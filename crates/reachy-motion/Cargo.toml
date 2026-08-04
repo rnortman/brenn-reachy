@@ -1,0 +1,16 @@
+[package]
+name = "reachy-motion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sans-I/O trajectory shaping, per-tick control step, and arm/disarm sequencers for the Reachy Mini"
+
+[dependencies]
+# Poses in, leg angles out, and the envelope check that gates every commanded
+# pose. The only in-workspace dependency this crate has: it speaks joint vectors
+# and abstract bus requests, never registers or bytes, which is what keeps it
+# hostable by a middleware harness that owns no serial port.
+reachy-kin = { path = "../reachy-kin" }
+# Typed fault causes. A fault here stops commanding and holds position, so the
+# cause has to survive as a value all the way to whatever reports it.
+thiserror = { workspace = true }

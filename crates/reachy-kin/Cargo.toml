@@ -1,0 +1,16 @@
+[package]
+name = "reachy-kin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Head kinematics, travel envelope, and singularity clearance for the Reachy Mini parallel platform"
+
+[dependencies]
+# Rigid transforms and rotations for the leg geometry and the commanded pose, and
+# the small dense solve the forward-kinematics iteration steps on. f64
+# throughout: the clearance margins that keep the linkage off its singular
+# configurations are millimetre-scale differences of decimetre-scale lengths.
+nalgebra = { workspace = true }
+# Typed reachability, convergence and envelope-violation errors. An unreachable
+# pose must surface as a named error rather than as a non-finite angle.
+thiserror = { workspace = true }

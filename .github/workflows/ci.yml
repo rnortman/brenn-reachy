@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Both jobs only read the tree. Pinned here so a permissive repo-level default
+# cannot silently hand a write-capable token to cached actions, the downloaded
+# scanner, or anything `make check` executes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI panic is read from the log or not at all — there is no rerunning it under
+  # a debugger.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Named for its role rather than its contents: the required-status-check rule on
+  # the branch embeds this string, so renaming it later silently makes that rule
+  # vacuous.
+  check:
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml names the channel and the components, so this resolves
+      # and installs exactly what a developer's machine uses. Doing it as an
+      # explicit step makes a failed install a failed step instead of a confusing
+      # failure inside the gate.
+      - name: Install Rust
+        run: rustup component add rustfmt clippy
+
+      # The workspace is at the repo root, so the default cache scope is correct
+      # and no explicit workspaces list is needed.
+      - uses: Swatinem/rust-cache@v2
+
+      # The gate's contents live in the root `check` target, not here, so the whole
+      # thing is reproducible locally on a fresh clone. No apt prerequisites: the
+      # serial port dependency is built without its udev-backed enumeration
+      # support, which is the only native library this workspace would otherwise
+      # need.
+      - run: make check
+
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installed outside the checkout: the tree scan below must see repo content
+      # only, not the scanner's own binary artifacts.
+      #
+      # The sha256 is the release's published checksum for this asset. Release
+      # assets are mutable, so the version self-check alone proves nothing — a
+      # swapped binary reports whatever version it likes and then writes the report
+      # that decides this job's verdict. The hash is the real gate; the version
+      # check stays as a secondary sanity line.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+
+      # --exit-code 0 makes a finding a reporting outcome, so a nonzero exit here
+      # means the scanner itself malfunctioned.
+      - name: Scan tree
+        run: |
+          "$RUNNER_TEMP/gitleaks" dir . \
+            --config .gitleaks.toml \
+            --report-format json \
+            --report-path "$RUNNER_TEMP/findings.json" \
+            --no-banner \
+            --exit-code 0 \
+            --log-level error
+
+      # `ephemeral-reference` is a diff-time rule. A whole-tree scan runs the full
+      # ruleset, so it has to be subtracted here or the job is red on content that
+      # the commit and push gates deliberately let through.
+      - name: Report
+        run: |
+          count=$(jq '[.[] | select(.RuleID != "ephemeral-reference")] | length' "$RUNNER_TEMP/findings.json")
+          if [ "$count" -ne 0 ]; then
+            echo "::error::$count scrub finding(s) in tree scan"
+            jq -r '.[] | select(.RuleID != "ephemeral-reference")
+                   | "\(.File):\(.StartLine): [\(.RuleID)] \(.Description)"' "$RUNNER_TEMP/findings.json"
+            exit 1
+          fi
+          echo "clean (shared rules)"

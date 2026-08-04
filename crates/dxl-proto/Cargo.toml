@@ -1,0 +1,12 @@
+[package]
+name = "dxl-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sans-I/O Dynamixel Protocol 2.0 codec, X-series register table, and unit conversions"
+
+[dependencies]
+# Typed encode/decode and frame errors. A corrupted frame has to be a distinct,
+# named outcome from a timeout all the way up the stack, which is what makes the
+# distinction enforceable with a match instead of a heuristic.
+thiserror = { workspace = true }

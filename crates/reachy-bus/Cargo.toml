@@ -1,0 +1,18 @@
+[package]
+name = "reachy-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The serial bus layer for the Reachy Mini servo chain: transactions, retry policy, and error taxonomy"
+
+[dependencies]
+# Frame encoding, incremental status decoding, the register table, and the count
+# conversions. This crate adds the port and the transaction semantics; it does not
+# reimplement any of the wire format.
+dxl-proto = { path = "../dxl-proto" }
+# The serial port itself, and the only external I/O dependency in the workspace.
+serialport = { workspace = true }
+# The transaction error taxonomy, which is the load-bearing part of this crate: a
+# timeout and a corrupt frame are separate variants because they demand opposite
+# retry policies.
+thiserror = { workspace = true }

@@ -1,0 +1,43 @@
+# Globs here are deliberately wide. An uncovered artifact is one `git add .`
+# away from becoming tracked content that has to be scrubbed back out again.
+
+# Rust build trees.
+target/
+**/*.rs.bk
+
+# Bench and bring-up output. Every run of the bench binary against real hardware
+# produces transcripts, register dumps and bus traces; none of it is source.
+*.log
+*.jsonl
+*.ndjson
+bench-out/
+captures/
+traces/
+
+# Live bench configuration and the state file the read-only self-test registry
+# writes beside it. Both name a specific unit and a specific serial device, so
+# they are configured per machine and never tracked.
+reachy-bench.toml
+reachy-bench.state.toml
+*.local.toml
+.local/
+
+# Measured geometry and calibration output. Per-unit fitted numbers belong to a
+# unit, not to the repo.
+calibration/
+*.csv
+
+# Personal Claude Code settings (settings.json is shared)
+.claude/settings.local.json
+
+# Local secret-scanner rule overrides. Never content in this repo.
+.gitleaks.local.toml
+
+# Private per-repo agent context (CLAUDE.md is shared)
+CLAUDE.local.md
+
+# Editor and OS noise
+*.swp
+.vscode/
+.idea/
+.DS_Store

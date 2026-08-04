@@ -1,0 +1,9 @@
+# One toolchain for the whole workspace. Stable: nothing here needs a nightly
+# feature, and the crates are host-architecture libraries plus one host binary,
+# so there is no cross-compilation toolchain to reconcile.
+#
+# rustfmt and clippy are named because `make check` runs both and a bare rustup
+# install does not necessarily carry them.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
