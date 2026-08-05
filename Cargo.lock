@@ -312,6 +312,7 @@ dependencies = [
 name = "reachy-motion"
 version = "0.1.0"
 dependencies = [
+ "nalgebra",
  "reachy-kin",
  "thiserror",
 ]

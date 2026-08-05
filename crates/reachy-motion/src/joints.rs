@@ -1,0 +1,340 @@
+//! The two command vectors and the names of the nine joints.
+//!
+//! Two views of the same machine, and the tick's whole job is turning one into
+//! the other:
+//!
+//! - [`JointTargets`] is what a caller commands — a head pose, a body yaw and
+//!   two antenna angles. It is the set the envelope check takes and the set the
+//!   trajectories interpolate, because a head pose is the thing that has a
+//!   meaningful straight line through it; six crank angles do not.
+//! - [`JointVector`] is what the servos speak — nine angles, in the order the
+//!   bus reports them. It is what comes back from a position read and what goes
+//!   out as goals.
+//!
+//! The map from targets to joints runs through the envelope check, in that
+//! direction only; the reverse needs the iterative solver and belongs to the
+//! tick's ingest path, not here.
+//!
+//! Angles are radians about the model datum: what the servo's own registers
+//! mean once the configured datum has been applied. Counts, registers and the
+//! datum itself live below this crate.
+
+use nalgebra::Isometry3;
+use reachy_kin::neutral_head_pose;
+
+/// One angle per joint, in bus order: body yaw, legs 1..=6, right antenna, left
+/// antenna. Radians about the model datum.
+///
+/// Used for both measurement (present positions) and command (goals), because
+/// they are the same nine numbers and a type that distinguished them would have
+/// to be converted at every comparison the tick makes between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JointVector {
+    /// Body yaw, radians.
+    pub body_yaw: f64,
+    /// The six crank angles, in servo order 1..=6, radians.
+    pub legs: [f64; 6],
+    /// Antenna angles, right then left, radians.
+    pub antennas: [f64; 2],
+}
+
+impl JointVector {
+    /// The angle at `id`, or `None` for a leg index past the sixth.
+    #[must_use]
+    pub fn get(&self, id: JointId) -> Option<f64> {
+        match id {
+            JointId::BodyYaw => Some(self.body_yaw),
+            JointId::Leg(leg) => self.legs.get(usize::from(leg)).copied(),
+            JointId::AntennaRight => Some(self.antennas[0]),
+            JointId::AntennaLeft => Some(self.antennas[1]),
+        }
+    }
+
+    /// Every joint paired with its angle, in bus order.
+    ///
+    /// A single pass over all nine joints ensures no joint is checked by one
+    /// guard and missed by another. Fixed size, so nothing allocates.
+    #[must_use]
+    pub fn joints(&self) -> [(JointId, f64); JointId::COUNT] {
+        [
+            (JointId::BodyYaw, self.body_yaw),
+            (JointId::Leg(0), self.legs[0]),
+            (JointId::Leg(1), self.legs[1]),
+            (JointId::Leg(2), self.legs[2]),
+            (JointId::Leg(3), self.legs[3]),
+            (JointId::Leg(4), self.legs[4]),
+            (JointId::Leg(5), self.legs[5]),
+            (JointId::AntennaRight, self.antennas[0]),
+            (JointId::AntennaLeft, self.antennas[1]),
+        ]
+    }
+
+    /// Whether all nine angles are finite.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        self.joints().iter().all(|(_, angle)| angle.is_finite())
+    }
+}
+
+/// The Cartesian command set: what a caller asks for and what a trajectory
+/// interpolates.
+///
+/// The head pose is expressed **in the body frame** — relative to the yawing
+/// body, not the fixed foot — so `body_yaw` and `head_pose_body` are
+/// independent commands rather than two descriptions of one motion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointTargets {
+    /// Head pose relative to the body at the commanded yaw.
+    pub head_pose_body: Isometry3<f64>,
+    /// Body yaw, radians.
+    pub body_yaw: f64,
+    /// Antenna angles, right then left, radians.
+    pub antennas: [f64; 2],
+}
+
+impl Default for JointTargets {
+    /// The neutral head pose, zero yaw, antennas at zero.
+    ///
+    /// Deliberately a configuration the machine can actually hold: these are
+    /// out-parameter buffers, and a default of all-zeros would put the head
+    /// origin at the floor — a pose no envelope admits and no reader would
+    /// recognise as uninitialised.
+    fn default() -> Self {
+        Self {
+            head_pose_body: neutral_head_pose(),
+            body_yaw: 0.0,
+            antennas: [0.0, 0.0],
+        }
+    }
+}
+
+impl JointTargets {
+    /// Whether every commanded number is finite, the pose included.
+    ///
+    /// A non-finite pose cannot be interpolated toward or checked against a
+    /// bound, so the trajectory constructor refuses one rather than carrying it
+    /// to the envelope check as a violation on every tick of a doomed move.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        self.head_pose_body
+            .translation
+            .vector
+            .iter()
+            .all(|c| c.is_finite())
+            && self
+                .head_pose_body
+                .rotation
+                .coords
+                .iter()
+                .all(|c| c.is_finite())
+            && self.body_yaw.is_finite()
+            && self.antennas.iter().all(|a| a.is_finite())
+    }
+}
+
+/// Per-tick step bounds, radians, one per group.
+///
+/// Exceeding one of these is a fault, never a clamp: an oversized step is a
+/// goal the servo applies as an immediate jump, and the interpolator or the
+/// seed being wrong is the thing worth reporting, not the jump being trimmed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointStep {
+    /// Bound on any one crank's change per tick.
+    pub legs: f64,
+    /// Bound on the body yaw's change per tick.
+    pub body_yaw: f64,
+    /// Bound on either antenna's change per tick.
+    pub antennas: f64,
+}
+
+impl JointStep {
+    /// The bound that applies to `id`.
+    #[must_use]
+    pub fn for_joint(&self, id: JointId) -> f64 {
+        match id {
+            JointId::BodyYaw => self.body_yaw,
+            JointId::Leg(_) => self.legs,
+            JointId::AntennaRight | JointId::AntennaLeft => self.antennas,
+        }
+    }
+}
+
+/// Names one joint, for fault causes and reports.
+///
+/// Leg indices are 0-based, matching the leg index the kinematics reports an
+/// unreachable pose against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JointId {
+    /// The body yaw servo.
+    BodyYaw,
+    /// A crank, 0-based in servo order.
+    Leg(u8),
+    /// The right antenna.
+    AntennaRight,
+    /// The left antenna.
+    AntennaLeft,
+}
+
+impl JointId {
+    /// How many joints there are.
+    pub const COUNT: usize = 9;
+
+    /// Every joint, in bus order.
+    pub const ALL: [JointId; Self::COUNT] = [
+        JointId::BodyYaw,
+        JointId::Leg(0),
+        JointId::Leg(1),
+        JointId::Leg(2),
+        JointId::Leg(3),
+        JointId::Leg(4),
+        JointId::Leg(5),
+        JointId::AntennaRight,
+        JointId::AntennaLeft,
+    ];
+
+    /// Position in bus order, or `None` for a leg index past the sixth.
+    #[must_use]
+    pub fn index(self) -> Option<usize> {
+        match self {
+            JointId::BodyYaw => Some(0),
+            JointId::Leg(leg) if leg < 6 => Some(1 + usize::from(leg)),
+            JointId::Leg(_) => None,
+            JointId::AntennaRight => Some(7),
+            JointId::AntennaLeft => Some(8),
+        }
+    }
+
+    /// The joint at `index` in bus order.
+    #[must_use]
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+}
+
+impl core::fmt::Display for JointId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            JointId::BodyYaw => write!(f, "body yaw"),
+            JointId::Leg(leg) => write!(f, "leg {leg}"),
+            JointId::AntennaRight => write!(f, "right antenna"),
+            JointId::AntennaLeft => write!(f, "left antenna"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reachy_kin::{EnvelopeConfig, EnvelopeReport, HeadGeometry, check_envelope};
+
+    #[test]
+    fn bus_order_is_one_order() {
+        let v = JointVector {
+            body_yaw: 0.5,
+            legs: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            antennas: [7.0, 8.0],
+        };
+        let joints = v.joints();
+        for (index, (id, angle)) in joints.iter().enumerate() {
+            assert_eq!(JointId::from_index(index), Some(*id), "index {index}");
+            assert_eq!(id.index(), Some(index), "index {index}");
+            assert_eq!(v.get(*id), Some(*angle), "index {index}");
+        }
+        assert_eq!(JointId::from_index(JointId::COUNT), None);
+    }
+
+    /// A leg index past the sixth names nothing, and says so rather than
+    /// indexing something else.
+    #[test]
+    fn out_of_range_leg_has_no_slot() {
+        let v = JointVector::default();
+        assert_eq!(JointId::Leg(6).index(), None);
+        assert_eq!(JointId::Leg(200).index(), None);
+        assert_eq!(v.get(JointId::Leg(6)), None);
+    }
+
+    #[test]
+    fn joint_names() {
+        assert_eq!(JointId::BodyYaw.to_string(), "body yaw");
+        assert_eq!(JointId::Leg(3).to_string(), "leg 3");
+        assert_eq!(JointId::AntennaRight.to_string(), "right antenna");
+        assert_eq!(JointId::AntennaLeft.to_string(), "left antenna");
+    }
+
+    /// Every one of the nine slots is covered by the finiteness check — a
+    /// per-slot sweep, because a hand-written conjunction that skipped one
+    /// would still pass an all-finite test.
+    #[test]
+    fn every_slot_is_checked_for_finiteness() {
+        assert!(JointVector::default().is_finite());
+        for index in 0..JointId::COUNT {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut v = JointVector::default();
+                match index {
+                    0 => v.body_yaw = bad,
+                    1..=6 => v.legs[index - 1] = bad,
+                    _ => v.antennas[index - 7] = bad,
+                }
+                assert!(!v.is_finite(), "slot {index} with {bad}");
+            }
+        }
+    }
+
+    /// The same sweep over the target set, pose components included.
+    #[test]
+    fn targets_check_the_pose_too() {
+        assert!(JointTargets::default().is_finite());
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut t = JointTargets::default();
+            t.head_pose_body.translation.vector.x = bad;
+            assert!(!t.is_finite(), "translation with {bad}");
+
+            let mut t = JointTargets::default();
+            t.head_pose_body.rotation = nalgebra::UnitQuaternion::new_unchecked(
+                nalgebra::Quaternion::new(bad, 0.0, 0.0, 0.0),
+            );
+            assert!(!t.is_finite(), "rotation with {bad}");
+
+            let t = JointTargets {
+                body_yaw: bad,
+                ..Default::default()
+            };
+            assert!(!t.is_finite(), "yaw with {bad}");
+
+            let mut t = JointTargets::default();
+            t.antennas[1] = bad;
+            assert!(!t.is_finite(), "antenna with {bad}");
+        }
+    }
+
+    #[test]
+    fn step_bounds_by_group() {
+        let step = JointStep {
+            legs: 0.05,
+            body_yaw: 0.02,
+            antennas: 0.1,
+        };
+        assert_eq!(step.for_joint(JointId::BodyYaw), 0.02);
+        assert_eq!(step.for_joint(JointId::Leg(4)), 0.05);
+        assert_eq!(step.for_joint(JointId::AntennaRight), 0.1);
+        assert_eq!(step.for_joint(JointId::AntennaLeft), 0.1);
+    }
+
+    /// The default target set is a configuration the machine can hold, not a
+    /// zeroed struct: it passes the envelope with no baseline.
+    #[test]
+    fn default_targets_pass_the_envelope() {
+        let targets = JointTargets::default();
+        let mut report = EnvelopeReport::default();
+        check_envelope(
+            &HeadGeometry::default(),
+            &EnvelopeConfig::default(),
+            &targets.head_pose_body,
+            targets.body_yaw,
+            targets.antennas,
+            None,
+            &mut report,
+        )
+        .expect("the neutral pose is inside the envelope");
+    }
+}

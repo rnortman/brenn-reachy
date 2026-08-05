@@ -37,3 +37,9 @@
 //! and emitted as a bounded increment.
 
 #![forbid(unsafe_code)]
+
+pub mod joints;
+pub mod traj;
+
+pub use joints::{JointId, JointStep, JointTargets, JointVector};
+pub use traj::{Trajectory, TrajectoryError, Warp};

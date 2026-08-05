@@ -11,6 +11,11 @@ description = "Sans-I/O trajectory shaping, per-tick control step, and arm/disar
 # and abstract bus requests, never registers or bytes, which is what keeps it
 # hostable by a middleware harness that owns no serial port.
 reachy-kin = { path = "../reachy-kin" }
+# The commanded head pose is a rigid transform and the trajectories interpolate
+# between two of them along the rotation geodesic, so the pose type and its
+# quaternion arithmetic are part of this crate's own surface, not just
+# something it hands through to the kinematics.
+nalgebra = { workspace = true }
 # Typed fault causes. A fault here stops commanding and holds position, so the
 # cause has to survive as a value all the way to whatever reports it.
 thiserror = { workspace = true }
