@@ -39,7 +39,12 @@
 #![forbid(unsafe_code)]
 
 pub mod joints;
+pub mod tick;
 pub mod traj;
 
 pub use joints::{JointId, JointStep, JointTargets, JointVector};
+pub use tick::{
+    CommandDisposition, CommandRejection, Fault, Mode, MotionCommand, MotionConfig, MotionState,
+    ServoHealth, TickInputs, TickOutputs, TickReport, TrackingFaultConfig, motion_tick,
+};
 pub use traj::{Trajectory, TrajectoryError, Warp};
