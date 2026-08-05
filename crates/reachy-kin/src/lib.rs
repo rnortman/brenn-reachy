@@ -42,7 +42,7 @@ mod testutil;
 pub mod yaw;
 
 pub use envelope::{
-    EnvelopeConfig, EnvelopeError, EnvelopeReport, EnvelopeViolations, check_envelope,
+    EnvelopeConfig, EnvelopeError, EnvelopeReport, EnvelopeViolations, below_limit, check_envelope,
     outside_limit,
 };
 pub use fk::{FkError, FkOptions, FkStats, forward_kinematics};
@@ -50,5 +50,5 @@ pub use geometry::{
     BranchSign, HeadGeometry, LegGeometry, cone_angle, neutral_head_pose, rest_head_pose,
     stow_head_pose,
 };
-pub use ik::{IkError, LegAngles, inverse_kinematics, min_pose_margin, pose_margins};
+pub use ik::{IkError, LegAngles, inverse_kinematics, min_margin, min_pose_margin, pose_margins};
 pub use yaw::{body_to_world, world_to_body};

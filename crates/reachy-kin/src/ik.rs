@@ -212,6 +212,21 @@ pub fn pose_margins(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>, out: &
     }
 }
 
+/// The smallest of six per-leg toggle margins, metres.
+///
+/// The one reduction every clearance comparison is made under: the envelope's
+/// minimum, the baseline an armed machine is started from, and any caller that
+/// already holds a margin array all reduce here, so a change to what "smallest"
+/// means cannot reach one of them and miss another. A caller holding only a pose
+/// uses [`min_pose_margin`] instead.
+///
+/// Never a NaN: an unsolvable leg's margin is zero or less, and `f64::min`
+/// carries a number past one, so the result is the least clearance any leg has.
+#[must_use]
+pub fn min_margin(margins: &[f64; 6]) -> f64 {
+    margins.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
 /// The smallest of a pose's six toggle margins, metres.
 ///
 /// The clearance baseline the margin-baseline policy is defined over. The
@@ -227,7 +242,7 @@ pub fn pose_margins(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>, out: &
 pub fn min_pose_margin(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>) -> f64 {
     let mut margins = [0.0; 6];
     pose_margins(geom, head_pose_body, &mut margins);
-    margins.iter().copied().fold(f64::INFINITY, f64::min)
+    min_margin(&margins)
 }
 
 #[cfg(test)]
@@ -369,6 +384,26 @@ mod tests {
                 );
                 assert_eq!(solved.angle.is_some(), solved.margin >= 0.0);
             }
+        }
+    }
+
+    /// The reduction every clearance comparison shares: it is the least of the
+    /// six, it agrees with solving the pose, and a leg with no clearance decides
+    /// it however the others sit.
+    #[test]
+    fn the_minimum_is_one_reduction() {
+        assert_eq!(
+            min_margin(&[0.004, 0.003, 0.009, 0.005, 0.011, 0.007]),
+            0.003
+        );
+        assert_eq!(min_margin(&[0.0; 6]), 0.0);
+        assert_eq!(min_margin(&[-0.002, 0.5, 0.5, 0.5, 0.5, 0.5]), -0.002);
+
+        let geom = HeadGeometry::default();
+        for pose in [neutral_head_pose(), stow_head_pose(), rest_head_pose()] {
+            let mut margins = [0.0; 6];
+            pose_margins(&geom, &pose, &mut margins);
+            assert_eq!(min_margin(&margins), min_pose_margin(&geom, &pose));
         }
     }
 

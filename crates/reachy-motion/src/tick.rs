@@ -29,6 +29,14 @@
 //! checker and the interpolation have disagreed about a pose already accepted —
 //! and that is a fault.
 //!
+//! ## The move's own start
+//!
+//! A trajectory sampled at zero elapsed time reproduces its start, which is the
+//! pose the machine is already commanded to hold. Such a tick commands the
+//! machine towards nothing, so it checks nothing and emits nothing, and stays in
+//! the move. That is the tick that accepts a move, and any later tick whose clock
+//! has not advanced past the move's start.
+//!
 //! ## Freshness
 //!
 //! A position read that did not arrive is `None`, never the previous tick's
@@ -54,44 +62,9 @@ use reachy_kin::{
 };
 use thiserror::Error;
 
-use crate::joints::{JointId, JointStep, JointTargets, JointVector};
+use crate::arm::ArmRecord;
+use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth};
 use crate::traj::{Trajectory, TrajectoryError, Warp};
-
-/// One servo's hardware-error byte, paired with the bus ID it was read from.
-///
-/// The tick names the offending servo by its bus ID, so the ID travels with the
-/// bits rather than being inferred from a position in an array. Whatever owns
-/// the port fills these in; this crate never learns what an ID means.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ServoHealth {
-    /// The servo's bus ID.
-    pub id: u8,
-    /// The hardware-error byte as read.
-    pub bits: u8,
-}
-
-impl ServoHealth {
-    /// Bit 0: the input voltage left its configured range at some point.
-    pub const INPUT_VOLTAGE: u8 = 1;
-
-    /// Whether the byte is clear, or carries the input-voltage bit and nothing
-    /// else.
-    ///
-    /// The voltage bit alone is expected on this platform and is reported
-    /// rather than acted on: it latches on a supply dip that the servo rode out,
-    /// and every other bit means something is wrong with the motor.
-    #[must_use]
-    pub fn healthy_or_voltage_only(self) -> bool {
-        self.bits & !Self::INPUT_VOLTAGE == 0
-    }
-
-    /// Whether the input-voltage bit is set and nothing else is — the
-    /// informational case.
-    #[must_use]
-    pub fn voltage_only(self) -> bool {
-        self.bits == Self::INPUT_VOLTAGE
-    }
-}
 
 /// When a joint is far enough from its goal, for long enough, to conclude the
 /// servo is not tracking it.
@@ -317,8 +290,12 @@ pub struct TickReport {
     pub health: Option<[ServoHealth; JointId::COUNT]>,
     /// What became of the command, if there was one.
     pub command: CommandDisposition,
-    /// The envelope check of the sampled path pose, when the tick advanced one.
+    /// The envelope check of the sampled path pose, when the tick checked one.
+    /// A tick that sampled a move's own start checked nothing.
     pub envelope: Option<EnvelopeReport>,
+    /// Whether this tick's sample was the active move's own start — the pose
+    /// already held — in which case nothing was checked and nothing emitted.
+    pub start_sample: bool,
     /// Whether goals were emitted. Holding writes nothing; the servos hold.
     pub emitted: bool,
     /// Whether an active move reached its endpoint on this tick.
@@ -343,6 +320,7 @@ impl Default for TickReport {
             health: None,
             command: CommandDisposition::None,
             envelope: None,
+            start_sample: false,
             emitted: false,
             completed: false,
             fault: None,
@@ -359,7 +337,8 @@ pub struct TickInputs<'a> {
     /// Nothing here reads a clock, so nothing here can enforce that. A `now` that
     /// went backwards during a move resamples the path at the earlier time and
     /// walks the head back the way it came, bounded only by the per-tick step
-    /// guard; before the move's own start it resamples the start.
+    /// guard. At or before the move's own start there is no elapsed time at all,
+    /// and such a tick commands nothing.
     pub now: Duration,
     /// The measured joint angles, or `None` when this tick's read failed.
     pub present: Option<&'a JointVector>,
@@ -398,30 +377,33 @@ pub struct MotionState {
 impl MotionState {
     /// The state of a machine that has just finished arming.
     ///
-    /// `pinned` is what arming left in the servos' goal registers,
-    /// `head_pose_body` the pose solved from the resting angles, and
-    /// `min_margin` that pose's smallest toggle margin — the baseline that lets
-    /// the first move lift off a rest tighter than the clearance floor.
+    /// `armed` is arming's record of what it left the machine holding: the goals
+    /// in the servos' registers, the pose those angles hold, and that pose's
+    /// smallest toggle margin — the baseline that lets a first move lift off a
+    /// rest tighter than the clearance floor.
+    ///
+    /// The **armed** record, specifically, and not the record of where the
+    /// platform was found. The two are different poses whenever arming had to
+    /// pull a joint into its travel window, and a state whose goals came from one
+    /// and whose Cartesian mirror came from the other would hand the first
+    /// trajectory a start the machine is not at — outside the travel windows
+    /// every later sample is checked against.
     ///
     /// There is no other way to build one, and that is the point: a tick can
     /// only run on a machine somebody armed.
     #[must_use]
-    pub fn new_armed(
-        pinned: &JointVector,
-        head_pose_body: &Isometry3<f64>,
-        min_margin: f64,
-    ) -> Self {
+    pub fn new_armed(armed: &ArmRecord) -> Self {
         Self {
             mode: Mode::Holding,
             trajectory: None,
-            last_goal: *pinned,
+            last_goal: armed.joints,
             last_targets: JointTargets {
-                head_pose_body: *head_pose_body,
-                body_yaw: pinned.body_yaw,
-                antennas: pinned.antennas,
+                head_pose_body: armed.head_pose_body,
+                body_yaw: armed.joints.body_yaw,
+                antennas: armed.joints.antennas,
             },
-            fk_seed: *head_pose_body,
-            present_min_margin: min_margin,
+            fk_seed: armed.head_pose_body,
+            present_min_margin: armed.min_margin,
             miss_count: 0,
             tracking_count: 0,
         }
@@ -608,8 +590,8 @@ pub fn motion_tick(
     let Mode::Moving { started } = state.mode else {
         return;
     };
+    let t = inp.now.saturating_sub(started);
     let Some((sampled, endpoint, done)) = state.trajectory.as_ref().map(|trajectory| {
-        let t = inp.now.saturating_sub(started);
         let mut sampled = JointTargets::default();
         trajectory.sample(t, &mut sampled);
         (sampled, *trajectory.target(), trajectory.done(t))
@@ -624,6 +606,18 @@ pub fn motion_tick(
         out.report.mode = state.mode;
         return;
     };
+
+    // Zero elapsed time samples the move's own start, which is the pose already
+    // commanded and held. Nothing is being asked of the machine, so nothing is
+    // checked and nothing goes out: a refusal here would stop the machine at the
+    // very pose the refusal was protecting, and a goal here would rewrite bits
+    // the servos already have. Exact time arithmetic, not a comparison of poses —
+    // a freshly armed machine's start is the solved mirror of its pinned goals
+    // and sits a rounding error away from them.
+    if t.is_zero() {
+        out.report.start_sample = true;
+        return;
+    }
 
     let mut envelope = EnvelopeReport::default();
     let verdict = check_envelope(
@@ -749,6 +743,7 @@ fn take_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arm::{ArmConfig, pin_goals};
     use reachy_kin::{inverse_kinematics, rest_head_pose};
 
     fn secs(s: f64) -> Duration {
@@ -782,13 +777,54 @@ mod tests {
         }
     }
 
-    /// A machine armed and holding at `targets`.
+    /// Arming's configuration, against the fences this tick's envelope implies.
+    fn arm_config(cfg: &MotionConfig) -> ArmConfig {
+        crate::testutil::arm_config(&cfg.env)
+    }
+
+    /// An arming record for angles known to hold `head_pose_body`.
+    fn record_at(
+        cfg: &MotionConfig,
+        joints: &JointVector,
+        head_pose_body: &Isometry3<f64>,
+    ) -> ArmRecord {
+        let mut margins = [0.0; 6];
+        reachy_kin::pose_margins(&cfg.geom, head_pose_body, &mut margins);
+        ArmRecord {
+            joints: *joints,
+            head_pose_body: *head_pose_body,
+            margins,
+            min_margin: min_pose_margin(&cfg.geom, head_pose_body),
+        }
+    }
+
+    /// A machine armed and holding at `targets`, through arming's own pin phase.
+    ///
+    /// A leg that `targets` puts outside its travel window is pinned at the
+    /// nearer bound, and the state's Cartesian mirror is then the pose those
+    /// pinned angles hold rather than the pose that was asked for. That matters
+    /// for a rest tighter than the linkage's own limits: arming leaves such a
+    /// machine in the window, and every trajectory therefore starts in it.
+    ///
+    /// With nothing to pin, the pose asked for *is* the pose the pinned angles
+    /// hold, and it is used as the solve's exact answer rather than a value a
+    /// rounding error away from it.
     fn armed_at(cfg: &MotionConfig, targets: &JointTargets) -> (MotionState, JointVector) {
-        let (pinned, margin) = joints_for(cfg, targets);
-        (
-            MotionState::new_armed(&pinned, &targets.head_pose_body, margin),
-            pinned,
-        )
+        let (present, _) = joints_for(cfg, targets);
+        let outcome =
+            pin_goals(&arm_config(cfg), &present).expect("the pull-in is inside the gate");
+        let record = if outcome.pinned.legs == present.legs {
+            record_at(cfg, &outcome.pinned, &targets.head_pose_body)
+        } else {
+            ArmRecord::solve(
+                &cfg.geom,
+                &cfg.fk,
+                &outcome.pinned,
+                &[targets.head_pose_body],
+            )
+            .expect("the pinned angles close the linkage")
+        };
+        (MotionState::new_armed(&record), outcome.pinned)
     }
 
     /// One tick with a live read.
@@ -1341,6 +1377,63 @@ mod tests {
         assert_eq!(out.goal, None);
     }
 
+    /// The recorded resting configuration puts four legs past their travel
+    /// windows, which is the case arming's pin phase exists for, and pinning
+    /// seats all six inside — including under the round trip through the pose
+    /// those pinned angles hold, which is what every later trajectory starts
+    /// from.
+    #[test]
+    fn pinning_seats_the_rest_configuration_in_its_windows() {
+        let cfg = MotionConfig::default();
+        let rest = rest_targets(0.0);
+        let (raw, _) = joints_for(&cfg, &rest);
+
+        let overrun = |legs: [f64; 6]| -> [f64; 6] {
+            core::array::from_fn(|leg| {
+                let (lo, hi) = cfg.env.crank_windows[leg];
+                (lo - legs[leg]).max(legs[leg] - hi).max(0.0).to_degrees()
+            })
+        };
+        assert_eq!(
+            format!("{:.3?}", overrun(raw.legs)),
+            "[7.531, 2.442, 0.000, 0.000, 0.755, 10.563]",
+            "how far the raw rest IK overruns each window, degrees"
+        );
+
+        let (state, pinned) = armed_at(&cfg, &rest);
+        assert_eq!(
+            format!("{:.3?}", overrun(pinned.legs)),
+            "[0.000, 0.000, 0.000, 0.000, 0.000, 0.000]",
+            "the pinned goals are inside every window"
+        );
+
+        // The pose those pinned angles hold, solved back to angles by the
+        // envelope, must also be inside: the trajectory starts from the pose,
+        // not from the goals.
+        let mut report = EnvelopeReport::default();
+        let held = state.last_targets();
+        let verdict = check_envelope(
+            &cfg.geom,
+            &cfg.env,
+            &held.head_pose_body,
+            held.body_yaw,
+            held.antennas,
+            None,
+            &mut report,
+        );
+        assert_eq!(report.violations.window, [false; 6], "{verdict:?}");
+        assert_eq!(report.violations.unreachable, [false; 6]);
+        assert!(
+            report.violations.margin,
+            "and it is still tighter than the floor"
+        );
+        assert_eq!(
+            format!("{:.9}", state.present_min_margin()),
+            "0.000841568",
+            "the armed clearance, metres"
+        );
+    }
+
     /// The baseline the tick passes to the envelope is the *present* pose's
     /// clearance, which is what lets an armed machine lift off a rest tighter
     /// than the clearance floor. The same command from a machine that has not
@@ -1351,8 +1444,8 @@ mod tests {
         let rest = rest_targets(0.0);
         let (mut state, pinned) = armed_at(&cfg, &rest);
         assert!(
-            state.present_min_margin() < 0.000_3,
-            "the rest is tighter than the floor: {}",
+            state.present_min_margin() < cfg.env.min_toggle_margin,
+            "the armed rest is tighter than the floor: {}",
             state.present_min_margin()
         );
 
@@ -1366,6 +1459,7 @@ mod tests {
         };
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
         assert_eq!(out.report.command, CommandDisposition::Started);
+        assert_eq!(out.report.fault, None);
 
         // Downward from the same rest is a tightening, and no baseline excuses
         // that.
@@ -1385,6 +1479,108 @@ mod tests {
             "got {:?}",
             out.report.command
         );
+        assert_eq!(out.report.fault, None);
+    }
+
+    /// The whole point of the two rules above, composed: the milestone's first
+    /// commanded motion is the lift off the rest, and it runs from end to end
+    /// without a single fault.
+    ///
+    /// It exercises the pinned start, the start-sample exemption on the accepting
+    /// tick, and the margin baseline carrying a path that spends its first
+    /// samples below the clearance floor. Any one of the three missing and this
+    /// stops on tick 0 or shortly after.
+    #[test]
+    fn the_lift_off_the_rest_never_faults() {
+        let cfg = MotionConfig::default();
+        let (mut state, pinned) = armed_at(&cfg, &rest_targets(0.0));
+        let neutral = JointTargets::default();
+        let command = MotionCommand::MoveTo {
+            target: neutral,
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        let mut emitted = 0;
+        let mut ticks = 0;
+        let mut completed = false;
+        for n in 0..200 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            ticks += 1;
+            assert_eq!(out.report.fault, None, "tick {n}");
+            if n == 0 {
+                assert_eq!(out.report.command, CommandDisposition::Started);
+            }
+            if let Some(goal) = out.goal {
+                emitted += 1;
+                present = goal;
+            }
+            if out.report.completed {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "the lift finished in {ticks} ticks");
+        assert_eq!(state.mode(), Mode::Holding);
+        assert!(emitted > 90, "only {emitted} goals over a 2 s lift");
+
+        // It arrived, and it arrived somewhere with real clearance.
+        assert_eq!(
+            state.last_targets().head_pose_body,
+            neutral.head_pose_body,
+            "the endpoint is the target's own bits"
+        );
+        assert!(
+            state.present_min_margin() > cfg.env.min_toggle_margin,
+            "clearance at the top of the lift: {}",
+            state.present_min_margin()
+        );
+    }
+
+    /// The tick that accepts a move samples the move's own start — the pose
+    /// already held — so it checks nothing and commands nothing, and says so. The
+    /// next tick is the first that asks anything of the machine.
+    ///
+    /// Run from a rest below the clearance floor, which is where it matters: the
+    /// start's clearance equals the baseline it would be compared against, so
+    /// checking it would refuse the pose the machine is standing in.
+    #[test]
+    fn a_moves_first_tick_samples_its_own_start() {
+        let cfg = MotionConfig::default();
+        let (mut state, pinned) = armed_at(&cfg, &rest_targets(0.0));
+        let held = *state.last_targets();
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+
+        let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
+        assert_eq!(out.report.command, CommandDisposition::Started);
+        assert!(out.report.start_sample);
+        assert_eq!(out.report.envelope, None, "nothing was checked");
+        assert_eq!(out.goal, None, "and nothing went out");
+        assert!(!out.report.emitted);
+        assert_eq!(out.report.fault, None);
+        assert!(matches!(out.report.mode, Mode::Moving { .. }));
+        assert_eq!(*state.last_goal(), pinned, "the goals are untouched");
+        assert_eq!(*state.last_targets(), held, "and so is their mirror");
+
+        // The next tick asks for a pose the machine is not in, and that one is
+        // checked and emitted.
+        let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, None);
+        assert!(!out.report.start_sample);
+        assert!(out.report.envelope.is_some(), "this one was checked");
+        assert!(out.report.emitted);
+        assert_eq!(out.report.fault, None);
+        assert_ne!(*state.last_goal(), pinned);
     }
 
     /// A reading that is not a number faults on the tick it arrives, naming the
@@ -1455,11 +1651,11 @@ mod tests {
             ..MotionConfig::default()
         };
         let targets = JointTargets::default();
-        let (present, margin) = joints_for(&cfg, &targets);
+        let (present, _) = joints_for(&cfg, &targets);
 
         let mut pinned = present;
         pinned.legs[3] = f64::NAN;
-        let mut state = MotionState::new_armed(&pinned, &targets.head_pose_body, margin);
+        let mut state = MotionState::new_armed(&record_at(&cfg, &pinned, &targets.head_pose_body));
 
         let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
         let Some(Fault::TrackingLost { joint, error }) = out.report.fault else {
@@ -1777,18 +1973,35 @@ mod tests {
         }
         let advanced = *state.last_goal();
 
-        // A `now` before the move's own start floors to zero elapsed, so the
-        // sample is the start pose again. The whole move's leg travel is under
-        // the step bound here, so nothing catches it.
-        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        // One tick's worth of elapsed time, long after twenty ticks have passed:
+        // the path is resampled near its start and the head walks back there.
+        // The whole move's leg travel is under the step bound here, so nothing
+        // catches it.
+        let out = tick_with(&cfg, &mut state, secs(0.02), &present, None);
         assert_eq!(out.report.fault, None);
         assert!(out.report.emitted, "a goal went out for the earlier time");
+        let rewound = *state.last_goal();
+        assert_ne!(rewound, advanced);
+        for (leg, angle) in rewound.legs.iter().enumerate() {
+            assert!(
+                (angle - pinned.legs[leg]).abs() < 1e-4,
+                "leg {leg} went back to within a tick of the start"
+            );
+        }
+
+        // Rewound to at or before the move's own start, there is no elapsed time
+        // at all, and that is the start-sample exemption: nothing is checked and
+        // nothing goes out, so this particular clock fault cannot walk the head
+        // anywhere.
+        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        assert!(out.report.start_sample);
+        assert_eq!(out.goal, None);
+        assert_eq!(out.report.fault, None);
         assert_eq!(
             *state.last_goal(),
-            pinned,
-            "the rewound goal is the move's own start"
+            rewound,
+            "still where the rewind left it"
         );
-        assert_ne!(*state.last_goal(), advanced);
 
         // A rewind that undoes more than one tick's worth of travel is caught,
         // and that is the whole protection: the same move on an axis with real
@@ -1816,7 +2029,7 @@ mod tests {
                 present = goal;
             }
         }
-        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        let out = tick_with(&cfg, &mut state, secs(0.02), &present, None);
         let Some(Fault::StepTooLarge { joint, .. }) = out.report.fault else {
             panic!("expected a step fault, got {:?}", out.report.fault);
         };

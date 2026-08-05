@@ -52,7 +52,7 @@ use thiserror::Error;
 
 use crate::baked;
 use crate::geometry::{HeadGeometry, cone_angle};
-use crate::ik::{LegAngles, solve_leg};
+use crate::ik::{LegAngles, min_margin, solve_leg};
 
 /// The bounds a commanded pose is checked against.
 ///
@@ -242,6 +242,18 @@ pub fn outside_limit(value: f64, limit: f64) -> bool {
     )
 }
 
+/// Whether `value` is *not* known to reach `floor`.
+///
+/// [`outside_limit`] with the operands the other way round, named so that a test
+/// against a lower bound reads in its own direction: a call site checking that a
+/// supply rail is up or that a height clears a floor says so, instead of looking
+/// like a ceiling test with its arguments swapped. Same rule for a value nobody
+/// can place — a `NaN` reaches no floor, so it counts as below one.
+#[must_use]
+pub fn below_limit(value: f64, floor: f64) -> bool {
+    outside_limit(floor, value)
+}
+
 /// Whether `value`'s magnitude is not known to be within `limit`, for the bounds
 /// that are symmetric about zero.
 fn magnitude_outside(value: f64, limit: f64) -> bool {
@@ -286,12 +298,10 @@ pub fn check_envelope(
     let mut violations = EnvelopeViolations::default();
     let mut angles = [0.0; 6];
     let mut solved_all = true;
-    let mut min_margin = f64::INFINITY;
 
     for (leg, &(lo, hi)) in env.crank_windows.iter().enumerate() {
         let solve = solve_leg(geom, leg, head_pose_body);
         out.toggle_margins[leg] = solve.margin;
-        min_margin = min_margin.min(solve.margin);
         match solve.angle {
             Some(angle) => {
                 angles[leg] = angle;
@@ -304,15 +314,16 @@ pub fn check_envelope(
         }
     }
 
-    out.min_margin = min_margin;
+    // The same reduction the baseline a caller supplies was made under.
+    out.min_margin = min_margin(&out.toggle_margins);
     out.leg_angles = solved_all.then_some(LegAngles(angles));
 
     // Below the floor is a violation unless the caller supplied the present
     // pose's clearance and this pose strictly improves on it. Strictly: a
     // command that merely holds the present clearance below the floor buys
     // nothing and is refused.
-    violations.margin = min_margin < env.min_toggle_margin
-        && !matches!(margin_baseline, Some(baseline) if min_margin > baseline);
+    violations.margin = out.min_margin < env.min_toggle_margin
+        && !matches!(margin_baseline, Some(baseline) if out.min_margin > baseline);
 
     violations.body_yaw = magnitude_outside(body_yaw, env.body_yaw_limit);
     violations.relative_yaw = magnitude_outside(out.relative_yaw, env.relative_yaw_limit);
@@ -662,6 +673,26 @@ mod tests {
         assert!(!magnitude_outside(-1.0, 1.0));
         assert!(magnitude_outside(-1.5, 1.0));
         assert!(magnitude_outside(f64::NEG_INFINITY, 1.0));
+    }
+
+    /// The floor test is the ceiling test read the other way: at the floor
+    /// passes, under it fails, and a reading nobody can place reaches no floor.
+    #[test]
+    fn the_floor_test_is_the_bound_test_the_other_way_round() {
+        assert!(!below_limit(1.0, 1.0));
+        assert!(!below_limit(1.5, 1.0));
+        assert!(below_limit(0.999_999_999_999_9, 1.0));
+        assert!(below_limit(f64::NAN, 1.0));
+        assert!(below_limit(f64::NEG_INFINITY, 1.0));
+        assert!(!below_limit(f64::INFINITY, 1.0));
+
+        for (value, bound) in [(0.9, 1.0), (1.0, 1.0), (f64::NAN, 1.0), (0.5, f64::NAN)] {
+            assert_eq!(
+                below_limit(value, bound),
+                outside_limit(bound, value),
+                "{value} against {bound}"
+            );
+        }
     }
 
     /// A non-finite commanded scalar is a violation, not something that passes

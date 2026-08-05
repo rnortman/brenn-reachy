@@ -1,4 +1,5 @@
-//! The two command vectors and the names of the nine joints.
+//! The two command vectors, the names of the nine joints, and a servo's health
+//! byte.
 //!
 //! Two views of the same machine, and the tick's whole job is turning one into
 //! the other:
@@ -18,6 +19,9 @@
 //! Angles are radians about the model datum: what the servo's own registers
 //! mean once the configured datum has been applied. Counts, registers and the
 //! datum itself live below this crate.
+//!
+//! [`ServoHealth`] is here for the same reason the joint names are: it is
+//! shared between tick and arming rather than owned by either.
 
 use nalgebra::Isometry3;
 use reachy_kin::neutral_head_pose;
@@ -48,6 +52,24 @@ impl JointVector {
             JointId::AntennaRight => Some(self.antennas[0]),
             JointId::AntennaLeft => Some(self.antennas[1]),
         }
+    }
+
+    /// Set the angle at `id`, reporting `false` — and changing nothing — for a
+    /// leg index past the sixth.
+    ///
+    /// The mirror of [`Self::get`], for filling a vector one servo's answer at a
+    /// time as the reads come back.
+    pub fn set(&mut self, id: JointId, angle: f64) -> bool {
+        match id {
+            JointId::BodyYaw => self.body_yaw = angle,
+            JointId::Leg(leg) => match self.legs.get_mut(usize::from(leg)) {
+                Some(slot) => *slot = angle,
+                None => return false,
+            },
+            JointId::AntennaRight => self.antennas[0] = angle,
+            JointId::AntennaLeft => self.antennas[1] = angle,
+        }
+        true
     }
 
     /// Every joint paired with its angle, in bus order.
@@ -165,6 +187,43 @@ impl JointStep {
     }
 }
 
+/// One servo's hardware-error byte, paired with the bus ID it was read from.
+///
+/// A fault or a refusal names the offending servo by its bus ID, so the ID
+/// travels with the bits rather than being inferred from a position in an array.
+/// Whatever owns the port fills these in; this crate never learns what an ID
+/// means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServoHealth {
+    /// The servo's bus ID.
+    pub id: u8,
+    /// The hardware-error byte as read.
+    pub bits: u8,
+}
+
+impl ServoHealth {
+    /// Bit 0: the input voltage left its configured range at some point.
+    pub const INPUT_VOLTAGE: u8 = 1;
+
+    /// Whether the byte is clear, or carries the input-voltage bit and nothing
+    /// else.
+    ///
+    /// The voltage bit alone is expected on this platform and is reported
+    /// rather than acted on: it latches on a supply dip that the servo rode out,
+    /// and every other bit means something is wrong with the motor.
+    #[must_use]
+    pub fn healthy_or_voltage_only(self) -> bool {
+        self.bits & !Self::INPUT_VOLTAGE == 0
+    }
+
+    /// Whether the input-voltage bit is set and nothing else is — the
+    /// informational case.
+    #[must_use]
+    pub fn voltage_only(self) -> bool {
+        self.bits == Self::INPUT_VOLTAGE
+    }
+}
+
 /// Names one joint, for fault causes and reports.
 ///
 /// The `Leg` payload is 0-based, matching the leg index the kinematics reports an
@@ -255,6 +314,38 @@ mod tests {
         assert_eq!(JointId::from_index(JointId::COUNT), None);
     }
 
+    /// Writing a joint writes that joint and leaves the other eight alone.
+    ///
+    /// A per-slot sweep because this is how a position sweep is assembled, one
+    /// servo's answer at a time: a `set` that routed the left antenna's reading
+    /// into the right antenna's slot would arm the machine with each antenna
+    /// pinned at the other's measured angle and drag both there under torque, and
+    /// no test of a whole armed sequence would see it.
+    #[test]
+    fn every_slot_is_written_where_it_is_named() {
+        for (index, id) in JointId::ALL.into_iter().enumerate() {
+            let before = JointVector {
+                body_yaw: 0.5,
+                legs: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                antennas: [7.0, 8.0],
+            };
+            let mut after = before;
+            assert!(after.set(id, -1.0), "slot {index}");
+            assert_eq!(after.get(id), Some(-1.0), "slot {index}");
+            for (other, angle) in before.joints() {
+                if other != id {
+                    assert_eq!(after.get(other), Some(angle), "{other} changed with {id}");
+                }
+            }
+        }
+
+        // A leg index past the sixth writes nothing anywhere.
+        let mut v = JointVector::default();
+        assert!(!v.set(JointId::Leg(6), 1.0));
+        assert!(!v.set(JointId::Leg(200), 1.0));
+        assert_eq!(v, JointVector::default());
+    }
+
     /// A leg index past the sixth names nothing, and says so rather than
     /// indexing something else.
     #[test]
@@ -340,6 +431,22 @@ mod tests {
             let mut t = JointTargets::default();
             t.antennas[1] = bad;
             assert!(!t.is_finite(), "antenna with {bad}");
+        }
+    }
+
+    /// The voltage bit alone is the informational case; any other bit is not,
+    /// and the two predicates agree on which is which.
+    #[test]
+    fn only_the_voltage_bit_is_tolerated() {
+        for bits in 0..=u8::MAX {
+            let health = ServoHealth { id: 11, bits };
+            let voltage_only = bits == ServoHealth::INPUT_VOLTAGE;
+            assert_eq!(health.voltage_only(), voltage_only, "bits {bits:#04x}");
+            assert_eq!(
+                health.healthy_or_voltage_only(),
+                bits == 0 || voltage_only,
+                "bits {bits:#04x}"
+            );
         }
     }
 

@@ -38,13 +38,25 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arm;
 pub mod joints;
+pub mod seq;
+#[cfg(test)]
+mod testutil;
 pub mod tick;
 pub mod traj;
 
-pub use joints::{JointId, JointStep, JointTargets, JointVector};
+pub use arm::{
+    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, Gains, GroupGains, PinOutcome, ProfileConfig,
+    ProvisionExpect, ProvisionReadings, ProvisionTable, pin_goals,
+};
+pub use joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth};
+pub use seq::{
+    AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
+    Sequencer, StepContext, ValueKind,
+};
 pub use tick::{
     CommandDisposition, CommandRejection, Fault, Mode, MotionCommand, MotionConfig, MotionState,
-    ServoHealth, TickInputs, TickOutputs, TickReport, TrackingFaultConfig, motion_tick,
+    TickInputs, TickOutputs, TickReport, TrackingFaultConfig, motion_tick,
 };
 pub use traj::{Trajectory, TrajectoryError, Warp};

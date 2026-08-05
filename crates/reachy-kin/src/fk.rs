@@ -58,7 +58,7 @@
 use nalgebra::{Isometry3, Matrix6, Point3, Vector3, Vector6};
 use thiserror::Error;
 
-use crate::envelope::outside_limit;
+use crate::envelope::{below_limit, outside_limit};
 use crate::geometry::{HeadGeometry, cone_angle};
 use crate::ik::LegAngles;
 
@@ -329,10 +329,9 @@ pub fn forward_kinematics(
     let cone = cone_angle(&pose.rotation);
     let z = pose.translation.z;
     // Negated comparisons, so a tilt or a height that cannot be placed inside
-    // the screen fails it. The low bound reads with its arguments swapped: the
-    // question is whether the height fails to reach the floor.
+    // the screen fails it.
     if outside_limit(cone, opts.screen_cone)
-        || outside_limit(opts.screen_z.0, z)
+        || below_limit(z, opts.screen_z.0)
         || outside_limit(z, opts.screen_z.1)
     {
         return Err(FkError::WrongAssemblyMode {

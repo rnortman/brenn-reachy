@@ -89,3 +89,38 @@ be treated as the only ones that have ever described the mechanism. The struct i
 already a runtime configuration seam for exactly this substitution; what is
 missing is the measurement, which needs the machine. Marked at `HeadGeometry` in
 `crates/reachy-kin/src/geometry.rs`.
+
+## `pin-settle-dwell`
+
+Decide whether arming waits between enabling the last servo's torque and
+re-reading where the nine joints ended up, and for how long.
+
+Deferral context: the re-read exists because enabling torque in position mode can
+reset a servo's reported position, and it runs immediately — nine reads, a few
+milliseconds. But the goals it compares against may be up to the pull-in gate away
+from where the platform was found, and a joint being pulled that far is still
+travelling when the read happens. It then reads short of its goal on both sweeps,
+and arming refuses a machine that is only mid-pull. Off the machine the two cases
+are indistinguishable: a fixture can model an instant arrival or a slow one and
+neither is evidence. What separates them is how far this unit's rest really sits
+outside the travel windows and how long the profile-shaped pull takes, both of
+which are readings from the first supervised arm. A dwell also has a cost —
+it is time with torque on and nothing verified — so the length wants to come from
+the measurement rather than from a guess. Marked at the post-enable re-check in
+`crates/reachy-motion/src/arm.rs`.
+
+## `rail-curve`
+
+Set the supply floor arming refuses to proceed below from a measurement of what
+the rail actually does under load, and decide whether one threshold covers both
+a bench supply and a battery.
+
+Deferral context: the figure in the code is 6.0 V — a round number above the
+servos' own minimum-voltage alarm and below anything a healthy supply should sag
+to, chosen with a margin rather than measured. What matters is the sag while nine
+servos take up the head's weight, which is the moment arming enables torque, and
+nobody has recorded the rail through that transient on this platform. Too high a
+floor refuses to arm a machine that would have been fine; too low a floor arms
+one that will brown out mid-motion, and a brown-out under load drops the head.
+The reading needs the machine and a scope or a logging meter on the rail. Marked
+at `DEFAULT_MIN_ARM_VOLTAGE` in `crates/reachy-motion/src/arm.rs`.
