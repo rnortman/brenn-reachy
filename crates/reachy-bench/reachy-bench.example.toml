@@ -1,0 +1,213 @@
+# reachy-bench.example.toml — every key the bench reads, at its default.
+#
+# Copy this beside the binary and change what your unit needs. Every key written
+# here is at its default, so deleting one changes nothing and the file doubles as
+# the documentation of what omitting it means. The exception is `[datum]`: it has
+# no default, it is commented out below, and a human writes it in from a
+# self-test record before any command that moves something will run.
+#
+# Angles are degrees, clearances are millimetres, and rates are hertz — the units
+# a person reasons in. The libraries take radians and metres and the conversion
+# happens on load.
+
+[bus]
+# The serial node the nine servos share. The platform's own documentation names
+# this one; the first read-only run is what confirms it on your machine.
+device = "/dev/ttyAMA3"
+baud = 1000000
+# Slack over the wire time for a request-response exchange: the servo's own
+# turnaround plus host scheduling jitter. Provisional — the shape of the open
+# budget for this kind of bus, not a measurement of this host. A ping is 24 bytes
+# end to end, 240 microseconds at this rate, so this figure dominates the
+# deadline and is the number to compare a measured sweep against.
+host_allowance_ms = 10
+# Total attempts a retried operation makes, the first included. Only a timeout is
+# ever retried; a corrupt frame fails immediately and is never retried.
+retry_attempts = 5
+retry_spacing_ms = 20
+# Bus order: body yaw, legs 1..=6, right antenna, left antenna. Every nine-slot
+# array in this file is in this order.
+servo_ids = [10, 11, 12, 13, 14, 15, 16, 17, 18]
+
+[envelope]
+# Per-leg crank travel, from the vendor's simulation model, which agrees with all
+# three of its robot descriptions. Asymmetric per leg and not interchangeable:
+# the bottom of vertical travel rests on four of the six legs, and a symmetric
+# window copied from the other two would drive those four straight past it.
+#
+# Deliberately not taken from the geometry file the linkage transforms come from:
+# that file carries a per-leg limit field of ±180° on all six, a generator
+# artifact, and ±180° windows are no protection at all in this mechanism.
+crank_windows_deg = [
+    [-48.0, 80.0],
+    [-80.0, 70.0],
+    [-48.0, 80.0],
+    [-80.0, 48.0],
+    [-70.0, 80.0],
+    [-80.0, 48.0],
+]
+# Well inside the ±160° mechanical figure. The cable routing at large yaw has
+# not been checked.
+body_yaw_limit_deg = 60.0
+# The vendor's two solvers disagree at 55° and 65°, neither states a derivation,
+# and nothing in the geometry binds near either. The tighter one stands until the
+# axis is measured.
+relative_yaw_limit_deg = 55.0
+head_cone_limit_deg = 35.0
+# Floor on the per-pose clearance from the linkage's singular configurations.
+# Comfortably above the millimetre the crank stops leave at the top of vertical
+# travel, so this floor is what binds there rather than the stops. A pose below
+# it is admissible only while it is strictly increasing clearance.
+min_toggle_margin_mm = 3.0
+# The magnitude the stow pose uses. The antennas have no servo-side envelope in
+# any operating mode, so this is the only bound on them there is.
+antenna_limit_rad = 3.05
+
+[motion]
+tick_hz = 50
+# The servos update their hardware-error byte far slower than they update
+# position; once a second catches a latch and costs nothing in the tick budget.
+health_poll_hz = 1
+# Per-tick step bounds. Exceeding one is a fault, never a clamp. A shaped move's
+# peak rate is 1.875 times its average, so a two-second move spanning a crank's
+# whole 2.2 rad window peaks near 0.041 rad per tick at 50 Hz.
+max_step_legs_rad = 0.05
+max_step_body_yaw_rad = 0.05
+# The antennas sweep the full 6.1 rad between their stow positions, which over
+# two seconds peaks near 0.114.
+max_step_antennas_rad = 0.15
+# How far a joint may lag its goal before the lag starts counting, and how many
+# consecutive lagging ticks are a fault. Both provisional: nothing has measured
+# this linkage's real position error under load, and they are sized to sit well
+# outside what the position gains should permit rather than derived.
+tracking_threshold_rad = 0.15
+tracking_ticks = 10
+# Consecutive ticks with no position read before the read-loss fault. Omit for
+# one second at the tick rate.
+read_loss_ticks = 50
+stow_duration_s = 2.0
+# Longer than the stow move: the lift is the one motion that starts from a
+# configuration close to a singular one, and there is no reason for it to be
+# quick.
+up_duration_s = 3.0
+
+[arm]
+# The supply floor arming refuses to proceed below. Provisional: a round number
+# above the servos' own minimum-voltage alarm and below anything a healthy supply
+# should sag to, chosen with a margin rather than measured. What matters is the
+# sag while nine servos take up the head's weight, which nobody has recorded.
+min_arm_voltage = 6.0
+# The servos refresh their own voltage reading about ten times a second, so
+# polling faster returns the same number twice.
+voltage_poll_period_ms = 100
+voltage_budget_s = 30.0
+# The largest distance a pin may pull a joint before arming stops and asks for a
+# human. Sized above the worst per-leg overrun in the recorded resting pose,
+# which is around 10°.
+max_pin_pull_in_deg = 12.0
+# How far a joint may drift between its pin and the read after torque came on.
+# Several counts of the servo's own 0.088° resolution: wide enough not to chase
+# quantisation, narrow enough that a real reset cannot hide inside it.
+repin_tolerance_deg = 0.5
+
+# Position gains, written fresh at every arm because they live in RAM and
+# power-on clears them. The values the vendor's own stack writes at startup,
+# which is the only evidence anyone has about what this linkage wants. Integral
+# and derivative are zero: the load is a linkage holding a head up against
+# gravity, and the proportional term plus the servo's own profile is what shapes
+# it.
+leg_gains = { p = 300, i = 0, d = 0 }
+yaw_gains = { p = 200, i = 0, d = 0 }
+antenna_gains = { p = 200, i = 0, d = 0 }
+
+# The servo-side motion profile, the backstop under host-side shaping. No
+# default: host-side interpolation is what makes motion gentle, and this is what
+# bounds a goal step the host got wrong, so it has to be sized against the moves
+# this bench actually makes rather than invented.
+#
+# Provisional, from arithmetic and not from a measurement. Velocity is in units
+# of 0.229 rev/min: the fastest planned motion is the antennas' 6.1 rad sweep in
+# two seconds, whose shaped peak is 5.72 rad/s, or 54.6 rev/min, or 239 units —
+# 300 leaves that about a quarter more room and still stops a full-scale jump.
+# Acceleration is in units of 214.577 rev/min²: the same sweep peaks at
+# 8.8 rad/s², or 23.5 units, and 50 is twice that. Both want revisiting against
+# what the first supervised arm measures.
+profile_acceleration = 50
+profile_velocity = 300
+
+[disarm]
+# How far a joint may be from its stow angle and still count as being at stow.
+# Deliberately tighter than the tracking threshold, because the two ask different
+# questions: tracking asks whether the position loop is keeping up with a moving
+# goal, this asks where the head physically is before the thing holding it up is
+# switched off. Provisional — what error the legs settle to under the head's
+# weight at stow has not been measured.
+tolerance_deg = 2.0
+# How long the platform settles at stow before torque comes off.
+dwell_s = 2.0
+
+[provision]
+# What the servos must already hold for this project to command them at all.
+# Register contents as a data sheet states them, not engineering units: integers
+# a person compares against how the unit was set up. Arming verifies these before
+# it writes anything and repairs none of them.
+return_delay_time = 0
+# Position mode. Anything else voids the servo-side position envelope entirely
+# and makes a torque enable a current-limited runaway, and the state is reachable
+# in practice because the vendor's own daemon switches modes as ordinary
+# operation. Checked on all nine before anything is written or enabled.
+operating_mode = 3
+drive_mode = 0
+# Disabled. On this linkage a servo that stops holding its goal drops the head,
+# and a latched watchdog answers writes with the same error an out-of-range goal
+# produces, so the two failures would be indistinguishable at the bus layer.
+bus_watchdog = 0
+temperature_limit = 70
+# Tenths of a volt.
+max_voltage_limit = 70
+min_voltage_limit = 35
+# Per servo in bus order: the body yaw servo is a different part with a different
+# ceiling.
+current_limit = [2352, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
+# As provisioned, which is the state the servo powers up in. Arming rewrites the
+# profile from [arm] at every arm.
+profile_acceleration = 0
+profile_velocity = 0
+# Legs 1..=6, counts. Alternate legs carry a quarter turn of opposite sign: this
+# platform's datum is expressed in the servo rather than in the host, which is
+# the reason the [datum] table below exists at all. The other three servos'
+# offsets are recorded in the arm report rather than checked.
+leg_homing_offset = [1024, -1024, 1024, -1024, 1024, -1024]
+# The per-leg window the servo itself refuses to be commanded past, counts, legs
+# 1..=6. Mapped through the servo map under the configured datum these must be
+# the envelope's crank windows above, to within one count: the servos and the
+# host envelope have to be guarding one region, and this is the only place that
+# is ever established. A leg that disagrees refuses the whole configuration by
+# name, because which of the three records is wrong — these limits, those
+# windows, or the datum — is not something code should pick.
+leg_position_limits = [
+    [1502, 2958],
+    [1138, 2844],
+    [1502, 2958],
+    [1138, 2594],
+    [1252, 2958],
+    [1138, 2594],
+]
+
+# [datum] — absent from a fresh configuration, and no command that moves anything
+# runs without it. Which reading of the legs' counts is the model's crank angle
+# is a property of how this unit was provisioned; both readings close the linkage
+# exactly, so nothing computed separates them and an externally measured head
+# height is what does. Run the self-test, read its classification, measure the
+# head height with a rule, and write the answer here yourself.
+#
+# It is commented out rather than filled in, and as shipped this file therefore
+# refuses every command that moves something. That is the intended state: no
+# example can know which reading your unit was provisioned with, and a value
+# copied from here would be a datum nobody checked, standing where the one thing
+# that separates the two readings is supposed to be. Uncomment both lines and
+# replace them with your own answer and your own note.
+#
+# [datum]
+# crank_datum = "direct"          # or "parity_shifted"
+# provenance = "who resolved it, when, and from which self-test record"

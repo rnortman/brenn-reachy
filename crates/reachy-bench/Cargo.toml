@@ -21,6 +21,11 @@ dxl-proto = { path = "../dxl-proto" }
 # Error reporting at the binary edge, where a chain of context is what an operator
 # at a bench wants. The libraries use thiserror.
 anyhow = { workspace = true }
+# Typed refusals for a configuration that cannot be used: a missing crank datum,
+# a servo roster that is not nine distinct servos, two per-leg fences that
+# describe different regions. Each is a named refusal rather than a substituted
+# value, so they are error enums like every other crate's.
+thiserror = { workspace = true }
 # The configuration file: bus device, envelope caps, motion parameters, arm
 # thresholds, and the resolved crank datum.
 serde = { workspace = true }

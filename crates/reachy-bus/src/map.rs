@@ -55,6 +55,22 @@ pub enum CrankDatum {
 }
 
 impl CrankDatum {
+    /// The shift added to each of the six legs' converted counts to reach the
+    /// model angle, in leg order.
+    ///
+    /// Total: under either datum every leg has a shift, so a caller working
+    /// over the six legs never has an absent one to substitute for. The 0-based
+    /// leg index: leg 1 on the bus is `0` here and takes the positive shift.
+    #[must_use]
+    pub fn leg_shifts(self) -> [f64; 6] {
+        match self {
+            Self::Direct => [0.0; 6],
+            Self::ParityShifted => [
+                FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, -FRAC_PI_2,
+            ],
+        }
+    }
+
     /// The shift added to `joint`'s converted count to reach the model angle,
     /// or `None` for a joint this bus has no place for.
     ///
@@ -66,18 +82,11 @@ impl CrankDatum {
     #[must_use]
     pub fn shift_for(self, joint: JointId) -> Option<f64> {
         joint.index()?;
-        match (self, joint) {
-            (Self::Direct, _) => Some(0.0),
-            // The 0-based leg index: leg 1 on the bus is `0` here and takes the
-            // positive shift.
-            (Self::ParityShifted, JointId::Leg(leg)) => Some(if leg.is_multiple_of(2) {
-                FRAC_PI_2
-            } else {
-                -FRAC_PI_2
-            }),
+        match joint {
+            JointId::Leg(leg) => self.leg_shifts().get(usize::from(leg)).copied(),
             // Yaw and the antennas are single-turn joints with no parity
             // pairing, so no reading of the datum moves them.
-            (Self::ParityShifted, _) => Some(0.0),
+            _ => Some(0.0),
         }
     }
 }
@@ -511,6 +520,26 @@ mod tests {
             CrankDatum::ParityShifted.shift_for(JointId::BodyYaw),
             Some(0.0)
         );
+    }
+
+    /// The six legs' shifts are one record, read the same way whether a caller
+    /// asks joint by joint or takes the whole array. A caller working over the
+    /// six legs therefore never meets an absent shift to substitute for.
+    #[test]
+    fn the_leg_shifts_are_the_array_and_the_lookup_alike() {
+        for datum in [CrankDatum::Direct, CrankDatum::ParityShifted] {
+            let shifts = datum.leg_shifts();
+            for (leg, shift) in shifts.iter().enumerate() {
+                let leg = u8::try_from(leg).expect("six legs fit a byte");
+                assert_eq!(datum.shift_for(JointId::Leg(leg)), Some(*shift));
+            }
+        }
+        assert_eq!(CrankDatum::Direct.leg_shifts(), [0.0; 6]);
+        // Alternate legs a quarter turn each way, and no leg left where it was.
+        for (leg, shift) in CrankDatum::ParityShifted.leg_shifts().iter().enumerate() {
+            assert_eq!(shift.abs(), FRAC_PI_2, "leg {}", leg + 1);
+            assert_eq!(shift.is_sign_positive(), leg.is_multiple_of(2));
+        }
     }
 
     #[test]

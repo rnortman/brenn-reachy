@@ -124,3 +124,22 @@ floor refuses to arm a machine that would have been fine; too low a floor arms
 one that will brown out mid-motion, and a brown-out under load drops the head.
 The reading needs the machine and a scope or a logging meter on the rail. Marked
 at `DEFAULT_MIN_ARM_VOLTAGE` in `crates/reachy-motion/src/arm.rs`.
+
+## `selftest-staleness`
+
+Decide when a self-test record stops counting as evidence, and refuse to command
+anything against one that has.
+
+Deferral context: the record is what stands between an unverified machine and
+every command that moves something, and today a record that passed every case
+admits arming however old it is. Age is the obvious criterion and not obviously
+the right one — a machine nobody has touched since the run is in the same state
+it was, while one that has been unplugged, re-provisioned or taken apart is not,
+and neither of those is a duration. What separates them is which facts the
+record asserts that the arm sequence does not re-establish on its own, and that
+list is short: the arm sequence re-reads presence, provisioning, supply, health
+and the resting pose on every run. Settling it wants the first few bring-up runs
+to show what actually goes stale in practice, and a criterion invented before
+then would be a number nobody could defend. The record already carries the
+timestamp any such rule needs. Marked at `SelftestRecord::admits_arm` in
+`crates/reachy-bench/src/selftest.rs`.
