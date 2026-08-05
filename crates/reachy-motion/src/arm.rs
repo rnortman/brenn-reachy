@@ -697,7 +697,7 @@ fn first_violated_row(violations: &EnvelopeViolations) -> usize {
 /// than a second statement of it. Every cursor in this file is bounded by
 /// `JointId::COUNT` by the phase transitions, so the row is in range wherever
 /// this is called.
-fn angle_at(joints: &JointVector, row: usize) -> f64 {
+pub(crate) fn angle_at(joints: &JointVector, row: usize) -> f64 {
     JointId::from_index(row)
         .and_then(|joint| joints.get(joint))
         .expect("bus rows are bounded by the phase cursors")
@@ -742,12 +742,6 @@ impl ArmSequencer {
             pending: None,
             records: Records::default(),
         }
-    }
-
-    /// Which phase is running, for whoever is reporting progress.
-    #[must_use]
-    pub fn step(&self) -> SeqStep {
-        self.phase.step()
     }
 
     fn read(&self, row: usize, reg: RegId) -> BusRequest {
@@ -1387,7 +1381,7 @@ impl ArmSequencer {
 }
 
 /// Confirm that a write landed, comparing against the value the request carried.
-fn confirm_write(
+pub(crate) fn confirm_write(
     result: &BusResult,
     request: &BusRequest,
     context: StepContext,
@@ -1414,11 +1408,16 @@ impl Sequencer for ArmSequencer {
         }
         self.emit(now)
     }
+
+    fn step(&self) -> SeqStep {
+        self.phase.step()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::ScriptedBus;
     use nalgebra::{Translation3, UnitQuaternion};
     use reachy_kin::{
         EnvelopeConfig, LegAngles, inverse_kinematics, min_pose_margin, rest_head_pose,
@@ -2009,46 +2008,6 @@ mod tests {
             self
         }
 
-        fn answer(&mut self, step: SeqStep, request: BusRequest) -> BusResult {
-            self.log.push((step, request));
-            let row = SERVO_IDS
-                .iter()
-                .position(|id| *id == request.id())
-                .expect("addressed to a servo on this bus");
-            if self.silent[row] {
-                return BusResult::NoAnswer;
-            }
-            let scripted = match request {
-                BusRequest::WriteRegVerified { .. } => self.fail_write,
-                _ => self.fail_read,
-            };
-            if let Some((id, reg, result)) = scripted
-                && request.id() == id
-                && request.reg() == Some(reg)
-            {
-                return result;
-            }
-            match request {
-                BusRequest::Ping { .. } => BusResult::Pinged {
-                    model: self.models[row],
-                },
-                BusRequest::ReadReg { reg, .. } => BusResult::Value(self.value(row, reg)),
-                BusRequest::WriteRegVerified { reg, value, .. } => {
-                    match (reg, value) {
-                        (RegId::GoalPosition, RegValue::Radians(angle)) => {
-                            self.goals.set(JointId::ALL[row], angle);
-                        }
-                        (RegId::TorqueEnable, RegValue::U8(1)) => {
-                            self.enabled[row] = true;
-                            self.reads_after_enable = 0;
-                        }
-                        _ => {}
-                    }
-                    BusResult::Written
-                }
-            }
-        }
-
         fn value(&mut self, row: usize, reg: RegId) -> RegValue {
             match reg {
                 RegId::ModelNumber => RegValue::U16(self.models[row]),
@@ -2098,7 +2057,53 @@ mod tests {
         }
     }
 
-    /// The pump's loop, against a machine instead of a port.
+    impl ScriptedBus for Machine {
+        fn answer(&mut self, step: SeqStep, request: BusRequest) -> BusResult {
+            self.log.push((step, request));
+            let row = SERVO_IDS
+                .iter()
+                .position(|id| *id == request.id())
+                .expect("addressed to a servo on this bus");
+            if self.silent[row] {
+                return BusResult::NoAnswer;
+            }
+            let scripted = match request {
+                BusRequest::WriteRegVerified { .. } => self.fail_write,
+                _ => self.fail_read,
+            };
+            if let Some((id, reg, result)) = scripted
+                && request.id() == id
+                && request.reg() == Some(reg)
+            {
+                return result;
+            }
+            match request {
+                BusRequest::Ping { .. } => BusResult::Pinged {
+                    model: self.models[row],
+                },
+                BusRequest::ReadReg { reg, .. } => BusResult::Value(self.value(row, reg)),
+                BusRequest::WriteRegVerified { reg, value, .. } => {
+                    match (reg, value) {
+                        (RegId::GoalPosition, RegValue::Radians(angle)) => {
+                            self.goals.set(JointId::ALL[row], angle);
+                        }
+                        (RegId::TorqueEnable, RegValue::U8(1)) => {
+                            self.enabled[row] = true;
+                            self.reads_after_enable = 0;
+                        }
+                        _ => {}
+                    }
+                    BusResult::Written
+                }
+            }
+        }
+
+        fn waited(&mut self, _now: Duration, _until: Duration) {
+            self.waits += 1;
+        }
+    }
+
+    /// The shared driver, against this crate's arming sequencer.
     fn drive(cfg: &ArmConfig, machine: &mut Machine) -> Result<ArmSummary, SeqError> {
         let mut seq = ArmSequencer::new(
             cfg,
@@ -2106,25 +2111,7 @@ mod tests {
             &EnvelopeConfig::default(),
             &FkOptions::default(),
         );
-        let mut now = Duration::ZERO;
-        let mut prior = None;
-        for _ in 0..8192 {
-            match seq.next(now, prior.as_ref()) {
-                SeqAction::Transact(request) => {
-                    let step = seq.step();
-                    prior = Some(machine.answer(step, request));
-                }
-                SeqAction::Wait { until } => {
-                    assert!(until > now, "a wait that does not advance the clock");
-                    now = until;
-                    machine.waits += 1;
-                    prior = None;
-                }
-                SeqAction::Done(summary) => return Ok(summary),
-                SeqAction::Fail(error) => return Err(error),
-            }
-        }
-        panic!("the sequence did not terminate");
+        crate::testutil::drive(&mut seq, machine)
     }
 
     /// A configuration that actually checks something: position mode on all nine,

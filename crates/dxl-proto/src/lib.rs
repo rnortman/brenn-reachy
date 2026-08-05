@@ -33,7 +33,8 @@ pub mod frame;
 pub mod regs;
 
 pub use conv::{
-    ConvError, HardwareError, counts_to_rad, milliamps_from_raw, rad_to_counts, volts_from_raw,
+    ConvError, HardwareError, counts_to_rad, milliamps_from_raw, rad_to_counts, raw_from_volts,
+    volts_from_raw,
 };
 pub use crc::{crc_matches, crc16};
 pub use decode::{DecodeStep, FrameError, StatusCode, StatusDecoder, StatusError, StatusView};

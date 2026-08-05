@@ -63,7 +63,7 @@ use reachy_kin::{
 use thiserror::Error;
 
 use crate::arm::ArmRecord;
-use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth};
+use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint};
 use crate::traj::{Trajectory, TrajectoryError, Warp};
 
 /// When a joint is far enough from its goal, for long enough, to conclude the
@@ -532,15 +532,16 @@ pub fn motion_tick(
     // Tracking, on live reads only: a stale reading compared against a fresh
     // goal is a difference nobody measured.
     if let Some(present) = fresh {
-        let mut worst = (JointId::BodyYaw, f64::NEG_INFINITY);
+        let mut errors = [0.0; JointId::COUNT];
         let mut over = false;
-        for ((id, angle), (_, goal)) in present.joints().into_iter().zip(state.last_goal.joints()) {
-            let error = (angle - goal).abs();
-            over |= outside_limit(error, cfg.tracking.threshold_rad);
-            if worse_error(error, worst.1) {
-                worst = (id, error);
-            }
+        for (error, ((_, angle), (_, goal))) in errors
+            .iter_mut()
+            .zip(present.joints().into_iter().zip(state.last_goal.joints()))
+        {
+            *error = (angle - goal).abs();
+            over |= outside_limit(*error, cfg.tracking.threshold_rad);
         }
+        let worst = worst_joint(&errors);
         out.report.tracking_worst = Some(worst);
         if over {
             state.tracking_count += 1;
@@ -671,24 +672,6 @@ pub fn motion_tick(
         out.report.completed = true;
     }
     out.report.mode = state.mode;
-}
-
-/// Whether `candidate` is a worse tracking error than `incumbent`.
-///
-/// An ordering, deliberately not the bound test the threshold beside it uses: a
-/// bound test treats an incomparable value as a violation, which is right for
-/// "is this joint past the threshold" and wrong for "which joint is furthest
-/// out" — an unplaceable error would both beat the incumbent and be beaten by
-/// whatever came next, so the fault would name the joint *after* the bad one and
-/// report its zero error.
-///
-/// An error nobody can place is the worst thing this comparison can see, so it
-/// wins outright and keeps winning. Ties keep the joint found first.
-fn worse_error(candidate: f64, incumbent: f64) -> bool {
-    if candidate.is_nan() {
-        return !incumbent.is_nan();
-    }
-    candidate > incumbent
 }
 
 /// Take at most one command, returning what became of it. Mutates the state
@@ -1612,27 +1595,6 @@ mod tests {
                 assert!(state.is_faulted());
             }
         }
-    }
-
-    /// The worst-error selection is an ordering, and an error nobody can place
-    /// wins it. Reusing the bound test here would let the unplaceable joint be
-    /// displaced by the next joint in the sweep, and the fault whose whole job is
-    /// naming a joint would name the wrong one with a zero error beside it.
-    #[test]
-    fn the_worst_error_selection_is_an_ordering() {
-        assert!(worse_error(0.2, 0.1));
-        assert!(!worse_error(0.1, 0.2));
-        assert!(!worse_error(0.1, 0.1), "a tie keeps the first joint");
-        assert!(
-            worse_error(0.0, f64::NEG_INFINITY),
-            "the sweep's starting point"
-        );
-        assert!(worse_error(f64::NAN, 0.5), "unplaceable beats any number");
-        assert!(!worse_error(0.5, f64::NAN), "and is not displaced by one");
-        assert!(
-            !worse_error(f64::NAN, f64::NAN),
-            "a tie between two of them"
-        );
     }
 
     /// The tracking fault names the joint whose error could not be placed, with

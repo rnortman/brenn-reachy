@@ -224,6 +224,48 @@ impl ServoHealth {
     }
 }
 
+/// Whether `candidate` is a worse deviation than `incumbent`.
+///
+/// An ordering, deliberately not the bound test that sits beside it wherever it
+/// is used: a bound test treats an incomparable value as a violation, which is
+/// right for "is this joint past the threshold" and wrong for "which joint is
+/// furthest out" — an unplaceable deviation would both beat the incumbent and be
+/// beaten by whatever came next, so the report whose whole job is naming a joint
+/// would name the one *after* the bad one and print its zero beside it.
+///
+/// A deviation nobody can place is the worst thing this comparison can see, so
+/// it wins outright and keeps winning. Ties keep the joint found first.
+fn worse_error(candidate: f64, incumbent: f64) -> bool {
+    if candidate.is_nan() {
+        return !incumbent.is_nan();
+    }
+    candidate > incumbent
+}
+
+/// Which row of `deviations` — one per joint, in bus order — is furthest out.
+///
+/// The sweep every report that names a joint runs, written once so the seed is
+/// decided once: the incumbent starts at row 0's own value, which is a real
+/// deviation, rather than at a floor no measurement can be worse than. A sweep
+/// seeded below every value can leave a joint named because nothing displaced
+/// the seed; seeded at a floor of zero it can name a joint with no deviation at
+/// all. Ties keep the earlier row, so the report is the same on every run.
+pub(crate) fn worst_row(deviations: &[f64; JointId::COUNT]) -> usize {
+    let mut worst = 0;
+    for (row, deviation) in deviations.iter().enumerate() {
+        if worse_error(*deviation, deviations[worst]) {
+            worst = row;
+        }
+    }
+    worst
+}
+
+/// The joint furthest out and how far, from deviations in bus order.
+pub(crate) fn worst_joint(deviations: &[f64; JointId::COUNT]) -> (JointId, f64) {
+    let row = worst_row(deviations);
+    (JointId::ALL[row], deviations[row])
+}
+
 /// Names one joint, for fault causes and reports.
 ///
 /// The `Leg` payload is 0-based, matching the leg index the kinematics reports an
@@ -297,6 +339,62 @@ mod tests {
     use reachy_kin::{
         EnvelopeConfig, EnvelopeReport, EnvelopeViolations, HeadGeometry, check_envelope,
     };
+
+    /// The worst-deviation selection is an ordering, and a value nobody can
+    /// place wins it. Reusing the bound test here would let the unplaceable
+    /// joint be displaced by the next joint in the sweep, and the report whose
+    /// whole job is naming a joint would name the wrong one with a zero beside
+    /// it.
+    #[test]
+    fn the_worst_error_selection_is_an_ordering() {
+        assert!(worse_error(0.2, 0.1));
+        assert!(!worse_error(0.1, 0.2));
+        assert!(!worse_error(0.1, 0.1), "a tie keeps the first joint");
+        assert!(worse_error(f64::NAN, 0.5), "unplaceable beats any number");
+        assert!(!worse_error(0.5, f64::NAN), "and is not displaced by one");
+        assert!(
+            !worse_error(f64::NAN, f64::NAN),
+            "a tie between two of them"
+        );
+    }
+
+    /// The sweep around that ordering, seed included: every joint is a
+    /// candidate including the first, a tie keeps the earlier one, and an
+    /// unplaceable deviation is named wherever it sits in the order.
+    #[test]
+    fn the_worst_joint_sweep_covers_its_own_seed() {
+        let mut deviations = [0.0; JointId::COUNT];
+        assert_eq!(
+            worst_joint(&deviations),
+            (JointId::BodyYaw, 0.0),
+            "all equal keeps the first row"
+        );
+
+        deviations[0] = 0.4;
+        assert_eq!(
+            worst_joint(&deviations),
+            (JointId::BodyYaw, 0.4),
+            "the seed row wins when it is the worst"
+        );
+
+        deviations[8] = 0.5;
+        assert_eq!(worst_joint(&deviations), (JointId::AntennaLeft, 0.5));
+
+        deviations[3] = 0.5;
+        assert_eq!(
+            worst_row(&deviations),
+            3,
+            "a tie between two rows keeps the earlier"
+        );
+
+        deviations[6] = f64::NAN;
+        let (joint, deviation) = worst_joint(&deviations);
+        assert_eq!(joint, JointId::Leg(5));
+        assert!(
+            deviation.is_nan(),
+            "unplaceable, and named as its own joint"
+        );
+    }
 
     #[test]
     fn bus_order_is_one_order() {

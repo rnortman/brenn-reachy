@@ -889,6 +889,29 @@ pub enum SeqError {
         /// Every check the pinned pose failed, the clearance floor excepted.
         violations: EnvelopeViolations,
     },
+    /// A joint is not where stow put it, so torque cannot come off here: the
+    /// head is held up by the torque about to be released, and stow is the pose
+    /// it can be left resting in. Overridden only by the operator's explicit
+    /// acceptance that the head falls.
+    #[error(
+        "{context}: {joint} reads {:.3}° and stow is {:.3}°, {:.3}° apart and past the {:.3}° gate",
+        present.to_degrees(),
+        target.to_degrees(),
+        (present - target).abs().to_degrees(),
+        tolerance.to_degrees()
+    )]
+    NotAtStow {
+        /// Where this happened; the servo of the joint furthest from stow.
+        context: StepContext,
+        /// That joint.
+        joint: JointId,
+        /// Where it reads, radians.
+        present: f64,
+        /// Where stow puts it, radians.
+        target: f64,
+        /// How far from stow a joint may be, radians.
+        tolerance: f64,
+    },
     /// A joint is not where it was pinned, twice over. Enabling torque can reset
     /// a servo's reported position once, which is why there is a second attempt;
     /// a joint that will not settle is a machine nobody should start commanding.
@@ -931,6 +954,7 @@ impl SeqError {
             | Self::DatumInconsistent { context, .. }
             | Self::PinnedPoseUnsolvable { context, .. }
             | Self::PinnedPoseOutsideEnvelope { context, .. }
+            | Self::NotAtStow { context, .. }
             | Self::PinUnstable { context, .. } => *context,
         }
     }
@@ -977,6 +1001,10 @@ pub trait Sequencer {
     /// Take the previous transaction's result — `None` on the first call, and on
     /// the call after a [`SeqAction::Wait`] — and decide what happens next.
     fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<Self::Summary>;
+
+    /// Which phase the sequence is in, which is the phase the action just
+    /// handed out belongs to. The driver logs against it.
+    fn step(&self) -> SeqStep;
 }
 
 #[cfg(test)]
@@ -1313,6 +1341,10 @@ mod tests {
                 },
                 _ => SeqAction::Done(self.model),
             }
+        }
+
+        fn step(&self) -> SeqStep {
+            SeqStep::Presence
         }
     }
 

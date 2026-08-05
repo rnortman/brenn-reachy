@@ -38,7 +38,7 @@ every exchange from the first ping onward; if it does not, the loop should say
 so rather than leave a future reader to assume it. Which of the two holds is an
 observation about the hardware and cannot be settled off the machine, so the
 decision waits for the first read-only run against the servos. Marked at the
-crate root in `crates/reachy-bus/src/lib.rs`.
+transaction loop's corrupt-frame arm in `crates/reachy-bus/src/bus.rs`.
 
 ## `collision-envelope`
 

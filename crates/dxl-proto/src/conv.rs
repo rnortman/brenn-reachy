@@ -26,6 +26,9 @@ pub enum ConvError {
     /// A finite value that no count can represent.
     #[error("{radians} rad is {counts} counts, outside the representable range")]
     OutOfRange { radians: f64, counts: f64 },
+    /// A finite voltage that no register unit can represent.
+    #[error("{volts} V is {units} register units, outside the representable range")]
+    VoltsOutOfRange { volts: f64, units: f64 },
 }
 
 /// Counts to radians. Linear and unwrapped, so a multi-turn Present Position
@@ -60,6 +63,22 @@ pub fn rad_to_counts(radians: f64) -> Result<i32, ConvError> {
 #[must_use]
 pub fn volts_from_raw(raw: u16) -> f64 {
     f64::from(raw) * VOLTS_PER_LSB
+}
+
+/// Volts to the voltage register's own units, rounded to nearest.
+///
+/// A voltage no unit represents is an error, never a saturated unit — the rule
+/// the angle path follows, for the same reason: a limit the caller did not ask
+/// for is worse than a refusal it can read.
+pub fn raw_from_volts(volts: f64) -> Result<u16, ConvError> {
+    if !volts.is_finite() {
+        return Err(ConvError::NonFinite { value: volts });
+    }
+    let units = (volts / VOLTS_PER_LSB).round();
+    if units < 0.0 || units > f64::from(u16::MAX) {
+        return Err(ConvError::VoltsOutOfRange { volts, units });
+    }
+    Ok(units as u16)
 }
 
 /// Current register to milliamps at the *nominal* scale of 1 mA per unit.
@@ -179,6 +198,28 @@ mod tests {
     fn voltage_scale() {
         assert!((volts_from_raw(70) - 7.0).abs() < 1e-12);
         assert!((volts_from_raw(0) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn voltage_round_trips_through_the_register() {
+        for raw in [0u16, 35, 70, 120, u16::MAX] {
+            assert_eq!(raw_from_volts(volts_from_raw(raw)).unwrap(), raw, "{raw}");
+        }
+        // Rounding to nearest, like the angle path: 7.04 V is not 71 units.
+        assert_eq!(raw_from_volts(7.04).unwrap(), 70);
+        assert_eq!(raw_from_volts(7.06).unwrap(), 71);
+    }
+
+    #[test]
+    fn a_voltage_no_unit_holds_is_an_error_not_a_saturated_unit() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = raw_from_volts(value).unwrap_err();
+            assert!(matches!(err, ConvError::NonFinite { .. }), "{value}");
+        }
+        for value in [-0.1, 1e9] {
+            let err = raw_from_volts(value).unwrap_err();
+            assert!(matches!(err, ConvError::VoltsOutOfRange { .. }), "{value}");
+        }
     }
 
     #[test]

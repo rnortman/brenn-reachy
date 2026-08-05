@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arm;
+pub mod disarm;
 pub mod joints;
 pub mod seq;
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub use arm::{
     ArmConfig, ArmRecord, ArmSequencer, ArmSummary, Gains, GroupGains, PinOutcome, ProfileConfig,
     ProvisionExpect, ProvisionReadings, ProvisionTable, pin_goals,
 };
+pub use disarm::{DisarmConfig, DisarmSequencer, DisarmSummary, stow_targets};
 pub use joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth};
 pub use seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,

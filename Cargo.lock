@@ -295,6 +295,7 @@ name = "reachy-bus"
 version = "0.1.0"
 dependencies = [
  "dxl-proto",
+ "reachy-motion",
  "serialport",
  "thiserror",
 ]

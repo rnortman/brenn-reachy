@@ -10,6 +10,10 @@ description = "The serial bus layer for the Reachy Mini servo chain: transaction
 # conversions. This crate adds the port and the transaction semantics; it does not
 # reimplement any of the wire format.
 dxl-proto = { path = "../dxl-proto" }
+# The joint names and the abstract register vocabulary the sequencers speak. The
+# edge runs this way only: nothing above this crate learns what an address or a
+# count is, and the servo map is where the two vocabularies meet.
+reachy-motion = { path = "../reachy-motion" }
 # The serial port itself, and the only external I/O dependency in the workspace.
 serialport = { workspace = true }
 # The transaction error taxonomy, which is the load-bearing part of this crate: a
