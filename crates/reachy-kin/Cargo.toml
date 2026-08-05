@@ -14,3 +14,10 @@ nalgebra = { workspace = true }
 # Typed reachability, convergence and envelope-violation errors. An unreachable
 # pose must surface as a named error rather than as a non-finite angle.
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests only. The linkage constants are transcribed by hand into `baked`, and one
+# test parses the vendored copy of the file they came from and compares every
+# number against it, so a transcription slip cannot go unnoticed. Nothing at
+# runtime reads a data file.
+serde_json = { workspace = true }

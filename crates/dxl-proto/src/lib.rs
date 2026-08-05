@@ -24,3 +24,22 @@
 //! order, so one silent servo cannot misalign the readings of the others.
 
 #![forbid(unsafe_code)]
+
+pub mod conv;
+pub mod crc;
+pub mod decode;
+pub mod encode;
+pub mod frame;
+pub mod regs;
+
+pub use conv::{
+    ConvError, HardwareError, counts_to_rad, milliamps_from_raw, rad_to_counts, volts_from_raw,
+};
+pub use crc::{crc_matches, crc16};
+pub use decode::{DecodeStep, FrameError, StatusCode, StatusDecoder, StatusError, StatusView};
+pub use encode::{
+    EncodeError, encode_ping, encode_read, encode_reboot, encode_sync_read, encode_sync_write,
+    encode_write,
+};
+pub use frame::{BROADCAST_ID, MAX_FRAME_BUF, MAX_INSTR_FRAME, MAX_STATUS_FRAME};
+pub use regs::{Area, Reg};

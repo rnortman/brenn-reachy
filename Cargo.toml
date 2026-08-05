@@ -41,3 +41,11 @@ anyhow = "1"
 # parameters, arm thresholds, and the resolved crank datum.
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+# Test-only, in reachy-kin: parses the vendored copy of the vendor's kinematics
+# data file so the hand-transcribed linkage constants can be compared against
+# their source. No runtime code reads JSON.
+#
+# `float_roundtrip` makes its number parsing correctly rounded; without it a
+# decimal in the file can land one unit in the last place away from the literal
+# Rust parses from the same digits, and the comparison is exact.
+serde_json = { version = "1", features = ["float_roundtrip"] }

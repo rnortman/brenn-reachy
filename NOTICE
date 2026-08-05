@@ -1,2 +1,33 @@
 brenn-reachy
 Copyright 2026 Randall Nortman
+
+This product includes software and data developed by third parties.
+
+--------------------------------------------------------------------------------
+
+rustypot
+Copyright the rustypot contributors
+Licensed under the Apache License, Version 2.0
+
+The byte-exact Dynamixel Protocol 2.0 frame expectations in the tests of
+crates/dxl-proto (encode::tests, decode::tests) are adapted from rustypot's
+Protocol 2.0 codec tests (src/dynamixel_protocol/v2.rs). No rustypot code is
+included; the adapted material is test data.
+
+Upstream: https://github.com/pollen-robotics/rustypot
+
+--------------------------------------------------------------------------------
+
+reachy_mini
+Copyright Pollen Robotics
+Licensed under the Apache License, Version 2.0
+
+crates/reachy-kin/tests/fixtures/kinematics_data.json is a verbatim copy of
+src/reachy_mini/assets/kinematics_data.json from that distribution, vendored so
+that the linkage constants in crates/reachy-kin/src/baked.rs can be tested
+against their source. The same constants — link lengths, crank frames and
+platform anchors — are transcriptions of that file, and the stow head pose in
+crates/reachy-kin/src/geometry.rs is derived from the sleep head pose in
+src/reachy_mini/daemon/backend/abstract.py. No reachy_mini code is included.
+
+Upstream: https://github.com/pollen-robotics/reachy_mini
