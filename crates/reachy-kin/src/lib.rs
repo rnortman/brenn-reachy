@@ -17,7 +17,8 @@
 //!   plate. Off the vertical axis that clearance is not bounded away from zero at
 //!   all. The per-leg travel windows are the only thing holding the mechanism off
 //!   those configurations, so they are baked in here rather than left in a
-//!   description file that nothing reads.
+//!   description file that nothing reads, and enforced positively on every
+//!   commanded pose alongside a floor on the clearance itself.
 //! - The clearance itself is computed per pose, as the distance from the leg's
 //!   actual configuration to the one where its two solution branches merge. It is
 //!   never read from a table, because the tabulated numbers describe pure vertical
@@ -32,12 +33,18 @@
 #![forbid(unsafe_code)]
 
 pub mod baked;
+pub mod envelope;
 pub mod fk;
 pub mod geometry;
 pub mod ik;
 #[cfg(test)]
 mod testutil;
+pub mod yaw;
 
+pub use envelope::{
+    EnvelopeConfig, EnvelopeError, EnvelopeReport, EnvelopeViolations, check_envelope,
+};
 pub use fk::{FkError, FkOptions, FkStats, forward_kinematics};
 pub use geometry::{BranchSign, HeadGeometry, LegGeometry, neutral_head_pose, stow_head_pose};
 pub use ik::{IkError, LegAngles, inverse_kinematics, pose_margins};
+pub use yaw::{body_to_world, world_to_body};

@@ -40,6 +40,24 @@ observation about the hardware and cannot be settled off the machine, so the
 decision waits for the first read-only run against the servos. Marked at the
 crate root in `crates/reachy-bus/src/lib.rs`.
 
+## `collision-envelope`
+
+Bound the linkage against itself. Nothing in the envelope check currently does:
+it covers reach, per-leg travel, clearance from the singular configurations,
+yaw, head attitude and antenna range, and none of those notice a rod touching
+another rod.
+
+Deferral context: in a band of head heights roughly 13 mm below nominal and
+15 mm above the bottom of travel, the crank travel windows stop binding on
+head-relative yaw entirely, and what limits it there is rod-to-rod interference
+— a separation that falls to a few hundredths of a millimetre at large relative
+yaw and to zero at half a turn. The working relative-yaw cap keeps commanded
+poses far outside that regime, so nothing in the milestone approaches it, and
+the check that would replace the cap needs the collision geometry the vendor
+publishes at three fidelities plus a segment-distance test that the envelope
+does not currently carry. Marked at `EnvelopeConfig` in
+`crates/reachy-kin/src/envelope.rs`.
+
 ## `geometry-fit`
 
 Measure this unit's crank length, rod length, base radius and platform radius on
