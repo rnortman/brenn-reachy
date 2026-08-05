@@ -58,6 +58,7 @@
 use nalgebra::{Isometry3, Matrix6, Point3, Vector3, Vector6};
 use thiserror::Error;
 
+use crate::envelope::outside_limit;
 use crate::geometry::{HeadGeometry, cone_angle};
 use crate::ik::LegAngles;
 
@@ -168,9 +169,26 @@ struct Closure {
 }
 
 impl Closure {
-    /// The convergence measure: the largest per-leg residual, metres.
+    /// The convergence measure: the largest per-leg residual magnitude, metres,
+    /// or `NaN` if any leg's residual is one.
+    ///
+    /// The `NaN` is propagated deliberately rather than folded away. A maximum
+    /// that dropped the one leg whose residual could not be evaluated would let
+    /// the remaining five decide the solve had converged, and the pose returned
+    /// would be whatever the seed was — a measurement of nothing, labelled as
+    /// converged to the nanometre.
     fn worst(&self) -> f64 {
-        self.residual.amax()
+        let mut worst = 0.0;
+        for residual in &self.residual {
+            let magnitude = residual.abs();
+            if magnitude.is_nan() {
+                return f64::NAN;
+            }
+            if magnitude > worst {
+                worst = magnitude;
+            }
+        }
+        worst
     }
 
     /// The 6×6 Jacobian of the residuals with respect to a left-composed twist
@@ -223,7 +241,10 @@ fn evaluate(geom: &HeadGeometry, tips: &[Point3<f64>; 6], pose: &Isometry3<f64>)
         let distance = separation.norm();
         closure.anchors[leg] = anchor;
         closure.residual[leg] = distance - geom.rod_len;
-        if distance < MIN_ROD_SEPARATION {
+        // A separation that cannot be placed against the floor — because some
+        // input was not a number — has no direction either, and is degenerate
+        // for the same reason a vanishing one is.
+        if !distance.is_finite() || distance < MIN_ROD_SEPARATION {
             closure.degenerate = true;
         } else {
             closure.dirs[leg] = separation / distance;
@@ -242,6 +263,11 @@ fn evaluate(geom: &HeadGeometry, tips: &[Point3<f64>; 6], pose: &Isometry3<f64>)
 /// The seed selects the assembly mode. Calling this with a seed far from the
 /// true pose is not an error, but it is a question about a different branch of
 /// the mechanism, and it will be answered as one.
+///
+/// A non-finite crank angle or seed component yields [`FkError::NoConvergence`]
+/// rather than an answer. Nothing here is asked to be inside a bound without
+/// being able to say so: every rod separation is unplaceable in that case, which
+/// is the same degeneracy as a rod of no length, and the caller gets no pose.
 pub fn forward_kinematics(
     geom: &HeadGeometry,
     angles: &LegAngles,
@@ -255,7 +281,10 @@ pub fn forward_kinematics(
     let mut residual = closure.worst();
     let mut iters = 0;
 
-    while residual >= opts.tol_m {
+    // Phrased as a failure to reach the tolerance rather than as a direct
+    // comparison, so a residual nobody can place keeps the iteration going into
+    // the no-acceptable-step path instead of reading as convergence.
+    while outside_limit(residual, opts.tol_m) {
         if iters >= opts.max_iters || closure.degenerate {
             return Err(FkError::NoConvergence { iters, residual });
         }
@@ -299,7 +328,13 @@ pub fn forward_kinematics(
     // looser bound and that tighter one stay comparable.
     let cone = cone_angle(&pose.rotation);
     let z = pose.translation.z;
-    if cone > opts.screen_cone || z < opts.screen_z.0 || z > opts.screen_z.1 {
+    // Negated comparisons, so a tilt or a height that cannot be placed inside
+    // the screen fails it. The low bound reads with its arguments swapped: the
+    // question is whether the height fails to reach the floor.
+    if outside_limit(cone, opts.screen_cone)
+        || outside_limit(opts.screen_z.0, z)
+        || outside_limit(z, opts.screen_z.1)
+    {
         return Err(FkError::WrongAssemblyMode {
             cone_deg: cone.to_degrees(),
             z,
@@ -315,7 +350,7 @@ mod tests {
     use super::*;
     use crate::baked;
     use crate::geometry::{neutral_head_pose, rest_head_pose, stow_head_pose};
-    use crate::ik::inverse_kinematics;
+    use crate::ik::{inverse_kinematics, min_pose_margin};
     use crate::testutil::Rng;
     use nalgebra::{Translation3, UnitQuaternion};
 
@@ -496,8 +531,21 @@ mod tests {
     /// The tight resting configuration is on record twice: as six crank angles,
     /// and as the head pose recovered from them. Starting from the *other*
     /// candidate resting configuration — centimetres and degrees away — the
-    /// solve crosses to the pose that belongs to those angles, and it is the
-    /// recorded one to within a couple of microns.
+    /// solve crosses to the pose that belongs to those angles.
+    ///
+    /// **The two records disagree**, and the size of the disagreement is pinned
+    /// here as a golden rather than bounded by a threshold: 3.689 µm of
+    /// translation and 0.306° of pitch, against records given to two decimals in
+    /// both degrees and millimetres. The pitch gap is thirty times the precision
+    /// either record states, so it is a real difference between two hand-recorded
+    /// observations and not rounding. It carries into the clearance the baseline
+    /// policy is written around: 0.141 mm from the pose record against 0.182 mm
+    /// from the crank-angle record. The pose record is what every caller uses,
+    /// so it is the authoritative one, and it is the tighter of the two.
+    ///
+    /// A golden here rather than a band because both numbers move when the
+    /// geometry is refitted, and a band wide enough to hold either record would
+    /// hide which one moved.
     #[test]
     fn candidate_b_angles_recover_their_recorded_pose() {
         let geom = HeadGeometry::default();
@@ -514,8 +562,27 @@ mod tests {
         .expect("the resting configuration is a plausible pose");
 
         let (metres, radians) = pose_gap(&out, &recorded);
-        assert!(metres < 5e-6, "translation off by {metres} m");
-        assert!(radians.to_degrees() < 0.35, "rotation off by {radians} rad");
+        assert!(
+            (metres - 3.688_950e-6).abs() < 1e-8,
+            "translation gap {metres} m"
+        );
+        assert!(
+            (radians.to_degrees() - 0.305_645).abs() < 1e-4,
+            "rotation gap {}°",
+            radians.to_degrees()
+        );
+
+        let from_angles = min_pose_margin(&geom, &out);
+        let from_pose = min_pose_margin(&geom, &recorded);
+        assert!(
+            (from_angles - 0.000_182_207).abs() < 1e-9,
+            "clearance from the crank-angle record {from_angles} m"
+        );
+        assert!(
+            (from_pose - 0.000_141_133).abs() < 1e-9,
+            "clearance from the pose record {from_pose} m"
+        );
+
         let (seed_metres, _) = pose_gap(&stow_head_pose(), &recorded);
         assert!(
             seed_metres > 0.006,
@@ -682,6 +749,82 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(out, Isometry3::identity());
+    }
+
+    /// A crank angle that is not a number yields no pose, from every slot and
+    /// for every flavour of non-finite.
+    ///
+    /// The failure mode this pins is a false success, not a panic: the residual
+    /// of the leg nobody can evaluate must not be quietly dropped from the
+    /// convergence measure, because the remaining five are near the seed on
+    /// every ordinary tick and would report a nanometre-tight convergence
+    /// onto the caller's own seed.
+    #[test]
+    fn non_finite_crank_angles_produce_no_pose() {
+        let geom = HeadGeometry::default();
+        let good = angles_of(&geom, &neutral_head_pose());
+        let before = Isometry3::translation(0.4, 0.5, 0.6);
+
+        for slot in 0..6 {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut angles = good;
+                angles.0[slot] = bad;
+
+                let mut out = before;
+                let err = forward_kinematics(
+                    &geom,
+                    &angles,
+                    &neutral_head_pose(),
+                    &FkOptions::default(),
+                    &mut out,
+                )
+                .expect_err("an unplaceable crank angle measures nothing");
+                assert!(
+                    matches!(err, FkError::NoConvergence { .. }),
+                    "leg {} with {bad}: {err:?}",
+                    slot + 1
+                );
+                assert_eq!(out, before, "leg {} with {bad}", slot + 1);
+            }
+        }
+    }
+
+    /// The same for the seed. A non-finite seed component must not come back out
+    /// as a pose: that is a non-finite number handed onward from the one place
+    /// that promises never to do it.
+    #[test]
+    fn a_non_finite_seed_produces_no_pose() {
+        let geom = HeadGeometry::default();
+        let angles = angles_of(&geom, &neutral_head_pose());
+        let before = Isometry3::translation(0.4, 0.5, 0.6);
+
+        for bad in [f64::NAN, f64::INFINITY] {
+            for axis in 0..3 {
+                let mut seed = neutral_head_pose();
+                seed.translation.vector[axis] = bad;
+                let mut out = before;
+                let err =
+                    forward_kinematics(&geom, &angles, &seed, &FkOptions::default(), &mut out)
+                        .expect_err("an unplaceable seed selects no assembly mode");
+                assert!(
+                    matches!(err, FkError::NoConvergence { .. }),
+                    "axis {axis} with {bad}: {err:?}"
+                );
+                assert_eq!(out, before, "axis {axis} with {bad}");
+            }
+
+            let mut seed = neutral_head_pose();
+            seed.rotation =
+                UnitQuaternion::new_unchecked(nalgebra::Quaternion::new(bad, 0.0, 0.0, 0.0));
+            let mut out = before;
+            let err = forward_kinematics(&geom, &angles, &seed, &FkOptions::default(), &mut out)
+                .expect_err("an unplaceable seed rotation selects no assembly mode");
+            assert!(
+                matches!(err, FkError::NoConvergence { .. }),
+                "rotation with {bad}: {err:?}"
+            );
+            assert_eq!(out, before, "rotation with {bad}");
+        }
     }
 
     /// A seed that already satisfies the tolerance is the answer, at no cost.

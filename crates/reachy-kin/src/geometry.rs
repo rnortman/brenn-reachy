@@ -131,7 +131,7 @@ pub fn stow_head_pose() -> Isometry3<f64> {
 }
 
 /// The head pose of the tight resting configuration the vendor's simulated
-/// backends start from: low, off-centre, pitched up, and under 0.2 mm from a
+/// backends start from: low, off-centre, pitched up, and 0.141 mm from a
 /// singular configuration of the linkage.
 ///
 /// Recorded rather than derived, and **not** the pose a limp machine settles

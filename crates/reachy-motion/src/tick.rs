@@ -32,10 +32,18 @@
 //! ## Freshness
 //!
 //! A position read that did not arrive is `None`, never the previous tick's
-//! numbers. A stale tick keeps the last goal, counts toward the read-loss fault,
-//! and is marked stale in the report; nothing downstream ever sees a stale
-//! reading presented as a live one. The same all-or-nothing rule governs the
-//! health poll.
+//! numbers, and a read carrying a value nobody can place is a fault naming the
+//! joint it arrived on rather than an input to the solvers. A stale tick is
+//! marked stale in the report and counts toward the read-loss fault; nothing
+//! downstream ever sees a stale reading presented as a live one. The same
+//! all-or-nothing rule governs the health poll.
+//!
+//! A stale tick does **not** stop an active move. It skips the tracking
+//! comparison — the one thing that needs a live reading — and otherwise advances,
+//! checks and emits as usual, so a validated move rides out a brief read outage
+//! instead of stalling halfway. What bounds that is `read_loss_ticks`: it is the
+//! length of the outage the machine may keep moving blind through, and sizing it
+//! is sizing exactly that.
 
 use core::time::Duration;
 
@@ -223,6 +231,14 @@ pub enum Fault {
     /// solver is never re-run on perturbed inputs.
     #[error("present pose unknown: {0}")]
     PresentPoseLost(FkError),
+    /// A position read carried a value that is not a number. Nothing is
+    /// commanded from it: an angle nobody can place is a corrupt read, and the
+    /// layer that produced it is the thing to look at.
+    #[error("the position read for {joint} is not a number")]
+    PresentNotFinite {
+        /// The first joint in bus order whose reading could not be placed.
+        joint: JointId,
+    },
 }
 
 /// What a caller asks the tick to do.
@@ -337,7 +353,13 @@ impl Default for TickReport {
 /// What this period measured, and what it was asked to do.
 #[derive(Clone, Copy, Debug)]
 pub struct TickInputs<'a> {
-    /// Elapsed time on the caller's own epoch.
+    /// Elapsed time on the caller's own epoch, required to be non-decreasing
+    /// across ticks.
+    ///
+    /// Nothing here reads a clock, so nothing here can enforce that. A `now` that
+    /// went backwards during a move resamples the path at the earlier time and
+    /// walks the head back the way it came, bounded only by the per-tick step
+    /// guard; before the move's own start it resamples the start.
     pub now: Duration,
     /// The measured joint angles, or `None` when this tick's read failed.
     pub present: Option<&'a JointVector>,
@@ -482,6 +504,10 @@ pub fn motion_tick(
         Some(present) => {
             state.miss_count = 0;
             out.report.present_fresh = true;
+            if let Some(joint) = present.first_non_finite() {
+                state.raise(Fault::PresentNotFinite { joint }, out);
+                return;
+            }
             let mut pose = Isometry3::identity();
             match forward_kinematics(
                 &cfg.geom,
@@ -529,7 +555,7 @@ pub fn motion_tick(
         for ((id, angle), (_, goal)) in present.joints().into_iter().zip(state.last_goal.joints()) {
             let error = (angle - goal).abs();
             over |= outside_limit(error, cfg.tracking.threshold_rad);
-            if outside_limit(error, worst.1) {
+            if worse_error(error, worst.1) {
                 worst = (id, error);
             }
         }
@@ -588,6 +614,14 @@ pub fn motion_tick(
         trajectory.sample(t, &mut sampled);
         (sampled, *trajectory.target(), trajectory.done(t))
     }) else {
+        // Moving with nothing to sample is a state no sequence of ticks
+        // produces: the mode and the trajectory are set and cleared together,
+        // and both are private. If one ever appears anyway, the machine drops to
+        // a named state instead of staying Moving forever — where it would emit
+        // nothing, refuse every command as already-moving, and report no reason.
+        debug_assert!(false, "Moving with no trajectory to sample");
+        state.mode = Mode::Holding;
+        out.report.mode = state.mode;
         return;
     };
 
@@ -643,6 +677,24 @@ pub fn motion_tick(
         out.report.completed = true;
     }
     out.report.mode = state.mode;
+}
+
+/// Whether `candidate` is a worse tracking error than `incumbent`.
+///
+/// An ordering, deliberately not the bound test the threshold beside it uses: a
+/// bound test treats an incomparable value as a violation, which is right for
+/// "is this joint past the threshold" and wrong for "which joint is furthest
+/// out" — an unplaceable error would both beat the incumbent and be beaten by
+/// whatever came next, so the fault would name the joint *after* the bad one and
+/// report its zero error.
+///
+/// An error nobody can place is the worst thing this comparison can see, so it
+/// wins outright and keeps winning. Ties keep the joint found first.
+fn worse_error(candidate: f64, incumbent: f64) -> bool {
+    if candidate.is_nan() {
+        return !incumbent.is_nan();
+    }
+    candidate > incumbent
 }
 
 /// Take at most one command, returning what became of it. Mutates the state
@@ -889,6 +941,7 @@ mod tests {
         };
         let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, Some(&good));
         assert_eq!(out.report.command, CommandDisposition::Started);
+        assert_eq!(out.report.fault, None, "and starting it faulted nothing");
 
         // Now tighten the envelope under the running move, which is the
         // disagreement the path check exists to catch: a pose that passed
@@ -1132,6 +1185,7 @@ mod tests {
 
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
         assert_eq!(out.report.command, CommandDisposition::Started);
+        assert_eq!(out.report.fault, None, "accepting it did not also fault");
         let started = state.mode();
 
         let other = MotionCommand::MoveTo {
@@ -1144,6 +1198,7 @@ mod tests {
             out.report.command,
             CommandDisposition::Rejected(CommandRejection::AlreadyMoving)
         );
+        assert_eq!(out.report.fault, None, "refusing it did not fault either");
         assert_eq!(state.mode(), started, "the running move is untouched");
         assert!(out.report.envelope.is_some(), "and it still advanced");
     }
@@ -1167,6 +1222,7 @@ mod tests {
                 TrajectoryError::NonPositiveDuration
             ))
         );
+        assert_eq!(out.report.fault, None);
         assert_eq!(state.mode(), Mode::Holding);
     }
 
@@ -1202,6 +1258,7 @@ mod tests {
             Some(&MotionCommand::Hold),
         );
         assert_eq!(out.report.command, CommandDisposition::Held);
+        assert_eq!(out.report.fault, None);
         assert_eq!(state.mode(), Mode::Holding);
         assert_eq!(*state.last_goal(), mid);
 
@@ -1328,6 +1385,513 @@ mod tests {
             "got {:?}",
             out.report.command
         );
+    }
+
+    /// A reading that is not a number faults on the tick it arrives, naming the
+    /// joint it arrived on — not nine ticks later as a tracking failure blaming
+    /// some other joint, and never as an input to the pose solve.
+    #[test]
+    fn a_non_finite_present_read_faults_at_once() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+
+        for (index, expected) in JointId::ALL.iter().enumerate() {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let (mut state, pinned) = armed_at(&cfg, &start);
+                let mut present = pinned;
+                match index {
+                    0 => present.body_yaw = bad,
+                    1..=6 => present.legs[index - 1] = bad,
+                    _ => present.antennas[index - 7] = bad,
+                }
+
+                let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+                assert_eq!(
+                    out.report.fault,
+                    Some(Fault::PresentNotFinite { joint: *expected }),
+                    "slot {index} with {bad}"
+                );
+                assert_eq!(out.goal, None);
+                assert_eq!(out.report.fk, None, "the solve never ran");
+                assert!(state.is_faulted());
+            }
+        }
+    }
+
+    /// The worst-error selection is an ordering, and an error nobody can place
+    /// wins it. Reusing the bound test here would let the unplaceable joint be
+    /// displaced by the next joint in the sweep, and the fault whose whole job is
+    /// naming a joint would name the wrong one with a zero error beside it.
+    #[test]
+    fn the_worst_error_selection_is_an_ordering() {
+        assert!(worse_error(0.2, 0.1));
+        assert!(!worse_error(0.1, 0.2));
+        assert!(!worse_error(0.1, 0.1), "a tie keeps the first joint");
+        assert!(
+            worse_error(0.0, f64::NEG_INFINITY),
+            "the sweep's starting point"
+        );
+        assert!(worse_error(f64::NAN, 0.5), "unplaceable beats any number");
+        assert!(!worse_error(0.5, f64::NAN), "and is not displaced by one");
+        assert!(
+            !worse_error(f64::NAN, f64::NAN),
+            "a tie between two of them"
+        );
+    }
+
+    /// The tracking fault names the joint whose error could not be placed, with
+    /// that error, rather than the joint after it with zero.
+    ///
+    /// An arming summary is the only way a goal nobody can place gets into the
+    /// state — a present read carrying one faults before tracking runs — so that
+    /// is how this is reached.
+    #[test]
+    fn the_tracking_fault_names_the_joint_nobody_could_place() {
+        let cfg = MotionConfig {
+            tracking: TrackingFaultConfig {
+                threshold_rad: 0.1,
+                ticks: 1,
+            },
+            ..MotionConfig::default()
+        };
+        let targets = JointTargets::default();
+        let (present, margin) = joints_for(&cfg, &targets);
+
+        let mut pinned = present;
+        pinned.legs[3] = f64::NAN;
+        let mut state = MotionState::new_armed(&pinned, &targets.head_pose_body, margin);
+
+        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        let Some(Fault::TrackingLost { joint, error }) = out.report.fault else {
+            panic!("expected a tracking fault, got {:?}", out.report.fault);
+        };
+        assert_eq!(joint, JointId::Leg(3));
+        assert!(
+            error.is_nan(),
+            "the error travels as it was measured: {error}"
+        );
+        assert_eq!(
+            out.report.fault.unwrap().to_string(),
+            "leg 4 is NaN rad from its goal and not closing"
+        );
+    }
+
+    /// Goals are written only when they change. A move to the pose the machine is
+    /// already holding runs its whole duration emitting nothing at all, which is
+    /// an ordinary thing for an operator or a script to ask for, and the tick is
+    /// what keeps it off the bus.
+    #[test]
+    fn a_move_to_where_the_machine_is_emits_nothing() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let command = MotionCommand::MoveTo {
+            target: start,
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+        let mut completed = false;
+        for n in 0..=100 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &pinned,
+                (n == 0).then_some(&command),
+            );
+            assert_eq!(out.goal, None, "tick {n}");
+            assert!(!out.report.emitted, "tick {n}");
+            assert_eq!(out.report.fault, None, "tick {n}");
+            completed |= out.report.completed;
+        }
+        assert!(completed, "the move still finished");
+        assert_eq!(state.mode(), Mode::Holding);
+    }
+
+    /// The other half of the same rule: in a move that does go somewhere, every
+    /// tick that emits a goal emits a *different* goal from the one before it.
+    #[test]
+    fn every_emitted_goal_differs_from_the_last() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let command = MotionCommand::MoveTo {
+            target: pose_at(0.19),
+            duration: secs(1.0),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        let mut emitted = 0;
+        for n in 0..60 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            assert_eq!(
+                out.goal.is_some(),
+                out.report.emitted,
+                "tick {n}: the report and the goal agree"
+            );
+            if let Some(goal) = out.goal {
+                assert_ne!(goal, present, "tick {n} re-sent what was already commanded");
+                emitted += 1;
+                present = goal;
+            }
+            if out.report.completed {
+                break;
+            }
+        }
+        assert!(emitted > 40, "only {emitted} goals over a 1 s move");
+    }
+
+    /// The seed advances with the head. The pose solve is a Newton iteration
+    /// seeded from where the platform was last seen, and that — not the
+    /// plausibility screen — is what keeps it on the assembly mode the machine is
+    /// actually in. A seed pinned at the arming pose would still converge across
+    /// this whole workspace, so nothing but this notices.
+    #[test]
+    fn the_fk_seed_follows_the_head() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let arming_seed = *state.fk_seed();
+        let command = MotionCommand::MoveTo {
+            target: pose_at(0.195),
+            duration: secs(1.0),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        for n in 0..60 {
+            let seed_before = *state.fk_seed();
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+
+            // What the solve returned this tick, recomputed from the same seed
+            // and the same reading, must be what the state now carries.
+            let mut expected = Isometry3::identity();
+            forward_kinematics(
+                &cfg.geom,
+                &LegAngles(present.legs),
+                &seed_before,
+                &cfg.fk,
+                &mut expected,
+            )
+            .expect("the present angles solve");
+            assert_eq!(*state.fk_seed(), expected, "tick {n}");
+
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+            if out.report.completed {
+                break;
+            }
+        }
+        let travelled =
+            (state.fk_seed().translation.vector - arming_seed.translation.vector).norm();
+        assert!(
+            travelled > 0.015,
+            "the seed stayed at the arming pose ({travelled} m)"
+        );
+    }
+
+    /// The step guard is wired per group, and each group's bound is checked
+    /// end to end: a bound attached to the wrong group would show up on hardware
+    /// as a slam or a spurious fault, and the lookup's own unit test would not
+    /// move.
+    #[test]
+    fn every_step_group_is_guarded() {
+        let start = JointTargets::default();
+        let antennas_target = JointTargets {
+            antennas: [0.4, -0.4],
+            ..JointTargets::default()
+        };
+        let yaw_target = JointTargets {
+            body_yaw: 0.5,
+            ..JointTargets::default()
+        };
+
+        let cases: [(&str, JointStep, JointTargets); 3] = [
+            (
+                "legs",
+                JointStep {
+                    legs: 1e-5,
+                    ..MotionConfig::default().max_step
+                },
+                pose_at(0.19),
+            ),
+            (
+                "body yaw",
+                JointStep {
+                    body_yaw: 1e-5,
+                    ..MotionConfig::default().max_step
+                },
+                yaw_target,
+            ),
+            (
+                "antennas",
+                JointStep {
+                    antennas: 1e-5,
+                    ..MotionConfig::default().max_step
+                },
+                antennas_target,
+            ),
+        ];
+
+        for (group, max_step, target) in cases {
+            let cfg = MotionConfig {
+                max_step,
+                ..MotionConfig::default()
+            };
+            let (mut state, pinned) = armed_at(&cfg, &start);
+            let (_, out) = run_move(&cfg, &mut state, &pinned, &target, secs(0.5), 0.02);
+
+            let Some(Fault::StepTooLarge { joint, delta }) = out.report.fault else {
+                panic!("{group}: expected a step fault, got {:?}", out.report.fault);
+            };
+            let named = match joint {
+                JointId::Leg(_) => "legs",
+                JointId::BodyYaw => "body yaw",
+                JointId::AntennaRight | JointId::AntennaLeft => "antennas",
+            };
+            assert_eq!(named, group, "{group}: the fault named {joint}");
+            assert!(delta > 1e-5, "{group}: delta {delta}");
+            assert_eq!(out.goal, None);
+        }
+    }
+
+    /// A read outage does not stop a move that was already validated: the tick
+    /// skips the tracking comparison, which is the only thing needing a live
+    /// reading, and goes on advancing and emitting. `read_loss_ticks` is the
+    /// length of outage that may be ridden out, and the fault at the end of it is
+    /// the backstop.
+    #[test]
+    fn a_stale_tick_keeps_a_move_going() {
+        let cfg = MotionConfig {
+            read_loss_ticks: 4,
+            ..MotionConfig::default()
+        };
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let command = MotionCommand::MoveTo {
+            target: pose_at(0.19),
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        for n in 0..10 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+        }
+        let before_outage = *state.last_goal();
+
+        for n in 10..14 {
+            let mut out = TickOutputs::default();
+            motion_tick(
+                &cfg,
+                &mut state,
+                &TickInputs {
+                    now: secs(f64::from(n) * 0.02),
+                    present: None,
+                    command: None,
+                    health: None,
+                },
+                &mut out,
+            );
+            assert!(!out.report.present_fresh, "tick {n}");
+            assert_eq!(out.report.fault, None, "tick {n}");
+            assert!(out.report.emitted, "tick {n} kept the move going");
+            assert_eq!(out.report.tracking_worst, None, "nothing was measured");
+        }
+        assert_ne!(
+            *state.last_goal(),
+            before_outage,
+            "the move advanced through the outage"
+        );
+
+        // One tick past the budget and the outage is the fault, with the move
+        // abandoned where it stands.
+        let mut out = TickOutputs::default();
+        motion_tick(
+            &cfg,
+            &mut state,
+            &TickInputs {
+                now: secs(0.28),
+                present: None,
+                command: None,
+                health: None,
+            },
+            &mut out,
+        );
+        assert_eq!(out.report.fault, Some(Fault::ReadLoss { misses: 5 }));
+        assert_eq!(out.goal, None);
+    }
+
+    /// `now` is required to be non-decreasing, and this is what a caller that
+    /// breaks that gets: the path is resampled at the earlier time and the head
+    /// walks back the way it came, with only the step guard between a rewind and a
+    /// slam. Pinned rather than left to `saturating_sub` to imply, because a
+    /// rewind smaller than the step bound raises nothing at all.
+    #[test]
+    fn a_clock_that_runs_backwards_rewinds_the_path() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let command = MotionCommand::MoveTo {
+            target: pose_at(0.19),
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        for n in 0..20 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+        }
+        let advanced = *state.last_goal();
+
+        // A `now` before the move's own start floors to zero elapsed, so the
+        // sample is the start pose again. The whole move's leg travel is under
+        // the step bound here, so nothing catches it.
+        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        assert_eq!(out.report.fault, None);
+        assert!(out.report.emitted, "a goal went out for the earlier time");
+        assert_eq!(
+            *state.last_goal(),
+            pinned,
+            "the rewound goal is the move's own start"
+        );
+        assert_ne!(*state.last_goal(), advanced);
+
+        // A rewind that undoes more than one tick's worth of travel is caught,
+        // and that is the whole protection: the same move on an axis with real
+        // travel in it faults on the step rather than walking back.
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let yaw_move = MotionCommand::MoveTo {
+            target: JointTargets {
+                body_yaw: 0.5,
+                ..JointTargets::default()
+            },
+            duration: secs(2.0),
+            warp: Warp::MinJerk,
+        };
+        let mut present = pinned;
+        for n in 0..60 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&yaw_move),
+            );
+            assert_eq!(out.report.fault, None, "tick {n} of the yaw move");
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+        }
+        let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
+        let Some(Fault::StepTooLarge { joint, .. }) = out.report.fault else {
+            panic!("expected a step fault, got {:?}", out.report.fault);
+        };
+        assert_eq!(joint, JointId::BodyYaw);
+        assert_eq!(out.goal, None);
+    }
+
+    /// Every fault and every refusal renders, and this is what it says. The
+    /// messages are the operator's whole view of a stopped machine, and the
+    /// formatting in them can go wrong silently.
+    #[test]
+    fn every_fault_and_refusal_names_itself() {
+        let mut violations = EnvelopeViolations::default();
+        violations.unreachable[0] = true;
+        violations.margin = true;
+
+        let faults: [(Fault, &str); 7] = [
+            (
+                Fault::Envelope(violations),
+                "the commanded path left the envelope: leg 1 unreachable, toggle margin below the floor",
+            ),
+            (
+                Fault::StepTooLarge {
+                    joint: JointId::Leg(3),
+                    delta: 0.5,
+                },
+                "leg 4 would step 0.5000 rad in one tick",
+            ),
+            (
+                Fault::ReadLoss { misses: 50 },
+                "no position read for 50 consecutive ticks",
+            ),
+            (
+                Fault::TrackingLost {
+                    joint: JointId::BodyYaw,
+                    error: 0.123_456,
+                },
+                "body yaw is 0.1235 rad from its goal and not closing",
+            ),
+            (
+                Fault::HardwareError { id: 13, bits: 0x20 },
+                "servo 13 reports hardware error bits 0x20",
+            ),
+            (
+                Fault::PresentPoseLost(FkError::NoConvergence {
+                    iters: 7,
+                    residual: 1.5e-4,
+                }),
+                "present pose unknown: no pose found after 7 iterations, residual 1.500e-4 m",
+            ),
+            (
+                Fault::PresentNotFinite {
+                    joint: JointId::AntennaRight,
+                },
+                "the position read for right antenna is not a number",
+            ),
+        ];
+        for (fault, expected) in faults {
+            assert_eq!(fault.to_string(), expected);
+        }
+
+        let refusals: [(CommandRejection, &str); 3] = [
+            (CommandRejection::AlreadyMoving, "a move is already running"),
+            (
+                CommandRejection::Envelope(violations),
+                "the commanded target is outside the envelope: leg 1 unreachable, toggle margin below the floor",
+            ),
+            (
+                CommandRejection::Trajectory(TrajectoryError::NonPositiveDuration),
+                "the commanded move cannot be shaped: trajectory duration must be greater than zero",
+            ),
+        ];
+        for (refusal, expected) in refusals {
+            assert_eq!(refusal.to_string(), expected);
+        }
     }
 
     /// Two identical calls answer identically: the tick reads no clock and

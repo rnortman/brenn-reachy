@@ -133,6 +133,10 @@ pub(crate) fn solve_leg(
     // D == 0 puts the anchor on the crank axis, where every crank angle solves
     // the leg. A whole circle of answers is not an answer, so it is refused —
     // and it is the one place the deficit can come out at zero.
+    //
+    // Both comparisons demand a definite answer, so a pose carrying a component
+    // nobody can place leaves the leg unsolvable rather than solved: an
+    // incomparable D fails the first test outright.
     let solvable = d > 0.0 && c.abs() <= d;
     let angle = if solvable {
         // |ratio| ≤ 1 by the strict test above, so acos never sees an argument
@@ -145,9 +149,15 @@ pub(crate) fn solve_leg(
 
     LegSolve {
         angle,
-        // A refused D == 0 must not report a non-negative margin.
+        // A refused D == 0 must not report a non-negative margin, and a margin
+        // nobody can place must not travel onward as one: an unsolvable leg
+        // reports zero or less, always a number.
         margin: if angle.is_none() {
-            margin.min(0.0)
+            if margin.is_nan() {
+                0.0
+            } else {
+                margin.min(0.0)
+            }
         } else {
             margin
         },
@@ -193,9 +203,9 @@ pub fn inverse_kinematics(
 
 /// Per-leg toggle margins for a head pose, metres.
 ///
-/// Infallible: the margin is defined at every pose, negative where the leg has
-/// no solution. Callers use it as the clearance baseline of a pose they are
-/// already at, which may be a pose no command would be allowed to reach.
+/// Infallible: the margin is defined at every pose, and is zero or less where
+/// the leg has no solution. Callers use it as the clearance baseline of a pose
+/// they are already at, which may be a pose no command would be allowed to reach.
 pub fn pose_margins(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>, out: &mut [f64; 6]) {
     for (leg, slot) in out.iter_mut().enumerate() {
         *slot = solve_leg(geom, leg, head_pose_body).margin;
@@ -209,8 +219,10 @@ pub fn pose_margins(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>, out: &
 /// be the same quantity, reduced the same way; callers that need only the
 /// minimum use this rather than folding [`pose_margins`] themselves.
 ///
-/// Allocates nothing and never returns a NaN: the per-leg margins are finite at
-/// every pose.
+/// Allocates nothing and never returns a NaN, an undefined pose included: such a
+/// pose has no solvable leg, and an unsolvable leg's margin is zero or less, so
+/// it reduces to exactly `0.0` — no clearance, which is the least a caller can
+/// act on. A pose placed infinitely far out reduces to negative infinity.
 #[must_use]
 pub fn min_pose_margin(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>) -> f64 {
     let mut margins = [0.0; 6];
@@ -467,15 +479,17 @@ mod tests {
         }
     }
 
-    /// The joint-space resting configuration the vendor's simulated backends
-    /// start from sits far tighter than stow: two legs under 0.2 mm. Pinned so
-    /// that any change to the margin formula shows up against a configuration
-    /// where it actually matters.
+    /// The resting configuration the vendor's simulated backends start from sits
+    /// far tighter than stow: 0.141 mm on the tightest leg, a twentieth of the
+    /// clearance floor. Pinned as a golden rather than a band, because it is the
+    /// number the whole clearance-baseline policy is sized against, and because
+    /// the same configuration is on record a second way that yields 0.182 mm —
+    /// a band loose enough to hold both would hide which record moved.
     #[test]
     fn candidate_resting_pose_is_much_tighter_than_stow() {
         let geom = HeadGeometry::default();
         let min = min_pose_margin(&geom, &rest_head_pose());
-        assert!(min > 0.0 && min < 0.001, "min margin {min}");
+        assert!((min - 0.000_141_133).abs() < 1e-9, "min margin {min}");
 
         let stow_min = min_pose_margin(&geom, &stow_head_pose());
         assert!(stow_min > 40.0 * min, "stow {stow_min} vs rest {min}");

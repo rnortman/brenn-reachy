@@ -40,8 +40,8 @@
 //! ## The margin baseline
 //!
 //! The clearance floor is a floor on *commanded* poses, but the machine can
-//! come to rest below it — one documented resting configuration sits at 0.19 mm
-//! of clearance, a sixteenth of the floor. Refusing every command from there
+//! come to rest below it — one documented resting configuration sits at 0.141 mm
+//! of clearance, a twentieth of the floor. Refusing every command from there
 //! would leave the head stuck at its tightest. So a caller that knows the
 //! present pose's clearance passes it as `margin_baseline`, and a pose that
 //! strictly increases clearance is admissible even below the floor. Motion
@@ -201,8 +201,8 @@ impl core::fmt::Display for EnvelopeViolations {
 pub struct EnvelopeReport {
     /// The crank angles, `None` exactly when some leg has no solution.
     pub leg_angles: Option<LegAngles>,
-    /// Per-leg toggle margins, metres. Always finite, negative where a leg has
-    /// no solution.
+    /// Per-leg toggle margins, metres. Never a NaN; zero or less on a leg with
+    /// no solution, and unbounded below for a pose placed infinitely far out.
     pub toggle_margins: [f64; 6],
     /// The smallest of the six margins.
     pub min_margin: f64,
@@ -360,7 +360,7 @@ mod tests {
     }
 
     /// The recorded tight resting configuration, raised or lowered by `dz`
-    /// metres. At `dz = 0` it carries under 0.2 mm of clearance, far below the
+    /// metres. At `dz = 0` it carries 0.141 mm of clearance, far below the
     /// floor.
     fn rest_shifted(dz: f64) -> Isometry3<f64> {
         let mut pose = rest_head_pose();
@@ -478,13 +478,16 @@ mod tests {
     }
 
     /// The baseline policy, on the configuration it exists for. From a rest at
-    /// 0.19 mm of clearance every command is below the floor, and the machine
+    /// 0.141 mm of clearance every command is below the floor, and the machine
     /// would be stuck there without it.
     #[test]
     fn the_baseline_admits_a_lift_and_refuses_a_tightening() {
         let rest = rest_shifted(0.0);
         let baseline = min_pose_margin(&HeadGeometry::default(), &rest);
-        assert!(baseline > 0.0 && baseline < 0.0003, "baseline {baseline}");
+        assert!(
+            (baseline - 0.000_141_133).abs() < 1e-9,
+            "baseline {baseline}"
+        );
 
         // Without a baseline the rest pose refuses its own clearance.
         let (verdict, report) = check(&rest, 0.0, [0.0, 0.0], None);
@@ -676,6 +679,68 @@ mod tests {
             assert!(verdict.is_err(), "antennas {bad}");
             assert_eq!(report.violations.antenna, [true, true]);
         }
+    }
+
+    /// The pose half of the same story, which the scalar bounds do not cover: a
+    /// translation or quaternion component nobody can place makes every leg
+    /// unsolvable, and the pose is refused on that.
+    ///
+    /// Pinned because the refusal comes out of the reach test demanding a
+    /// definite answer rather than out of a check written for this case: a
+    /// reordering of those guards that read as equivalent could turn an undefined
+    /// pose into an accepted one. Pinned too is what the report says about the
+    /// clearance of such a pose — never a positive number, and never a NaN, since
+    /// the tick feeds that reduction straight back as the next check's baseline.
+    /// A pose that cannot be placed at all reduces to exactly zero; one placed
+    /// infinitely far out reduces to negative infinity.
+    #[test]
+    fn a_non_finite_pose_is_refused_on_every_leg() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for axis in 0..3 {
+                let mut pose = neutral_head_pose();
+                pose.translation.vector[axis] = bad;
+                let (verdict, report) = check(&pose, 0.0, [0.0, 0.0], None);
+                let case = format!("translation axis {axis} with {bad}");
+                assert!(verdict.is_err(), "{case}");
+                assert_eq!(report.violations.unreachable, [true; 6], "{case}");
+                assert!(report.leg_angles.is_none(), "{case}");
+                assert!(report.violations.margin, "{case}");
+                assert!(
+                    !report.min_margin.is_nan() && report.min_margin <= 0.0,
+                    "{case}: no clearance is claimed, and the number is one: {}",
+                    report.min_margin
+                );
+                assert_eq!(
+                    min_pose_margin(&HeadGeometry::default(), &pose),
+                    report.min_margin,
+                    "{case}: the baseline reducer agrees with the report"
+                );
+            }
+
+            // The undefined case reduces to exactly zero, which is what the
+            // baseline reducer promises for a pose it cannot place at all.
+            let mut pose = neutral_head_pose();
+            pose.translation.vector.y = f64::NAN;
+            assert_eq!(min_pose_margin(&HeadGeometry::default(), &pose), 0.0);
+
+            let mut pose = neutral_head_pose();
+            pose.rotation =
+                UnitQuaternion::new_unchecked(nalgebra::Quaternion::new(bad, 0.0, 0.0, 0.0));
+            let (verdict, report) = check(&pose, 0.0, [0.0, 0.0], None);
+            assert!(verdict.is_err(), "rotation with {bad}");
+            assert_eq!(report.violations.unreachable, [true; 6]);
+            assert!(report.violations.relative_yaw && report.violations.cone);
+            assert!(
+                report.cone_angle.is_nan(),
+                "a rotation nobody can place has no tilt to report: {}",
+                report.cone_angle
+            );
+        }
+
+        // A baseline excuses none of it, at any value.
+        let mut pose = neutral_head_pose();
+        pose.translation.vector.y = f64::NAN;
+        assert!(check(&pose, 0.0, [0.0, 0.0], Some(-1.0)).0.is_err());
     }
 
     /// Every violation kind is producible and every one is named in the

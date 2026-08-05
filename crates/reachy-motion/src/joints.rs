@@ -69,10 +69,16 @@ impl JointVector {
         ]
     }
 
-    /// Whether all nine angles are finite.
+    /// The first joint in bus order whose angle is not a number, if any.
+    ///
+    /// Named rather than counted, so a fault raised from this can name the
+    /// joint the bad number arrived on.
     #[must_use]
-    pub fn is_finite(&self) -> bool {
-        self.joints().iter().all(|(_, angle)| angle.is_finite())
+    pub fn first_non_finite(&self) -> Option<JointId> {
+        self.joints()
+            .into_iter()
+            .find(|(_, angle)| !angle.is_finite())
+            .map(|(id, _)| id)
     }
 }
 
@@ -161,8 +167,10 @@ impl JointStep {
 
 /// Names one joint, for fault causes and reports.
 ///
-/// Leg indices are 0-based, matching the leg index the kinematics reports an
-/// unreachable pose against.
+/// The `Leg` payload is 0-based, matching the leg index the kinematics reports an
+/// unreachable pose against. It **renders** 1-based, matching the servo numbering
+/// on the bus and the way the envelope names a leg: an operator reading a fault
+/// and an envelope refusal in the same log must be reading about the same crank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JointId {
     /// The body yaw servo.
@@ -215,7 +223,9 @@ impl core::fmt::Display for JointId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             JointId::BodyYaw => write!(f, "body yaw"),
-            JointId::Leg(leg) => write!(f, "leg {leg}"),
+            // 1-based, as the servos and the envelope's own messages number the
+            // legs; the payload stays the 0-based index.
+            JointId::Leg(leg) => write!(f, "leg {}", u16::from(*leg) + 1),
             JointId::AntennaRight => write!(f, "right antenna"),
             JointId::AntennaLeft => write!(f, "left antenna"),
         }
@@ -225,7 +235,9 @@ impl core::fmt::Display for JointId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reachy_kin::{EnvelopeConfig, EnvelopeReport, HeadGeometry, check_envelope};
+    use reachy_kin::{
+        EnvelopeConfig, EnvelopeReport, EnvelopeViolations, HeadGeometry, check_envelope,
+    };
 
     #[test]
     fn bus_order_is_one_order() {
@@ -256,18 +268,38 @@ mod tests {
     #[test]
     fn joint_names() {
         assert_eq!(JointId::BodyYaw.to_string(), "body yaw");
-        assert_eq!(JointId::Leg(3).to_string(), "leg 3");
+        assert_eq!(JointId::Leg(0).to_string(), "leg 1");
+        assert_eq!(JointId::Leg(3).to_string(), "leg 4");
+        assert_eq!(JointId::Leg(5).to_string(), "leg 6");
         assert_eq!(JointId::AntennaRight.to_string(), "right antenna");
         assert_eq!(JointId::AntennaLeft.to_string(), "left antenna");
     }
 
-    /// Every one of the nine slots is covered by the finiteness check — a
-    /// per-slot sweep, because a hand-written conjunction that skipped one
-    /// would still pass an all-finite test.
+    /// The two crates must name the same physical crank the same way. Two
+    /// numberings in one log is a wrong-part diagnosis on a mechanism with six
+    /// identical-looking legs, and each crate's own test would pass either way.
+    #[test]
+    fn both_crates_number_the_legs_alike() {
+        for leg in 0..6usize {
+            let mut violations = EnvelopeViolations::default();
+            violations.unreachable[leg] = true;
+            let envelope_says = violations.to_string();
+            let motion_says = JointId::Leg(leg as u8).to_string();
+            assert!(
+                envelope_says.starts_with(&format!("{motion_says} ")),
+                "the envelope says {envelope_says:?}, the tick says {motion_says:?}"
+            );
+        }
+    }
+
+    /// Every one of the nine slots is covered by the finiteness check, and the
+    /// slot it finds is the one it names — a per-slot sweep, because a
+    /// hand-written conjunction that skipped one would still pass an all-finite
+    /// test, and a check that named the wrong joint would still refuse.
     #[test]
     fn every_slot_is_checked_for_finiteness() {
-        assert!(JointVector::default().is_finite());
-        for index in 0..JointId::COUNT {
+        assert_eq!(JointVector::default().first_non_finite(), None);
+        for (index, expected) in JointId::ALL.iter().enumerate() {
             for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut v = JointVector::default();
                 match index {
@@ -275,7 +307,11 @@ mod tests {
                     1..=6 => v.legs[index - 1] = bad,
                     _ => v.antennas[index - 7] = bad,
                 }
-                assert!(!v.is_finite(), "slot {index} with {bad}");
+                assert_eq!(
+                    v.first_non_finite(),
+                    Some(*expected),
+                    "slot {index} with {bad}"
+                );
             }
         }
     }

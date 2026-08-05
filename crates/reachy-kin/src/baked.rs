@@ -252,15 +252,20 @@ pub const STOW_PITCH: f64 = 0.425_634_609_124_168_34;
 /// Head translation of the tight resting configuration, base frame, metres.
 ///
 /// A recorded observation, not a derivation: this is the configuration the
-/// vendor's simulated backends start from, and it sits under 0.2 mm from a
-/// singular configuration of the linkage — a sixteenth of the clearance floor
-/// commands are held to. It is the configuration the clearance baseline exists
-/// for, so it is baked here once rather than retyped by each test that needs a
-/// rest tighter than the floor.
+/// vendor's simulated backends start from, and it sits 0.141 mm from a singular
+/// configuration of the linkage — a twentieth of the clearance floor commands are
+/// held to. It is the configuration the clearance baseline exists for, so it is
+/// baked here once rather than retyped by each test that needs a rest tighter
+/// than the floor.
 ///
 /// The same configuration is on record twice, as this pose and as
-/// [`REST_CRANK_ANGLES_DEG`]; the two records must agree (tests cross-check
-/// them).
+/// [`REST_CRANK_ANGLES_DEG`], and **the two records disagree**: run through the
+/// solvers they differ by 3.689 µm of translation and 0.306° of pitch, and the
+/// clearance they imply differs by a third — 0.141 mm from this pose against
+/// 0.182 mm from the angles. Both were written to two decimals, so the pitch gap
+/// is thirty times either record's own precision. This pose is the record every
+/// caller uses, and the tighter of the two. The gaps are pinned as goldens by
+/// the tests that cross-check them.
 pub const REST_TRANSLATION: [f64; 3] = [-0.015_17, 0.001_03, 0.126_57];
 
 /// Head pitch of the tight resting configuration, **degrees**, about the head y
