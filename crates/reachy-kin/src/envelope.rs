@@ -51,7 +51,7 @@ use nalgebra::Isometry3;
 use thiserror::Error;
 
 use crate::baked;
-use crate::geometry::HeadGeometry;
+use crate::geometry::{HeadGeometry, cone_angle};
 use crate::ik::{LegAngles, solve_leg};
 
 /// The bounds a commanded pose is checked against.
@@ -223,18 +223,29 @@ pub struct EnvelopeError {
     pub violations: EnvelopeViolations,
 }
 
-/// Whether `value`'s magnitude is *not* known to be within `limit`.
+/// Whether `value` is *not* known to be within `limit`.
 ///
 /// Phrased as a failure to compare rather than as a comparison, because a
-/// commanded value can be non-finite: `NaN` is neither inside a bound nor
-/// outside it, and every direct test of it comes back false. Requiring a
+/// commanded or measured value can be non-finite: `NaN` is neither inside a bound
+/// nor outside it, and every direct test of it comes back false. Requiring a
 /// definite answer makes the incomparable case a violation, which is the only
-/// safe reading of a commanded quantity nobody can place.
-fn magnitude_outside(value: f64, limit: f64) -> bool {
+/// safe reading of a quantity nobody can place.
+///
+/// Every bound test on the command path — envelope, tracking, and step guards —
+/// must use this definition; two copies would drift on what counts as a
+/// violation while both kept passing their own tests.
+#[must_use]
+pub fn outside_limit(value: f64, limit: f64) -> bool {
     !matches!(
-        value.abs().partial_cmp(&limit),
+        value.partial_cmp(&limit),
         Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
     )
+}
+
+/// Whether `value`'s magnitude is not known to be within `limit`, for the bounds
+/// that are symmetric about zero.
+fn magnitude_outside(value: f64, limit: f64) -> bool {
+    outside_limit(value.abs(), limit)
 }
 
 /// Check one commanded configuration against the envelope.
@@ -270,11 +281,7 @@ pub fn check_envelope(
     // enforced under: the ZYX yaw of the head frame in the body frame.
     out.relative_yaw = m[(1, 0)].atan2(m[(0, 0)]);
 
-    // The head's own vertical against the base vertical. The clamp is
-    // numeric hygiene on a unit-vector component that fp error can push an ulp
-    // past either end of the domain; the near-inverted end is reachable in
-    // practice, so the full domain must be handled.
-    out.cone_angle = m[(2, 2)].clamp(-1.0, 1.0).acos();
+    out.cone_angle = cone_angle(&head_pose_body.rotation);
 
     let mut violations = EnvelopeViolations::default();
     let mut angles = [0.0; 6];
@@ -325,7 +332,8 @@ pub fn check_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{neutral_head_pose, stow_head_pose};
+    use crate::geometry::{neutral_head_pose, rest_head_pose, stow_head_pose};
+    use crate::ik::min_pose_margin;
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
 
     /// A pose at the neutral attitude, `z` metres up the yaw axis.
@@ -351,14 +359,13 @@ mod tests {
         )
     }
 
-    /// The recovered head pose of the tight resting configuration the vendor's
-    /// simulated backends start from: under 0.2 mm of clearance, far below the
+    /// The recorded tight resting configuration, raised or lowered by `dz`
+    /// metres. At `dz = 0` it carries under 0.2 mm of clearance, far below the
     /// floor.
-    fn tight_rest_pose() -> Isometry3<f64> {
-        Isometry3::from_parts(
-            Translation3::new(-0.015_17, 0.001_03, 0.126_57),
-            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 30.84_f64.to_radians()),
-        )
+    fn rest_shifted(dz: f64) -> Isometry3<f64> {
+        let mut pose = rest_head_pose();
+        pose.translation.z += dz;
+        pose
     }
 
     fn check(
@@ -475,10 +482,8 @@ mod tests {
     /// would be stuck there without it.
     #[test]
     fn the_baseline_admits_a_lift_and_refuses_a_tightening() {
-        let rest = tight_rest_pose();
-        let mut margins = [0.0; 6];
-        crate::ik::pose_margins(&HeadGeometry::default(), &rest, &mut margins);
-        let baseline = margins.iter().copied().fold(f64::INFINITY, f64::min);
+        let rest = rest_shifted(0.0);
+        let baseline = min_pose_margin(&HeadGeometry::default(), &rest);
         assert!(baseline > 0.0 && baseline < 0.0003, "baseline {baseline}");
 
         // Without a baseline the rest pose refuses its own clearance.
@@ -488,10 +493,7 @@ mod tests {
 
         // A pose 1 mm higher is still far below the floor, but improves on the
         // baseline, so it is admitted.
-        let lift = Isometry3::from_parts(
-            Translation3::new(-0.015_17, 0.001_03, 0.127_57),
-            rest.rotation,
-        );
+        let lift = rest_shifted(0.001);
         let (verdict, report) = check(&lift, 0.0, [0.0, 0.0], Some(baseline));
         assert!(verdict.is_ok(), "{:?}", report.violations);
         assert!(
@@ -516,11 +518,7 @@ mod tests {
     /// with a baseline as readily as without one.
     #[test]
     fn the_baseline_excuses_only_the_clearance_floor() {
-        let rest = tight_rest_pose();
-        let drop = Isometry3::from_parts(
-            Translation3::new(-0.015_17, 0.001_03, 0.125_57),
-            rest.rotation,
-        );
+        let drop = rest_shifted(-0.001);
         let (verdict, report) = check(&drop, 0.0, [0.0, 0.0], Some(0.001));
         assert!(verdict.is_err());
         assert!(report.violations.margin);
@@ -644,6 +642,23 @@ mod tests {
             assert!(!report.violations.antenna[1 - index]);
         }
         assert!(check(&pose, 0.0, [-3.05, 3.05], None).0.is_ok());
+    }
+
+    /// Inside and at the bound pass, past it fails, and a value nobody can
+    /// compare fails.
+    #[test]
+    fn the_bound_test_admits_the_bound_and_refuses_the_incomparable() {
+        assert!(!outside_limit(0.9, 1.0));
+        assert!(!outside_limit(1.0, 1.0));
+        assert!(outside_limit(1.000_000_000_000_1, 1.0));
+        assert!(outside_limit(f64::NAN, 1.0));
+        assert!(outside_limit(f64::INFINITY, 1.0));
+        assert!(!outside_limit(f64::NEG_INFINITY, 1.0));
+        assert!(outside_limit(0.5, f64::NAN));
+
+        assert!(!magnitude_outside(-1.0, 1.0));
+        assert!(magnitude_outside(-1.5, 1.0));
+        assert!(magnitude_outside(f64::NEG_INFINITY, 1.0));
     }
 
     /// A non-finite commanded scalar is a violation, not something that passes

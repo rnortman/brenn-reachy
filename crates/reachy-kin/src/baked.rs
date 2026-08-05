@@ -249,6 +249,28 @@ pub const STOW_TRANSLATION: [f64; 3] = [-0.021, 0.001, HEAD_Z_OFFSET - 0.044];
 /// against the rounded matrix.
 pub const STOW_PITCH: f64 = 0.425_634_609_124_168_34;
 
+/// Head translation of the tight resting configuration, base frame, metres.
+///
+/// A recorded observation, not a derivation: this is the configuration the
+/// vendor's simulated backends start from, and it sits under 0.2 mm from a
+/// singular configuration of the linkage — a sixteenth of the clearance floor
+/// commands are held to. It is the configuration the clearance baseline exists
+/// for, so it is baked here once rather than retyped by each test that needs a
+/// rest tighter than the floor.
+///
+/// The same configuration is on record twice, as this pose and as
+/// [`REST_CRANK_ANGLES_DEG`]; the two records must agree (tests cross-check
+/// them).
+pub const REST_TRANSLATION: [f64; 3] = [-0.015_17, 0.001_03, 0.126_57];
+
+/// Head pitch of the tight resting configuration, **degrees**, about the head y
+/// axis.
+pub const REST_PITCH_DEG: f64 = 30.84;
+
+/// Crank angles of the tight resting configuration, **degrees**, in servo order
+/// 1..=6.
+pub const REST_CRANK_ANGLES_DEG: [f64; 6] = [-56.43, 72.33, -13.97, 11.78, -70.84, 57.48];
+
 #[cfg(test)]
 mod tests {
     use super::*;

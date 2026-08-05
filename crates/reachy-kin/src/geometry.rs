@@ -130,6 +130,39 @@ pub fn stow_head_pose() -> Isometry3<f64> {
     )
 }
 
+/// The head pose of the tight resting configuration the vendor's simulated
+/// backends start from: low, off-centre, pitched up, and under 0.2 mm from a
+/// singular configuration of the linkage.
+///
+/// Recorded rather than derived, and **not** the pose a limp machine settles
+/// into — that is a measurement nobody here has taken.
+#[must_use]
+pub fn rest_head_pose() -> Isometry3<f64> {
+    Isometry3::from_parts(
+        Translation3::new(
+            baked::REST_TRANSLATION[0],
+            baked::REST_TRANSLATION[1],
+            baked::REST_TRANSLATION[2],
+        ),
+        UnitQuaternion::from_axis_angle(&Vector3::y_axis(), baked::REST_PITCH_DEG.to_radians()),
+    )
+}
+
+/// The angle between the head's own vertical and the base vertical, radians;
+/// never negative.
+///
+/// All bounds stated in head tilt must share this extraction; two definitions
+/// could disagree about what "tilt" means and the bounds would stop being
+/// comparable.
+///
+/// The clamp is arithmetic hygiene on a component of a unit vector, which
+/// rounding can push an ulp past either end of `acos`'s domain; the near-
+/// inverted end is reachable through the screen. It caps nothing commanded.
+#[must_use]
+pub fn cone_angle(rotation: &UnitQuaternion<f64>) -> f64 {
+    (rotation * Vector3::z()).z.clamp(-1.0, 1.0).acos()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +212,40 @@ mod tests {
         let head_z = pose.rotation * Vector3::z();
         let cone = head_z.z.acos();
         assert!((cone - baked::STOW_PITCH).abs() < 1e-9, "cone {cone}");
+    }
+
+    /// The recorded resting pose is low, off-axis and pitched a good deal
+    /// further than stow, and it is the pose the baked numbers say it is.
+    #[test]
+    fn rest_pose_is_lower_and_steeper_than_stow() {
+        let rest = rest_head_pose();
+        assert_eq!(rest.translation.z, baked::REST_TRANSLATION[2]);
+        assert_eq!(rest.translation.x, baked::REST_TRANSLATION[0]);
+        assert!(rest.translation.z < stow_head_pose().translation.z);
+        assert!(
+            (cone_angle(&rest.rotation) - baked::REST_PITCH_DEG.to_radians()).abs() < 1e-12,
+            "cone {}",
+            cone_angle(&rest.rotation)
+        );
+        assert!(cone_angle(&rest.rotation) > baked::STOW_PITCH);
+    }
+
+    /// The tilt extraction agrees with the rotation matrix's own third diagonal
+    /// element, is never negative, and survives the two attitudes where `acos`
+    /// would otherwise see an out-of-domain argument.
+    #[test]
+    fn cone_angle_matches_the_rotation_matrix() {
+        for deg in [0.0, 12.5, -34.0, 90.0, 179.0, 180.0] {
+            let rotation =
+                UnitQuaternion::from_axis_angle(&Vector3::y_axis(), f64::to_radians(deg));
+            let cone = cone_angle(&rotation);
+            let matrix = rotation.to_rotation_matrix();
+            assert!(
+                (cone - matrix.matrix()[(2, 2)].clamp(-1.0, 1.0).acos()).abs() < 1e-12,
+                "{deg}° gave {cone}"
+            );
+            assert!(cone.is_finite() && cone >= 0.0, "{deg}° gave {cone}");
+            assert!((cone - deg.abs().to_radians()).abs() < 1e-9, "{deg}°");
+        }
     }
 }

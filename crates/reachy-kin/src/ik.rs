@@ -202,11 +202,27 @@ pub fn pose_margins(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>, out: &
     }
 }
 
+/// The smallest of a pose's six toggle margins, metres.
+///
+/// The clearance baseline the margin-baseline policy is defined over. The
+/// baseline a caller measures and the minimum the envelope compares against must
+/// be the same quantity, reduced the same way; callers that need only the
+/// minimum use this rather than folding [`pose_margins`] themselves.
+///
+/// Allocates nothing and never returns a NaN: the per-leg margins are finite at
+/// every pose.
+#[must_use]
+pub fn min_pose_margin(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>) -> f64 {
+    let mut margins = [0.0; 6];
+    pose_margins(geom, head_pose_body, &mut margins);
+    margins.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::baked;
-    use crate::geometry::{BranchSign, neutral_head_pose, stow_head_pose};
+    use crate::geometry::{BranchSign, neutral_head_pose, rest_head_pose, stow_head_pose};
     use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
     use crate::testutil::Rng;
@@ -354,9 +370,7 @@ mod tests {
         for step in 0..4000 {
             let z = 0.177 + f64::from(step) * 1e-5;
             let pose = Isometry3::translation(0.0, 0.0, z);
-            let mut margins = [0.0; 6];
-            pose_margins(&geom, &pose, &mut margins);
-            let min = margins.iter().copied().fold(f64::INFINITY, f64::min);
+            let min = min_pose_margin(&geom, &pose);
             let mut angles = LegAngles::default();
             let solvable = inverse_kinematics(&geom, &pose, &mut angles).is_ok();
             assert_eq!(solvable, min >= 0.0, "z {z} min margin {min}");
@@ -460,19 +474,10 @@ mod tests {
     #[test]
     fn candidate_resting_pose_is_much_tighter_than_stow() {
         let geom = HeadGeometry::default();
-        // Recovered head pose of that resting configuration.
-        let pose = Isometry3::from_parts(
-            Translation3::new(-0.015_17, 0.001_03, 0.126_57),
-            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 30.84_f64.to_radians()),
-        );
-        let mut margins = [0.0; 6];
-        pose_margins(&geom, &pose, &mut margins);
-        let min = margins.iter().copied().fold(f64::INFINITY, f64::min);
+        let min = min_pose_margin(&geom, &rest_head_pose());
         assert!(min > 0.0 && min < 0.001, "min margin {min}");
 
-        let mut stow_margins = [0.0; 6];
-        pose_margins(&geom, &stow_head_pose(), &mut stow_margins);
-        let stow_min = stow_margins.iter().copied().fold(f64::INFINITY, f64::min);
+        let stow_min = min_pose_margin(&geom, &stow_head_pose());
         assert!(stow_min > 40.0 * min, "stow {stow_min} vs rest {min}");
     }
 
@@ -552,8 +557,6 @@ mod tests {
                 }
                 continue;
             }
-            let mut margins = [0.0; 6];
-            pose_margins(geom, &pose, &mut margins);
             let mut slack = [0.0; 6];
             let mut newly_bound = false;
             for (leg, slot) in sweep.left_window.iter_mut().enumerate() {
@@ -567,7 +570,7 @@ mod tests {
             }
             if newly_bound && sweep.first_bind_z.is_nan() {
                 sweep.first_bind_z = z;
-                sweep.min_margin_at_bind = margins.iter().copied().fold(f64::INFINITY, f64::min);
+                sweep.min_margin_at_bind = min_pose_margin(geom, &pose);
                 sweep.slack_at_bind = slack;
             }
         }

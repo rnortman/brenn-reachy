@@ -58,7 +58,7 @@
 use nalgebra::{Isometry3, Matrix6, Point3, Vector3, Vector6};
 use thiserror::Error;
 
-use crate::geometry::HeadGeometry;
+use crate::geometry::{HeadGeometry, cone_angle};
 use crate::ik::LegAngles;
 
 /// Per-iteration cap on the translational part of a step, metres. The whole
@@ -295,11 +295,9 @@ pub fn forward_kinematics(
         residual = next_residual;
     }
 
-    // The clamp is on a component of a unit vector, which rounding can push an
-    // ulp outside [−1, 1] at either end — the near-inverted poses this screen
-    // exists to catch sit at the −1 end. It is arithmetic hygiene before
-    // `acos`, not a cap on anything commanded.
-    let cone = (pose.rotation * Vector3::z()).z.clamp(-1.0, 1.0).acos();
+    // The same tilt the envelope's attitude bound is stated in, so the screen's
+    // looser bound and that tighter one stay comparable.
+    let cone = cone_angle(&pose.rotation);
     let z = pose.translation.z;
     if cone > opts.screen_cone || z < opts.screen_z.0 || z > opts.screen_z.1 {
         return Err(FkError::WrongAssemblyMode {
@@ -316,7 +314,7 @@ pub fn forward_kinematics(
 mod tests {
     use super::*;
     use crate::baked;
-    use crate::geometry::{neutral_head_pose, stow_head_pose};
+    use crate::geometry::{neutral_head_pose, rest_head_pose, stow_head_pose};
     use crate::ik::inverse_kinematics;
     use crate::testutil::Rng;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -359,9 +357,9 @@ mod tests {
     }
 
     /// Crank angles of the vendor's simulated resting configuration, recorded
-    /// independently.
+    /// independently of the head pose [`rest_head_pose`] carries.
     fn candidate_b_angles() -> LegAngles {
-        LegAngles([-56.43, 72.33, -13.97, 11.78, -70.84, 57.48].map(f64::to_radians))
+        LegAngles(baked::REST_CRANK_ANGLES_DEG.map(f64::to_radians))
     }
 
     /// The neutral pose's own crank angles put the head back at neutral, from a
@@ -503,10 +501,7 @@ mod tests {
     #[test]
     fn candidate_b_angles_recover_their_recorded_pose() {
         let geom = HeadGeometry::default();
-        let recorded = Isometry3::from_parts(
-            Translation3::new(-0.015_17, 0.001_03, 0.126_57),
-            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 30.84_f64.to_radians()),
-        );
+        let recorded = rest_head_pose();
 
         let mut out = Isometry3::identity();
         forward_kinematics(

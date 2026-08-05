@@ -42,7 +42,7 @@ use core::time::Duration;
 use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeConfig, EnvelopeReport, EnvelopeViolations, FkError, FkOptions, FkStats, HeadGeometry,
-    LegAngles, check_envelope, forward_kinematics, pose_margins,
+    LegAngles, check_envelope, forward_kinematics, min_pose_margin, outside_limit,
 };
 use thiserror::Error;
 
@@ -284,7 +284,9 @@ pub struct TickReport {
     pub present_fresh: bool,
     /// Consecutive ticks without a position read, this one included.
     pub misses: u32,
-    /// Consecutive ticks with some joint past the tracking threshold.
+    /// Consecutive live ticks with some joint past the tracking threshold,
+    /// including the tick that raised [`Fault::TrackingLost`]. A tick without a
+    /// live read measures nothing and repeats the standing count.
     pub tracking_count: u32,
     /// The joint furthest from its goal, and by how much, when the read was
     /// live.
@@ -296,7 +298,7 @@ pub struct TickReport {
     pub present_min_margin: f64,
     /// The hardware-error bytes, when the health poll ran this tick. Reported
     /// verbatim, including the input-voltage bit that raises no fault.
-    pub health: Option<[ServoHealth; 9]>,
+    pub health: Option<[ServoHealth; JointId::COUNT]>,
     /// What became of the command, if there was one.
     pub command: CommandDisposition,
     /// The envelope check of the sampled path pose, when the tick advanced one.
@@ -342,7 +344,7 @@ pub struct TickInputs<'a> {
     /// A command, at most one per tick.
     pub command: Option<&'a MotionCommand>,
     /// The hardware-error bytes, when the slower health poll ran this tick.
-    pub health: Option<&'a [ServoHealth; 9]>,
+    pub health: Option<&'a [ServoHealth; JointId::COUNT]>,
 }
 
 /// What to command, and the record of how that was decided.
@@ -491,10 +493,7 @@ pub fn motion_tick(
                 Ok(stats) => {
                     out.report.fk = Some(stats);
                     state.fk_seed = pose;
-                    let mut margins = [0.0; 6];
-                    pose_margins(&cfg.geom, &pose, &mut margins);
-                    state.present_min_margin =
-                        margins.iter().copied().fold(f64::INFINITY, f64::min);
+                    state.present_min_margin = min_pose_margin(&cfg.geom, &pose);
                     out.report.present_min_margin = state.present_min_margin;
                     Some(present)
                 }
@@ -520,6 +519,7 @@ pub fn motion_tick(
         }
     };
     out.report.misses = state.miss_count;
+    out.report.tracking_count = state.tracking_count;
 
     // Tracking, on live reads only: a stale reading compared against a fresh
     // goal is a difference nobody measured.
@@ -528,28 +528,31 @@ pub fn motion_tick(
         let mut over = false;
         for ((id, angle), (_, goal)) in present.joints().into_iter().zip(state.last_goal.joints()) {
             let error = (angle - goal).abs();
-            over |= exceeds(error, cfg.tracking.threshold_rad);
-            if exceeds(error, worst.1) {
+            over |= outside_limit(error, cfg.tracking.threshold_rad);
+            if outside_limit(error, worst.1) {
                 worst = (id, error);
             }
         }
         out.report.tracking_worst = Some(worst);
         if over {
             state.tracking_count += 1;
-            if state.tracking_count >= cfg.tracking.ticks {
-                state.raise(
-                    Fault::TrackingLost {
-                        joint: worst.0,
-                        error: worst.1,
-                    },
-                    out,
-                );
-                return;
-            }
         } else {
             state.tracking_count = 0;
         }
+        // Recorded before the fault check: the tick that runs the budget out is
+        // the one whose count matters most, and a report that shipped zero there
+        // would read as a single-tick trip rather than a sustained breach.
         out.report.tracking_count = state.tracking_count;
+        if over && state.tracking_count >= cfg.tracking.ticks {
+            state.raise(
+                Fault::TrackingLost {
+                    joint: worst.0,
+                    error: worst.1,
+                },
+                out,
+            );
+            return;
+        }
     }
 
     // Health, when the slower poll ran. Reported in full either way; the
@@ -617,7 +620,7 @@ pub fn motion_tick(
     // the thing worth reporting; it is never trimmed and sent.
     for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(state.last_goal.joints()) {
         let delta = (angle - last).abs();
-        if exceeds(delta, cfg.max_step.for_joint(id)) {
+        if outside_limit(delta, cfg.max_step.for_joint(id)) {
             state.raise(Fault::StepTooLarge { joint: id, delta }, out);
             return;
         }
@@ -640,19 +643,6 @@ pub fn motion_tick(
         out.report.completed = true;
     }
     out.report.mode = state.mode;
-}
-
-/// Whether `value` is *not* known to be within `limit`.
-///
-/// Phrased as a failure to place the value rather than as a comparison, because
-/// a measured angle can be non-finite and every direct test of one comes back
-/// false. A quantity nobody can place is over every bound it is put to, which is
-/// the only reading that fails safe.
-fn exceeds(value: f64, limit: f64) -> bool {
-    !matches!(
-        value.partial_cmp(&limit),
-        Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
-    )
 }
 
 /// Take at most one command, returning what became of it. Mutates the state
@@ -707,8 +697,7 @@ fn take_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nalgebra::{Translation3, UnitQuaternion, Vector3};
-    use reachy_kin::inverse_kinematics;
+    use reachy_kin::{inverse_kinematics, rest_head_pose};
 
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
@@ -719,16 +708,26 @@ mod tests {
         let mut angles = LegAngles::default();
         inverse_kinematics(&cfg.geom, &targets.head_pose_body, &mut angles)
             .expect("the test pose is reachable");
-        let mut margins = [0.0; 6];
-        pose_margins(&cfg.geom, &targets.head_pose_body, &mut margins);
         (
             JointVector {
                 body_yaw: targets.body_yaw,
                 legs: angles.0,
                 antennas: targets.antennas,
             },
-            margins.iter().copied().fold(f64::INFINITY, f64::min),
+            min_pose_margin(&cfg.geom, &targets.head_pose_body),
         )
+    }
+
+    /// The recorded tight resting configuration, raised or lowered by `dz`
+    /// metres. At `dz = 0` its clearance is a fraction of the floor, which is
+    /// the configuration the baseline policy exists for.
+    fn rest_targets(dz: f64) -> JointTargets {
+        let mut head_pose_body = rest_head_pose();
+        head_pose_body.translation.z += dz;
+        JointTargets {
+            head_pose_body,
+            ..JointTargets::default()
+        }
     }
 
     /// A machine armed and holding at `targets`.
@@ -1082,8 +1081,27 @@ mod tests {
 
         for n in 3..5 {
             let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &lagging, None);
+            assert_eq!(out.report.tracking_count, n - 2);
             assert_eq!(out.report.fault, None);
         }
+
+        // A tick that measured nothing repeats the standing count rather than
+        // reporting a run that has not ended.
+        let mut out = TickOutputs::default();
+        motion_tick(
+            &cfg,
+            &mut state,
+            &TickInputs {
+                now: secs(0.08),
+                present: None,
+                command: None,
+                health: None,
+            },
+            &mut out,
+        );
+        assert!(!out.report.present_fresh);
+        assert_eq!(out.report.tracking_count, 2);
+
         let out = tick_with(&cfg, &mut state, secs(0.1), &lagging, None);
         assert_eq!(
             out.report.fault,
@@ -1092,6 +1110,10 @@ mod tests {
                 error: 0.4
             }),
             "the joint furthest from its goal is the one named"
+        );
+        assert_eq!(
+            out.report.tracking_count, 3,
+            "the tick that ran the budget out reports the full run, not zero"
         );
     }
 
@@ -1269,13 +1291,7 @@ mod tests {
     #[test]
     fn the_present_clearance_is_the_baseline() {
         let cfg = MotionConfig::default();
-        let rest = JointTargets {
-            head_pose_body: Isometry3::from_parts(
-                Translation3::new(-0.015_17, 0.001_03, 0.126_57),
-                UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 30.84_f64.to_radians()),
-            ),
-            ..JointTargets::default()
-        };
+        let rest = rest_targets(0.0);
         let (mut state, pinned) = armed_at(&cfg, &rest);
         assert!(
             state.present_min_margin() < 0.000_3,
@@ -1285,13 +1301,7 @@ mod tests {
 
         // One millimetre up: still far below the floor, admitted because it
         // improves on the measured clearance.
-        let lift = JointTargets {
-            head_pose_body: Isometry3::from_parts(
-                Translation3::new(-0.015_17, 0.001_03, 0.127_57),
-                rest.head_pose_body.rotation,
-            ),
-            ..JointTargets::default()
-        };
+        let lift = rest_targets(0.001);
         let command = MotionCommand::MoveTo {
             target: lift,
             duration: secs(2.0),
@@ -1303,13 +1313,7 @@ mod tests {
         // Downward from the same rest is a tightening, and no baseline excuses
         // that.
         let (mut state, pinned) = armed_at(&cfg, &rest);
-        let drop = JointTargets {
-            head_pose_body: Isometry3::from_parts(
-                Translation3::new(-0.015_17, 0.001_03, 0.125_57),
-                rest.head_pose_body.rotation,
-            ),
-            ..JointTargets::default()
-        };
+        let drop = rest_targets(-0.001);
         let command = MotionCommand::MoveTo {
             target: drop,
             duration: secs(2.0),
