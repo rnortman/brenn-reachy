@@ -32,10 +32,12 @@
 #![forbid(unsafe_code)]
 
 pub mod baked;
+pub mod fk;
 pub mod geometry;
 pub mod ik;
 #[cfg(test)]
 mod testutil;
 
+pub use fk::{FkError, FkOptions, FkStats, forward_kinematics};
 pub use geometry::{BranchSign, HeadGeometry, LegGeometry, neutral_head_pose, stow_head_pose};
 pub use ik::{IkError, LegAngles, inverse_kinematics, pose_margins};
