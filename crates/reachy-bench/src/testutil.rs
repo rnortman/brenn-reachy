@@ -47,6 +47,16 @@ pub(crate) struct FakeMachine {
     /// checksum was taken, so the host sees bytes that disagree with
     /// themselves.
     pub(crate) damaged: Vec<(u8, u16)>,
+    /// Servos whose Goal Position register stores what is written to it even
+    /// with torque off, instead of reporting the present position. Not this
+    /// platform: it is the firmware the goal-shadow case exists to catch, and
+    /// the only way a test can put a limp servo's goal anywhere but where it
+    /// stands.
+    pub(crate) unmirrored: Vec<u8>,
+    /// Per servo, how many counts short of its goal a torqued servo comes to
+    /// rest: the standing error of a loaded position loop. Zero is the perfect
+    /// tracking the rest of the fixture assumes.
+    pub(crate) lag: HashMap<u8, i32>,
     out: VecDeque<u8>,
 }
 
@@ -59,6 +69,8 @@ impl FakeMachine {
             ignored: Vec::new(),
             mute: HashMap::new(),
             damaged: Vec::new(),
+            unmirrored: Vec::new(),
+            lag: HashMap::new(),
             out: VecDeque::new(),
         }
     }
@@ -72,17 +84,59 @@ impl FakeMachine {
         self.regs.get(&(id, reg.addr)).map(Vec::as_slice)
     }
 
+    /// Whether this servo is holding torque.
+    fn torqued(&self, id: u8) -> bool {
+        self.regs
+            .get(&(id, reg_for(RegId::TorqueEnable).addr))
+            .is_some_and(|bytes| bytes.first().is_some_and(|byte| *byte != 0))
+    }
+
+    /// Whether this servo's Goal Position register is a mirror of Present
+    /// Position rather than a store.
+    ///
+    /// What these servos do with torque off: a goal read comes back as the
+    /// present position and a goal write is acknowledged and dropped.
+    fn mirroring(&self, id: u8) -> bool {
+        !self.torqued(id) && !self.unmirrored.contains(&id)
+    }
+
+    /// The register a read of `addr` actually comes out of.
+    fn source(&self, id: u8, addr: u16) -> u16 {
+        if addr == reg_for(RegId::GoalPosition).addr && self.mirroring(id) {
+            return reg_for(RegId::PresentPosition).addr;
+        }
+        addr
+    }
+
     /// Take a write, whether it came unicast or in a grouped frame.
     ///
     /// A servo in position mode reports where its goal put it. This fixture
     /// models that as instant, so a position read after a goal write sees the
-    /// written value.
+    /// written value, short of it by whatever lag the servo was given. A goal
+    /// written to a mirroring servo goes nowhere, and a goal stored by a limp
+    /// unmirrored one moves nothing: torque is what makes a target a motion.
     fn store(&mut self, id: u8, addr: u16, data: Vec<u8>) {
         if addr == reg_for(RegId::GoalPosition).addr {
-            self.regs
-                .insert((id, reg_for(RegId::PresentPosition).addr), data.clone());
+            if self.mirroring(id) {
+                return;
+            }
+            if self.torqued(id) {
+                let reached = self.reached(id, &data);
+                self.regs
+                    .insert((id, reg_for(RegId::PresentPosition).addr), reached);
+            }
         }
         self.regs.insert((id, addr), data);
+    }
+
+    /// Where a goal of `data` counts actually leaves the servo: at it, or the
+    /// configured lag short of it.
+    fn reached(&self, id: u8, data: &[u8]) -> Vec<u8> {
+        let lag = self.lag.get(&id).copied().unwrap_or(0);
+        let Ok(bytes) = <[u8; 4]>::try_from(data) else {
+            return data.to_vec();
+        };
+        (i32::from_le_bytes(bytes) - lag).to_le_bytes().to_vec()
     }
 
     /// Whether this servo answers a read of `addr` at all, spending one count
@@ -155,7 +209,8 @@ impl BusPort for FakeMachine {
                     return Ok(());
                 }
                 let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
-                let mut value = self.regs.get(&(id, addr)).cloned().unwrap_or_default();
+                let source = self.source(id, addr);
+                let mut value = self.regs.get(&(id, source)).cloned().unwrap_or_default();
                 value.resize(width, 0);
                 self.answer(id, addr, error, &value);
             }
@@ -178,7 +233,8 @@ impl BusPort for FakeMachine {
                         continue;
                     }
                     let error = self.errors.get(&(asked, addr)).copied().unwrap_or(0);
-                    let mut value = self.regs.get(&(asked, addr)).cloned().unwrap_or_default();
+                    let source = self.source(asked, addr);
+                    let mut value = self.regs.get(&(asked, source)).cloned().unwrap_or_default();
                     value.resize(width, 0);
                     self.answer(asked, addr, error, &value);
                 }
@@ -247,6 +303,7 @@ pub(crate) struct GroupedWrite {
 pub(crate) struct Spy {
     machine: Rc<RefCell<FakeMachine>>,
     log: Rc<RefCell<Vec<(u8, u8)>>>,
+    reads: Rc<RefCell<Vec<(u8, u16)>>>,
     grouped: Rc<RefCell<Vec<u16>>>,
     addressed: Rc<RefCell<Vec<Vec<u8>>>>,
     commanded: Rc<RefCell<Vec<GroupedWrite>>>,
@@ -255,9 +312,19 @@ pub(crate) struct Spy {
 impl Spy {
     /// Wrap `machine`.
     pub(crate) fn new(machine: FakeMachine) -> Self {
+        Self::sharing(Rc::new(RefCell::new(machine)))
+    }
+
+    /// Wrap a machine another port already wrapped, with a fresh traffic log.
+    ///
+    /// One register file behind two runs is what a second command in one power
+    /// cycle is: the RAM the first run wrote is still holding what it wrote, and
+    /// the servos are still holding torque.
+    pub(crate) fn sharing(machine: Rc<RefCell<FakeMachine>>) -> Self {
         Self {
-            machine: Rc::new(RefCell::new(machine)),
+            machine,
             log: Rc::new(RefCell::new(Vec::new())),
+            reads: Rc::new(RefCell::new(Vec::new())),
             grouped: Rc::new(RefCell::new(Vec::new())),
             addressed: Rc::new(RefCell::new(Vec::new())),
             commanded: Rc::new(RefCell::new(Vec::new())),
@@ -296,11 +363,26 @@ impl Spy {
     pub(crate) fn log(&self) -> Rc<RefCell<Vec<(u8, u8)>>> {
         Rc::clone(&self.log)
     }
+
+    /// Every unicast read, as (servo, register address) pairs, in the order they
+    /// were asked.
+    ///
+    /// Separate from [`Self::log`], which carries the instruction byte only: one
+    /// read looks like every other there, so which register a case actually put
+    /// on the wire — and how many times — is only visible here.
+    pub(crate) fn reads(&self) -> Rc<RefCell<Vec<(u8, u16)>>> {
+        Rc::clone(&self.reads)
+    }
 }
 
 impl BusPort for Spy {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.log.borrow_mut().push((buf[4], buf[7]));
+        if buf[7] == INST_READ {
+            self.reads
+                .borrow_mut()
+                .push((buf[4], u16::from_le_bytes([buf[8], buf[9]])));
+        }
         if buf[7] == INST_SYNC_READ {
             self.grouped
                 .borrow_mut()

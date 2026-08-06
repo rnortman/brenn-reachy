@@ -69,8 +69,11 @@ the edge: `reachy-motion` still carries no I/O, no addresses and no counts.
 
 ## Status
 
-Early. The repository is scaffolded, licensed, and gated; the crates above are
-declared but not yet implemented. Nothing here has driven a motor.
+Implemented through the bench milestone: all five crates are functional and
+tested, and the read-only self-test registry has run green against a real unit.
+
+Supervised motion bring-up is in progress. The arming sequence has enabled
+torque on hardware, and no commanded motion has run yet.
 
 ## Attribution
 

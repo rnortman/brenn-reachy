@@ -309,7 +309,8 @@ fn record_path(args: &Args) -> PathBuf {
 ///
 /// The record is written whether the run passed or not — a failing run is
 /// exactly the evidence a bring-up wants kept — and the exit code is the
-/// verdict.
+/// verdict. Nothing that moves the machine runs against a record short of a
+/// pass.
 fn selftest(args: &Args) -> anyhow::Result<()> {
     let cfg = config::load(&args.config)?;
     let registry = Registry::from_config(&cfg)?;
@@ -321,11 +322,9 @@ fn selftest(args: &Args) -> anyhow::Result<()> {
 /// Run the registry, print the run, write the record, and refuse if anything
 /// fell short.
 ///
-/// The record is saved before the refusal, which is the property that matters
-/// on a bring-up: with no reviewed clearance
-/// floor baked in yet every run fails, so the failing path is the only path
-/// there is, and an early return between the run and the save would throw away
-/// the whole product of a hardware round trip.
+/// The record is saved before the refusal: a failing run is the reading a
+/// bring-up most wants kept, and an early return between the run and the save
+/// would throw away the whole product of a hardware round trip.
 fn run_and_record<P, E>(
     registry: &Registry,
     port: Result<P, E>,
@@ -380,9 +379,9 @@ where
     let resolved = arm_gates(&cfg, &record_path(args))?;
 
     println!(
-        "{command} over {} at {} baud. Every command but `off` verifies the nine servos, pins \
-         every joint where it stands and enables torque before it moves anything; a joint \
-         outside its travel window is pulled to the nearer bound.\n\
+        "{command} over {} at {} baud. Every command but `off` verifies the nine servos, enables \
+         torque — which holds every joint where it stands — and pins it there before it moves \
+         anything; a joint outside its travel window is pulled to the nearer bound.\n\
          Only `off` releases torque, and only at stow. A session ended any other way ends by \
          cutting power, and the head falls when it goes — so be ready to take its weight.",
         resolved.device, resolved.timing.baud
@@ -477,10 +476,10 @@ mod tests {
 
     /// A failing run still leaves its record, and the record names what failed.
     ///
-    /// This is the property the whole bring-up rests on: with no reviewed
-    /// clearance floor baked in, every run fails, so the failing path is the
-    /// only path there is. A record saved after the refusal instead of before
-    /// it would throw away the entire product of a hardware round trip.
+    /// A record saved after the refusal instead of before it would throw away
+    /// the entire product of a hardware round trip, and a run against a
+    /// machine that answers nothing is exactly the one whose record is worth
+    /// reading.
     #[test]
     fn a_failing_run_writes_its_record_before_it_refuses() {
         let path = scratch_path();
@@ -506,8 +505,8 @@ mod tests {
         }
     }
 
-    /// A port that will not open is one of the nine cases, not something that
-    /// happened before the run began — so it too leaves a record.
+    /// A port that will not open is one of the registry's own cases, not
+    /// something that happened before the run began — so it too leaves a record.
     #[test]
     fn a_port_that_will_not_open_still_leaves_a_record() {
         let path = scratch_path();
@@ -767,9 +766,9 @@ mod tests {
         assert!(refused.to_string().contains("selftest"), "{refused}");
     }
 
-    /// A record with a case short of a pass refuses by name. Every real record
-    /// is one of these until the clearance floor has been reviewed, so this is
-    /// the gate as a bring-up meets it.
+    /// A record with a case short of a pass refuses by name: an empty record, a
+    /// run that stopped at the case that failed, and one predating a case the
+    /// registry has since gained all fail the same way.
     #[test]
     fn arming_refuses_on_a_record_that_did_not_pass() {
         let path = scratch_path();

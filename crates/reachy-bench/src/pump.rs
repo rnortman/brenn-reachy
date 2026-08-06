@@ -404,14 +404,25 @@ pub fn arm_report(summary: &ArmSummary) -> String {
         summary.antenna_pull_in[0].to_degrees(),
         summary.antenna_pull_in[1].to_degrees()
     ));
-    out.push_str(&format!(
-        "re-pin     {}\n",
-        if summary.repinned {
-            "one pass, after torque came on"
-        } else {
-            "not needed"
-        }
-    ));
+    // Two measurements rather than verdicts: nothing acts on either, and both
+    // are quantities this project has so far only guessed at.
+    let droop: Vec<String> = summary
+        .droop
+        .iter()
+        .map(|gap| {
+            gap.map_or_else(
+                || "limp".to_string(),
+                |rad| format!("{:.3}", rad.to_degrees()),
+            )
+        })
+        .collect();
+    out.push_str(&format!("droop      [{}] deg\n", droop.join(", ")));
+    let shift: Vec<String> = summary
+        .post_enable_shift
+        .iter()
+        .map(|rad| format!("{:.3}", rad.to_degrees()))
+        .collect();
+    out.push_str(&format!("torque-on  [{}] deg of shift\n", shift.join(", ")));
 
     out.push_str(&format!("models     {:?}\n", summary.models));
     let volts: Vec<String> = summary.voltages.iter().map(|v| format!("{v:.1}")).collect();
@@ -1100,6 +1111,7 @@ mod tests {
     use crate::config::Resolved;
     use crate::testutil::{
         BrokenPort, FakeMachine, Spy, TestClock, datumed_config, machine_at, resolved, stow_legs,
+        wind_down_bus,
     };
 
     /// Drive an arm sequence against `machine`, handing back the outcome, the
@@ -1146,7 +1158,8 @@ mod tests {
         // with both antennas well inside their bound.
         assert_eq!(summary.pull_in, [0.0; 6]);
         assert_eq!(summary.antenna_pull_in, [0.0; 2]);
-        assert!(!summary.repinned);
+        // Nothing was found holding torque, so there is no droop to record.
+        assert!(summary.droop.iter().all(Option::is_none));
         assert!(summary.torque_before.iter().all(|on| !on));
         assert_eq!(summary.voltage_polls, 1);
 
@@ -1160,6 +1173,7 @@ mod tests {
                 SeqStep::Health,
                 SeqStep::PoseAndDatum,
                 SeqStep::StateDiscovery,
+                SeqStep::GoalShadow,
                 SeqStep::GainsProfiles,
                 SeqStep::PinAndEnable,
             ]
@@ -1217,6 +1231,77 @@ mod tests {
                 Some(&[1u8][..]),
                 "servo {id} holds torque"
             );
+        }
+    }
+
+    /// A second arm in one power cycle passes, over the machine the first one
+    /// left behind.
+    ///
+    /// The lifecycle re-arms in every process, so this is the ordinary case and
+    /// not an unusual one: the second arm finds the RAM the first wrote — the
+    /// configured profile in the profile registers — and every servo still
+    /// holding torque at the goal it was pinned to. Nothing about that is a
+    /// disagreement with the platform's provisioning, and a sweep that judged
+    /// those registers would refuse every command after the first arm until
+    /// somebody power-cycled the unit.
+    ///
+    /// It also carries the torqued-before path end to end: the shadow assertion
+    /// is skipped for a servo that is really holding, the droop is recorded, and
+    /// the pins come off the held goals rather than off the sagged positions.
+    #[test]
+    fn a_second_arm_in_one_power_cycle_passes_over_the_machine_the_first_left() {
+        let cfg = resolved();
+        let registers = Rc::new(RefCell::new(machine_at(&datumed_config(), &stow_legs())));
+
+        let drive_one = |registers: &Rc<RefCell<FakeMachine>>| {
+            let mut bus = Bus::new(Spy::sharing(Rc::clone(registers)), cfg.timing);
+            let mut seq =
+                ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
+            let mut clock = TestClock::default();
+            drive(
+                &mut bus,
+                &cfg.map,
+                &mut seq,
+                &mut clock,
+                action_budget(&cfg.arm),
+                &mut |_| {},
+            )
+        };
+
+        let first = drive_one(&registers).expect("a correct machine arms");
+        assert!(first.torque_before.iter().all(|on| !on));
+
+        // What the first arm wrote is what the second one finds: the profile
+        // registers hold the configured figures, not the zero a fresh power-on
+        // reads.
+        {
+            let machine = registers.borrow();
+            for id in cfg.map.ids() {
+                let held = machine
+                    .get(id, reg_for(RegId::ProfileAcceleration))
+                    .expect("arming wrote the profile");
+                assert_eq!(
+                    u32::from_le_bytes(held.try_into().expect("a profile is four bytes")),
+                    cfg.arm.profile.acceleration,
+                    "servo {id}"
+                );
+            }
+        }
+
+        let second = drive_one(&registers).expect("a second arm in one power cycle passes");
+        assert!(
+            second.torque_before.iter().all(|on| *on),
+            "the second arm finds the machine holding"
+        );
+        assert!(
+            second.droop.iter().all(Option::is_some),
+            "every held servo's droop is recorded"
+        );
+        // The pins did not ratchet: the second arm pinned where the first did.
+        for joint in JointId::ALL {
+            let before = first.armed.joints.get(joint).expect("a pinned joint");
+            let after = second.armed.joints.get(joint).expect("a pinned joint");
+            assert!((before - after).abs() < 1e-12, "{joint}");
         }
     }
 
@@ -1301,6 +1386,121 @@ mod tests {
         };
         assert_eq!(context.id, 12);
         assert_eq!(read_back, RegValue::Gains { p: 0, i: 0, d: 0 });
+    }
+
+    /// The gains and profiles left in the servos are the configured ones, each
+    /// joint group's own and each register's own.
+    ///
+    /// Read off the fixture's register file rather than off the traffic: what
+    /// matters is what the machine is holding when arming is done with it, and
+    /// these are the registers the whole motion path's behaviour rests on.
+    #[test]
+    fn the_gains_and_profiles_left_in_the_servos_are_the_configured_ones() {
+        let cfg = resolved();
+        let spy = Spy::new(machine_at(&datumed_config(), &stow_legs()));
+        let registers = spy.machine();
+        let mut bus = Bus::new(spy, cfg.timing);
+        let mut seq =
+            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
+        let mut clock = TestClock::default();
+        drive(
+            &mut bus,
+            &cfg.map,
+            &mut seq,
+            &mut clock,
+            action_budget(&cfg.arm),
+            &mut |_| {},
+        )
+        .expect("a correct machine arms");
+
+        // The legs carry the head and are tuned apart from the other three, and
+        // the two profile figures differ from each other — so a lookup that
+        // collapsed the groups, or a register written with its neighbour's
+        // figure, has somewhere to show.
+        assert_ne!(cfg.arm.gains.legs, cfg.arm.gains.yaw);
+        assert_ne!(cfg.arm.profile.acceleration, cfg.arm.profile.velocity);
+
+        let machine = registers.borrow();
+        for (row, id) in cfg.map.ids().iter().enumerate() {
+            let joint = JointId::ALL[row];
+            for (reg, value) in [
+                (RegId::PositionGains, cfg.arm.gains.for_joint(joint).into()),
+                (
+                    RegId::ProfileAcceleration,
+                    RegValue::U32(cfg.arm.profile.acceleration),
+                ),
+                (
+                    RegId::ProfileVelocity,
+                    RegValue::U32(cfg.arm.profile.velocity),
+                ),
+            ] {
+                let raw = cfg
+                    .map
+                    .encode_value(row, reg, value)
+                    .expect("a configured figure encodes");
+                assert_eq!(
+                    machine.get(*id, reg_for(reg)),
+                    Some(raw.as_slice()),
+                    "servo {id}, {reg}"
+                );
+            }
+        }
+    }
+
+    /// A reply that goes missing once is retried on the configured budget, and
+    /// the sequencer never learns it happened.
+    ///
+    /// The retry budget is the driver's to spend: a sequencer told "no answer"
+    /// when one dropped reply would have come back on a second ask refuses a
+    /// healthy machine, and the same budget spent gives "silent" its meaning.
+    #[test]
+    fn a_dropped_reply_inside_the_retry_budget_is_retried() {
+        let position = reg_for(RegId::PresentPosition).addr;
+
+        let mut generous = datumed_config();
+        wind_down_bus(&mut generous);
+        generous.bus.retry_attempts = 2;
+        let generous = generous.resolve().expect("a datumed example resolves");
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        machine.mute.insert((13, position), 1);
+        let (outcome, _, _) = arm(&generous, machine);
+        outcome.expect("one dropped reply inside the budget still arms");
+
+        // The same machine with nothing to spend: one miss is silence.
+        let single = resolved();
+        assert_eq!(single.timing.retry_attempts, 1);
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        machine.mute.insert((13, position), 1);
+        let (outcome, _, _) = arm(&single, machine);
+        let refused = outcome.expect_err("a single attempt has nothing to fall back on");
+        let PumpError::Sequence(SeqError::NoAnswer { context }) = refused else {
+            panic!("expected silence, got {refused}");
+        };
+        assert_eq!(context.id, 13);
+        assert_eq!(context.step, SeqStep::PoseAndDatum);
+    }
+
+    /// A transaction's result reaches the action that earned it, and nothing
+    /// after that.
+    ///
+    /// A sequencer absorbs whatever it is handed as the answer to its own last
+    /// request, so a result carried past a wait would be read as the answer to
+    /// a request that was never made.
+    #[test]
+    fn a_result_answers_the_transaction_that_earned_it() {
+        let cfg = resolved();
+        let mut bus = Bus::new(
+            Spy::new(machine_at(&datumed_config(), &stow_legs())),
+            cfg.timing,
+        );
+        let mut seq = Recorder::default();
+        let mut clock = TestClock::default();
+        drive(&mut bus, &cfg.map, &mut seq, &mut clock, 16, &mut |_| {})
+            .expect("the scripted sequence finishes");
+
+        // Opening call, then the ping's answer, then the wait — which answers
+        // nothing — then the second ping's answer.
+        assert_eq!(seq.handed, vec![false, true, false, true]);
     }
 
     /// The supply gate's waits are the driver's, and a rail that never comes up
@@ -1471,7 +1671,8 @@ mod tests {
             "found",
             "armed",
             "pull-in",
-            "re-pin",
+            "droop",
+            "torque-on",
             "models",
             "supply",
             "health",
@@ -1581,6 +1782,32 @@ mod tests {
                 Self::Waiting => SeqAction::Wait {
                     until: now + Duration::from_millis(1),
                 },
+            }
+        }
+
+        fn step(&self) -> SeqStep {
+            SeqStep::Presence
+        }
+    }
+
+    /// A scripted sequence that pings, waits, pings again and finishes,
+    /// recording whether it was handed a prior result at each step.
+    #[derive(Default)]
+    struct Recorder {
+        handed: Vec<bool>,
+    }
+
+    impl Sequencer for Recorder {
+        type Summary = ();
+
+        fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<()> {
+            self.handed.push(prior.is_some());
+            match self.handed.len() {
+                1 | 3 => SeqAction::Transact(BusRequest::Ping { id: 10 }),
+                2 => SeqAction::Wait {
+                    until: now + Duration::from_millis(1),
+                },
+                _ => SeqAction::Done(()),
             }
         }
 
@@ -2524,6 +2751,121 @@ mod tests {
         assert!(events.contains(&TickEvent::Completed));
     }
 
+    /// A health poll configured at or above the tick rate sweeps every period.
+    ///
+    /// The poll interval is whole periods, and a rate at or above the tick rate
+    /// rounds to none of them — so the floor at one period is what stands
+    /// between a fast poll and a loop dividing by it.
+    #[test]
+    fn a_health_poll_at_the_tick_rate_sweeps_every_period() {
+        let mut cfg = resolved();
+        cfg.health_poll_hz = cfg.tick_hz * 2;
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = hold(
+            &mut bench,
+            &mut pump,
+            Duration::from_millis(200),
+            &mut clock,
+        );
+        let summary = outcome.expect("a hold runs at whatever poll rate it was given");
+
+        let hardware = reg_for(RegId::HardwareErrorStatus).addr;
+        assert!(summary.ticks > 1, "{summary:?}");
+        assert_eq!(
+            bench
+                .grouped
+                .borrow()
+                .iter()
+                .filter(|addr| **addr == hardware)
+                .count() as u64,
+            summary.ticks
+        );
+        assert_eq!(summary.health_misses, 0);
+    }
+
+    /// The jitter a run reports is the worst period of the whole run, not the
+    /// last one.
+    ///
+    /// It is the number that says whether the overrun tolerance is the right
+    /// size on a given host, and a spike that a later on-time period erased
+    /// would say the opposite of what happened.
+    #[test]
+    fn the_reported_jitter_is_the_worst_period_not_the_last() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        // Three quarters of a period: over the overrun tolerance, and under a
+        // whole period, so the loop is back on schedule for the next one.
+        let spike = pump.period() * 3 / 4;
+        let mut clock = SpikeClock {
+            now: Duration::ZERO,
+            spike,
+            at: 2,
+            woken: 0,
+        };
+
+        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let summary = outcome.expect("one late period does not stop a move");
+
+        assert_eq!(summary.worst_jitter, spike, "{summary:?}");
+        assert_eq!(summary.overruns, 1, "{summary:?}");
+        assert!(summary.ticks > 10, "later periods ran on time: {summary:?}");
+        assert!(
+            events.contains(&TickEvent::Overrun {
+                tick: 2,
+                late: spike
+            }),
+            "{events:?}"
+        );
+    }
+
+    /// The tick is fed what the servos report, not what they were last told.
+    ///
+    /// The tracking monitor is the only thing that can tell a machine holding
+    /// its goals from one being dragged off them, and it can only do that if
+    /// the measurement is a measurement. A loop that handed the tick its own
+    /// last goals would report perfect tracking on a machine that never moved.
+    #[test]
+    fn a_machine_that_never_reaches_its_goals_faults_on_tracking() {
+        let mut cfg = resolved();
+        cfg.motion.tracking.threshold_rad = 0.02;
+        cfg.motion.tracking.ticks = 5;
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        // Thirty counts short of whatever it is told, on every servo: about
+        // 0.046 rad, and a standing offset rather than a lag that closes.
+        for id in cfg.map.ids() {
+            bench.registers.borrow_mut().lag.insert(id, 30);
+        }
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("a machine that never arrives is not tracking");
+
+        assert!(
+            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            "{error}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Faulted(Fault::TrackingLost { .. }))),
+            "{events:?}"
+        );
+        // Stopped, not released: the head is still held where it got to.
+        let machine = bench.registers.borrow();
+        for id in cfg.map.ids() {
+            assert_eq!(
+                machine.get(id, reg_for(RegId::TorqueEnable)),
+                Some(&[1u8][..]),
+                "servo {id}"
+            );
+        }
+    }
+
     /// The port failing mid-move is not the machine's answer, and it is not a
     /// missed read either.
     #[test]
@@ -2634,6 +2976,32 @@ mod tests {
         }
 
         fn sleep_until(&mut self, _until: Duration) {}
+    }
+
+    /// A clock that wakes late once, on one nominated period, and on time for
+    /// every other.
+    struct SpikeClock {
+        now: Duration,
+        spike: Duration,
+        /// Which wake runs late, counted from one.
+        at: u64,
+        woken: u64,
+    }
+
+    impl Clock for SpikeClock {
+        fn now(&self) -> Duration {
+            self.now
+        }
+
+        fn sleep_until(&mut self, until: Duration) {
+            self.woken += 1;
+            let late = if self.woken == self.at {
+                self.spike
+            } else {
+                Duration::ZERO
+            };
+            self.now = (until + late).max(self.now);
+        }
     }
 
     /// A clock that always wakes late, by a fixed amount.

@@ -11,9 +11,9 @@ use std::time::Duration;
 use reachy_kin::EnvelopeConfig;
 
 use crate::arm::{
-    ArmConfig, DEFAULT_GAINS, DEFAULT_MAX_PIN_PULL_IN, DEFAULT_MIN_ARM_VOLTAGE,
-    DEFAULT_REPIN_TOLERANCE, DEFAULT_VOLTAGE_BUDGET, DEFAULT_VOLTAGE_POLL_PERIOD, ProfileConfig,
-    ProvisionTable, SERVO_IDS,
+    ArmConfig, DEFAULT_GAINS, DEFAULT_GOAL_SHADOW_TOLERANCE, DEFAULT_MAX_PIN_PULL_IN,
+    DEFAULT_MIN_ARM_VOLTAGE, DEFAULT_RECHECK_TOLERANCE, DEFAULT_VOLTAGE_BUDGET,
+    DEFAULT_VOLTAGE_POLL_PERIOD, ProfileConfig, ProvisionTable, SERVO_IDS,
 };
 use crate::seq::{BusRequest, BusResult, SeqAction, SeqError, SeqStep, Sequencer};
 
@@ -51,7 +51,8 @@ pub(crate) fn arm_config(env: &EnvelopeConfig) -> ArmConfig {
             velocity: 50,
         },
         max_pin_pull_in: DEFAULT_MAX_PIN_PULL_IN,
-        repin_tolerance: DEFAULT_REPIN_TOLERANCE,
+        recheck_tolerance: DEFAULT_RECHECK_TOLERANCE,
+        goal_shadow_tolerance: DEFAULT_GOAL_SHADOW_TOLERANCE,
         leg_windows: leg_windows(env),
     }
 }

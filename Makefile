@@ -17,7 +17,7 @@ SHELL := /bin/bash
 .PHONY: help
 help:
 	@echo "Repo-root targets:"
-	@echo "  make check         the gate (fmt, clippy, tests) — same contents CI runs"
+	@echo "  make check         the gate (shellcheck, fmt, clippy, tests) — same contents CI runs"
 	@echo "  make fix           auto-fix what the gate can fix (fmt + clippy --fix)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
@@ -29,13 +29,47 @@ help:
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
 	@echo "  make bench-fetch     bring a run's state file back, timestamped"
 
+# The shell half of the gate. The tracked scripts push binaries and
+# configuration onto real hardware and drop privileges there, and they already
+# carry `# shellcheck source=` directives, which mean nothing unless something
+# runs them.
+#
+# The file set is every tracked `.sh` plus the two extensionless git hooks,
+# which have no suffix to be found by. The flags are load-bearing: -x follows
+# the sourced files, and -P SCRIPTDIR resolves a `source=` directive against the
+# directory of the script carrying it rather than the working directory — which
+# is what the directives assume, and without which a clean tree reports SC1091
+# and SC2154 findings that are artifacts of the invocation.
+#
+# The tracked set arrives NUL-separated through xargs rather than as an unquoted
+# substitution: a path carrying a space would otherwise split into arguments
+# naming nothing, and one starting with a dash would be read as a flag. `--`
+# ends the options on both invocations for the same reason.
+#
+# Hard-required, never skipped when the tool is absent: a gate that passes on a
+# machine missing shellcheck and fails on CI inverts the local-gate-first rule.
+.PHONY: check-scripts
+check-scripts:
+	@command -v shellcheck >/dev/null 2>&1 || { \
+	    echo "shellcheck not found on PATH — the script half of the gate cannot run." >&2; \
+	    echo "Install it from your distribution (Fedora: dnf install ShellCheck;" >&2; \
+	    echo "Debian and Ubuntu: apt install shellcheck), or from" >&2; \
+	    echo "https://github.com/koalaman/shellcheck#installing." >&2; \
+	    exit 1; \
+	}
+	git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -x -P SCRIPTDIR --
+	shellcheck -x -P SCRIPTDIR -- .githooks/pre-commit .githooks/pre-push
+
 # The whole gate. One workspace at the repo root, every crate a default member,
 # so --workspace and a bare invocation cover the same set.
 #
 # -D warnings on clippy and --check on fmt: this repo's style rules are not
 # advisory, and a warning that CI tolerates is a warning nobody reads.
+#
+# The scripts go first: they are seconds of work, and a broken deploy script is
+# not something to discover after a full test run.
 .PHONY: check
-check:
+check: check-scripts
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace

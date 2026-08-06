@@ -23,10 +23,18 @@ jobs:
   # the branch embeds this string, so renaming it later silently makes that rule
   # vacuous.
   check:
-    name: check (fmt, clippy, test)
+    name: check (shellcheck, fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # The gate's first step needs it. Installed explicitly rather than
+      # inherited from whatever the runner image happens to ship, so a step that
+      # names the dependency fails instead of the gate failing obscurely. The
+      # update first: the image's package lists go stale against the mirrors,
+      # and an install off a stale list 404s on a tree that is fine.
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       # rust-toolchain.toml names the channel and the components, so this resolves
       # and installs exactly what a developer's machine uses. Doing it as an
@@ -40,10 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The gate's contents live in the root `check` target, not here, so the whole
-      # thing is reproducible locally on a fresh clone. No apt prerequisites: the
-      # serial port dependency is built without its udev-backed enumeration
-      # support, which is the only native library this workspace would otherwise
-      # need.
+      # thing is reproducible locally on a fresh clone. shellcheck above is the only
+      # apt prerequisite: the serial port dependency is built without its udev-backed
+      # enumeration support, which is the only native library this workspace would
+      # otherwise need.
       - run: make check
 
   scrub:

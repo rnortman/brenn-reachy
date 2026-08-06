@@ -411,10 +411,13 @@ pub struct ArmSection {
     /// The largest distance a pin may pull a joint, degrees.
     #[serde(default = "default_max_pin_pull_in_deg")]
     pub max_pin_pull_in_deg: f64,
-    /// How far a joint may drift between its pin and the read after torque came
-    /// on, degrees.
-    #[serde(default = "default_repin_tolerance_deg")]
-    pub repin_tolerance_deg: f64,
+    /// How far a joint may be from where the arrival check expects it, degrees.
+    #[serde(default = "default_recheck_tolerance_deg")]
+    pub recheck_tolerance_deg: f64,
+    /// How far a limp servo's goal register may sit from its measured position,
+    /// degrees.
+    #[serde(default = "default_goal_shadow_tolerance_deg")]
+    pub goal_shadow_tolerance_deg: f64,
     /// Position gains for the six crank servos.
     #[serde(default = "default_leg_gains")]
     pub leg_gains: GainsSection,
@@ -473,8 +476,12 @@ fn default_max_pin_pull_in_deg() -> f64 {
     12.0
 }
 
-fn default_repin_tolerance_deg() -> f64 {
+fn default_recheck_tolerance_deg() -> f64 {
     0.5
+}
+
+fn default_goal_shadow_tolerance_deg() -> f64 {
+    2.0
 }
 
 fn default_leg_gains() -> GainsSection {
@@ -526,6 +533,13 @@ impl Default for DisarmSection {
 /// the shutdown masks, whose correct values nobody has established. Arming reads
 /// and reports those rather than judging them, and a reading in an arm report is
 /// what establishes them.
+///
+/// The profile registers are absent for a different reason: arming writes them
+/// itself, verified, at every arm, and they live in RAM that holds until power
+/// comes off. What a table here could state is the power-on value, which stops
+/// being true the moment this process has armed once — so they are read and
+/// reported rather than checked, and arming's own read-back is the sole
+/// authority on what they hold. The gains are absent for the same reason.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvisionSection {
@@ -551,11 +565,6 @@ pub struct ProvisionSection {
     /// because the roster is not all one part; on this unit all nine read the
     /// same untouched factory ceiling.
     pub current_limit: [u16; JointId::COUNT],
-    /// Profile Acceleration, all nine, as provisioned. Arming rewrites this at
-    /// every arm; what is checked here is the state the servo powers up in.
-    pub profile_acceleration: u32,
-    /// Profile Velocity, all nine, as provisioned.
-    pub profile_velocity: u32,
     /// The per-leg position window the servo itself refuses to be commanded
     /// past, counts, lower then upper, legs 1..=6. Mapped through the servo map
     /// under the configured datum, this must be the envelope's crank window.
@@ -575,8 +584,6 @@ impl Default for ProvisionSection {
             max_voltage_limit: 70,
             min_voltage_limit: 35,
             current_limit: [1750; JointId::COUNT],
-            profile_acceleration: 0,
-            profile_velocity: 0,
             leg_position_limits: [
                 [1502, 2958],
                 [1138, 2844],
@@ -823,14 +830,13 @@ impl BenchConfig {
             RegId::MinVoltageLimit,
             ProvisionExpect::Check(RegValue::U16(section.min_voltage_limit)),
         );
-        table.set_all(
-            RegId::ProfileAcceleration,
-            ProvisionExpect::Check(RegValue::U32(section.profile_acceleration)),
-        );
-        table.set_all(
-            RegId::ProfileVelocity,
-            ProvisionExpect::Check(RegValue::U32(section.profile_velocity)),
-        );
+        // Read and reported, never judged: the gains-and-profiles phase writes
+        // these RAM registers at every arm and verifies its own write, so what
+        // they hold is arming's property rather than the platform's setup. A
+        // nonzero reading here is useful evidence — it says the machine has not
+        // been power-cycled since the last arm — and it is not a disagreement.
+        table.set_all(RegId::ProfileAcceleration, ProvisionExpect::Record);
+        table.set_all(RegId::ProfileVelocity, ProvisionExpect::Record);
         // Recorded rather than checked: nobody has established what these hold,
         // and a reading in the arm report is what establishes them. The three
         // single-turn joints' position limits are here for the same reason —
@@ -910,8 +916,16 @@ impl BenchConfig {
             },
             max_pin_pull_in: positive("arm.max_pin_pull_in_deg", arm_section.max_pin_pull_in_deg)?
                 .to_radians(),
-            repin_tolerance: positive("arm.repin_tolerance_deg", arm_section.repin_tolerance_deg)?
-                .to_radians(),
+            recheck_tolerance: positive(
+                "arm.recheck_tolerance_deg",
+                arm_section.recheck_tolerance_deg,
+            )?
+            .to_radians(),
+            goal_shadow_tolerance: positive(
+                "arm.goal_shadow_tolerance_deg",
+                arm_section.goal_shadow_tolerance_deg,
+            )?
+            .to_radians(),
             leg_windows,
         };
 
@@ -1202,7 +1216,13 @@ provenance = \"test fixture\"
                 < 1e-15
         );
         assert!(
-            (resolved.arm.repin_tolerance - reachy_motion::arm::DEFAULT_REPIN_TOLERANCE).abs()
+            (resolved.arm.recheck_tolerance - reachy_motion::arm::DEFAULT_RECHECK_TOLERANCE).abs()
+                < 1e-15
+        );
+        assert!(
+            (resolved.arm.goal_shadow_tolerance
+                - reachy_motion::arm::DEFAULT_GOAL_SHADOW_TOLERANCE)
+                .abs()
                 < 1e-15
         );
         assert!(
@@ -1587,12 +1607,13 @@ provenance = \"test fixture\"
     fn the_provisioning_table_checks_the_setup_and_records_the_rest() {
         let cfg = minimal();
         let table = cfg.provision_table();
-        // Ten registers on all nine servos — the homing offset among them — the
-        // current limit on all nine, and two more per-leg registers on six legs.
-        assert_eq!(table.checks(), 10 * 9 + 9 + 2 * 6);
-        // Everything checked, plus four recorded families on all nine, less the
+        // Eight registers on all nine servos — the homing offset among them —
+        // the current limit on all nine, and two more per-leg registers on six
+        // legs.
+        assert_eq!(table.checks(), 8 * 9 + 9 + 2 * 6);
+        // Everything checked, plus six recorded families on all nine, less the
         // two per-leg position limits that are checked rather than recorded.
-        assert_eq!(table.reads(), table.checks() + 4 * 9 - 2 * 6);
+        assert_eq!(table.reads(), table.checks() + 6 * 9 - 2 * 6);
 
         let column = ProvisionTable::column(RegId::OperatingMode).expect("provisioned");
         for row in 0..JointId::COUNT {
@@ -1624,6 +1645,49 @@ provenance = \"test fixture\"
                 "row {row}"
             );
         }
+    }
+
+    /// The two profile registers are read and reported, never compared.
+    ///
+    /// Arming writes them at every arm and they persist in RAM until power comes
+    /// off, so a checked value here holds only until this process has armed
+    /// once — after which every arm and every self-test in the same power cycle
+    /// would fail the sweep on a machine that is behaving exactly as designed.
+    /// The lifecycle re-arms in every process, so that is not an edge case.
+    #[test]
+    fn the_registers_arming_rewrites_are_recorded_and_not_checked() {
+        let table = minimal().provision_table();
+        for reg in [RegId::ProfileAcceleration, RegId::ProfileVelocity] {
+            let column = ProvisionTable::column(reg).expect("read by the sweep");
+            for row in 0..JointId::COUNT {
+                assert_eq!(
+                    table.at(row, column),
+                    Some(ProvisionExpect::Record),
+                    "{reg} row {row}"
+                );
+            }
+        }
+    }
+
+    /// Retired keys are refused by name rather than ignored.
+    ///
+    /// Every section is `deny_unknown_fields`, so a configuration carrying a
+    /// key that no longer exists says so loudly instead of silently accepting
+    /// it.
+    #[test]
+    fn a_configuration_carrying_a_retired_key_is_refused_by_name() {
+        for key in ["profile_acceleration", "profile_velocity"] {
+            let stale = parse(&format!("{MINIMAL}\n[provision]\n{key} = 0\n"));
+            let message = format!("{:#}", stale.expect_err("there is no such key"));
+            assert!(message.contains(key), "{message}");
+        }
+
+        let stale = parse(
+            "[arm]\nprofile_acceleration = 50\nprofile_velocity = 300\n\
+             repin_tolerance_deg = 0.5\n",
+        );
+        let message = format!("{:#}", stale.expect_err("there is no such key"));
+        assert!(message.contains("repin_tolerance_deg"), "{message}");
     }
 
     #[test]

@@ -113,10 +113,18 @@ voltage_budget_s = 30.0
 # human. Sized above the worst per-leg overrun in the recorded resting pose,
 # which is around 10°.
 max_pin_pull_in_deg = 12.0
-# How far a joint may drift between its pin and the read after torque came on.
-# Several counts of the servo's own 0.088° resolution: wide enough not to chase
-# quantisation, narrow enough that a real reset cannot hide inside it.
-repin_tolerance_deg = 0.5
+# How far a joint may be from where the arrival check expects it: either side of
+# the corridor a pulled joint travels along, or away from where an unpulled one
+# was reading a moment earlier. Several counts of the servo's own 0.088°
+# resolution — wide enough not to chase quantisation, narrow enough that real
+# motion cannot hide inside it.
+recheck_tolerance_deg = 0.5
+# How far a limp servo's goal register may sit from its measured position. With
+# torque off these servos report their goal as their present position, and
+# arming enables torque before it writes any goal — so this gate is what says a
+# joint cannot be commanded anywhere when its torque comes on. Twenty-odd times
+# the one count of read wobble the register was observed to have.
+goal_shadow_tolerance_deg = 2.0
 
 # Position gains, written fresh at every arm because they live in RAM and
 # power-on clears them. The values the vendor's own stack writes at startup,
@@ -179,10 +187,13 @@ min_voltage_limit = 35
 # configuration writes a current limit, so what the servos hold is what they
 # shipped with.
 current_limit = [1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
-# As provisioned, which is the state the servo powers up in. Arming rewrites the
-# profile from [arm] at every arm.
-profile_acceleration = 0
-profile_velocity = 0
+# The profile registers are deliberately not keys here. Arming writes them from
+# [arm] at every arm and verifies its own write, and they live in RAM that holds
+# until power comes off — so the only value a key here could state is the
+# power-on one, which stops being true as soon as this machine has armed once.
+# They are read and reported by the sweep instead: a nonzero reading says the
+# machine has not been power-cycled since its last arm.
+#
 # The homing offsets are deliberately not a key here. They are the datum — the
 # servo applies its own offset before reporting a position, so a converted count
 # is the model's crank angle exactly when they hold what the vendor wrote — and

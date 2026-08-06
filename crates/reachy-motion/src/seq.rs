@@ -2,8 +2,9 @@
 //! never touch a port.
 //!
 //! Arming and disarming are not one read and one write. Arming verifies nine
-//! servos' provisioning register by register, waits for the supply rail, pins
-//! every joint at where it already is, and only then enables torque — dozens of
+//! servos' provisioning register by register, waits for the supply rail, checks
+//! that every limp servo's goal register is mirroring where the joint already
+//! is, and only then enables torque and writes goals — dozens of
 //! transactions whose order is the safety property. A state machine that yields
 //! one abstract request at a time keeps that order in one readable place and lets
 //! the whole procedure be tested against scripted replies, with no hardware and
@@ -613,9 +614,13 @@ pub enum SeqStep {
     PoseAndDatum,
     /// Which servos are already holding torque.
     StateDiscovery,
+    /// Every limp servo's goal register mirrors the position it was measured at,
+    /// which is what makes enabling its torque safe.
+    GoalShadow,
     /// The position gains and motion profiles, written fresh.
     GainsProfiles,
-    /// Goals pinned where the joints already are, then torque enabled.
+    /// Torque enabled, which holds every joint where it stands, then goals
+    /// pinned there.
     PinAndEnable,
     /// The platform is measured to be at the stow pose.
     VerifyAtStow,
@@ -630,7 +635,7 @@ impl SeqStep {
     ///
     /// Exhaustive: a phase added without a name is caught by the name guard
     /// rather than escaping it.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Presence,
         Self::Identity,
         Self::Provision,
@@ -638,6 +643,7 @@ impl SeqStep {
         Self::Health,
         Self::PoseAndDatum,
         Self::StateDiscovery,
+        Self::GoalShadow,
         Self::GainsProfiles,
         Self::PinAndEnable,
         Self::VerifyAtStow,
@@ -656,6 +662,7 @@ impl fmt::Display for SeqStep {
             Self::Health => "health",
             Self::PoseAndDatum => "resting pose and datum",
             Self::StateDiscovery => "torque state discovery",
+            Self::GoalShadow => "goal shadow",
             Self::GainsProfiles => "gains and profiles",
             Self::PinAndEnable => "pin and enable",
             Self::VerifyAtStow => "stow verification",
@@ -919,23 +926,56 @@ pub enum SeqError {
         /// How far from stow a joint may be, radians.
         tolerance: f64,
     },
-    /// A joint is not where it was pinned, twice over. Enabling torque can reset
-    /// a servo's reported position once, which is why there is a second attempt;
-    /// a joint that will not settle is a machine nobody should start commanding.
+    /// A joint did not end up where writing its goal should have left it: it
+    /// moved when nothing asked it to, or it is somewhere other than between
+    /// where it started and where it was sent. Either way the machine is not
+    /// standing where arming believes it is, and nothing should start commanding
+    /// it.
     #[error(
-        "{context}: {joint} was pinned at {:.3}° and reads {:.3}° after re-pinning",
+        "{context}: {joint} was pinned at {:.3}°, read {:.3}° before the goal was written \
+         and {:.3}° after",
         pinned.to_degrees(),
+        before.to_degrees(),
         present.to_degrees()
     )]
     PinUnstable {
         /// Where this happened.
         context: StepContext,
-        /// The joint that would not settle.
+        /// The joint that did not settle.
         joint: JointId,
         /// Where it was pinned, radians.
         pinned: f64,
-        /// Where it reads, radians.
+        /// Where it read once torque was on and before its goal was written,
+        /// radians.
+        before: f64,
+        /// Where it reads now, radians.
         present: f64,
+    },
+    /// A servo that is not holding torque has a goal register that does not
+    /// mirror its measured position. Arming enables torque before it writes any
+    /// goal, and that is safe only because a limp servo's goal is where the
+    /// joint already stands — a goal anywhere else means the joint has moved
+    /// since it was measured, or this firmware does not mirror at all, and
+    /// enabling torque would command the difference.
+    #[error(
+        "{context}: {joint} is limp and its goal reads {:.3}° against a position of {:.3}°, \
+         {:.3}° apart and past the {:.3}° gate",
+        goal.to_degrees(),
+        present.to_degrees(),
+        (goal - present).abs().to_degrees(),
+        tolerance.to_degrees()
+    )]
+    GoalShadowMismatch {
+        /// Where this happened.
+        context: StepContext,
+        /// The joint whose goal does not mirror.
+        joint: JointId,
+        /// What its goal register holds, radians.
+        goal: f64,
+        /// Where it was measured, radians.
+        present: f64,
+        /// How far apart the two may be, radians.
+        tolerance: f64,
     },
 }
 
@@ -961,7 +1001,8 @@ impl SeqError {
             | Self::PinnedPoseUnsolvable { context, .. }
             | Self::PinnedPoseOutsideEnvelope { context, .. }
             | Self::NotAtStow { context, .. }
-            | Self::PinUnstable { context, .. } => *context,
+            | Self::PinUnstable { context, .. }
+            | Self::GoalShadowMismatch { context, .. } => *context,
         }
     }
 }

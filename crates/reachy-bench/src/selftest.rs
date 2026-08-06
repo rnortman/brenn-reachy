@@ -2,8 +2,9 @@
 //! record it leaves behind.
 //!
 //! Every case here reads and nothing here writes: pings, register sweeps, the
-//! supply rail, the health bytes, where the platform is resting. No torque, no
-//! motion, nothing sent to a servo but a question. That is what makes the
+//! supply rail, the health bytes, where the platform is resting, and what a limp
+//! servo's goal register says while it rests there. No torque, no motion,
+//! nothing sent to a servo but a question. That is what makes the
 //! registry the gate in front of every command that moves something — it can be
 //! run on an unknown machine at no risk, and it is how this project brings
 //! hardware up: a case asserts what we expect, and the failure is the discovery.
@@ -31,7 +32,9 @@ use thiserror::Error;
 
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
 use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, reg_for, with_retry};
-use reachy_kin::{FkOptions, HeadGeometry, below_limit, rest_head_pose, stow_head_pose};
+use reachy_kin::{
+    FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose, stow_head_pose,
+};
 use reachy_motion::{
     ArmRecord, EXPECTED_MODELS, JointId, JointVector, ProvisionExpect, ProvisionTable, RegId,
     RegValue, VENDOR_HOMING_OFFSETS,
@@ -97,6 +100,9 @@ pub enum Case {
     Health,
     /// Where the platform is resting, recorded.
     RestPose,
+    /// Every limp servo reports its goal as its present position, which is what
+    /// makes enabling torque before writing a goal safe.
+    GoalShadow,
     /// The provisioned homing offsets are the vendor's, so a converted count is
     /// the model's crank angle.
     Datum,
@@ -107,7 +113,7 @@ pub enum Case {
 
 impl Case {
     /// Every case, in run order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::PortOpen,
         Self::Presence,
         Self::Identity,
@@ -115,6 +121,7 @@ impl Case {
         Self::Voltage,
         Self::Health,
         Self::RestPose,
+        Self::GoalShadow,
         Self::Datum,
         Self::RestMargins,
     ];
@@ -130,6 +137,7 @@ impl Case {
             Self::Voltage => "voltage",
             Self::Health => "health",
             Self::RestPose => "rest-pose",
+            Self::GoalShadow => "goal-shadow",
             Self::Datum => "datum",
             Self::RestMargins => "rest-margins",
         }
@@ -248,8 +256,8 @@ fn first_not_passed(cases: &[CaseResult]) -> Option<(Case, Outcome)> {
 /// A run in progress, and the record it becomes.
 ///
 /// Cases are pushed in run order. A case never pushed is reported as
-/// [`Outcome::NotRun`], so a run that stopped at the presence sweep prints nine
-/// lines and fails, rather than printing two and looking short.
+/// [`Outcome::NotRun`], so a run that stopped at the presence sweep prints a
+/// line per case and fails, rather than printing two and looking short.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Report {
     results: Vec<CaseResult>,
@@ -455,15 +463,23 @@ impl SelftestRecord {
 }
 
 /// The clearance the resting pose has to leave from the linkage's singular
-/// configurations, metres — once a person has read a run and set one.
+/// configurations, metres.
 ///
-/// `None` until then, and while it is `None` the case reports [`Outcome::NotRun`]
-/// and records what it measured. Nobody has established what this platform's
-/// rest actually clears, and a threshold invented here would be a number no
-/// reading ever had to survive. The consequence is deliberate: a first run
-/// cannot admit arming, and filling this in is the review step that turns an
-/// observed clearance into a permanent regression guard.
-pub const REST_MARGIN_FLOOR_M: Option<f64> = None;
+/// Reviewed, not invented. Across settle sessions on this unit the smallest
+/// clearance measured was 3.02 mm — after the head had been deliberately
+/// repositioned and firmly re-seated; an earlier undisturbed settle measured
+/// 6.11 mm — and this floor sits at half of the worst of them.
+///
+/// Deliberately loose, because of what it is for: this is an
+/// is-the-machine-assembled-sanely guard, and a machine resting an order of
+/// magnitude tighter than any settle has ever produced is one to look at rather
+/// than to arm. It is not the fence a move is held to. What governs motion off a
+/// tight rest is the present clearance taken as a baseline, in the envelope's
+/// own margin check, and that runs on every commanded pose.
+///
+/// `None` puts the case back to recording what it measures without judging it,
+/// which is where a fresh unit with no settle history of its own starts.
+pub const REST_MARGIN_FLOOR_M: Option<f64> = Some(0.0015);
 
 /// The clearance case's verdict on a measured minimum margin.
 ///
@@ -511,6 +527,7 @@ pub struct Registry {
     geom: HeadGeometry,
     fk: FkOptions,
     min_arm_voltage: f64,
+    goal_shadow_tolerance: f64,
 }
 
 impl Registry {
@@ -535,6 +552,15 @@ impl Registry {
             // it a non-positive floor would let the voltage case pass a dead
             // rail and write that pass into the record a person reviews.
             min_arm_voltage: positive("arm.min_arm_voltage", cfg.arm.min_arm_voltage)?,
+            // Checked here for the same reason and against the same risk: an
+            // infinite or non-finite tolerance would pass a machine whose goal
+            // registers say anything at all, and write that pass into the record
+            // the arm gate reads.
+            goal_shadow_tolerance: positive(
+                "arm.goal_shadow_tolerance_deg",
+                cfg.arm.goal_shadow_tolerance_deg,
+            )?
+            .to_radians(),
         })
     }
 
@@ -577,6 +603,7 @@ impl Registry {
         let Some(counts) = self.rest_pose(&mut bus, report) else {
             return;
         };
+        self.goal_shadow(&mut bus, report);
         self.datum(&mut bus, report);
         self.rest_margins(&counts, report);
     }
@@ -807,6 +834,98 @@ impl Registry {
         Some(counts)
     }
 
+    /// Every limp servo's Goal Position register against the position it is
+    /// reporting.
+    ///
+    /// This is the precondition the arm sequence's order rests on. Arming enables
+    /// torque before it writes any goal, and that is safe only because a servo
+    /// with torque off reports its goal as its present position: at the instant
+    /// torque comes on, the target it starts holding is where it already stands,
+    /// so an enable cannot slam. A servo answering otherwise is a machine this
+    /// project has no safety argument for, and it says so here — with no torque
+    /// on and nothing written, which is why the question is asked in the
+    /// read-only half rather than discovered mid-arm.
+    ///
+    /// A servo found holding torque is exempt: its goal is a target it really is
+    /// holding, and the gap to its present position is the sag of a loaded
+    /// servo. Reported, never judged.
+    fn goal_shadow<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
+        let torque = match self.sweep_u8(bus, RegId::TorqueEnable) {
+            Ok(torque) => torque,
+            Err(detail) => {
+                report.push(CaseResult::fail(Case::GoalShadow, detail));
+                return;
+            }
+        };
+        // Read here rather than taken from the resting-pose case: the comparison
+        // is between two registers of one servo, and a present position read a
+        // sweep earlier could have moved under a hand in between.
+        let present = match self.sweep_i32(bus, RegId::PresentPosition) {
+            Ok(present) => present,
+            Err(detail) => {
+                report.push(CaseResult::fail(Case::GoalShadow, detail));
+                return;
+            }
+        };
+        let goal = match self.sweep_i32(bus, RegId::GoalPosition) {
+            Ok(goal) => goal,
+            Err(detail) => {
+                report.push(CaseResult::fail(Case::GoalShadow, detail));
+                return;
+            }
+        };
+
+        let mut readings = Vec::with_capacity(JointId::COUNT);
+        let mut wrong = Vec::new();
+        let mut holding = 0usize;
+        for (row, id) in self.ids.iter().enumerate() {
+            let (Ok(goal_rad), Ok(present_rad)) = (
+                self.map.present_rad(row, goal[row]),
+                self.map.present_rad(row, present[row]),
+            ) else {
+                report.push(CaseResult::fail(
+                    Case::GoalShadow,
+                    format!("servo {id}: bus row {row} is not one of the nine joints"),
+                ));
+                return;
+            };
+            let gap = goal_rad - present_rad;
+            let torqued = torque[row] != 0;
+            readings.push(format!(
+                "{id}: torque {}, goal {} present {} ({:+.3} deg)",
+                if torqued { "on" } else { "off" },
+                goal[row],
+                present[row],
+                gap.to_degrees()
+            ));
+            if torqued {
+                holding += 1;
+            } else if outside_limit(gap.abs(), self.goal_shadow_tolerance) {
+                wrong.push(format!(
+                    "servo {id}: goal {} sits {:+.3} deg off the present {} it should shadow",
+                    goal[row],
+                    gap.to_degrees(),
+                    present[row]
+                ));
+            }
+        }
+
+        let detail = format!(
+            "{} limp, {holding} holding torque and exempt, against a {:.3} deg tolerance: {}",
+            JointId::COUNT - holding,
+            self.goal_shadow_tolerance.to_degrees(),
+            readings.join("; ")
+        );
+        if wrong.is_empty() {
+            report.push(CaseResult::pass(Case::GoalShadow, detail));
+        } else {
+            report.push(CaseResult::fail(
+                Case::GoalShadow,
+                format!("{}; {detail}", wrong.join("; ")),
+            ));
+        }
+    }
+
     /// The nine provisioned homing offsets against the vendor's own constant.
     ///
     /// This is what the datum rests on: each servo applies its offset before
@@ -997,33 +1116,43 @@ mod runner_tests {
     /// A run of the registry against a machine, with the port already open, and
     /// every instruction that crossed the wire.
     fn run(cfg: &BenchConfig, machine: FakeMachine) -> (Report, Vec<(u8, u8)>) {
-        let registry = Registry::from_config(cfg).expect("the configuration converts");
-        let spy = Spy::new(machine);
-        let log = spy.log();
-        let mut report = Report::new();
-        registry.run(Ok::<Spy, String>(spy), &mut report);
-        let instructions = log.borrow().clone();
+        let (report, instructions, _) = run_watched(cfg, machine);
         (report, instructions)
     }
 
+    /// What a watched run leaves behind: the verdicts, every instruction that
+    /// crossed the wire as (servo, instruction), and every unicast read as
+    /// (servo, register address).
+    type Watched = (Report, Vec<(u8, u8)>, Vec<(u8, u16)>);
+
+    /// The same run, carrying the register each unicast read asked for as well
+    /// as the instructions — which is the only record of *which* register a case
+    /// put on the wire, and how often.
+    fn run_watched(cfg: &BenchConfig, machine: FakeMachine) -> Watched {
+        let registry = Registry::from_config(cfg).expect("the configuration converts");
+        let spy = Spy::new(machine);
+        let log = spy.log();
+        let reads = spy.reads();
+        let mut report = Report::new();
+        registry.run(Ok::<Spy, String>(spy), &mut report);
+        let instructions = log.borrow().clone();
+        let asked = reads.borrow().clone();
+        (report, instructions, asked)
+    }
+
     /// A machine holding what it should, resting at the stow pose, passes every
-    /// case the registry can decide — and the clearance case still reports
-    /// `NotRun`, because no reviewed floor exists to assert against.
+    /// case the registry has — the clearance among them, since the floor is a
+    /// reviewed number and a correct machine clears it.
     #[test]
-    fn a_correct_machine_passes_every_case_but_the_unreviewed_clearance() {
+    fn a_correct_machine_passes_every_case() {
         let cfg = undatumed_config();
         let machine = machine_at(&cfg, &stow_legs());
         let (report, _) = run(&cfg, machine);
 
         for case in Case::ALL {
-            let expected = if case == Case::RestMargins {
-                Outcome::NotRun
-            } else {
-                Outcome::Pass
-            };
             assert_eq!(
                 report.outcome(case),
-                expected,
+                Outcome::Pass,
                 "{case}: {}",
                 report
                     .results()
@@ -1032,7 +1161,7 @@ mod runner_tests {
                     .map_or_else(|| "no verdict".to_string(), ToString::to_string)
             );
         }
-        assert!(!report.all_passed(), "an unreviewed floor is not a pass");
+        assert!(report.all_passed(), "every case passed");
 
         let record = report.into_record(1);
         assert!(record.rest_counts.is_some());
@@ -1086,7 +1215,9 @@ mod runner_tests {
         for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
             let mut cfg = undatumed_config();
             cfg.arm.min_arm_voltage = bad;
-            let refusal = Registry::from_config(&cfg).expect_err("{bad} is not a supply floor");
+            let Err(refusal) = Registry::from_config(&cfg) else {
+                panic!("{bad} is not a supply floor, and a registry was built on it");
+            };
             // Compared by key rather than by whole value: a `NaN` payload is
             // never equal to itself, which is the reason it is refused.
             let ConfigError::NotPositive { key, value } = refusal else {
@@ -1258,22 +1389,159 @@ mod runner_tests {
     }
 
     /// The clearance case reads the resting counts under the bare conversion and
-    /// reports what it measured, floor or no floor.
+    /// reports what it measured, whatever the verdict on it.
     #[test]
     fn the_clearance_is_measured_off_the_resting_counts() {
         let cfg = undatumed_config();
         let machine = machine_at(&cfg, &rest_legs());
         let (report, _) = run(&cfg, machine);
 
-        assert_eq!(report.outcome(Case::RestMargins), Outcome::NotRun);
+        // Well under the floor: this configuration is the tight one, and a
+        // machine resting there is not one to arm.
+        assert_eq!(report.outcome(Case::RestMargins), Outcome::Fail);
         let printed = report.to_string();
-        assert!(printed.contains("no reviewed clearance floor"), "{printed}");
         // The clearance the tight configuration leaves, measured back off whole
         // counts. This tree records 0.1411 mm for that configuration; a servo
         // reports whole counts, and rounding the fixture's angles to them moves
         // the clearance by about a micrometre. What a real run reports is this
         // quantised number, never the recorded one.
         assert!(printed.contains("0.1423"), "{printed}");
+    }
+
+    /// A limp servo whose goal register does not shadow its present position
+    /// fails the case by name, and the reading is on the line either way.
+    ///
+    /// This is the whole safety argument for enabling torque before writing a
+    /// goal. A firmware that stores a limp servo's goal instead of mirroring it
+    /// can have that servo enabled against a target somewhere else entirely, and
+    /// on this linkage that is the head being slammed. The case has to find it
+    /// with the torque still off.
+    #[test]
+    fn a_limp_servo_whose_goal_is_not_its_present_fails_the_shadow_case() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        // A servo that stores its goal, holding one a long way from where it
+        // stands: 200 counts is about 17.6°, far outside the 2° gate.
+        machine.unmirrored = vec![14];
+        let resting = i32::from_le_bytes(
+            machine
+                .get(14, reg_for(RegId::PresentPosition))
+                .expect("the fixture rests somewhere")
+                .try_into()
+                .expect("a position is four bytes"),
+        );
+        machine.set(
+            14,
+            reg_for(RegId::GoalPosition),
+            &(resting + 200).to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::GoalShadow), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("servo 14: goal"), "{printed}");
+        assert!(
+            printed.contains("17.5"),
+            "the gap is on the line: {printed}"
+        );
+        // Evidence, not a reason to stop reading: the cases after it still ran.
+        assert_eq!(report.outcome(Case::Datum), Outcome::Pass);
+    }
+
+    /// A servo found holding torque is exempt from the assertion and reported
+    /// with its gap.
+    ///
+    /// A torqued servo's goal is a target it really is holding, and the distance
+    /// to where it actually sits is the sag of a loaded servo — the number this
+    /// project has never measured. Judging it against a tolerance meant for a
+    /// mirror would fail every machine that opened the session still holding.
+    #[test]
+    fn a_torqued_servo_is_exempt_from_the_shadow_assertion_and_still_reported() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        let resting = i32::from_le_bytes(
+            machine
+                .get(14, reg_for(RegId::PresentPosition))
+                .expect("the fixture rests somewhere")
+                .try_into()
+                .expect("a position is four bytes"),
+        );
+        machine.set(14, reg_for(RegId::TorqueEnable), &[1]);
+        machine.set(
+            14,
+            reg_for(RegId::GoalPosition),
+            &(resting + 200).to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::GoalShadow), Outcome::Pass);
+        let printed = report.to_string();
+        assert!(printed.contains("14: torque on"), "{printed}");
+        assert!(printed.contains("17.5"), "the gap is recorded: {printed}");
+        assert!(
+            printed.contains("8 limp, 1 holding torque and exempt"),
+            "{printed}"
+        );
+    }
+
+    /// The shadow case reads its own present position rather than reusing the
+    /// resting-pose sweep's, and asks every servo whether it is holding torque.
+    ///
+    /// Asserted off the wire, not off the printed detail: a case that quietly
+    /// reused the resting sweep's counts, or filled the torque column in from
+    /// nowhere, would print exactly the same lines — and the re-read is what
+    /// closes the gap a hand could move the machine through between two sweeps.
+    #[test]
+    fn the_shadow_case_reads_all_three_registers_from_every_servo() {
+        let cfg = undatumed_config();
+        let machine = machine_at(&cfg, &stow_legs());
+        let ids = cfg.servo_ids().expect("the roster is nine servos");
+        let (report, _, reads) = run_watched(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::GoalShadow), Outcome::Pass);
+        let printed = report.to_string();
+        for id in ids {
+            let asked = |reg: RegId| {
+                reads
+                    .iter()
+                    .filter(|(servo, addr)| *servo == id && *addr == reg_for(reg).addr)
+                    .count()
+            };
+            // Torque state and goal are read once each, by this case and nothing
+            // else in the registry. The present position twice over the whole
+            // run: the resting-pose sweep's, and this case's own.
+            assert_eq!(asked(RegId::TorqueEnable), 1, "servo {id} torque reads");
+            assert_eq!(asked(RegId::GoalPosition), 1, "servo {id} goal reads");
+            assert_eq!(
+                asked(RegId::PresentPosition),
+                2,
+                "servo {id} position reads"
+            );
+            assert!(printed.contains(&format!("{id}: torque off")), "{printed}");
+        }
+    }
+
+    /// A goal-shadow tolerance the configuration cannot stand behind refuses
+    /// before the registry is built.
+    ///
+    /// An infinite tolerance passes a machine whose goal registers say anything
+    /// at all, and writes that pass into the record the arm gate reads. The
+    /// registry does not resolve the configuration, so the gate `resolve` gives
+    /// every other consumer has to be run here too.
+    #[test]
+    fn a_shadow_tolerance_that_is_not_an_angle_refuses_the_registry() {
+        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
+            let mut cfg = undatumed_config();
+            cfg.arm.goal_shadow_tolerance_deg = bad;
+            let Err(refusal) = Registry::from_config(&cfg) else {
+                panic!("{bad} is not a tolerance, and a registry was built on it");
+            };
+            let ConfigError::NotPositive { key, value } = refusal else {
+                panic!("{bad}: expected a positivity refusal, got {refusal}");
+            };
+            assert_eq!(key, "arm.goal_shadow_tolerance_deg");
+            assert_eq!(value.to_bits(), bad.to_bits(), "{bad}");
+        }
     }
 
     /// A servo answering a register read with an error number fails the case
@@ -1295,11 +1563,10 @@ mod runner_tests {
 
     /// The clearance verdict, all three arms, whatever the shipped floor holds.
     ///
-    /// [`REST_MARGIN_FLOOR_M`] is `None` today, so nothing on a run reaches the
-    /// comparison. It is filled in from the first reviewed hardware run, and the
-    /// arm that then decides whether a resting pose is far enough from the
-    /// linkage's singular configurations must not be executing for the first
-    /// time when it does.
+    /// [`REST_MARGIN_FLOOR_M`] carries a reviewed number, so a run reaches the
+    /// comparison and takes one of the two deciding arms. The third — no floor
+    /// at all — is the shape the constant can still be put back into, and it is
+    /// asserted here rather than left to execute for the first time on a bench.
     #[test]
     fn the_clearance_verdict_decides_all_three_ways() {
         let floor = 0.000_14;
@@ -1541,6 +1808,32 @@ mod tests {
         }
         let refusal = record.admits_arm().expect_err("a failed case refuses");
         assert!(refusal.to_string().contains("voltage"), "{refusal}");
+    }
+
+    /// A record written before the goal-shadow case existed does not admit
+    /// arming.
+    ///
+    /// The case is the precondition the arm sequence's enable-then-pin order
+    /// rests on, and a record that never asked the question has not established
+    /// it. Nothing migrates such a file: an absent case reads as not run, which
+    /// is a failure, and re-running the self-test is what re-qualifies the
+    /// machine.
+    #[test]
+    fn a_record_predating_the_shadow_case_does_not_admit_arming() {
+        let mut record = green();
+        record
+            .cases
+            .retain(|result| result.case != Case::GoalShadow);
+        let text = record.render().expect("the record renders");
+        let read = SelftestRecord::parse(&text).expect("an older record still parses");
+        assert_eq!(read.outcome(Case::GoalShadow), Outcome::NotRun);
+        assert_eq!(
+            read.admits_arm(),
+            Err(RecordRefusal::CaseNotPassed {
+                case: Case::GoalShadow,
+                outcome: Outcome::NotRun,
+            })
+        );
     }
 
     /// The datum is one of the cases, so a machine whose offsets do not

@@ -3,8 +3,9 @@
 //! Every command that moves the head has the same shape, and the shape is the
 //! safety property. Nothing is remembered between invocations — each is a fresh
 //! process — so a command re-drives the whole arm sequence, which verifies the
-//! nine servos, pins every joint where it stands and enables torque, and only
-//! then injects one `MoveTo` over the fixed-rate loop. A machine that has
+//! nine servos, enables torque — which holds every joint where it stands — pins
+//! each joint there, and only then injects one `MoveTo` over the fixed-rate
+//! loop. A machine that has
 //! drifted, been handled, or was never armed at all is therefore re-established
 //! from scratch every time, and a command that cannot establish it does not
 //! move anything.
@@ -672,7 +673,8 @@ mod tests {
             for label in [
                 "armed",
                 "pull-in",
-                "re-pin",
+                "droop",
+                "torque-on",
                 "models",
                 "supply",
                 "health",
@@ -753,8 +755,8 @@ mod tests {
             run.printed
         );
         // Torque ending at zero is true of an `off` that armed first as well,
-        // so it says nothing on its own. Arming pins every joint where it
-        // stands and pulls one outside its window to the nearer bound: on a
+        // so it says nothing on its own. Arming enables torque where every
+        // joint stands and pulls one outside its window to the nearer bound: on a
         // machine about to be released that is a movement nobody is standing
         // ready for, and these two are what say it did not happen.
         run.armed_nothing();
