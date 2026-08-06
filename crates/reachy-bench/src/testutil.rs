@@ -227,6 +227,17 @@ impl BusPort for FakeMachine {
     }
 }
 
+/// One grouped write as it went out: the register it addressed, and what each
+/// servo in it was given.
+///
+/// The register file only holds where a run *ended*. A run that swept somewhere
+/// and came back leaves no trace in it, so the frames themselves are the only
+/// record of what a move passed through.
+pub(crate) struct GroupedWrite {
+    pub(crate) addr: u16,
+    pub(crate) entries: Vec<(u8, Vec<u8>)>,
+}
+
 /// A port that records every instruction that crosses it, over a machine the
 /// test keeps a handle on.
 ///
@@ -238,6 +249,7 @@ pub(crate) struct Spy {
     log: Rc<RefCell<Vec<(u8, u8)>>>,
     grouped: Rc<RefCell<Vec<u16>>>,
     addressed: Rc<RefCell<Vec<Vec<u8>>>>,
+    commanded: Rc<RefCell<Vec<GroupedWrite>>>,
 }
 
 impl Spy {
@@ -248,6 +260,7 @@ impl Spy {
             log: Rc::new(RefCell::new(Vec::new())),
             grouped: Rc::new(RefCell::new(Vec::new())),
             addressed: Rc::new(RefCell::new(Vec::new())),
+            commanded: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -258,6 +271,11 @@ impl Spy {
     /// says whether a goal went to the joint it belongs to.
     pub(crate) fn addressed(&self) -> Rc<RefCell<Vec<Vec<u8>>>> {
         Rc::clone(&self.addressed)
+    }
+
+    /// Every grouped write in full, in the order it went out.
+    pub(crate) fn commanded(&self) -> Rc<RefCell<Vec<GroupedWrite>>> {
+        Rc::clone(&self.commanded)
     }
 
     /// The register each grouped read asked for, in the order they were asked.
@@ -291,12 +309,20 @@ impl BusPort for Spy {
         if buf[7] == INST_SYNC_WRITE {
             let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
             let params = &buf[8..8 + len - 3];
+            let addr = u16::from_le_bytes([params[0], params[1]]);
             let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
-            let ids = params[4..]
+            // Parsed once and recorded two ways: which servos a frame carried,
+            // and what each of them was given.
+            let entries: Vec<(u8, Vec<u8>)> = params[4..]
                 .chunks_exact(1 + width)
-                .map(|entry| entry[0])
+                .map(|entry| (entry[0], entry[1..].to_vec()))
                 .collect();
-            self.addressed.borrow_mut().push(ids);
+            self.addressed
+                .borrow_mut()
+                .push(entries.iter().map(|(id, _)| *id).collect());
+            self.commanded
+                .borrow_mut()
+                .push(GroupedWrite { addr, entries });
         }
         self.machine.borrow_mut().write_all(buf)
     }
@@ -371,6 +397,26 @@ pub(crate) fn datumed_config() -> BenchConfig {
         provenance: "a test, not a unit".to_string(),
     });
     cfg
+}
+
+/// The resolved configuration of a reviewed unit, with the bus timing wound
+/// down so a test that waits on a deadline does not wait in real time.
+///
+/// One definition, because a knob wound down in one test module and not another
+/// leaves that module either spending real retry time or testing different
+/// timing than the rest, and each copy looks locally complete.
+pub(crate) fn resolved() -> crate::config::Resolved {
+    let mut cfg = datumed_config();
+    wind_down_bus(&mut cfg);
+    cfg.resolve().expect("a datumed example resolves")
+}
+
+/// Wind `cfg`'s bus timing down to the shortest waits the transaction layer
+/// will take, so a test against a scripted machine spends no real time.
+pub(crate) fn wind_down_bus(cfg: &mut BenchConfig) {
+    cfg.bus.host_allowance_ms = 1;
+    cfg.bus.retry_attempts = 1;
+    cfg.bus.retry_spacing_ms = 0;
 }
 
 /// A machine holding exactly what the configuration says it should, resting at

@@ -29,8 +29,10 @@
 //!
 //! ## The tick loop
 //!
-//! [`MotionPump`] is the other half: the fixed-rate loop that carries a move.
-//! Each period reads all nine positions in one grouped request, hands them to
+//! [`MotionPump`] is the other half: the fixed-rate loop that carries a move,
+//! and the same loop is what a timed hold runs on, so the pacing every run
+//! reports is the pacing of the loop that actually spaced its periods. Each
+//! period reads all nine positions in one grouped request, hands them to
 //! [`motion_tick`] with whatever command is pending, and writes back only the
 //! joint groups whose goals changed. The read comes before the write within a
 //! period, because the tick consumes the measurement it is given.
@@ -72,6 +74,14 @@ use reachy_motion::{
 /// over that still stops a sequencer looping on its own cursor long before a
 /// bench session notices.
 const FIXED_ACTIONS: usize = 10_000;
+
+/// How many actions the disarm sequence may take before the driver calls it
+/// stuck.
+///
+/// Nothing about disarming is configurable in length: nine position reads, one
+/// settle and nine verified releases, whatever the settle is set to. So the
+/// bound is the fixed one, with the same two orders of magnitude of room.
+pub const DISARM_ACTIONS: usize = FIXED_ACTIONS;
 
 /// Actions one supply-gate poll cycle takes: a read per servo, and the wait
 /// that spaces it from the next cycle.
@@ -644,6 +654,16 @@ pub struct MoveSummary {
     pub elapsed: Duration,
 }
 
+/// What ends a run of the fixed-rate loop.
+#[derive(Clone, Copy, Debug)]
+enum Until {
+    /// The machine is holding again: the move reached its endpoint.
+    Holding,
+    /// The dwell has elapsed. A hold is holding from its first period, so
+    /// there is nothing else for it to wait for.
+    Elapsed(Duration),
+}
+
 /// The fixed-rate loop that carries one move.
 ///
 /// Holds the loop-invariant configuration and the buffers a period reuses — the
@@ -715,15 +735,20 @@ impl<'a> MotionPump<'a> {
     /// a legal move mid-travel and report it as a loop that hung.
     #[must_use]
     pub fn stall_budget(&self, command: &MotionCommand) -> u64 {
-        let travel = match command {
-            MotionCommand::MoveTo { duration, .. } => {
-                let periods = duration.as_nanos().div_ceil(self.period.as_nanos());
-                u64::try_from(periods).unwrap_or(u64::MAX)
-            }
+        match command {
+            MotionCommand::MoveTo { duration, .. } => self.budget_for(*duration),
             // A hold commands no travel: it takes the period it is asked in.
-            MotionCommand::Hold => 0,
-        };
-        travel.saturating_add(self.stall_margin)
+            MotionCommand::Hold => self.budget_for(Duration::ZERO),
+        }
+    }
+
+    /// How many periods a run spanning `wanted` may take before the loop calls
+    /// it stuck: the periods that span it, plus the fixed margin.
+    fn budget_for(&self, wanted: Duration) -> u64 {
+        let periods = wanted.as_nanos().div_ceil(self.period.as_nanos());
+        u64::try_from(periods)
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.stall_margin)
     }
 
     /// Run `command` to completion.
@@ -740,7 +765,51 @@ impl<'a> MotionPump<'a> {
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
-        let budget = self.stall_budget(&command);
+        self.carry(bus, state, command, Until::Holding, clock, event)
+    }
+
+    /// Watch the machine hold for `dwell`, commanding nothing.
+    ///
+    /// A hold is holding from its first period, so what makes this a
+    /// measurement rather than a sleep is that every period still reads all
+    /// nine positions and runs the tick: the tracking monitor, the read-loss
+    /// budget and the health poll all apply, and the goals are already where
+    /// they belong so nothing is written.
+    ///
+    /// Paced by this loop and not by the caller, which is what lets a hold
+    /// report its own lateness — the telemetry the command exists for.
+    pub fn hold<P: BusPort>(
+        &mut self,
+        bus: &mut Bus<P>,
+        state: &mut MotionState,
+        dwell: Duration,
+        clock: &mut dyn Clock,
+        event: &mut dyn FnMut(TickEvent),
+    ) -> Result<MoveSummary, PumpError> {
+        self.carry(
+            bus,
+            state,
+            MotionCommand::Hold,
+            Until::Elapsed(dwell),
+            clock,
+            event,
+        )
+    }
+
+    /// The fixed-rate loop itself, run until `until` says the run is over.
+    fn carry<P: BusPort>(
+        &mut self,
+        bus: &mut Bus<P>,
+        state: &mut MotionState,
+        command: MotionCommand,
+        until: Until,
+        clock: &mut dyn Clock,
+        event: &mut dyn FnMut(TickEvent),
+    ) -> Result<MoveSummary, PumpError> {
+        let budget = match until {
+            Until::Holding => self.stall_budget(&command),
+            Until::Elapsed(dwell) => self.budget_for(dwell),
+        };
         let epoch = clock.now();
         let mut due = epoch;
         let mut pending = Some(command);
@@ -839,7 +908,11 @@ impl<'a> MotionPump<'a> {
             if report.completed {
                 event(TickEvent::Completed);
             }
-            if matches!(state.mode(), Mode::Holding) {
+            let over = match until {
+                Until::Holding => matches!(state.mode(), Mode::Holding),
+                Until::Elapsed(dwell) => now.saturating_sub(epoch) >= dwell,
+            };
+            if over {
                 summary.elapsed = clock.now().saturating_sub(epoch);
                 return Ok(summary);
             }
@@ -1026,18 +1099,8 @@ mod tests {
     use super::*;
     use crate::config::Resolved;
     use crate::testutil::{
-        BrokenPort, FakeMachine, Spy, TestClock, datumed_config, machine_at, stow_legs,
+        BrokenPort, FakeMachine, Spy, TestClock, datumed_config, machine_at, resolved, stow_legs,
     };
-
-    /// The resolved configuration of a reviewed unit, with the bus timing wound
-    /// down so a test that waits on a deadline does not wait in real time.
-    fn resolved() -> Resolved {
-        let mut cfg = datumed_config();
-        cfg.bus.host_allowance_ms = 1;
-        cfg.bus.retry_attempts = 1;
-        cfg.bus.retry_spacing_ms = 0;
-        cfg.resolve().expect("a datumed example resolves")
-    }
 
     /// Drive an arm sequence against `machine`, handing back the outcome, the
     /// phases as they were announced, and every instruction that crossed the
@@ -1640,6 +1703,24 @@ mod tests {
         (outcome, events)
     }
 
+    /// Hold `bench` for `dwell`, collecting the events it announced.
+    fn hold(
+        bench: &mut Bench,
+        pump: &mut MotionPump<'_>,
+        dwell: Duration,
+        clock: &mut dyn Clock,
+    ) -> (Result<MoveSummary, PumpError>, Vec<TickEvent>) {
+        let mut events = Vec::new();
+        let outcome = pump.hold(
+            &mut bench.bus,
+            &mut bench.state,
+            dwell,
+            clock,
+            &mut |event| events.push(event),
+        );
+        (outcome, events)
+    }
+
     /// How many grouped frames of `instruction` crossed the wire.
     fn frames(log: &Rc<RefCell<Vec<(u8, u8)>>>, instruction: u8) -> usize {
         log.borrow()
@@ -1839,6 +1920,102 @@ mod tests {
         assert_eq!(summary.frames, 0);
         assert_eq!(frames(&bench.log, INST_SYNC_WRITE), 0);
         assert!(events.contains(&TickEvent::Command(CommandDisposition::Held)));
+    }
+
+    /// A timed hold runs one period per tick of its dwell, and still commands
+    /// nothing: the goals are already where they belong.
+    #[test]
+    fn a_timed_hold_measures_every_period_of_its_dwell() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+        let dwell = pump.period() * 10;
+
+        let (outcome, events) = hold(&mut bench, &mut pump, dwell, &mut clock);
+        let summary = outcome.expect("holding an armed machine is always available");
+
+        // One period per tick of the dwell, plus the period the deadline is
+        // noticed in.
+        assert_eq!(summary.ticks, 11, "{summary:?}");
+        assert_eq!(summary.elapsed, dwell, "{summary:?}");
+        assert_eq!(summary.goals, 0);
+        assert_eq!(frames(&bench.log, INST_SYNC_WRITE), 0);
+        assert!(events.contains(&TickEvent::Command(CommandDisposition::Held)));
+    }
+
+    /// A hold on a host that wakes late says so.
+    ///
+    /// This is the command's whole purpose — a scheduler stall during a
+    /// supervised hold is exactly the incident the telemetry exists for — and a
+    /// hold paced outside the loop would report a clean run however badly the
+    /// host kept time, because each inner run would take its own epoch afresh.
+    #[test]
+    fn a_timed_hold_counts_the_periods_it_began_late() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let late = pump.period();
+        let dwell = pump.period() * 10;
+        let mut clock = LateClock {
+            now: Duration::ZERO,
+            late,
+        };
+
+        let (outcome, events) = hold(&mut bench, &mut pump, dwell, &mut clock);
+        let summary = outcome.expect("a late loop still holds");
+
+        assert_eq!(summary.overruns, summary.ticks - 1, "{summary:?}");
+        assert_eq!(summary.worst_jitter, late, "{summary:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TickEvent::Overrun { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        // The dwell is wall time, not a period count. Each period here consumes
+        // two periods of it, so a ten-period dwell is spanned by ten periods
+        // rather than the eleven a punctual host takes — and it is spanned
+        // exactly, which a loop that counted its own periods would not do.
+        assert_eq!(summary.ticks, 10, "{summary:?}");
+        assert_eq!(summary.elapsed, dwell, "{summary:?}");
+    }
+
+    /// A hold's stall budget follows the dwell it was asked for.
+    ///
+    /// The dwell is an operator-facing knob with no ceiling, and the obvious
+    /// thing to do at the bench is turn it up. A budget that did not follow it
+    /// would call a perfectly healthy machine stuck partway through the one
+    /// command whose output exists to be believed about timing.
+    #[test]
+    fn a_hold_budget_follows_the_dwell_it_was_asked_for() {
+        let cfg = resolved();
+        // Longer than the fixed margin, so the margin alone cannot cover it.
+        let dwell = Duration::from_secs(STALL_MARGIN_SECS + 5);
+        let periods = dwell.as_secs() * u64::from(cfg.tick_hz);
+
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut punctual = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+        let (outcome, _) = hold(&mut bench, &mut punctual, dwell, &mut clock);
+        let summary = outcome.expect("a long dwell is a legal dwell");
+        assert_eq!(summary.ticks, periods + 1, "{summary:?}");
+        assert_eq!(summary.elapsed, dwell, "{summary:?}");
+
+        // And a clock that stopped advancing still ends, on a budget that is
+        // the dwell plus the margin rather than the margin alone.
+        let mut stuck_bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut stuck_pump = pump(&cfg, stuck_bench.held);
+        let mut clock = FrozenClock;
+        let (outcome, _) = hold(&mut stuck_bench, &mut stuck_pump, dwell, &mut clock);
+        let error = outcome.expect_err("a hold on a stopped clock never reaches its deadline");
+        let budget = periods + u64::from(cfg.tick_hz) * STALL_MARGIN_SECS;
+        assert!(
+            matches!(error, PumpError::Stalled { budget: ran } if ran == budget),
+            "{error}"
+        );
     }
 
     /// A target the envelope refuses stops the run without commanding

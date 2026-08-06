@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod commands;
 pub mod config;
 pub mod pump;
 pub mod selftest;

@@ -354,6 +354,11 @@ pub struct MotionSection {
     pub stow_duration_s: f64,
     /// How long the move from stow to the neutral pose takes, seconds.
     pub up_duration_s: f64,
+    /// How long a joint-space move — a yaw or an antenna command — takes,
+    /// seconds.
+    pub move_duration_s: f64,
+    /// How long a `hold` command watches the machine before returning, seconds.
+    pub hold_duration_s: f64,
 }
 
 impl Default for MotionSection {
@@ -376,6 +381,14 @@ impl Default for MotionSection {
             // from a configuration close to a singular one, and there is no
             // reason for it to be quick.
             up_duration_s: 3.0,
+            // A yaw or an antenna command moves joints that carry no load and
+            // pass through no near-singular configuration, so the length is a
+            // matter of what is comfortable to watch rather than of mechanics.
+            move_duration_s: 3.0,
+            // Long enough that a tracking fault or a health latch has periods
+            // to appear in, short enough that a supervised operator is not left
+            // waiting on a command that does nothing by design.
+            hold_duration_s: 2.0,
         }
     }
 }
@@ -643,6 +656,10 @@ pub struct Resolved {
     pub stow_duration: Duration,
     /// How long the move from stow to neutral takes.
     pub up_duration: Duration,
+    /// How long a yaw or antenna move takes.
+    pub move_duration: Duration,
+    /// How long a `hold` command watches the machine.
+    pub hold_duration: Duration,
 }
 
 /// Read and parse a configuration file.
@@ -921,6 +938,14 @@ impl BenchConfig {
                 self.motion.stow_duration_s,
             )?,
             up_duration: duration_from_secs("motion.up_duration_s", self.motion.up_duration_s)?,
+            move_duration: duration_from_secs(
+                "motion.move_duration_s",
+                self.motion.move_duration_s,
+            )?,
+            hold_duration: duration_from_secs(
+                "motion.hold_duration_s",
+                self.motion.hold_duration_s,
+            )?,
         })
     }
 }
@@ -1419,7 +1444,17 @@ provenance = \"test fixture\"
         // Each key, mutated to something that is not a positive real number,
         // must come back naming itself. A key that silently accepted a zero
         // would put a zero step bound or a zero tick rate into the pump.
-        let cases: [Mutation; 11] = [
+        let cases: [Mutation; 15] = [
+            ("motion.stow_duration_s", |c| {
+                c.motion.stow_duration_s = 0.0;
+            }),
+            ("motion.up_duration_s", |c| c.motion.up_duration_s = -1.0),
+            ("motion.move_duration_s", |c| {
+                c.motion.move_duration_s = f64::NAN;
+            }),
+            ("motion.hold_duration_s", |c| {
+                c.motion.hold_duration_s = 0.0;
+            }),
             ("envelope.body_yaw_limit_deg", |c| {
                 c.envelope.body_yaw_limit_deg = 0.0;
             }),
@@ -1503,11 +1538,17 @@ provenance = \"test fixture\"
     /// range, and every one of these keys is operator-typed.
     #[test]
     fn a_duration_longer_than_a_duration_refuses() {
-        let cases: [Mutation; 4] = [
+        let cases: [Mutation; 6] = [
             ("motion.stow_duration_s", |c| {
                 c.motion.stow_duration_s = 1e30;
             }),
             ("motion.up_duration_s", |c| c.motion.up_duration_s = 1e30),
+            ("motion.move_duration_s", |c| {
+                c.motion.move_duration_s = 1e30;
+            }),
+            ("motion.hold_duration_s", |c| {
+                c.motion.hold_duration_s = 1e30;
+            }),
             ("arm.voltage_budget_s", |c| c.arm.voltage_budget_s = 30e30),
             ("disarm.dwell_s", |c| c.disarm.dwell_s = f64::MAX),
         ];
@@ -1608,15 +1649,24 @@ provenance = \"test fixture\"
         assert_eq!(resolved.disarm.ids, resolved.arm.ids);
     }
 
+    /// Every duration key lands in its own resolved field.
+    ///
+    /// Four distinct values, because the resolve arms are a copy-paste block
+    /// and equal values would let two of them read the same key: a `hold` that
+    /// watched for the move duration and a `yaw` that ran for the hold duration
+    /// would be a move carried over the wrong length of time with torque on.
     #[test]
     fn the_durations_are_what_the_file_said() {
         let cfg = parse(&format!(
-            "{MINIMAL}\n[motion]\nstow_duration_s = 2.5\nup_duration_s = 4.0\n"
+            "{MINIMAL}\n[motion]\nstow_duration_s = 2.5\nup_duration_s = 4.0\n\
+             move_duration_s = 1.5\nhold_duration_s = 0.5\n"
         ))
         .expect("parses");
         let resolved = cfg.resolve().expect("resolves");
         assert_eq!(resolved.stow_duration, Duration::from_millis(2500));
         assert_eq!(resolved.up_duration, Duration::from_secs(4));
+        assert_eq!(resolved.move_duration, Duration::from_millis(1500));
+        assert_eq!(resolved.hold_duration, Duration::from_millis(500));
         assert_eq!(resolved.device, "/dev/ttyAMA3");
     }
 

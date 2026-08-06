@@ -90,6 +90,14 @@ stow_duration_s = 2.0
 # configuration close to a singular one, and there is no reason for it to be
 # quick.
 up_duration_s = 3.0
+# A yaw or an antenna command moves joints that carry no load and pass through
+# no near-singular configuration, so the length is a matter of what is
+# comfortable to watch rather than of mechanics.
+move_duration_s = 3.0
+# How long `hold` watches the machine before returning: long enough for a
+# tracking fault or a health latch to appear in, short enough that a supervised
+# operator is not left waiting on a command that does nothing by design.
+hold_duration_s = 2.0
 
 [arm]
 # The supply floor arming refuses to proceed below. Provisional: a round number
