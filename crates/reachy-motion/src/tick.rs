@@ -794,8 +794,8 @@ mod tests {
     /// rounding error away from it.
     fn armed_at(cfg: &MotionConfig, targets: &JointTargets) -> (MotionState, JointVector) {
         let (present, _) = joints_for(cfg, targets);
-        let outcome =
-            pin_goals(&arm_config(cfg), &present).expect("the pull-in is inside the gate");
+        let outcome = pin_goals(&arm_config(cfg), &cfg.env, &present)
+            .expect("the pull-in is inside the gate");
         let record = if outcome.pinned.legs == present.legs {
             record_at(cfg, &outcome.pinned, &targets.head_pose_body)
         } else {

@@ -1,32 +1,32 @@
-//! Joints, the datum, registers and counts — the one place all four meet.
+//! Joints, registers and counts — the one place all three meet.
 //!
 //! Above this module the machine is nine joints holding angles in radians.
 //! Below it the machine is servo IDs, control-table addresses and encoder
 //! counts. This map is the only translation between the two, and being the only
-//! one is the point: a second copy of the datum shift, or a second register
-//! table, could disagree with this one, and a disagreement about which crank a
-//! goal belongs to puts the head on the desk.
+//! one is the point: a second register table could disagree with this one, and a
+//! disagreement about which crank a goal belongs to puts the head on the desk.
 //!
 //! ## The datum
 //!
-//! The legs' position registers carry a provisioned homing offset, and which
-//! offset this unit was given is not yet known. Under one reading a converted
-//! count *is* the model's crank angle; under the other, alternate legs sit a
-//! quarter turn either side of it. Both readings close the linkage exactly, so
-//! nothing computed separates them — an externally measured head height does.
-//! Until a human has resolved it and written it down, no motion command runs.
+//! A converted count *is* the crank angle the kinematic model means, with no
+//! host-side correction anywhere. The quarter turn that separates a crank's
+//! mechanical zero from the model's is provisioned into each leg servo's homing
+//! offset register, applied by servo firmware before Present Position is
+//! reported, and the vendor's own per-leg count limits are derived from the
+//! crank-angle limits under exactly that bare conversion. A servo missing its
+//! offset is a per-servo provisioning fault to be refused by name, never
+//! something to compensate for here: a host-side shift would move all six legs
+//! for a fault that is one servo's.
 //!
 //! ## Shapes
 //!
 //! Each register has exactly one engineering shape, and it is fixed here.
-//! Position registers cross this boundary as radians, with the datum applied;
-//! the supply-voltage reading crosses as volts. Everything else crosses as the
-//! integer the control table holds, because the provisioning checks compare
-//! those against a data sheet and a converted angle would be the wrong thing to
-//! compare. The position-gain span is the one register whose byte order is not
-//! its field order: the table runs D, I, P.
-
-use std::f64::consts::FRAC_PI_2;
+//! Position registers cross this boundary as radians; the supply-voltage reading
+//! crosses as volts. Everything else crosses as the integer the control table
+//! holds, because the provisioning checks compare those against a data sheet and
+//! a converted angle would be the wrong thing to compare. The position-gain span
+//! is the one register whose byte order is not its field order: the table runs
+//! D, I, P.
 
 use dxl_proto::regs;
 use dxl_proto::{ConvError, Reg, counts_to_rad, rad_to_counts, raw_from_volts, volts_from_raw};
@@ -39,66 +39,6 @@ use crate::bus::{MAX_SYNC_IDS, RawValue};
 // more IDs than a single frame carries. Tying the two counts here makes a roster
 // that outgrew the frame a compile error rather than a refusal on hardware.
 const _: () = assert!(JointId::COUNT <= MAX_SYNC_IDS);
-
-/// How the legs' counts relate to the model's crank angles.
-///
-/// Absent from a bench configuration until a human has resolved it, and no
-/// motion command runs without one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CrankDatum {
-    /// A converted count is the crank angle as the model means it.
-    Direct,
-    /// Alternate legs are a quarter turn either side of the model's angle: the
-    /// odd-numbered legs a quarter turn one way, the even-numbered legs the
-    /// other.
-    ParityShifted,
-}
-
-impl CrankDatum {
-    /// The shift added to each of the six legs' converted counts to reach the
-    /// model angle, in leg order.
-    ///
-    /// Total: under either datum every leg has a shift, so a caller working
-    /// over the six legs never has an absent one to substitute for. The 0-based
-    /// leg index: leg 1 on the bus is `0` here and takes the positive shift.
-    #[must_use]
-    pub fn leg_shifts(self) -> [f64; 6] {
-        match self {
-            Self::Direct => [0.0; 6],
-            Self::ParityShifted => [
-                FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, -FRAC_PI_2,
-            ],
-        }
-    }
-
-    /// The shift added to `joint`'s converted count to reach the model angle,
-    /// or `None` for a joint this bus has no place for.
-    ///
-    /// Takes the joint rather than a row number or a bare leg index, because
-    /// the two numberings are one apart and the datum must never move the yaw
-    /// or an antenna: a row handed in where a leg was meant would otherwise
-    /// come back with a quarter turn on it. A leg past the sixth places
-    /// nowhere and has no shift to give.
-    #[must_use]
-    pub fn shift_for(self, joint: JointId) -> Option<f64> {
-        joint.index()?;
-        match joint {
-            JointId::Leg(leg) => self.leg_shifts().get(usize::from(leg)).copied(),
-            // Yaw and the antennas are single-turn joints with no parity
-            // pairing, so no reading of the datum moves them.
-            _ => Some(0.0),
-        }
-    }
-}
-
-impl core::fmt::Display for CrankDatum {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Direct => f.write_str("direct"),
-            Self::ParityShifted => f.write_str("parity shifted"),
-        }
-    }
-}
 
 /// Why a value could not cross the boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Error)]
@@ -193,8 +133,10 @@ pub fn reg_for(reg: RegId) -> Reg {
 ///
 /// Only the two position registers a command path touches are angles. The
 /// travel limits and the homing offset stay integers: they are compared
-/// against how the unit was provisioned, and a datum-shifted angle is not that
-/// comparison.
+/// against how the unit was provisioned, and an angle is not that comparison.
+/// The homing offset is the one signed integer among them — this platform's
+/// legs carry a quarter turn of either sign — and reading it unsigned renders a
+/// negative offset as a number near four billion.
 #[must_use]
 pub fn value_kind(reg: RegId) -> ValueKind {
     match reg {
@@ -213,8 +155,8 @@ pub fn value_kind(reg: RegId) -> ValueKind {
         | RegId::MinVoltageLimit
         | RegId::CurrentLimit
         | RegId::ModelNumber => ValueKind::U16,
-        RegId::HomingOffset
-        | RegId::MinPositionLimit
+        RegId::HomingOffset => ValueKind::I32,
+        RegId::MinPositionLimit
         | RegId::MaxPositionLimit
         | RegId::VelocityLimit
         | RegId::ProfileAcceleration
@@ -232,41 +174,24 @@ const SHAPE_FITS_WIDTH: &str = "a register's width is the width its shape needs"
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct JointServo {
     id: u8,
-    datum_shift: f64,
 }
 
 /// Which servo each joint is, and what its counts mean.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ServoMap {
     joints: [JointServo; JointId::COUNT],
-    datum: CrankDatum,
 }
 
 impl ServoMap {
     /// A map over `ids` in bus order — body yaw, legs 1..=6, right antenna,
-    /// left antenna — with the legs' counts read under `datum`.
+    /// left antenna.
     #[must_use]
-    pub fn new(ids: [u8; JointId::COUNT], datum: CrankDatum) -> Self {
-        let mut joints = [JointServo {
-            id: 0,
-            datum_shift: 0.0,
-        }; JointId::COUNT];
-        for (slot, (id, joint)) in joints.iter_mut().zip(ids.iter().zip(JointId::ALL)) {
-            // Every joint in bus order places, so every one has a shift.
-            debug_assert!(datum.shift_for(joint).is_some());
-            let shift = datum.shift_for(joint).unwrap_or(0.0);
-            *slot = JointServo {
-                id: *id,
-                datum_shift: shift,
-            };
+    pub fn new(ids: [u8; JointId::COUNT]) -> Self {
+        let mut joints = [JointServo { id: 0 }; JointId::COUNT];
+        for (slot, id) in joints.iter_mut().zip(ids.iter()) {
+            *slot = JointServo { id: *id };
         }
-        Self { joints, datum }
-    }
-
-    /// The datum the legs are read under.
-    #[must_use]
-    pub fn datum(&self) -> CrankDatum {
-        self.datum
+        Self { joints }
     }
 
     /// The servo IDs, in bus order.
@@ -285,16 +210,14 @@ impl ServoMap {
         self.joints.get(joint).map(|servo| servo.id)
     }
 
-    /// The shift added to `joint`'s converted count to reach the model angle.
-    #[must_use]
-    pub fn shift_at(&self, joint: usize) -> Option<f64> {
-        self.joints.get(joint).map(|servo| servo.datum_shift)
-    }
-
     /// A measured count as the model's angle.
+    ///
+    /// The bare conversion: the servo's provisioned homing offset has already
+    /// been applied by its own firmware, so what arrives here is the model's
+    /// angle in counts.
     pub fn present_rad(&self, joint: usize, counts: i32) -> Result<f64, MapError> {
-        let servo = self.servo(joint)?;
-        Ok(counts_to_rad(counts) + servo.datum_shift)
+        self.servo(joint)?;
+        Ok(counts_to_rad(counts))
     }
 
     /// A model angle as the count to command.
@@ -302,7 +225,7 @@ impl ServoMap {
     /// Rounds to the nearest count and refuses anything no count represents.
     pub fn goal_counts(&self, joint: usize, rad: f64) -> Result<i32, MapError> {
         let servo = self.servo(joint)?;
-        rad_to_counts(rad - servo.datum_shift).map_err(|source| MapError::Angle {
+        rad_to_counts(rad).map_err(|source| MapError::Angle {
             joint,
             id: servo.id,
             source,
@@ -328,6 +251,7 @@ impl ServoMap {
             RegValue::U8(byte) => self.carry(reg, &[byte]),
             RegValue::U16(word) => self.carry(reg, &word.to_le_bytes()),
             RegValue::U32(long) => self.carry(reg, &long.to_le_bytes()),
+            RegValue::I32(signed) => self.carry(reg, &signed.to_le_bytes()),
             RegValue::Radians(rad) => {
                 let counts = self.goal_counts(joint, rad)?;
                 self.carry(reg, &counts.to_le_bytes())
@@ -368,6 +292,7 @@ impl ServoMap {
             ValueKind::U8 => Ok(RegValue::U8(raw.u8().expect(SHAPE_FITS_WIDTH))),
             ValueKind::U16 => Ok(RegValue::U16(raw.u16().expect(SHAPE_FITS_WIDTH))),
             ValueKind::U32 => Ok(RegValue::U32(raw.u32().expect(SHAPE_FITS_WIDTH))),
+            ValueKind::I32 => Ok(RegValue::I32(raw.i32().expect(SHAPE_FITS_WIDTH))),
             ValueKind::Radians => {
                 let counts = raw.i32().expect(SHAPE_FITS_WIDTH);
                 Ok(RegValue::Radians(self.present_rad(joint, counts)?))
@@ -425,11 +350,7 @@ mod tests {
     const IDS: [u8; JointId::COUNT] = [10, 11, 12, 13, 14, 15, 16, 17, 18];
 
     fn direct() -> ServoMap {
-        ServoMap::new(IDS, CrankDatum::Direct)
-    }
-
-    fn shifted() -> ServoMap {
-        ServoMap::new(IDS, CrankDatum::ParityShifted)
+        ServoMap::new(IDS)
     }
 
     #[test]
@@ -440,7 +361,6 @@ mod tests {
             assert_eq!(map.id_at(index), Some(*id));
         }
         assert_eq!(map.id_at(JointId::COUNT), None);
-        assert_eq!(map.shift_at(JointId::COUNT), None);
         assert_eq!(
             map.present_rad(JointId::COUNT, 0),
             Err(MapError::UnknownJoint {
@@ -455,106 +375,36 @@ mod tests {
         );
     }
 
+    /// Every joint's counts convert the same way: the offset that separates a
+    /// crank's mechanical zero from the model's lives in the servo, so nothing
+    /// here moves one joint's reading relative to another's.
     #[test]
-    fn the_direct_datum_shifts_nothing() {
+    fn a_count_is_the_model_angle_on_every_joint_alike() {
         let map = direct();
-        assert_eq!(map.datum(), CrankDatum::Direct);
-        for index in 0..JointId::COUNT {
-            assert_eq!(map.shift_at(index), Some(0.0));
-        }
-        assert!(map.present_rad(1, CENTRE_COUNTS).unwrap().abs() < 1e-12);
-        assert_eq!(map.goal_counts(1, 0.0), Ok(CENTRE_COUNTS));
-    }
-
-    #[test]
-    fn the_parity_datum_moves_alternate_legs_a_quarter_turn_each_way() {
-        let map = shifted();
-        assert_eq!(map.datum(), CrankDatum::ParityShifted);
-
-        // Yaw and the antennas are untouched under either datum.
-        assert_eq!(map.shift_at(0), Some(0.0));
-        assert_eq!(map.shift_at(7), Some(0.0));
-        assert_eq!(map.shift_at(8), Some(0.0));
-
-        // Legs 1, 3, 5 sit at bus positions 1, 3, 5 and take the positive
-        // shift; legs 2, 4, 6 take the negative one.
-        for (index, expected) in [
-            (1, FRAC_PI_2),
-            (2, -FRAC_PI_2),
-            (3, FRAC_PI_2),
-            (4, -FRAC_PI_2),
-            (5, FRAC_PI_2),
-            (6, -FRAC_PI_2),
-        ] {
-            assert_eq!(map.shift_at(index), Some(expected));
-            let model = map.present_rad(index, CENTRE_COUNTS).unwrap();
-            assert!((model - expected).abs() < 1e-12, "joint {index}");
+        for joint in 0..JointId::COUNT {
+            assert!(
+                map.present_rad(joint, CENTRE_COUNTS).unwrap().abs() < 1e-12,
+                "joint {joint}"
+            );
+            assert_eq!(
+                map.goal_counts(joint, 0.0),
+                Ok(CENTRE_COUNTS),
+                "joint {joint}"
+            );
         }
     }
 
-    /// The shift is asked for by joint, not by a number: the bus rows and the
-    /// leg indices are one apart, and a row handed in where a leg was meant
-    /// would otherwise come back with a quarter turn on a joint the datum must
-    /// never move. A leg past the sixth places nowhere and gets no answer.
     #[test]
-    fn only_a_joint_this_bus_has_a_place_for_has_a_shift() {
-        for datum in [CrankDatum::Direct, CrankDatum::ParityShifted] {
-            for joint in JointId::ALL {
-                assert!(datum.shift_for(joint).is_some(), "{joint} under {datum}");
-            }
-            for leg in [6u8, 7, 9, u8::MAX] {
+    fn a_count_and_an_angle_round_trip() {
+        let map = direct();
+        for joint in 0..JointId::COUNT {
+            for counts in [0, 1000, CENTRE_COUNTS, 3000, COUNTS_PER_REV] {
+                let rad = map.present_rad(joint, counts).unwrap();
                 assert_eq!(
-                    datum.shift_for(JointId::Leg(leg)),
-                    None,
-                    "there is no seventh crank"
+                    map.goal_counts(joint, rad),
+                    Ok(counts),
+                    "joint {joint} at {counts} counts"
                 );
-            }
-        }
-        // The right antenna sits at row 7, where leg 7 would be if rows were
-        // legs. It takes no shift under either datum.
-        assert_eq!(
-            CrankDatum::ParityShifted.shift_for(JointId::AntennaRight),
-            Some(0.0)
-        );
-        assert_eq!(
-            CrankDatum::ParityShifted.shift_for(JointId::BodyYaw),
-            Some(0.0)
-        );
-    }
-
-    /// The six legs' shifts are one record, read the same way whether a caller
-    /// asks joint by joint or takes the whole array. A caller working over the
-    /// six legs therefore never meets an absent shift to substitute for.
-    #[test]
-    fn the_leg_shifts_are_the_array_and_the_lookup_alike() {
-        for datum in [CrankDatum::Direct, CrankDatum::ParityShifted] {
-            let shifts = datum.leg_shifts();
-            for (leg, shift) in shifts.iter().enumerate() {
-                let leg = u8::try_from(leg).expect("six legs fit a byte");
-                assert_eq!(datum.shift_for(JointId::Leg(leg)), Some(*shift));
-            }
-        }
-        assert_eq!(CrankDatum::Direct.leg_shifts(), [0.0; 6]);
-        // Alternate legs a quarter turn each way, and no leg left where it was.
-        for (leg, shift) in CrankDatum::ParityShifted.leg_shifts().iter().enumerate() {
-            assert_eq!(shift.abs(), FRAC_PI_2, "leg {}", leg + 1);
-            assert_eq!(shift.is_sign_positive(), leg.is_multiple_of(2));
-        }
-    }
-
-    #[test]
-    fn a_count_and_an_angle_round_trip_under_both_datums() {
-        for map in [direct(), shifted()] {
-            for joint in 0..JointId::COUNT {
-                for counts in [0, 1000, CENTRE_COUNTS, 3000, COUNTS_PER_REV] {
-                    let rad = map.present_rad(joint, counts).unwrap();
-                    assert_eq!(
-                        map.goal_counts(joint, rad),
-                        Ok(counts),
-                        "joint {joint} at {counts} counts under {}",
-                        map.datum()
-                    );
-                }
             }
         }
     }
@@ -585,9 +435,9 @@ mod tests {
 
     #[test]
     fn a_goal_is_the_measurement_it_reads_back_as() {
-        // What the tick relies on: a goal written under a datum and read back
-        // under the same datum is the angle that was commanded.
-        let map = shifted();
+        // What the tick relies on: a goal written and read back is the angle
+        // that was commanded.
+        let map = direct();
         let commanded = 0.3;
         let counts = map.goal_counts(2, commanded).unwrap();
         let measured = map.present_rad(2, counts).unwrap();
@@ -604,7 +454,7 @@ mod tests {
             let expected_width = match kind {
                 ValueKind::U8 => 1,
                 ValueKind::U16 | ValueKind::Volts => 2,
-                ValueKind::U32 | ValueKind::Radians => 4,
+                ValueKind::U32 | ValueKind::I32 | ValueKind::Radians => 4,
                 ValueKind::Gains => 6,
             };
             assert_eq!(
@@ -698,9 +548,10 @@ mod tests {
 
     #[test]
     fn integer_registers_cross_as_integers() {
-        let map = shifted();
+        let map = direct();
         // The travel limits are what a provisioning check compares against the
-        // way the unit was set up, so the datum must not touch them.
+        // way the unit was set up, so they cross as the counts the register
+        // holds and never as angles.
         let raw = map
             .encode_value(1, RegId::MinPositionLimit, RegValue::U32(1502))
             .unwrap();
@@ -725,22 +576,48 @@ mod tests {
         assert_eq!(word.as_slice(), &2352u16.to_le_bytes());
     }
 
+    /// The homing offset is the one signed register: this platform's legs carry
+    /// a quarter turn of either sign, and read unsigned the negative ones report
+    /// as a span near four billion.
     #[test]
-    fn a_position_register_crosses_as_an_angle_under_the_datum() {
-        let map = shifted();
+    fn the_homing_offset_crosses_as_a_signed_integer() {
+        let map = direct();
         let raw = map
-            .encode_value(1, RegId::GoalPosition, RegValue::Radians(FRAC_PI_2))
+            .encode_value(2, RegId::HomingOffset, RegValue::I32(-1024))
+            .unwrap();
+        assert_eq!(raw.as_slice(), &(-1024i32).to_le_bytes());
+        assert_eq!(raw.as_slice(), &0xFFFF_FC00u32.to_le_bytes());
+        let decoded = map.decode_value(2, RegId::HomingOffset, &raw).unwrap();
+        assert_eq!(decoded, RegValue::I32(-1024));
+        assert_eq!(decoded.to_string(), "-1024");
+
+        assert_eq!(
+            map.encode_value(2, RegId::HomingOffset, RegValue::U32(1024)),
+            Err(MapError::WrongShape {
+                reg: RegId::HomingOffset,
+                expected: ValueKind::I32,
+                observed: ValueKind::U32,
+            })
+        );
+    }
+
+    #[test]
+    fn a_position_register_crosses_as_an_angle() {
+        let map = direct();
+        let raw = map
+            .encode_value(1, RegId::GoalPosition, RegValue::Radians(0.0))
             .unwrap();
         assert_eq!(
             raw.i32(),
             Some(CENTRE_COUNTS),
-            "leg 1's quarter-turn shift lands the model's 90 degrees at centre"
+            "the model's zero is the register's centre count"
         );
         assert_eq!(
             map.decode_value(1, RegId::PresentPosition, &raw),
-            Ok(RegValue::Radians(FRAC_PI_2))
+            Ok(RegValue::Radians(0.0))
         );
-        // The same bytes on the yaw servo mean a different angle.
+        // The same bytes mean the same angle on every joint: nothing here is
+        // per-joint, which is what makes a provisioning fault a servo's own.
         assert_eq!(
             map.decode_value(0, RegId::PresentPosition, &raw),
             Ok(RegValue::Radians(0.0))
@@ -807,11 +684,5 @@ mod tests {
                 actual: 2,
             })
         );
-    }
-
-    #[test]
-    fn a_datum_names_itself() {
-        assert_eq!(format!("{}", CrankDatum::Direct), "direct");
-        assert_eq!(format!("{}", CrankDatum::ParityShifted), "parity shifted");
     }
 }

@@ -8,9 +8,10 @@
 //! loop under every host substrate, and pretending otherwise buys nothing.
 //!
 //! It is also where joints meet the wire. The servo map turns a joint's index
-//! into a servo ID, a register name into an address, and a count into the
-//! angle the model means — applying the leg datum. Nothing above this crate
-//! learns what an address or a count is.
+//! into a servo ID, a register name into an address, and a count into the angle
+//! the model means. Nothing above this crate learns what an address or a count
+//! is, and nothing here shifts a reading: the offset between a crank's
+//! mechanical zero and the model's is provisioned into the servo itself.
 //!
 //! The port is reached through a narrow trait of our own — write, read with a
 //! deadline, discard input — rather than the serial crate's full interface. Three
@@ -52,5 +53,5 @@ pub mod port;
 
 pub use bus::{Bus, BusCounters, BusTiming, MAX_SYNC_IDS, PingInfo, RawValue, with_retry};
 pub use error::{IdOutcome, SyncReadOutcome, XactError};
-pub use map::{CrankDatum, MapError, ServoMap, reg_for, value_kind};
+pub use map::{MapError, ServoMap, reg_for, value_kind};
 pub use port::{BusPort, DEFAULT_BAUD, SerialBusPort};

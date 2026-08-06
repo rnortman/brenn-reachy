@@ -57,8 +57,15 @@ The response is uniform and deliberate:
 | `dxl-proto` | Dynamixel Protocol 2.0 frame codec, X-series register table, unit conversions. No I/O. |
 | `reachy-kin` | Head kinematics for the parallel platform: inverse and forward solutions, travel envelope, clearance margins. Pure math. |
 | `reachy-motion` | Trajectory shaping, the per-tick control step, and the arm/disarm sequences. Sans-I/O. |
-| `reachy-bus` | The one I/O layer: serial port, transactions, error taxonomy. |
+| `reachy-bus` | The one I/O layer: serial port, transactions, error taxonomy, and the joint-to-servo map. |
 | `reachy-bench` | Bench binary: a read-only self-test registry, and the supervised bring-up commands. |
+
+The edges run one way: `reachy-kin` under `reachy-motion`, and both of those
+plus `dxl-proto` under `reachy-bus`, with `reachy-bench` on top. `reachy-bus`
+depends on `reachy-motion` because the joint-to-servo map is what joins the two
+vocabularies — a joint and a register name on one side, an address and a count
+on the other — and it is typed against both. The property that matters survives
+the edge: `reachy-motion` still carries no I/O, no addresses and no counts.
 
 ## Status
 

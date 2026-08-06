@@ -166,25 +166,29 @@ temperature_limit = 70
 # Tenths of a volt.
 max_voltage_limit = 70
 min_voltage_limit = 35
-# Per servo in bus order: the body yaw servo is a different part with a different
-# ceiling.
-current_limit = [2352, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
+# Per servo in bus order, because the roster is not all one part. This unit reads
+# the same untouched factory ceiling on all nine: nothing in the vendor's
+# configuration writes a current limit, so what the servos hold is what they
+# shipped with.
+current_limit = [1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
 # As provisioned, which is the state the servo powers up in. Arming rewrites the
 # profile from [arm] at every arm.
 profile_acceleration = 0
 profile_velocity = 0
-# Legs 1..=6, counts. Alternate legs carry a quarter turn of opposite sign: this
-# platform's datum is expressed in the servo rather than in the host, which is
-# the reason the [datum] table below exists at all. The other three servos'
-# offsets are recorded in the arm report rather than checked.
-leg_homing_offset = [1024, -1024, 1024, -1024, 1024, -1024]
+# The homing offsets are deliberately not a key here. They are the datum — the
+# servo applies its own offset before reporting a position, so a converted count
+# is the model's crank angle exactly when they hold what the vendor wrote — and
+# a datum is not a per-unit setting to be edited. The nine expected values are
+# baked in code, and a servo answering otherwise is a provisioning fault to be
+# repaired with the vendor's tool.
+#
 # The per-leg window the servo itself refuses to be commanded past, counts, legs
-# 1..=6. Mapped through the servo map under the configured datum these must be
-# the envelope's crank windows above, to within one count: the servos and the
-# host envelope have to be guarding one region, and this is the only place that
-# is ever established. A leg that disagrees refuses the whole configuration by
-# name, because which of the three records is wrong — these limits, those
-# windows, or the datum — is not something code should pick.
+# 1..=6. Mapped through the servo map these must be the envelope's crank windows
+# above, to within one count: the servos and the host envelope have to be
+# guarding one region, and this is the only place that is ever established. A leg
+# that disagrees refuses the whole configuration by name, because which of the
+# two records is wrong — these limits or those windows — is not something code
+# should pick.
 leg_position_limits = [
     [1502, 2958],
     [1138, 2844],
@@ -195,19 +199,18 @@ leg_position_limits = [
 ]
 
 # [datum] — absent from a fresh configuration, and no command that moves anything
-# runs without it. Which reading of the legs' counts is the model's crank angle
-# is a property of how this unit was provisioned; both readings close the linkage
-# exactly, so nothing computed separates them and an externally measured head
-# height is what does. Run the self-test, read its classification, measure the
-# head height with a rule, and write the answer here yourself.
+# runs without it. That a converted count is the model's crank angle rests on
+# every servo carrying its provisioned homing offset: the self-test's datum case
+# reads all nine back and compares them, and the arm sequence re-verifies them
+# before it enables anything. This table is not that check — it is the record
+# that a person read a run and stands behind what it says.
 #
 # It is commented out rather than filled in, and as shipped this file therefore
-# refuses every command that moves something. That is the intended state: no
-# example can know which reading your unit was provisioned with, and a value
-# copied from here would be a datum nobody checked, standing where the one thing
-# that separates the two readings is supposed to be. Uncomment both lines and
-# replace them with your own answer and your own note.
+# refuses every command that moves something. That is the intended state: an
+# example cannot have read your unit's run, and a value copied from here would be
+# a review nobody performed standing where the review is supposed to be.
+# Uncomment both lines and write your own note.
 #
 # [datum]
-# crank_datum = "direct"          # or "parity_shifted"
-# provenance = "who resolved it, when, and from which self-test record"
+# crank_datum = "direct"          # the only reading; anything else is refused
+# provenance = "who reviewed it, when, and from which self-test record"

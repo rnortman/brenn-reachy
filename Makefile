@@ -22,8 +22,12 @@ help:
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
 	@echo ""
-	@echo "The bench binary needs real hardware and is not part of any gate."
-	@echo "It parses no arguments yet, and every invocation exits nonzero saying so."
+	@echo "Device targets — real hardware, no part of any gate. Need podman, and a"
+	@echo "REACHY_HOST naming a reachable unit:"
+	@echo "  make bench-build     the aarch64 binary, built in the pinned container"
+	@echo "  make bench-config    push the bench's configuration into the unit's RAM"
+	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
+	@echo "  make bench-fetch     bring a run's state file back, timestamped"
 
 # The whole gate. One workspace at the repo root, every crate a default member,
 # so --workspace and a bare invocation cover the same set.
@@ -68,3 +72,74 @@ setup-hooks:
 .PHONY: scrub-tree
 scrub-tree:
 	brenn-scrub tree
+
+# ---------------------------------------------------------------------------
+# The device path: building the bench for the Reachy Mini and running it there.
+#
+# None of this is part of the gate. It needs podman to build and a reachable
+# unit to run, and it exists because the device cannot build anything itself —
+# brenn-os carries no compiler, and its flash is not somewhere a toolchain gets
+# installed.
+
+# The unit these targets talk to. Named for one invocation on the command line
+# first, and in the gitignored .local/reachy.conf second, so a workstation that
+# always talks to the same unit says so once:
+#
+#     echo 'REACHY_HOST=reachy00' > .local/reachy.conf
+#
+# The file is only read when the variable is not already set, so an override for
+# one invocation stays an override for one invocation.
+ifeq ($(origin REACHY_HOST), undefined)
+-include .local/reachy.conf
+endif
+
+# The bench's configuration for this unit. Gitignored: it holds the serial node
+# and, once a person has reviewed a run, the crank datum record for one machine.
+BENCH_CONFIG ?= .local/reachy-bench.toml
+
+# Where fetched state files accumulate. One per run, named for its fetch time.
+BENCH_RECORDS ?= .local/records
+
+# Refuse before doing anything rather than ssh to nowhere. A prerequisite of
+# every target that talks to a device, listed first so the refusal comes before
+# a container build.
+.PHONY: bench-host
+bench-host:
+	@[ -n "$(REACHY_HOST)" ] || { \
+	    echo "REACHY_HOST is not set, so there is no device to talk to." >&2; \
+	    echo "Name the unit for this invocation:" >&2; \
+	    echo "    make $(MAKECMDGOALS) REACHY_HOST=<hostname>" >&2; \
+	    echo "or once, in the gitignored .local/reachy.conf:" >&2; \
+	    echo "    REACHY_HOST=<hostname>" >&2; \
+	    exit 1; \
+	}
+
+# The aarch64 binary, built in the pinned container. Needs podman; needs no
+# device.
+.PHONY: bench-build
+bench-build:
+	tools/build-bench.sh
+
+# Give the unit the bench's configuration. Needs no build, so it can run before
+# or after one; idempotent, and the re-run after a reboot is the whole story —
+# the device's copy is in RAM.
+.PHONY: bench-config
+bench-config: bench-host
+	tools/deploy-bench.sh $(REACHY_HOST) --config $(BENCH_CONFIG)
+
+# Build, push, and run the read-only self-test registry on the unit. ARGS is
+# passed to the bench verbatim.
+#
+# Leave the record where it lands — bench-fetch reads it from beside the
+# configuration. A --record elsewhere writes to RAM that no target brings
+# back and a reboot clears.
+.PHONY: bench-selftest
+bench-selftest: bench-host bench-build
+	tools/deploy-bench.sh $(REACHY_HOST) --run selftest $(ARGS)
+
+# Bring a run's state file back. Each fetch lands under its own timestamped
+# name, so the several runs a session calls for accumulate rather than
+# overwrite each other.
+.PHONY: bench-fetch
+bench-fetch: bench-host
+	tools/deploy-bench.sh $(REACHY_HOST) --fetch $(BENCH_RECORDS)

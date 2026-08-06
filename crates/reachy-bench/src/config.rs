@@ -10,11 +10,12 @@
 //!
 //! ## The datum gate
 //!
-//! There is no default crank datum and there never will be. Which of the two
-//! readings of the legs' counts is the model's crank angle is a property of how
-//! this unit was provisioned; both readings close the linkage exactly, so
-//! nothing computed separates them. A configuration without a `[datum]` table,
-//! or with one carrying no provenance line, resolves to a typed refusal and no
+//! There is no default crank datum and there never will be. That a converted
+//! count is the model's crank angle rests on every leg servo carrying its
+//! provisioned homing offset, which the self-test reads back and the arm
+//! sequence re-verifies; the `[datum]` table is the record that a person checked
+//! that evidence and stands behind it. A configuration without the table, or
+//! with one carrying no provenance line, resolves to a typed refusal and no
 //! command that moves anything runs.
 //!
 //! ## Two fences, one region
@@ -22,27 +23,27 @@
 //! The servos enforce a per-leg position window of their own, in counts, and the
 //! envelope enforces a per-leg crank window, in radians. They are separate
 //! mechanisms guarding what must be one region. Mapping the count window through
-//! the servo map under the configured datum and comparing it against the
-//! envelope window is the only place that correspondence is ever established, so
-//! it is established here, before any sequencer runs: each count bound must land
-//! inside its envelope bound and within one count of it. A datum that moves the
-//! count window somewhere else is refused by name rather than left to diverge
-//! silently — which of the three records is wrong is not something code should
-//! pick.
+//! the servo map and comparing it against the envelope window is the only place
+//! that correspondence is ever established, so it is established here, before
+//! any sequencer runs: each count bound must land inside its envelope bound and
+//! within one count of it. A leg whose two windows describe different regions is
+//! refused by name rather than left to diverge silently — which of the two
+//! records is wrong is not something code should pick.
 
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use reachy_bus::{BusTiming, CrankDatum, DEFAULT_BAUD, MapError, ServoMap};
+use reachy_bus::{BusTiming, DEFAULT_BAUD, MapError, ServoMap};
 use reachy_kin::{EnvelopeConfig, FkOptions, HeadGeometry, IkError, baked};
 use reachy_motion::{
     ArmConfig, DisarmConfig, Gains, GroupGains, JointId, JointStep, MotionConfig, ProfileConfig,
-    ProvisionExpect, ProvisionTable, RegId, RegValue, TrackingFaultConfig, stow_targets,
+    ProvisionExpect, ProvisionTable, RegId, RegValue, TrackingFaultConfig, VENDOR_HOMING_OFFSETS,
+    stow_targets,
 };
 
 /// One encoder count, radians — the finest distinction a position register can
@@ -142,7 +143,7 @@ pub enum ConfigError {
 
     /// No crank datum has been resolved.
     #[error(
-        "no crank datum is configured: add a [datum] table once the self-test has classified it and a human has reviewed the classification"
+        "no crank datum is configured: add a [datum] table once a human has read a self-test record and stands behind what its datum case says"
     )]
     MissingDatum,
 
@@ -171,15 +172,12 @@ pub enum ConfigError {
 /// A leg whose provisioned count window and envelope crank window do not
 /// describe the same region.
 ///
-/// Carries both windows in both domains and the datum they were compared under,
-/// because the fault is in exactly one of the three records and the message has
-/// to give a person enough to say which.
+/// Carries both windows in both domains, because the fault is in exactly one of
+/// the two records and the message has to give a person enough to say which.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FenceMismatch {
     /// 0-based leg index.
     pub leg: usize,
-    /// The datum the count window was read under.
-    pub datum: CrankDatum,
     /// The provisioned window, counts.
     pub servo_counts: [u32; 2],
     /// The same window mapped to model angles, degrees.
@@ -194,14 +192,13 @@ impl fmt::Display for FenceMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "leg {}: the provisioned window {}..{} counts reads {:.3}°..{:.3}° under the {} datum, \
+            "leg {}: the provisioned window {}..{} counts reads {:.3}°..{:.3}°, \
              which is not inside the envelope window {:.3}°..{:.3}° ({}..{} counts) to within one count",
             self.leg + 1,
             self.servo_counts[0],
             self.servo_counts[1],
             self.servo_deg[0],
             self.servo_deg[1],
-            self.datum,
             self.envelope_deg[0],
             self.envelope_deg[1],
             render_count(self.envelope_counts[0]),
@@ -241,8 +238,8 @@ pub struct BenchConfig {
     /// What the provisioned registers must hold.
     #[serde(default)]
     pub provision: ProvisionSection,
-    /// The resolved crank datum. Absent until the self-test has classified it
-    /// and a human has reviewed the classification.
+    /// The resolved crank datum. Absent until a human has read a self-test
+    /// record and written it in.
     #[serde(default)]
     pub datum: Option<DatumSection>,
 }
@@ -537,19 +534,15 @@ pub struct ProvisionSection {
     pub max_voltage_limit: u16,
     /// Minimum Voltage Limit, all nine, in tenths of a volt.
     pub min_voltage_limit: u16,
-    /// Current Limit, per servo in bus order. The body yaw servo is a different
-    /// part with a different ceiling.
+    /// Current Limit, per servo in bus order. Per servo rather than one value
+    /// because the roster is not all one part; on this unit all nine read the
+    /// same untouched factory ceiling.
     pub current_limit: [u16; JointId::COUNT],
     /// Profile Acceleration, all nine, as provisioned. Arming rewrites this at
     /// every arm; what is checked here is the state the servo powers up in.
     pub profile_acceleration: u32,
     /// Profile Velocity, all nine, as provisioned.
     pub profile_velocity: u32,
-    /// Homing Offset for the six legs, counts, legs 1..=6. Alternate legs carry
-    /// a quarter turn of opposite sign, which is how this platform's datum is
-    /// expressed in the servo rather than in the host. The other three servos'
-    /// offsets are recorded rather than checked.
-    pub leg_homing_offset: [i32; 6],
     /// The per-leg position window the servo itself refuses to be commanded
     /// past, counts, lower then upper, legs 1..=6. Mapped through the servo map
     /// under the configured datum, this must be the envelope's crank window.
@@ -568,10 +561,9 @@ impl Default for ProvisionSection {
             temperature_limit: 70,
             max_voltage_limit: 70,
             min_voltage_limit: 35,
-            current_limit: [2352, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750],
+            current_limit: [1750; JointId::COUNT],
             profile_acceleration: 0,
             profile_velocity: 0,
-            leg_homing_offset: [1024, -1024, 1024, -1024, 1024, -1024],
             leg_position_limits: [
                 [1502, 2958],
                 [1138, 2844],
@@ -586,9 +578,9 @@ impl Default for ProvisionSection {
 
 /// `[datum]` — how the legs' counts relate to the model's crank angles.
 ///
-/// Both keys are required. A datum without a provenance line is a number nobody
-/// can trace back to the reading that produced it, and the self-test record's
-/// agreement rule leans on the provenance being there.
+/// Both keys are required. A datum without a provenance line is a claim nobody
+/// can trace back to the reading that produced it, and the whole point of this
+/// table is that a person read the evidence.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DatumSection {
@@ -598,21 +590,26 @@ pub struct DatumSection {
     pub provenance: String,
 }
 
-/// The datum as the file spells it.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+/// The datum as a file spells it — the bench configuration and the self-test
+/// record alike, which is why one spelling serves both.
+///
+/// One variant, deliberately. A host-side correction is never the answer to a
+/// servo that lacks its provisioned offset: that is one servo's fault, refused
+/// by name, and a compensating shift would move all six legs for it. The enum
+/// exists so that a file saying anything else is refused by serde rather than
+/// read past.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatumSetting {
-    /// A converted count is the crank angle as the model means it.
+    /// A converted count is the crank angle as the model means it, because each
+    /// leg servo applies its provisioned homing offset before reporting.
     Direct,
-    /// Alternate legs sit a quarter turn either side of it.
-    ParityShifted,
 }
 
-impl From<DatumSetting> for CrankDatum {
-    fn from(setting: DatumSetting) -> Self {
-        match setting {
-            DatumSetting::Direct => Self::Direct,
-            DatumSetting::ParityShifted => Self::ParityShifted,
+impl fmt::Display for DatumSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
         }
     }
 }
@@ -722,16 +719,16 @@ impl BenchConfig {
         Ok(ids)
     }
 
-    /// The resolved datum and where it came from.
+    /// Where the recorded datum came from.
     ///
-    /// This is the gate that keeps every motion command off an unresolved
-    /// machine.
-    pub fn datum(&self) -> Result<(CrankDatum, &str), ConfigError> {
+    /// This is the gate that keeps every motion command off a machine nobody
+    /// has reviewed the provisioning evidence for.
+    pub fn datum(&self) -> Result<&str, ConfigError> {
         let section = self.datum.as_ref().ok_or(ConfigError::MissingDatum)?;
         if section.provenance.trim().is_empty() {
             return Err(ConfigError::DatumProvenanceEmpty);
         }
-        Ok((section.crank_datum.into(), section.provenance.as_str()))
+        Ok(section.provenance.as_str())
     }
 
     /// The tick's configuration.
@@ -823,29 +820,25 @@ impl BenchConfig {
         // their provisioned range is the whole turn and no window is claimed.
         table.set_all(RegId::VelocityLimit, ProvisionExpect::Record);
         table.set_all(RegId::Shutdown, ProvisionExpect::Record);
-        table.set_all(RegId::HomingOffset, ProvisionExpect::Record);
         table.set_all(RegId::MinPositionLimit, ProvisionExpect::Record);
         table.set_all(RegId::MaxPositionLimit, ProvisionExpect::Record);
-
+        // Checked against the workspace's one record of the datum, not a
+        // per-unit setting.
         for (row, joint) in JointId::ALL.iter().enumerate() {
             table.set(
                 *joint,
                 RegId::CurrentLimit,
                 ProvisionExpect::Check(RegValue::U16(section.current_limit[row])),
             );
+            table.set(
+                *joint,
+                RegId::HomingOffset,
+                ProvisionExpect::Check(RegValue::I32(VENDOR_HOMING_OFFSETS[row])),
+            );
         }
         for leg in 0..6u8 {
             let index = usize::from(leg);
             let [lower, upper] = section.leg_position_limits[index];
-            // The register is four bytes read as an unsigned span; a negative
-            // offset crosses as its two's complement, which is what the servo
-            // holds and what a read comes back as.
-            let offset = section.leg_homing_offset[index] as u32;
-            table.set(
-                JointId::Leg(leg),
-                RegId::HomingOffset,
-                ProvisionExpect::Check(RegValue::U32(offset)),
-            );
             table.set(
                 JointId::Leg(leg),
                 RegId::MinPositionLimit,
@@ -862,13 +855,12 @@ impl BenchConfig {
 
     /// Everything the libraries need, with every check run.
     ///
-    /// The order matters: the datum is resolved first, because the fence
-    /// correspondence is a statement about a particular datum and there is
-    /// nothing to say without one.
+    /// The datum gate runs first: without a reviewed datum record nothing that
+    /// moves the machine may run, so there is no point converting the rest.
     pub fn resolve(&self) -> Result<Resolved, ConfigError> {
-        let (datum, provenance) = self.datum()?;
+        let provenance = self.datum()?;
         let ids = self.servo_ids()?;
-        let map = ServoMap::new(ids, datum);
+        let map = ServoMap::new(ids);
         let env = self.envelope()?;
         let geom = HeadGeometry::default();
         let motion = self.motion(geom.clone(), env)?;
@@ -972,7 +964,6 @@ pub fn leg_windows_from_counts(
         if !agrees {
             return Err(ConfigError::FenceMismatch(FenceMismatch {
                 leg,
-                datum: map.datum(),
                 servo_counts: [lower_counts, upper_counts],
                 servo_deg: [lower.to_degrees(), upper.to_degrees()],
                 envelope_deg: [env_lower.to_degrees(), env_upper.to_degrees()],
@@ -1097,7 +1088,6 @@ provenance = \"test fixture\"
     fn the_example_file_parses_and_resolves_once_a_datum_is_written_in() {
         let cfg = example_resolved();
         let resolved = cfg.resolve().expect("the example plus a datum resolves");
-        assert_eq!(resolved.map.datum(), CrankDatum::Direct);
         assert_eq!(resolved.map.ids(), reachy_motion::arm::SERVO_IDS);
         assert!(!resolved.datum_provenance.trim().is_empty());
     }
@@ -1105,11 +1095,9 @@ provenance = \"test fixture\"
     /// The shipped example carries no datum, and therefore refuses every command
     /// that moves something exactly as it stands.
     ///
-    /// A filled-in example would be a datum nobody measured sitting on the gate
-    /// that exists to force a human to measure one: the copied file would
-    /// resolve, and the record-versus-configuration check cannot fire against it
-    /// on a machine whose classification is left for review — which is the
-    /// steady state on this platform.
+    /// A filled-in example would be a datum nobody reviewed sitting on the gate
+    /// that exists to force a human to review one: the copied file would
+    /// resolve, and nothing downstream re-asks the question the table answers.
     #[test]
     fn the_shipped_example_resolves_no_datum() {
         let cfg = parse(EXAMPLE).expect("the shipped example parses");
@@ -1259,6 +1247,21 @@ provenance = \"test fixture\"
         assert!(message.contains("tick_hertz"), "{message}");
     }
 
+    /// The datum has one record, and this file is not it.
+    ///
+    /// A homing offset is what makes a converted count the model's crank angle;
+    /// a file that could set it would be a second record of the same truth,
+    /// free to disagree. There is no such key, so a file carrying one is
+    /// refused rather than quietly ignored.
+    #[test]
+    fn the_homing_offsets_are_not_a_configuration_key() {
+        let typo = parse(&format!(
+            "{MINIMAL}\n[provision]\nleg_homing_offset = [1024, -1024, 1024, -1024, 1024, -1024]\n"
+        ));
+        let message = format!("{:#}", typo.expect_err("there is no such key"));
+        assert!(message.contains("leg_homing_offset"), "{message}");
+    }
+
     #[test]
     fn a_roster_that_is_not_nine_distinct_addressable_servos_refuses() {
         let reserved = parse(&format!(
@@ -1281,7 +1284,7 @@ provenance = \"test fixture\"
     }
 
     #[test]
-    fn the_two_fences_agree_under_the_direct_datum() {
+    fn the_two_fences_agree_on_the_shipped_windows() {
         let cfg = minimal();
         let resolved = cfg.resolve().expect("resolves");
         let env = cfg.envelope().expect("resolves");
@@ -1319,34 +1322,35 @@ provenance = \"test fixture\"
         assert!((loosest - 0.039_062_5).abs() < 1e-9, "loosest {loosest}");
     }
 
+    /// A refused fence names the leg and both windows in both domains.
+    ///
+    /// The two records come from different places — the servos' provisioned
+    /// limits and this file's envelope — and the refusal exists because which of
+    /// them is wrong is a person's call. A message that named only the leg would
+    /// send that person back to read both tables themselves.
     #[test]
-    fn the_parity_shifted_datum_is_refused_on_these_windows() {
-        // Not a hypothetical: the shift moves each leg's count window a quarter
-        // turn, and the envelope windows stay where they are. If the datum ever
-        // resolves this way while the provisioned limits stay as they are, the
-        // two fences genuinely disagree and arming must stop until a human
-        // reconciles them.
-        let cfg = parse(
-            "[arm]\nprofile_acceleration = 50\nprofile_velocity = 300\n\
-             [datum]\ncrank_datum = \"parity_shifted\"\nprovenance = \"test fixture\"\n",
-        )
-        .expect("parses");
+    fn a_refused_fence_names_the_leg_and_both_windows_in_both_domains() {
+        let mut cfg = minimal();
+        // Two counts out on leg 1's low bound: past the one count of slack the
+        // whole-degrees-against-whole-counts derivation leaves.
+        cfg.provision.leg_position_limits[0][0] -= 2;
         let error = cfg.resolve().unwrap_err();
         let ConfigError::FenceMismatch(mismatch) = error else {
             panic!("expected a fence mismatch, got {error}");
         };
         assert_eq!(mismatch.leg, 0);
-        assert_eq!(mismatch.datum, CrankDatum::ParityShifted);
-        assert_eq!(mismatch.servo_counts, [1502, 2958]);
-        assert!((mismatch.servo_deg[0] - 42.012).abs() < 0.01, "{mismatch}");
-        assert!((mismatch.servo_deg[1] - 169.980).abs() < 0.01, "{mismatch}");
+        assert_eq!(mismatch.servo_counts, [1500, 2958]);
+        assert!((mismatch.servo_deg[0] + 48.164).abs() < 0.01, "{mismatch}");
+        assert!((mismatch.servo_deg[1] - 79.980).abs() < 0.01, "{mismatch}");
         assert!((mismatch.envelope_deg[0] + 48.0).abs() < 1e-9);
         assert!((mismatch.envelope_deg[1] - 80.0).abs() < 1e-9);
+        assert_eq!(mismatch.envelope_counts, [Some(1502), Some(2958)]);
 
         let message = mismatch.to_string();
         assert!(message.contains("leg 1"), "{message}");
-        assert!(message.contains("parity shifted"), "{message}");
-        assert!(message.contains("1502..2958"), "{message}");
+        assert!(message.contains("1500..2958"), "{message}");
+        assert!(message.contains("1502..2958 counts"), "{message}");
+        assert!(message.contains("-48.000°..80.000°"), "{message}");
     }
 
     #[test]
@@ -1542,11 +1546,12 @@ provenance = \"test fixture\"
     fn the_provisioning_table_checks_the_setup_and_records_the_rest() {
         let cfg = minimal();
         let table = cfg.provision_table();
-        // Nine registers on all nine servos, the current limit on all nine, and
-        // three per-leg registers on six legs.
-        assert_eq!(table.checks(), 9 * 9 + 9 + 3 * 6);
-        // Everything checked, plus five recorded families on all nine.
-        assert_eq!(table.reads(), table.checks() + 5 * 9 - 3 * 6);
+        // Ten registers on all nine servos — the homing offset among them — the
+        // current limit on all nine, and two more per-leg registers on six legs.
+        assert_eq!(table.checks(), 10 * 9 + 9 + 2 * 6);
+        // Everything checked, plus four recorded families on all nine, less the
+        // two per-leg position limits that are checked rather than recorded.
+        assert_eq!(table.reads(), table.checks() + 4 * 9 - 2 * 6);
 
         let column = ProvisionTable::column(RegId::OperatingMode).expect("provisioned");
         for row in 0..JointId::COUNT {
@@ -1557,31 +1562,27 @@ provenance = \"test fixture\"
             );
         }
 
-        // A negative homing offset crosses as the span the servo holds. Row 1 is
-        // leg 1, body yaw having row 0.
+        // The offset register is signed, so a negative quarter turn is checked
+        // and reported as one rather than as a span near four billion.
         let column = ProvisionTable::column(RegId::HomingOffset).expect("provisioned");
-        assert_eq!(
-            table.at(1, column),
-            Some(ProvisionExpect::Check(RegValue::U32(1024)))
-        );
-        assert_eq!(
-            table.at(2, column),
-            Some(ProvisionExpect::Check(RegValue::U32(0xFFFF_FC00)))
-        );
-        // Body yaw and the antennas are recorded, not checked.
-        assert_eq!(table.at(0, column), Some(ProvisionExpect::Record));
-        assert_eq!(table.at(8, column), Some(ProvisionExpect::Record));
+        for (row, offset) in VENDOR_HOMING_OFFSETS.into_iter().enumerate() {
+            assert_eq!(
+                table.at(row, column),
+                Some(ProvisionExpect::Check(RegValue::I32(offset))),
+                "row {row}"
+            );
+        }
+        assert_eq!(RegValue::I32(-1024).to_string(), "-1024");
 
-        // The body yaw servo is a different part with a different ceiling.
+        // Per servo, and on this unit every servo holds the same ceiling.
         let column = ProvisionTable::column(RegId::CurrentLimit).expect("provisioned");
-        assert_eq!(
-            table.at(0, column),
-            Some(ProvisionExpect::Check(RegValue::U16(2352)))
-        );
-        assert_eq!(
-            table.at(1, column),
-            Some(ProvisionExpect::Check(RegValue::U16(1750)))
-        );
+        for row in 0..JointId::COUNT {
+            assert_eq!(
+                table.at(row, column),
+                Some(ProvisionExpect::Check(RegValue::U16(1750))),
+                "row {row}"
+            );
+        }
     }
 
     #[test]

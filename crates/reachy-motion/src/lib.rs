@@ -48,11 +48,12 @@ pub mod tick;
 pub mod traj;
 
 pub use arm::{
-    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, Gains, GroupGains, PinOutcome, ProfileConfig,
-    ProvisionExpect, ProvisionReadings, ProvisionTable, pin_goals,
+    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, EXPECTED_MODELS, Gains, GroupGains, PinOutcome,
+    ProfileConfig, ProvisionExpect, ProvisionReadings, ProvisionTable, VENDOR_HOMING_OFFSETS,
+    pin_goals,
 };
 pub use disarm::{DisarmConfig, DisarmSequencer, DisarmSummary, stow_targets};
-pub use joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth};
+pub use joints::{JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth};
 pub use seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
     Sequencer, StepContext, ValueKind,

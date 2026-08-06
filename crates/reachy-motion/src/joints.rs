@@ -179,10 +179,10 @@ impl JointStep {
     /// The bound that applies to `id`.
     #[must_use]
     pub fn for_joint(&self, id: JointId) -> f64 {
-        match id {
-            JointId::BodyYaw => self.body_yaw,
-            JointId::Leg(_) => self.legs,
-            JointId::AntennaRight | JointId::AntennaLeft => self.antennas,
+        match id.group() {
+            JointGroup::BodyYaw => self.body_yaw,
+            JointGroup::Legs => self.legs,
+            JointGroup::Antennas => self.antennas,
         }
     }
 }
@@ -318,6 +318,38 @@ impl JointId {
     pub fn from_index(index: usize) -> Option<Self> {
         Self::ALL.get(index).copied()
     }
+
+    /// Which group this joint belongs to.
+    #[must_use]
+    pub fn group(self) -> JointGroup {
+        match self {
+            JointId::BodyYaw => JointGroup::BodyYaw,
+            JointId::Leg(_) => JointGroup::Legs,
+            JointId::AntennaRight | JointId::AntennaLeft => JointGroup::Antennas,
+        }
+    }
+}
+
+/// The joints that move as one.
+///
+/// The six cranks carry the head together and are bounded together; the two
+/// antennas are their own pair; body yaw is one servo. Anything that treats the
+/// nine joints as three sets — a per-group step bound, a grouped goal write —
+/// asks for the grouping here rather than restating which bus rows are which,
+/// so the bus layout has one owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JointGroup {
+    /// The body yaw servo alone.
+    BodyYaw,
+    /// The six cranks.
+    Legs,
+    /// The two antennas.
+    Antennas,
+}
+
+impl JointGroup {
+    /// Every group, in bus order of its first joint.
+    pub const ALL: [JointGroup; 3] = [Self::BodyYaw, Self::Legs, Self::Antennas];
 }
 
 impl core::fmt::Display for JointId {
@@ -559,6 +591,31 @@ mod tests {
         assert_eq!(step.for_joint(JointId::Leg(4)), 0.05);
         assert_eq!(step.for_joint(JointId::AntennaRight), 0.1);
         assert_eq!(step.for_joint(JointId::AntennaLeft), 0.1);
+    }
+
+    /// The three groups partition the nine joints, and each one is a run of
+    /// consecutive bus rows — which is what lets a grouped write ask for a
+    /// group rather than restate a row range.
+    #[test]
+    fn the_groups_partition_bus_order_in_runs() {
+        let mut seen = 0;
+        let mut first_row = Vec::new();
+        for group in JointGroup::ALL {
+            let rows: Vec<usize> = JointId::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(_, joint)| joint.group() == group)
+                .map(|(row, _)| row)
+                .collect();
+            assert!(!rows.is_empty(), "{group:?} names no joint");
+            for pair in rows.windows(2) {
+                assert_eq!(pair[1], pair[0] + 1, "{group:?} is not consecutive");
+            }
+            first_row.push(rows[0]);
+            seen += rows.len();
+        }
+        assert_eq!(seen, JointId::COUNT);
+        assert_eq!(first_row, vec![0, 1, 7]);
     }
 
     /// The default target set is a configuration the machine can hold, not a

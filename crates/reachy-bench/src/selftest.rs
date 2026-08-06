@@ -13,10 +13,10 @@
 //! - **A case that did not run is a failure, not silence.** [`Outcome::NotRun`]
 //!   never counts as a pass, and a case missing from a record reads as
 //!   `NotRun` rather than as absent.
-//! - **The registry records; a person resolves.** The datum case classifies and
-//!   writes down what it saw. Which datum this unit actually has is written
-//!   into the bench configuration by a human, with a note saying where it came
-//!   from.
+//! - **The registry records; a person resolves.** The datum case reads the
+//!   servos' provisioned homing offsets and writes down what it saw. That a
+//!   person has read the evidence is recorded separately, in the bench
+//!   configuration, with a note saying where it came from.
 //! - **The record is evidence, not memory.** It says what was observed and
 //!   when. Nothing reads it to find out what state the machine is in now —
 //!   arming re-verifies every one of these facts against the hardware on every
@@ -30,16 +30,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
-use reachy_bus::{Bus, BusPort, BusTiming, CrankDatum, RawValue, ServoMap, reg_for, with_retry};
-use reachy_kin::{
-    EnvelopeConfig, FkOptions, HeadGeometry, below_limit, rest_head_pose, stow_head_pose,
-};
+use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, reg_for, with_retry};
+use reachy_kin::{FkOptions, HeadGeometry, below_limit, rest_head_pose, stow_head_pose};
 use reachy_motion::{
-    ArmRecord, JointId, JointVector, ProvisionExpect, ProvisionTable, RegId, RegValue,
+    ArmRecord, EXPECTED_MODELS, JointId, JointVector, ProvisionExpect, ProvisionTable, RegId,
+    RegValue, VENDOR_HOMING_OFFSETS,
 };
 
-use crate::config::{BenchConfig, ConfigError, positive};
-use crate::datum::{DatumClass, classify_datum, head_height};
+use crate::config::{BenchConfig, ConfigError, DatumSetting, positive};
 
 /// What a case decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,8 +76,8 @@ impl fmt::Display for Outcome {
 ///
 /// The order is the dependency order: nothing is read before the port opens,
 /// nothing is asked of a servo that did not answer a ping, and the resting
-/// pose's clearance is computed under a datum only after the datum case has
-/// classified one.
+/// pose's clearance is computed only after the offsets that make its counts mean
+/// anything have been checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Case {
@@ -89,7 +87,7 @@ pub enum Case {
     /// probed, so this establishes that the nine are there and not that they
     /// are the only ones.
     Presence,
-    /// The model numbers fall into the three groups this machine has.
+    /// Every servo reports the model number this platform's servos report.
     Identity,
     /// The provisioned setup registers hold what the configuration says.
     ProvisionSweep,
@@ -99,7 +97,8 @@ pub enum Case {
     Health,
     /// Where the platform is resting, recorded.
     RestPose,
-    /// What the resting reading says about the crank datum.
+    /// The provisioned homing offsets are the vendor's, so a converted count is
+    /// the model's crank angle.
     Datum,
     /// The clearance the resting pose leaves from the linkage's singular
     /// configurations.
@@ -299,7 +298,7 @@ impl Report {
         self.models = Some(models);
     }
 
-    /// What the datum case classified.
+    /// What the datum case read.
     pub fn set_datum(&mut self, datum: DatumRecord) {
         self.datum = Some(datum);
     }
@@ -329,33 +328,24 @@ impl fmt::Display for Report {
     }
 }
 
-/// What the datum case saw and what it made of it.
+/// What the datum case saw and what it establishes.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatumRecord {
-    /// What the reading classified as, and — where it resolved nothing — why.
-    #[serde(flatten)]
-    pub class: DatumClass,
-    /// The six legs as converted counts with no shift applied, degrees — the
-    /// reading the classification was made from.
-    pub rest_angles_deg: [f64; 6],
-    /// The head height the operator measured, metres, if one was measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measured_height_m: Option<f64>,
+    /// The datum the offsets establish, written down only when they matched.
+    pub crank_datum: DatumSetting,
+    /// The nine homing offset registers as read, counts in bus order — the
+    /// evidence the datum rests on.
+    pub homing_offsets: [i32; JointId::COUNT],
 }
 
 impl DatumRecord {
-    /// Record a classification against the reading it was made from.
+    /// Record the datum the observed offsets establish.
     #[must_use]
-    pub fn new(
-        class: DatumClass,
-        rest_angles_deg: [f64; 6],
-        measured_height_m: Option<f64>,
-    ) -> Self {
+    pub fn new(crank_datum: DatumSetting, homing_offsets: [i32; JointId::COUNT]) -> Self {
         Self {
-            class,
-            rest_angles_deg,
-            measured_height_m,
+            crank_datum,
+            homing_offsets,
         }
     }
 }
@@ -378,7 +368,7 @@ pub struct SelftestRecord {
     /// expected value is baked into the identity case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<[u16; JointId::COUNT]>,
-    /// What the datum case classified.
+    /// What the datum case read, present only when the offsets matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datum: Option<DatumRecord>,
     /// Every case's verdict.
@@ -399,23 +389,6 @@ pub enum RecordRefusal {
         /// What the record says about it.
         outcome: Outcome,
     },
-
-    /// A record with no datum row at all.
-    #[error(
-        "the self-test record carries no datum classification: re-run the self-test before commanding anything"
-    )]
-    DatumUnclassified,
-
-    /// A record that resolved a datum other than the configured one.
-    #[error(
-        "the self-test record classified the crank datum as {recorded}, and the configuration says {configured}: one of the two is wrong and no code should pick which"
-    )]
-    DatumContradiction {
-        /// What the record classified.
-        recorded: CrankDatum,
-        /// What the configuration says.
-        configured: CrankDatum,
-    },
 }
 
 impl SelftestRecord {
@@ -426,30 +399,21 @@ impl SelftestRecord {
         outcome_of(&self.cases, case)
     }
 
-    /// Whether this record admits arming against the configured datum.
+    /// Whether this record admits arming.
     ///
-    /// Two conditions, and they are separate: every case passed, and the
-    /// record's own classification does not contradict the configuration. A
-    /// classification left for human review contradicts nothing — it is the
-    /// steady state on a machine resting where membership cannot decide — so a
-    /// configured datum with a provenance line stands beside it. A clean
-    /// classification disagreeing with configuration is refused outright:
-    /// which of the two records is wrong is a person's call.
+    /// One condition: every case passed. The datum is one of those cases, and it
+    /// passes only when all nine homing offsets are the vendor's — so a machine
+    /// whose provisioning does not establish the datum has already failed here,
+    /// and there is no second record for a configured value to contradict. That
+    /// a person reviewed the evidence is the configuration's `[datum]` table,
+    /// checked separately at load.
     ///
     /// TODO(selftest-staleness): a record is admitted here however old it is.
-    pub fn admits_arm(&self, configured: CrankDatum) -> Result<(), RecordRefusal> {
+    pub fn admits_arm(&self) -> Result<(), RecordRefusal> {
         if let Some((case, outcome)) = first_not_passed(&self.cases) {
             return Err(RecordRefusal::CaseNotPassed { case, outcome });
         }
-
-        let datum = self.datum.ok_or(RecordRefusal::DatumUnclassified)?;
-        match datum.class.resolved() {
-            Some(recorded) if recorded != configured => Err(RecordRefusal::DatumContradiction {
-                recorded,
-                configured,
-            }),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     /// The record as TOML.
@@ -489,15 +453,6 @@ impl SelftestRecord {
             .with_context(|| format!("parsing the self-test record at {}", path.display()))
     }
 }
-
-/// How far the operator's measured head height may sit from where a datum
-/// candidate puts the head and still be taken as agreeing, metres.
-///
-/// A height taken off the bench with a rule is good to a few millimetres. The
-/// two candidate readings put the head tens of millimetres apart, so five
-/// millimetres accepts an honest measurement while staying far tighter than the
-/// distance the test has to resolve.
-pub const HEIGHT_TOLERANCE_M: f64 = 0.005;
 
 /// The clearance the resting pose has to leave from the linkage's singular
 /// configurations, metres — once a person has read a run and set one.
@@ -542,24 +497,20 @@ pub fn margin_verdict(min_margin: f64, floor: Option<f64>, detail: &str) -> Case
 /// Everything the read-only registry needs that is not the machine.
 ///
 /// Built from the configuration file *before* it resolves, because resolving
-/// requires a crank datum and the datum is what this registry exists to
-/// classify. Nothing here is a value the registry could send: the only wire
-/// traffic it produces is pings and register reads.
+/// refuses a file with no reviewed `[datum]` record and this registry is what
+/// produces the evidence that record is written from. Nothing here is a value
+/// the registry could send: the only wire traffic it produces is pings and
+/// register reads.
 #[derive(Clone, Debug)]
 pub struct Registry {
     device: String,
     ids: [u8; JointId::COUNT],
     timing: BusTiming,
-    /// Counts read with no datum shift applied — the reading the classifier
-    /// calls direct, and the only reading available before a datum is resolved.
-    direct: ServoMap,
+    map: ServoMap,
     expected: ProvisionTable,
-    env: EnvelopeConfig,
     geom: HeadGeometry,
     fk: FkOptions,
     min_arm_voltage: f64,
-    configured_datum: Option<CrankDatum>,
-    measured_height_m: Option<f64>,
 }
 
 impl Registry {
@@ -568,32 +519,22 @@ impl Registry {
     /// Only the tables the read-only half needs are converted, so a file with no
     /// `[datum]` table — every file, before the first run — still produces a
     /// runnable registry.
-    pub fn from_config(
-        cfg: &BenchConfig,
-        measured_height_m: Option<f64>,
-    ) -> Result<Self, ConfigError> {
+    pub fn from_config(cfg: &BenchConfig) -> Result<Self, ConfigError> {
         let ids = cfg.servo_ids()?;
         Ok(Self {
             device: cfg.bus.device.clone(),
             ids,
             timing: cfg.bus_timing()?,
-            direct: ServoMap::new(ids, CrankDatum::Direct),
+            map: ServoMap::new(ids),
             expected: cfg.provision_table(),
-            env: cfg.envelope()?,
             geom: HeadGeometry::default(),
             fk: FkOptions::default(),
             // Checked here rather than inherited: resolving the configuration is
             // what normally runs this gate, and the registry deliberately does
-            // not resolve — it must run before a datum exists. Without it a
-            // non-positive floor would let the voltage case pass a dead rail and
-            // write that pass into the record a person reviews.
+            // not resolve — it must run before the datum record exists. Without
+            // it a non-positive floor would let the voltage case pass a dead
+            // rail and write that pass into the record a person reviews.
             min_arm_voltage: positive("arm.min_arm_voltage", cfg.arm.min_arm_voltage)?,
-            // Through the gated accessor, never around it: a datum the
-            // configuration will not stand behind — absent, or carrying no
-            // provenance — reads here as no configured datum, and the clearance
-            // case falls back to what this run itself classified.
-            configured_datum: cfg.datum().ok().map(|(datum, _)| datum),
-            measured_height_m,
         })
     }
 
@@ -636,8 +577,8 @@ impl Registry {
         let Some(counts) = self.rest_pose(&mut bus, report) else {
             return;
         };
-        let class = self.datum(&counts, report);
-        self.rest_margins(&counts, class, report);
+        self.datum(&mut bus, report);
+        self.rest_margins(&counts, report);
     }
 
     /// Ping every configured servo, naming every one that does not answer.
@@ -674,12 +615,12 @@ impl Registry {
         }
     }
 
-    /// The model numbers, and whether they fall into the three groups this
-    /// machine has: six legs alike, two antennas alike, body yaw its own.
+    /// The model numbers, against the ones this platform's servos report.
     ///
-    /// The values themselves are recorded rather than compared against
-    /// expectations: what this unit answers has not been observed yet, and a
-    /// number invented here would be one the hardware never had to match.
+    /// Every reading is recorded either way; a servo answering with another
+    /// number is a servo of another kind at a roster address, and the case names
+    /// it. Firmware versions are recorded by the presence case and asserted
+    /// nowhere: a vendor update moves them and says nothing about the hardware.
     fn identity<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
         let models = match self.sweep_u16(bus, RegId::ModelNumber) {
             Ok(models) => models,
@@ -690,24 +631,20 @@ impl Registry {
         };
         report.set_models(models);
 
-        let yaw = models[0];
-        let legs = &models[1..7];
-        let antennas = &models[7..9];
-        let detail = format!(
-            "body yaw {yaw}, legs {legs:?}, antennas {antennas:?} — recorded for review, no \
-             expected value is baked in yet"
-        );
-        let grouped = legs.iter().all(|model| *model == legs[0])
-            && antennas[0] == antennas[1]
-            && legs[0] != antennas[0]
-            && yaw != legs[0]
-            && yaw != antennas[0];
-        if grouped {
+        let wrong: Vec<String> = self
+            .ids
+            .iter()
+            .zip(models.iter().zip(EXPECTED_MODELS.iter()))
+            .filter(|(_, (model, expected))| model != expected)
+            .map(|(id, (model, expected))| format!("servo {id}: expected {expected}, read {model}"))
+            .collect();
+        let detail = format!("models {models:?}");
+        if wrong.is_empty() {
             report.push(CaseResult::pass(Case::Identity, detail));
         } else {
             report.push(CaseResult::fail(
                 Case::Identity,
-                format!("the three groups are not three distinct model numbers: {detail}"),
+                format!("{detail} — {}", wrong.join("; ")),
             ));
         }
     }
@@ -846,8 +783,9 @@ impl Registry {
 
     /// Where the platform is resting, as counts.
     ///
-    /// Counts rather than angles: a count is what the servo said, and every
-    /// reading of it as an angle depends on a datum that is not resolved yet.
+    /// Counts rather than angles: a count is what the servo said, and the
+    /// conversion to an angle is only the model's angle once the datum case has
+    /// confirmed the offsets it rests on.
     fn rest_pose<P: BusPort>(
         &self,
         bus: &mut Bus<P>,
@@ -869,68 +807,55 @@ impl Registry {
         Some(counts)
     }
 
-    /// Classify the datum from the resting reading, and record the
-    /// classification.
+    /// The nine provisioned homing offsets against the vendor's own constant.
     ///
-    /// The case passes on any classification, review included: classifying is
-    /// what it does, and a reading that resolves nothing is a fact about this
-    /// machine rather than a failure of the run. Which datum this unit has is
-    /// then a person's call, written into the configuration with a note saying
-    /// where it came from.
-    fn datum(&self, counts: &[i32; JointId::COUNT], report: &mut Report) -> DatumClass {
-        let mut rest_direct = [0.0; 6];
-        // Walked in bus order and filtered to the legs, so which row a leg's
-        // reading arrives on comes from the joint layout rather than from
-        // arithmetic here.
-        for (row, id) in JointId::ALL.into_iter().enumerate() {
-            if let JointId::Leg(leg) = id {
-                rest_direct[usize::from(leg)] = counts_to_rad(counts[row]);
+    /// This is what the datum rests on: each servo applies its offset before
+    /// reporting a position, so a converted count is the model's crank angle
+    /// exactly when these nine registers hold what the vendor wrote. A servo
+    /// answering otherwise fails the case by name — the repair is the vendor's
+    /// provisioning tool, and no host-side correction for it exists anywhere in
+    /// this workspace.
+    fn datum<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
+        let offsets = match self.sweep_i32(bus, RegId::HomingOffset) {
+            Ok(offsets) => offsets,
+            Err(detail) => {
+                report.push(CaseResult::fail(Case::Datum, detail));
+                return;
             }
-        }
-        let class = classify_datum(
-            &self.env.crank_windows,
-            &rest_direct,
-            self.measured_height_m,
-            |legs| head_height(&self.geom, &self.fk, legs),
-            HEIGHT_TOLERANCE_M,
-        );
-        let rest_deg = rest_direct.map(f64::to_degrees);
-        report.set_datum(DatumRecord::new(class, rest_deg, self.measured_height_m));
-        let measured = match self.measured_height_m {
-            Some(height) => format!("{height:.4} m measured"),
-            None => "no height measured".to_string(),
         };
-        report.push(CaseResult::pass(
-            Case::Datum,
-            format!("{class}, from {rest_deg:.3?} deg and {measured}"),
-        ));
-        class
+        let wrong: Vec<String> = self
+            .ids
+            .iter()
+            .zip(offsets.iter().zip(VENDOR_HOMING_OFFSETS.iter()))
+            .filter(|(_, (read, expected))| read != expected)
+            .map(|(id, (read, expected))| format!("servo {id}: expected {expected}, read {read}"))
+            .collect();
+        let detail = format!("offsets {offsets:?}");
+        if wrong.is_empty() {
+            report.set_datum(DatumRecord::new(DatumSetting::Direct, offsets));
+            report.push(CaseResult::pass(
+                Case::Datum,
+                format!(
+                    "{detail} — the vendor constant, so the datum is {}",
+                    DatumSetting::Direct
+                ),
+            ));
+        } else {
+            report.push(CaseResult::fail(
+                Case::Datum,
+                format!("{}; {detail}", wrong.join("; ")),
+            ));
+        }
     }
 
     /// The clearance the resting pose leaves from the linkage's singular
-    /// configurations, under whichever datum is available.
-    ///
-    /// The configured datum wins over the classification: configuration is what
-    /// a person reviewed, and the classification is the evidence they reviewed
-    /// it from.
-    fn rest_margins(&self, counts: &[i32; JointId::COUNT], class: DatumClass, report: &mut Report) {
-        let Some(datum) = self.configured_datum.or_else(|| class.resolved()) else {
-            report.push(CaseResult::not_run(
-                Case::RestMargins,
-                format!(
-                    "no datum to read the counts under: the configuration carries none and the \
-                     classification is {class}"
-                ),
-            ));
-            return;
-        };
-
-        let map = ServoMap::new(self.ids, datum);
+    /// configurations.
+    fn rest_margins(&self, counts: &[i32; JointId::COUNT], report: &mut Report) {
         let mut joints = JointVector::default();
         // The joint layout is asked for rather than restated: each reading is
         // filed against the joint that bus row belongs to.
         for (row, (id, count)) in JointId::ALL.into_iter().zip(counts.iter()).enumerate() {
-            let angle = match map.present_rad(row, *count) {
+            let angle = match self.map.present_rad(row, *count) {
                 Ok(angle) => angle,
                 Err(error) => {
                     report.push(CaseResult::fail(Case::RestMargins, error.to_string()));
@@ -950,7 +875,7 @@ impl Registry {
             Err(error) => {
                 report.push(CaseResult::fail(
                     Case::RestMargins,
-                    format!("the resting angles close no plausible pose under the {datum} datum: {error}"),
+                    format!("the resting angles close no plausible pose: {error}"),
                 ));
                 return;
             }
@@ -958,8 +883,7 @@ impl Registry {
 
         let margins_mm = record.margins.map(|margin| margin * 1000.0);
         let height = record.head_pose_body.translation.z;
-        let detail =
-            format!("under the {datum} datum: margins {margins_mm:.4?} mm, head at {height:.4} m");
+        let detail = format!("margins {margins_mm:.4?} mm, head at {height:.4} m");
         report.push(margin_verdict(
             record.min_margin,
             REST_MARGIN_FLOOR_M,
@@ -976,7 +900,7 @@ impl Registry {
     ) -> Result<RegValue, String> {
         let raw = self.read_raw(bus, row, reg)?;
         let id = self.ids[row];
-        self.direct
+        self.map
             .decode_value(row, reg, &raw)
             .map_err(|error| format!("servo {id} {reg}: {error}"))
     }
@@ -1065,271 +989,31 @@ pub fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod runner_tests {
-    use std::cell::RefCell;
-    use std::collections::{HashMap, VecDeque};
-    use std::io;
-    use std::rc::Rc;
-    use std::time::Instant;
-
-    use dxl_proto::frame::{HEADER, INST_PING, INST_READ, INST_STATUS};
-    use dxl_proto::{Reg, crc16, rad_to_counts};
-    use reachy_kin::{LegAngles, inverse_kinematics};
+    use dxl_proto::frame::{INST_PING, INST_READ};
 
     use super::*;
-    use crate::datum::ReviewReason;
-
-    /// Model numbers the three groups answer with in these fixtures. Not this
-    /// unit's values — nobody has read them yet, and the case records rather
-    /// than compares.
-    const YAW_MODEL: u16 = 1190;
-    const LEG_MODEL: u16 = 1200;
-    const ANTENNA_MODEL: u16 = 1020;
-
-    /// A rail comfortably over the arm floor, in the register's tenths of a volt.
-    const HEALTHY_RAIL: u16 = 118;
-
-    /// A scripted machine: nine servos with a register file, answering pings and
-    /// reads over the port seam.
-    ///
-    /// It answers nothing else: an instruction it does not implement gets
-    /// silence, and the [`Spy`] wrapped around it is what a test reads the
-    /// traffic back from.
-    struct FakeMachine {
-        regs: HashMap<(u8, u16), Vec<u8>>,
-        errors: HashMap<(u8, u16), u8>,
-        silent: Vec<u8>,
-        out: VecDeque<u8>,
-    }
-
-    impl FakeMachine {
-        fn new() -> Self {
-            Self {
-                regs: HashMap::new(),
-                errors: HashMap::new(),
-                silent: Vec::new(),
-                out: VecDeque::new(),
-            }
-        }
-
-        fn set(&mut self, id: u8, reg: Reg, bytes: &[u8]) {
-            self.regs.insert((id, reg.addr), bytes.to_vec());
-        }
-
-        /// A status frame as a servo puts it on the wire.
-        fn reply(&mut self, id: u8, error: u8, params: &[u8]) {
-            let mut frame = Vec::from(HEADER);
-            frame.push(id);
-            let len = u16::try_from(params.len() + 4).expect("a fixture reply is short");
-            frame.extend_from_slice(&len.to_le_bytes());
-            frame.push(INST_STATUS);
-            frame.push(error);
-            frame.extend_from_slice(params);
-            frame.extend_from_slice(&crc16(&frame).to_le_bytes());
-            self.out.extend(frame);
-        }
-    }
-
-    impl BusPort for FakeMachine {
-        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-            let id = buf[4];
-            let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
-            let instruction = buf[7];
-            let params = &buf[8..8 + len - 3];
-            if self.silent.contains(&id) {
-                return Ok(());
-            }
-            match instruction {
-                INST_PING => {
-                    let model = self
-                        .regs
-                        .get(&(id, 0))
-                        .cloned()
-                        .unwrap_or_else(|| vec![0, 0]);
-                    self.reply(id, 0, &[model[0], model[1], 42]);
-                }
-                INST_READ => {
-                    let addr = u16::from_le_bytes([params[0], params[1]]);
-                    let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
-                    let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
-                    let mut value = self.regs.get(&(id, addr)).cloned().unwrap_or_default();
-                    value.resize(width, 0);
-                    self.reply(id, error, &value);
-                }
-                // Anything else is a fixture that was asked to do something this
-                // machine does not do; silence makes the caller time out and the
-                // recorded instruction makes the test say why.
-                _ => {}
-            }
-            Ok(())
-        }
-
-        fn read_some(&mut self, buf: &mut [u8], _deadline: Instant) -> io::Result<usize> {
-            let mut taken = 0;
-            while taken < buf.len() {
-                match self.out.pop_front() {
-                    Some(byte) => {
-                        buf[taken] = byte;
-                        taken += 1;
-                    }
-                    None => break,
-                }
-            }
-            Ok(taken)
-        }
-
-        fn discard_input(&mut self) -> io::Result<()> {
-            self.out.clear();
-            Ok(())
-        }
-    }
-
-    /// The configuration the example ships with, which is what an operator
-    /// copies. It carries no datum table — the first run has no way to have one
-    /// — so it is exactly the file a bring-up starts from.
-    fn undatumed_config() -> BenchConfig {
-        let cfg =
-            crate::config::parse(include_str!("../reachy-bench.example.toml")).expect("it parses");
-        assert_eq!(cfg.datum, None, "the shipped example resolves no datum");
-        cfg
-    }
-
-    /// The same file after a person has reviewed a run and written the datum in,
-    /// with whatever they wrote as its provenance.
-    fn datumed_config(provenance: &str) -> BenchConfig {
-        crate::config::parse(&format!(
-            "{}\n[datum]\ncrank_datum = \"direct\"\nprovenance = \"{provenance}\"\n",
-            include_str!("../reachy-bench.example.toml")
-        ))
-        .expect("it parses")
-    }
-
-    /// A machine holding exactly what the configuration says it should, resting
-    /// at `legs`.
-    fn machine_at(cfg: &BenchConfig, legs: &[f64; 6]) -> FakeMachine {
-        let ids = cfg.servo_ids().expect("the roster is nine servos");
-        let map = ServoMap::new(ids, CrankDatum::Direct);
-        let table = cfg.provision_table();
-        let mut machine = FakeMachine::new();
-
-        for (row, id) in ids.iter().enumerate() {
-            let model = match row {
-                0 => YAW_MODEL,
-                1..=6 => LEG_MODEL,
-                _ => ANTENNA_MODEL,
-            };
-            machine.set(*id, reg_for(RegId::ModelNumber), &model.to_le_bytes());
-            machine.set(
-                *id,
-                reg_for(RegId::PresentInputVoltage),
-                &HEALTHY_RAIL.to_le_bytes(),
-            );
-            machine.set(*id, reg_for(RegId::HardwareErrorStatus), &[0]);
-            let angle = match row {
-                0 => 0.0,
-                1..=6 => legs[row - 1],
-                _ => 0.0,
-            };
-            let counts = rad_to_counts(angle).expect("a resting angle places");
-            machine.set(*id, reg_for(RegId::PresentPosition), &counts.to_le_bytes());
-        }
-
-        for reg in RegId::ALL {
-            let Some(column) = ProvisionTable::column(reg) else {
-                continue;
-            };
-            for (row, id) in ids.iter().enumerate() {
-                let entry = reg_for(reg);
-                match table.at(row, column) {
-                    Some(ProvisionExpect::Check(value)) => {
-                        let raw = map
-                            .encode_value(row, reg, value)
-                            .expect("a configured expectation encodes");
-                        machine.set(*id, entry, raw.as_slice());
-                    }
-                    // A recorded register holds whatever it holds; zero is a
-                    // value like any other and the case does not judge it.
-                    Some(ProvisionExpect::Record) => {
-                        machine.set(*id, entry, &vec![0u8; usize::from(entry.len)]);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        machine
-    }
-
-    /// The six crank angles the stow pose holds.
-    fn stow_legs() -> [f64; 6] {
-        let mut angles = LegAngles([0.0; 6]);
-        inverse_kinematics(&HeadGeometry::default(), &stow_head_pose(), &mut angles)
-            .expect("the stow pose is reachable");
-        angles.0
-    }
-
-    /// The six crank angles the tight resting configuration holds.
-    fn rest_legs() -> [f64; 6] {
-        let mut angles = LegAngles([0.0; 6]);
-        inverse_kinematics(&HeadGeometry::default(), &rest_head_pose(), &mut angles)
-            .expect("the resting pose is reachable");
-        angles.0
-    }
-
-    /// The head height a set of crank angles implies — the probe the classifier
-    /// is handed, and the registry's own.
-    fn probe_height(legs: &[f64; 6]) -> Option<f64> {
-        head_height(&HeadGeometry::default(), &FkOptions::default(), legs)
-    }
+    use crate::testutil::{FakeMachine, Spy, machine_at, rest_legs, stow_legs, undatumed_config};
 
     /// A run of the registry against a machine, with the port already open, and
     /// every instruction that crossed the wire.
-    fn run(
-        cfg: &BenchConfig,
-        machine: FakeMachine,
-        height: Option<f64>,
-    ) -> (Report, Vec<(u8, u8)>) {
-        let registry = Registry::from_config(cfg, height).expect("the configuration converts");
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let spy = Spy {
-            inner: machine,
-            log: Rc::clone(&log),
-        };
+    fn run(cfg: &BenchConfig, machine: FakeMachine) -> (Report, Vec<(u8, u8)>) {
+        let registry = Registry::from_config(cfg).expect("the configuration converts");
+        let spy = Spy::new(machine);
+        let log = spy.log();
         let mut report = Report::new();
         registry.run(Ok::<Spy, String>(spy), &mut report);
         let instructions = log.borrow().clone();
         (report, instructions)
     }
 
-    /// A port that records every instruction that crosses it.
-    struct Spy {
-        inner: FakeMachine,
-        log: Rc<RefCell<Vec<(u8, u8)>>>,
-    }
-
-    impl BusPort for Spy {
-        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-            self.log.borrow_mut().push((buf[4], buf[7]));
-            self.inner.write_all(buf)
-        }
-
-        fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
-            self.inner.read_some(buf, deadline)
-        }
-
-        fn discard_input(&mut self) -> io::Result<()> {
-            self.inner.discard_input()
-        }
-    }
-
-    /// A machine holding what it should, resting at the stow pose with the
-    /// height that pose implies, passes every case the registry can decide —
-    /// and the clearance case still reports `NotRun`, because no reviewed floor
-    /// exists to assert against.
+    /// A machine holding what it should, resting at the stow pose, passes every
+    /// case the registry can decide — and the clearance case still reports
+    /// `NotRun`, because no reviewed floor exists to assert against.
     #[test]
     fn a_correct_machine_passes_every_case_but_the_unreviewed_clearance() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let machine = machine_at(&cfg, &stow_legs());
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        let (report, _) = run(&cfg, machine);
 
         for case in Case::ALL {
             let expected = if case == Case::RestMargins {
@@ -1352,23 +1036,10 @@ mod runner_tests {
 
         let record = report.into_record(1);
         assert!(record.rest_counts.is_some());
-        assert_eq!(
-            record.models,
-            Some([
-                YAW_MODEL,
-                LEG_MODEL,
-                LEG_MODEL,
-                LEG_MODEL,
-                LEG_MODEL,
-                LEG_MODEL,
-                LEG_MODEL,
-                ANTENNA_MODEL,
-                ANTENNA_MODEL
-            ])
-        );
+        assert_eq!(record.models, Some(EXPECTED_MODELS));
         let datum = record.datum.expect("the datum case recorded");
-        assert_eq!(datum.class, DatumClass::Direct);
-        assert_eq!(datum.measured_height_m, Some(pose.translation.z));
+        assert_eq!(datum.crank_datum, DatumSetting::Direct);
+        assert_eq!(datum.homing_offsets, VENDOR_HOMING_OFFSETS);
     }
 
     /// The registry pings and reads, addresses nothing but its own roster, and
@@ -1378,10 +1049,9 @@ mod runner_tests {
     #[test]
     fn the_registry_only_ever_pings_and_reads_its_own_roster() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let machine = machine_at(&cfg, &stow_legs());
         let ids = cfg.servo_ids().expect("the roster is nine servos");
-        let (_, instructions) = run(&cfg, machine, Some(pose.translation.z));
+        let (_, instructions) = run(&cfg, machine);
 
         assert!(!instructions.is_empty());
         let mut seen = Vec::new();
@@ -1416,8 +1086,7 @@ mod runner_tests {
         for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
             let mut cfg = undatumed_config();
             cfg.arm.min_arm_voltage = bad;
-            let refusal =
-                Registry::from_config(&cfg, None).expect_err("{bad} is not a supply floor");
+            let refusal = Registry::from_config(&cfg).expect_err("{bad} is not a supply floor");
             // Compared by key rather than by whole value: a `NaN` payload is
             // never equal to itself, which is the reason it is refused.
             let ConfigError::NotPositive { key, value } = refusal else {
@@ -1432,7 +1101,7 @@ mod runner_tests {
     #[test]
     fn a_port_that_does_not_open_stops_the_run_at_the_first_case() {
         let cfg = undatumed_config();
-        let registry = Registry::from_config(&cfg, None).expect("the configuration converts");
+        let registry = Registry::from_config(&cfg).expect("the configuration converts");
         let mut report = Report::new();
         registry.run(Err::<FakeMachine, _>("no such device"), &mut report);
 
@@ -1449,10 +1118,9 @@ mod runner_tests {
     #[test]
     fn silent_servos_are_all_named_and_stop_the_run() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.silent = vec![12, 17];
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::Presence), Outcome::Fail);
         assert_eq!(report.outcome(Case::Identity), Outcome::NotRun);
@@ -1467,13 +1135,12 @@ mod runner_tests {
     #[test]
     fn a_provisioned_register_that_disagrees_is_named_with_both_values() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let mut machine = machine_at(&cfg, &stow_legs());
         // Operating mode 0 on one servo: the reading that voids the servo-side
         // position envelope.
         machine.set(13, reg_for(RegId::OperatingMode), &[0]);
         machine.set(16, reg_for(RegId::TemperatureLimit), &[95]);
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
         let printed = report.to_string();
@@ -1489,14 +1156,13 @@ mod runner_tests {
     #[test]
     fn a_rail_under_the_arm_floor_fails_and_says_which_servo() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             15,
             reg_for(RegId::PresentInputVoltage),
             &45u16.to_le_bytes(),
         );
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::Voltage), Outcome::Fail);
         let printed = report.to_string();
@@ -1509,18 +1175,17 @@ mod runner_tests {
     #[test]
     fn only_bits_beyond_input_voltage_fail_health() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let legs = stow_legs();
 
         let mut voltage_only = machine_at(&cfg, &legs);
         voltage_only.set(11, reg_for(RegId::HardwareErrorStatus), &[0x01]);
-        let (report, _) = run(&cfg, voltage_only, Some(pose.translation.z));
+        let (report, _) = run(&cfg, voltage_only);
         assert_eq!(report.outcome(Case::Health), Outcome::Pass);
         assert!(report.to_string().contains("0x01"), "the byte is reported");
 
         let mut overload = machine_at(&cfg, &legs);
         overload.set(11, reg_for(RegId::HardwareErrorStatus), &[0x20]);
-        let (report, _) = run(&cfg, overload, Some(pose.translation.z));
+        let (report, _) = run(&cfg, overload);
         assert_eq!(report.outcome(Case::Health), Outcome::Fail);
         assert!(
             report.to_string().contains("11 = 0x20"),
@@ -1528,72 +1193,80 @@ mod runner_tests {
         );
     }
 
-    /// The model numbers have to be three distinct groups; two groups answering
-    /// alike is a machine that is not wired the way this project thinks.
+    /// A servo answering with a model number this platform's servos do not fails
+    /// the case, named with both values.
     #[test]
-    fn the_model_numbers_must_be_three_distinct_groups() {
+    fn a_servo_of_the_wrong_kind_fails_the_identity_case() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(17, reg_for(RegId::ModelNumber), &LEG_MODEL.to_le_bytes());
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        // The right antenna answering as one of the legs.
+        machine.set(
+            17,
+            reg_for(RegId::ModelNumber),
+            &EXPECTED_MODELS[1].to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::Identity), Outcome::Fail);
         assert!(
             report
                 .to_string()
-                .contains("not three distinct model numbers"),
+                .contains("servo 17: expected 1190, read 1200"),
             "{report}"
         );
         // Recorded regardless: the reading is the evidence a person reviews.
         let record = report.into_record(1);
         assert_eq!(
             record.models.map(|models| models[7]),
-            Some(LEG_MODEL),
+            Some(EXPECTED_MODELS[1]),
             "the observed value is recorded even when it fails"
         );
     }
 
-    /// A machine resting at the tight configuration classifies for review, which
-    /// is the steady state there — and with no datum in configuration and none
-    /// classified, the clearance case has nothing to read the counts under.
+    /// One servo whose homing offset is not the vendor's fails the datum case,
+    /// naming the servo and both values.
+    ///
+    /// The whole of the datum is that these nine registers hold what the vendor
+    /// wrote. A servo that lost its offset — replaced hardware, a factory reset
+    /// — reports a crank angle a quarter turn from the model's, and nothing
+    /// downstream of here would notice: the counts stay inside the servo's own
+    /// provisioned window, the linkage still closes, and the pose is simply not
+    /// where the head is.
     #[test]
-    fn the_tight_resting_configuration_classifies_for_review_and_leaves_no_datum() {
+    fn a_servo_without_its_vendor_homing_offset_fails_the_datum_case() {
         let cfg = undatumed_config();
-        let legs = rest_legs();
-        let machine = machine_at(&cfg, &legs);
-        let (report, _) = run(&cfg, machine, Some(rest_head_pose().translation.z));
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(13, reg_for(RegId::HomingOffset), &0i32.to_le_bytes());
+        let (report, _) = run(&cfg, machine);
 
-        assert_eq!(report.outcome(Case::Datum), Outcome::Pass);
-        assert_eq!(report.outcome(Case::RestMargins), Outcome::NotRun);
+        assert_eq!(report.outcome(Case::Datum), Outcome::Fail);
         let printed = report.to_string();
-        assert!(printed.contains("for human review"), "{printed}");
         assert!(
-            printed.contains("no datum to read the counts under"),
+            printed.contains("servo 13: expected 1024, read 0"),
             "{printed}"
         );
 
         let record = report.into_record(1);
-        let datum = record.datum.expect("a classification was recorded");
         assert_eq!(
-            datum.class,
-            DatumClass::HumanReview(ReviewReason::ShiftedAtCandidateB)
+            record.datum, None,
+            "a datum is written down only when the offsets establish one"
+        );
+        assert!(
+            record.admits_arm().is_err(),
+            "a machine whose provisioning does not establish the datum arms nothing"
         );
     }
 
-    /// With a datum in configuration the clearance case reads the counts under
-    /// it and reports what it measured, floor or no floor.
+    /// The clearance case reads the resting counts under the bare conversion and
+    /// reports what it measured, floor or no floor.
     #[test]
-    fn a_configured_datum_is_what_the_clearance_is_measured_under() {
-        let cfg = datumed_config("test fixture");
-        assert!(cfg.datum().is_ok(), "the gate stands behind it");
-        let legs = rest_legs();
-        let machine = machine_at(&cfg, &legs);
-        let (report, _) = run(&cfg, machine, Some(rest_head_pose().translation.z));
+    fn the_clearance_is_measured_off_the_resting_counts() {
+        let cfg = undatumed_config();
+        let machine = machine_at(&cfg, &rest_legs());
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::RestMargins), Outcome::NotRun);
         let printed = report.to_string();
-        assert!(printed.contains("under the direct datum"), "{printed}");
         assert!(printed.contains("no reviewed clearance floor"), "{printed}");
         // The clearance the tight configuration leaves, measured back off whole
         // counts. This tree records 0.1411 mm for that configuration; a servo
@@ -1603,42 +1276,16 @@ mod runner_tests {
         assert!(printed.contains("0.1423"), "{printed}");
     }
 
-    /// A `[datum]` table the configuration will not stand behind is not a
-    /// configured datum here either. The registry asks through the same gate
-    /// every motion command asks through, so a clearance is never measured
-    /// under a datum that cannot resolve.
-    #[test]
-    fn an_unprovenanced_datum_is_no_configured_datum() {
-        let cfg = datumed_config("   ");
-        assert!(cfg.datum.is_some(), "the table is there");
-        assert!(cfg.datum().is_err(), "the gate refuses it");
-
-        let legs = rest_legs();
-        let machine = machine_at(&cfg, &legs);
-        let (report, _) = run(&cfg, machine, Some(rest_head_pose().translation.z));
-
-        // The tight rest classifies for review, so with the configured datum
-        // out of play there is nothing left to read the counts under.
-        assert_eq!(report.outcome(Case::RestMargins), Outcome::NotRun);
-        let printed = report.to_string();
-        assert!(
-            printed.contains("no datum to read the counts under"),
-            "{printed}"
-        );
-        assert!(!printed.contains("under the direct datum"), "{printed}");
-    }
-
     /// A servo answering a register read with an error number fails the case
     /// that asked, with the number intact.
     #[test]
     fn a_servo_refusing_a_read_fails_the_case_that_asked() {
         let cfg = undatumed_config();
-        let pose = stow_head_pose();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .errors
             .insert((14, reg_for(RegId::PresentPosition).addr), 7);
-        let (report, _) = run(&cfg, machine, Some(pose.translation.z));
+        let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::RestPose), Outcome::Fail);
         assert_eq!(report.outcome(Case::Datum), Outcome::NotRun);
@@ -1698,103 +1345,51 @@ mod runner_tests {
         );
     }
 
-    /// The height tolerance is tight against the thing it has to resolve.
+    /// The vendor constant is the alternating quarter turns the legs need and
+    /// nothing on the three single-turn joints.
     ///
-    /// The height test is the only one in the classifier carrying information
-    /// from outside the model, and it is the one that decides between the two
-    /// readings. Its tolerance is therefore bounded from above by the distance
-    /// between the two candidates' heads: widen it past that gap and a machine
-    /// on the wrong datum classifies clean, a person writes that datum into the
-    /// configuration, and the head is commanded from tens of millimetres away
-    /// from where the model thinks it is.
+    /// A quarter turn is 1024 counts, and it is what puts a leg's mechanical
+    /// zero at the model's. The parity is what makes the six windows asymmetric
+    /// in the two directions they are; getting a sign the wrong way round here
+    /// would leave the case passing a machine whose legs read a half turn from
+    /// where the model puts them.
     #[test]
-    fn the_height_tolerance_is_far_inside_the_gap_it_resolves() {
-        let legs = stow_legs();
-        let under_model = probe_height(&legs).expect("the model's own angles close");
-        // The same machine read under the other datum: what the direct reading
-        // would be if the truth were the shifted one.
-        let under_other = probe_height(&crate::datum::shifted_reading(&legs))
-            .expect("the shifted candidate closes too");
-        let gap = (under_model - under_other).abs();
-        assert!(
-            gap > 0.02,
-            "the two candidates are {gap} m apart, which is not a gap a rule resolves"
-        );
-        assert!(
-            HEIGHT_TOLERANCE_M < gap / 4.0,
-            "a {HEIGHT_TOLERANCE_M} m tolerance is not far inside a {gap} m gap"
-        );
-    }
-
-    /// The boundary the tolerance draws, from both sides.
-    ///
-    /// Without this the constant could be widened several-fold with the suite
-    /// green, which is the one change it exists to prevent.
-    #[test]
-    fn the_height_tolerance_decides_at_its_own_boundary() {
-        let legs = stow_legs();
-        let height = probe_height(&legs).expect("the stow configuration closes");
-        let windows = EnvelopeConfig::default().crank_windows;
-        let classify = |measured: f64| {
-            crate::datum::classify_datum(
-                &windows,
-                &legs,
-                Some(measured),
-                probe_height,
-                HEIGHT_TOLERANCE_M,
-            )
-        };
-
-        for side in [-1.0, 1.0] {
-            assert_eq!(
-                classify(height + side * HEIGHT_TOLERANCE_M * 0.99),
-                DatumClass::Direct,
-                "a measurement just inside the tolerance agrees"
-            );
-            assert_eq!(
-                classify(height + side * HEIGHT_TOLERANCE_M * 1.01),
-                DatumClass::HumanReview(ReviewReason::HeightMismatch),
-                "a measurement just outside it does not"
-            );
+    fn the_vendor_offsets_are_alternating_quarter_turns_on_the_legs_alone() {
+        let quarter_turn = dxl_proto::conv::COUNTS_PER_REV / 4;
+        for (row, joint) in JointId::ALL.into_iter().enumerate() {
+            let offset = VENDOR_HOMING_OFFSETS[row];
+            match joint {
+                JointId::Leg(leg) => {
+                    assert_eq!(offset.abs(), quarter_turn, "leg {}", leg + 1);
+                    assert_eq!(
+                        offset > 0,
+                        leg.is_multiple_of(2),
+                        "leg {} takes the other sign",
+                        leg + 1
+                    );
+                }
+                _ => assert_eq!(offset, 0, "{joint} is a single-turn joint"),
+            }
         }
-    }
-
-    /// What the height tolerance is bounded by is the rule, not the model.
-    ///
-    /// The two records this tree holds of the resting configuration — six crank
-    /// angles, and the head pose recovered from them — disagree by micrometres
-    /// when both are put through the solver. The tolerance is orders of
-    /// magnitude looser than that, so what it is really sized against is how
-    /// well a person can measure a head height, which is the intended reading.
-    #[test]
-    fn the_height_tolerance_is_bounded_by_the_rule_and_not_by_the_model() {
-        let geom = HeadGeometry::default();
-        let fk = FkOptions::default();
-        let from_angles = head_height(&geom, &fk, &rest_legs()).expect("the resting angles close");
-        let from_pose = rest_head_pose().translation.z;
-        let model_disagreement = (from_angles - from_pose).abs();
-        assert!(
-            model_disagreement < HEIGHT_TOLERANCE_M / 100.0,
-            "the model disagrees with itself by {model_disagreement} m, against a \
-             {HEIGHT_TOLERANCE_M} m tolerance"
-        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datum::ReviewReason;
 
-    /// A run in which every case passed, with a clean classification.
-    fn green(class: DatumClass) -> SelftestRecord {
+    /// A run in which every case passed.
+    fn green() -> SelftestRecord {
         let mut report = Report::new();
         for case in Case::ALL {
             report.push(CaseResult::pass(case, "as expected"));
         }
         report.set_rest_counts([2048; JointId::COUNT]);
         report.set_models([1200, 1200, 1200, 1200, 1200, 1200, 1200, 1020, 1020]);
-        report.set_datum(DatumRecord::new(class, [10.0; 6], Some(0.1266)));
+        report.set_datum(DatumRecord::new(
+            DatumSetting::Direct,
+            VENDOR_HOMING_OFFSETS,
+        ));
         report.into_record(1_754_000_000)
     }
 
@@ -1850,68 +1445,46 @@ mod tests {
     }
 
     /// The record round-trips through TOML: what a run wrote is what the next
-    /// process reads, cases, readings, classification and all.
+    /// process reads, cases, readings, offsets and all.
+    ///
+    /// The signed reading is the half worth pinning. A homing offset is a signed
+    /// four-byte register and half of the legs' offsets are negative; rendered as
+    /// the unsigned span the register literally holds, a person reviewing the run
+    /// reads `4294966272` where the vendor wrote a quarter turn the other way.
     #[test]
     fn a_record_round_trips_through_toml() {
-        let record = green(DatumClass::Direct);
+        let record = green();
         let text = record.render().expect("the record renders");
+        assert!(text.contains("crank_datum = \"direct\""), "{text}");
+        assert!(
+            text.contains("-1024"),
+            "the negative offsets read as such: {text}"
+        );
+        assert!(!text.contains("4294966272"), "{text}");
+
         let read = SelftestRecord::parse(&text).expect("the record parses");
         assert_eq!(read, record);
-
-        // And the review arm, whose reason is a second field.
-        let reviewed = green(DatumClass::HumanReview(ReviewReason::ShiftedAtCandidateB));
-        let text = reviewed.render().expect("the record renders");
-        assert!(text.contains("shifted-at-candidate-b"), "{text}");
-        assert_eq!(
-            SelftestRecord::parse(&text).expect("the record parses"),
-            reviewed
-        );
+        let datum = read.datum.expect("the datum row survived");
+        assert_eq!(datum.crank_datum, DatumSetting::Direct);
+        assert_eq!(datum.homing_offsets, VENDOR_HOMING_OFFSETS);
     }
 
-    /// Every classification survives a round trip through the record file, and
-    /// arrives on the arming gate as itself.
+    /// A datum row naming anything but the one reading this project has is
+    /// refused rather than read past.
     ///
-    /// The serde contract is not free: the class is adjacently tagged, renamed
-    /// to kebab-case and flattened into a struct that refuses unknown keys. A
-    /// rename typo on a variant nothing round-trips would write a record the
-    /// parser cannot read, and a variant that came back as the wrong arm would
-    /// turn a `parity-shifted` reading into `direct` on the gate in front of
-    /// every motion command. The wire name is asserted for each, so a rename is
-    /// a visible diff rather than a silent one.
+    /// There is one datum, established by the servos' own provisioning; a record
+    /// claiming another is a file somebody edited, and reading it as `direct`
+    /// anyway would put a value nobody wrote in front of the person reviewing the
+    /// run.
     #[test]
-    fn every_classification_survives_the_record() {
-        let classes = [
-            (DatumClass::Direct, "direct"),
-            (DatumClass::ParityShifted, "parity-shifted"),
-            (DatumClass::HumanReview(ReviewReason::Neither), "neither"),
-            (DatumClass::HumanReview(ReviewReason::Both), "both"),
-            (
-                DatumClass::HumanReview(ReviewReason::ShiftedAtCandidateB),
-                "shifted-at-candidate-b",
-            ),
-            (
-                DatumClass::HumanReview(ReviewReason::FkInconsistent),
-                "fk-inconsistent",
-            ),
-            (
-                DatumClass::HumanReview(ReviewReason::HeightUnmeasured),
-                "height-unmeasured",
-            ),
-            (
-                DatumClass::HumanReview(ReviewReason::HeightMismatch),
-                "height-mismatch",
-            ),
-        ];
-        for (class, wire_name) in classes {
-            let record = green(class);
-            let text = record.render().expect("the record renders");
-            assert!(text.contains(wire_name), "{class:?} renders as: {text}");
-            let read = SelftestRecord::parse(&text).expect("the record parses");
-            assert_eq!(read, record, "{class:?}");
-            let datum = read.datum.expect("the datum row survived");
-            assert_eq!(datum.class, class);
-            assert_eq!(datum.class.resolved(), class.resolved());
-        }
+    fn a_datum_row_naming_another_reading_is_refused() {
+        let record = green();
+        let text = record.render().expect("the record renders").replace(
+            "crank_datum = \"direct\"",
+            "crank_datum = \"parity_shifted\"",
+        );
+        let error = SelftestRecord::parse(&text).expect_err("there is no other reading");
+        assert!(error.to_string().contains("parity_shifted"), "{error}");
     }
 
     /// A record that answers one case twice is refused rather than read past,
@@ -1923,7 +1496,7 @@ mod tests {
     /// says it failed.
     #[test]
     fn a_record_that_answers_a_case_twice_is_refused() {
-        let mut record = green(DatumClass::Direct);
+        let mut record = green();
         record
             .cases
             .push(CaseResult::fail(Case::Voltage, "and then it was not"));
@@ -1936,7 +1509,7 @@ mod tests {
         // that came first.
         assert_eq!(record.outcome(Case::Voltage), Outcome::Fail);
         assert_eq!(
-            record.admits_arm(CrankDatum::Direct),
+            record.admits_arm(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::Voltage,
                 outcome: Outcome::Fail,
@@ -1948,71 +1521,46 @@ mod tests {
     /// the case and what the record says about it.
     #[test]
     fn a_case_short_of_a_pass_refuses_arming() {
-        let mut record = green(DatumClass::Direct);
+        assert_eq!(green().admits_arm(), Ok(()));
+
+        let mut record = green();
         record.cases.retain(|result| result.case != Case::Health);
         assert_eq!(
-            record.admits_arm(CrankDatum::Direct),
+            record.admits_arm(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::Health,
                 outcome: Outcome::NotRun,
             })
         );
 
-        let mut record = green(DatumClass::Direct);
+        let mut record = green();
         for result in &mut record.cases {
             if result.case == Case::Voltage {
                 result.outcome = Outcome::Fail;
             }
         }
-        let refusal = record
-            .admits_arm(CrankDatum::Direct)
-            .expect_err("a failed case refuses");
+        let refusal = record.admits_arm().expect_err("a failed case refuses");
         assert!(refusal.to_string().contains("voltage"), "{refusal}");
     }
 
-    /// A clean classification that contradicts the configuration refuses, and
-    /// says both records.
+    /// The datum is one of the cases, so a machine whose offsets do not
+    /// establish it has already failed the sweep rather than needing a second
+    /// gate of its own.
     #[test]
-    fn a_clean_classification_against_the_configured_datum_refuses() {
-        let record = green(DatumClass::Direct);
-        assert_eq!(record.admits_arm(CrankDatum::Direct), Ok(()));
-
-        let refusal = record
-            .admits_arm(CrankDatum::ParityShifted)
-            .expect_err("the two records disagree");
-        assert_eq!(
-            refusal,
-            RecordRefusal::DatumContradiction {
-                recorded: CrankDatum::Direct,
-                configured: CrankDatum::ParityShifted,
+    fn a_failed_datum_case_is_what_refuses_arming() {
+        let mut record = green();
+        for result in &mut record.cases {
+            if result.case == Case::Datum {
+                result.outcome = Outcome::Fail;
             }
-        );
-        let printed = refusal.to_string();
-        assert!(
-            printed.contains("direct") && printed.contains("parity shifted"),
-            "{printed}"
-        );
-    }
-
-    /// The agreement rule's positive case: a record left for human review arms
-    /// under either configured datum, because it contradicts neither. It is the
-    /// steady state on a machine resting where membership cannot decide.
-    #[test]
-    fn a_reviewed_classification_arms_under_either_datum() {
-        let record = green(DatumClass::HumanReview(ReviewReason::ShiftedAtCandidateB));
-        assert_eq!(record.admits_arm(CrankDatum::Direct), Ok(()));
-        assert_eq!(record.admits_arm(CrankDatum::ParityShifted), Ok(()));
-    }
-
-    /// A green record with no datum row at all refuses rather than arming on a
-    /// classification nobody made.
-    #[test]
-    fn a_record_with_no_classification_refuses() {
-        let mut record = green(DatumClass::Direct);
+        }
         record.datum = None;
         assert_eq!(
-            record.admits_arm(CrankDatum::Direct),
-            Err(RecordRefusal::DatumUnclassified)
+            record.admits_arm(),
+            Err(RecordRefusal::CaseNotPassed {
+                case: Case::Datum,
+                outcome: Outcome::Fail,
+            })
         );
     }
 
@@ -2022,26 +1570,10 @@ mod tests {
         let text = "taken_at_unix = 1\nwhat_is_this = 2\n";
         assert!(SelftestRecord::parse(text).is_err());
 
-        let text = "taken_at_unix = 1\n\n[datum]\nclassification = \"direct\"\n\
-                    rest_angles_deg = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]\nwhat_is_this = 2\n";
+        let text = "taken_at_unix = 1\n\n[datum]\ncrank_datum = \"direct\"\n\
+                    homing_offsets = [0, 1024, -1024, 1024, -1024, 1024, -1024, 0, 0]\n\
+                    what_is_this = 2\n";
         assert!(SelftestRecord::parse(text).is_err());
-    }
-
-    /// A `human-review` row whose reason is missing is refused, not read as
-    /// some particular reason. A record that lost half of what it says is
-    /// evidence of nothing, and substituting a plausible reason would put a
-    /// reading nobody took in front of the person reviewing the run.
-    #[test]
-    fn a_review_row_with_no_reason_is_refused() {
-        let text = "taken_at_unix = 1\n\n[datum]\nclassification = \"human-review\"\n\
-                    rest_angles_deg = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]\n";
-        let error = SelftestRecord::parse(text).expect_err("a reason-less review row is refused");
-        assert!(error.to_string().contains("review_reason"), "{error}");
-
-        let text = format!("{text}review_reason = \"both\"\n");
-        let record = SelftestRecord::parse(&text).expect("a complete review row parses");
-        let datum = record.datum.expect("the datum row is there");
-        assert_eq!(datum.class, DatumClass::HumanReview(ReviewReason::Both));
     }
 
     /// The timestamp is a real second, not a placeholder.

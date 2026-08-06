@@ -11,13 +11,14 @@
 //!
 //! - **The read-only registry.** Port open, presence sweep naming any absent
 //!   servo, model-number grouping, the provisioned-register sweep, rail voltage,
-//!   hardware health, the crank datum resolution, and the resting pose with its
-//!   clearance margins. No torque, no motion, nothing written to a servo. One line
-//!   per case, and a case that did not run counts as a failure rather than as
-//!   silence.
+//!   hardware health, the legs' homing offsets against the vendor constant, and
+//!   the resting pose with its clearance margins. No torque, no motion, nothing
+//!   written to a servo. One line per case, and a case that did not run counts as
+//!   a failure rather than as silence.
 //! - **The supervised commands.** Arm, raise, hold, stow, release, plus antenna
 //!   and base moves. Each is gated on the state before it, and none of them runs
-//!   at all without a green registry pass on record and a resolved crank datum.
+//!   at all without a green registry pass on record and a crank datum a human
+//!   has written into the configuration.
 //!
 //! That gate is deliberate. The registry is how this project brings up hardware:
 //! write a case that asserts the behaviour we expect, let it fail, and read the
@@ -26,11 +27,13 @@
 //! review before any case is changed to accept it.
 //!
 //! The binary is a thin entry point over this library, so everything the bench
-//! decides — configuration, the registry's verdicts, the datum classification —
-//! is reachable from tests that need no port and no machine.
+//! decides — configuration and the registry's verdicts — is reachable from tests
+//! that need no port and no machine.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
-pub mod datum;
+pub mod pump;
 pub mod selftest;
+#[cfg(test)]
+mod testutil;

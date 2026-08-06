@@ -1,13 +1,20 @@
 //! The bench binary's entry point: argument parsing and command dispatch.
 //!
 //! What a command decides lives in the library beside this file, so the
-//! decisions — configuration, the registry's verdicts, the datum classification
-//! — are reachable from tests that need no port and no machine. This file owns
-//! only the argument shape, the port, the printing and the exit code.
+//! decisions — configuration and the registry's verdicts — are reachable from
+//! tests that need no port and no machine. This file owns only the argument
+//! shape, the port, the printing and the exit code.
 //!
-//! One command is dispatched: `selftest`, which is read-only. Every command that
-//! moves something refuses, and keeps refusing until a self-test has run on the
-//! machine and its record has been reviewed.
+//! Two commands are dispatched: `selftest`, which is read-only, and `arm`, which
+//! enables torque and leaves the machine holding where it stands. Every command
+//! that moves the head refuses, and keeps refusing until the pump's tick loop
+//! exists.
+//!
+//! `arm` is the first command that writes to a servo, so it is the first behind
+//! both standing gates: a self-test record in which every case passed, and a
+//! crank datum a human wrote into the configuration. Neither is remembered state
+//! — the record is a file and the datum is a config table — and both are checked
+//! before the port is opened.
 
 #![forbid(unsafe_code)]
 
@@ -15,9 +22,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use reachy_bench::config;
-use reachy_bench::selftest::{Case, Registry, Report, now_unix};
-use reachy_bus::SerialBusPort;
+use reachy_bench::config::{self, BenchConfig, Resolved};
+use reachy_bench::pump::{self, MonotonicClock, PumpError};
+use reachy_bench::selftest::{Case, Registry, Report, SelftestRecord, now_unix};
+use reachy_bus::{Bus, SerialBusPort};
+use reachy_motion::ArmSequencer;
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
@@ -30,19 +39,20 @@ const RECORD_NAME: &str = "selftest-state.toml";
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
-    measured_height_m: Option<f64>,
 }
 
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-bench selftest [--config PATH] [--record PATH] \
-         [--measured-height-m METRES]\n\
+        "usage: reachy-bench <selftest|arm> [--config PATH] [--record PATH]\n\
          \n\
          `selftest` is read-only: pings and register reads, no torque and no motion.\n\
-         The measured head height is a rule reading from the base to the head; \
-         without it the crank datum cannot be resolved, and the run records that \
-         it was not measured.\n\
+         `arm` verifies the machine, pins every joint where it stands, and enables\n\
+         torque. It moves nothing further and requires a self-test record in which\n\
+         every case passed.\n\
+         \n\
+         Nothing here releases torque yet — `off` is not implemented — so an armed\n\
+         machine stays armed until its power is cut, and the head falls when it goes.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -61,10 +71,12 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
 
     match command.as_str() {
         "selftest" => selftest(&parse_args(argv)?),
-        "arm" | "up" | "hold" | "stow" | "off" | "yaw" | "antennas" | "demo" => bail!(
-            "reachy-bench: `{command}` moves the machine and is not implemented. Nothing that \
-             commands a servo runs until a read-only self-test has passed on this unit and its \
-             crank datum has been reviewed and written into the configuration."
+        "arm" => arm(&parse_args(argv)?),
+        "up" | "hold" | "stow" | "off" | "yaw" | "antennas" | "demo" => bail!(
+            "reachy-bench: `{command}` moves the head and is not implemented. Arming is, and it \
+             leaves the machine holding where it stands — but there is no command that releases \
+             torque either, so the only way to end an armed session is to cut power, and the \
+             head falls when it goes."
         ),
         other => bail!("reachy-bench: unknown command `{other}`\n\n{}", usage()),
     }
@@ -75,7 +87,6 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
-        measured_height_m: None,
     };
     let mut argv = argv;
     while let Some(flag) = argv.next() {
@@ -87,15 +98,6 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         match flag.as_str() {
             "--config" => args.config = PathBuf::from(value),
             "--record" => args.record = Some(PathBuf::from(value)),
-            "--measured-height-m" => {
-                let height: f64 = value
-                    .parse()
-                    .with_context(|| format!("`--measured-height-m {value}` is not a number"))?;
-                if !height.is_finite() || height <= 0.0 {
-                    bail!("`--measured-height-m {value}` is not a height above the base");
-                }
-                args.measured_height_m = Some(height);
-            }
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
@@ -118,7 +120,7 @@ fn record_path(args: &Args) -> PathBuf {
 /// verdict.
 fn selftest(args: &Args) -> anyhow::Result<()> {
     let cfg = config::load(&args.config)?;
-    let registry = Registry::from_config(&cfg, args.measured_height_m)?;
+    let registry = Registry::from_config(&cfg)?;
 
     let port = SerialBusPort::open(&cfg.bus.device, cfg.bus.baud);
     run_and_record(&registry, port, &record_path(args), now_unix())
@@ -164,6 +166,76 @@ where
         );
     }
     Ok(())
+}
+
+/// Verify the machine, pin every joint where it stands, and enable torque.
+///
+/// Both gates are checked before the port is opened, so a refusal costs the
+/// machine nothing: the configuration must resolve — which is where the recorded
+/// crank datum is required — and the self-test record beside it must be one in
+/// which every case passed.
+fn arm(args: &Args) -> anyhow::Result<()> {
+    let cfg = config::load(&args.config)?;
+    let resolved = arm_gates(&cfg, &record_path(args))?;
+
+    println!(
+        "arming over {} at {} baud: nine servos verified, then pinned where they stand and \
+         held. The head does not move under its own power; a joint outside its travel window \
+         is pulled to the nearer bound.\n\
+         Before you do: no command in this binary releases torque — `off` is not implemented \
+         yet — so this session ends by cutting power, and the head falls when it goes. Arm only \
+         what you are willing to end that way, and be ready to take the head's weight.",
+        resolved.device, resolved.timing.baud
+    );
+
+    let port = SerialBusPort::open(&resolved.device, resolved.timing.baud)
+        .with_context(|| format!("opening {}", resolved.device))?;
+    let mut bus = Bus::new(port, resolved.timing);
+    let mut sequencer = ArmSequencer::new(
+        &resolved.arm,
+        &resolved.motion.geom,
+        &resolved.motion.env,
+        &resolved.motion.fk,
+    );
+    let mut clock = MonotonicClock::new();
+
+    let summary = pump::drive(
+        &mut bus,
+        &resolved.map,
+        &mut sequencer,
+        &mut clock,
+        pump::action_budget(&resolved.arm),
+        &mut |step| println!("  {step}"),
+    )
+    .map_err(|error| match error {
+        // A sequence that refused has already said which phase, which servo,
+        // which register and both values. Wrapping that in "arming failed"
+        // would bury the only part worth reading.
+        PumpError::Sequence(refusal) => anyhow::anyhow!("arming stopped at {refusal}"),
+        other => anyhow::Error::new(other).context("arming"),
+    })?;
+
+    print!("{}", pump::arm_report(&summary));
+    println!("armed; torque is on and the machine is holding.");
+    Ok(())
+}
+
+/// The two standing gates, and the configuration that survived them.
+///
+/// Separate from the run so the refusals are testable without a port: they are
+/// the whole reason a motion command exists behind a read-only one.
+fn arm_gates(cfg: &BenchConfig, record: &Path) -> anyhow::Result<Resolved> {
+    let resolved = cfg.resolve()?;
+    let record = SelftestRecord::load(record).with_context(|| {
+        format!(
+            "reading the self-test record at {}; run `reachy-bench selftest` first",
+            record.display()
+        )
+    })?;
+    record
+        .admits_arm()
+        .context("the self-test record does not admit arming")?;
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -215,7 +287,7 @@ mod tests {
         cfg.bus.host_allowance_ms = 1;
         cfg.bus.retry_attempts = 1;
         cfg.bus.retry_spacing_ms = 0;
-        Registry::from_config(&cfg, None).expect("the configuration converts")
+        Registry::from_config(&cfg).expect("the configuration converts")
     }
 
     /// A failing run still leaves its record, and the record names what failed.
@@ -287,14 +359,11 @@ mod tests {
             .into_iter()
     }
 
-    /// With no flags, the defaults are the file beside the working directory
-    /// and no measured height — which is the run that records that nobody
-    /// measured one.
+    /// With no flags, the defaults are the file beside the working directory.
     #[test]
     fn the_defaults_are_the_file_beside_the_working_directory() {
         let args = parse_args(argv(&[])).expect("no flags is a valid invocation");
         assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG));
-        assert_eq!(args.measured_height_m, None);
         assert_eq!(record_path(&args), PathBuf::from(RECORD_NAME));
     }
 
@@ -318,22 +387,6 @@ mod tests {
         assert_eq!(record_path(&args), PathBuf::from("/tmp/r"));
     }
 
-    /// A measured height is a positive number of metres, and nothing else.
-    #[test]
-    fn a_measured_height_is_a_positive_number_of_metres() {
-        let args = parse_args(argv(&["--measured-height-m", "0.1266"])).expect("it parses");
-        assert_eq!(args.measured_height_m, Some(0.1266));
-
-        for bad in ["hand-width", "0", "-0.1", "NaN", "inf"] {
-            let refused =
-                parse_args(argv(&["--measured-height-m", bad])).expect_err("{bad} is not a height");
-            assert!(
-                refused.to_string().contains(bad),
-                "the refusal repeats what was typed: {refused}"
-            );
-        }
-    }
-
     /// A flag with no value, and a flag nobody defined, are both refused with
     /// the usage rather than assumed away.
     #[test]
@@ -346,19 +399,67 @@ mod tests {
         assert!(refused.to_string().contains("usage:"), "{refused}");
     }
 
-    /// Every command that moves the machine refuses, and says what has to
-    /// happen before it will not.
+    /// Every command that moves the head refuses, and says what does exist.
     #[test]
-    fn every_command_that_moves_the_machine_refuses() {
-        for command in [
-            "arm", "up", "hold", "stow", "off", "yaw", "antennas", "demo",
-        ] {
-            let refused = dispatch(argv(&[command])).expect_err("{command} moves the machine");
+    fn every_command_that_moves_the_head_refuses() {
+        for command in ["up", "hold", "stow", "off", "yaw", "antennas", "demo"] {
+            let refused = dispatch(argv(&[command])).expect_err("{command} moves the head");
             let printed = refused.to_string();
             assert!(printed.contains(command), "{printed}");
-            assert!(printed.contains("self-test"), "{printed}");
-            assert!(printed.contains("crank datum"), "{printed}");
+            assert!(printed.contains("not implemented"), "{printed}");
         }
+    }
+
+    /// The shipped example, which carries no datum table, and the same file with
+    /// one recorded.
+    fn example_config(datum: bool) -> reachy_bench::config::BenchConfig {
+        let mut cfg = reachy_bench::config::parse(include_str!("../reachy-bench.example.toml"))
+            .expect("the shipped example parses");
+        if datum {
+            cfg.datum = Some(reachy_bench::config::DatumSection {
+                crank_datum: reachy_bench::config::DatumSetting::Direct,
+                provenance: "a test, not a unit".to_string(),
+            });
+        }
+        cfg
+    }
+
+    /// Without a crank datum written into the configuration, arming refuses —
+    /// before it opens anything.
+    #[test]
+    fn arming_refuses_without_a_recorded_datum() {
+        let refused = arm_gates(&example_config(false), Path::new("/nonexistent"))
+            .expect_err("the shipped example resolves no datum");
+        assert!(refused.to_string().contains("datum"), "{refused}");
+    }
+
+    /// With a datum but no self-test record, arming refuses and says which
+    /// command produces one.
+    #[test]
+    fn arming_refuses_without_a_record() {
+        let refused = arm_gates(&example_config(true), &scratch_path())
+            .expect_err("there is no record at a scratch path");
+        assert!(refused.to_string().contains("selftest"), "{refused}");
+    }
+
+    /// A record with a case short of a pass refuses by name. Every real record
+    /// is one of these until the clearance floor has been reviewed, so this is
+    /// the gate as a bring-up meets it.
+    #[test]
+    fn arming_refuses_on_a_record_that_did_not_pass() {
+        let path = scratch_path();
+        Report::new()
+            .into_record(1_754_000_000)
+            .save(&path)
+            .expect("the scratch record is written");
+
+        let refused =
+            arm_gates(&example_config(true), &path).expect_err("an empty record passed nothing");
+        std::fs::remove_file(&path).expect("the scratch record is removed");
+        // The whole chain: the outer context says the record refused, and the
+        // refusal itself names the case.
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("port-open"), "{printed}");
     }
 
     /// No command, and an unknown one, are refused rather than treated as a

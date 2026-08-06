@@ -51,8 +51,7 @@ impl Reg {
     }
 }
 
-/// Model number. Identifies the part; the three servo groups on this machine
-/// answer with three distinct values.
+/// Model number. Identifies the servo part.
 pub const MODEL_NUMBER: Reg = Reg::new(0, 2);
 /// Servo ID.
 pub const ID: Reg = Reg::new(7, 1);

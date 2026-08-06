@@ -159,9 +159,9 @@ impl fmt::Display for RegId {
 
 /// A register's value, in engineering units wherever the register has any.
 ///
-/// Radians and volts cross this boundary as radians and volts. Counts, raw bytes
-/// and the datum shift that separates the two are the wire layer's business, and
-/// nothing above this line may depend on them.
+/// Radians and volts cross this boundary as radians and volts. Counts and raw
+/// bytes are the wire layer's business, and nothing above this line may depend
+/// on them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RegValue {
     /// A one-byte register.
@@ -170,6 +170,10 @@ pub enum RegValue {
     U16(u16),
     /// A four-byte register.
     U32(u32),
+    /// A four-byte register whose contents are signed. The homing offset is
+    /// one: it is a quarter turn either side of zero on this platform, and read
+    /// unsigned it reports a negative offset as a number near four billion.
+    I32(i32),
     /// An angle: a position register, in the model's own frame.
     Radians(f64),
     /// A supply voltage.
@@ -195,6 +199,8 @@ pub enum ValueKind {
     U16,
     /// [`RegValue::U32`].
     U32,
+    /// [`RegValue::I32`].
+    I32,
     /// [`RegValue::Radians`].
     Radians,
     /// [`RegValue::Volts`].
@@ -209,6 +215,7 @@ impl fmt::Display for ValueKind {
             Self::U8 => "one-byte value",
             Self::U16 => "two-byte value",
             Self::U32 => "four-byte value",
+            Self::I32 => "signed four-byte value",
             Self::Radians => "angle",
             Self::Volts => "voltage",
             Self::Gains => "gain span",
@@ -225,6 +232,7 @@ impl RegValue {
             Self::U8(_) => ValueKind::U8,
             Self::U16(_) => ValueKind::U16,
             Self::U32(_) => ValueKind::U32,
+            Self::I32(_) => ValueKind::I32,
             Self::Radians(_) => ValueKind::Radians,
             Self::Volts(_) => ValueKind::Volts,
             Self::Gains { .. } => ValueKind::Gains,
@@ -252,6 +260,14 @@ impl RegValue {
         match self {
             Self::U32(value) => Ok(*value),
             other => Err(other.wrong_shape(context, ValueKind::U32)),
+        }
+    }
+
+    /// The signed four-byte value, or a failure naming what arrived instead.
+    pub fn i32(&self, context: StepContext) -> Result<i32, SeqError> {
+        match self {
+            Self::I32(value) => Ok(*value),
+            other => Err(other.wrong_shape(context, ValueKind::I32)),
         }
     }
 
@@ -294,6 +310,7 @@ impl fmt::Display for RegValue {
             Self::U8(value) => write!(f, "{value}"),
             Self::U16(value) => write!(f, "{value}"),
             Self::U32(value) => write!(f, "{value}"),
+            Self::I32(value) => write!(f, "{value}"),
             Self::Radians(value) => write!(f, "{value:.4} rad"),
             Self::Volts(value) => write!(f, "{value:.1} V"),
             Self::Gains { p, i, d } => write!(f, "P {p} I {i} D {d}"),
@@ -590,8 +607,9 @@ pub enum SeqStep {
     VoltageGate,
     /// Nothing has latched a hardware error.
     Health,
-    /// Where the platform is resting, and whether that agrees with the recorded
-    /// datum.
+    /// Where the platform is resting, and whether those angles place a pose at
+    /// all. What the datum itself rests on — the provisioned homing offsets — is
+    /// verified in the provisioning phase, before anything here is read.
     PoseAndDatum,
     /// Which servos are already holding torque.
     StateDiscovery,
@@ -792,28 +810,16 @@ pub enum SeqError {
         /// Every servo that did not answer.
         absent: AbsentSet,
     },
-    /// Two servos that have to be the same kind report different model numbers,
-    /// which means the bus is not the platform this code was written for.
-    #[error("{context}: model {model}, where servo {reference} reports {reference_model}")]
+    /// A servo reports a model number this platform's servos do not, which means
+    /// the bus is not the platform this code was written for.
+    #[error("{context}: model {model}, where this platform reports {expected}")]
     IdentityMismatch {
         /// Where this happened.
         context: StepContext,
         /// What this servo reports.
         model: u16,
-        /// The servo it has to agree with.
-        reference: u8,
-        /// What that one reports.
-        reference_model: u16,
-    },
-    /// Two servos that have to be different kinds report the same model number.
-    #[error("{context}: model {model} is what servo {reference} reports too")]
-    IdentityCollision {
-        /// Where this happened.
-        context: StepContext,
-        /// The model both report.
-        model: u16,
-        /// The servo it collides with.
-        reference: u8,
+        /// What a servo at this address reports on this platform.
+        expected: u16,
     },
     /// A provisioned register does not hold what this platform was set up with.
     /// Arming verifies provisioning and never repairs it: a register that is
@@ -856,10 +862,11 @@ pub enum SeqError {
         bits: u8,
     },
     /// The measured resting angles place no pose the platform could be holding.
-    /// The angles are what they are, so what is in question is the datum they
-    /// were read under.
+    /// The angles are what they are, so what is in question is whether the model
+    /// and the machine are the same machine — geometry, assembly, or a servo
+    /// answering for a joint it is not.
     #[error("{context}: the resting angles place no plausible pose ({cause})")]
-    DatumInconsistent {
+    RestPoseImplausible {
         /// Where this happened.
         context: StepContext,
         /// What the solver said.
@@ -947,11 +954,10 @@ impl SeqError {
             | Self::UnplaceableAngle { context, .. }
             | Self::AbsentServos { context, .. }
             | Self::IdentityMismatch { context, .. }
-            | Self::IdentityCollision { context, .. }
             | Self::ProvisionMismatch { context, .. }
             | Self::VoltageLow { context, .. }
             | Self::UnhealthyServo { context, .. }
-            | Self::DatumInconsistent { context, .. }
+            | Self::RestPoseImplausible { context, .. }
             | Self::PinnedPoseUnsolvable { context, .. }
             | Self::PinnedPoseOutsideEnvelope { context, .. }
             | Self::NotAtStow { context, .. }
@@ -1232,6 +1238,7 @@ mod tests {
         assert_eq!(RegValue::U8(3).u8(context()), Ok(3));
         assert_eq!(RegValue::U16(1750).u16(context()), Ok(1750));
         assert_eq!(RegValue::U32(4096).u32(context()), Ok(4096));
+        assert_eq!(RegValue::I32(-1024).i32(context()), Ok(-1024));
         assert_eq!(RegValue::Radians(-0.5).radians(context()), Ok(-0.5));
         assert_eq!(RegValue::Volts(7.4).volts(context()), Ok(7.4));
         assert_eq!(
@@ -1253,6 +1260,25 @@ mod tests {
                 .expect_err("a byte is not an angle")
                 .to_string(),
             "provisioning of servo 12, operating mode: expected an angle and got a one-byte value"
+        );
+        // The confusion the signed shape exists to prevent, named in both
+        // directions: the same four bytes read unsigned are a homing offset of
+        // about four billion.
+        let confused = RegValue::U32(1024)
+            .i32(context())
+            .expect_err("an unsigned four bytes is not the signed register")
+            .to_string();
+        assert!(
+            confused.contains("signed four-byte value") && confused.ends_with("four-byte value"),
+            "{confused}"
+        );
+        assert_eq!(
+            RegValue::I32(-1024).u32(context()),
+            Err(SeqError::WrongValue {
+                context: context(),
+                expected: ValueKind::U32,
+                observed: ValueKind::I32,
+            })
         );
     }
 

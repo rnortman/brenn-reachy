@@ -2,7 +2,7 @@
 //!
 //! Arming takes a limp platform to a platform holding itself up: nine servos
 //! verified register by register, the supply rail confirmed, the resting pose
-//! solved and checked against the recorded datum, and only then goals pinned
+//! solved and found plausible, and only then goals pinned
 //! where the joints already are and torque enabled. The order of those
 //! transactions is the safety property and belongs to the state machine that
 //! yields them; what lives here is what that machine decides *with* — the
@@ -23,11 +23,23 @@
 //! which arming stops for a human. The alternative is not "no clamp"; it is a
 //! write whose effect is unknown.
 //!
+//! The antennas are pinned the same way, against the envelope's own antenna
+//! bound rather than a servo-side window: they have no provisioned window at
+//! all, and the platform parks them right at the command bound with torque off,
+//! from where they settle a little past it. Pinning them is what makes a machine
+//! found in its own parked state armable without moving the bound that the
+//! command path enforces. There is deliberately **no pull-in gate on an
+//! antenna**: it is a free rotor with no linkage behind it and no mass that
+//! matters, its reading is unbounded with torque off, and a gate there would
+//! refuse an ordinary resting state with no hazard behind the refusal. Body yaw
+//! is pinned where it is: a body turned past its cap is a gross, visible state
+//! somebody put it in by hand, and the recovery is that same hand.
+//!
 //! ## Two records, not one blur
 //!
 //! Arming produces two descriptions of the machine and they are not the same
-//! pose. The **rest** record is where the platform was found — the evidence for
-//! the datum, and the reason a tight rest does not refuse arming. The **armed**
+//! pose. The **rest** record is where the platform was found — the report's
+//! evidence, and the reason a tight rest does not refuse arming. The **armed**
 //! record is what arming left it holding, which is the rest pulled into every
 //! travel window. The tick starts from the armed record alone: a tick whose
 //! goals came from one pose and whose Cartesian mirror came from the other would
@@ -56,6 +68,35 @@ use crate::seq::{
 /// The platform's own numbering, and the order every nine-slot array in this
 /// crate is in.
 pub const SERVO_IDS: [u8; JointId::COUNT] = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+
+/// The model number each servo must report, in bus order.
+///
+/// Read off this platform and identical across four runs: the body-yaw servo and
+/// the six legs report one number, the two antennas another. Two groups rather
+/// than three — the base's gearbox is a custom part but carries no model number
+/// of its own, so it answers as the same servo the legs are.
+///
+/// Baked rather than left as a structural check: a number a real machine
+/// answered with is a regression guard, and "these six agree with each other"
+/// passes on a bus of six wrong servos.
+pub const EXPECTED_MODELS: [u16; JointId::COUNT] =
+    [1200, 1200, 1200, 1200, 1200, 1200, 1200, 1190, 1190];
+
+/// The homing offset each servo must be provisioned with, counts, in bus order.
+///
+/// This is the datum. Each servo applies its own offset before reporting a
+/// position, so a converted count is the model's crank angle exactly when these
+/// nine registers hold these nine values; the legs' alternating quarter turns
+/// are what the per-leg count limits were derived from in the first place. A
+/// servo answering otherwise is a provisioning fault to be repaired with the
+/// vendor's tool, and no host-side correction for it exists anywhere in this
+/// workspace.
+///
+/// One record, deliberately: two copies of the expectation would let a run
+/// render two verdicts on one truth. It is not a per-unit setting and so is
+/// not a configuration key.
+pub const VENDOR_HOMING_OFFSETS: [i32; JointId::COUNT] =
+    [0, 1024, -1024, 1024, -1024, 1024, -1024, 0, 0];
 
 /// The supply floor arming refuses to proceed below, volts.
 ///
@@ -180,8 +221,8 @@ pub struct ProfileConfig {
 /// The closed set of provisioning: what a servo must already hold for this
 /// project to command it at all. Expectations are the register's own contents in
 /// whatever shape the wire layer decodes it to, not engineering units — these
-/// are integers a person compares against a data sheet, and a datum-shifted
-/// angle would be the wrong thing to compare.
+/// are integers a person compares against a data sheet, and an angle converted
+/// from them would be the wrong thing to compare.
 pub const PROVISION_REGS: [RegId; 15] = [
     RegId::ReturnDelayTime,
     RegId::OperatingMode,
@@ -355,16 +396,23 @@ impl ArmConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PinOutcome {
     /// The goals to write: the measured angles, with each leg brought inside its
-    /// travel window.
+    /// travel window and each antenna inside the envelope's antenna bound.
     pub pinned: JointVector,
     /// Per leg, how far the pin moved it, radians. Zero for a leg already
     /// inside its window, which is the ordinary case on an already-armed
     /// machine.
     pub pull_in: [f64; 6],
+    /// Per antenna, how far the pin moved it, radians. Recorded, never gated —
+    /// an antenna resting past its bound is an ordinary limp state and the pull
+    /// is a free rotor turning a fraction of a turn.
+    pub antenna_pull_in: [f64; 2],
 }
 
 impl PinOutcome {
-    /// The largest pull applied, radians.
+    /// The largest pull applied to a leg, radians.
+    ///
+    /// The legs alone, because they are what the gate is about: the antennas'
+    /// pulls are recorded beside them and bounded by nothing.
     #[must_use]
     pub fn worst_pull_in(&self) -> f64 {
         self.pull_in.iter().copied().fold(0.0, f64::max)
@@ -373,12 +421,18 @@ impl PinOutcome {
 
 /// The goals to pin the platform at, given where it says it is.
 ///
-/// Each leg is brought inside its own travel window; body yaw and the antennas
-/// are pinned where they are, their provisioned range being the whole turn. A
-/// pull beyond `cfg.max_pin_pull_in` stops arming, and so does a measured angle
-/// nobody can place: pinning a goal to a value that is not a number would send a
-/// meaningless write to a servo about to take the head's weight.
-pub fn pin_goals(cfg: &ArmConfig, present: &JointVector) -> Result<PinOutcome, SeqError> {
+/// Each leg is brought inside its own travel window and each antenna inside
+/// `env.antenna_limit`; body yaw is pinned where it is, its provisioned range
+/// being the whole turn and a body outside its cap being a state a hand made and
+/// a hand undoes. A leg pulled beyond `cfg.max_pin_pull_in` stops arming — the
+/// antennas have no such gate — and so does a measured angle nobody can place:
+/// pinning a goal to a value that is not a number would send a meaningless write
+/// to a servo about to take the head's weight.
+pub fn pin_goals(
+    cfg: &ArmConfig,
+    env: &EnvelopeConfig,
+    present: &JointVector,
+) -> Result<PinOutcome, SeqError> {
     for (row, (joint, angle)) in present.joints().into_iter().enumerate() {
         if !angle.is_finite() {
             return Err(SeqError::UnplaceableAngle {
@@ -423,7 +477,25 @@ pub fn pin_goals(cfg: &ArmConfig, present: &JointVector) -> Result<PinOutcome, S
         }
     }
 
-    Ok(PinOutcome { pinned, pull_in })
+    let mut antenna_pull_in = [0.0; 2];
+    for (side, measured) in present.antennas.into_iter().enumerate() {
+        // The bound is symmetric, so the nearer end of it is the one the reading
+        // is already on. A reading exactly at the bound is inside it and is
+        // pinned untouched, which is where the platform parks them.
+        let angle = if outside_limit(measured.abs(), env.antenna_limit) {
+            measured.signum() * env.antenna_limit
+        } else {
+            measured
+        };
+        pinned.antennas[side] = angle;
+        antenna_pull_in[side] = (angle - measured).abs();
+    }
+
+    Ok(PinOutcome {
+        pinned,
+        pull_in,
+        antenna_pull_in,
+    })
 }
 
 /// One description of the machine: nine angles and the head pose they hold.
@@ -454,7 +526,7 @@ impl ArmRecord {
     /// platform hands both over and takes the first that closes the linkage
     /// plausibly. No seed working is a refusal, never a guess: the last solver
     /// failure is returned as it came, because an unsolvable set of angles at
-    /// arm time is evidence about the datum and reads as such.
+    /// arm time says the model and the machine disagree, and reads as such.
     pub fn solve(
         geom: &HeadGeometry,
         opts: &FkOptions,
@@ -526,12 +598,16 @@ impl ProvisionReadings {
 /// Held by value so a report can be printed after the sequencer is gone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArmSummary {
-    /// Where the platform was found — the datum's evidence.
+    /// Where the platform was found, before anything was pinned.
     pub rest: ArmRecord,
     /// What it was left holding, and what a tick starts from.
     pub armed: ArmRecord,
     /// Per leg, how far the first pin pulled it, radians.
     pub pull_in: [f64; 6],
+    /// Per antenna, how far the first pin pulled it, radians. Nothing gates
+    /// this: it is here to be read, since arming a machine found in its parked
+    /// state pulls both antennas in a little and the pull is worth seeing.
+    pub antenna_pull_in: [f64; 2],
     /// Whether a joint had to be pinned a second time after torque came on.
     pub repinned: bool,
     /// Each servo's model number, in bus order.
@@ -549,7 +625,8 @@ pub struct ArmSummary {
 }
 
 impl ArmSummary {
-    /// The largest distance the pin pulled any leg, radians.
+    /// The largest distance the pin pulled any leg, radians. The legs alone:
+    /// the antennas' pulls are gated by nothing and compared against nothing.
     #[must_use]
     pub fn worst_pull_in(&self) -> f64 {
         self.pull_in.iter().copied().fold(0.0, f64::max)
@@ -571,6 +648,8 @@ struct Pinning {
     /// The first pin's per-leg pull, which is the one worth reporting: a re-pin's
     /// pulls are quantisation, and the arm-time pull is the measurement.
     pull_in: [f64; 6],
+    /// The first pin's per-antenna pull, carried for the same reason.
+    antenna_pull_in: [f64; 2],
     /// Whether a re-pin pass has run.
     repinned: bool,
 }
@@ -646,8 +725,11 @@ impl Phase {
             Self::PinAndEnable { .. }
             | Self::Recheck { .. }
             | Self::Repin { .. }
-            | Self::Complete(_)
-            | Self::Failed(_) => SeqStep::PinAndEnable,
+            | Self::Complete(_) => SeqStep::PinAndEnable,
+            // A failure already carries the phase it happened in; taking the
+            // name from anywhere else would report a supply gate that refused
+            // as a pin that never happened.
+            Self::Failed(error) => error.context().step,
         }
     }
 }
@@ -839,6 +921,7 @@ impl ArmSequencer {
             rest: pinning.rest,
             armed: pinning.armed,
             pull_in: pinning.pull_in,
+            antenna_pull_in: pinning.antenna_pull_in,
             repinned: pinning.repinned,
             models: self.records.models,
             voltages: self.records.voltages,
@@ -978,48 +1061,32 @@ impl ArmSequencer {
         self.enter_provision(now, 0)
     }
 
-    /// The three-group shape this platform has: six alike legs, two alike
-    /// antennas of another kind, and a yaw servo of a third.
+    /// Each servo against the model number this platform's servos report.
     ///
-    /// Which model numbers those are is not asserted — nobody has read them off
-    /// this unit yet, and the readings in an arm report are what will establish
-    /// them. The structure is assertable now, and a bus wired up wrong or
-    /// answering out of order breaks it.
+    /// A servo of the wrong kind at a roster address is a bus wired up wrong, a
+    /// replaced part, or a reply attributed to the wrong servo, and every one of
+    /// those has to stop arming before anything is written.
     fn check_identity(&self) -> Result<(), SeqError> {
-        let models = self.records.models;
-        let ids = self.cfg.ids;
-        let context =
-            |row: usize| StepContext::reg(SeqStep::Identity, ids[row], RegId::ModelNumber);
-        let alike = |row: usize, reference: usize| {
-            if models[row] == models[reference] {
-                Ok(())
-            } else {
-                Err(SeqError::IdentityMismatch {
-                    context: context(row),
-                    model: models[row],
-                    reference: ids[reference],
-                    reference_model: models[reference],
-                })
+        for (row, (model, expected)) in self
+            .records
+            .models
+            .into_iter()
+            .zip(EXPECTED_MODELS)
+            .enumerate()
+        {
+            if model != expected {
+                return Err(SeqError::IdentityMismatch {
+                    context: StepContext::reg(
+                        SeqStep::Identity,
+                        self.cfg.ids[row],
+                        RegId::ModelNumber,
+                    ),
+                    model,
+                    expected,
+                });
             }
-        };
-        let differs = |row: usize, reference: usize| {
-            if models[row] == models[reference] {
-                Err(SeqError::IdentityCollision {
-                    context: context(row),
-                    model: models[row],
-                    reference: ids[reference],
-                })
-            } else {
-                Ok(())
-            }
-        };
-        for leg in 2..=6 {
-            alike(leg, 1)?;
         }
-        alike(8, 7)?;
-        differs(7, 1)?;
-        differs(0, 1)?;
-        differs(0, 7)
+        Ok(())
     }
 
     /// Enter the provisioning sweep at the first cell at or after `from` that the
@@ -1183,15 +1250,15 @@ impl ArmSequencer {
         }
         // The resting pose, solved from the two candidates the platform is known
         // to come to rest at. Failure is not a solver problem to retry with a
-        // perturbed seed: these angles were read under a configured datum, and
-        // angles that place no pose are evidence about that datum.
+        // perturbed seed: the angles are what nine servos reported, and angles
+        // that place no pose say the model and the machine disagree.
         let rest = ArmRecord::solve(
             &self.geom,
             &self.fk,
             &self.records.present,
             &[stow_head_pose(), rest_head_pose()],
         )
-        .map_err(|cause| SeqError::DatumInconsistent {
+        .map_err(|cause| SeqError::RestPoseImplausible {
             // Named against the first crank: the failure belongs to the six of
             // them together, and a context names one servo.
             context: self.context(1, RegId::PresentPosition),
@@ -1229,7 +1296,7 @@ impl ArmSequencer {
     /// place, or a goal set that closes no linkage all stop the sequence here,
     /// with nothing written and no torque enabled.
     fn enter_pinning(&mut self, rest: ArmRecord) -> Result<(), SeqError> {
-        let pins = pin_goals(&self.cfg, &self.records.present)?;
+        let pins = pin_goals(&self.cfg, &self.env, &self.records.present)?;
         // The pull is at most the pin-in gate, which is millimetres of head
         // motion, so the resting pose is a close seed. The context is built for
         // the phase this is entering, not the one it is leaving: the pins are
@@ -1251,6 +1318,7 @@ impl ArmSequencer {
                 pins,
                 armed,
                 pull_in: pins.pull_in,
+                antenna_pull_in: pins.antenna_pull_in,
                 repinned: false,
             },
         };
@@ -1262,9 +1330,12 @@ impl ArmSequencer {
     /// Every trajectory starts at the pose arming left the machine holding, so a
     /// start outside the envelope is a move that faults on its second tick, at a
     /// pose the machine is already standing in and with torque already on. The
-    /// legs are inside their windows by the pin; this is what covers the rest of
-    /// the verdict — body yaw, the antennas, head attitude and head-relative yaw
-    /// — none of which the pin has any fence for.
+    /// legs are inside their windows and the antennas inside their bound by the
+    /// pin; this is what covers the rest of the verdict — body yaw, head
+    /// attitude and head-relative yaw — none of which the pin has any fence for.
+    /// It runs the whole envelope rather than the remainder, so a pin that ever
+    /// stopped establishing what it establishes is caught here rather than
+    /// passing unchecked.
     ///
     /// The clearance floor is excepted, and only it: the platform is known to
     /// come to rest tighter than the floor, and what governs the move off such a
@@ -1329,7 +1400,8 @@ impl ArmSequencer {
         // TODO(pin-settle-dwell): nothing waits between the last enable and this
         // read, so a joint the pin is still pulling reads short of its goal
         // through both sweeps and arming gives up on a machine that is merely
-        // mid-travel.
+        // mid-travel. An antenna pulled in from a limp rest is in that same
+        // position, and its pull is bounded by nothing.
         let drifted =
             self.records
                 .recheck
@@ -1354,7 +1426,7 @@ impl ArmSequencer {
                 present,
             });
         }
-        let pins = pin_goals(&self.cfg, &self.records.recheck)?;
+        let pins = pin_goals(&self.cfg, &self.env, &self.records.recheck)?;
         let mut pinning = Pinning {
             repinned: true,
             ..pinning
@@ -1430,6 +1502,12 @@ mod tests {
         crate::testutil::arm_config(&EnvelopeConfig::default())
     }
 
+    /// The envelope the pin reads its antenna bound from, and the one the
+    /// windows in [`config`] are drawn from.
+    fn default_env() -> EnvelopeConfig {
+        EnvelopeConfig::default()
+    }
+
     /// The nine angles a pose puts the machine at, yaw and antennas at zero.
     fn joints_at(pose: &Isometry3<f64>) -> JointVector {
         let geom = HeadGeometry::default();
@@ -1448,7 +1526,7 @@ mod tests {
     fn a_joint_inside_its_window_is_pinned_where_it_is() {
         let cfg = config();
         let present = joints_at(&reachy_kin::neutral_head_pose());
-        let outcome = pin_goals(&cfg, &present).expect("nothing to pull");
+        let outcome = pin_goals(&cfg, &default_env(), &present).expect("nothing to pull");
         assert_eq!(outcome.pinned, present);
         assert_eq!(outcome.pull_in, [0.0; 6]);
         assert_eq!(outcome.worst_pull_in(), 0.0);
@@ -1461,7 +1539,8 @@ mod tests {
     fn the_resting_pose_is_pulled_into_every_window() {
         let cfg = config();
         let present = joints_at(&rest_head_pose());
-        let outcome = pin_goals(&cfg, &present).expect("the pulls are inside the gate");
+        let outcome =
+            pin_goals(&cfg, &default_env(), &present).expect("the pulls are inside the gate");
 
         for (leg, (angle, (low, high))) in
             outcome.pinned.legs.iter().zip(cfg.leg_windows).enumerate()
@@ -1493,6 +1572,92 @@ mod tests {
             .collect();
         assert_eq!(degrees, vec![7.543, 2.454, 0.0, 0.0, 0.767, 10.575]);
         assert!(outcome.worst_pull_in() < cfg.max_pin_pull_in);
+        // The antennas were at zero and stayed there: the leg pull touches
+        // nothing else.
+        assert_eq!(outcome.antenna_pull_in, [0.0; 2]);
+    }
+
+    /// The model angle a servo count denotes: a whole turn spread over 4096
+    /// counts, zero at the middle of the range. Spelled out here because nothing
+    /// in this crate knows what a count is, and the antenna readings below are
+    /// what a real machine reported.
+    fn rad_from_counts(counts: i32) -> f64 {
+        core::f64::consts::TAU * f64::from(counts) / 4096.0 - PI
+    }
+
+    /// The antennas as the platform parks them: driven to the command bound,
+    /// torque cut, settled a little past it. Both are pinned back to the bound
+    /// and both pulls are recorded, with nothing refused — which is what makes a
+    /// machine found in its own parked state armable at all.
+    #[test]
+    fn the_parked_antennas_are_pinned_to_their_bound() {
+        let cfg = config();
+        let env = default_env();
+        let rest = joints_at(&rest_head_pose());
+
+        let mut present = rest;
+        // The two readings this unit reported at rest: 38 and 4051 counts.
+        present.antennas = [rad_from_counts(38), rad_from_counts(4051)];
+        assert!(present.antennas[0] < -env.antenna_limit);
+        assert!(present.antennas[1] > env.antenna_limit);
+
+        let outcome = pin_goals(&cfg, &env, &present).expect("no gate stands in front of this");
+        assert_eq!(
+            outcome.pinned.antennas,
+            [-env.antenna_limit, env.antenna_limit]
+        );
+        let degrees: Vec<f64> = outcome
+            .antenna_pull_in
+            .iter()
+            .map(|pull| (pull.to_degrees() * 1e3).round() / 1e3)
+            .collect();
+        assert_eq!(degrees, vec![1.908, 1.293]);
+
+        // The legs are pinned exactly as they are without any of this: the two
+        // fences are independent, and the leg gate never sees an antenna.
+        let plain = pin_goals(&cfg, &env, &rest).expect("the pulls are inside the gate");
+        assert_eq!(outcome.pinned.legs, plain.pinned.legs);
+        assert_eq!(outcome.pull_in, plain.pull_in);
+        assert_eq!(outcome.worst_pull_in(), plain.worst_pull_in());
+    }
+
+    /// An antenna is a free rotor and its reading runs past the half turn with
+    /// torque off, so the pin is by sign rather than by wrapping — and however
+    /// far out the reading is, there is no gate to refuse it.
+    #[test]
+    fn an_antenna_past_the_half_turn_pins_by_sign() {
+        let cfg = config();
+        let env = default_env();
+        let mut present = joints_at(&rest_head_pose());
+        present.antennas = [3.6, -4.2];
+
+        let outcome = pin_goals(&cfg, &env, &present).expect("no gate stands in front of this");
+        assert_eq!(
+            outcome.pinned.antennas,
+            [env.antenna_limit, -env.antenna_limit]
+        );
+        let degrees: Vec<f64> = outcome
+            .antenna_pull_in
+            .iter()
+            .map(|pull| (pull.to_degrees() * 1e3).round() / 1e3)
+            .collect();
+        assert_eq!(degrees, vec![31.513, 65.890]);
+    }
+
+    /// An antenna inside the bound is pinned where it is, bit for bit — and the
+    /// bound itself is inside it, which is where the stow pose leaves them.
+    #[test]
+    fn an_antenna_inside_its_bound_is_pinned_where_it_is() {
+        let cfg = config();
+        let env = default_env();
+        let mut present = joints_at(&rest_head_pose());
+
+        for antennas in [[0.2, -0.15], [-env.antenna_limit, env.antenna_limit]] {
+            present.antennas = antennas;
+            let outcome = pin_goals(&cfg, &env, &present).expect("nothing to pull");
+            assert_eq!(outcome.pinned.antennas, antennas);
+            assert_eq!(outcome.antenna_pull_in, [0.0; 2]);
+        }
     }
 
     /// A pull beyond the gate stops arming, naming the leg, the servo, the
@@ -1504,7 +1669,8 @@ mod tests {
             ..config()
         };
         let present = joints_at(&rest_head_pose());
-        let error = pin_goals(&cfg, &present).expect_err("the sixth leg is ten degrees out");
+        let error = pin_goals(&cfg, &default_env(), &present)
+            .expect_err("the sixth leg is ten degrees out");
         let SeqError::PullInTooLarge {
             context,
             joint,
@@ -1543,7 +1709,8 @@ mod tests {
                     1..=6 => present.legs[row - 1] = bad,
                     _ => present.antennas[row - 7] = bad,
                 }
-                let error = pin_goals(&cfg, &present).expect_err("an unplaceable angle refuses");
+                let error = pin_goals(&cfg, &default_env(), &present)
+                    .expect_err("an unplaceable angle refuses");
                 let SeqError::UnplaceableAngle {
                     context,
                     joint: named,
@@ -1579,7 +1746,8 @@ mod tests {
         let opts = FkOptions::default();
         let rest = rest_head_pose();
         let present = joints_at(&rest);
-        let outcome = pin_goals(&cfg, &present).expect("the pulls are inside the gate");
+        let outcome =
+            pin_goals(&cfg, &default_env(), &present).expect("the pulls are inside the gate");
 
         let record = ArmRecord::solve(&geom, &opts, &outcome.pinned, &[rest])
             .expect("the pinned angles close the linkage");
@@ -1692,19 +1860,20 @@ mod tests {
         assert!((record.head_pose_body.translation.z - 0.149_571).abs() < 1e-6);
     }
 
-    /// A quarter-turn datum error is caught by neither the solver nor the travel
-    /// windows at this resting configuration, and that is the whole reason the
-    /// datum needs a measurement taken off the machine.
+    /// A servo reporting a quarter turn from where the model puts it is caught
+    /// by neither the solver nor the travel windows at this resting
+    /// configuration, and that is why the provisioned homing offsets are read
+    /// back and compared rather than inferred from the angles.
     ///
-    /// The resting angles read under the wrong datum are the same measurement
-    /// shifted ±90° by parity. They close the linkage perfectly well — a head
-    /// tilted 55°, 176 mm up, inside the solver's plausibility band — and they sit
+    /// The legs' offsets are what put a crank's mechanical zero at the model's,
+    /// so a servo that lost its offset reports the same measurement shifted ±90°
+    /// by parity. Those angles close the linkage perfectly well — a head tilted
+    /// 55°, 176 mm up, inside the solver's plausibility band — and they sit
     /// inside every travel window, which the *correct* reading of this rest does
-    /// not. Membership therefore prefers the wrong datum here. What does separate
-    /// them is head height: the two poses are five centimetres apart, which is
-    /// why a height measured with a ruler settles it and nothing computed does.
+    /// not. Nothing on the command path would notice; the head would simply not
+    /// be where the model thinks it is, by five centimetres.
     #[test]
-    fn a_quarter_turn_datum_error_looks_admissible_at_this_rest() {
+    fn a_quarter_turn_offset_error_looks_admissible_at_this_rest() {
         let geom = HeadGeometry::default();
         let opts = FkOptions::default();
         let mut joints = joints_at(&rest_head_pose());
@@ -1725,11 +1894,12 @@ mod tests {
                 .count()
         };
         // Every shifted angle is inside its window, while four of the six correct
-        // ones are not: at this rest, window membership picks the wrong datum.
+        // ones are not: at this rest the windows admit the wrong reading and
+        // refuse the right one.
         assert_eq!(outside(&joints.legs), 0);
         assert_eq!(outside(&joints_at(&rest_head_pose()).legs), 4);
 
-        // Height is what tells them apart, by five centimetres.
+        // What the two readings actually differ by: five centimetres of head.
         let gap = record.head_pose_body.translation.z - rest_head_pose().translation.z;
         assert!(gap > 0.04, "the two poses differ by {gap} m in height");
     }
@@ -1877,7 +2047,7 @@ mod tests {
         // arming would refuse the case it was sized for.
         let cfg = config();
         let present = joints_at(&rest_head_pose());
-        let outcome = pin_goals(&cfg, &present).expect("inside the gate");
+        let outcome = pin_goals(&cfg, &default_env(), &present).expect("inside the gate");
         assert!(outcome.worst_pull_in() < DEFAULT_MAX_PIN_PULL_IN);
     }
 
@@ -1894,14 +2064,15 @@ mod tests {
         let present = joints_at(&reachy_kin::neutral_head_pose());
         // The neutral pose sits near ±36°, so every leg is pulled to the fence
         // and the first one trips the gate.
-        let error = pin_goals(&cfg, &present).expect_err("thirty degrees is past the gate");
+        let error =
+            pin_goals(&cfg, &default_env(), &present).expect_err("thirty degrees is past the gate");
         assert!(matches!(error, SeqError::PullInTooLarge { .. }));
 
         let wide = ArmConfig {
             leg_windows: [(-PI, PI); 6],
             ..cfg
         };
-        let outcome = pin_goals(&wide, &present).expect("nothing to pull");
+        let outcome = pin_goals(&wide, &default_env(), &present).expect("nothing to pull");
         assert_eq!(outcome.pinned, present);
     }
 
@@ -1915,7 +2086,7 @@ mod tests {
         for (angle, (low, _)) in present.legs.iter_mut().zip(cfg.leg_windows) {
             *angle = low;
         }
-        let outcome = pin_goals(&cfg, &present).expect("nothing to pull");
+        let outcome = pin_goals(&cfg, &default_env(), &present).expect("nothing to pull");
         assert_eq!(outcome.pull_in, [0.0; 6]);
         assert_eq!(outcome.pinned.legs, present.legs);
     }
@@ -1973,7 +2144,7 @@ mod tests {
         present.body_yaw = 0.35;
         present.antennas = [0.20, -0.15];
         Machine {
-            models: [1200, 1190, 1190, 1190, 1190, 1190, 1190, 1180, 1180],
+            models: EXPECTED_MODELS,
             silent: [false; JointId::COUNT],
             sweeps: vec![7.4],
             sag: [0.0; JointId::COUNT],
@@ -1982,7 +2153,7 @@ mod tests {
             present,
             provision: vec![
                 (RegId::OperatingMode, RegValue::U8(3)),
-                (RegId::HomingOffset, RegValue::U32(1024)),
+                (RegId::HomingOffset, RegValue::I32(1024)),
                 (RegId::Shutdown, RegValue::U8(0x34)),
             ],
             drift_sweeps: 0,
@@ -2208,7 +2379,7 @@ mod tests {
         // A goal and an enable per servo, then the nine-servo re-check.
         assert_eq!(count(SeqStep::PinAndEnable), 3 * JointId::COUNT);
 
-        let pins = pin_goals(&cfg, &machine.present).expect("inside the gate");
+        let pins = pin_goals(&cfg, &default_env(), &machine.present).expect("inside the gate");
         assert_eq!(summary.rest.joints, machine.present);
         assert_eq!(summary.armed.joints, pins.pinned);
         assert_eq!(
@@ -2288,7 +2459,7 @@ mod tests {
             .count();
         assert_eq!(positions, 3 * JointId::COUNT);
         // The pull recorded is the pull off the rest, not the re-pin's own.
-        let pins = pin_goals(&cfg, &machine.present).expect("inside the gate");
+        let pins = pin_goals(&cfg, &default_env(), &machine.present).expect("inside the gate");
         assert_eq!(summary.pull_in, pins.pull_in);
         // The armed record describes the goals actually left in the servos.
         assert_eq!(summary.armed.joints, machine.goals);
@@ -2463,7 +2634,7 @@ mod tests {
         machine.present.legs[5] += 1.0;
         let error = drive(&cfg, &mut machine).expect_err("those angles close no loop");
         assert!(
-            matches!(error, SeqError::DatumInconsistent { .. }),
+            matches!(error, SeqError::RestPoseImplausible { .. }),
             "{error}"
         );
         assert_eq!(error.context().step, SeqStep::PoseAndDatum);
@@ -2504,36 +2675,12 @@ mod tests {
     }
 
     /// The pins are what the tick's first trajectory starts from, so a pinned
-    /// pose the envelope refuses stops arming — on the three joints the pin has
-    /// no fence of its own for, where a limp antenna or a hand-turned body can
-    /// come to rest anywhere in its turn.
+    /// pose the envelope refuses stops arming — on what the pin has no fence of
+    /// its own for, which is the body yaw a hand can turn anywhere in its cap.
     #[test]
     fn a_pinned_pose_outside_the_envelope_stops_arming() {
         let cfg = provisioned_config();
         let env = EnvelopeConfig::default();
-
-        let mut machine = bus();
-        machine.present.antennas[0] = env.antenna_limit + 0.05;
-        let error = drive(&cfg, &mut machine).expect_err("that antenna is past its bound");
-        let SeqError::PinnedPoseOutsideEnvelope {
-            context,
-            violations,
-        } = error
-        else {
-            panic!("expected an envelope refusal, got {error}");
-        };
-        assert!(violations.antenna[0]);
-        assert!(!violations.antenna[1]);
-        assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert_eq!(context.id, 17);
-        assert_eq!(
-            error.to_string(),
-            "pin and enable of servo 17, goal position: the pinned pose is outside the \
-             envelope (right antenna out of range)"
-        );
-        // Refused before the pin was written and before any torque went on.
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
-        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
 
         let mut machine = bus();
         machine.present.body_yaw = env.body_yaw_limit + 0.05;
@@ -2546,12 +2693,58 @@ mod tests {
             panic!("expected an envelope refusal, got {error}");
         };
         assert!(violations.body_yaw);
+        assert_eq!(context.step, SeqStep::PinAndEnable);
         assert_eq!(context.id, 10);
+        assert_eq!(
+            error.to_string(),
+            "pin and enable of servo 10, goal position: the pinned pose is outside the \
+             envelope (body yaw out of range)"
+        );
+        // Refused before the pin was written and before any torque went on.
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
+        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
 
         // The rest the pin exists for still arms: below the clearance floor is
         // the one verdict arming ignores.
         let summary = drive(&cfg, &mut bus()).expect("a tight rest is not a refusal");
         assert!(summary.armed.min_margin < env.min_toggle_margin);
+    }
+
+    /// The whole sequence over a machine found parked: both antennas resting
+    /// past the command bound, which is where the platform's own stow leaves
+    /// them. Arming pins them in, writes those goals, and completes — the state
+    /// it would refuse if the pin had no fence for an antenna.
+    #[test]
+    fn a_machine_parked_past_the_antenna_bound_arms() {
+        let cfg = provisioned_config();
+        let env = EnvelopeConfig::default();
+
+        let mut machine = bus();
+        machine.present.antennas = [rad_from_counts(38), rad_from_counts(4051)];
+        let summary = drive(&cfg, &mut machine).expect("a parked antenna is not a refusal");
+
+        // Recorded as found, left at the bound, and the pull reported.
+        assert_eq!(summary.rest.joints.antennas, machine.present.antennas);
+        assert_eq!(
+            summary.armed.joints.antennas,
+            [-env.antenna_limit, env.antenna_limit]
+        );
+        let degrees: Vec<f64> = summary
+            .antenna_pull_in
+            .iter()
+            .map(|pull| (pull.to_degrees() * 1e3).round() / 1e3)
+            .collect();
+        assert_eq!(degrees, vec![1.908, 1.293]);
+        assert!(!summary.repinned);
+
+        // The goals that reached the machine are the pinned values, not the
+        // measured ones, and every servo took one.
+        assert_eq!(
+            machine.goals.antennas,
+            [-env.antenna_limit, env.antenna_limit]
+        );
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
+        assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
     }
 
     /// Pins that close no linkage are refused before a byte of them is written,
@@ -2584,14 +2777,14 @@ mod tests {
         );
     }
 
-    /// The identity phase's two failures, each named in full: servos that have to
-    /// match and do not, and servos that have to differ and do not.
+    /// A wrong servo at a roster address is named with what it answered and what
+    /// this platform answers, on whichever of the nine it sits.
     #[test]
-    fn identity_names_both_kinds_of_wrong_servo() {
+    fn identity_names_a_servo_of_the_wrong_kind() {
         let cfg = provisioned_config();
 
         let mut machine = Machine {
-            models: [1200, 1190, 1190, 1191, 1190, 1190, 1190, 1180, 1180],
+            models: [1200, 1200, 1200, 1191, 1200, 1200, 1200, 1190, 1190],
             ..bus()
         };
         let error = drive(&cfg, &mut machine).expect_err("that leg is not a leg servo");
@@ -2600,65 +2793,45 @@ mod tests {
             SeqError::IdentityMismatch {
                 context: StepContext::reg(SeqStep::Identity, 13, RegId::ModelNumber),
                 model: 1191,
-                reference: 11,
-                reference_model: 1190,
+                expected: 1200,
             }
         );
         assert_eq!(
             error.to_string(),
-            "identity of servo 13, model number: model 1191, where servo 11 reports 1190"
+            "identity of servo 13, model number: model 1191, where this platform reports 1200"
         );
+        // Stopped at the identity phase: nine pings and nine model reads.
         assert_eq!(machine.log.len(), 2 * JointId::COUNT);
 
-        // The two antennas have to agree with each other, and the reference is
-        // the right one.
+        // An antenna is a different servo from a leg, and its own expectation is
+        // what it is held to.
         let mut machine = Machine {
-            models: [1200, 1190, 1190, 1190, 1190, 1190, 1190, 1180, 1181],
+            models: [1200, 1200, 1200, 1200, 1200, 1200, 1200, 1190, 1200],
             ..bus()
         };
-        let error = drive(&cfg, &mut machine).expect_err("the antennas disagree");
+        let error = drive(&cfg, &mut machine).expect_err("that antenna is a leg servo");
         assert_eq!(
             error,
             SeqError::IdentityMismatch {
                 context: StepContext::reg(SeqStep::Identity, 18, RegId::ModelNumber),
-                model: 1181,
-                reference: 17,
-                reference_model: 1180,
+                model: 1200,
+                expected: 1190,
             }
         );
 
-        // The yaw servo answering as a leg servo: same kind where two kinds are
-        // required.
+        // A bus of nine servos that agree with each other but not with this
+        // platform fails on the first one.
         let mut machine = Machine {
-            models: [1190, 1190, 1190, 1190, 1190, 1190, 1190, 1180, 1180],
+            models: [1180, 1190, 1190, 1190, 1190, 1190, 1190, 1170, 1170],
             ..bus()
         };
-        let error = drive(&cfg, &mut machine).expect_err("the yaw servo is a leg servo");
+        let error = drive(&cfg, &mut machine).expect_err("none of those is this platform");
         assert_eq!(
             error,
-            SeqError::IdentityCollision {
+            SeqError::IdentityMismatch {
                 context: StepContext::reg(SeqStep::Identity, 10, RegId::ModelNumber),
-                model: 1190,
-                reference: 11,
-            }
-        );
-        assert_eq!(
-            error.to_string(),
-            "identity of servo 10, model number: model 1190 is what servo 11 reports too"
-        );
-
-        // An antenna answering as a leg servo, which is the other collision.
-        let mut machine = Machine {
-            models: [1200, 1190, 1190, 1190, 1190, 1190, 1190, 1190, 1190],
-            ..bus()
-        };
-        let error = drive(&cfg, &mut machine).expect_err("the antennas are leg servos");
-        assert_eq!(
-            error,
-            SeqError::IdentityCollision {
-                context: StepContext::reg(SeqStep::Identity, 17, RegId::ModelNumber),
-                model: 1190,
-                reference: 11,
+                model: 1180,
+                expected: 1200,
             }
         );
     }
@@ -2757,7 +2930,7 @@ mod tests {
         // The pins were rewritten, and to the same angles: a leg short of a bound
         // it is being pulled to is still outside the window, so it pins there
         // again.
-        let pins = pin_goals(&cfg, &machine.present).expect("inside the gate");
+        let pins = pin_goals(&cfg, &default_env(), &machine.present).expect("inside the gate");
         assert_eq!(machine.goals, pins.pinned);
         assert_eq!(
             writes(&machine.log, RegId::GoalPosition),

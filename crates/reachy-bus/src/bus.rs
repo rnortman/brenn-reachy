@@ -115,7 +115,10 @@ pub struct BusCounters {
 ///
 /// Wide enough for the position-gain span, which is the widest entry in the
 /// table at six bytes. Carries the bytes without interpretation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// The default is the zero-width value, which no register produces: it is what
+/// a caller assembling a batch seeds an array with before filling it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct RawValue {
     bytes: [u8; Self::MAX_LEN],
     len: u8,
@@ -314,6 +317,9 @@ impl<P: BusPort> Bus<P> {
         reg: Reg,
         value: &RawValue,
     ) -> Result<(), XactError> {
+        // TODO(provisioning-repair): a guarded path that may write a
+        // non-volatile register belongs here, behind evidence that torque is
+        // off. Nothing in this project writes one, so none is offered.
         if reg.is_eeprom() {
             return Err(XactError::EepromRefused { id, addr: reg.addr });
         }
@@ -595,11 +601,13 @@ impl<P: BusPort> Bus<P> {
                             len: view.params.len(),
                         });
                     }
-                    // TODO(bus-echo-policy): a well-formed frame that is not a
-                    // status packet arrives here as one of these, and this
-                    // arm's no-retry rule then fails the whole exchange. If
-                    // this serial path reflects the host's own transmission,
-                    // that happens on every request from the first ping on.
+                    // A well-formed frame that is not a status packet arrives
+                    // here too, and fails the exchange with everything else
+                    // this arm refuses. That is the right verdict on this path:
+                    // it does not reflect the host's own transmission — four
+                    // read-only runs over nine servos saw every exchange clean
+                    // from the first ping — so a non-status frame here is a
+                    // genuine anomaly and not traffic to be skipped past.
                     DecodeStep::Corrupt(cause) => return Err(XactError::Corrupt { id, cause }),
                 }
             }
