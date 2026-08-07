@@ -18,16 +18,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use reachy_bench::commands;
-use reachy_bench::config::{self, BenchConfig, Resolved};
+use reachy_bench::config::{self, RECORD_NAME, Resolved, arm_gates};
 use reachy_bench::pump::{MonotonicClock, PumpError};
-use reachy_bench::selftest::{Case, Registry, Report, SelftestRecord, now_unix};
+use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
-
-/// The record file's name, written beside the configuration.
-const RECORD_NAME: &str = "selftest-state.toml";
 
 /// What the operator asked for.
 #[derive(Debug)]
@@ -311,12 +308,9 @@ fn number(word: &str) -> anyhow::Result<f64> {
 }
 
 fn record_path(args: &Args) -> PathBuf {
-    args.record.clone().unwrap_or_else(|| {
-        args.config
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join(RECORD_NAME)
-    })
+    args.record
+        .clone()
+        .unwrap_or_else(|| config::record_path_beside(&args.config))
 }
 
 /// Run the read-only registry and write down what it saw.
@@ -457,31 +451,13 @@ where
     })
 }
 
-/// The two standing gates, and the configuration that survived them.
-///
-/// Separate from the run so the refusals are testable without a port: they are
-/// the whole reason a motion command exists behind a read-only one.
-fn arm_gates(cfg: &BenchConfig, record: &Path) -> anyhow::Result<Resolved> {
-    let resolved = cfg.resolve()?;
-    let record = SelftestRecord::load(record).with_context(|| {
-        format!(
-            "reading the self-test record at {}; run `reachy-bench selftest` first",
-            record.display()
-        )
-    })?;
-    record
-        .admits_arm()
-        .context("the self-test record does not admit arming")?;
-    Ok(resolved)
-}
-
 #[cfg(test)]
 mod tests {
     use std::io;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
 
-    use reachy_bench::selftest::{Outcome, SelftestRecord};
+    use reachy_bench::selftest::{Case, CaseResult, Outcome, SelftestRecord};
     use reachy_bus::BusPort;
 
     use super::*;
@@ -892,6 +868,38 @@ mod tests {
         // refusal itself names the case.
         let printed = format!("{refused:#}");
         assert!(printed.contains("port-open"), "{printed}");
+    }
+
+    /// A record in which every case passed. `admits_arm` reads the case
+    /// verdicts and nothing else, so the readings a real run also carries are
+    /// left off.
+    fn green_record() -> SelftestRecord {
+        let mut report = Report::new();
+        for case in Case::ALL {
+            report.push(CaseResult::pass(case, "a test, not a unit"));
+        }
+        report.into_record(1_754_000_000)
+    }
+
+    /// The gate's one pass case. Every other test over it is a refusal, and a
+    /// gate that refused everything — an inverted record check, a `resolve`
+    /// that stopped resolving — would leave all of them green while leaving
+    /// every host unable to arm. What comes back is the configuration the
+    /// caller then opens, so the assertions are on that.
+    #[test]
+    fn arming_admits_a_resolved_config_with_a_green_record() {
+        let path = scratch_path();
+        green_record()
+            .save(&path)
+            .expect("the scratch record is written");
+
+        let cfg = example_config(true);
+        let resolved = arm_gates(&cfg, &path);
+        std::fs::remove_file(&path).expect("the scratch record is removed");
+
+        let resolved = resolved.expect("a resolved datum and a green record admit arming");
+        assert_eq!(resolved.device, cfg.bus.device);
+        assert_eq!(resolved.timing.baud, cfg.bus.baud);
     }
 
     /// No command, and an unknown one, are refused rather than treated as a

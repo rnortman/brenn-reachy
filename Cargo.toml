@@ -32,11 +32,19 @@ nalgebra = "0.35"
 # Serial port access for the servo bus, and the only I/O dependency in the
 # workspace. `default-features = false` drops the udev-backed enumeration
 # support: the port is named in configuration, never discovered, so the extra
-# native dependency would buy nothing and cost a build prerequisite.
-serialport = { version = "4", default-features = false }
+# native dependency would buy nothing and cost a build prerequisite. The floor
+# is 4.9 because the bus layer's one-speaker guarantee rests on what an
+# exclusive open does there: `TIOCEXCL` and a non-blocking exclusive `flock`,
+# both held for the lifetime of the port.
+serialport = { version = "4.9", default-features = false }
 # Error reporting at the binary edge only, where a chain of context is what an
 # operator at a bench actually wants. Libraries use thiserror.
 anyhow = "1"
+# Platform constants — the two open(2) flags and the one errno the bus layer's
+# contention probe reads. reachy-bus only, and constants only: every crate here
+# forbids unsafe code, so nothing calls into it. Already in the tree under
+# serialport.
+libc = "0.2"
 # The bench binary's configuration file: bus device, envelope caps, motion
 # parameters, arm thresholds, and the resolved crank datum.
 serde = { version = "1", features = ["derive"] }

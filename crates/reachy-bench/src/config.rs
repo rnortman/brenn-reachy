@@ -18,6 +18,11 @@
 //! with one carrying no provenance line, resolves to a typed refusal and no
 //! command that moves anything runs.
 //!
+//! That gate and the self-test record's gate are one function here,
+//! [`arm_gates`], rather than a step in a binary: the bench is not the only
+//! host that commands this machine, and a second host has to run the gate
+//! itself and not a copy of it.
+//!
 //! ## Two fences, one region
 //!
 //! The servos enforce a per-leg position window of their own, in counts, and the
@@ -31,13 +36,14 @@
 //! records is wrong is not something code should pick.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::selftest::SelftestRecord;
 use reachy_bus::{BusTiming, DEFAULT_BAUD, MapError, ServoMap};
 use reachy_kin::{EnvelopeConfig, FkOptions, HeadGeometry, IkError, baked};
 use reachy_motion::{
@@ -696,6 +702,43 @@ pub fn load(path: &Path) -> anyhow::Result<BenchConfig> {
 /// Parse a configuration from TOML text.
 pub fn parse(text: &str) -> anyhow::Result<BenchConfig> {
     toml::from_str(text).map_err(Into::into)
+}
+
+/// The self-test record's file name, written beside the configuration it
+/// describes a run of.
+pub const RECORD_NAME: &str = "selftest-state.toml";
+
+/// Where the record for `config` lives unless a caller names another path.
+///
+/// Beside the configuration, because the pair belongs to one machine: a record
+/// says a particular unit's servos answered as the file next to it says they
+/// should.
+pub fn record_path_beside(config: &Path) -> PathBuf {
+    config.parent().unwrap_or(Path::new("")).join(RECORD_NAME)
+}
+
+/// The two standing gates, and the configuration that survived them.
+///
+/// Every host that commands this machine runs exactly this, before it opens the
+/// port: the configuration must resolve — which is where the recorded crank
+/// datum is required — and the self-test record at `record` must be one in
+/// which every case passed. It lives here rather than in a binary so a second
+/// host runs the gate itself and not a copy of it.
+///
+/// Separate from the run, so the refusals are testable without a port: they are
+/// the whole reason a motion command exists behind a read-only one.
+pub fn arm_gates(cfg: &BenchConfig, record: &Path) -> anyhow::Result<Resolved> {
+    let resolved = cfg.resolve()?;
+    let record = SelftestRecord::load(record).with_context(|| {
+        format!(
+            "reading the self-test record at {}; run `reachy-bench selftest` first",
+            record.display()
+        )
+    })?;
+    record
+        .admits_arm()
+        .context("the self-test record does not admit arming")?;
+    Ok(resolved)
 }
 
 impl BenchConfig {

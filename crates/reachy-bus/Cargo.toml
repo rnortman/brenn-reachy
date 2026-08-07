@@ -16,6 +16,11 @@ dxl-proto = { path = "../dxl-proto" }
 reachy-motion = { path = "../reachy-motion" }
 # The serial port itself, and the only external I/O dependency in the workspace.
 serialport = { workspace = true }
+# Three constants for the contention probe: O_NONBLOCK and O_NOCTTY for the
+# descriptor it opens, and EBUSY to recognize the refusal an exclusive holder
+# leaves behind. Constants only: this crate forbids unsafe code and calls
+# nothing in libc.
+libc = { workspace = true }
 # The transaction error taxonomy, which is the load-bearing part of this crate: a
 # timeout and a corrupt frame are separate variants because they demand opposite
 # retry policies.

@@ -37,6 +37,10 @@
 //!   none of them aborts the call.
 //! - **Errors are never flattened to a boolean.** "Did not answer" and "answered
 //!   with an error number" are different diagnoses and reach the caller as such.
+//! - **The device is opened exclusively.** An advisory lock on the node, taken
+//!   without waiting; a second opener is refused by name. One half-duplex line
+//!   carries one speaker, and two hosts sharing it corrupt each other's replies
+//!   rather than taking turns.
 //!
 //! Writes to the servos' non-volatile registers are refused outright. A servo
 //! silently ignores such a write while its torque is on, and a write that is
@@ -54,4 +58,4 @@ pub mod port;
 pub use bus::{Bus, BusCounters, BusTiming, MAX_SYNC_IDS, PingInfo, RawValue, with_retry};
 pub use error::{IdOutcome, SyncReadOutcome, XactError};
 pub use map::{MapError, ServoMap, reg_for, value_kind};
-pub use port::{BusPort, DEFAULT_BAUD, SerialBusPort};
+pub use port::{BusPort, DEFAULT_BAUD, OpenError, SerialBusPort};
