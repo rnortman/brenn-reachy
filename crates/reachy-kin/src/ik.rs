@@ -82,7 +82,14 @@ impl LegSolve {
 }
 
 /// Normalise an angle into `(−π, π]`.
-fn normalize(angle: f64) -> f64 {
+///
+/// The one piece of circular arithmetic in this workspace: the leg solve folds
+/// its crank angle here, and the motion layer resolves an antenna direction and
+/// measures an antenna's distance from stow with it. One definition, so a
+/// difference taken in one place and a bound applied in another cannot disagree
+/// about where the half turn is.
+#[must_use]
+pub fn wrap_to_pi(angle: f64) -> f64 {
     let wrapped = angle.rem_euclid(core::f64::consts::TAU);
     if wrapped > core::f64::consts::PI {
         wrapped - core::f64::consts::TAU
@@ -142,7 +149,9 @@ pub(crate) fn solve_leg(
         // |ratio| ≤ 1 by the strict test above, so acos never sees an argument
         // outside its domain and never returns NaN.
         let ratio = c / d;
-        Some(normalize(q.y.atan2(q.x) + l.branch.as_f64() * ratio.acos()))
+        Some(wrap_to_pi(
+            q.y.atan2(q.x) + l.branch.as_f64() * ratio.acos(),
+        ))
     } else {
         None
     };
@@ -795,11 +804,11 @@ mod tests {
 
     #[test]
     fn angles_normalise_into_the_half_open_turn() {
-        assert!((normalize(core::f64::consts::PI) - core::f64::consts::PI).abs() < 1e-15);
-        assert!((normalize(-core::f64::consts::PI) - core::f64::consts::PI).abs() < 1e-15);
-        assert!(normalize(0.0).abs() < 1e-15);
+        assert!((wrap_to_pi(core::f64::consts::PI) - core::f64::consts::PI).abs() < 1e-15);
+        assert!((wrap_to_pi(-core::f64::consts::PI) - core::f64::consts::PI).abs() < 1e-15);
+        assert!(wrap_to_pi(0.0).abs() < 1e-15);
         assert!(
-            (normalize(3.0 * core::f64::consts::FRAC_PI_2) + core::f64::consts::FRAC_PI_2).abs()
+            (wrap_to_pi(3.0 * core::f64::consts::FRAC_PI_2) + core::f64::consts::FRAC_PI_2).abs()
                 < 1e-15
         );
     }

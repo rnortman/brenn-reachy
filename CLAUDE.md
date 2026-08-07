@@ -9,7 +9,8 @@ binding on every change in this repo.
 
 - **Every command path runs the envelope check first.** Reachability, per-leg
   travel windows, per-pose clearance from the linkage's singular configurations,
-  yaw caps, antenna range.
+  yaw caps, antenna representability (finite, within the extended-position
+  range).
 - **A violation is a typed error.** Never a clamp, never saturation, never a
   non-finite number handed onward. If you find yourself reaching for
   `clamp`/`min`/`max` on a commanded value, stop.

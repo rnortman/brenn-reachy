@@ -61,8 +61,9 @@ pub const BAUD_RATE: Reg = Reg::new(8, 1);
 pub const RETURN_DELAY_TIME: Reg = Reg::new(9, 1);
 /// Direction and profile configuration bits.
 pub const DRIVE_MODE: Reg = Reg::new(10, 1);
-/// Control mode. 3 is position control, which is the only mode this project
-/// uses; anything else voids the servo-side position envelope.
+/// Control mode. 3 is single-turn position control (the servo enforces a
+/// travel window); 4 is extended position (no window, continuous counting).
+/// Anything else voids the servo-side position envelope.
 pub const OPERATING_MODE: Reg = Reg::new(11, 1);
 /// Offset added to the raw encoder position, in counts.
 pub const HOMING_OFFSET: Reg = Reg::new(20, 4);
@@ -125,8 +126,9 @@ pub const GOAL_POSITION: Reg = Reg::new(116, 4);
 /// Measured current, in raw register units.
 pub const PRESENT_CURRENT: Reg = Reg::new(126, 2);
 /// Measured position, in counts. Multi-turn while torque is off; reset into a
-/// single turn when torque is enabled in position mode, when the operating mode
-/// is changed to position mode, and at power-on or reboot.
+/// single turn when torque is enabled in single-turn position mode, when the
+/// operating mode is changed to it, and at power-on or reboot. In extended
+/// position mode the reading stays continuous across those transitions.
 pub const PRESENT_POSITION: Reg = Reg::new(132, 4);
 /// Measured supply voltage, in 0.1 V units.
 pub const PRESENT_INPUT_VOLTAGE: Reg = Reg::new(144, 2);

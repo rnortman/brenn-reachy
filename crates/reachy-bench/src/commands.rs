@@ -17,6 +17,10 @@
 //! somewhere else is refused unless the operator has accepted that the head
 //! will fall.
 //!
+//! `provision` is the other exception: it writes a non-volatile register on a
+//! machine whose torque is off and moves nothing, so arming it first would be
+//! the one thing that stops the write from being accepted.
+//!
 //! Ports are the caller's: every command here takes one already open, so the
 //! whole surface is exercisable against a scripted machine with no device in
 //! sight. What a command prints goes out through a callback for the same
@@ -24,11 +28,12 @@
 
 use core::time::Duration;
 
-use reachy_bus::{Bus, BusPort};
+use reachy_bus::{Bus, BusPort, BusTiming, MapError, ServoMap, reg_for, value_kind, with_retry};
 use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
-    ArmSequencer, DisarmSequencer, DisarmSummary, JointTargets, MotionCommand, MotionState, Warp,
+    ArmSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
+    JointId, JointTargets, MotionCommand, MotionState, RegId, RegValue, ValueKind, Warp,
 };
 
 use crate::config::Resolved;
@@ -52,10 +57,14 @@ const WARP: Warp = Warp::MinJerk;
 /// every run a boundary test of the envelope.
 const DEMO_YAW_DEG: f64 = 30.0;
 
+/// The joints `provision` writes: the two antennas, whose extended-position
+/// mode is this project's own provisioning rather than the vendor's.
+const PROVISIONED_JOINTS: [JointId; 2] = [JointId::AntennaRight, JointId::AntennaLeft];
+
 /// How far the demo swings the antennas, radians either side of upright.
 ///
-/// A visible motion that stays far from the antenna bound, for the same reason
-/// the yaw sweep stays inside the yaw cap.
+/// A visible motion rather than a big one: the antennas turn freely and a whole
+/// swing would read as a spin rather than as a gesture.
 const DEMO_ANTENNA_RAD: f64 = 1.0;
 
 /// The neutral configuration: head square and level at nominal height, body
@@ -169,15 +178,32 @@ impl<'a, P: BusPort> Session<'a, P> {
             duration,
             warp: WARP,
         };
-        let summary = self.pump.run(
+        let outcome = self.pump.run(
             &mut self.bus,
             &mut self.state,
             command,
             clock,
             &mut |event| line(&format!("  {event}")),
-        )?;
+        );
+        self.report(line);
+        outcome
+    }
+
+    /// What the run measured, printed whether or not it got where it was going.
+    ///
+    /// Printed on the count of periods rather than on the kind of ending: a
+    /// fault, a stall and a lost wire all reach the end of the run having
+    /// measured what the loop cost and what the servos were doing, and those
+    /// are the runs whose numbers are worth the most. A command refused on the
+    /// period that accepted it measured none of that, and its zeros would read
+    /// as a clean run of nothing, so nothing is printed for it.
+    fn report(&self, line: &mut dyn FnMut(&str)) {
+        let summary = self.pump.last_summary();
+        if summary.ticks == 0 {
+            return;
+        }
         line(&move_line(&summary));
-        Ok(summary)
+        line(&lag_line(&summary));
     }
 
     /// Watch the machine hold for `duration`, commanding nothing.
@@ -191,7 +217,7 @@ impl<'a, P: BusPort> Session<'a, P> {
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<MoveSummary, PumpError> {
-        let summary = self.pump.hold(
+        let outcome = self.pump.hold(
             &mut self.bus,
             &mut self.state,
             duration,
@@ -204,9 +230,9 @@ impl<'a, P: BusPort> Session<'a, P> {
                     line(&format!("  {event}"));
                 }
             },
-        )?;
-        line(&move_line(&summary));
-        Ok(summary)
+        );
+        self.report(line);
+        outcome
     }
 
     /// Release torque, having verified the machine is at stow, and end the
@@ -274,6 +300,20 @@ fn move_line(summary: &MoveSummary) -> String {
         jitter = summary.worst_jitter.as_secs_f64() * 1e3,
         elapsed = summary.elapsed.as_secs_f64(),
     )
+}
+
+/// How far each joint ran behind its goal at worst, in bus order.
+///
+/// The measurement the tracking threshold, its window and the stow tolerance
+/// have all been provisional against. Degrees, like arming's droop and pull-in
+/// lines, so the nine numbers a run brings back are read on one scale.
+fn lag_line(summary: &MoveSummary) -> String {
+    let lags: Vec<String> = summary
+        .worst_lag
+        .iter()
+        .map(|rad| format!("{:.3}", rad.to_degrees()))
+        .collect();
+    format!("  worst lag [{}] deg", lags.join(", "))
 }
 
 /// Where the machine was when torque came off.
@@ -350,9 +390,111 @@ pub fn off<P: BusPort>(
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
     let mut bus = Bus::new(port, resolved.timing);
-    line("off: verifying the machine is at stow, settling, then releasing torque");
+    line("off: settling, verifying the machine is at stow, then releasing torque");
     release(resolved, &mut bus, force_drop, clock, line)?;
     Ok(())
+}
+
+/// Write the antennas' operating mode, and nothing else.
+///
+/// The one register this project provisions itself. It is non-volatile, so it
+/// survives a power cycle and is written once per unit rather than per session;
+/// the self-test's provisioning sweep checks it on every run thereafter and
+/// refuses a machine that does not hold it.
+///
+/// No arming and no motion: the bus is bare, as `off`'s is, and torque must
+/// already be off — the guarded write path reads Torque Enable itself and
+/// refuses otherwise. Presence, identity and torque are established on both
+/// servos before either is written, so a refusal on the second one leaves the
+/// first unwritten too.
+pub fn provision<P: BusPort>(
+    map: &ServoMap,
+    timing: BusTiming,
+    port: P,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
+    let mut bus = Bus::new(port, timing);
+    let mut found = Vec::new();
+
+    for joint in PROVISIONED_JOINTS {
+        let row = joint.index().expect("a named joint has a bus row");
+        let id = map.ids()[row];
+        let info = with_retry(&mut bus, |bus| bus.ping(id))
+            .map_err(|source| PumpError::Bus { id, source })?;
+        let expected = EXPECTED_MODELS[row];
+        if info.model != expected {
+            return Err(PumpError::WrongPart {
+                id,
+                model: info.model,
+                expected,
+            });
+        }
+        if read_byte(&mut bus, map, row, RegId::TorqueEnable)? != 0 {
+            return Err(PumpError::TorqueHeld { id });
+        }
+        let mode = read_byte(&mut bus, map, row, RegId::OperatingMode)?;
+        line(&format!(
+            "  {joint}: servo {id}, model {model}, torque off, operating mode {mode}",
+            model = info.model
+        ));
+        found.push((row, id, mode));
+    }
+
+    for (row, id, mode) in found {
+        let wanted = EXPECTED_OPERATING_MODES[row];
+        if mode == wanted {
+            line(&format!(
+                "  servo {id} already holds operating mode {wanted}; nothing written"
+            ));
+            continue;
+        }
+        let raw = map
+            .encode_value(row, RegId::OperatingMode, RegValue::U8(wanted))
+            .map_err(|source| PumpError::Map {
+                id,
+                reg: RegId::OperatingMode,
+                source,
+            })?;
+        let entry = reg_for(RegId::OperatingMode);
+        with_retry(&mut bus, |bus| bus.write_eeprom_verified(id, entry, &raw))
+            .map_err(|source| PumpError::Bus { id, source })?;
+        line(&format!(
+            "  servo {id} operating mode {mode} -> {wanted}, read back and verified"
+        ));
+    }
+
+    line("provisioned; run `reachy-bench selftest` before arming.");
+    Ok(())
+}
+
+/// One servo's one-byte register, with retry.
+///
+/// The width the answer must have is the map's to know, not this function's.
+fn read_byte<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+    reg: RegId,
+) -> Result<u8, PumpError> {
+    let id = map.ids()[row];
+    let entry = reg_for(reg);
+    let raw = with_retry(bus, |bus| bus.read_reg(id, entry))
+        .map_err(|source| PumpError::Bus { id, source })?;
+    let value = map
+        .decode_value(row, reg, &raw)
+        .map_err(|source| PumpError::Map { id, reg, source })?;
+    match value {
+        RegValue::U8(byte) => Ok(byte),
+        _ => Err(PumpError::Map {
+            id,
+            reg,
+            source: MapError::WrongShape {
+                reg,
+                expected: ValueKind::U8,
+                observed: value_kind(reg),
+            },
+        }),
+    }
 }
 
 /// Rotate the body to `degrees`, leaving the head where it is relative to it.
@@ -448,9 +590,11 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use reachy_bus::reg_for;
-    use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics};
-    use reachy_motion::{JointGroup, JointId, JointVector, RegId, SeqError};
+    use dxl_proto::frame::INST_WRITE;
+    use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
+    use reachy_motion::{
+        ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, JointGroup, JointVector, SeqError,
+    };
 
     use super::*;
     use crate::testutil::{
@@ -465,11 +609,13 @@ mod tests {
         angles.0
     }
 
-    /// What a command left behind: the registers, the servos each grouped write
-    /// carried, every grouped write in full, and every line it printed.
+    /// What a command left behind: the registers, every instruction that
+    /// crossed the wire, the servos each grouped write carried, every grouped
+    /// write in full, and every line it printed.
     struct Run {
         outcome: Result<(), PumpError>,
         registers: Rc<RefCell<FakeMachine>>,
+        log: Rc<RefCell<Vec<(u8, u8)>>>,
         addressed: Rc<RefCell<Vec<Vec<u8>>>>,
         commanded: Rc<RefCell<Vec<GroupedWrite>>>,
         printed: Vec<String>,
@@ -553,6 +699,7 @@ mod tests {
     {
         let spy = Spy::new(machine);
         let registers = spy.machine();
+        let log = spy.log();
         let addressed = spy.addressed();
         let commanded = spy.commanded();
         let mut clock = TestClock::default();
@@ -561,6 +708,7 @@ mod tests {
         Run {
             outcome,
             registers,
+            log,
             addressed,
             commanded,
             printed,
@@ -708,6 +856,104 @@ mod tests {
         assert_eq!(torque(&cfg, &run), vec![1; JointId::COUNT]);
     }
 
+    /// The line a run prints of what each period measured, or nothing if it
+    /// never printed one.
+    fn line_starting(run: &Run, what: &str) -> Option<String> {
+        run.printed
+            .iter()
+            .find(|line| line.trim_start().starts_with(what))
+            .cloned()
+    }
+
+    /// The nine figures a run's worst-lag line carries, degrees.
+    fn lag_figures(run: &Run) -> Vec<f64> {
+        let line = line_starting(run, "worst lag").expect("a run reports its per-joint lag");
+        let inside = line
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .expect("the lag line is a bracketed row")
+            .0;
+        inside
+            .split(", ")
+            .map(|figure| figure.parse().expect("a lag figure is a number"))
+            .collect()
+    }
+
+    /// A faulted move still says what it cost and what it measured.
+    ///
+    /// The fault is the final word and the command still fails, but the period
+    /// counts and the per-joint lag are the numbers a bench run exists to bring
+    /// back — and a fault is when they are worth the most, because it is the run
+    /// nobody can explain without them.
+    #[test]
+    fn a_faulted_move_still_reports_what_it_measured() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        // A leg, because a lift moves the legs: the body and the antennas are
+        // already where neutral wants them and are never commanded.
+        let stuck = cfg.map.ids()[2];
+        machine.stalled.push(stuck);
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+
+        let error = run.err("a servo that takes its goals and does not move");
+        assert!(matches!(error, PumpError::Fault(_)), "{error}");
+
+        let summary = run
+            .printed
+            .iter()
+            .find(|line| line.contains("period(s)"))
+            .expect("the faulted run reports its periods");
+        assert!(
+            summary.contains("blind") && summary.contains("worst jitter"),
+            "{summary}"
+        );
+
+        let lags = lag_figures(&run);
+        assert_eq!(lags.len(), JointId::COUNT);
+        let threshold = cfg.motion.tracking.threshold_rad.to_degrees();
+        assert!(
+            lags[2] > threshold,
+            "the stalled leg ran past the threshold: {lags:?}"
+        );
+        // Everything else tracked its goal to the count: a servo holds whole
+        // counts and the goal it is compared against is the interpolant's
+        // float, so half a count is the floor a perfect machine reports.
+        let half_count = 180.0 / 4096.0;
+        for (row, lag) in lags.iter().enumerate() {
+            if row != 2 {
+                assert!(*lag <= half_count, "row {row} tracked its goal: {lags:?}");
+            }
+        }
+    }
+
+    /// A machine chasing its goals reports the lag it ran, and is not faulted
+    /// for it.
+    ///
+    /// The threshold, its window and the stow tolerance are all provisional
+    /// against a lag nobody has measured; this is the measurement, and it is
+    /// taken on every move rather than on a run someone remembered to instrument.
+    #[test]
+    fn a_chasing_machine_reports_the_lag_it_ran() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        for id in cfg.map.ids() {
+            machine.delay.insert(id, 3);
+        }
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+        run.ok("a joint closing on its goal is not a joint that lost it");
+
+        let lags = lag_figures(&run);
+        // The six legs are what a lift moves; the body and the antennas are
+        // already at neutral and are never commanded, so they never run behind.
+        for row in 1..=6 {
+            assert!(
+                lags[row] > 0.0,
+                "leg row {row} moved, so it ran behind: {lags:?}"
+            );
+        }
+        assert_eq!([lags[0], lags[7], lags[8]], [0.0; 3], "{lags:?}");
+    }
+
     /// `stow` puts the machine at the pose disarming verifies, and leaves
     /// torque on: the release is a separate, explicit command.
     #[test]
@@ -761,6 +1007,142 @@ mod tests {
         // ready for, and these two are what say it did not happen.
         run.armed_nothing();
         run.commanded_nothing(&cfg);
+    }
+
+    /// A machine physically folded, whose antennas read a turn away from the
+    /// fold, releases: the whole path — counts past one turn decoded by the map,
+    /// the circular deviation, the gate — carries the frame extended position
+    /// mode leaves an antenna in.
+    ///
+    /// A limp antenna on this unit rests past the half turn, and nothing
+    /// renormalises it.
+    #[test]
+    fn off_releases_a_machine_whose_antennas_read_a_turn_from_their_fold() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &cfg.disarm.stow_targets.legs);
+        // The right antenna a turn below its fold, the left a turn above it:
+        // both physically at stow, neither within a turn of it in the reading.
+        let turns = [-core::f64::consts::TAU, core::f64::consts::TAU];
+        for (row, id) in cfg.map.ids().iter().enumerate() {
+            let joint = JointId::ALL[row];
+            let mut angle = cfg.disarm.stow_targets.get(joint).expect("nine joints");
+            if let Some(side) = [JointId::AntennaRight, JointId::AntennaLeft]
+                .iter()
+                .position(|antenna| *antenna == joint)
+            {
+                angle += turns[side];
+            }
+            let counts = cfg
+                .map
+                .goal_counts(row, angle)
+                .expect("a stow angle a turn out still places");
+            machine.set(*id, reg_for(RegId::PresentPosition), &counts.to_le_bytes());
+            machine.set(*id, reg_for(RegId::TorqueEnable), &[1]);
+        }
+
+        let run = run(machine, |port, clock, line| {
+            off(&cfg, port, false, clock, line)
+        });
+        run.ok("a machine at its fold is at stow whichever turn it reads");
+        assert_eq!(torque(&cfg, &run), vec![0; JointId::COUNT]);
+        assert!(
+            run.printed.iter().any(|line| line.contains("at stow")),
+            "{:?}",
+            run.printed
+        );
+        run.armed_nothing();
+        run.commanded_nothing(&cfg);
+    }
+
+    /// The bound the motion layer refuses an antenna goal on is a count bound,
+    /// and this is the one place the two layers that hold it meet: the tick
+    /// works in radians and the map is what turns a radian into the count the
+    /// goal register takes.
+    ///
+    /// Each end is exactly the last count extended position mode accepts —
+    /// asymmetric, because zero radians sits at count 2048 — and a radian past
+    /// either end is a count the register would refuse.
+    #[test]
+    fn the_antenna_goal_bounds_are_the_last_counts_the_register_holds() {
+        const REGISTER_LIMIT: i32 = 1_048_575;
+        let cfg = resolved();
+        let ends = [
+            (7usize, ANTENNA_GOAL_MAX_RAD, REGISTER_LIMIT, 1.0),
+            (8, ANTENNA_GOAL_MIN_RAD, -REGISTER_LIMIT, -1.0),
+        ];
+        for (row, edge, limit, past) in ends {
+            assert_eq!(
+                cfg.map.goal_counts(row, edge).expect("the bound places"),
+                limit
+            );
+            let over = cfg
+                .map
+                .goal_counts(row, edge + past)
+                .expect("a count outside the register's range is still an i32");
+            assert!(
+                over.abs() > REGISTER_LIMIT,
+                "a radian past the bound is {over} counts"
+            );
+        }
+    }
+
+    /// An antenna found several turns from zero keeps that frame: it pins where
+    /// it stands, and the direction it is then commanded to resolves into the
+    /// turn it was found in rather than folding back into the first one.
+    ///
+    /// The motion layer decides this in radians; what only the map and a
+    /// register file can show is that the counts written are past one turn and
+    /// the sweep commanded is still the short way round.
+    #[test]
+    fn an_antenna_found_turns_from_zero_is_commanded_in_the_turn_it_was_found_in() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &neutral_legs());
+        // Three turns and 38 counts past the count frame's own zero: a limp
+        // antenna in extended position mode reads where it physically is.
+        let found_counts: i32 = 3 * 4096 + 38;
+        machine.set(
+            cfg.map.ids()[7],
+            reg_for(RegId::PresentPosition),
+            &found_counts.to_le_bytes(),
+        );
+        let found = cfg
+            .map
+            .present_rad(7, found_counts)
+            .expect("a multi-turn reading places");
+
+        let run = run(machine, |port, clock, line| {
+            antennas(&cfg, port, 0.5, -0.5, clock, line)
+        });
+        run.ok("an antenna a few turns out still moves");
+
+        let resolved_goal = found + wrap_to_pi(0.5 - found);
+        assert!(
+            (resolved_goal - found).abs() <= core::f64::consts::PI,
+            "the commanded sweep is the short way: {}",
+            resolved_goal - found
+        );
+        assert!(
+            run.commanded_angle(&cfg, JointId::AntennaRight, resolved_goal),
+            "the goal that went out is the direction resolved into the found turn: {:?}",
+            run.goal_series(&cfg, JointId::AntennaRight).last()
+        );
+
+        // And in counts, which is where a fold back into the first turn would
+        // show: every goal written stays in the turn the antenna was found in.
+        let goal = run
+            .registers
+            .borrow()
+            .get(cfg.map.ids()[7], reg_for(RegId::GoalPosition))
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("a goal is four bytes")))
+            .expect("the right antenna was given a goal");
+        assert!(
+            goal > 2 * 4096,
+            "a goal folded into one turn would read {goal}"
+        );
+        assert!(
+            (goal - found_counts).abs() <= 2048,
+            "and it is half a turn at most from where the antenna was found: {goal}"
+        );
     }
 
     /// A machine anywhere but stow is refused, with nothing released — and the
@@ -921,6 +1303,14 @@ mod tests {
             "a refused command writes no goals"
         );
         assert_eq!(torque(&cfg, &run), vec![1; JointId::COUNT]);
+
+        // A refusal on the accepting period measured nothing, so it reports
+        // nothing: a period line and a lag row of zeros would read as a clean
+        // run of nothing at the moment an operator is diagnosing the refusal.
+        assert_eq!(line_starting(&run, "worst lag"), None, "{:?}", run.printed);
+        for line in &run.printed {
+            assert!(!line.contains("period(s)"), "{line}");
+        }
     }
 
     /// `antennas` moves the antennas and addresses nothing else: the legs' and
@@ -963,20 +1353,164 @@ mod tests {
         assert!(frames.len() > 1, "{frames:?}");
     }
 
-    /// An antenna past its bound is refused, on the same verdict path a leg or
-    /// the body would be.
+    /// An antenna direction past the half turn is an ordinary command: it
+    /// resolves to the representative nearest the frame the machine is in and
+    /// sweeps the short way there. Four radians, from a machine found at zero,
+    /// is 2.283 rad of travel the other way — not four the long way, and not a
+    /// refusal.
     #[test]
-    fn an_antenna_past_its_bound_is_refused() {
+    fn an_antenna_direction_past_the_half_turn_takes_the_short_way() {
         let cfg = resolved();
         let machine = machine_at(&datumed_config(), &neutral_legs());
         let run = run(machine, |port, clock, line| {
             antennas(&cfg, port, 4.0, 0.0, clock, line)
         });
+        run.ok("a direction past the half turn is still a direction");
 
-        let error = run.err("four radians is past the bound");
-        assert!(matches!(error, PumpError::Rejected(_)), "{error}");
-        assert!(error.to_string().contains("antenna"), "{error}");
-        assert!(run.addressed.borrow().is_empty());
+        let series = run.goal_series(&cfg, JointId::AntennaRight);
+        assert!(!series.is_empty(), "the antenna was commanded");
+        assert!(
+            series.iter().all(|goal| *goal <= 1e-9),
+            "the sweep went down through the near side: {series:?}"
+        );
+        let landed = *series.last().expect("a last goal");
+        let short_way = 4.0 - core::f64::consts::TAU;
+        assert!(
+            (landed - short_way).abs() < 0.01,
+            "landed at {landed}, asked for {short_way}"
+        );
+    }
+
+    /// A machine as the vendor provisions it: every servo in single-turn
+    /// position mode, torque off.
+    fn unprovisioned(cfg: &Resolved) -> FakeMachine {
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        for id in [cfg.map.ids()[7], cfg.map.ids()[8]] {
+            machine.set(id, reg_for(RegId::OperatingMode), &[3]);
+        }
+        machine
+    }
+
+    /// What each servo's Operating Mode register holds after a run.
+    fn modes(cfg: &Resolved, run: &Run) -> Vec<u8> {
+        let machine = run.registers.borrow();
+        cfg.map
+            .ids()
+            .iter()
+            .map(|id| {
+                machine
+                    .get(*id, reg_for(RegId::OperatingMode))
+                    .map_or(0, |bytes| bytes[0])
+            })
+            .collect()
+    }
+
+    /// `provision` writes the two antennas into extended position mode and
+    /// touches nothing else — no goals, no torque, no arm sequence.
+    #[test]
+    fn provision_writes_the_antennas_into_extended_position_mode() {
+        let cfg = resolved();
+        let run = run(unprovisioned(&cfg), |port, _, line| {
+            provision(&cfg.map, cfg.timing, port, line)
+        });
+        run.ok("a machine with torque off takes the write");
+
+        assert_eq!(modes(&cfg, &run), vec![3, 3, 3, 3, 3, 3, 3, 4, 4]);
+        assert_eq!(
+            torque(&cfg, &run),
+            vec![0; JointId::COUNT],
+            "provisioning enables torque on nothing"
+        );
+        run.armed_nothing();
+        run.commanded_nothing(&cfg);
+        assert!(
+            run.printed.iter().any(|line| line.contains("3 -> 4")),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            run.printed.iter().any(|line| line.contains("selftest")),
+            "the run says what to do next: {:?}",
+            run.printed
+        );
+    }
+
+    /// A servo already in the mode is left alone: the command is idempotent, so
+    /// an operator can run it twice without a second non-volatile write.
+    #[test]
+    fn provision_writes_nothing_to_a_machine_already_in_the_mode() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let run = run(machine, |port, _, line| {
+            provision(&cfg.map, cfg.timing, port, line)
+        });
+        run.ok("a provisioned machine provisions to itself");
+
+        assert!(
+            !run.log
+                .borrow()
+                .iter()
+                .any(|(_, instruction)| *instruction == INST_WRITE),
+            "nothing was written: {:?}",
+            run.log.borrow()
+        );
+        assert_eq!(
+            run.printed
+                .iter()
+                .filter(|line| line.contains("already holds"))
+                .count(),
+            2,
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// A servo holding torque refuses the whole command, and the other antenna
+    /// is not written either: a servo ignores a non-volatile write under torque
+    /// and acknowledges it anyway, and half a provisioning is worse than none.
+    #[test]
+    fn provision_refuses_a_machine_holding_torque_with_nothing_written() {
+        let cfg = resolved();
+        let mut machine = unprovisioned(&cfg);
+        machine.set(cfg.map.ids()[8], reg_for(RegId::TorqueEnable), &[1]);
+        let run = run(machine, |port, _, line| {
+            provision(&cfg.map, cfg.timing, port, line)
+        });
+
+        let error = run.err("a torqued antenna is refused");
+        let PumpError::TorqueHeld { id } = error else {
+            panic!("expected a torque refusal, got {error}");
+        };
+        assert_eq!(*id, cfg.map.ids()[8]);
+        assert_eq!(
+            modes(&cfg, &run),
+            vec![3; JointId::COUNT],
+            "the first antenna was not written either"
+        );
+    }
+
+    /// A servo answering as another part is refused before anything is written:
+    /// whatever holds that ID is not the servo this project provisions.
+    #[test]
+    fn provision_refuses_a_servo_that_is_not_the_part_it_should_be() {
+        let cfg = resolved();
+        let mut machine = unprovisioned(&cfg);
+        machine.set(cfg.map.ids()[7], reg_for(RegId::ModelNumber), &[0xB0, 0x04]);
+        let run = run(machine, |port, _, line| {
+            provision(&cfg.map, cfg.timing, port, line)
+        });
+
+        let error = run.err("that is not an antenna servo");
+        let PumpError::WrongPart {
+            id,
+            model,
+            expected,
+        } = error
+        else {
+            panic!("expected an identity refusal, got {error}");
+        };
+        assert_eq!((*id, *model, *expected), (cfg.map.ids()[7], 1200, 1190));
+        assert_eq!(modes(&cfg, &run), vec![3; JointId::COUNT]);
     }
 
     /// Every command that moves re-drives the whole arm sequence first, so a

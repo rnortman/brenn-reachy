@@ -48,9 +48,9 @@ pub mod tick;
 pub mod traj;
 
 pub use arm::{
-    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, EXPECTED_MODELS, Gains, GroupGains, PinOutcome,
-    ProfileConfig, ProvisionExpect, ProvisionReadings, ProvisionTable, VENDOR_HOMING_OFFSETS,
-    pin_goals,
+    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
+    Gains, GroupGains, PinOutcome, ProfileConfig, ProvisionExpect, ProvisionReadings,
+    ProvisionTable, VENDOR_HOMING_OFFSETS, pin_goals,
 };
 pub use disarm::{DisarmConfig, DisarmSequencer, DisarmSummary, stow_targets};
 pub use joints::{JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth};
@@ -59,7 +59,8 @@ pub use seq::{
     Sequencer, StepContext, ValueKind,
 };
 pub use tick::{
-    CommandDisposition, CommandRejection, Fault, Mode, MotionCommand, MotionConfig, MotionState,
-    TickInputs, TickOutputs, TickReport, TrackingFaultConfig, motion_tick,
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, CommandRejection, Fault, Mode,
+    MotionCommand, MotionConfig, MotionState, TickInputs, TickOutputs, TickReport,
+    TrackingFaultConfig, motion_tick,
 };
 pub use traj::{Trajectory, TrajectoryError, Warp};

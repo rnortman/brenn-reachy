@@ -5,8 +5,18 @@
 //! every tick, emitted as bounded increments — because it is the one path where
 //! the head travels near the bottom of its range and the checks that matter
 //! there are the tick's. What is left over is what cannot be expressed as a
-//! trajectory: confirm the platform is measured where stow put it, let it
-//! settle, and release torque servo by servo with each release read back.
+//! trajectory: let the platform settle, confirm it is measured where stow put
+//! it, and release torque servo by servo with each release read back.
+//!
+//! ## The settle comes before the check
+//!
+//! A move is over when its trajectory ends, not when the joints arrive, so a
+//! joint still closing the lag a proportional loop runs is legitimately short
+//! of its fold at the moment `off` starts — and `demo` reaches here at exactly
+//! that moment. The dwell exists to let the machine settle; waiting it out
+//! first is what makes the measurement that follows a measurement of where the
+//! head came to rest. The cost is that a machine genuinely somewhere else
+//! learns of its refusal one dwell later, with torque still holding it.
 //!
 //! ## Nothing happens after the last release
 //!
@@ -28,7 +38,7 @@ use core::f64::consts::PI;
 use core::time::Duration;
 
 use reachy_kin::{
-    HeadGeometry, IkError, LegAngles, inverse_kinematics, outside_limit, stow_head_pose,
+    HeadGeometry, IkError, LegAngles, inverse_kinematics, outside_limit, stow_head_pose, wrap_to_pi,
 };
 
 use crate::arm::{angle_at, confirm_write};
@@ -97,7 +107,8 @@ pub struct DisarmConfig {
 pub struct DisarmSummary {
     /// The nine angles measured before torque came off.
     pub present: JointVector,
-    /// How far each joint was from its stow angle, in bus order, radians.
+    /// How far each joint was from its stow angle, in bus order, radians;
+    /// circular on the antennas, linear elsewhere.
     pub deviation: [f64; JointId::COUNT],
     /// Whether every joint was inside the tolerance. A summary reporting
     /// `false` exists only because the drop flag was set: torque was released
@@ -113,11 +124,28 @@ impl DisarmSummary {
     }
 }
 
+/// How far one joint is from its stow angle, radians, never negative.
+///
+/// Circular for the antennas and linear for everything else. An antenna is a
+/// free rotor whose reading is a direction in a continuous frame: a machine
+/// physically folded is at its fold whichever turn the reading sits on, and a
+/// linear difference there reports the turns rather than the distance — run 4's
+/// refusal put an antenna 231° from a fold it was 129° from. The legs and the
+/// body are bounded joints working far from the half turn, where the two agree
+/// and the linear form is the honest one: a leg reading a turn away from its
+/// target is a broken reading, not a joint at its target.
+fn deviation_from(joint: JointId, present: f64, target: f64) -> f64 {
+    match joint {
+        JointId::AntennaRight | JointId::AntennaLeft => wrap_to_pi(present - target).abs(),
+        _ => (present - target).abs(),
+    }
+}
+
 /// Which part of the sequence is running.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
-    Verify { cursor: usize },
     Dwell { waiting: bool },
+    Verify { cursor: usize },
     Release { cursor: usize },
     Complete,
     Failed(SeqError),
@@ -140,11 +168,11 @@ impl Phase {
 
 /// Disarming, as a state machine that touches no port.
 ///
-/// Three phases in a fixed order: every joint measured against the stow pose,
-/// the settle waited out, then torque released one servo at a time with each
-/// release read back. The order is the safety property — nothing is written
-/// until the platform is confirmed to be somewhere it can be left — and it lives
-/// here, testable against scripted replies.
+/// Three phases in a fixed order: the settle waited out, every joint then
+/// measured against the stow pose, then torque released one servo at a time with
+/// each release read back. The order is the safety property — nothing is written
+/// until the settled platform is confirmed to be somewhere it can be left — and
+/// it lives here, testable against scripted replies.
 pub struct DisarmSequencer {
     cfg: DisarmConfig,
     phase: Phase,
@@ -160,7 +188,7 @@ impl DisarmSequencer {
     pub fn new(cfg: &DisarmConfig) -> Self {
         Self {
             cfg: *cfg,
-            phase: Phase::Verify { cursor: 0 },
+            phase: Phase::Dwell { waiting: true },
             pending: None,
             present: JointVector::default(),
             deviation: [0.0; JointId::COUNT],
@@ -190,7 +218,6 @@ impl DisarmSequencer {
     /// The next action, the previous one having been absorbed.
     fn emit(&mut self, now: Duration) -> SeqAction<DisarmSummary> {
         let request = match self.phase {
-            Phase::Verify { cursor } => self.read(cursor, RegId::PresentPosition),
             Phase::Dwell { waiting } => {
                 // The settle is waited once, on entry. A configured dwell of
                 // zero is no dwell at all rather than a wait until now, which
@@ -203,9 +230,10 @@ impl DisarmSequencer {
                         until: now + self.cfg.dwell,
                     };
                 }
-                self.phase = Phase::Release { cursor: 0 };
-                self.release(0)
+                self.phase = Phase::Verify { cursor: 0 };
+                self.read(0, RegId::PresentPosition)
             }
+            Phase::Verify { cursor } => self.read(cursor, RegId::PresentPosition),
             Phase::Release { cursor } => self.release(cursor),
             Phase::Complete => {
                 return SeqAction::Done(DisarmSummary {
@@ -273,7 +301,8 @@ impl DisarmSequencer {
             });
         }
         self.present.set(joint, angle);
-        self.deviation[cursor] = (angle - angle_at(&self.cfg.stow_targets, cursor)).abs();
+        self.deviation[cursor] =
+            deviation_from(joint, angle, angle_at(&self.cfg.stow_targets, cursor));
         if cursor + 1 < JointId::COUNT {
             self.phase = Phase::Verify { cursor: cursor + 1 };
             return Ok(());
@@ -292,10 +321,11 @@ impl DisarmSequencer {
                 joint: JointId::ALL[row],
                 present: angle_at(&self.present, row),
                 target: angle_at(&self.cfg.stow_targets, row),
+                deviation: self.deviation[row],
                 tolerance: self.cfg.tolerance,
             });
         }
-        self.phase = Phase::Dwell { waiting: true };
+        self.phase = Phase::Release { cursor: 0 };
         Ok(())
     }
 }
@@ -358,6 +388,9 @@ mod tests {
         fail_read: Option<(u8, BusResult)>,
         log: Vec<(SeqStep, BusRequest)>,
         waits: Vec<(Duration, Duration)>,
+        /// How many transactions had run when each wait began, which is what
+        /// places the settle in the order rather than merely counting it.
+        waited_after: Vec<usize>,
     }
 
     /// A platform holding itself at stow, torque on.
@@ -370,6 +403,7 @@ mod tests {
             fail_read: None,
             log: Vec::new(),
             waits: Vec::new(),
+            waited_after: Vec::new(),
         }
     }
 
@@ -408,6 +442,7 @@ mod tests {
 
         fn waited(&mut self, now: Duration, until: Duration) {
             self.waits.push((now, until));
+            self.waited_after.push(self.log.len());
         }
     }
 
@@ -429,11 +464,11 @@ mod tests {
         crate::testutil::drive(&mut seq, machine)
     }
 
-    /// The order is the whole safety property: every joint is measured, the
-    /// settle is waited out, and only then does torque come off — servo by
+    /// The order is the whole safety property: the settle is waited out, every
+    /// joint is then measured, and only then does torque come off — servo by
     /// servo, in bus order, each release read back.
     #[test]
-    fn torque_comes_off_only_after_the_stow_check_and_the_dwell() {
+    fn the_dwell_precedes_the_stow_check_and_torque_comes_off_last() {
         let cfg = config();
         let mut machine = bus();
         let summary = drive(&cfg, &mut machine).expect("a machine at stow disarms");
@@ -456,6 +491,12 @@ mod tests {
         );
         assert_eq!(machine.torque, [false; JointId::COUNT]);
         assert_eq!(machine.waits.len(), 1, "the settle is waited exactly once");
+        assert_eq!(
+            machine.waited_after,
+            [0],
+            "the settle runs before anything is read: the gate judges the \
+             machine where it came to rest"
+        );
 
         assert!(summary.at_stow);
         assert_eq!(summary.present, cfg.stow_targets);
@@ -477,6 +518,7 @@ mod tests {
             joint,
             present,
             target,
+            deviation,
             tolerance,
         } = error
         else {
@@ -486,6 +528,8 @@ mod tests {
         assert_eq!(context.id, SERVO_IDS[3]);
         assert_eq!(context.step, SeqStep::VerifyAtStow);
         assert!((present - target).abs() > tolerance);
+        // A leg is judged along the line, so its two figures are the same one.
+        assert!((deviation - (present - target).abs()).abs() < 1e-12);
         assert!(
             error.to_string().contains("leg 3"),
             "the message names the crank the way the envelope does: {error}"
@@ -493,7 +537,11 @@ mod tests {
 
         assert!(machine.writes().is_empty(), "nothing was written");
         assert_eq!(machine.torque, [true; JointId::COUNT]);
-        assert!(machine.waits.is_empty(), "the settle was never entered");
+        assert_eq!(
+            machine.waits.len(),
+            1,
+            "the settle ran first, and the joint is still away from stow after it"
+        );
     }
 
     /// Every joint is measured before the verdict, so the one named is the one
@@ -540,6 +588,80 @@ mod tests {
         assert!(deviation > cfg.tolerance);
     }
 
+    /// An antenna is judged on where it physically points, not on which turn its
+    /// reading sits on. A machine whose right antenna is folded 23° short of its
+    /// −174.75° fold but reads it from the other side of the half turn, at
+    /// +162.25°, is 23° from stow — not the 337° a linear difference reports and
+    /// refuses on.
+    ///
+    /// Both antennas, and each read across the half turn from its own fold: a
+    /// reading on the same side of it needs no wrapping to come out right, and
+    /// `stow` folds the two symmetrically, so a rule reaching only one of them
+    /// would refuse every release of a machine whose other antenna was found a
+    /// turn out — with the operator holding the head up by hand.
+    #[test]
+    fn an_antenna_is_judged_around_the_circle() {
+        let stow = stow_targets(&HeadGeometry::default()).expect("stow is reachable");
+        let wide = DisarmConfig {
+            tolerance: 25.0_f64.to_radians(),
+            ..config()
+        };
+
+        let cases = [
+            (0usize, 7usize, 162.248_f64, JointId::AntennaRight),
+            (1, 8, -162.248, JointId::AntennaLeft),
+        ];
+        for (side, row, degrees, joint) in cases {
+            let mut machine = bus();
+            machine.present.antennas[side] = degrees.to_radians();
+
+            let summary = drive(&wide, &mut machine).expect("23° is inside a 25° gate");
+            assert!(summary.at_stow, "{joint}");
+            assert!(
+                (summary.deviation[row].to_degrees() - 23.0).abs() < 1e-3,
+                "the distance around the circle is {}°",
+                summary.deviation[row].to_degrees()
+            );
+            assert_eq!(machine.torque, [false; JointId::COUNT]);
+
+            // The same reading against the 2° gate is still refused, and by the
+            // circular figure: nothing here waives the check, it measures it.
+            let mut machine = bus();
+            machine.present.antennas[side] = degrees.to_radians();
+            let error = drive(&config(), &mut machine).expect_err("23° is past a 2° gate");
+            let SeqError::NotAtStow {
+                joint: refused,
+                deviation,
+                ..
+            } = error
+            else {
+                panic!("expected a stow refusal, got {error}");
+            };
+            assert_eq!(refused, joint);
+            assert!(
+                (deviation.to_degrees() - 23.0).abs() < 1e-3,
+                "the refusal reports the distance around the circle: {}°",
+                deviation.to_degrees()
+            );
+            assert!(
+                error.to_string().contains("23.000° apart"),
+                "and says so to the operator: {error}"
+            );
+        }
+
+        // A leg keeps the linear difference: it is a windowed joint working far
+        // from the half turn, and a reading a whole turn from its target is a
+        // broken reading rather than a leg at stow.
+        let mut machine = bus();
+        machine.present.legs[0] += core::f64::consts::TAU;
+        let error = drive(&wide, &mut machine).expect_err("a turn is not zero on a leg");
+        let SeqError::NotAtStow { joint, present, .. } = error else {
+            panic!("expected a stow refusal, got {error}");
+        };
+        assert_eq!(joint, JointId::Leg(0));
+        assert!((present - stow.legs[0] - core::f64::consts::TAU).abs() < 1e-12);
+    }
+
     /// A reading that is not an angle is refused whichever way the drop flag is
     /// set: the flag excuses a head away from stow, not a bus handing back
     /// numbers nothing can be decided from.
@@ -570,9 +692,10 @@ mod tests {
         }
     }
 
-    /// The settle is one wait of the configured length, between the last read
-    /// and the first release. A dwell of zero is no wait at all rather than a
-    /// deadline the driver has already passed.
+    /// The settle is one wait of the configured length, before the first read.
+    /// A dwell of zero is no wait at all rather than a deadline the driver has
+    /// already passed, and skipping it skips nothing else: the check and the
+    /// releases still run in order.
     #[test]
     fn the_dwell_is_waited_once_at_the_configured_length() {
         let cfg = config();
@@ -580,6 +703,7 @@ mod tests {
         drive(&cfg, &mut machine).expect("a machine at stow disarms");
         assert_eq!(machine.waits.len(), 1);
         let (from, until) = machine.waits[0];
+        assert_eq!(from, Duration::ZERO);
         assert_eq!(until - from, DEFAULT_STOW_DWELL);
 
         let brisk = DisarmConfig {
@@ -590,6 +714,7 @@ mod tests {
         drive(&brisk, &mut machine).expect("a machine at stow disarms");
         assert!(machine.waits.is_empty());
         assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(machine.log.len(), 2 * JointId::COUNT);
     }
 
     /// A release the servo refuses stops the sequence where it stood: the servos
@@ -642,10 +767,13 @@ mod tests {
     fn a_driver_that_brings_nothing_back_is_silence() {
         let cfg = config();
         let mut seq = DisarmSequencer::new(&cfg);
-        let first = seq.next(Duration::ZERO, None);
+        let SeqAction::Wait { until } = seq.next(Duration::ZERO, None) else {
+            panic!("the settle comes first");
+        };
+        let first = seq.next(until, None);
         assert!(matches!(first, SeqAction::Transact(_)));
 
-        let SeqAction::Fail(error) = seq.next(Duration::ZERO, None) else {
+        let SeqAction::Fail(error) = seq.next(until, None) else {
             panic!("expected a failure after an unanswered transaction");
         };
         assert!(matches!(error, SeqError::NoAnswer { .. }));
@@ -666,7 +794,6 @@ mod tests {
             &env,
             &stow_head_pose(),
             0.0,
-            STOW_ANTENNAS,
             None,
             &mut report,
         )

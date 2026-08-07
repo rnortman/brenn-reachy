@@ -201,6 +201,28 @@ pub enum PumpError {
         source: MapError,
     },
 
+    /// A servo about to be provisioned answered as a part this platform does
+    /// not carry. Whatever holds that ID is not the servo whose non-volatile
+    /// registers this project writes.
+    #[error("servo {id} reports model {model}, where this platform's is {expected}")]
+    WrongPart {
+        /// The servo addressed.
+        id: u8,
+        /// The model it answered with.
+        model: u16,
+        /// The model this platform carries at that position.
+        expected: u16,
+    },
+
+    /// A servo was holding torque where a non-volatile write requires it
+    /// released. Refused across the whole roster before anything is written, so
+    /// a half-provisioned machine is not a state this leaves behind.
+    #[error("servo {id} is holding torque; release it with `off` before provisioning")]
+    TorqueHeld {
+        /// The servo addressed.
+        id: u8,
+    },
+
     /// The sequence addressed a servo the configured roster does not carry.
     /// A wiring mistake between the configuration and the sequencer, caught
     /// before a frame goes out to whatever holds that ID.
@@ -398,11 +420,6 @@ pub fn arm_report(summary: &ArmSummary) -> String {
         "pull-in    legs [{}] deg, worst {:.3} deg\n",
         pulls.join(", "),
         summary.worst_pull_in().to_degrees()
-    ));
-    out.push_str(&format!(
-        "pull-in    antennas [{:.3}, {:.3}] deg, ungated\n",
-        summary.antenna_pull_in[0].to_degrees(),
-        summary.antenna_pull_in[1].to_degrees()
     ));
     // Two measurements rather than verdicts: nothing acts on either, and both
     // are quantities this project has so far only guessed at.
@@ -638,7 +655,10 @@ impl fmt::Display for TickEvent {
 }
 
 /// What a move cost, once it is over.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Filled whichever way the run ended. A faulted move is the one whose numbers
+/// are worth the most, so nothing in here waits on a clean exit to exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MoveSummary {
     /// Control periods run.
     pub ticks: u64,
@@ -661,6 +681,13 @@ pub struct MoveSummary {
     /// scale a loop's wake latency runs at, which is what says whether the
     /// overrun tolerance is the right size on a given host.
     pub worst_jitter: Duration,
+    /// The furthest each joint was measured behind the goal it had been
+    /// written, in bus order, radians, over every period with a live read.
+    ///
+    /// A measurement and not a verdict: what a proportional loop runs behind a
+    /// moving goal is the quantity the tracking threshold, the window and the
+    /// stow tolerance have all been guessed against, and every move produces it.
+    pub worst_lag: [f64; JointId::COUNT],
     /// Wall time from the first period to the last.
     pub elapsed: Duration,
 }
@@ -695,6 +722,7 @@ pub struct MotionPump<'a> {
     outputs: TickOutputs,
     present: SyncReadOutcome,
     health: SyncReadOutcome,
+    summary: MoveSummary,
 }
 
 impl<'a> MotionPump<'a> {
@@ -729,6 +757,7 @@ impl<'a> MotionPump<'a> {
             outputs: TickOutputs::default(),
             present: SyncReadOutcome::new(),
             health: SyncReadOutcome::new(),
+            summary: MoveSummary::default(),
         })
     }
 
@@ -736,6 +765,18 @@ impl<'a> MotionPump<'a> {
     #[must_use]
     pub fn period(&self) -> Duration {
         self.period
+    }
+
+    /// What the last run measured, whether it reached its endpoint, faulted, or
+    /// ran out of periods.
+    ///
+    /// The counts and the per-joint lag are the point of running a move on
+    /// hardware at all, and a faulted run is where they matter most, so they are
+    /// kept here rather than only handed back on the success path. Zeroed at the
+    /// start of every run: this is never the previous move's record.
+    #[must_use]
+    pub fn last_summary(&self) -> MoveSummary {
+        self.summary
     }
 
     /// How many periods `command` may take before the loop calls it stuck: the
@@ -824,11 +865,18 @@ impl<'a> MotionPump<'a> {
         let epoch = clock.now();
         let mut due = epoch;
         let mut pending = Some(command);
+        // The run's own record, and never the last run's: a caller reading it
+        // after a command refused on the accepting period — which ends the run
+        // before any of it was measured — gets zeros.
+        self.summary = MoveSummary::default();
         let mut summary = MoveSummary::default();
         let mut last_misses = 0;
         let mut health_misses: u32 = 0;
         let mut reported_health: Option<[ServoHealth; JointId::COUNT]> = None;
         let mut overrun_reported = false;
+        // How the loop ended, filled by the one period that ends it. Still
+        // `None` when the periods run out, which is the stall.
+        let mut ending: Option<Result<(), PumpError>> = None;
 
         for tick in 0..budget {
             let now = clock.now();
@@ -846,31 +894,45 @@ impl<'a> MotionPump<'a> {
                 }
             }
 
-            let present = self.read_present(bus)?;
-            let health = if tick % self.health_every == 0 {
-                match self.read_health(bus)? {
-                    Some(servos) => {
-                        if health_misses > 0 {
-                            event(TickEvent::HealthRestored {
-                                after: health_misses,
-                            });
-                            health_misses = 0;
-                        }
-                        Some(servos)
-                    }
-                    None => {
-                        health_misses += 1;
-                        summary.health_misses += 1;
-                        if health_misses == 1 {
-                            event(TickEvent::HealthLost {
-                                failed: ReadFailures::of(&self.health),
-                            });
-                        }
-                        None
+            let present = match self.read_present(bus) {
+                Ok(present) => present,
+                Err(error) => {
+                    ending = Some(Err(error));
+                    break;
+                }
+            };
+            let polled = if tick % self.health_every == 0 {
+                match self.read_health(bus) {
+                    Ok(servos) => Some(servos),
+                    Err(error) => {
+                        ending = Some(Err(error));
+                        break;
                     }
                 }
             } else {
                 None
+            };
+            let health = match polled {
+                Some(Some(servos)) => {
+                    if health_misses > 0 {
+                        event(TickEvent::HealthRestored {
+                            after: health_misses,
+                        });
+                        health_misses = 0;
+                    }
+                    Some(servos)
+                }
+                Some(None) => {
+                    health_misses += 1;
+                    summary.health_misses += 1;
+                    if health_misses == 1 {
+                        event(TickEvent::HealthLost {
+                            failed: ReadFailures::of(&self.health),
+                        });
+                    }
+                    None
+                }
+                None => None,
             };
 
             let inputs = TickInputs {
@@ -884,11 +946,22 @@ impl<'a> MotionPump<'a> {
             summary.ticks += 1;
 
             if let Some(goal) = self.outputs.goal {
-                summary.frames += self.write_goals(bus, &goal)?;
+                match self.write_goals(bus, &goal) {
+                    Ok(frames) => summary.frames += frames,
+                    Err(error) => {
+                        ending = Some(Err(error));
+                        break;
+                    }
+                }
                 summary.goals += 1;
             }
 
             let report = self.outputs.report;
+            if let Some(errors) = report.tracking_errors {
+                for (worst, error) in summary.worst_lag.iter_mut().zip(errors) {
+                    *worst = worst.max(error);
+                }
+            }
             if asked {
                 event(TickEvent::Command(report.command));
                 if let CommandDisposition::Rejected(why) = report.command {
@@ -914,7 +987,8 @@ impl<'a> MotionPump<'a> {
             }
             if let Some(fault) = report.fault {
                 event(TickEvent::Faulted(fault));
-                return Err(PumpError::Fault(fault));
+                ending = Some(Err(PumpError::Fault(fault)));
+                break;
             }
             if report.completed {
                 event(TickEvent::Completed);
@@ -924,14 +998,28 @@ impl<'a> MotionPump<'a> {
                 Until::Elapsed(dwell) => now.saturating_sub(epoch) >= dwell,
             };
             if over {
-                summary.elapsed = clock.now().saturating_sub(epoch);
-                return Ok(summary);
+                ending = Some(Ok(()));
+                break;
             }
 
             due += self.period;
             clock.sleep_until(due);
         }
-        Err(PumpError::Stalled { budget })
+
+        // The one place a run is sealed. Every way the loop ends — reaching the
+        // endpoint, faulting, losing the wire, or running out of periods —
+        // stamps the elapsed time and keeps the record here, and what the
+        // caller is handed is that same record, so `last_summary()` and the
+        // returned value cannot come to disagree. A run that ended badly is the
+        // one whose period counts and per-joint lag are worth the most, which
+        // is why the record outlives the run rather than riding only on the
+        // success path.
+        summary.elapsed = clock.now().saturating_sub(epoch);
+        self.summary = summary;
+        match ending {
+            Some(result) => result.map(|()| self.summary),
+            None => Err(PumpError::Stalled { budget }),
+        }
     }
 
     /// All nine positions, or nothing at all.
@@ -1110,8 +1198,8 @@ mod tests {
     use super::*;
     use crate::config::Resolved;
     use crate::testutil::{
-        BrokenPort, FakeMachine, Spy, TestClock, datumed_config, machine_at, resolved, stow_legs,
-        wind_down_bus,
+        BrokenPort, FailsAfter, FakeMachine, Spy, TestClock, datumed_config, machine_at, resolved,
+        rest_legs, stow_legs, wind_down_bus,
     };
 
     /// Drive an arm sequence against `machine`, handing back the outcome, the
@@ -1148,16 +1236,42 @@ mod tests {
 
     /// A machine provisioned as configured and resting where it can be armed
     /// goes all the way through, and the goals that reached it are the pins.
+    /// The two refusals `provision` raises itself, as an operator reads them.
+    ///
+    /// One of them carries the whole recovery — which command releases the
+    /// torque that is in the way — and the other names the part that answered
+    /// against the part this platform carries. Neither is reachable from a test
+    /// that only destructures the variant, so the rendered strings are pinned
+    /// here the way the tick's refusals are.
+    #[test]
+    fn the_provisioning_refusals_say_what_an_operator_does_next() {
+        let refusals: [(PumpError, &str); 2] = [
+            (
+                PumpError::TorqueHeld { id: 17 },
+                "servo 17 is holding torque; release it with `off` before provisioning",
+            ),
+            (
+                PumpError::WrongPart {
+                    id: 18,
+                    model: 1200,
+                    expected: 1190,
+                },
+                "servo 18 reports model 1200, where this platform's is 1190",
+            ),
+        ];
+        for (refusal, expected) in refusals {
+            assert_eq!(refusal.to_string(), expected);
+        }
+    }
+
     #[test]
     fn an_arm_sequence_runs_to_completion_over_the_port() {
         let cfg = resolved();
         let (outcome, phases, log) = arm(&cfg, machine_at(&datumed_config(), &stow_legs()));
         let summary = outcome.expect("a correct machine arms");
 
-        // Nothing had to be pulled: this machine rests inside every window and
-        // with both antennas well inside their bound.
+        // Nothing had to be pulled: this machine rests inside every window.
         assert_eq!(summary.pull_in, [0.0; 6]);
-        assert_eq!(summary.antenna_pull_in, [0.0; 2]);
         // Nothing was found holding torque, so there is no droop to record.
         assert!(summary.droop.iter().all(Option::is_none));
         assert!(summary.torque_before.iter().all(|on| !on));
@@ -1696,30 +1810,23 @@ mod tests {
     ///
     /// The fixture above cannot see a units error, a left-for-right swap or a
     /// line rendered off the wrong record, because every number in it is zero
-    /// and zero prints the same in every unit. This is the report an operator
-    /// reads the antennas' pull-in off — the number the design leaves ungated
-    /// precisely because it is watched.
+    /// and zero prints the same in every unit. This one is a machine resting
+    /// where the pin has real work to do, with the antennas parked past the half
+    /// turn where run 1 found them.
     #[test]
     fn the_report_carries_the_numbers_the_operator_judges_by() {
         let cfg = resolved();
-        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        let mut machine = machine_at(&datumed_config(), &rest_legs());
         // Run 1's own readings: the two antennas rest on opposite sides of the
-        // wrap, both past the command bound.
+        // wrap, both past the half turn.
         machine.set(17, reg_for(RegId::PresentPosition), &38i32.to_le_bytes());
         machine.set(18, reg_for(RegId::PresentPosition), &4051i32.to_le_bytes());
         let (outcome, _, _) = arm(&cfg, machine);
         let summary = outcome.expect("a parked antenna is not a refusal");
         let printed = arm_report(&summary);
 
-        // The pulls, in degrees, right antenna first — the order the goals go
-        // out in, and the order the two servos sit in on the bus.
-        assert!(
-            printed.contains("antennas [1.908, 1.293] deg, ungated"),
-            "the antenna pull-in reads right then left, in degrees:\n{printed}"
-        );
-        // Two records, not one printed twice: the antennas were found outside
-        // the bound and left on it. The head line is the same on both, because
-        // no leg was pulled — the antennas are the joints that moved.
+        // Two records, not one printed twice: the legs were pulled into their
+        // windows and the head pose that holds moved with them.
         let lines: Vec<&str> = printed.lines().collect();
         let found = lines
             .iter()
@@ -1734,14 +1841,16 @@ mod tests {
             lines[armed + 1],
             "the two records are different poses:\n{printed}"
         );
-        assert!(
-            lines[found + 1].contains("antennas [-176.660, 176.045] deg"),
-            "the found record is the measurement:\n{printed}"
-        );
-        assert!(
-            lines[armed + 1].contains("antennas [-174.752, 174.752] deg"),
-            "the armed record is where the pins put them:\n{printed}"
-        );
+
+        // The antennas read the same on both, right then left, in degrees — the
+        // order the goals go out in and the order the servos sit in on the bus.
+        // Nothing pulls an antenna, so the armed record is the measurement.
+        for line in [lines[found + 1], lines[armed + 1]] {
+            assert!(
+                line.contains("antennas [-176.660, 176.045] deg"),
+                "an antenna is pinned where it was found:\n{printed}"
+            );
+        }
         assert!(
             printed.contains(&format!(
                 "clearance {:.3} mm",
@@ -1756,10 +1865,10 @@ mod tests {
             )),
             "the armed height is printed in metres:\n{printed}"
         );
-        // The legs were resting inside their windows, so their pull is zero and
-        // the antennas' is not — which is what says the two are separate lines.
+        // The legs are the joints a pull-in line has anything to say about, and
+        // four of them were pulled.
         assert!(
-            printed.contains("legs [0.000, 0.000, 0.000, 0.000, 0.000, 0.000] deg, worst 0.000"),
+            printed.contains("legs [7.559, 2.461, 0.000, 0.000, 0.791, 10.547] deg, worst 10.547"),
             "{printed}"
         );
     }
@@ -1990,6 +2099,50 @@ mod tests {
         goals_match(&cfg, &bench, &last);
     }
 
+    /// A machine that follows its goals a few periods behind carries the move
+    /// through, however far behind that puts it.
+    ///
+    /// Nine servos on a proportional loop, each sitting behind a streamed goal
+    /// in proportion to how fast the goal is moving. The paired run is the
+    /// control — the same machine, the same threshold, and a progress minimum
+    /// nothing can meet — and it faults, which is what says the lag really did
+    /// clear the threshold rather than the first run passing for want of
+    /// anything to detect.
+    #[test]
+    fn a_machine_chasing_its_goals_carries_the_move() {
+        let mut cfg = resolved();
+        cfg.motion.tracking.threshold_rad = 0.02;
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        for id in cfg.map.ids() {
+            bench.registers.borrow_mut().delay.insert(id, 4);
+        }
+        let mut driver = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, events) = run(&mut bench, &mut driver, to_neutral(&cfg), &mut clock);
+        outcome.expect("a joint closing on its goal is a joint following it");
+        assert!(events.contains(&TickEvent::Completed));
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+
+        cfg.motion.tracking.progress_min_rad = 1.0;
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        for id in cfg.map.ids() {
+            bench.registers.borrow_mut().delay.insert(id, 4);
+        }
+        let mut driver = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = run(&mut bench, &mut driver, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("nothing closes a whole radian in a window");
+        assert!(
+            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            "{error}"
+        );
+    }
+
     /// A move that leaves body yaw and the antennas where they are writes
     /// neither: one grouped frame per emitting period, not three, and every
     /// frame carries the six legs.
@@ -2003,6 +2156,10 @@ mod tests {
         let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
         let summary = outcome.expect("the move completes");
 
+        // One record of the run, whichever way it is read: the value handed
+        // back is the value kept, so the bench's printed line and a caller's
+        // own copy cannot describe different runs.
+        assert_eq!(summary, pump.last_summary(), "{summary:?}");
         assert_eq!(summary.frames, summary.goals, "{summary:?}");
         assert_eq!(
             frames(&bench.log, INST_SYNC_WRITE),
@@ -2258,9 +2415,9 @@ mod tests {
             &mut bench,
             &mut pump,
             MotionCommand::MoveTo {
-                // Well past the antennas' command bound.
+                // Well past the bench's body-yaw cap.
                 target: JointTargets {
-                    antennas: [4.0, 0.0],
+                    body_yaw: 3.0,
                     ..JointTargets::default()
                 },
                 duration: cfg.up_duration,
@@ -2649,6 +2806,48 @@ mod tests {
             "{error}"
         );
         assert_eq!(frames(&bench.log, INST_SYNC_WRITE), 0, "nothing commanded");
+        // The run that ran out of periods is one whose period count is the
+        // whole finding, so it is kept rather than handed back only on success.
+        assert_eq!(pump.last_summary().ticks, budget);
+    }
+
+    /// The record of a run outlives whichever way the run ended, and is the run's
+    /// own: a fault keeps everything the periods before it measured, and the
+    /// next run starts from zero rather than from that.
+    #[test]
+    fn a_faulted_run_keeps_its_record_and_the_next_one_starts_clean() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let stuck = cfg.map.ids()[2];
+        bench.registers.borrow_mut().stalled.push(stuck);
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("a servo that takes its goals and does not move");
+        assert!(
+            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            "{error}"
+        );
+
+        let faulted = pump.last_summary();
+        assert!(faulted.ticks > 0, "{faulted:?}");
+        assert!(faulted.goals > 0, "{faulted:?}");
+        assert!(faulted.elapsed > Duration::ZERO, "{faulted:?}");
+        assert!(
+            faulted.worst_lag[2] > cfg.motion.tracking.threshold_rad,
+            "the stalled leg's lag is what the fault was raised on: {faulted:?}"
+        );
+
+        // A faulted machine stops the next run on its standing fault, and what
+        // that run leaves behind is its own single period rather than the
+        // faulted run's numbers read a second time.
+        let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        outcome.expect_err("a faulted machine commands nothing");
+        let after = pump.last_summary();
+        assert_eq!(after.ticks, 1, "{after:?}");
+        assert_eq!(after.goals, 0, "{after:?}");
+        assert_eq!(after.worst_lag, [0.0; JointId::COUNT], "{after:?}");
     }
 
     /// A move slower than any fixed watchdog would allow runs to its target.
@@ -2834,11 +3033,10 @@ mod tests {
         cfg.motion.tracking.threshold_rad = 0.02;
         cfg.motion.tracking.ticks = 5;
         let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        // Thirty counts short of whatever it is told, on every servo: about
-        // 0.046 rad, and a standing offset rather than a lag that closes.
-        for id in cfg.map.ids() {
-            bench.registers.borrow_mut().lag.insert(id, 30);
-        }
+        // Every servo takes its goals and stays where it is: the goal write
+        // that never applied, and the stalled motor, are the same thing from
+        // here.
+        bench.registers.borrow_mut().stalled = cfg.map.ids().to_vec();
         let mut pump = pump(&cfg, bench.held);
         let mut clock = TestClock::default();
 
@@ -2893,6 +3091,50 @@ mod tests {
         assert_eq!(id, dxl_proto::frame::BROADCAST_ID, "a grouped request");
         assert!(matches!(source, XactError::Io { .. }), "{source}");
         assert!(!state.is_faulted(), "the tick never saw a period");
+        assert_eq!(
+            pump.last_summary().ticks,
+            0,
+            "and nothing was measured to keep"
+        );
+    }
+
+    /// A wire lost in the middle of a run keeps what the run had measured.
+    ///
+    /// An intermittent adapter is the failure hardest to reproduce and the one
+    /// whose period counts, jitter and per-joint lag are worth the most: the
+    /// numbers say what the loop was doing when it went. The record is sealed
+    /// on the way out rather than abandoned with the periods that filled it.
+    #[test]
+    fn a_bus_failure_mid_run_keeps_what_it_measured() {
+        let cfg = resolved();
+        let bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut state = bench.state;
+        // Enough transactions for a few whole periods, and then nothing.
+        let port = FailsAfter::new(machine_at(&datumed_config(), &stow_legs()), 12);
+        let mut bus = Bus::new(port, cfg.timing);
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let error = pump
+            .run(
+                &mut bus,
+                &mut state,
+                to_neutral(&cfg),
+                &mut clock,
+                &mut |_| {},
+            )
+            .expect_err("a port that goes away carries no move to its end");
+        assert!(matches!(error, PumpError::Bus { .. }), "{error}");
+
+        let summary = pump.last_summary();
+        assert!(
+            summary.ticks > 0 && summary.goals > 0,
+            "the run turned periods and commanded before the wire went: {summary:?}"
+        );
+        assert!(
+            summary.elapsed > Duration::ZERO,
+            "and the elapsed time was stamped: {summary:?}"
+        );
     }
 
     /// A rate of zero is refused rather than dividing by it. Configuration

@@ -58,7 +58,8 @@ use core::time::Duration;
 use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeConfig, EnvelopeReport, EnvelopeViolations, FkError, FkOptions, FkStats, HeadGeometry,
-    LegAngles, check_envelope, forward_kinematics, min_pose_margin, outside_limit,
+    LegAngles, below_limit, check_envelope, forward_kinematics, min_pose_margin, outside_limit,
+    wrap_to_pi,
 };
 use thiserror::Error;
 
@@ -66,35 +67,78 @@ use crate::arm::ArmRecord;
 use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint};
 use crate::traj::{Trajectory, TrajectoryError, Warp};
 
-/// When a joint is far enough from its goal, for long enough, to conclude the
-/// servo is not tracking it.
+/// When a joint is far enough from its goal, for long enough, without closing
+/// on it, to conclude the servo is not tracking it.
 ///
 /// Goal writes to the whole group are unacknowledged by the protocol, so a
 /// write that never applied leaves no trace on the bus. This comparison is the
 /// compensating detection: a goal that is not being followed shows up as a
-/// standing position error whether the write landed or the motor stalled.
+/// position error that does not close, whether the write landed or the motor
+/// stalled.
+///
+/// Distance alone cannot say that. The servos run a proportional position loop
+/// with no integral term, so a joint chasing a streamed goal sits behind it by
+/// roughly the commanded velocity times the loop's own time constant. At the
+/// bench, leg 2 ran 0.246 rad behind a goal moving near 0.71 rad/s, and the
+/// right antenna 0.430 rad behind one moving near 4.91 rad/s, both while
+/// following perfectly well. Lag scales with commanded speed, so no constant
+/// distance separates a chase from a stall; what separates them is whether the
+/// joint is closing on where its goal lies, which is what `progress_min_rad`
+/// measures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackingFaultConfig {
-    /// How far a joint may sit from its goal without counting, radians.
+    /// How far a joint may sit from its goal without being examined at all,
+    /// radians.
+    ///
+    /// At least as wide as the widest per-tick goal step the step guard admits.
+    /// Progress is measured from where the joint stood when its run opened, so
+    /// a goal able to step past that anchor in one period would read a joint
+    /// that is following as one running away from it.
     pub threshold_rad: f64,
-    /// How many consecutive ticks of that before the fault.
+    /// How far a joint past that threshold must travel toward its goal, within
+    /// a window of `ticks`, to count as closing on it, radians.
+    pub progress_min_rad: f64,
+    /// How many consecutive live ticks past the threshold without that
+    /// progress before the fault.
     pub ticks: u32,
 }
 
 impl Default for TrackingFaultConfig {
-    /// Provisional bench figures, to be replaced by measured ones: no lag this
-    /// large has been observed on this linkage, because nothing has yet
-    /// measured one.
+    /// Provisional bench figures. The threshold and the window are sized rather
+    /// than measured; every move records its per-joint worst lag, and those are
+    /// the numbers that will ground them.
     fn default() -> Self {
         Self {
-            // 8.6° of crank, well past anything the position gains should
-            // permit under the head's own weight.
+            // 8.6° of crank. Only a screen for which joints are worth
+            // examining, not a verdict: the bench has seen 0.43 rad of healthy
+            // lag on an antenna at speed.
             threshold_rad: 0.15,
+            // About 6.5 of the servos' 0.088° counts, comfortably above the
+            // half-count quantisation floor of 7.7e-4 rad. Over the ten-tick
+            // window at the bench's 50 Hz that asks a joint sitting past the
+            // threshold for 0.05 rad/s of closing speed — an order of magnitude
+            // under the 0.71 rad/s the legs were commanded at on the fastest
+            // move so far, and two under the antennas' 4.91 rad/s.
+            progress_min_rad: 0.01,
             // A fifth of a second at the bench's 50 Hz tick, so a single
             // transient on one read cannot raise it.
             ticks: 10,
         }
     }
+}
+
+/// One joint's open run of live ticks past the tracking threshold.
+///
+/// Progress is measured from `anchor` — where the joint stood when the run
+/// opened, or when it last closed a window's worth of distance — rather than
+/// between consecutive ticks, so a joint creeping less than one count per tick
+/// still shows its motion over the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrackingStreak {
+    /// Where the joint was when this run last restarted, radians.
+    anchor: f64,
+    /// Live ticks since, this one included.
+    count: u32,
 }
 
 /// Everything the tick needs that does not change between ticks.
@@ -130,8 +174,10 @@ impl Default for MotionConfig {
             max_step: JointStep {
                 legs: 0.05,
                 body_yaw: 0.05,
-                // The antennas sweep the full 6.1 rad between their stow
-                // positions, which over two seconds peaks near 0.114.
+                // An antenna target resolves to within half a turn of where the
+                // frame stands, so the longest commandable sweep is π: over the
+                // two seconds of the shortest move that peaks near 0.059 at
+                // 50 Hz, and this leaves better than double the room.
                 antennas: 0.15,
             },
             tracking: TrackingFaultConfig::default(),
@@ -182,10 +228,12 @@ pub enum Fault {
         /// Consecutive missed reads.
         misses: u32,
     },
-    /// A joint sat too far from its goal for too long.
+    /// A joint sat past the tracking threshold for a whole window without
+    /// closing on its goal.
     #[error("{joint} is {error:.4} rad from its goal and not closing")]
     TrackingLost {
-        /// The joint furthest from its goal when the count ran out.
+        /// The joint whose window ran out, or the furthest out of those whose
+        /// windows ran out together.
         joint: JointId,
         /// How far, radians.
         error: f64,
@@ -213,6 +261,33 @@ pub enum Fault {
         joint: JointId,
     },
 }
+
+/// Counts the antennas' goal register reaches either side of its own zero, and
+/// the count that reads as zero radians.
+///
+/// The wire layer owns the conversion; these two figures are repeated here
+/// because the bound below is a count bound and the two layers share no crate.
+/// A bench test pins them against the conversion itself.
+const ANTENNA_GOAL_COUNTS: f64 = 1_048_575.0;
+const COUNTS_PER_TURN: f64 = 4096.0;
+
+/// The highest angle either antenna's goal may hold, radians.
+///
+/// The servos run the antennas in extended position mode, whose goal register
+/// reaches ±1_048_575 counts. That span is not symmetric about zero *radians*:
+/// the count frame's zero sits half a turn below it, so the reachable angles
+/// run from half a turn below −256 turns to half a turn below +256. A goal
+/// outside them has no count to write. Nothing this machine commands
+/// approaches either bound — every antenna target resolves to within half a
+/// turn of the frame the last command left — but a value no count represents
+/// is a refusal rather than something to saturate.
+pub const ANTENNA_GOAL_MAX_RAD: f64 =
+    core::f64::consts::TAU * (ANTENNA_GOAL_COUNTS / COUNTS_PER_TURN) - core::f64::consts::PI;
+
+/// The lowest angle either antenna's goal may hold, radians. See
+/// [`ANTENNA_GOAL_MAX_RAD`] for why the two are not mirror images.
+pub const ANTENNA_GOAL_MIN_RAD: f64 =
+    -core::f64::consts::TAU * (ANTENNA_GOAL_COUNTS / COUNTS_PER_TURN) - core::f64::consts::PI;
 
 /// What a caller asks the tick to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,6 +319,14 @@ pub enum CommandRejection {
     /// The commanded move cannot be shaped into a path.
     #[error("the commanded move cannot be shaped: {0}")]
     Trajectory(TrajectoryError),
+    /// An antenna direction resolved to a goal no servo count represents.
+    #[error("the commanded {joint} angle {angle:.4} rad is not commandable")]
+    AntennaUnreachable {
+        /// Which antenna.
+        joint: JointId,
+        /// The goal that has no count, radians.
+        angle: f64,
+    },
 }
 
 /// What became of this tick's command.
@@ -273,13 +356,18 @@ pub struct TickReport {
     pub present_fresh: bool,
     /// Consecutive ticks without a position read, this one included.
     pub misses: u32,
-    /// Consecutive live ticks with some joint past the tracking threshold,
-    /// including the tick that raised [`Fault::TrackingLost`]. A tick without a
-    /// live read measures nothing and repeats the standing count.
+    /// The longest open run of live ticks with one joint past the tracking
+    /// threshold and not closing on its goal, including the tick that raised
+    /// [`Fault::TrackingLost`]. A tick without a live read measures nothing and
+    /// repeats the standing figure.
     pub tracking_count: u32,
-    /// The joint furthest from its goal, and by how much, when the read was
-    /// live.
-    pub tracking_worst: Option<(JointId, f64)>,
+    /// How far each joint was from the goal it was last written, in bus order,
+    /// radians, when the read was live.
+    ///
+    /// The raw per-joint lag, not a verdict: what a proportional loop runs
+    /// behind a moving goal is the number this project has so far only guessed
+    /// at, and every move — clean or faulted — is a measurement of it.
+    pub tracking_errors: Option<[f64; JointId::COUNT]>,
     /// What the present-pose solve cost, when it ran and succeeded.
     pub fk: Option<FkStats>,
     /// The present pose's smallest toggle margin — the baseline every envelope
@@ -314,7 +402,7 @@ impl Default for TickReport {
             present_fresh: false,
             misses: 0,
             tracking_count: 0,
-            tracking_worst: None,
+            tracking_errors: None,
             fk: None,
             present_min_margin: 0.0,
             health: None,
@@ -325,6 +413,19 @@ impl Default for TickReport {
             completed: false,
             fault: None,
         }
+    }
+}
+
+impl TickReport {
+    /// The joint furthest from its goal, and by how much, when the read was
+    /// live.
+    ///
+    /// Derived from `tracking_errors` rather than carried beside it, so the
+    /// worst named here and the nine figures a summary accumulates cannot
+    /// disagree.
+    #[must_use]
+    pub fn tracking_worst(&self) -> Option<(JointId, f64)> {
+        self.tracking_errors.as_ref().map(worst_joint)
     }
 }
 
@@ -371,7 +472,7 @@ pub struct MotionState {
     fk_seed: Isometry3<f64>,
     present_min_margin: f64,
     miss_count: u32,
-    tracking_count: u32,
+    tracking: [Option<TrackingStreak>; JointId::COUNT],
 }
 
 impl MotionState {
@@ -405,7 +506,7 @@ impl MotionState {
             fk_seed: armed.head_pose_body,
             present_min_margin: armed.min_margin,
             miss_count: 0,
-            tracking_count: 0,
+            tracking: [None; JointId::COUNT],
         }
     }
 
@@ -453,6 +554,18 @@ impl MotionState {
         out.report.mode = self.mode;
         out.report.fault = Some(fault);
     }
+}
+
+/// The longest open run across the nine joints, or zero when none is open.
+///
+/// The single number the report carries about nine independent runs: the one
+/// closest to raising the fault.
+fn longest_streak(streaks: &[Option<TrackingStreak>; JointId::COUNT]) -> u32 {
+    streaks
+        .iter()
+        .filter_map(|streak| streak.map(|open| open.count))
+        .max()
+        .unwrap_or(0)
 }
 
 /// One control step.
@@ -527,39 +640,76 @@ pub fn motion_tick(
         }
     };
     out.report.misses = state.miss_count;
-    out.report.tracking_count = state.tracking_count;
+    out.report.tracking_count = longest_streak(&state.tracking);
 
     // Tracking, on live reads only: a stale reading compared against a fresh
-    // goal is a difference nobody measured.
+    // goal is a difference nobody measured, so a stale tick freezes every
+    // joint's run where it stands rather than growing or clearing it.
     if let Some(present) = fresh {
         let mut errors = [0.0; JointId::COUNT];
-        let mut over = false;
-        for (error, ((_, angle), (_, goal))) in errors
-            .iter_mut()
-            .zip(present.joints().into_iter().zip(state.last_goal.joints()))
+        // The rows whose window ran out on this tick, by how far out they are.
+        // Every other row holds a value no measurement can beat, so the same
+        // worst-of sweep names the joint among them.
+        let mut exhausted = [f64::NEG_INFINITY; JointId::COUNT];
+        let mut any_exhausted = false;
+        for (row, ((_, angle), (_, goal))) in present
+            .joints()
+            .into_iter()
+            .zip(state.last_goal.joints())
+            .enumerate()
         {
-            *error = (angle - goal).abs();
-            over |= outside_limit(*error, cfg.tracking.threshold_rad);
+            errors[row] = (angle - goal).abs();
+            let streak = &mut state.tracking[row];
+            if !outside_limit(errors[row], cfg.tracking.threshold_rad) {
+                // Within the threshold is healthy, whatever came before it.
+                *streak = None;
+                continue;
+            }
+            let (count, closing) = match streak {
+                // Progress is measured from where the joint stands now.
+                None => {
+                    *streak = Some(TrackingStreak {
+                        anchor: angle,
+                        count: 1,
+                    });
+                    (1, false)
+                }
+                Some(open) => {
+                    // Ground covered since the anchor, signed toward the goal:
+                    // positive is closing, negative is running away, and a goal
+                    // that has arrived at the anchor leaves no direction to
+                    // close in. An unplaceable number closes nothing.
+                    let toward = goal - open.anchor;
+                    let advance = if toward == 0.0 {
+                        0.0
+                    } else {
+                        (angle - open.anchor) * toward.signum()
+                    };
+                    if advance >= cfg.tracking.progress_min_rad {
+                        // Sitting behind a moving goal is what a proportional
+                        // loop does, not what this fault is for.
+                        open.anchor = angle;
+                        open.count = 1;
+                        (1, true)
+                    } else {
+                        open.count += 1;
+                        (open.count, false)
+                    }
+                }
+            };
+            if !closing && count >= cfg.tracking.ticks {
+                exhausted[row] = errors[row];
+                any_exhausted = true;
+            }
         }
-        let worst = worst_joint(&errors);
-        out.report.tracking_worst = Some(worst);
-        if over {
-            state.tracking_count += 1;
-        } else {
-            state.tracking_count = 0;
-        }
-        // Recorded before the fault check: the tick that runs the budget out is
-        // the one whose count matters most, and a report that shipped zero there
-        // would read as a single-tick trip rather than a sustained breach.
-        out.report.tracking_count = state.tracking_count;
-        if over && state.tracking_count >= cfg.tracking.ticks {
-            state.raise(
-                Fault::TrackingLost {
-                    joint: worst.0,
-                    error: worst.1,
-                },
-                out,
-            );
+        out.report.tracking_errors = Some(errors);
+        // Recorded before the fault check: the tick that runs a window out is
+        // the one whose figure matters most, and a report that shipped zero
+        // there would read as a single-tick trip rather than a sustained one.
+        out.report.tracking_count = longest_streak(&state.tracking);
+        if any_exhausted {
+            let (joint, error) = worst_joint(&exhausted);
+            state.raise(Fault::TrackingLost { joint, error }, out);
             return;
         }
     }
@@ -626,7 +776,6 @@ pub fn motion_tick(
         &cfg.env,
         &sampled.head_pose_body,
         sampled.body_yaw,
-        sampled.antennas,
         Some(state.present_min_margin),
         &mut envelope,
     );
@@ -697,13 +846,35 @@ fn take_command(
         return CommandDisposition::Rejected(CommandRejection::AlreadyMoving);
     }
 
+    // An antenna target is a direction — a physical angle mod 2π — and the
+    // machine's frame for it is continuous and unbounded. Each direction
+    // resolves here to the representative nearest where the last command left
+    // that antenna, so no commanded sweep exceeds half a turn and consecutive
+    // moves chain in one frame without a step. This is the only wrap arithmetic
+    // on the command path: the interpolation, the step guard and the tracking
+    // comparison all take plain linear differences in the frame it produces.
+    let mut target = *target;
+    for (side, joint) in [JointId::AntennaRight, JointId::AntennaLeft]
+        .into_iter()
+        .enumerate()
+    {
+        let last = state.last_targets.antennas[side];
+        let angle = last + wrap_to_pi(target.antennas[side] - last);
+        if outside_limit(angle, ANTENNA_GOAL_MAX_RAD) || below_limit(angle, ANTENNA_GOAL_MIN_RAD) {
+            return CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
+                joint,
+                angle,
+            });
+        }
+        target.antennas[side] = angle;
+    }
+
     let mut report = EnvelopeReport::default();
     if let Err(error) = check_envelope(
         &cfg.geom,
         &cfg.env,
         &target.head_pose_body,
         target.body_yaw,
-        target.antennas,
         Some(state.present_min_margin),
         &mut report,
     ) {
@@ -713,7 +884,7 @@ fn take_command(
     // Start from the last commanded targets rather than the measured pose, so
     // consecutive moves chain without a step and a tracking lag is not written
     // into the path.
-    match Trajectory::new(&state.last_targets, target, *duration, *warp) {
+    match Trajectory::new(&state.last_targets, &target, *duration, *warp) {
         Ok(trajectory) => {
             state.trajectory = Some(trajectory);
             state.mode = Mode::Moving { started: now };
@@ -794,8 +965,8 @@ mod tests {
     /// rounding error away from it.
     fn armed_at(cfg: &MotionConfig, targets: &JointTargets) -> (MotionState, JointVector) {
         let (present, _) = joints_for(cfg, targets);
-        let outcome = pin_goals(&arm_config(cfg), &cfg.env, &present)
-            .expect("the pull-in is inside the gate");
+        let outcome =
+            pin_goals(&arm_config(cfg), &present).expect("the pull-in is inside the gate");
         let record = if outcome.pinned.legs == present.legs {
             record_at(cfg, &outcome.pinned, &targets.head_pose_body)
         } else {
@@ -1107,7 +1278,7 @@ mod tests {
             assert_eq!(out.report.misses, n);
             assert_eq!(out.report.fault, None);
             assert_eq!(out.goal, None);
-            assert_eq!(out.report.tracking_worst, None, "nothing was measured");
+            assert_eq!(out.report.tracking_worst(), None, "nothing was measured");
         }
 
         let out = tick_with(&cfg, &mut state, secs(0.08), &pinned, None);
@@ -1120,14 +1291,16 @@ mod tests {
         assert!(state.is_faulted());
     }
 
-    /// The tracking counter needs the breach sustained: it resets on the first
-    /// tick that is back inside the threshold, and only a run as long as the
-    /// configured one faults. The joint named is the one furthest out.
+    /// A run needs the breach sustained: it clears on the first tick back
+    /// inside the threshold, and only a run as long as the configured one
+    /// faults. Two joints run out together here, and the one named is the
+    /// furthest out.
     #[test]
-    fn the_tracking_counter_resets_on_a_good_tick() {
+    fn a_tracking_run_clears_on_a_good_tick() {
         let cfg = MotionConfig {
             tracking: TrackingFaultConfig {
                 threshold_rad: 0.1,
+                progress_min_rad: 0.01,
                 ticks: 3,
             },
             ..MotionConfig::default()
@@ -1147,7 +1320,7 @@ mod tests {
         let out = tick_with(&cfg, &mut state, secs(0.04), &pinned, None);
         assert_eq!(out.report.tracking_count, 0);
         assert!(
-            out.report.tracking_worst.expect("measured").1 < 1e-12,
+            out.report.tracking_worst().expect("measured").1 < 1e-12,
             "a tracking machine has no error"
         );
 
@@ -1181,11 +1354,619 @@ mod tests {
                 joint: JointId::AntennaLeft,
                 error: 0.4
             }),
-            "the joint furthest from its goal is the one named"
+            "of the two runs that ran out together, the furthest out is named"
         );
         assert_eq!(
             out.report.tracking_count, 3,
             "the tick that ran the budget out reports the full run, not zero"
+        );
+    }
+
+    /// Every joint's own distance from its goal rides the report, in bus order.
+    ///
+    /// The worst of them is what a fault names, but the nine are what a move
+    /// accumulates into the lag it reports: which joint ran behind, and by how
+    /// far, is the measurement the threshold, its window and the stow tolerance
+    /// are all still provisional against. A single worst figure per tick would
+    /// hide every joint but one.
+    #[test]
+    fn the_report_carries_each_joint_s_own_distance_from_its_goal() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        // Nine distinct offsets, each inside the threshold, so what is being
+        // read back is the per-joint figure and not a fault's aftermath.
+        let mut off = pinned;
+        off.body_yaw += 0.01;
+        for (n, leg) in off.legs.iter_mut().enumerate() {
+            *leg += 0.02 * (n as f64 + 1.0);
+        }
+        off.antennas[0] -= 0.03;
+        off.antennas[1] += 0.05;
+
+        let out = tick_with(&cfg, &mut state, secs(0.0), &off, None);
+        assert_eq!(out.report.fault, None);
+        let errors = out.report.tracking_errors.expect("a live tick measures");
+        for (row, ((joint, angle), (_, goal))) in
+            off.joints().into_iter().zip(pinned.joints()).enumerate()
+        {
+            assert!(
+                (errors[row] - (angle - goal).abs()).abs() < 1e-12,
+                "{joint} reports {} against {}",
+                errors[row],
+                (angle - goal).abs()
+            );
+        }
+        assert_eq!(
+            out.report.tracking_worst(),
+            Some((JointId::Leg(5), 0.12)),
+            "the worst is the sweep of the nine, not a figure kept beside them"
+        );
+
+        // A tick with no read measured nothing, and says so rather than
+        // repeating the last tick's nine numbers as if they were fresh.
+        let mut stale = TickOutputs::default();
+        motion_tick(
+            &cfg,
+            &mut state,
+            &TickInputs {
+                now: secs(0.02),
+                present: None,
+                command: None,
+                health: None,
+            },
+            &mut stale,
+        );
+        assert_eq!(stale.report.tracking_errors, None);
+    }
+
+    /// A tracking configuration with everything else left at its default.
+    fn tracking_cfg(threshold_rad: f64, progress_min_rad: f64, ticks: u32) -> MotionConfig {
+        MotionConfig {
+            tracking: TrackingFaultConfig {
+                threshold_rad,
+                progress_min_rad,
+                ticks,
+            },
+            ..MotionConfig::default()
+        }
+    }
+
+    /// A machine that reaches each goal `lag` ticks after it was written.
+    ///
+    /// The shape a proportional position loop's error actually has: distance
+    /// behind the goal proportional to how fast the goal is moving, largest in
+    /// the middle of a shaped move and zero at its ends. The fixture that
+    /// hands the tick its own last goals cannot see this fault working at all,
+    /// and the fixture that freezes the machine cannot see it staying quiet.
+    struct Follower {
+        /// Every goal written, oldest first.
+        goals: Vec<JointVector>,
+        /// How many ticks behind the machine runs.
+        lag: usize,
+        /// The worst tracking error any tick measured.
+        worst: f64,
+        /// The longest run any tick reported.
+        longest: u32,
+        /// Ticks issued so far, at 50 Hz.
+        tick: u32,
+    }
+
+    impl Follower {
+        fn new(start: &JointVector, lag: usize) -> Self {
+            Self {
+                goals: vec![*start],
+                lag,
+                worst: 0.0,
+                longest: 0,
+                tick: 0,
+            }
+        }
+
+        /// Where the machine reports itself: the goal `lag` writes ago, or the
+        /// pose it started from while the move is younger than that.
+        fn present(&self) -> JointVector {
+            self.goals[self.goals.len().saturating_sub(1 + self.lag)]
+        }
+
+        /// One tick, taking `command` if there is one.
+        fn step(
+            &mut self,
+            cfg: &MotionConfig,
+            state: &mut MotionState,
+            command: Option<&MotionCommand>,
+        ) -> TickOutputs {
+            let present = self.present();
+            let now = secs(f64::from(self.tick) * 0.02);
+            let out = tick_with(cfg, state, now, &present, command);
+            self.tick += 1;
+            if let Some((_, error)) = out.report.tracking_worst() {
+                self.worst = self.worst.max(error);
+            }
+            self.longest = self.longest.max(out.report.tracking_count);
+            self.goals.push(*state.last_goal());
+            out
+        }
+
+        /// Command a move and run it out, or until it faults.
+        fn run(
+            &mut self,
+            cfg: &MotionConfig,
+            state: &mut MotionState,
+            command: &MotionCommand,
+        ) -> TickOutputs {
+            let mut out = TickOutputs::default();
+            for n in 0..500 {
+                out = self.step(cfg, state, (n == 0).then_some(command));
+                if out.report.completed || out.report.fault.is_some() {
+                    break;
+                }
+            }
+            out
+        }
+    }
+
+    fn move_to(target: JointTargets, duration: Duration) -> MotionCommand {
+        MotionCommand::MoveTo {
+            target,
+            duration,
+            warp: Warp::MinJerk,
+        }
+    }
+
+    /// A lagging chase, and the move that produces one, in each of the two
+    /// configurations this fault has to hold in.
+    ///
+    /// The first is tuned by hand — a tight threshold and a slow move, which
+    /// separates the arithmetic from the numbers the machine happens to ship
+    /// with. The second is what the bench ships and its resolver admits: every
+    /// per-tick goal step bounded by a step guard no wider than the threshold,
+    /// which is the relationship the reversal case below rests on. A joint
+    /// following at a distance has to survive both.
+    fn regimes() -> [(MotionConfig, JointTargets, Duration, usize); 2] {
+        [
+            (tracking_cfg(0.02, 0.002, 10), pose_at(0.19), secs(2.0), 8),
+            (
+                MotionConfig::default(),
+                antennas_at([1.5, -1.5]),
+                secs(0.8),
+                8,
+            ),
+        ]
+    }
+
+    /// The step guard is no wider than the threshold in the shipped
+    /// configuration, which is what stops a goal stepping over the band that
+    /// clears a run. The bench's own resolver refuses a file that breaks it;
+    /// this is the same relationship at the layer that depends on it.
+    #[test]
+    fn the_shipped_step_guard_is_inside_the_shipped_threshold() {
+        let cfg = MotionConfig::default();
+        for (joint, step) in [
+            (JointId::Leg(0), cfg.max_step.legs),
+            (JointId::BodyYaw, cfg.max_step.body_yaw),
+            (JointId::AntennaRight, cfg.max_step.antennas),
+        ] {
+            assert!(
+                step <= cfg.tracking.threshold_rad,
+                "{joint} steps {step} against a {} threshold",
+                cfg.tracking.threshold_rad
+            );
+        }
+    }
+
+    /// The fault this machine's own gains guarantee, and must not raise: a
+    /// joint sitting well past the threshold for the whole middle of a move,
+    /// closing on its goal the entire time, is following it.
+    #[test]
+    fn a_lagging_but_closing_joint_never_faults() {
+        for (cfg, target, duration, lag) in regimes() {
+            let start = JointTargets::default();
+            let (mut state, pinned) = armed_at(&cfg, &start);
+
+            let mut machine = Follower::new(&pinned, lag);
+            let out = machine.run(&cfg, &mut state, &move_to(target, duration));
+
+            assert_eq!(
+                out.report.fault, None,
+                "a closing joint is a tracking joint"
+            );
+            assert!(out.report.completed, "and the move finished");
+            assert!(
+                machine.worst > 2.0 * cfg.tracking.threshold_rad,
+                "the lag has to clear the threshold for this to test anything: {}",
+                machine.worst
+            );
+            assert!(
+                machine.longest > 0 && machine.longest < cfg.tracking.ticks,
+                "runs opened and were closed by progress, not by luck: {}",
+                machine.longest
+            );
+        }
+    }
+
+    /// The detection this fault exists for: a goal that
+    /// never applied, or a motor that cannot move, leaves the joint standing
+    /// still with its goal beyond the threshold. Nothing closes, so the window
+    /// runs out — on the tick the count reaches it, not one either side.
+    #[test]
+    fn a_stalled_joint_faults_at_exactly_the_window() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut stuck = pinned;
+        stuck.body_yaw += 0.3;
+
+        for n in 1..=5u32 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &stuck, None);
+            assert_eq!(out.report.tracking_count, n, "tick {n}");
+            if n < cfg.tracking.ticks {
+                assert_eq!(out.report.fault, None, "tick {n}");
+            } else {
+                assert_eq!(
+                    out.report.fault,
+                    Some(Fault::TrackingLost {
+                        joint: JointId::BodyYaw,
+                        error: 0.3,
+                    }),
+                    "tick {n}"
+                );
+            }
+        }
+        assert!(state.is_faulted());
+    }
+
+    /// Progress buys one window, not immunity. A joint that closes on its goal
+    /// and then stops dead — the arrival that never completes, a servo losing
+    /// the last of a move — faults a window after it stopped, because progress
+    /// is measured from where the closing left it rather than from where the
+    /// run first opened.
+    #[test]
+    fn a_joint_that_stops_after_closing_still_faults() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut present = pinned;
+        present.body_yaw = 0.5;
+        let mut tick = 0u32;
+        // Closing at twice the minimum every tick: the run restarts each time.
+        for _ in 0..5 {
+            tick += 1;
+            present.body_yaw -= 0.02;
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(tick) * 0.02),
+                &present,
+                None,
+            );
+            assert_eq!(out.report.tracking_count, 1, "tick {tick}");
+            assert_eq!(out.report.fault, None, "tick {tick}");
+        }
+
+        // Then stopped, still well past the threshold.
+        let mut last = None;
+        for expected in 2..=5u32 {
+            tick += 1;
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(tick) * 0.02),
+                &present,
+                None,
+            );
+            assert_eq!(out.report.tracking_count, expected, "tick {tick}");
+            last = out.report.fault;
+        }
+        assert!(
+            matches!(
+                last,
+                Some(Fault::TrackingLost {
+                    joint: JointId::BodyYaw,
+                    ..
+                })
+            ),
+            "expected a tracking fault, got {last:?}"
+        );
+    }
+
+    /// Motion away from the goal is not progress. A sign error somewhere below
+    /// this crate drives a joint the wrong way at full speed, and distance
+    /// alone would call that a lag; the signed advance calls it what it is.
+    #[test]
+    fn a_joint_running_away_from_its_goal_faults() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut present = pinned;
+        present.body_yaw = 0.15;
+        let mut last = None;
+        for n in 1..=5u32 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            assert_eq!(out.report.tracking_count, n, "tick {n}");
+            last = out.report.fault;
+            // Away from the goal at zero, and faster than the progress
+            // minimum, so nothing here could be mistaken for a slow chase.
+            present.body_yaw += 0.05;
+        }
+        let Some(Fault::TrackingLost { joint, .. }) = last else {
+            panic!("expected a tracking fault, got {last:?}");
+        };
+        assert_eq!(joint, JointId::BodyYaw);
+    }
+
+    /// Motion with no net progress is not progress either: a joint hunting
+    /// around a standing offset covers ground every tick and closes none of it.
+    #[test]
+    fn oscillation_without_net_progress_faults() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut present = pinned;
+        let mut last = None;
+        for n in 1..=5u32 {
+            present.body_yaw = if n.is_multiple_of(2) { 0.25 } else { 0.2 };
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            assert_eq!(out.report.tracking_count, n, "tick {n}");
+            last = out.report.fault;
+        }
+        let Some(Fault::TrackingLost { joint, .. }) = last else {
+            panic!("expected a tracking fault, got {last:?}");
+        };
+        assert_eq!(joint, JointId::BodyYaw);
+    }
+
+    /// A goal that comes to rest exactly on an open run's anchor leaves no
+    /// direction to close in, and a joint walking away from it is closing on
+    /// nothing.
+    ///
+    /// `f64::signum` answers `+1` for a zero, so the signed advance has to name
+    /// this case rather than multiply through it: fold the three lines into the
+    /// single product and motion away from a stopped goal reads as progress,
+    /// the run re-anchors on every tick, and the arrival failure never faults.
+    #[test]
+    fn a_goal_at_rest_on_the_anchor_closes_nothing() {
+        let cfg = tracking_cfg(0.15, 0.01, 25);
+        // A move that ends where this joint is already reading, so the run that
+        // opens on the first tick anchors exactly where the goal comes to rest.
+        let start = antennas_at([-0.4, 0.0]);
+        let (mut state, pinned) = armed_at(&cfg, &start);
+        let command = move_to(antennas_at([0.0, 0.0]), secs(0.3));
+
+        let mut present = pinned;
+        let mut arrived = None;
+        let mut faulted = None;
+        for n in 0..cfg.tracking.ticks {
+            // Walking away from the goal, in the direction the anchor lies from
+            // it, and faster every tick than the progress minimum.
+            present.antennas[0] = 0.05 * f64::from(n);
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            if let Some(fault) = out.report.fault {
+                let Fault::TrackingLost { joint, .. } = fault else {
+                    panic!("expected a tracking fault at tick {n}, got {fault}");
+                };
+                assert_eq!(joint, JointId::AntennaRight);
+                faulted = Some(n);
+                break;
+            }
+            assert_eq!(
+                out.report.tracking_count,
+                n + 1,
+                "the run re-anchored at tick {n}"
+            );
+            if arrived.is_none() && state.last_goal().antennas[0] == 0.0 {
+                arrived = Some(n);
+            }
+        }
+
+        let arrived = arrived.expect("the goal comes to rest on the anchor");
+        let faulted = faulted.expect("a joint walking away from a stopped goal faults");
+        assert_eq!(faulted, cfg.tracking.ticks - 1);
+        assert!(
+            faulted >= arrived + 5,
+            "the run stood on a goal at rest for {} ticks",
+            faulted - arrived
+        );
+    }
+
+    /// The progress minimum is a rate, and it is the line between the two: a
+    /// joint closing less than it over a whole window faults, and the same
+    /// crawl a shade faster runs indefinitely. Both sit far past the threshold
+    /// throughout, so only the closing rate separates them.
+    #[test]
+    fn a_crawl_below_the_progress_minimum_faults_and_one_above_it_does_not() {
+        let cfg = tracking_cfg(0.1, 0.01, 10);
+
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        let mut present = pinned;
+        present.body_yaw = 0.3;
+        let mut last = None;
+        for n in 1..=10u32 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            assert_eq!(out.report.tracking_count, n, "tick {n}");
+            last = out.report.fault;
+            // 0.0009 a tick is 0.0081 over the window, just under the minimum.
+            present.body_yaw -= 0.0009;
+        }
+        assert!(
+            matches!(
+                last,
+                Some(Fault::TrackingLost {
+                    joint: JointId::BodyYaw,
+                    ..
+                })
+            ),
+            "expected a tracking fault, got {last:?}"
+        );
+
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        let mut present = pinned;
+        present.body_yaw = 0.3;
+        for n in 1..=40u32 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            assert_eq!(out.report.fault, None, "tick {n}");
+            assert!(out.report.tracking_count <= cfg.tracking.ticks, "tick {n}");
+            // 0.0012 a tick is 0.0108 over the window, just over it.
+            present.body_yaw -= 0.0012;
+        }
+        assert!(
+            present.body_yaw > cfg.tracking.threshold_rad,
+            "still past the threshold the whole way: {}",
+            present.body_yaw
+        );
+    }
+
+    /// A tick that measured nothing freezes every run where it stands. Counting
+    /// stale ticks would run the window out on a read outage — during which the
+    /// move goes on, by design — and blame a joint nobody looked at.
+    #[test]
+    fn stale_ticks_freeze_every_run() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut stuck = pinned;
+        stuck.body_yaw += 0.3;
+
+        for n in 1..=3u32 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &stuck, None);
+            assert_eq!(out.report.tracking_count, n);
+        }
+
+        for n in 4..=13u32 {
+            let mut out = TickOutputs::default();
+            motion_tick(
+                &cfg,
+                &mut state,
+                &TickInputs {
+                    now: secs(f64::from(n) * 0.02),
+                    present: None,
+                    command: None,
+                    health: None,
+                },
+                &mut out,
+            );
+            assert_eq!(
+                out.report.tracking_worst(),
+                None,
+                "tick {n} measured nothing"
+            );
+            assert_eq!(out.report.tracking_count, 3, "tick {n} froze the run");
+            assert_eq!(out.report.fault, None, "tick {n}");
+        }
+
+        let out = tick_with(&cfg, &mut state, secs(0.28), &stuck, None);
+        assert_eq!(out.report.tracking_count, 4, "the run resumes where it was");
+        assert_eq!(out.report.fault, None);
+        let out = tick_with(&cfg, &mut state, secs(0.30), &stuck, None);
+        assert_eq!(
+            out.report.fault,
+            Some(Fault::TrackingLost {
+                joint: JointId::BodyYaw,
+                error: 0.3,
+            })
+        );
+    }
+
+    /// A lagging joint through a goal that reverses under it, in both the ways
+    /// this system produces one: a move abandoned and reversed mid-flight, and
+    /// two moves issued back to back the way `demo` does.
+    ///
+    /// The reversal is the case the signed advance could get wrong — a goal
+    /// crossing the anchor flips the sign of progress. It cannot get there: a
+    /// goal on its way to the anchor passes through the threshold band around
+    /// the joint first, which clears the run.
+    #[test]
+    fn a_lagging_joint_survives_a_goal_reversal() {
+        for (cfg, target, duration, lag) in regimes() {
+            let start = JointTargets::default();
+
+            // Back to back: the second move starts on the tick after the first
+            // finished, with the machine still that many goals behind.
+            let (mut state, pinned) = armed_at(&cfg, &start);
+            let mut machine = Follower::new(&pinned, lag);
+            let out = machine.run(&cfg, &mut state, &move_to(target, duration));
+            assert!(out.report.completed && out.report.fault.is_none());
+            let out = machine.run(&cfg, &mut state, &move_to(start, duration));
+            assert_eq!(out.report.fault, None, "the reversal faulted nothing");
+            assert!(out.report.completed);
+            assert!(
+                machine.worst > cfg.tracking.threshold_rad,
+                "the machine lagged through both moves: {}",
+                machine.worst
+            );
+
+            // Mid-flight: hold, then reverse, while the lag is at its largest.
+            let (mut state, pinned) = armed_at(&cfg, &start);
+            let mut machine = Follower::new(&pinned, lag);
+            // Halfway through the move at 50 Hz, where a min-jerk goal is
+            // moving fastest and the chase is furthest behind.
+            let half = (duration.as_secs_f64() * 25.0).round() as u32;
+            for n in 0..half {
+                let command = move_to(target, duration);
+                let out = machine.step(&cfg, &mut state, (n == 0).then_some(&command));
+                assert_eq!(out.report.fault, None, "tick {n}");
+            }
+            let held = machine.step(&cfg, &mut state, Some(&MotionCommand::Hold));
+            assert_eq!(held.report.command, CommandDisposition::Held);
+            let out = machine.run(&cfg, &mut state, &move_to(start, duration));
+            assert_eq!(
+                out.report.fault, None,
+                "the mid-flight reversal faulted nothing"
+            );
+            assert!(out.report.completed);
+            assert!(
+                machine.worst > cfg.tracking.threshold_rad,
+                "and it was lagging when the goal turned round: {}",
+                machine.worst
+            );
+        }
+    }
+
+    /// The nine runs are nine runs. A joint closing on its goal, and a joint
+    /// inside the threshold, neither hold up nor reset the run of the joint
+    /// that is stuck — and the fault names the joint whose window ran out, not
+    /// the one furthest from its goal.
+    #[test]
+    fn the_window_that_ran_out_names_its_own_joint() {
+        let cfg = tracking_cfg(0.1, 0.01, 5);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut present = pinned;
+        // Stuck, just past the threshold.
+        present.body_yaw = 0.15;
+        // Four times as far out, and closing on its goal every tick.
+        present.antennas[0] = 0.6;
+        // Comfortably inside the threshold, and staying there.
+        present.antennas[1] = 0.05;
+
+        let mut last = None;
+        for n in 1..=5u32 {
+            present.antennas[0] -= 0.03;
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            assert_eq!(
+                out.report.tracking_worst().expect("measured").0,
+                JointId::AntennaRight,
+                "tick {n}: the antenna is the furthest from its goal throughout"
+            );
+            assert_eq!(
+                out.report.tracking_count, n,
+                "tick {n}: the stuck joint's run is untouched by the other two"
+            );
+            last = out.report.fault;
+        }
+        assert_eq!(
+            last,
+            Some(Fault::TrackingLost {
+                joint: JointId::BodyYaw,
+                error: 0.15,
+            })
         );
     }
 
@@ -1400,7 +2181,6 @@ mod tests {
             &cfg.env,
             &held.head_pose_body,
             held.body_yaw,
-            held.antennas,
             None,
             &mut report,
         );
@@ -1608,6 +2388,7 @@ mod tests {
         let cfg = MotionConfig {
             tracking: TrackingFaultConfig {
                 threshold_rad: 0.1,
+                progress_min_rad: 0.01,
                 ticks: 1,
             },
             ..MotionConfig::default()
@@ -1878,7 +2659,7 @@ mod tests {
             assert!(!out.report.present_fresh, "tick {n}");
             assert_eq!(out.report.fault, None, "tick {n}");
             assert!(out.report.emitted, "tick {n} kept the move going");
-            assert_eq!(out.report.tracking_worst, None, "nothing was measured");
+            assert_eq!(out.report.tracking_worst(), None, "nothing was measured");
         }
         assert_ne!(
             *state.last_goal(),
@@ -2053,7 +2834,7 @@ mod tests {
             assert_eq!(fault.to_string(), expected);
         }
 
-        let refusals: [(CommandRejection, &str); 3] = [
+        let refusals: [(CommandRejection, &str); 4] = [
             (CommandRejection::AlreadyMoving, "a move is already running"),
             (
                 CommandRejection::Envelope(violations),
@@ -2063,10 +2844,221 @@ mod tests {
                 CommandRejection::Trajectory(TrajectoryError::NonPositiveDuration),
                 "the commanded move cannot be shaped: trajectory duration must be greater than zero",
             ),
+            (
+                CommandRejection::AntennaUnreachable {
+                    joint: JointId::AntennaLeft,
+                    angle: 2000.0,
+                },
+                "the commanded left antenna angle 2000.0000 rad is not commandable",
+            ),
         ];
         for (refusal, expected) in refusals {
             assert_eq!(refusal.to_string(), expected);
         }
+    }
+
+    /// The nine angles a set of antenna directions asks for, at the neutral
+    /// head pose.
+    fn antennas_at(antennas: [f64; 2]) -> JointTargets {
+        JointTargets {
+            antennas,
+            ..JointTargets::default()
+        }
+    }
+
+    /// An antenna target is a direction, resolved against the frame the machine
+    /// is already in. Run 4's geometry: the right antenna reads +162.334° after
+    /// torque-on and stow's fold is −174.752°, which is 22.9° away the near way
+    /// and 337° away the way a raw difference asks for. The near way is what
+    /// gets commanded.
+    #[test]
+    fn an_antenna_direction_resolves_to_the_nearest_representative() {
+        let cfg = MotionConfig::default();
+        let start = antennas_at([162.334_f64.to_radians(), 0.0]);
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let (_, out) = run_move(
+            &cfg,
+            &mut state,
+            &pinned,
+            &antennas_at([-3.05, 0.0]),
+            secs(2.0),
+            0.02,
+        );
+        assert!(out.report.completed, "{:?}", out.report.fault);
+
+        // It ended pointing at the fold, measured around the circle.
+        let landed = state.last_targets().antennas[0];
+        assert!(
+            wrap_to_pi(landed - (-3.05)).abs() < 1e-12,
+            "landed {landed}"
+        );
+
+        // And it got there the short way: 22.9° of sweep, not 337°.
+        let swept = landed - start.antennas[0];
+        assert!(
+            swept > 0.0 && swept < core::f64::consts::PI,
+            "swept {} rad",
+            swept
+        );
+        assert!(
+            (swept.to_degrees() - 22.914).abs() < 1e-3,
+            "swept {}°",
+            swept.to_degrees()
+        );
+    }
+
+    /// A direction a whole turn from the frame is the direction the machine is
+    /// already pointing, so it commands nothing at all.
+    #[test]
+    fn a_direction_a_whole_turn_from_the_frame_commands_no_motion() {
+        let cfg = MotionConfig::default();
+        let frame = 0.6;
+        let start = antennas_at([frame, frame]);
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let turns = core::f64::consts::TAU;
+        let (_, out) = run_move(
+            &cfg,
+            &mut state,
+            &pinned,
+            &antennas_at([frame + turns, frame - 3.0 * turns]),
+            secs(2.0),
+            0.02,
+        );
+        assert!(out.report.completed, "{:?}", out.report.fault);
+        for side in 0..2 {
+            let landed = state.last_targets().antennas[side];
+            assert!((landed - frame).abs() < 1e-12, "antenna {side} at {landed}");
+        }
+    }
+
+    /// Consecutive moves chain in the continuous frame: a machine found ten
+    /// turns out from zero takes stow, then neutral, then stow again, each a
+    /// sweep of half a turn or less, with no step and no fault. The frame it
+    /// ends in is ten turns from zero still — nothing renormalises it — and
+    /// every one of those poses points where it was asked to.
+    #[test]
+    fn antenna_moves_chain_in_the_continuous_frame() {
+        let cfg = MotionConfig::default();
+        let turns = 10.0 * core::f64::consts::TAU;
+        let start = antennas_at([turns, -turns]);
+        let (mut state, mut pinned) = armed_at(&cfg, &start);
+
+        let mut previous = start.antennas;
+        for directions in [[-3.05, 3.05], [0.0, 0.0], [-3.05, 3.05]] {
+            let (_, out) = run_move(
+                &cfg,
+                &mut state,
+                &pinned,
+                &antennas_at(directions),
+                secs(2.0),
+                0.02,
+            );
+            assert!(out.report.completed, "{:?}", out.report.fault);
+            pinned = out.goal.unwrap_or(pinned);
+
+            let landed = state.last_targets().antennas;
+            for side in 0..2 {
+                assert!(
+                    wrap_to_pi(landed[side] - directions[side]).abs() < 1e-12,
+                    "antenna {side} landed at {} for {}",
+                    landed[side],
+                    directions[side]
+                );
+                let swept = (landed[side] - previous[side]).abs();
+                assert!(
+                    swept <= core::f64::consts::PI,
+                    "antenna {side} swept {swept} rad"
+                );
+                assert!(
+                    (landed[side].abs() - turns).abs() < core::f64::consts::PI,
+                    "antenna {side} stayed in the frame it was found in: {}",
+                    landed[side]
+                );
+            }
+            previous = landed;
+        }
+    }
+
+    /// The one limit an antenna has: extended position mode's goal register
+    /// reaches ±1_048_575 counts and no further. The two ends are not mirror
+    /// images — zero radians sits half a turn up the count frame — so each is
+    /// pinned in its own direction. A goal past either is a typed refusal, and
+    /// so is a direction nobody can place. Neither is saturated, and neither
+    /// disturbs a holding machine.
+    #[test]
+    fn an_antenna_goal_no_count_represents_is_refused() {
+        let cfg = MotionConfig::default();
+        let edges = [
+            (ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MAX_RAD + 1.0),
+            (ANTENNA_GOAL_MIN_RAD, ANTENNA_GOAL_MIN_RAD - 1.0),
+        ];
+        for (edge, past) in edges {
+            let start = antennas_at([edge, 0.0]);
+            let (mut state, pinned) = armed_at(&cfg, &start);
+
+            let cases = [
+                (past, false),
+                (f64::NAN, true),
+                (f64::INFINITY, true),
+                (f64::NEG_INFINITY, true),
+            ];
+            for (direction, unplaceable) in cases {
+                let command = MotionCommand::MoveTo {
+                    target: antennas_at([direction, 0.0]),
+                    duration: secs(2.0),
+                    warp: Warp::MinJerk,
+                };
+                let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
+                let CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
+                    joint,
+                    angle,
+                }) = out.report.command
+                else {
+                    panic!(
+                        "expected a refusal for {direction}, got {:?}",
+                        out.report.command
+                    );
+                };
+                assert_eq!(joint, JointId::AntennaRight);
+                if unplaceable {
+                    assert!(!angle.is_finite(), "{direction} resolved to {angle}");
+                } else {
+                    assert!(
+                        !(ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&angle),
+                        "{direction} -> {angle}"
+                    );
+                }
+                // Refused, so nothing moved and nothing went out.
+                assert_eq!(out.report.mode, Mode::Holding);
+                assert!(out.goal.is_none());
+                assert_eq!(state.last_targets().antennas, start.antennas);
+            }
+
+            // The range's own edge is inside it: a bound admits its bound.
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(0.0),
+                &pinned,
+                Some(&MotionCommand::MoveTo {
+                    target: antennas_at([edge, 0.0]),
+                    duration: secs(2.0),
+                    warp: Warp::MinJerk,
+                }),
+            );
+            assert_eq!(out.report.command, CommandDisposition::Started);
+        }
+
+        // Half a turn apart from symmetric, and each end a whole turn clear of
+        // the other's magnitude: the asymmetry is the count frame's offset, not
+        // a rounding artefact.
+        let offset = ANTENNA_GOAL_MAX_RAD + ANTENNA_GOAL_MIN_RAD;
+        assert!(
+            (offset + core::f64::consts::TAU).abs() < 1e-9,
+            "the two ends sit {offset} rad apart from mirror images"
+        );
     }
 
     /// Two identical calls answer identically: the tick reads no clock and

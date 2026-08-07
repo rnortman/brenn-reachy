@@ -19,11 +19,17 @@
 //! is acknowledged by nothing at all, so there is nothing to read back and
 //! nothing to verify; it exists because streaming nine goals as nine verified
 //! writes would not fit in a control period.
+//!
+//! Non-volatile registers are refused on every write path but one. The
+//! exception reads the servo's Torque Enable first and refuses unless it is
+//! off, because a servo holding torque ignores such a write and acknowledges it
+//! anyway.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 use dxl_proto::frame::{CRC_LEN, MAX_STATUS_PARAMS, PREAMBLE_LEN};
+use dxl_proto::regs::TORQUE_ENABLE;
 use dxl_proto::{
     BROADCAST_ID, DecodeStep, MAX_FRAME_BUF, MAX_INSTR_FRAME, Reg, StatusDecoder, StatusError,
     encode_ping, encode_read, encode_sync_read, encode_sync_write, encode_write,
@@ -310,19 +316,53 @@ impl<P: BusPort> Bus<P> {
 
     /// Writes `value` to `reg` on `id`, then reads it back and compares.
     ///
-    /// Refuses non-volatile registers outright.
+    /// Refuses non-volatile registers outright: [`Self::write_eeprom_verified`]
+    /// is the only path that writes one, and it establishes torque-off first.
     pub fn write_reg_verified(
         &mut self,
         id: u8,
         reg: Reg,
         value: &RawValue,
     ) -> Result<(), XactError> {
-        // TODO(provisioning-repair): a guarded path that may write a
-        // non-volatile register belongs here, behind evidence that torque is
-        // off. Nothing in this project writes one, so none is offered.
+        // TODO(provisioning-repair): the guarded path below writes the one
+        // non-volatile register this project provisions itself. Repairing a
+        // vendor-provisioned register — a homing offset, a travel limit — is
+        // still refused here and still undecided.
         if reg.is_eeprom() {
             return Err(XactError::EepromRefused { id, addr: reg.addr });
         }
+        self.write_and_verify(id, reg, value)
+    }
+
+    /// Writes `value` to a non-volatile `reg` on `id`, having established that
+    /// the servo is not holding torque, then reads it back and compares.
+    ///
+    /// Both halves are load-bearing. A servo accepts a non-volatile write only
+    /// while its torque is off and acknowledges one it ignored, so torque is
+    /// read here rather than assumed, and the read-back is what says the write
+    /// took. Either half alone reports a no-op as a success.
+    ///
+    /// The window between the read and the write is the host's own: nothing
+    /// else on this bus enables torque, and a servo that gained it in between
+    /// fails the read-back rather than passing quietly.
+    pub fn write_eeprom_verified(
+        &mut self,
+        id: u8,
+        reg: Reg,
+        value: &RawValue,
+    ) -> Result<(), XactError> {
+        let torque = self.read_reg(id, TORQUE_ENABLE)?;
+        // A reply of another width cannot happen — the read checks its own — and
+        // if it did, "not demonstrably off" is the only safe reading of it.
+        if torque.u8().is_none_or(|held| held != 0) {
+            return Err(XactError::TorqueHeld { id, addr: reg.addr });
+        }
+        self.write_and_verify(id, reg, value)
+    }
+
+    /// The write itself: put it on the wire, take the acknowledgement, read the
+    /// register back and compare it count-exact.
+    fn write_and_verify(&mut self, id: u8, reg: Reg, value: &RawValue) -> Result<(), XactError> {
         if value.len() != usize::from(reg.len) {
             return Err(XactError::ValueWidth {
                 id,
@@ -696,10 +736,11 @@ mod tests {
     use std::io;
 
     use dxl_proto::frame::{
-        HEADER, IDX_ID, IDX_INSTRUCTION, INST_STATUS, INST_SYNC_WRITE, MIN_STATUS_LEN,
+        HEADER, IDX_ID, IDX_INSTRUCTION, INST_READ, INST_STATUS, INST_SYNC_WRITE, INST_WRITE,
+        MIN_STATUS_LEN,
     };
     use dxl_proto::regs::{
-        GOAL_POSITION, HARDWARE_ERROR_STATUS, HOMING_OFFSET, PRESENT_POSITION, TORQUE_ENABLE,
+        GOAL_POSITION, HARDWARE_ERROR_STATUS, HOMING_OFFSET, OPERATING_MODE, PRESENT_POSITION,
     };
     use dxl_proto::{Area, FrameError, StatusCode, crc16};
 
@@ -1004,6 +1045,108 @@ mod tests {
         };
         assert_eq!(wrote.u8(), Some(1));
         assert_eq!(read_back.u8(), Some(0));
+    }
+
+    /// The guarded path reads torque before it writes, and a servo holding it
+    /// gets nothing: a non-volatile write under torque is ignored by the servo
+    /// and acknowledged anyway, so an unguarded "success" here is the worst
+    /// available outcome.
+    #[test]
+    fn a_guarded_write_to_a_servo_holding_torque_writes_nothing() {
+        let mut bus = bus_over(&[status(17, 0, &[1])]);
+        let value = RawValue::new(&[4]).expect("one byte");
+        let failure = bus
+            .write_eeprom_verified(17, OPERATING_MODE, &value)
+            .expect_err("the servo is holding torque");
+        assert!(matches!(
+            failure,
+            XactError::TorqueHeld { id: 17, addr: 11 }
+        ));
+        // What the operator reads: which servo, which register, and that the
+        // register takes the write once the torque is off.
+        assert_eq!(
+            failure.to_string(),
+            "servo 17 is holding torque; register 11 takes a write only once it is released"
+        );
+        assert_eq!(
+            bus.port.writes.len(),
+            1,
+            "the torque read went out and nothing else"
+        );
+        let frame = &bus.port.writes[0];
+        assert_eq!(frame[IDX_INSTRUCTION], INST_READ);
+        let params = &frame[IDX_INSTRUCTION + 1..frame.len() - CRC_LEN];
+        assert_eq!(
+            u16::from_le_bytes([params[0], params[1]]),
+            TORQUE_ENABLE.addr
+        );
+    }
+
+    /// With torque off the write goes out and is read back count-exact.
+    #[test]
+    fn a_guarded_write_with_torque_off_is_read_back_and_compared() {
+        let mut bus = bus_over(&[status(17, 0, &[0]), status(17, 0, &[]), status(17, 0, &[4])]);
+        let value = RawValue::new(&[4]).expect("one byte");
+        bus.write_eeprom_verified(17, OPERATING_MODE, &value)
+            .expect("the read-back matched");
+        assert_eq!(
+            bus.port.writes.len(),
+            3,
+            "a torque read, the write, and its read-back"
+        );
+        let frame = &bus.port.writes[1];
+        assert_eq!(frame[IDX_INSTRUCTION], INST_WRITE);
+        let params = &frame[IDX_INSTRUCTION + 1..frame.len() - CRC_LEN];
+        assert_eq!(
+            u16::from_le_bytes([params[0], params[1]]),
+            OPERATING_MODE.addr
+        );
+        assert_eq!(params[2], 4);
+    }
+
+    /// A servo that acknowledged the write and kept its old value fails, with
+    /// both values named. This is what an EEPROM write the firmware dropped
+    /// looks like from the host, and it is the reason the read-back exists.
+    #[test]
+    fn a_guarded_write_the_servo_ignored_is_a_typed_failure() {
+        let mut bus = bus_over(&[status(17, 0, &[0]), status(17, 0, &[]), status(17, 0, &[3])]);
+        let value = RawValue::new(&[4]).expect("one byte");
+        let failure = bus
+            .write_eeprom_verified(17, OPERATING_MODE, &value)
+            .expect_err("the servo kept mode 3");
+        let XactError::VerifyMismatch {
+            id,
+            addr,
+            wrote,
+            read_back,
+        } = failure
+        else {
+            panic!("expected a verify mismatch, got {failure:?}");
+        };
+        assert_eq!((id, addr), (17, OPERATING_MODE.addr));
+        assert_eq!(wrote.u8(), Some(4));
+        assert_eq!(read_back.u8(), Some(3));
+    }
+
+    /// The guarded path is the only one: everything else still refuses a
+    /// non-volatile register with nothing on the wire.
+    #[test]
+    fn every_other_path_still_refuses_a_non_volatile_write() {
+        let value = RawValue::new(&[4]).expect("one byte");
+
+        let mut bus = bus_over(&[]);
+        assert!(matches!(
+            bus.write_reg_verified(17, OPERATING_MODE, &value),
+            Err(XactError::EepromRefused { id: 17, addr: 11 })
+        ));
+        assert!(bus.port.writes.is_empty());
+
+        let mut bus = bus_over(&[]);
+        assert!(matches!(
+            bus.sync_write(OPERATING_MODE, &[(17, value), (18, value)]),
+            Err(XactError::EepromRefused { addr: 11, .. })
+        ));
+        assert!(bus.port.writes.is_empty());
     }
 
     #[test]

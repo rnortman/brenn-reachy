@@ -629,7 +629,6 @@ mod tests {
             &EnvelopeConfig::default(),
             &targets.head_pose_body,
             targets.body_yaw,
-            targets.antennas,
             None,
             &mut report,
         )

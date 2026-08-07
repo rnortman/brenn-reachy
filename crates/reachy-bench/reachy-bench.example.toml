@@ -59,9 +59,9 @@ head_cone_limit_deg = 35.0
 # travel, so this floor is what binds there rather than the stops. A pose below
 # it is admissible only while it is strictly increasing clearance.
 min_toggle_margin_mm = 3.0
-# The magnitude the stow pose uses. The antennas have no servo-side envelope in
-# any operating mode, so this is the only bound on them there is.
-antenna_limit_rad = 3.05
+# The antennas are not here. They are free rotors turning a full circle with no
+# hard stop and nothing behind them for a bound to guard, so the only thing asked
+# of a commanded antenna angle is that a servo count represents it.
 
 [motion]
 tick_hz = 50
@@ -73,14 +73,29 @@ health_poll_hz = 1
 # whole 2.2 rad window peaks near 0.041 rad per tick at 50 Hz.
 max_step_legs_rad = 0.05
 max_step_body_yaw_rad = 0.05
-# The antennas sweep the full 6.1 rad between their stow positions, which over
-# two seconds peaks near 0.114.
+# An antenna target resolves to within half a turn of the frame the machine is
+# in, so the longest sweep it can be asked for is π: over two seconds that peaks
+# near 0.059 rad per tick at 50 Hz, and this leaves better than double the room.
 max_step_antennas_rad = 0.15
-# How far a joint may lag its goal before the lag starts counting, and how many
-# consecutive lagging ticks are a fault. Both provisional: nothing has measured
-# this linkage's real position error under load, and they are sized to sit well
-# outside what the position gains should permit rather than derived.
+# The tracking fault, in three numbers. A joint further than the threshold from
+# its goal is examined; over a window of that many ticks it must close at least
+# the progress minimum on where its goal lies, or the tick faults and stops
+# commanding. Distance alone says nothing: these servos run a proportional loop
+# with no integral term, so a joint chasing a streamed goal sits behind it in
+# proportion to commanded speed — 0.43 rad on an antenna moving at 4.91 rad/s,
+# while following it perfectly. Closing is what separates that from a stall.
+#
+# The threshold and the window stay provisional, sized rather than measured;
+# every move records its per-joint worst lag, and those are the numbers that
+# will ground them. Lowering the threshold below any of the three step bounds
+# above is refused by name: progress is measured from where a joint stood when
+# its lag began, and a goal able to step past that point in one tick would read
+# a following joint as one running away. The progress minimum is about 6.5 of
+# the servos' 0.088° counts: over ten ticks at 50 Hz it asks a lagging joint for
+# 0.05 rad/s of closing speed, an order of magnitude under the fastest leg
+# motion this bench commands.
 tracking_threshold_rad = 0.15
+tracking_progress_min_rad = 0.01
 tracking_ticks = 10
 # Consecutive ticks with no position read before the read-loss fault. Omit for
 # one second at the tick rate.
@@ -142,12 +157,13 @@ antenna_gains = { p = 200, i = 0, d = 0 }
 # this bench actually makes rather than invented.
 #
 # Provisional, from arithmetic and not from a measurement. Velocity is in units
-# of 0.229 rev/min: the fastest planned motion is the antennas' 6.1 rad sweep in
-# two seconds, whose shaped peak is 5.72 rad/s, or 54.6 rev/min, or 239 units —
-# 300 leaves that about a quarter more room and still stops a full-scale jump.
-# Acceleration is in units of 214.577 rev/min²: the same sweep peaks at
-# 8.8 rad/s², or 23.5 units, and 50 is twice that. Both want revisiting against
-# what the first supervised arm measures.
+# of 0.229 rev/min: the fastest motion this bench can command is an antenna's
+# half-turn sweep in two seconds — every antenna target resolves to within half a
+# turn of the frame — whose shaped peak is 2.95 rad/s, or 28.1 rev/min, or 123
+# units, and 300 leaves better than double that while still stopping a full-scale
+# jump. Acceleration is in units of 214.577 rev/min²: the same sweep peaks at
+# 4.53 rad/s², or 12.1 units, and 50 is four times that. Both want revisiting
+# against what the first supervised arm measures.
 profile_acceleration = 50
 profile_velocity = 300
 
@@ -159,7 +175,10 @@ profile_velocity = 300
 # switched off. Provisional — what error the legs settle to under the head's
 # weight at stow has not been measured.
 tolerance_deg = 2.0
-# How long the platform settles at stow before torque comes off.
+# How long the platform is left to settle before it is measured against stow.
+# The settle runs first, so the check judges where the head came to rest rather
+# than where it was the instant the stow trajectory ended — a joint still
+# closing the lag its position loop runs is not a joint away from stow.
 dwell_s = 2.0
 
 [provision]
@@ -168,11 +187,12 @@ dwell_s = 2.0
 # a person compares against how the unit was set up. Arming verifies these before
 # it writes anything and repairs none of them.
 return_delay_time = 0
-# Position mode. Anything else voids the servo-side position envelope entirely
-# and makes a torque enable a current-limited runaway, and the state is reachable
-# in practice because the vendor's own daemon switches modes as ordinary
-# operation. Checked on all nine before anything is written or enabled.
-operating_mode = 3
+# The operating mode is deliberately not a key here. It differs per servo — the
+# body and the legs in single-turn position mode, the two antennas in extended
+# position, which is what makes a free-turning antenna reachable the short way
+# from anywhere — and it is not an operator's to choose, so the nine expected
+# modes are baked into the library and checked on every servo before anything is
+# written or enabled. `reachy-bench provision` is what writes the antennas'.
 drive_mode = 0
 # Disabled. On this linkage a servo that stops holding its goal drops the head,
 # and a latched watchdog answers writes with the same error an out-of-range goal

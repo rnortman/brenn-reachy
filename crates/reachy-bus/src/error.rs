@@ -108,6 +108,17 @@ pub enum XactError {
         addr: u16,
     },
 
+    /// A non-volatile write to a servo that was holding torque, refused before
+    /// anything went out. Torque is read rather than assumed: a servo ignores a
+    /// non-volatile write while its torque is on and acknowledges it anyway.
+    #[error("servo {id} is holding torque; register {addr} takes a write only once it is released")]
+    TorqueHeld {
+        /// The servo addressed.
+        id: u8,
+        /// Control-table address.
+        addr: u16,
+    },
+
     /// A value whose width disagrees with the register it addresses.
     #[error("servo {id} register {addr} is {expected} bytes wide, value is {actual}")]
     ValueWidth {
@@ -188,6 +199,7 @@ impl XactError {
             | Self::LongReply { id, .. }
             | Self::VerifyMismatch { id, .. }
             | Self::EepromRefused { id, .. }
+            | Self::TorqueHeld { id, .. }
             | Self::ValueWidth { id, .. }
             | Self::RegisterTooWide { id, .. }
             | Self::Encode { id, .. }
@@ -412,6 +424,7 @@ mod tests {
                 read_back: value,
             },
             XactError::EepromRefused { id: 17, addr: 20 },
+            XactError::TorqueHeld { id: 17, addr: 11 },
             XactError::ValueWidth {
                 id: 18,
                 addr: 64,
@@ -433,7 +446,7 @@ mod tests {
                 source: io::Error::from(io::ErrorKind::BrokenPipe),
             },
         ];
-        let expected = [11, 12, 13, 14, 15, 16, 17, 18, 10, 11, 12];
+        let expected = [11, 12, 13, 14, 15, 16, 17, 17, 18, 10, 11, 12];
         for (failure, id) in failures.iter().zip(expected) {
             assert_eq!(failure.id(), id, "{failure}");
         }

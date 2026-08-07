@@ -41,9 +41,9 @@ use thiserror::Error;
 use reachy_bus::{BusTiming, DEFAULT_BAUD, MapError, ServoMap};
 use reachy_kin::{EnvelopeConfig, FkOptions, HeadGeometry, IkError, baked};
 use reachy_motion::{
-    ArmConfig, DisarmConfig, Gains, GroupGains, JointId, JointStep, MotionConfig, ProfileConfig,
-    ProvisionExpect, ProvisionTable, RegId, RegValue, TrackingFaultConfig, VENDOR_HOMING_OFFSETS,
-    stow_targets,
+    ArmConfig, DisarmConfig, EXPECTED_OPERATING_MODES, Gains, GroupGains, JointId, JointStep,
+    MotionConfig, ProfileConfig, ProvisionExpect, ProvisionTable, RegId, RegValue,
+    TrackingFaultConfig, VENDOR_HOMING_OFFSETS, stow_targets,
 };
 
 /// One encoder count, radians — the finest distinction a position register can
@@ -78,6 +78,22 @@ pub enum ConfigError {
     NotPositiveInt {
         /// The configuration key, in `table.key` form.
         key: &'static str,
+    },
+
+    /// A per-tick step bound wider than the tracking threshold, which would let
+    /// a goal move past an open tracking run's anchor in one period and fault a
+    /// joint that is following.
+    #[error(
+        "{key} is {step} rad, wider than motion.tracking_threshold_rad ({threshold} rad): a goal \
+         stepping that far in one period can be read as a joint running away from it"
+    )]
+    StepPastTrackingThreshold {
+        /// The step bound's configuration key, in `table.key` form.
+        key: &'static str,
+        /// What the file said the step bound is, radians.
+        step: f64,
+        /// The threshold it must not exceed, radians.
+        threshold: f64,
     },
 
     /// A positive number of seconds that is longer than a duration can hold.
@@ -301,8 +317,6 @@ pub struct EnvelopeSection {
     pub head_cone_limit_deg: f64,
     /// Floor on the per-pose toggle margin, millimetres.
     pub min_toggle_margin_mm: f64,
-    /// Antenna cap, radians, symmetric about zero.
-    pub antenna_limit_rad: f64,
 }
 
 impl Default for EnvelopeSection {
@@ -322,7 +336,6 @@ impl Default for EnvelopeSection {
             relative_yaw_limit_deg: 55.0,
             head_cone_limit_deg: 35.0,
             min_toggle_margin_mm: 3.0,
-            antenna_limit_rad: 3.05,
         }
     }
 }
@@ -342,10 +355,13 @@ pub struct MotionSection {
     pub max_step_body_yaw_rad: f64,
     /// Bound on either antenna's change per tick, radians.
     pub max_step_antennas_rad: f64,
-    /// How far a joint may lag its goal before the lag starts counting,
+    /// How far a joint may lag its goal before the lag is examined at all,
     /// radians.
     pub tracking_threshold_rad: f64,
-    /// How many consecutive lagging ticks are a tracking fault.
+    /// How far a lagging joint must close on its goal, over a window of
+    /// `tracking_ticks`, to count as following it, radians.
+    pub tracking_progress_min_rad: f64,
+    /// How many consecutive lagging, non-closing ticks are a tracking fault.
     pub tracking_ticks: u32,
     /// Consecutive ticks without a position read before the read-loss fault.
     /// Absent means one second at the tick rate.
@@ -374,6 +390,7 @@ impl Default for MotionSection {
             max_step_body_yaw_rad: defaults.max_step.body_yaw,
             max_step_antennas_rad: defaults.max_step.antennas,
             tracking_threshold_rad: defaults.tracking.threshold_rad,
+            tracking_progress_min_rad: defaults.tracking.progress_min_rad,
             tracking_ticks: defaults.tracking.ticks,
             read_loss_ticks: None,
             stow_duration_s: 2.0,
@@ -511,7 +528,8 @@ pub struct DisarmSection {
     /// How far a joint may be from its stow angle and still count as at stow,
     /// degrees.
     pub tolerance_deg: f64,
-    /// How long the platform settles at stow before torque comes off, seconds.
+    /// How long the platform is left to settle before it is measured against
+    /// stow, seconds.
     pub dwell_s: f64,
 }
 
@@ -540,16 +558,15 @@ impl Default for DisarmSection {
 /// being true the moment this process has armed once — so they are read and
 /// reported rather than checked, and arming's own read-back is the sole
 /// authority on what they hold. The gains are absent for the same reason.
+///
+/// The operating mode is absent for a third: it differs per servo and is not an
+/// operator's to choose, so it is baked in
+/// [`reachy_motion::EXPECTED_OPERATING_MODES`] and checked from there.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvisionSection {
     /// Return Delay Time, all nine servos.
     pub return_delay_time: u8,
-    /// Operating Mode, all nine. Anything but position mode voids the
-    /// servo-side position envelope entirely and makes a torque enable a
-    /// current-limited runaway, so it is checked on every servo before anything
-    /// is written.
-    pub operating_mode: u8,
     /// Drive Mode, all nine.
     pub drive_mode: u8,
     /// Bus Watchdog, all nine. Disabled: on this linkage a servo that stops
@@ -576,8 +593,6 @@ impl Default for ProvisionSection {
     fn default() -> Self {
         Self {
             return_delay_time: 0,
-            // Position mode.
-            operating_mode: 3,
             drive_mode: 0,
             bus_watchdog: 0,
             temperature_limit: 70,
@@ -714,7 +729,6 @@ impl BenchConfig {
                 "envelope.min_toggle_margin_mm",
                 section.min_toggle_margin_mm,
             )? / 1000.0,
-            antenna_limit: positive("envelope.antenna_limit_rad", section.antenna_limit_rad)?,
         })
     }
 
@@ -763,28 +777,55 @@ impl BenchConfig {
     ) -> Result<MotionConfig, ConfigError> {
         let section = &self.motion;
         let tick_hz = positive_int("motion.tick_hz", section.tick_hz)?;
+        let max_step = JointStep {
+            legs: positive("motion.max_step_legs_rad", section.max_step_legs_rad)?,
+            body_yaw: positive(
+                "motion.max_step_body_yaw_rad",
+                section.max_step_body_yaw_rad,
+            )?,
+            antennas: positive(
+                "motion.max_step_antennas_rad",
+                section.max_step_antennas_rad,
+            )?,
+        };
+        let tracking = TrackingFaultConfig {
+            threshold_rad: positive(
+                "motion.tracking_threshold_rad",
+                section.tracking_threshold_rad,
+            )?,
+            progress_min_rad: positive(
+                "motion.tracking_progress_min_rad",
+                section.tracking_progress_min_rad,
+            )?,
+            ticks: positive_int("motion.tracking_ticks", section.tracking_ticks)?,
+        };
+        // The tracking monitor measures a joint's progress from where it stood
+        // when its run opened, signed toward the goal, so a goal that moves
+        // past that anchor in one period reverses the sign on a joint that is
+        // following healthily. What keeps a goal from getting there is the step
+        // guard: a per-tick step no wider than the threshold cannot cross the
+        // band of tolerated error around the joint, and a run inside that band
+        // has already cleared. The two bounds are therefore checked against
+        // each other rather than only for positivity.
+        for (key, step) in [
+            ("motion.max_step_legs_rad", max_step.legs),
+            ("motion.max_step_body_yaw_rad", max_step.body_yaw),
+            ("motion.max_step_antennas_rad", max_step.antennas),
+        ] {
+            if step > tracking.threshold_rad {
+                return Err(ConfigError::StepPastTrackingThreshold {
+                    key,
+                    step,
+                    threshold: tracking.threshold_rad,
+                });
+            }
+        }
         Ok(MotionConfig {
             geom,
             env,
             fk: FkOptions::default(),
-            max_step: JointStep {
-                legs: positive("motion.max_step_legs_rad", section.max_step_legs_rad)?,
-                body_yaw: positive(
-                    "motion.max_step_body_yaw_rad",
-                    section.max_step_body_yaw_rad,
-                )?,
-                antennas: positive(
-                    "motion.max_step_antennas_rad",
-                    section.max_step_antennas_rad,
-                )?,
-            },
-            tracking: TrackingFaultConfig {
-                threshold_rad: positive(
-                    "motion.tracking_threshold_rad",
-                    section.tracking_threshold_rad,
-                )?,
-                ticks: positive_int("motion.tracking_ticks", section.tracking_ticks)?,
-            },
+            max_step,
+            tracking,
             // One second of silence at the configured rate, unless the file says
             // otherwise.
             read_loss_ticks: match section.read_loss_ticks {
@@ -805,10 +846,6 @@ impl BenchConfig {
         table.set_all(
             RegId::ReturnDelayTime,
             ProvisionExpect::Check(RegValue::U8(section.return_delay_time)),
-        );
-        table.set_all(
-            RegId::OperatingMode,
-            ProvisionExpect::Check(RegValue::U8(section.operating_mode)),
         );
         table.set_all(
             RegId::DriveMode,
@@ -845,8 +882,8 @@ impl BenchConfig {
         table.set_all(RegId::Shutdown, ProvisionExpect::Record);
         table.set_all(RegId::MinPositionLimit, ProvisionExpect::Record);
         table.set_all(RegId::MaxPositionLimit, ProvisionExpect::Record);
-        // Checked against the workspace's one record of the datum, not a
-        // per-unit setting.
+        // Checked against the workspace's one record of the datum and of the
+        // per-servo modes, neither of them a per-unit setting.
         for (row, joint) in JointId::ALL.iter().enumerate() {
             table.set(
                 *joint,
@@ -857,6 +894,11 @@ impl BenchConfig {
                 *joint,
                 RegId::HomingOffset,
                 ProvisionExpect::Check(RegValue::I32(VENDOR_HOMING_OFFSETS[row])),
+            );
+            table.set(
+                *joint,
+                RegId::OperatingMode,
+                ProvisionExpect::Check(RegValue::U8(EXPECTED_OPERATING_MODES[row])),
             );
         }
         for leg in 0..6u8 {
@@ -1191,7 +1233,6 @@ provenance = \"test fixture\"
         assert_eq!(env.relative_yaw_limit, library.relative_yaw_limit);
         assert_eq!(env.head_cone_limit, library.head_cone_limit);
         assert!((env.min_toggle_margin - library.min_toggle_margin).abs() < 1e-15);
-        assert_eq!(env.antenna_limit, library.antenna_limit);
         // The one deliberate departure: the bench works well inside the
         // mechanical yaw figure.
         assert!(env.body_yaw_limit < library.body_yaw_limit);
@@ -1487,9 +1528,6 @@ provenance = \"test fixture\"
             ("envelope.min_toggle_margin_mm", |c| {
                 c.envelope.min_toggle_margin_mm = 0.0;
             }),
-            ("envelope.antenna_limit_rad", |c| {
-                c.envelope.antenna_limit_rad = f64::INFINITY;
-            }),
             ("motion.max_step_legs_rad", |c| {
                 c.motion.max_step_legs_rad = 0.0;
             }),
@@ -1501,6 +1539,9 @@ provenance = \"test fixture\"
             }),
             ("motion.tracking_threshold_rad", |c| {
                 c.motion.tracking_threshold_rad = 0.0;
+            }),
+            ("motion.tracking_progress_min_rad", |c| {
+                c.motion.tracking_progress_min_rad = 0.0;
             }),
             ("arm.min_arm_voltage", |c| {
                 c.arm.min_arm_voltage = 0.0;
@@ -1551,6 +1592,61 @@ provenance = \"test fixture\"
         let timing = cfg.resolve().expect("resolves").timing;
         assert_eq!(timing.retry_attempts, 0);
         assert_eq!(timing.retry_spacing, Duration::ZERO);
+    }
+
+    /// A step bound wider than the tracking threshold refuses, naming both
+    /// numbers.
+    ///
+    /// Nothing in the file's own numbers says the two are related, so
+    /// lowering the threshold has to be refused rather than silently arming
+    /// a spurious fault.
+    #[test]
+    fn a_step_bound_wider_than_the_tracking_band_refuses() {
+        let shipped = minimal();
+        shipped
+            .resolve()
+            .expect("the shipped numbers hold the invariant");
+
+        let cases: [Mutation; 3] = [
+            ("motion.max_step_legs_rad", |c| {
+                c.motion.max_step_legs_rad = 0.2;
+            }),
+            ("motion.max_step_body_yaw_rad", |c| {
+                c.motion.max_step_body_yaw_rad = 0.2;
+            }),
+            ("motion.max_step_antennas_rad", |c| {
+                c.motion.max_step_antennas_rad = 0.2;
+            }),
+        ];
+        for (key, mutate) in cases {
+            let mut cfg = minimal();
+            mutate(&mut cfg);
+            cfg.motion.tracking_threshold_rad = 0.1;
+            let error = cfg.resolve().unwrap_err();
+            assert_eq!(
+                error,
+                ConfigError::StepPastTrackingThreshold {
+                    key,
+                    step: 0.2,
+                    threshold: 0.1,
+                },
+                "{key}"
+            );
+            let printed = error.to_string();
+            assert!(printed.contains(key), "{printed}");
+            assert!(
+                printed.contains("motion.tracking_threshold_rad"),
+                "{printed}"
+            );
+        }
+
+        // Equal is the shipped relationship and is admitted: a goal step of
+        // exactly the threshold reaches the edge of the band, not past it.
+        let mut cfg = minimal();
+        cfg.motion.max_step_legs_rad = 0.15;
+        cfg.motion.tracking_threshold_rad = 0.15;
+        cfg.resolve()
+            .expect("a step of exactly the band is admitted");
     }
 
     /// A number of seconds no duration can hold is a refusal naming the key, not
@@ -1615,14 +1711,17 @@ provenance = \"test fixture\"
         // two per-leg position limits that are checked rather than recorded.
         assert_eq!(table.reads(), table.checks() + 6 * 9 - 2 * 6);
 
+        // The mode is per servo and not a key: single-turn position on the body
+        // and the legs, extended position on the two free-turning antennas.
         let column = ProvisionTable::column(RegId::OperatingMode).expect("provisioned");
-        for row in 0..JointId::COUNT {
+        for (row, mode) in EXPECTED_OPERATING_MODES.into_iter().enumerate() {
             assert_eq!(
                 table.at(row, column),
-                Some(ProvisionExpect::Check(RegValue::U8(3))),
+                Some(ProvisionExpect::Check(RegValue::U8(mode))),
                 "row {row}"
             );
         }
+        assert_eq!(EXPECTED_OPERATING_MODES, [3, 3, 3, 3, 3, 3, 3, 4, 4]);
 
         // The offset register is signed, so a negative quarter turn is checked
         // and reported as one rather than as a span near four billion.
@@ -1688,6 +1787,21 @@ provenance = \"test fixture\"
         );
         let message = format!("{:#}", stale.expect_err("there is no such key"));
         assert!(message.contains("repin_tolerance_deg"), "{message}");
+
+        // `antenna_limit_rad` is not a recognised key: a file carrying it
+        // says so rather than setting nothing.
+        let stale = parse(&format!(
+            "{MINIMAL}\n[envelope]\nantenna_limit_rad = 3.05\n"
+        ));
+        let message = format!("{:#}", stale.expect_err("there is no such key"));
+        assert!(message.contains("antenna_limit_rad"), "{message}");
+
+        // `operating_mode` is a per-servo record in the library, not a
+        // configuration key. A file setting it is refused rather than silently
+        // accepted with wrong antenna expectations.
+        let stale = parse(&format!("{MINIMAL}\n[provision]\noperating_mode = 3\n"));
+        let message = format!("{:#}", stale.expect_err("there is no such key"));
+        assert!(message.contains("operating_mode"), "{message}");
     }
 
     #[test]

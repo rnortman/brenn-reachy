@@ -1283,6 +1283,34 @@ mod runner_tests {
         assert_eq!(report.outcome(Case::Health), Outcome::Pass);
     }
 
+    /// An antenna still in single-turn position mode fails the sweep by name.
+    ///
+    /// This is the gate a unit meets before it is provisioned: the antennas are
+    /// expected in extended position (4), which the vendor does not set, so the
+    /// first self-test on a fresh unit fails here and `provision` is the answer.
+    /// The seven other servos are expected in single-turn mode on the same run,
+    /// so the expectation is genuinely per servo rather than one value.
+    #[test]
+    fn an_antenna_in_single_turn_mode_fails_the_sweep_by_name() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(17, reg_for(RegId::OperatingMode), &[3]);
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("servo 17 operating mode"), "{printed}");
+        assert!(
+            printed.contains('4'),
+            "the expected mode is named: {printed}"
+        );
+
+        // The same fixture with the antennas as this project provisions them
+        // passes, so the case above is the mode and not the fixture.
+        let (report, _) = run(&cfg, machine_at(&cfg, &stow_legs()));
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Pass);
+    }
+
     /// A rail under the arm floor fails, and the reading is reported either way.
     #[test]
     fn a_rail_under_the_arm_floor_fails_and_says_which_servo() {

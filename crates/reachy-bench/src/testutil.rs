@@ -53,10 +53,17 @@ pub(crate) struct FakeMachine {
     /// the only way a test can put a limp servo's goal anywhere but where it
     /// stands.
     pub(crate) unmirrored: Vec<u8>,
-    /// Per servo, how many counts short of its goal a torqued servo comes to
-    /// rest: the standing error of a loaded position loop. Zero is the perfect
-    /// tracking the rest of the fixture assumes.
-    pub(crate) lag: HashMap<u8, i32>,
+    /// Per servo, how many goal writes behind its present position runs: a
+    /// position loop chasing a streamed goal rather than arriving instantly.
+    /// The error such a servo shows is proportional to how fast the goal is
+    /// moving, which is what a real one does.
+    pub(crate) delay: HashMap<u8, usize>,
+    /// Goals written to a delayed servo and not yet reached, oldest first.
+    queued: HashMap<u8, VecDeque<Vec<u8>>>,
+    /// Servos that take their goals and do not move: a stalled motor, or a
+    /// write the servo never applied. Nothing on the wire distinguishes the
+    /// two, which is why the tick watches positions at all.
+    pub(crate) stalled: Vec<u8>,
     out: VecDeque<u8>,
 }
 
@@ -70,7 +77,9 @@ impl FakeMachine {
             mute: HashMap::new(),
             damaged: Vec::new(),
             unmirrored: Vec::new(),
-            lag: HashMap::new(),
+            delay: HashMap::new(),
+            queued: HashMap::new(),
+            stalled: Vec::new(),
             out: VecDeque::new(),
         }
     }
@@ -111,17 +120,20 @@ impl FakeMachine {
     /// Take a write, whether it came unicast or in a grouped frame.
     ///
     /// A servo in position mode reports where its goal put it. This fixture
-    /// models that as instant, so a position read after a goal write sees the
-    /// written value, short of it by whatever lag the servo was given. A goal
-    /// written to a mirroring servo goes nowhere, and a goal stored by a limp
-    /// unmirrored one moves nothing: torque is what makes a target a motion.
+    /// models that as instant unless the servo was given a delay, so a position
+    /// read after a goal write sees the written value — or the value written
+    /// that many goals ago. A goal written to a mirroring servo goes nowhere,
+    /// and a goal stored by a limp unmirrored one moves nothing: torque is what
+    /// makes a target a motion, and a stalled servo not even that.
     fn store(&mut self, id: u8, addr: u16, data: Vec<u8>) {
         if addr == reg_for(RegId::GoalPosition).addr {
             if self.mirroring(id) {
                 return;
             }
-            if self.torqued(id) {
-                let reached = self.reached(id, &data);
+            if self.torqued(id)
+                && !self.stalled.contains(&id)
+                && let Some(reached) = self.arriving(id, &data)
+            {
                 self.regs
                     .insert((id, reg_for(RegId::PresentPosition).addr), reached);
             }
@@ -129,14 +141,21 @@ impl FakeMachine {
         self.regs.insert((id, addr), data);
     }
 
-    /// Where a goal of `data` counts actually leaves the servo: at it, or the
-    /// configured lag short of it.
-    fn reached(&self, id: u8, data: &[u8]) -> Vec<u8> {
-        let lag = self.lag.get(&id).copied().unwrap_or(0);
-        let Ok(bytes) = <[u8; 4]>::try_from(data) else {
-            return data.to_vec();
-        };
-        (i32::from_le_bytes(bytes) - lag).to_le_bytes().to_vec()
+    /// Which goal this servo reaches on this write: the one just written, or —
+    /// for a delayed servo — the one written that many goals ago, once it has
+    /// taken that many. A delayed servo that has not yet filled its queue is
+    /// still standing where it was.
+    fn arriving(&mut self, id: u8, data: &[u8]) -> Option<Vec<u8>> {
+        let delay = self.delay.get(&id).copied().unwrap_or(0);
+        if delay == 0 {
+            return Some(data.to_vec());
+        }
+        let queue = self.queued.entry(id).or_default();
+        queue.push_back(data.to_vec());
+        if queue.len() > delay {
+            return queue.pop_front();
+        }
+        None
     }
 
     /// Whether this servo answers a read of `addr` at all, spending one count
@@ -433,6 +452,39 @@ impl BusPort for BrokenPort {
 
     fn discard_input(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A machine whose port carries a few transactions and then goes away, so a
+/// test can place a transport failure in the middle of a run rather than before
+/// its first read.
+pub(crate) struct FailsAfter {
+    machine: FakeMachine,
+    /// Transactions still to be carried before the adapter stops answering.
+    good: usize,
+}
+
+impl FailsAfter {
+    pub(crate) fn new(machine: FakeMachine, good: usize) -> Self {
+        Self { machine, good }
+    }
+}
+
+impl BusPort for FailsAfter {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if self.good == 0 {
+            return Err(io::Error::other("the adapter went away"));
+        }
+        self.good -= 1;
+        self.machine.write_all(buf)
+    }
+
+    fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+        self.machine.read_some(buf, deadline)
+    }
+
+    fn discard_input(&mut self) -> io::Result<()> {
+        self.machine.discard_input()
     }
 }
 

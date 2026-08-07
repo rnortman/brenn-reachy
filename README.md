@@ -41,7 +41,8 @@ The response is uniform and deliberate:
 
 - Every command path runs a positive envelope check before anything reaches the
   bus — per-leg travel windows, per-pose clearance from the singular
-  configurations, yaw caps, antenna range.
+  configurations, yaw caps, antenna representability (finite, within the
+  extended-position range).
 - A violation is a typed error. It is never a clamp, never a saturated value,
   and never a quietly non-finite number.
 - A fault stops commanding and holds position. It never silently continues, and

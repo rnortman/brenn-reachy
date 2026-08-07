@@ -115,16 +115,15 @@ Marked at `read_health` in `crates/reachy-bench/src/pump.rs`.
 ## `held-goal-bound`
 
 Decide what bounds the gap between a torque-holding servo's goal register and
-its measured position on body yaw and the antennas, where nothing bounds it
-today.
+its measured position on body yaw, where nothing bounds it today.
 
 Deferral context: a servo found already holding torque is pinned at the goal it
 is holding rather than at the position it has sagged to, so that re-arming does
 not ratchet the target down by the sag every time. The gap between the two is
 recorded per servo and judged on the legs only, by the pull-in gate, which is
-measured against the position. Body yaw is pinned at that goal untouched and an
-antenna's pull is recorded and not judged, so on those three the gap is bounded
-by nothing nearer than the envelope's absolute caps. What it usually costs is
+measured against the position. Body yaw is pinned at that goal untouched, so
+there the gap is bounded by nothing nearer than the envelope's yaw cap. What it
+usually costs is
 not a commanded slew — the servo already holds that goal, so writing it back
 commands nothing new — but an armed record that claims the pose the goals
 describe while the machine stands a sag away from it, and every trajectory then
@@ -153,30 +152,31 @@ that is the case a dwell would close. Off the machine the two are
 indistinguishable: a fixture can model an instant arrival or a slow one and
 neither is evidence. What separates them is how far this unit's rest really sits
 outside the travel windows and how long the profile-shaped pull takes, both of
-which are readings from a supervised arm. The antennas are in the same position
-and bounded by less: they are pinned in from wherever they were left limp, with
-no gate on how far that pull is. A dwell also has a cost — it is time with torque
-on and nothing verified — so the length wants to come from the measurement rather
+which are readings from a supervised arm. A dwell also has a cost — it is time
+with torque on and nothing verified — so the length wants to come from the
+measurement rather
 than from a guess. Marked at the arrival check in
 `crates/reachy-motion/src/arm.rs`.
 
 ## `provisioning-repair`
 
-Decide whether this project ever writes a servo's provisioned setup registers,
-and behind what evidence. Today it verifies them and repairs nothing.
+Decide whether this project ever repairs a servo's *vendor*-provisioned setup
+registers — homing offsets, travel limits, current limits — and behind what
+evidence. Today it verifies them and repairs none of them.
 
 Deferral context: those registers are non-volatile, and a servo silently ignores
-a write to one while its torque is on — so a repair that appeared to succeed
-could have changed nothing, which is the worst available outcome. The bus layer
-therefore refuses non-volatile writes outright rather than threading torque-state
-evidence through an API nothing calls: this milestone writes no such register,
-since gains, profiles, goals and torque all live in RAM. A unit that arrives
-part-provisioned is currently a typed refusal naming the servo and the register,
-with the vendor's own setup tool as the fix, and that is the right answer while
-one machine is in play. What would change it is a second unit, or a servo
-replaced in the field, at which point the guarded path needs designing —
-including how torque-off is established rather than assumed. Marked at the
-non-volatile refusal in `crates/reachy-bus/src/bus.rs`.
+a write to one while its torque is on, so a repair that appeared to succeed
+could have changed nothing — the worst available outcome. The guarded path that
+answers that now exists, scoped to the one register this project provisions
+itself: it reads Torque Enable, refuses unless it is off, writes, and reads back
+count-exact, and the `provision` command is its only caller. Every other write
+path still refuses a non-volatile register outright. What is still undecided is
+the vendor's half: a unit that arrives part-provisioned is a typed refusal
+naming the servo and the register, with the vendor's own setup tool as the fix,
+and that remains the right answer while one machine is in play. What would
+change it is a second unit, or a servo replaced in the field, at which point the
+question is which registers this project is willing to author rather than
+compare. Marked at the non-volatile refusal in `crates/reachy-bus/src/bus.rs`.
 
 ## `rail-curve`
 

@@ -1,8 +1,11 @@
 //! Trajectories: a shaped path between two command sets.
 //!
-//! The servos shape nothing. A goal position is applied as an immediate step,
-//! so every gentle movement in this system is an interpolation computed here
-//! and emitted as a bounded increment once per tick.
+//! The host does the shaping. Every gentle movement in this system is an
+//! interpolation computed here and emitted as a bounded increment once per
+//! tick, so the servos' own profile registers — which do shape each written
+//! goal's approach, which is why arming writes them — are left as the backstop
+//! under a goal step the host got wrong rather than as the thing that makes
+//! motion gentle.
 //!
 //! A trajectory is fixed at construction and then sampled — no state, no
 //! integration, no dependence on when it was last asked. Sampling the same time

@@ -21,7 +21,7 @@ use reachy_bench::commands;
 use reachy_bench::config::{self, BenchConfig, Resolved};
 use reachy_bench::pump::{MonotonicClock, PumpError};
 use reachy_bench::selftest::{Case, Registry, Report, SelftestRecord, now_unix};
-use reachy_bus::SerialBusPort;
+use reachy_bus::{SerialBusPort, ServoMap};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
@@ -49,6 +49,7 @@ fn usage() -> String {
          \n\
          commands:\n\
          \x20 selftest              read-only: pings and register reads, no torque, no motion\n\
+         \x20 provision             write the antennas' operating mode; no torque, no motion\n\
          \x20 arm                   verify, pin every joint where it stands, enable torque\n\
          \x20 up                    lift the head to the neutral configuration\n\
          \x20 hold                  command nothing and measure the machine holding\n\
@@ -58,9 +59,13 @@ fn usage() -> String {
          \x20 antennas <right> <left>   move the antennas, radians\n\
          \x20 demo                  up, hold, antennas, yaw, stow, off\n\
          \n\
-         Every command but `selftest` and `off` re-drives the whole arm sequence first:\n\
-         nothing is remembered between invocations. Only `off` releases torque, and it\n\
-         refuses away from stow unless `--drop-head` says the head may fall.\n\
+         Every command but `selftest`, `provision` and `off` re-drives the whole arm\n\
+         sequence first: nothing is remembered between invocations.\n\
+         \n\
+         Only `off` releases torque. At stow it releases outright; anywhere else it\n\
+         refuses unless `--drop-head` says the head may fall, and with that flag it\n\
+         releases wherever the machine is — the head falls the moment it does, so take\n\
+         its weight first. That is the way out of any session, at any moment.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -80,6 +85,7 @@ fn main() -> anyhow::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Selftest,
+    Provision,
     Arm,
     Up,
     Hold,
@@ -93,8 +99,9 @@ enum Command {
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 9] = [
+    const ALL: [Command; 10] = [
         Self::Selftest,
+        Self::Provision,
         Self::Arm,
         Self::Up,
         Self::Hold,
@@ -109,6 +116,7 @@ impl Command {
     fn parse(word: &str) -> Option<Self> {
         Some(match word {
             "selftest" => Self::Selftest,
+            "provision" => Self::Provision,
             "arm" => Self::Arm,
             "up" => Self::Up,
             "hold" => Self::Hold,
@@ -125,6 +133,7 @@ impl Command {
     fn name(self) -> &'static str {
         match self {
             Self::Selftest => "selftest",
+            Self::Provision => "provision",
             Self::Arm => "arm",
             Self::Up => "up",
             Self::Hold => "hold",
@@ -140,9 +149,13 @@ impl Command {
     /// whether `--drop-head` authorises anything for it.
     fn accepts(self) -> (usize, bool) {
         match self {
-            Self::Selftest | Self::Arm | Self::Up | Self::Hold | Self::Stow | Self::Demo => {
-                (0, false)
-            }
+            Self::Selftest
+            | Self::Provision
+            | Self::Arm
+            | Self::Up
+            | Self::Hold
+            | Self::Stow
+            | Self::Demo => (0, false),
             Self::Off => (0, true),
             Self::Yaw => (1, false),
             Self::Antennas => (2, false),
@@ -164,6 +177,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
 
     match command {
         Command::Selftest => selftest(&args),
+        Command::Provision => provision(&args),
         Command::Arm => moving(&args, name, |resolved, port, clock, line| {
             commands::arm(resolved, port, clock, line)
         }),
@@ -359,6 +373,53 @@ where
     Ok(())
 }
 
+/// Write the antennas' operating mode.
+///
+/// Behind neither standing gate, and that is the point of it: the self-test's
+/// provisioning sweep is exactly what fails on a unit whose antennas are still
+/// in single-turn mode, so a record gate here would make the repair unreachable
+/// from the failure that calls for it. The crank datum gates what moves the
+/// machine, and this moves nothing — it needs no envelope, no kinematics and no
+/// torque, so it reads the roster and the bus timing straight out of the file.
+fn provision(args: &Args) -> anyhow::Result<()> {
+    let cfg = config::load(&args.config)?;
+    let map = ServoMap::new(cfg.servo_ids()?);
+    let timing = cfg.bus_timing()?;
+
+    println!(
+        "provision over {} at {} baud. This writes one non-volatile register on the two \
+         antenna servos and moves nothing.\n\
+         Torque must be off on both — release it with `off` (or `off --drop-head`, which \
+         releases anywhere and drops the head) and take the head's weight first.",
+        cfg.bus.device, timing.baud
+    );
+
+    let port = SerialBusPort::open(&cfg.bus.device, timing.baud)
+        .with_context(|| format!("opening {}", cfg.bus.device))?;
+
+    commands::provision(&map, timing, port, &mut |line| println!("{line}"))
+        .map_err(|error| anyhow::Error::new(error).context("`provision`"))
+}
+
+/// What every command that touches a servo says before it does.
+///
+/// It describes the machine that ships, the way out included: an operator
+/// reading this in the middle of a session is entitled to find the release that
+/// works from anywhere, rather than concluding that cutting power is the only
+/// way to end it.
+fn preamble(command: &str, device: &str, baud: u32) -> String {
+    format!(
+        "{command} over {device} at {baud} baud. Every command but `selftest`, `provision` and \
+         `off` verifies the nine servos, enables torque — which holds every joint where it \
+         stands — and pins it there before it moves anything; a leg outside its travel window is \
+         pulled to the nearer bound.\n\
+         Only `off` releases torque. At stow it releases outright; anywhere else it refuses \
+         unless `--drop-head` is given, and with that flag it releases wherever the machine is. \
+         The head falls the moment torque goes, so take its weight first. That is the way out \
+         of any session, at any point — no session needs to end by cutting power."
+    )
+}
+
 /// Run a command that writes to a servo: check the gates, open the port, and
 /// hand both to the command.
 ///
@@ -379,12 +440,8 @@ where
     let resolved = arm_gates(&cfg, &record_path(args))?;
 
     println!(
-        "{command} over {} at {} baud. Every command but `off` verifies the nine servos, enables \
-         torque — which holds every joint where it stands — and pins it there before it moves \
-         anything; a joint outside its travel window is pulled to the nearer bound.\n\
-         Only `off` releases torque, and only at stow. A session ended any other way ends by \
-         cutting power, and the head falls when it goes — so be ready to take its weight.",
-        resolved.device, resolved.timing.baud
+        "{}",
+        preamble(command, &resolved.device, resolved.timing.baud)
     );
 
     let port = SerialBusPort::open(&resolved.device, resolved.timing.baud)
@@ -660,6 +717,7 @@ mod tests {
     fn a_stray_operand_is_refused_rather_than_discarded() {
         for words in [
             vec!["selftest", "extra"],
+            vec!["provision", "now"],
             vec!["arm", "up"],
             vec!["up", "now"],
             vec!["hold", "10"],
@@ -680,7 +738,7 @@ mod tests {
     /// so every other command refuses it instead of throwing it away.
     #[test]
     fn drop_head_is_refused_by_every_command_but_off() {
-        for command in ["selftest", "arm", "up", "hold", "stow", "demo"] {
+        for command in ["selftest", "provision", "arm", "up", "hold", "stow", "demo"] {
             let refused = dispatch(argv(&[command, "--drop-head"]))
                 .expect_err("that flag authorises nothing here");
             let printed = refused.to_string();
@@ -710,12 +768,62 @@ mod tests {
         assert!(refused.to_string().contains("wiggle"), "{refused}");
     }
 
+    /// The way out of a session is in the text an operator has in front of them
+    /// when they need it.
+    ///
+    /// An operator holding a head up with one hand does not read the source:
+    /// they read the banner the last command printed, and if it omits the
+    /// release that works from anywhere, that is a release they do not know
+    /// about.
+    #[test]
+    fn the_operator_text_names_the_release_that_works_from_anywhere() {
+        for text in [usage(), preamble("stow", "/dev/ttyAMA3", 1_000_000)] {
+            assert!(text.contains("--drop-head"), "{text}");
+            assert!(
+                text.contains("anywhere else") || text.contains("refuses away from stow"),
+                "the flag is named, but not what it is for: {text}"
+            );
+            assert!(
+                text.contains("falls") || text.contains("fall"),
+                "the flag is named, but not what it costs: {text}"
+            );
+        }
+
+        let printed = preamble("up", "/dev/ttyAMA3", 1_000_000);
+        assert!(
+            !printed.contains("only at stow"),
+            "the banner still says stow is the only release: {printed}"
+        );
+    }
+
+    /// The commands that enable torque are the ones the operator text says
+    /// enable torque.
+    ///
+    /// Both banners say which commands arm, and an operator reads that as what
+    /// a command is about to do to a machine they are standing next to. A
+    /// read-only command listed among the arming ones is the same defect as a
+    /// missing release: text that describes a different machine from the one
+    /// that ships.
+    #[test]
+    fn the_operator_text_excepts_every_command_that_does_not_arm() {
+        // `selftest` reads registers, `provision` writes one non-volatile
+        // register, and `off` releases; none of the three arms.
+        let excepted = "Every command but `selftest`, `provision` and `off`";
+        for text in [usage(), preamble("up", "/dev/ttyAMA3", 1_000_000)] {
+            assert!(
+                text.contains(excepted),
+                "a command that arms nothing is claimed to arm: {text}"
+            );
+        }
+    }
+
     /// Every command that writes to a servo goes through the same gates, so a
     /// missing configuration stops each of them in the same place — before any
     /// port is opened.
     #[test]
     fn every_writing_command_is_gated_before_the_port() {
         for words in [
+            vec!["provision"],
             vec!["arm"],
             vec!["up"],
             vec!["hold"],

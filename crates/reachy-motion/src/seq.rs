@@ -622,10 +622,10 @@ pub enum SeqStep {
     /// Torque enabled, which holds every joint where it stands, then goals
     /// pinned there.
     PinAndEnable,
-    /// The platform is measured to be at the stow pose.
-    VerifyAtStow,
-    /// Waiting out the settle before torque comes off.
+    /// Waiting out the settle, before the stow pose is measured at all.
     Dwell,
+    /// The settled platform is measured to be at the stow pose.
+    VerifyAtStow,
     /// Torque released, servo by servo.
     TorqueOff,
 }
@@ -646,8 +646,8 @@ impl SeqStep {
         Self::GoalShadow,
         Self::GainsProfiles,
         Self::PinAndEnable,
-        Self::VerifyAtStow,
         Self::Dwell,
+        Self::VerifyAtStow,
         Self::TorqueOff,
     ];
 }
@@ -911,7 +911,7 @@ pub enum SeqError {
         "{context}: {joint} reads {:.3}° and stow is {:.3}°, {:.3}° apart and past the {:.3}° gate",
         present.to_degrees(),
         target.to_degrees(),
-        (present - target).abs().to_degrees(),
+        deviation.to_degrees(),
         tolerance.to_degrees()
     )]
     NotAtStow {
@@ -923,6 +923,11 @@ pub enum SeqError {
         present: f64,
         /// Where stow puts it, radians.
         target: f64,
+        /// How far apart those two are, radians, measured the way this joint is
+        /// judged — around the circle for a free rotor, along the line for a
+        /// windowed joint. Carried rather than recomputed here, so the figure
+        /// the operator reads is the one the gate refused on.
+        deviation: f64,
         /// How far from stow a joint may be, radians.
         tolerance: f64,
     },
