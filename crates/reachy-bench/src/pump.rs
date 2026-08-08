@@ -527,6 +527,33 @@ impl ReadFailures {
         failures
     }
 
+    /// The same value assembled from verdicts named directly, for a caller that
+    /// has no read outcome in hand — a test standing in for a bus, or a program
+    /// replaying what one reported.
+    ///
+    /// Clean answers are dropped exactly as they are on the read path, so
+    /// [`servos`](Self::servos) is failures and nothing else, and verdicts past
+    /// the ninth are dropped: the array is the joint count wide and a grouped
+    /// read cannot exceed it.
+    #[must_use]
+    pub fn from_verdicts(verdicts: &[(u8, IdOutcome)], corrupt_frames: u32) -> Self {
+        let mut failures = Self {
+            servos: [(0, IdOutcome::Timeout); JointId::COUNT],
+            count: 0,
+            corrupt: corrupt_frames,
+        };
+        for &(id, verdict) in verdicts {
+            if matches!(verdict, IdOutcome::Ok(_)) {
+                continue;
+            }
+            if let Some(slot) = failures.servos.get_mut(failures.count) {
+                *slot = (id, verdict);
+                failures.count += 1;
+            }
+        }
+        failures
+    }
+
     /// The servos that fell short, with what each did instead.
     #[must_use]
     pub fn servos(&self) -> &[(u8, IdOutcome)] {
@@ -3157,6 +3184,41 @@ mod tests {
                 "{tick_hz}/{health_poll_hz}: {refused}"
             );
         }
+    }
+
+    /// Verdicts named directly come out the same shape a read outcome makes:
+    /// the failures in the order given, the clean answers gone, the damaged
+    /// frames carried. A caller assembling one of these is describing a bus it
+    /// does not have, and a value that behaved differently from the read path's
+    /// would make that description a lie.
+    #[test]
+    fn failures_named_directly_hold_only_the_failures() {
+        let failures = ReadFailures::from_verdicts(
+            &[
+                (11, IdOutcome::Timeout),
+                (
+                    12,
+                    IdOutcome::Ok(RawValue::new(&[0]).expect("one byte fits")),
+                ),
+                (13, IdOutcome::ServoError(dxl_proto::StatusError(0x07))),
+            ],
+            2,
+        );
+
+        assert_eq!(
+            failures.servos(),
+            &[
+                (11, IdOutcome::Timeout),
+                (13, IdOutcome::ServoError(dxl_proto::StatusError(0x07))),
+            ]
+        );
+        assert_eq!(failures.corrupt_frames(), 2);
+        assert_ne!(
+            failures,
+            ReadFailures::from_verdicts(&[(11, IdOutcome::Timeout)], 2),
+            "a different set of servos is a different condition"
+        );
+        assert_eq!(ReadFailures::from_verdicts(&[], 0), ReadFailures::default());
     }
 
     /// Every event renders as its own line, so a supervised run reads.

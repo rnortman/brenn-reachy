@@ -217,22 +217,37 @@ impl<'a, P: BusPort> Session<'a, P> {
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<MoveSummary, PumpError> {
-        let outcome = self.pump.hold(
-            &mut self.bus,
-            &mut self.state,
-            duration,
-            clock,
-            // The disposition of a hold is that it is holding, which is the one
-            // thing this command already knows. Everything else — a lost read,
-            // a health latch, a fault — is news.
-            &mut |event| {
-                if !matches!(event, TickEvent::Command(_)) {
-                    line(&format!("  {event}"));
-                }
-            },
-        );
+        // The disposition of a hold is that it is holding, which is the one
+        // thing this command already knows. Everything else — a lost read, a
+        // health latch, a fault — is news.
+        let outcome = self.hold_events(duration, clock, &mut |event| {
+            if !matches!(event, TickEvent::Command(_)) {
+                line(&format!("  {event}"));
+            }
+        });
         self.report(line);
         outcome
+    }
+
+    /// Watch the machine hold for `duration`, handing the caller the raw tick
+    /// events instead of rendered lines.
+    ///
+    /// No filtering and no timing report: what to say about a hold — which
+    /// events are worth a line, in what words, and whether the periods are
+    /// worth printing at all — is the caller's policy, and a program holding on
+    /// a cadence for as long as it runs has a different one from an operator
+    /// reading a single bench run. The numbers are not lost either way; they
+    /// come back in the summary, typed.
+    ///
+    /// [`Session::hold`] is this with the bench's own policy applied.
+    pub fn hold_events(
+        &mut self,
+        duration: Duration,
+        clock: &mut dyn Clock,
+        event: &mut dyn FnMut(TickEvent),
+    ) -> Result<MoveSummary, PumpError> {
+        self.pump
+            .hold(&mut self.bus, &mut self.state, duration, clock, event)
     }
 
     /// Release torque, having verified the machine is at stow, and end the
@@ -593,7 +608,8 @@ mod tests {
     use dxl_proto::frame::INST_WRITE;
     use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
     use reachy_motion::{
-        ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, JointGroup, JointVector, SeqError,
+        ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointVector,
+        SeqError,
     };
 
     use super::*;
@@ -1250,6 +1266,70 @@ mod tests {
             !run.printed.iter().any(|line| line.trim() == "holding"),
             "a hold already knows it is holding: {:?}",
             run.printed
+        );
+    }
+
+    /// `hold_events` hands every tick event to its caller and renders nothing.
+    ///
+    /// A filter or a report leaking into this entry point would reach every
+    /// caller as text it cannot suppress — the zero-policy guarantee is the
+    /// point.
+    #[test]
+    fn hold_events_hands_over_every_event_and_renders_nothing() {
+        // Arming narrates, so the mark separates what the sequence said from
+        // what the hold said — and what the hold said is meant to be nothing at
+        // all, not merely nothing of three shapes anybody thought to name.
+        const ARMED: &str = "-- armed --";
+
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &neutral_legs());
+        let events: Rc<RefCell<Vec<TickEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let summary = Rc::new(RefCell::new(None));
+        let seen = events.clone();
+        let measured = summary.clone();
+        let run = run(machine, move |port, clock, line| {
+            let mut session = Session::arm(&cfg, port, clock, line)?;
+            line(ARMED);
+            let outcome = session.hold_events(cfg.hold_duration, clock, &mut |event| {
+                seen.borrow_mut().push(event);
+            })?;
+            *measured.borrow_mut() = Some(outcome);
+            Ok(())
+        });
+        run.ok("a machine holds");
+
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Command(CommandDisposition::Held))),
+            "the disposition is the caller's to drop: {events:?}",
+        );
+        // The event `hold` filters and one it does not: a passthrough that let
+        // the disposition alone through would have re-added a filter.
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Health(_))),
+            "the health sweep reaches the caller too: {events:?}",
+        );
+        let mark = run
+            .printed
+            .iter()
+            .position(|line| line == ARMED)
+            .expect("the mark is printed");
+        assert_eq!(
+            &run.printed[mark + 1..],
+            [] as [String; 0],
+            "hold_events renders nothing: {:?}",
+            &run.printed[mark + 1..],
+        );
+        // +1: the tick that notices the deadline has elapsed.
+        let cfg = resolved();
+        let summary = summary.borrow().expect("the hold returns its summary");
+        assert_eq!(
+            summary.ticks,
+            u64::from(cfg.tick_hz) * cfg.hold_duration.as_secs() + 1
         );
     }
 
