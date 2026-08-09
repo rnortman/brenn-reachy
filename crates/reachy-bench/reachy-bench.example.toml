@@ -105,25 +105,33 @@ tracking_ticks = 10
 # one second at the tick rate.
 read_loss_ticks = 50
 # The three durations below govern the head group — the head pose and the body
-# yaw, which the six legs follow. Their floor is 1.07 s: below that a
-# stow-to-neutral move steps a leg further in one 50 Hz period than
-# `max_step_legs_rad` allows, and the guard faults the move rather than trimming
-# it. Derived by sampling the move through the IK at tick rate, and pinned by a
-# reachy-motion unit test, so it moves only when the geometry or the tick rate
-# does. A configuration test checks the three values here against it.
+# yaw, which the six legs follow. They are a nominal policy rather than a
+# promise: a move whose span will not fit inside the per-tick step bounds at the
+# duration named here runs on a clock stretched to fit, and says so on the way
+# in. The path is unchanged; it is traversed more slowly. So a duration set too
+# low costs a slower move and a line of output, never a fault mid-travel.
 #
-# The *yaw* has a floor of its own, and it is the one to watch: the body turns
+# What the floors are still for is knowing when that happens. The head group's
+# is 1.07 s: below that a stow-to-neutral move steps a leg further in one 50 Hz
+# period than `max_step_legs_rad` allows. Derived by sampling the move through
+# the IK at tick rate, and pinned by a reachy-motion unit test, so it moves only
+# when the geometry or the tick rate does. A configuration test checks the three
+# values here against it, so the shipped durations are the ones no ordinary
+# command has to be stretched out of.
+#
+# The *yaw* has a floor of its own, and it is the one that moves: the body turns
 # through whatever angle is asked, against `max_step_body_yaw_rad`, so the floor
 # is 37.5 × the sweep in radians ÷ 50, and it is the whole sweep that counts —
 # not the head group's usual travel. Stowing from the 60° cap this file sets
 # needs 0.79 s, and the widest sweep a command can lawfully ask for — cap to
-# cap — needs 1.57 s, which the configuration test checks the three durations
-# here against. Stowing from a body a hand spun to the half turn while the
-# machine lay limp needs 2.36 s, and `stow_duration_s = 2.0` does not cover it:
-# a stow from beyond about 153° faults on the step bound, and after the gate
-# audit a fault de-torques, so the head stops and settles. Raise this, or yaw
-# back in stages, if that matters on your bench —
-# TODO(recovery-move-clock) is the fix.
+# cap — needs 1.57 s, which the configuration test checks these durations
+# against. Where the machine physically *stands* is not capped, though: stowing
+# from a body a hand spun to the half turn while the machine lay limp needs
+# 2.36 s, well past `stow_duration_s = 2.0`, and that fold is the one the
+# stretch exists for. A stretched clock is sized past the bare floor rather than
+# onto it — a control loop that begins a period late covers more of the path in
+# it, and a clock with no headroom would fault on that alone — so the fold takes
+# something over four seconds instead of two, once, and lands.
 stow_duration_s = 2.0
 # Longer than the stow move: the lift is the one motion that starts from a
 # configuration close to a singular one, and there is no reason for it to be
@@ -140,7 +148,8 @@ move_duration_s = 3.0
 # antennas sweep three times as far as the head does on the same move. The floor
 # is the sweep being commanded against `max_step_antennas_rad` above, and the
 # `antennas` command here can be asked for anything up to a full turn, so a
-# bench that sets this at all wants at least 1.57 s.
+# bench that sets this at all wants at least 1.57 s to avoid being stretched
+# there on the wide sweeps.
 # antenna_duration_s = 1.5
 # How long `hold` watches the machine before returning: long enough for a
 # tracking fault or a health latch to appear in, short enough that a supervised

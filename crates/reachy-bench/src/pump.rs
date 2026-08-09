@@ -75,10 +75,10 @@ use reachy_bus::{
 };
 use reachy_bus::{reg_for, with_retry};
 use reachy_motion::{
-    ArmConfig, ArmRecord, BusRequest, BusResult, CommandDisposition, CommandRejection,
-    CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointVector, Mode, MotionCommand,
-    MotionConfig, MotionState, RegId, RegValue, SeqAction, SeqError, SeqStep, Sequencer,
-    ServoHealth, TickInputs, TickOutputs, motion_tick,
+    ArmConfig, ArmRecord, BusRequest, BusResult, ClockStretch, CommandDisposition,
+    CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointVector,
+    Mode, MotionCommand, MotionConfig, MotionState, RegId, RegValue, SeqAction, SeqError, SeqStep,
+    Sequencer, ServoHealth, TickInputs, TickOutputs, floor_move_clock, motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -767,6 +767,10 @@ pub enum TickEvent {
         /// How far behind the fixed rate it started.
         late: Duration,
     },
+    /// A move's clock was too short for the span it covers, and was stretched
+    /// to fit before the move was commanded. Emitted for the command that
+    /// starts a run and for every replacement that retargets one.
+    Stretched(ClockStretch),
     /// The move reached its endpoint.
     Completed,
     /// The tick stopped commanding.
@@ -803,6 +807,17 @@ impl fmt::Display for TickEvent {
                     f,
                     "period {tick} began {:.1} ms late",
                     late.as_secs_f64() * 1e3
+                )
+            }
+            Self::Stretched(stretch) => {
+                write!(
+                    f,
+                    "clock stretched to fit the span: head {:.3} s to {:.3} s, antennas {:.3} s \
+                     to {:.3} s",
+                    stretch.requested.head.as_secs_f64(),
+                    stretch.effective.head.as_secs_f64(),
+                    stretch.requested.antennas.as_secs_f64(),
+                    stretch.effective.antennas.as_secs_f64(),
                 )
             }
             Self::Completed => f.write_str("at the target"),
@@ -959,6 +974,27 @@ impl<'a> MotionPump<'a> {
         }
     }
 
+    /// `command` on a clock that can carry its span, and the stretch when there
+    /// was one.
+    ///
+    /// Applied here, and not inside the tick, because of what reads a command
+    /// first: the stall budget is sized from the durations before the tick ever
+    /// sees them, so a clock stretched downstream of this would leave the loop
+    /// killing the very move the stretch exists to save. One dry pass per
+    /// command or splice, never inside a move already running.
+    fn right_sized(
+        &self,
+        state: &MotionState,
+        command: MotionCommand,
+    ) -> (MotionCommand, Option<ClockStretch>) {
+        floor_move_clock(
+            self.cfg,
+            state.last_targets(),
+            &command,
+            1.0 / self.period.as_secs_f64(),
+        )
+    }
+
     /// How many periods a run spanning `wanted` may take before the loop calls
     /// it stuck: the periods that span it, plus the fixed margin.
     fn budget_for(&self, wanted: Duration) -> u64 {
@@ -1066,6 +1102,10 @@ impl<'a> MotionPump<'a> {
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
+        let (command, stretch) = self.right_sized(state, command);
+        if let Some(stretch) = stretch {
+            event(TickEvent::Stretched(stretch));
+        }
         let mut budget = match until {
             Until::Holding { .. } => self.stall_budget(&command),
             Until::Elapsed(dwell) => self.budget_for(dwell),
@@ -1097,6 +1137,14 @@ impl<'a> MotionPump<'a> {
                 && let Until::Holding { retarget } = &mut until
                 && let Some(replacement) = retarget()
             {
+                // Right-sized against where the machine has got to, so a
+                // replacement issued mid-recovery gets a clock for the span
+                // still ahead of it rather than for the one the original
+                // command had.
+                let (replacement, stretch) = self.right_sized(state, replacement);
+                if let Some(stretch) = stretch {
+                    event(TickEvent::Stretched(stretch));
+                }
                 // Re-sized from here, not extended: what bounds the run is the
                 // travel still ahead of it, and a caller that keeps changing
                 // its mind is doing exactly what this entry point is for.
@@ -1419,8 +1467,8 @@ mod tests {
     use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE};
     use reachy_bus::reg_for;
     use reachy_motion::{
-        CommissionSequencer, EngageSequencer, JointId, JointTargets, PollCadence, PollSequencer,
-        Posture, RegValue, Warp,
+        CommissionSequencer, EngageSequencer, HEAD_GROUP_FLOOR_S, JointId, JointTargets,
+        MoveDurations, PollCadence, PollSequencer, Posture, RegValue, Warp,
     };
 
     use super::*;
@@ -2636,6 +2684,162 @@ mod tests {
         assert!(
             matches!(error, PumpError::Stalled { budget: ran } if ran == budget),
             "{error}"
+        );
+    }
+
+    /// The stow-to-neutral move on a clock far too short for it runs anyway, on
+    /// a clock the loop stretched to fit, and says so once before the first
+    /// period.
+    ///
+    /// Unfloored this is the fault that de-torques mid-travel. The loop is
+    /// where the stretch lands because the loop is what reads a command first.
+    #[test]
+    fn a_command_too_short_for_its_span_runs_on_a_stretched_clock() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let asked = Duration::from_millis(500);
+        let (outcome, events) = run(
+            &mut bench,
+            &mut pump,
+            MotionCommand::MoveTo {
+                target: JointTargets::default(),
+                durations: MoveDurations::uniform(asked),
+                warp: Warp::MinJerk,
+            },
+            &mut clock,
+        );
+        let summary = outcome.expect("a stretched fold reaches its endpoint");
+
+        let stretch = events
+            .iter()
+            .find_map(|event| match event {
+                TickEvent::Stretched(stretch) => Some(*stretch),
+                _ => None,
+            })
+            .expect("half a second cannot carry the fold");
+        assert_eq!(stretch.requested, MoveDurations::uniform(asked));
+        assert!(
+            stretch.effective.head.as_secs_f64() >= HEAD_GROUP_FLOOR_S,
+            "{stretch:?}"
+        );
+        // The stretch is announced before anything the loop did, so an operator
+        // reads why the move is taking longer than the knob says.
+        assert!(
+            matches!(events.first(), Some(TickEvent::Stretched(_))),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&TickEvent::Completed)
+                && !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+
+        // And the periods it ran are the stretched clock's, not the asked-for
+        // one's.
+        assert!(
+            summary.ticks > periods_for(asked, cfg.tick_hz),
+            "{summary:?}"
+        );
+    }
+
+    /// The stall budget is sized from the clock the move actually runs on.
+    ///
+    /// This is why the stretch belongs to the loop rather than to the tick: a
+    /// budget still sized from the duration the caller named would abort the
+    /// stretched move partway and report a healthy machine as one that hung.
+    #[test]
+    fn the_stall_budget_follows_the_stretched_clock() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+
+        let asked = Duration::from_millis(500);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations::uniform(asked),
+            warp: Warp::MinJerk,
+        };
+        let (floored, stretch) = floor_move_clock(
+            &cfg.motion,
+            bench.state.last_targets(),
+            &command,
+            f64::from(cfg.tick_hz),
+        );
+        assert!(stretch.is_some(), "the fixture move is the stretched one");
+
+        // A clock that never advances never reaches the endpoint, so the run
+        // ends on the budget and reports it.
+        let mut clock = FrozenClock;
+        let (outcome, _) = run(&mut bench, &mut pump, command, &mut clock);
+        let error = outcome.expect_err("a move on a stopped clock never lands");
+        let PumpError::Stalled { budget } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(budget, pump.stall_budget(&floored));
+        assert!(
+            budget > pump.stall_budget(&command),
+            "the budget is the asked-for clock's, not the stretched one's"
+        );
+    }
+
+    /// A replacement issued mid-travel goes through the same right-sizing, from
+    /// the setpoint the previous period commanded.
+    ///
+    /// The retarget site sizes its own budget, so a replacement that skipped
+    /// the pass would be the one move a stretch could not save.
+    #[test]
+    fn a_replacement_is_right_sized_before_its_budget_is() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        // A minute in: long enough that the replacement lands well inside the
+        // first move, and slow enough that the first move needs no stretch.
+        let mut periods = 0;
+        let (outcome, events) = run_retargeting(
+            &mut bench,
+            &mut pump,
+            to_neutral(&cfg),
+            &mut clock,
+            &mut || {
+                periods += 1;
+                (periods == 10).then(|| MotionCommand::MoveTo {
+                    target: crate::commands::stow_pose_targets(),
+                    durations: MoveDurations::uniform(Duration::from_millis(300)),
+                    warp: Warp::MinJerk,
+                })
+            },
+        );
+        outcome.expect("the replacement reaches its own endpoint");
+
+        let stretches: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TickEvent::Stretched(stretch) => Some(*stretch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stretches.len(), 1, "{events:?}");
+        assert_eq!(
+            stretches[0].requested,
+            MoveDurations::uniform(Duration::from_millis(300))
+        );
+        let ClockStretch {
+            requested,
+            effective,
+        } = stretches[0];
+        assert!(effective.longest() > requested.longest(), "{stretches:?}");
+        assert!(
+            effective.head >= requested.head && effective.antennas >= requested.antennas,
+            "a clock was shortened: {stretches:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
         );
     }
 

@@ -142,39 +142,3 @@ answer: what carries an intent, what happens to a fault when there is no operato
 watching, and who owns the port when two things want it. None of it changes the
 libraries; it is a second host beside this one. Marked at the driver in
 `crates/reachy-bench/src/pump.rs`.
-
-## `recovery-move-clock`
-
-Give a move out of a wide excursion a clock sized to the span it actually
-covers, so recovering from a pose the machine was left in cannot fault on the
-step guard.
-
-Deferral context: a move runs for the duration its caller names, and those
-durations are chosen for the spans an ordinary command covers — a yaw target is
-capped at 60°, so cap to cap is 2.09 rad and the shipped `stow_duration_s = 2.0`
-clears its 1.57 s floor. Where the machine physically *stands* is not capped:
-the yaw servo's provisioned range is the full turn, and a hand or a crash can
-leave the body anywhere in it. The envelope check now admits a move out of such
-a pose — that is the recovery — but the step guard still measures each tick
-against `max_step_body_yaw_rad`, and 2.0 s at 0.05 rad per tick covers 2.67 rad,
-about 153°. A body left further round than that stows, faults on
-`Fault::StepTooLarge` partway, and de-torques where it stopped. This is a
-regression against the pre-torque pose refusal that used to catch the same
-machine before torque came on, so it is a real loss and not just a gap.
-
-The blanket fixes are both wrong: raising the shipped stow duration to cover a
-half turn slows every presence stow to serve a rare recovery, and lowering the
-step bound slows everything. The right shape is a clock the *recovering* move
-derives from its own span — the tick already knows it is recovering, and
-`duration_floor_s` already says what a span needs — but that changes which side
-of the interface owns a move's duration, which is a design decision and not a
-local edit.
-
-Done = a move admitted as a recovery cannot fault its own step guard on the
-distance it was given to cover, with a test driving a body past 153° through a
-stow, and the operator caveat in `crates/reachy-bench/reachy-bench.example.toml`
-retired. Marked at the step guard in `crates/reachy-motion/src/tick.rs`, in the
-configuration test that pins the shipped durations against their floors
-(`crates/reachy-bench/src/config.rs`), and in the pod repo's `TODO.md` under
-this same slug — the daemon is where this path runs with nobody watching, so
-the two entries move together.

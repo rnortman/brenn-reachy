@@ -63,9 +63,9 @@ pub use seq::{
     Sequencer, StepContext, ValueKind,
 };
 pub use tick::{
-    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, CommandDisposition,
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, ClockStretch, CommandDisposition,
     CommandRejection, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE, Mode,
     MotionCommand, MotionConfig, MotionState, TickInputs, TickOutputs, TickReport,
-    TrackingFaultConfig, duration_floor_s, motion_tick,
+    TrackingFaultConfig, duration_floor_s, floor_move_clock, motion_tick,
 };
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

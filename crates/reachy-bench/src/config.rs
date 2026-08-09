@@ -1323,18 +1323,20 @@ provenance = \"test fixture\"
     /// Every duration the bench ships clears the floor its own step bound sets.
     ///
     /// Resolution only checks that a duration is positive, and 0.1 s is
-    /// positive. What a duration too short for its span actually produces is a
-    /// step-bound fault mid-move — never a clamp — and after the gate audit a
-    /// fault de-torques: the head stops and falls. The floors are derived in
+    /// positive. A duration too short for its span does not break anything —
+    /// the clock is stretched to fit before the move is commanded — but it does
+    /// mean the shipped numbers stop describing what the machine does, and an
+    /// ordinary command being right-sized every time is a configuration that
+    /// has quietly stopped being the policy. The floors are derived in
     /// `reachy-motion` and quoted in the example file's comments; this is what
     /// joins the three, so that editing a duration downward (which the speed
-    /// trials exist to do) cannot quietly cross one.
+    /// trials exist to do) cannot cross one without saying so.
     ///
     /// All three step bounds are covered: the legs through the derived
     /// head-group floor, the body yaw through its widest lawful sweep, and the
     /// antennas through theirs. Each yaw and antenna span is the widest a
-    /// *command* can ask for; a machine found standing further out than that is
-    /// `TODO(recovery-move-clock)`.
+    /// *command* can ask for. A machine found standing further out than that is
+    /// the recovery case, which is exactly where the stretch takes over.
     #[test]
     fn the_shipped_durations_clear_their_step_bound_floors() {
         for (name, cfg) in [

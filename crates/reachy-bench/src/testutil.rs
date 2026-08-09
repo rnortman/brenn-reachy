@@ -8,7 +8,7 @@
 //!
 //! Test-only: nothing here is compiled into the binary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
@@ -465,6 +465,50 @@ impl BusPort for BrokenPort {
 
     fn discard_input(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A port a test can take away and give back, so a run can carry on over the
+/// same machine after one transaction of it failed.
+///
+/// Distinct from [`FailsAfter`], which never comes back: what a sweep does
+/// about a bus that recovers is only testable against a bus that recovers.
+pub(crate) struct Flaky<P> {
+    port: P,
+    down: Rc<Cell<bool>>,
+}
+
+impl<P> Flaky<P> {
+    pub(crate) fn new(port: P) -> Self {
+        Self {
+            port,
+            down: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// The switch that takes the adapter away and gives it back.
+    pub(crate) fn switch(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.down)
+    }
+}
+
+impl<P: BusPort> BusPort for Flaky<P> {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if self.down.get() {
+            return Err(io::Error::other("the adapter went away"));
+        }
+        self.port.write_all(buf)
+    }
+
+    fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+        if self.down.get() {
+            return Err(io::Error::other("the adapter went away"));
+        }
+        self.port.read_some(buf, deadline)
+    }
+
+    fn discard_input(&mut self) -> io::Result<()> {
+        self.port.discard_input()
     }
 }
 

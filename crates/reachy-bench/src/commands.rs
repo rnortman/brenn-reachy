@@ -196,8 +196,9 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
 
     /// Whether [`Self::posture`] still describes the machine.
     ///
-    /// False from the moment a release goes by without measuring every joint —
-    /// the fault release measures none — until the next sweep that does.
+    /// False from the moment anything goes by without measuring every joint —
+    /// a release that measured none, a sweep that did not complete — until the
+    /// next sweep that does.
     #[must_use]
     pub fn fresh(&self) -> bool {
         self.fresh
@@ -217,6 +218,12 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
         line: &mut dyn FnMut(&str),
     ) -> Result<Posture, PumpError> {
         let mut polling = PollSequencer::new(&self.resolved.arm, self.posture.rail, cadence);
+        // Cleared before the sweep, not after it: a sweep that fails measured
+        // nothing, and a caller left believing the posture in hand is current
+        // would pin a limp head at where it was however long ago. The engage
+        // precondition is what acts on this, and it is the reason a failed
+        // sweep costs a later engage nine reads instead of a slam.
+        self.fresh = false;
         self.posture = drive(
             &mut self.bus,
             &self.resolved.map,
@@ -448,6 +455,24 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         line: &mut dyn FnMut(&str),
         retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
     ) -> Result<MoveSummary, PumpError> {
+        self.move_retargeting_events(target, durations, clock, line, &mut |_| {}, retarget)
+    }
+
+    /// The same move, with the run's tick events handed to `event` as values
+    /// as well as printed.
+    ///
+    /// Unlike [`Engaged::hold_events`], the bench's printed report stays —
+    /// `event` observes beside it. A rendered line is not a fact downstream
+    /// can key on; this gives a caller its own machine-readable record.
+    pub fn move_retargeting_events(
+        &mut self,
+        target: JointTargets,
+        durations: MoveDurations,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
+    ) -> Result<MoveSummary, PumpError> {
         let command = MotionCommand::MoveTo {
             target,
             durations,
@@ -458,7 +483,10 @@ impl<P: BusPort> Engaged<'_, '_, P> {
             &mut self.state,
             command,
             clock,
-            &mut |event| line(&format!("  {event}")),
+            &mut |reported| {
+                line(&format!("  {reported}"));
+                event(reported);
+            },
             &mut || {
                 retarget().map(|(target, durations)| MotionCommand::MoveTo {
                     target,
@@ -1052,7 +1080,8 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        FakeMachine, GroupedWrite, Spy, TestClock, datumed_config, machine_at, resolved, stow_legs,
+        FakeMachine, Flaky, GroupedWrite, Spy, TestClock, datumed_config, machine_at, resolved,
+        stow_legs,
     };
 
     /// The six crank angles the neutral pose holds.
@@ -2109,6 +2138,61 @@ mod tests {
         );
     }
 
+    /// `move_retargeting_events` hands the caller the run's events as values
+    /// and still prints the run.
+    #[test]
+    fn a_move_hands_out_its_events_and_still_prints_them() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let events: Rc<RefCell<Vec<TickEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let seen = events.clone();
+        // Far under the head group's floor for the stow-to-neutral span, so the
+        // pump right-sizes the clock before it commands anything.
+        let hurried = MoveDurations::uniform(Duration::from_millis(200));
+        let run = run(machine, move |port, clock, line| {
+            let mut machine = commission(&cfg, port, clock, line)?;
+            let mut engaged = machine.engage(clock, line)?;
+            engaged.move_retargeting_events(
+                neutral_targets(),
+                hurried,
+                clock,
+                line,
+                &mut |event| seen.borrow_mut().push(event),
+                &mut || None,
+            )?;
+            Ok(())
+        });
+        run.ok("a hurried raise runs on the clock it was right-sized to");
+
+        let events = events.borrow();
+        let stretch = events
+            .iter()
+            .find_map(|event| match event {
+                TickEvent::Stretched(stretch) => Some(*stretch),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the caller is told the clock moved: {events:?}"));
+        assert_eq!(stretch.requested, hurried);
+        assert!(
+            stretch.effective.head > hurried.head,
+            "{:?}",
+            stretch.effective
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Completed)),
+            "every event reaches the caller, not only the interesting one: {events:?}",
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("clock stretched to fit the span")),
+            "the run is still printed: {:?}",
+            run.printed
+        );
+    }
+
     /// `yaw` turns the body and leaves the head where it was relative to it, so
     /// the six cranks do not move at all.
     #[test]
@@ -2582,6 +2666,56 @@ mod tests {
             (engaged.targets().body_yaw - turned).abs() <= half_count,
             "the first move would start from {} deg",
             engaged.targets().body_yaw.to_degrees()
+        );
+    }
+
+    /// A sweep that did not complete measured nothing, so the posture in hand
+    /// stops describing the machine — and the next engage looks again before it
+    /// pins anything.
+    ///
+    /// A watch that keeps sweeping over a flaky bus is the whole point: the
+    /// machine is limp and safe, and a failed sweep costs it its picture rather
+    /// than its safety. What must not survive the outage is the *belief* that
+    /// the picture is current, because the engage's pin sweep writes that
+    /// picture into nine goal registers immediately before the enables.
+    #[test]
+    fn a_sweep_that_failed_costs_the_posture_its_freshness() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let log = rig.log;
+        let port = Flaky::new(rig.port);
+        let down = port.switch();
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        assert!(machine.fresh(), "commissioning takes its own sweep");
+
+        down.set(true);
+        machine
+            .poll(PollCadence::Positions, &mut clock, &mut |line| {
+                printed.push(line.to_string());
+            })
+            .expect_err("a sweep over an adapter that went away does not complete");
+        assert!(
+            !machine.fresh(),
+            "a sweep that failed left the posture describing a machine nobody has looked at"
+        );
+
+        // The bus comes back, and the engage pays for the outage in reads
+        // rather than in a slam.
+        down.set(false);
+        let before = log.borrow().len();
+        machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages once the adapter is back");
+        assert_eq!(
+            log.borrow().len() - before,
+            JointId::COUNT + 5 * JointId::COUNT,
+            "a sweep of nine reads, then the engage's own twenty-seven"
         );
     }
 

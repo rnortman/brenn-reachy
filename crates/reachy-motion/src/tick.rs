@@ -37,6 +37,20 @@
 //! gearbox absorb whatever the old path was carrying at the moment it was
 //! dropped.
 //!
+//! ## The move's clock
+//!
+//! A caller's durations are a nominal policy, not a promise the machine can
+//! keep from anywhere: they are sized for the spans an ordinary command covers,
+//! and a move out of a pose a hand or a crash left the machine in can span far
+//! more. [`floor_move_clock`] right-sizes such a move before it is commanded —
+//! it dry-samples the candidate path at the control rate and stretches
+//! whichever group clock cannot carry its own span inside the per-tick step
+//! bounds. Clocks are only ever lengthened, so the path is preserved exactly
+//! and merely traversed more slowly, which is the right degradation for a move
+//! whose only sin is starting further away than the knob assumed. The step
+//! guard below is untouched by any of it and stays the backstop for genuine
+//! runaway bugs.
+//!
 //! ## The move's own start
 //!
 //! A trajectory sampled at zero elapsed time reproduces its start, which is the
@@ -72,7 +86,9 @@ use reachy_kin::{
 use thiserror::Error;
 
 use crate::arm::ArmRecord;
-use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint};
+use crate::joints::{
+    JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint,
+};
 use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 
 /// When a joint is far enough from its goal, for long enough, without closing
@@ -977,12 +993,11 @@ pub fn motion_tick(
     };
 
     // Step guard. An oversized step is a slam, and the bug that produced it is
-    // the thing worth reporting; it is never trimmed and sent.
-    //
-    // TODO(recovery-move-clock): the clock a move runs on is the caller's fixed
-    // duration, chosen for the spans an ordinary command covers, so a move out
-    // of a wide excursion — the recovery the admission above exists to allow —
-    // can step past this bound partway through and fault, which de-torques.
+    // the thing worth reporting; it is never trimmed and sent. A move whose
+    // clock is too short for its span does not reach here:
+    // `floor_move_clock` right-sizes it before it is commanded, so what
+    // remains for this guard to catch is an interpolator or a seed that is
+    // wrong.
     for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(state.last_goal.joints()) {
         let delta = (angle - last).abs();
         if outside_limit(delta, cfg.max_step.for_joint(id)) {
@@ -1029,32 +1044,10 @@ fn take_command(
         return CommandDisposition::Held;
     };
 
-    // An antenna target is a direction — a physical angle mod 2π — and the
-    // machine's frame for it is continuous and unbounded. Each direction
-    // resolves here to a representative within a turn of where the last command
-    // left that antenna, chosen to miss the outboard sideways point. This is the
-    // only wrap arithmetic on the command path: the interpolation, the step
-    // guard and the tracking comparison all take plain linear differences in the
-    // frame it produces.
-    let mut target = *target;
-    for (side, joint) in [JointId::AntennaRight, JointId::AntennaLeft]
-        .into_iter()
-        .enumerate()
-    {
-        let last = state.last_targets.antennas[side];
-        match resolve_antenna(last, target.antennas[side], ANTENNA_OUTBOARD[side]) {
-            Some(angle) => target.antennas[side] = angle,
-            None => {
-                // Both arcs land where no servo count reaches. The preferred one
-                // is what the operator asked for, so it is the number reported.
-                let angle = short_arc(last, target.antennas[side]);
-                return CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
-                    joint,
-                    angle,
-                });
-            }
-        }
-    }
+    let target = match resolve_antennas(&state.last_targets, target) {
+        Ok(target) => target,
+        Err(rejection) => return CommandDisposition::Rejected(rejection),
+    };
 
     let mut report = EnvelopeReport::default();
     if let Err(error) = check_envelope(
@@ -1090,6 +1083,284 @@ fn take_command(
         }
         Err(error) => CommandDisposition::Rejected(CommandRejection::Trajectory(error)),
     }
+}
+
+/// How much slack past the measured ratio a stretched clock is given.
+///
+/// The correction itself is first-order exact for a joint the path moves
+/// linearly in its own coordinate: min-jerk is time-scale invariant, so twice
+/// the clock is half the per-tick step. What the slack is for is everything the
+/// dry pass cannot see, and the largest of those by far is the clock the live
+/// loop keeps. This pass samples an ideal grid; the loop samples the trajectory
+/// at whatever time each period *begins*, and the sleep that paces it wakes at
+/// or after its deadline. A period that starts late by some fraction of a
+/// period covers that much more of the path, and the step it commands grows in
+/// proportion — so a clock sized to land exactly on the bound faults on
+/// ordinary scheduler jitter, on the recovery move a stretch exists to save.
+/// Half a period is the lateness the control loop treats as ordinary, so half
+/// again is what a stretched clock has to cover before anything else; the rest
+/// is room over that, and over the two small terms — the inverse kinematics the
+/// legs go through, and the shift of the sampling grid itself under a stretch.
+/// A stretch is already the slow path, and a recovery span taking this much
+/// longer costs nothing next to a machine de-torqued partway through it.
+const STRETCH_MARGIN: f64 = 0.75;
+
+/// How many times a clock may be measured and stretched before the move runs on
+/// whatever the last pass produced.
+///
+/// The worst per-tick step shrinks monotonically as the same path is sampled
+/// over a longer clock, so the loop terminates on its own; this bound is what
+/// keeps a pathological geometry from spending an unbounded number of dry
+/// passes on the period that accepts a command. Exhausting it is not expected,
+/// and the step guard is the backstop if it ever happens.
+const STRETCH_PASSES: usize = 4;
+
+/// The most samples one dry pass takes.
+///
+/// Two thousand seconds at fifty hertz. Any span this machine can travel fits
+/// inside the step bounds on a clock far shorter than that, so a duration past
+/// this is one there is nothing left to measure about.
+const MAX_DRY_SAMPLES: u32 = 100_000;
+
+/// A move's clock as it was asked for and as it will run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockStretch {
+    /// The durations the caller commanded.
+    pub requested: MoveDurations,
+    /// The durations the move runs on instead: long enough, per group, to carry
+    /// the move's own span inside the per-tick step bounds.
+    pub effective: MoveDurations,
+}
+
+/// The worst per-tick step one dry pass saw, per group clock, as a fraction of
+/// the bound that group is judged against.
+///
+/// At or under one is a clock that fits. The head clock drives the body yaw and
+/// the six legs, which are bounded separately and reduced together here because
+/// one duration governs them both.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StepRatios {
+    head: f64,
+    antennas: f64,
+}
+
+impl StepRatios {
+    /// Whether both clocks carry their spans.
+    fn fit(self) -> bool {
+        self.head <= 1.0 && self.antennas <= 1.0
+    }
+}
+
+/// `command` on a clock long enough to carry the span it actually covers within
+/// the per-tick step bounds, and what the stretch was when there was one.
+///
+/// A duration is configuration, sized for the spans an ordinary command covers.
+/// Where the machine physically *stands* is not configuration: a hand or a crash
+/// can leave the body most of a turn from where a stow expects to find it, and
+/// a fixed clock over that span steps past the guard partway through and
+/// faults, which de-torques the machine at the exact moment it was recovering.
+/// This measures the candidate path before it is commanded — dry-sampling it at
+/// `tick_hz` through the same envelope and inverse kinematics the live tick
+/// runs, over the same trajectory [`take_command`] will build — and hands back a
+/// clock that fits.
+///
+/// Only ever longer, and only where a fixed clock was never sized: a feasible
+/// move comes back untouched with `None`, so the configured durations remain
+/// the policy for every move they are feasible for. A command this cannot
+/// measure — a move that cannot be shaped, a path some sample has no inverse
+/// kinematics for, a step bound of zero — also comes back untouched. Nothing
+/// here refuses anything; [`take_command`] still judges the command it is
+/// handed.
+///
+/// `start` is what the accepted trajectory will chain from — the state's last
+/// commanded targets — so a retarget mid-recovery is right-sized for the span
+/// still ahead of it rather than for the one the original command had.
+#[must_use]
+pub fn floor_move_clock(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    command: &MotionCommand,
+    tick_hz: f64,
+) -> (MotionCommand, Option<ClockStretch>) {
+    let MotionCommand::MoveTo {
+        target,
+        durations,
+        warp,
+    } = command
+    else {
+        return (*command, None);
+    };
+    let Ok(resolved) = resolve_antennas(start, target) else {
+        return (*command, None);
+    };
+
+    let requested = *durations;
+    let mut effective = requested;
+    for _ in 0..STRETCH_PASSES {
+        let Some(ratios) = worst_step_ratios(cfg, start, &resolved, effective, *warp, tick_hz)
+        else {
+            break;
+        };
+        if ratios.fit() {
+            break;
+        }
+        let Some(stretched) = stretched(effective, ratios) else {
+            break;
+        };
+        effective = stretched;
+    }
+
+    if effective == requested {
+        return (*command, None);
+    }
+    (
+        // The target as it was handed in, unresolved: the resolution above is
+        // this pass's own arithmetic, and re-resolving an already-resolved
+        // antenna direction is not the identity.
+        MotionCommand::MoveTo {
+            target: *target,
+            durations: effective,
+            warp: *warp,
+        },
+        Some(ClockStretch {
+            requested,
+            effective,
+        }),
+    )
+}
+
+/// `durations` with each group that overran its bound scaled past it, and the
+/// group that did not left alone. `None` when the arithmetic leaves the range a
+/// duration can hold.
+fn stretched(durations: MoveDurations, ratios: StepRatios) -> Option<MoveDurations> {
+    Some(MoveDurations {
+        head: scale_past(durations.head, ratios.head)?,
+        antennas: scale_past(durations.antennas, ratios.antennas)?,
+    })
+}
+
+/// `duration` scaled by `ratio` and the margin, or itself when the ratio is
+/// already inside the bound. Never shortened.
+fn scale_past(duration: Duration, ratio: f64) -> Option<Duration> {
+    if ratio <= 1.0 {
+        return Some(duration);
+    }
+    Duration::try_from_secs_f64(duration.as_secs_f64() * ratio * (1.0 + STRETCH_MARGIN)).ok()
+}
+
+/// The worst per-tick step the move from `start` to `target` would emit on
+/// `durations`, per group, as a fraction of that group's bound.
+///
+/// `None` when the path cannot be measured at all: an unshapeable move, a
+/// sample the inverse kinematics has no answer for, a bound of zero, or a clock
+/// too long to walk. Every one of those is a question for the tick rather than
+/// something a longer clock fixes.
+fn worst_step_ratios(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    target: &JointTargets,
+    durations: MoveDurations,
+    warp: Warp,
+    tick_hz: f64,
+) -> Option<StepRatios> {
+    if !(tick_hz.is_finite() && tick_hz > 0.0) {
+        return None;
+    }
+    let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
+
+    let samples = (durations.longest().as_secs_f64() * tick_hz).ceil();
+    if !samples.is_finite() || samples > f64::from(MAX_DRY_SAMPLES) {
+        return None;
+    }
+    // The grid the live loop samples on, from the first period that commands
+    // anything through the one that lands the endpoint. The move's own start is
+    // the pose already held and is the baseline rather than a step.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded above by MAX_DRY_SAMPLES and below by the ceil of a non-negative span"
+    )]
+    let samples = samples as u32;
+
+    let mut previous = joints_of(cfg, start)?;
+    let mut sampled = JointTargets::default();
+    let mut ratios = StepRatios::default();
+    for step in 1..=samples {
+        let t = Duration::try_from_secs_f64(f64::from(step) / tick_hz).ok()?;
+        trajectory.sample(t, &mut sampled);
+        let candidate = joints_of(cfg, &sampled)?;
+        for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(previous.joints()) {
+            let ratio = (angle - last).abs() / cfg.max_step.for_joint(id);
+            if !ratio.is_finite() {
+                return None;
+            }
+            let group = match id.group() {
+                JointGroup::Antennas => &mut ratios.antennas,
+                JointGroup::BodyYaw | JointGroup::Legs => &mut ratios.head,
+            };
+            *group = group.max(ratio);
+        }
+        previous = candidate;
+    }
+    Some(ratios)
+}
+
+/// The nine joint angles that hold `targets`, or `None` when some leg has no
+/// solution.
+///
+/// The same solve the tick commands from — [`check_envelope`]'s own crank
+/// angles — so what this measures is what the guard will see. The verdict is
+/// dropped: a recovering move is admitted outside the envelope, and its steps
+/// are exactly the ones worth sizing a clock for.
+fn joints_of(cfg: &MotionConfig, targets: &JointTargets) -> Option<JointVector> {
+    let mut report = EnvelopeReport::default();
+    let _ = check_envelope(
+        &cfg.geom,
+        &cfg.env,
+        &targets.head_pose_body,
+        targets.body_yaw,
+        None,
+        &mut report,
+    );
+    report.leg_angles.map(|LegAngles(legs)| JointVector {
+        body_yaw: targets.body_yaw,
+        legs,
+        antennas: targets.antennas,
+    })
+}
+
+/// `target` with each antenna direction resolved to the representative the
+/// machine will sweep to from `start`.
+///
+/// An antenna target is a direction — a physical angle mod 2π — and the
+/// machine's frame for it is continuous and unbounded. Each direction resolves
+/// to a representative within a turn of where the last command left that
+/// antenna, chosen to miss the outboard sideways point. This is the only wrap
+/// arithmetic on the command path, and the one place it lives: the
+/// interpolation, the step guard, the tracking comparison and the dry pass that
+/// right-sizes a move's clock all take plain linear differences in the frame it
+/// produces.
+fn resolve_antennas(
+    start: &JointTargets,
+    target: &JointTargets,
+) -> Result<JointTargets, CommandRejection> {
+    let mut resolved = *target;
+    for (side, joint) in [JointId::AntennaRight, JointId::AntennaLeft]
+        .into_iter()
+        .enumerate()
+    {
+        let last = start.antennas[side];
+        match resolve_antenna(last, resolved.antennas[side], ANTENNA_OUTBOARD[side]) {
+            Some(angle) => resolved.antennas[side] = angle,
+            None => {
+                // Both arcs land where no servo count reaches. The preferred one
+                // is what the operator asked for, so it is the number reported.
+                let angle = short_arc(last, resolved.antennas[side]);
+                return Err(CommandRejection::AntennaUnreachable { joint, angle });
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// The representative of direction `target` nearest `last`: the arc no longer
@@ -1263,11 +1534,28 @@ mod tests {
         duration: Duration,
         period: f64,
     ) -> (u32, TickOutputs) {
-        let command = MotionCommand::MoveTo {
-            target: *target,
-            durations: MoveDurations::uniform(duration),
-            warp: Warp::MinJerk,
-        };
+        run_command(
+            cfg,
+            state,
+            start,
+            &MotionCommand::MoveTo {
+                target: *target,
+                durations: MoveDurations::uniform(duration),
+                warp: Warp::MinJerk,
+            },
+            period,
+        )
+    }
+
+    /// The same, for a command whose two group clocks differ.
+    fn run_command(
+        cfg: &MotionConfig,
+        state: &mut MotionState,
+        start: &JointVector,
+        command: &MotionCommand,
+        period: f64,
+    ) -> (u32, TickOutputs) {
+        let command = *command;
         let mut present = *start;
         let mut ticks = 0;
         let mut out = TickOutputs::default();
@@ -1382,6 +1670,445 @@ mod tests {
             "under the floor: {:?}",
             out.report.fault
         );
+    }
+
+    /// A stow-to-neutral command at a duration the span fits inside is handed
+    /// back exactly as it came, with nothing to report.
+    ///
+    /// This is the ordinary case and it is the one that matters most: the
+    /// configured durations are the policy, and a right-sizing pass that
+    /// nudged a feasible move would have quietly taken that policy over.
+    #[test]
+    fn a_feasible_move_keeps_the_clock_it_was_given() {
+        let cfg = MotionConfig::default();
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let (state, _) = armed_at(&cfg, &stow);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations::uniform(secs(2.0)),
+            warp: Warp::MinJerk,
+        };
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        assert_eq!(stretch, None);
+        assert_eq!(floored, command);
+    }
+
+    /// A stow-to-neutral command under the derived head-group floor comes back
+    /// on a clock at or above it, and that clock carries the move through.
+    ///
+    /// The requested clock is the one the derivation test pins as faulting, so
+    /// the two halves are the same move: the original clock faults partway
+    /// through; the stretched one completes.
+    #[test]
+    fn a_move_under_the_head_floor_is_stretched_past_it() {
+        let cfg = MotionConfig::default();
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let requested = secs(0.5);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations::uniform(requested),
+            warp: Warp::MinJerk,
+        };
+
+        let (mut state, pinned) = armed_at(&cfg, &stow);
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("half a second cannot carry the fold");
+        assert_eq!(stretch.requested, MoveDurations::uniform(requested));
+        assert_eq!(stretch.effective, durations_of(&floored));
+        assert!(
+            stretch.effective.head.as_secs_f64() >= HEAD_GROUP_FLOOR_S,
+            "stretched to {:?}, under the {HEAD_GROUP_FLOOR_S} s floor",
+            stretch.effective.head,
+        );
+
+        let (_, out) = run_command(&cfg, &mut state, &pinned, &floored, 1.0 / FLOOR_TICK_HZ);
+        assert_eq!(out.report.fault, None);
+        assert!(out.report.completed, "{:?}", out.report);
+
+        // And the clock it was asked for is the one that faults, so the
+        // stretch is what stands between this move and a de-torqued machine.
+        let (mut state, pinned) = armed_at(&cfg, &stow);
+        let (_, out) = run_command(&cfg, &mut state, &pinned, &command, 1.0 / FLOOR_TICK_HZ);
+        assert!(
+            matches!(out.report.fault, Some(Fault::StepTooLarge { .. })),
+            "{:?}",
+            out.report.fault
+        );
+    }
+
+    /// The body yaw and the antennas move linearly in their own coordinates, so
+    /// what a stretch lands on is [`duration_floor_s`] of the span it covers —
+    /// within the margin the stretch adds and never under the floor itself.
+    ///
+    /// Two independent clocks, checked one at a time: a yaw sweep leaves the
+    /// antenna clock alone and an antenna sweep leaves the head clock alone,
+    /// which is the whole point of the split.
+    #[test]
+    fn the_yaw_and_antenna_stretches_land_on_their_closed_forms() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &JointTargets::default());
+        let requested = MoveDurations {
+            head: secs(0.5),
+            antennas: secs(0.3),
+        };
+
+        let yaw_span = 1.0;
+        let antenna_span = 3.0;
+        for (name, target, span, bound, group) in [
+            (
+                "yaw",
+                JointTargets {
+                    body_yaw: yaw_span,
+                    ..JointTargets::default()
+                },
+                yaw_span,
+                cfg.max_step.body_yaw,
+                JointGroup::BodyYaw,
+            ),
+            (
+                "antenna",
+                JointTargets {
+                    antennas: [antenna_span, 0.0],
+                    ..JointTargets::default()
+                },
+                antenna_span,
+                cfg.max_step.antennas,
+                JointGroup::Antennas,
+            ),
+        ] {
+            let command = MotionCommand::MoveTo {
+                target,
+                durations: requested,
+                warp: Warp::MinJerk,
+            };
+            let (_, stretch) =
+                floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+            let stretch = stretch.expect("the span does not fit the clock it was given");
+
+            let floor = duration_floor_s(span, bound, FLOOR_TICK_HZ);
+            let antennas_moved = group == JointGroup::Antennas;
+            let (moved, asked, untouched, left) = if antennas_moved {
+                (
+                    stretch.effective.antennas,
+                    requested.antennas,
+                    stretch.effective.head,
+                    requested.head,
+                )
+            } else {
+                (
+                    stretch.effective.head,
+                    requested.head,
+                    stretch.effective.antennas,
+                    requested.antennas,
+                )
+            };
+            assert!(
+                moved.as_secs_f64() >= floor,
+                "{name}: stretched to {moved:?}, under its {floor:.4} s floor"
+            );
+            assert!(
+                moved.as_secs_f64() <= floor * (1.0 + STRETCH_MARGIN),
+                "{name}: stretched to {moved:?}, past the {floor:.4} s floor by more than the \
+                 margin"
+            );
+            assert!(
+                moved > asked,
+                "{name}: {moved:?} is not longer than {asked:?}"
+            );
+            assert_eq!(untouched, left, "{name}: the other group's clock moved");
+        }
+    }
+
+    /// The recovery this exists for: a body a hand spun to the half turn while
+    /// the machine lay limp folds to stow on a clock sized for the half turn,
+    /// instead of faulting partway and dropping the head.
+    ///
+    /// Half a turn exceeds the ~153° a two-second clock covers at this step
+    /// bound, and it is the unattended-at-boot case: nobody is there to catch
+    /// the head or to restart the daemon.
+    #[test]
+    fn a_body_spun_to_the_half_turn_folds_on_a_stretched_clock() {
+        let cfg = MotionConfig::default();
+        let crooked = JointTargets {
+            body_yaw: core::f64::consts::PI,
+            ..JointTargets::default()
+        };
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let shipped = secs(2.0);
+        let command = MotionCommand::MoveTo {
+            target: stow,
+            durations: MoveDurations::uniform(shipped),
+            warp: Warp::MinJerk,
+        };
+
+        // Unfloored, the shipped fold is the regression: it steps past the
+        // bound partway round and stops the machine wherever that was.
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let (_, out) = run_command(&cfg, &mut state, &pinned, &command, 1.0 / FLOOR_TICK_HZ);
+        assert!(
+            matches!(
+                out.report.fault,
+                Some(Fault::StepTooLarge {
+                    joint: JointId::BodyYaw,
+                    ..
+                })
+            ),
+            "{:?}",
+            out.report.fault
+        );
+
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("a half turn does not fit a two second clock");
+        let floor = duration_floor_s(core::f64::consts::PI, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
+        assert!(
+            stretch.effective.head.as_secs_f64() >= floor,
+            "stretched to {:?}, under the {floor:.4} s the half turn needs",
+            stretch.effective.head,
+        );
+
+        let (_, out) = run_command(&cfg, &mut state, &pinned, &floored, 1.0 / FLOOR_TICK_HZ);
+        assert_eq!(out.report.fault, None, "{:?}", out.report);
+        assert!(out.report.completed, "{:?}", out.report);
+        // The fold travelled the whole way: the recovery ends at stow, not
+        // partway to it.
+        assert!(
+            state.last_targets().body_yaw.abs() < 1e-12,
+            "left at {} rad",
+            state.last_targets().body_yaw
+        );
+    }
+
+    /// A stretched clock carries its move through a loop that runs late.
+    ///
+    /// Injects the worst alternation of the lateness the control loop treats
+    /// as ordinary — half a period on every second tick — and expects the
+    /// guard to stay quiet. A clock sized exactly to the bound would fault
+    /// here on timing noise, not on span.
+    #[test]
+    fn a_stretched_move_survives_a_loop_running_late() {
+        let cfg = MotionConfig::default();
+        let crooked = JointTargets {
+            body_yaw: core::f64::consts::PI,
+            ..JointTargets::default()
+        };
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let command = MotionCommand::MoveTo {
+            target: stow,
+            durations: MoveDurations::uniform(secs(2.0)),
+            warp: Warp::MinJerk,
+        };
+
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let (floored, _) = floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+
+        let period = 1.0 / FLOOR_TICK_HZ;
+        let mut present = pinned;
+        let mut out = TickOutputs::default();
+        for n in 0..2000 {
+            let late = if n % 2 == 1 { period / 2.0 } else { 0.0 };
+            let now = secs(f64::from(n) * period + late);
+            let command = (n == 0).then_some(&floored);
+            out = tick_with(&cfg, &mut state, now, &present, command);
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+            if out.report.completed || out.report.fault.is_some() {
+                break;
+            }
+        }
+        assert_eq!(out.report.fault, None, "{:?}", out.report);
+        assert!(out.report.completed, "{:?}", out.report);
+    }
+
+    /// A stretch is sized from where the move starts, so a replacement issued
+    /// partway through a recovery is right-sized for the span still ahead of it
+    /// rather than for the one the original command had.
+    #[test]
+    fn a_stretch_follows_the_span_still_ahead() {
+        let cfg = MotionConfig::default();
+        let requested = MoveDurations::uniform(secs(0.5));
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+
+        let effective_from = |yaw: f64| {
+            let (state, _) = armed_at(
+                &cfg,
+                &JointTargets {
+                    body_yaw: yaw,
+                    ..JointTargets::default()
+                },
+            );
+            let command = MotionCommand::MoveTo {
+                target: stow,
+                durations: requested,
+                warp: Warp::MinJerk,
+            };
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
+                .1
+                .expect("half a second carries neither span")
+                .effective
+                .head
+                .as_secs_f64()
+        };
+
+        let far = effective_from(core::f64::consts::PI);
+        let near = effective_from(core::f64::consts::FRAC_PI_2);
+        assert!(
+            far > near,
+            "the half turn asked for {far:.4} s, the quarter for {near:.4} s"
+        );
+    }
+
+    /// Nothing a right-sizing pass cannot measure is changed by it, and nothing
+    /// it is not asked about either: a hold has no clock, and a move that
+    /// cannot be shaped is the tick's refusal to make, not this pass's.
+    ///
+    /// Every bail-out — every way the pass hands the command back unchanged —
+    /// is enumerated here. Losing one takes the pass somewhere it has no
+    /// answer for.
+    #[test]
+    fn what_cannot_be_measured_is_handed_straight_back() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &JointTargets::default());
+
+        for (command, tick_hz) in [
+            (MotionCommand::Hold, FLOOR_TICK_HZ),
+            // Zero on either clock: unshapeable, and refused by name at the
+            // tick rather than stretched into something shapeable here.
+            (
+                MotionCommand::MoveTo {
+                    target: JointTargets::default(),
+                    durations: MoveDurations::uniform(Duration::ZERO),
+                    warp: Warp::MinJerk,
+                },
+                FLOOR_TICK_HZ,
+            ),
+            // A head pose the linkage cannot close on: the path has samples
+            // with no crank angles at all, so there is nothing to measure and
+            // no clock that would help.
+            (
+                MotionCommand::MoveTo {
+                    target: pose_at(10.0),
+                    durations: MoveDurations::uniform(secs(1.0)),
+                    warp: Warp::MinJerk,
+                },
+                FLOOR_TICK_HZ,
+            ),
+            // No control rate: there is no grid to sample the path on, and a
+            // dry pass with no periods in it measures nothing.
+            (
+                MotionCommand::MoveTo {
+                    target: pose_at(0.19),
+                    durations: MoveDurations::uniform(secs(1.0)),
+                    warp: Warp::MinJerk,
+                },
+                0.0,
+            ),
+            // A clock past what one pass may walk: forty minutes at the control
+            // rate is more samples than `MAX_DRY_SAMPLES` allows, and a span
+            // this machine can travel fits its bounds on a clock nothing like
+            // that long anyway.
+            (
+                MotionCommand::MoveTo {
+                    target: pose_at(0.19),
+                    durations: MoveDurations::uniform(secs(
+                        f64::from(MAX_DRY_SAMPLES) / FLOOR_TICK_HZ + 1.0,
+                    )),
+                    warp: Warp::MinJerk,
+                },
+                FLOOR_TICK_HZ,
+            ),
+        ] {
+            let (floored, stretch) =
+                floor_move_clock(&cfg, state.last_targets(), &command, tick_hz);
+            assert_eq!(stretch, None, "{command:?} at {tick_hz} Hz");
+            assert_eq!(floored, command, "{command:?} at {tick_hz} Hz");
+        }
+    }
+
+    /// An antenna whose short arc would sweep through the outboard point goes
+    /// the long way round, and the clock is sized for the arc the machine
+    /// actually travels — not for the short one nobody commanded.
+    ///
+    /// Both halves of the one place this pass does wrap arithmetic. The dry
+    /// sample runs over the resolved representative, so the span it measures is
+    /// the long one; and what comes back carries the target exactly as it was
+    /// handed in, because resolving an already-resolved direction a second time
+    /// at the tick would flip it back to the short arc and run a path whose
+    /// clock was never measured.
+    #[test]
+    fn an_antenna_that_wraps_is_floored_for_the_arc_it_sweeps() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &JointTargets::default());
+
+        // The right antenna, from straight up: the short way to -2 rad crosses
+        // its outboard direction at -π/2, so the sweep is the other way round.
+        let short_arc = -2.0;
+        let long_arc = short_arc + core::f64::consts::TAU;
+        let command = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [short_arc, 0.0],
+                ..JointTargets::default()
+            },
+            durations: MoveDurations::uniform(secs(0.5)),
+            warp: Warp::MinJerk,
+        };
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("half a second cannot carry a turn of antenna");
+
+        let long_floor = duration_floor_s(long_arc, cfg.max_step.antennas, FLOOR_TICK_HZ);
+        let short_floor = duration_floor_s(short_arc.abs(), cfg.max_step.antennas, FLOOR_TICK_HZ);
+        let moved = stretch.effective.antennas.as_secs_f64();
+        assert!(
+            moved >= long_floor,
+            "stretched to {moved:.4} s, under the {long_floor:.4} s the long way round needs"
+        );
+        assert!(
+            moved <= long_floor * (1.0 + STRETCH_MARGIN),
+            "stretched to {moved:.4} s, past the {long_floor:.4} s floor by more than the margin"
+        );
+        assert!(
+            moved > short_floor * (1.0 + STRETCH_MARGIN),
+            "stretched to {moved:.4} s, which the {short_floor:.4} s short arc would have covered"
+        );
+
+        let MotionCommand::MoveTo { target, .. } = floored else {
+            panic!("a move came back as {floored:?}");
+        };
+        assert_eq!(
+            target.antennas,
+            [short_arc, 0.0],
+            "the target came back resolved, and the tick resolves it again"
+        );
+    }
+
+    /// The durations a command carries, or the zero clock a hold has.
+    fn durations_of(command: &MotionCommand) -> MoveDurations {
+        match command {
+            MotionCommand::MoveTo { durations, .. } => *durations,
+            MotionCommand::Hold => MoveDurations::uniform(Duration::ZERO),
+        }
     }
 
     /// An armed machine holding still commands nothing at all. The servos hold
