@@ -14,10 +14,16 @@ binding on every change in this repo.
 - **A violation is a typed error.** Never a clamp, never saturation, never a
   non-finite number handed onward. If you find yourself reaching for
   `clamp`/`min`/`max` on a commanded value, stop.
-- **A fault stops commanding and holds torque.** Cutting torque drops the head.
-  Releasing is only ever an explicit operator action.
-- **No automatic recovery.** No retry with perturbed inputs, no reboot, no
-  auto-disarm. Recovery is a command.
+- **Fault management follows `docs/fault-management.md`.** Read it before
+  touching anything that arms, disarms, or handles a fault. The short form:
+  the Minimum Risk Condition is *stowed and de-torqued*; a fault response
+  de-torques the motors (a controlled stow first when control is trusted,
+  an immediate best-effort torque-off when it is not); **nothing ever gates
+  de-torquing**, and holding torque is never a fault response — stowed with
+  torque held is this machine's only pinch hazard.
+- **No automatic fault recovery.** A fault is never auto-cleared and never
+  retried with perturbed inputs; re-arming after a fault is a command.
+  Reaching the Minimum Risk Condition itself is autonomous, not a recovery.
 
 ## Gates
 
@@ -54,8 +60,21 @@ truth. Keep presence tests (does the servo at this ID answer) separate from
 identity tests (does this register read this value).
 
 The read-only half of the registry — presence, register sweeps, voltage,
-health, resting pose — runs with no torque and no motion, and gates every
-command that moves something.
+health, resting pose — runs with no torque and no motion. The registry is a
+diagnostic and a regression guard; it does **not** gate arming or commanding.
+Gating routine operation on self-test records was bring-up caution, retired by
+`docs/fault-management.md`.
+
+## Device deployment doctrine (dev cycles)
+
+During development iteration, **nothing we push touches the device's eMMC**.
+Binaries, configs, tokens, secrets — all of it lands in RAM (tmpfs) and is
+re-pushed after a reboot by one command. This is the brenn-os design: the only
+flash-resident state is fundamental remote-access credentials and identity.
+Flash-backed ("baked") placement of anything else is a release-hardening act
+performed on a stable release — never a dev-cycle convenience. Do not propose
+persisting app state to `/persistent` (or anywhere else on flash) to make a
+dev workflow nicer; fix the deploy command instead.
 
 ## Comments
 
