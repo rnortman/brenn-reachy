@@ -13,11 +13,14 @@
 //! overran its period simply ask for the time it actually is instead of
 //! catching up.
 //!
-//! Shape: one scalar warp of normalised time drives all four components, so
-//! translation, rotation, body yaw and the antennas start together, finish
-//! together, and stay in the same phase throughout. Rotation follows the
-//! geodesic between the two orientations; translation and the scalars are
-//! straight lines.
+//! Shape: the same warp runs over two independent clocks, one per mechanical
+//! group. The head group — translation, rotation and body yaw, which the legs
+//! follow through the IK — shares one duration and stays in phase throughout;
+//! the antennas, which are free rotors bolted to the same skull and share
+//! nothing else with it, get their own. Both groups start together and each
+//! finishes on its own clock, so the head's lift is not floored by however long
+//! an antenna sweep takes. Rotation follows the geodesic between the two
+//! orientations; translation and the scalars are straight lines.
 //!
 //! Two things this deliberately does differently from the vendor's open
 //! implementation, both of which it gets wrong:
@@ -83,12 +86,46 @@ pub enum TrajectoryError {
     NonFinite,
 }
 
+/// How long each mechanical group takes to cover its part of a move.
+///
+/// Two clocks rather than one because the head and the antennas are
+/// mechanically independent: they share a skull and nothing else, and tying the
+/// head's lift to the antennas' sweep is an implementation detail's grip on the
+/// machine's behaviour, not a property of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveDurations {
+    /// The head pose and the body yaw, which the six legs follow through the
+    /// IK.
+    pub head: Duration,
+    /// Both antennas.
+    pub antennas: Duration,
+}
+
+impl MoveDurations {
+    /// Both groups on one clock — what a caller with nothing to say about the
+    /// antennas asks for.
+    #[must_use]
+    pub fn uniform(duration: Duration) -> Self {
+        Self {
+            head: duration,
+            antennas: duration,
+        }
+    }
+
+    /// The group clock that finishes last, which is when the move is over.
+    #[must_use]
+    pub fn longest(self) -> Duration {
+        self.head.max(self.antennas)
+    }
+}
+
 /// A shaped path between two command sets, sampled by elapsed time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trajectory {
     start: JointTargets,
     target: JointTargets,
-    duration_s: f64,
+    head_s: f64,
+    antennas_s: f64,
     warp: Warp,
     /// The geodesic from the start orientation to the target one, as a rotation
     /// vector in the *start's* frame. Precomputed: it costs a square root and
@@ -97,20 +134,20 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
-    /// Shape a move from `start` to `target` over `duration`.
+    /// Shape a move from `start` to `target`, each group over its own duration.
     ///
     /// # Errors
     ///
-    /// [`TrajectoryError::NonPositiveDuration`] for a zero duration, and
-    /// [`TrajectoryError::NonFinite`] if either endpoint carries a non-finite
-    /// number.
+    /// [`TrajectoryError::NonPositiveDuration`] if either group's duration is
+    /// zero, and [`TrajectoryError::NonFinite`] if either endpoint carries a
+    /// non-finite number.
     pub fn new(
         start: &JointTargets,
         target: &JointTargets,
-        duration: Duration,
+        durations: MoveDurations,
         warp: Warp,
     ) -> Result<Self, TrajectoryError> {
-        if duration.is_zero() {
+        if durations.head.is_zero() || durations.antennas.is_zero() {
             return Err(TrajectoryError::NonPositiveDuration);
         }
         if !start.is_finite() || !target.is_finite() {
@@ -122,7 +159,8 @@ impl Trajectory {
         Ok(Self {
             start: *start,
             target: *target,
-            duration_s: duration.as_secs_f64(),
+            head_s: durations.head.as_secs_f64(),
+            antennas_s: durations.antennas.as_secs_f64(),
             warp,
             rotvec_rel: relative.scaled_axis(),
         })
@@ -140,10 +178,13 @@ impl Trajectory {
         &self.start
     }
 
-    /// The path's duration, seconds.
+    /// The path's per-group durations.
     #[must_use]
-    pub fn duration_s(&self) -> f64 {
-        self.duration_s
+    pub fn durations(&self) -> MoveDurations {
+        MoveDurations {
+            head: Duration::from_secs_f64(self.head_s),
+            antennas: Duration::from_secs_f64(self.antennas_s),
+        }
     }
 
     /// The shape this path was built with.
@@ -152,40 +193,55 @@ impl Trajectory {
         self.warp
     }
 
-    /// Whether `t` is at or past the end.
+    /// Whether `t` is at or past the end of both groups' clocks.
     #[must_use]
     pub fn done(&self, t: Duration) -> bool {
-        t.as_secs_f64() >= self.duration_s
+        let secs = t.as_secs_f64();
+        secs >= self.head_s && secs >= self.antennas_s
     }
 
     /// The command set at elapsed time `t`, written into `out`.
     ///
-    /// At or past the duration this is the target's own bits, so a move that
-    /// ran to completion commands exactly what was asked for and a subsequent
-    /// move chains from it without a step.
+    /// At or past a group's duration that group is the target's own bits, so a
+    /// move that ran to completion commands exactly what was asked for and a
+    /// subsequent move chains from it without a step. The group that finishes
+    /// first sits at its target while the other carries on.
     pub fn sample(&self, t: Duration, out: &mut JointTargets) {
-        if self.done(t) {
-            *out = self.target;
-            return;
-        }
-        // Normalised time. `done` above already excluded the upper end; the cap
-        // covers the rounding in the division alone, and is on elapsed time,
-        // never on a commanded quantity.
-        let u = (t.as_secs_f64() / self.duration_s).clamp(0.0, 1.0);
-        let s = self.warp.progress(u);
+        let secs = t.as_secs_f64();
 
-        let start_t = self.start.head_pose_body.translation.vector;
-        let target_t = self.target.head_pose_body.translation.vector;
-        out.head_pose_body = Isometry3::from_parts(
-            Translation3::from(start_t + (target_t - start_t) * s),
-            self.start.head_pose_body.rotation
-                * UnitQuaternion::from_scaled_axis(self.rotvec_rel * s),
-        );
-        out.body_yaw = lerp(self.start.body_yaw, self.target.body_yaw, s);
-        out.antennas = [
-            lerp(self.start.antennas[0], self.target.antennas[0], s),
-            lerp(self.start.antennas[1], self.target.antennas[1], s),
-        ];
+        if secs >= self.head_s {
+            out.head_pose_body = self.target.head_pose_body;
+            out.body_yaw = self.target.body_yaw;
+        } else {
+            let s = self.progress(secs, self.head_s);
+            let start_t = self.start.head_pose_body.translation.vector;
+            let target_t = self.target.head_pose_body.translation.vector;
+            out.head_pose_body = Isometry3::from_parts(
+                Translation3::from(start_t + (target_t - start_t) * s),
+                self.start.head_pose_body.rotation
+                    * UnitQuaternion::from_scaled_axis(self.rotvec_rel * s),
+            );
+            out.body_yaw = lerp(self.start.body_yaw, self.target.body_yaw, s);
+        }
+
+        if secs >= self.antennas_s {
+            out.antennas = self.target.antennas;
+        } else {
+            let s = self.progress(secs, self.antennas_s);
+            out.antennas = [
+                lerp(self.start.antennas[0], self.target.antennas[0], s),
+                lerp(self.start.antennas[1], self.target.antennas[1], s),
+            ];
+        }
+    }
+
+    /// Warped progress at `secs` on a group clock of `duration_s`.
+    ///
+    /// The caller has already excluded the upper end, so the cap covers the
+    /// rounding in the division alone, and it is on elapsed time, never on a
+    /// commanded quantity.
+    fn progress(&self, secs: f64, duration_s: f64) -> f64 {
+        self.warp.progress((secs / duration_s).clamp(0.0, 1.0))
     }
 }
 
@@ -238,7 +294,8 @@ mod tests {
     #[test]
     fn endpoint_is_bitwise_the_target() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, secs(2.0), Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+            .expect("valid move");
         for t in [secs(2.0), secs(2.000_000_001), secs(60.0)] {
             let mut out = JointTargets::default();
             traj.sample(t, &mut out);
@@ -253,7 +310,8 @@ mod tests {
     fn zero_time_reproduces_the_start() {
         let (a, b) = (neutral(), stow());
         for warp in [Warp::MinJerk, Warp::Linear] {
-            let traj = Trajectory::new(&a, &b, secs(2.0), warp).expect("valid move");
+            let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), warp)
+                .expect("valid move");
             let mut out = JointTargets::default();
             traj.sample(Duration::ZERO, &mut out);
             assert_eq!(bits(&out), bits(&a), "{warp:?}");
@@ -266,25 +324,56 @@ mod tests {
     #[test]
     fn consecutive_moves_chain_without_a_step() {
         let (a, b) = (neutral(), stow());
-        let first = Trajectory::new(&a, &b, secs(2.0), Warp::MinJerk).expect("valid move");
+        let first = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+            .expect("valid move");
         let mut landed = JointTargets::default();
         first.sample(secs(2.0), &mut landed);
 
-        let second = Trajectory::new(&landed, &a, secs(1.5), Warp::MinJerk).expect("valid move");
+        let second = Trajectory::new(
+            &landed,
+            &a,
+            MoveDurations::uniform(secs(1.5)),
+            Warp::MinJerk,
+        )
+        .expect("valid move");
         let mut resumed = JointTargets::default();
         second.sample(Duration::ZERO, &mut resumed);
         assert_eq!(bits(&resumed), bits(&landed));
     }
 
+    /// Either group's clock at zero is refused, not just both: a head duration
+    /// of zero with a live antenna clock would divide by it on the first sample
+    /// of the group nobody was thinking about.
     #[test]
     fn zero_duration_is_refused() {
         let (a, b) = (neutral(), stow());
-        assert_eq!(
-            Trajectory::new(&a, &b, Duration::ZERO, Warp::MinJerk),
-            Err(TrajectoryError::NonPositiveDuration)
-        );
+        for durations in [
+            MoveDurations::uniform(Duration::ZERO),
+            MoveDurations {
+                head: Duration::ZERO,
+                antennas: secs(1.0),
+            },
+            MoveDurations {
+                head: secs(1.0),
+                antennas: Duration::ZERO,
+            },
+        ] {
+            assert_eq!(
+                Trajectory::new(&a, &b, durations, Warp::MinJerk),
+                Err(TrajectoryError::NonPositiveDuration),
+                "{durations:?}"
+            );
+        }
         // One nanosecond is a terrible move, but it is a well-defined one.
-        assert!(Trajectory::new(&a, &b, Duration::from_nanos(1), Warp::MinJerk).is_ok());
+        assert!(
+            Trajectory::new(
+                &a,
+                &b,
+                MoveDurations::uniform(Duration::from_nanos(1)),
+                Warp::MinJerk
+            )
+            .is_ok()
+        );
     }
 
     /// A non-finite endpoint is refused at construction, whichever end it is
@@ -305,12 +394,22 @@ mod tests {
 
             for bad in [translation, rotation, yaw, antenna] {
                 assert_eq!(
-                    Trajectory::new(&bad, &good, secs(1.0), Warp::MinJerk),
+                    Trajectory::new(
+                        &bad,
+                        &good,
+                        MoveDurations::uniform(secs(1.0)),
+                        Warp::MinJerk
+                    ),
                     Err(TrajectoryError::NonFinite),
                     "bad start with {bad_value}"
                 );
                 assert_eq!(
-                    Trajectory::new(&good, &bad, secs(1.0), Warp::MinJerk),
+                    Trajectory::new(
+                        &good,
+                        &bad,
+                        MoveDurations::uniform(secs(1.0)),
+                        Warp::MinJerk
+                    ),
                     Err(TrajectoryError::NonFinite),
                     "bad target with {bad_value}"
                 );
@@ -368,14 +467,16 @@ mod tests {
         }
     }
 
-    /// One warp scalar drives all four components: at any sample, the fraction
-    /// of the translation covered, of the yaw, of each antenna and of the
-    /// rotation angle are the same number. A per-component phase difference
-    /// would be invisible at the endpoints and wrong everywhere between.
+    /// On one clock the warp drives all four components together: at any
+    /// sample, the fraction of the translation covered, of the yaw, of each
+    /// antenna and of the rotation angle are the same number. A phase
+    /// difference within a group would be invisible at the endpoints and wrong
+    /// everywhere between.
     #[test]
     fn one_warp_scalar_drives_every_component() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, secs(2.0), Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+            .expect("valid move");
         let total_translation =
             (b.head_pose_body.translation.vector - a.head_pose_body.translation.vector).norm();
         let total_rotation =
@@ -424,7 +525,8 @@ mod tests {
         b.head_pose_body.rotation = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.5_f64)
             * UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.3_f64);
 
-        let traj = Trajectory::new(&a, &b, secs(1.0), Warp::Linear).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), Warp::Linear)
+            .expect("valid move");
         let axis = (a.head_pose_body.rotation.inverse() * b.head_pose_body.rotation)
             .axis()
             .expect("the endpoints differ");
@@ -460,7 +562,8 @@ mod tests {
         b.head_pose_body.rotation =
             UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 350.0_f64.to_radians());
 
-        let traj = Trajectory::new(&a, &b, secs(1.0), Warp::Linear).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), Warp::Linear)
+            .expect("valid move");
         let mut out = JointTargets::default();
         traj.sample(secs(0.5), &mut out);
         let swept = out.head_pose_body.rotation.angle().to_degrees();
@@ -472,7 +575,8 @@ mod tests {
     #[test]
     fn sampling_overwrites_and_repeats_exactly() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, secs(2.0), Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+            .expect("valid move");
 
         let mut fresh = JointTargets::default();
         traj.sample(secs(0.7), &mut fresh);
@@ -494,7 +598,8 @@ mod tests {
     #[test]
     fn done_agrees_with_the_endpoint_snap() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, secs(1.25), Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.25)), Warp::MinJerk)
+            .expect("valid move");
         let mut out = JointTargets::default();
         for nanos in [0_u64, 1, 1_249_999_999, 1_250_000_000, 1_250_000_001] {
             let t = Duration::from_nanos(nanos);
@@ -509,10 +614,98 @@ mod tests {
     #[test]
     fn accessors_report_what_was_built() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, secs(3.5), Warp::Linear).expect("valid move");
+        let durations = MoveDurations {
+            head: secs(3.5),
+            antennas: secs(1.25),
+        };
+        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
         assert_eq!(bits(traj.start()), bits(&a));
         assert_eq!(bits(traj.target()), bits(&b));
-        assert_eq!(traj.duration_s(), 3.5);
+        assert_eq!(traj.durations(), durations);
+        assert_eq!(traj.durations().longest(), secs(3.5));
         assert_eq!(traj.warp(), Warp::Linear);
+    }
+
+    /// The two clocks are independent: at any sample the head group's progress
+    /// is read off its own duration and the antennas' off theirs. This is the
+    /// whole point of the split — a lift that no longer waits on a sweep.
+    #[test]
+    fn group_clocks_run_independently() {
+        let (a, b) = (neutral(), stow());
+        let durations = MoveDurations {
+            head: secs(1.0),
+            antennas: secs(4.0),
+        };
+        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
+
+        let mut out = JointTargets::default();
+        for step in 1..10 {
+            let t = f64::from(step) / 10.0;
+            traj.sample(secs(t), &mut out);
+            let head = (out.head_pose_body.translation.vector.z
+                - a.head_pose_body.translation.vector.z)
+                / (b.head_pose_body.translation.vector.z - a.head_pose_body.translation.vector.z);
+            let antenna = (out.antennas[0] - a.antennas[0]) / (b.antennas[0] - a.antennas[0]);
+            assert!((head - t).abs() < 1e-12, "head at {t}s: {head}");
+            assert!(
+                (antenna - t / 4.0).abs() < 1e-12,
+                "antenna at {t}s: {antenna}"
+            );
+        }
+    }
+
+    /// The group that finishes first sits on its target while the other carries
+    /// on, and the move is over when the longer clock is — so a completed move
+    /// still commands both groups' endpoints exactly.
+    #[test]
+    fn the_short_group_waits_at_its_target() {
+        let (a, b) = (neutral(), stow());
+        let durations = MoveDurations {
+            head: secs(1.0),
+            antennas: secs(4.0),
+        };
+        let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
+
+        let mut out = JointTargets::default();
+        for t in [secs(1.0), secs(2.0), secs(3.9)] {
+            traj.sample(t, &mut out);
+            assert!(!traj.done(t), "at {t:?}");
+            assert_eq!(
+                out.head_pose_body.translation.vector.z.to_bits(),
+                b.head_pose_body.translation.vector.z.to_bits(),
+                "head at {t:?}"
+            );
+            assert_eq!(out.body_yaw.to_bits(), b.body_yaw.to_bits(), "yaw at {t:?}");
+            assert!(
+                (out.antennas[0] - b.antennas[0]).abs() > 1e-6,
+                "antennas still moving at {t:?}"
+            );
+        }
+
+        traj.sample(secs(4.0), &mut out);
+        assert!(traj.done(secs(4.0)));
+        assert_eq!(bits(&out), bits(&b));
+    }
+
+    /// The antenna group may be the shorter one just as well, and then it is the
+    /// head still travelling after the sweep has landed.
+    #[test]
+    fn either_group_may_be_the_shorter_one() {
+        let (a, b) = (neutral(), stow());
+        let durations = MoveDurations {
+            head: secs(3.0),
+            antennas: secs(0.5),
+        };
+        let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
+
+        let mut out = JointTargets::default();
+        traj.sample(secs(1.0), &mut out);
+        assert!(!traj.done(secs(1.0)));
+        assert_eq!(out.antennas[0].to_bits(), b.antennas[0].to_bits());
+        assert_eq!(out.antennas[1].to_bits(), b.antennas[1].to_bits());
+        assert!(
+            (out.head_pose_body.translation.vector.z - b.head_pose_body.translation.vector.z).abs()
+                > 1e-6
+        );
     }
 }

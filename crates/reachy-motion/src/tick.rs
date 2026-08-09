@@ -15,19 +15,27 @@
 //! ## The failure policy
 //!
 //! Any stage can raise a [`Fault`], and a fault is absorbing: the tick stops
-//! commanding and every subsequent tick emits nothing. It never cuts torque —
-//! that drops the head — and it never recovers on its own. The servos hold their
-//! last goal indefinitely, which is exactly what a stopped tick wants from them,
-//! and releasing is an operator action taken with full knowledge of what it
-//! does.
+//! commanding and every subsequent tick emits nothing, and it never recovers on
+//! its own. This layer owns no wire, so it cuts no torque either; what it hands
+//! back is the verdict that the machine must be brought to the minimum risk
+//! condition, and the caller driving the bus is what writes torque off.
 //!
-//! Two things are deliberately *not* faults. A command whose target fails the
-//! envelope is **rejected** and reported: an armed, holding machine must not be
-//! bricked by someone typing a pose it cannot reach. A command that arrives
-//! while a move is running is rejected the same way. A sampled *path* pose that
+//! A command whose target fails the envelope is deliberately *not* a fault: it
+//! is **rejected** and reported, because an armed, holding machine must not be
+//! bricked by someone typing a pose it cannot reach. A sampled *path* pose that
 //! fails the envelope after its target passed is a different matter — the
 //! checker and the interpolation have disagreed about a pose already accepted —
 //! and that is a fault.
+//!
+//! ## Replacing a move in flight
+//!
+//! A command that arrives mid-move **retargets**: the running trajectory is
+//! abandoned and a new one is shaped from the setpoint the last tick commanded,
+//! at rest. Nothing queues and nothing blends — the machine follows the latest
+//! intent it was given, which is what an interaction that changes its mind
+//! partway needs. The splice assumes zero velocity, so the servo and the
+//! gearbox absorb whatever the old path was carrying at the moment it was
+//! dropped.
 //!
 //! ## The move's own start
 //!
@@ -65,7 +73,7 @@ use thiserror::Error;
 
 use crate::arm::ArmRecord;
 use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint};
-use crate::traj::{Trajectory, TrajectoryError, Warp};
+use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 
 /// When a joint is far enough from its goal, for long enough, without closing
 /// on it, to conclude the servo is not tracking it.
@@ -174,10 +182,13 @@ impl Default for MotionConfig {
             max_step: JointStep {
                 legs: 0.05,
                 body_yaw: 0.05,
-                // An antenna target resolves to within half a turn of where the
-                // frame stands, so the longest commandable sweep is π: over the
-                // two seconds of the shortest move that peaks near 0.059 at
-                // 50 Hz, and this leaves better than double the room.
+                // An antenna sweep takes the arc that misses its outboard
+                // direction, so a commandable sweep runs to just under a full
+                // turn — 6.28 rad, peaking near 0.15 at 50 Hz over a 1.57 s
+                // move. That is this bound exactly, and it is why an antenna
+                // duration has a floor: the presence sweep of 3.23 rad needs
+                // 0.81 s, and re-stowing an antenna left inboard of sideways
+                // (4.80 rad) needs 1.21 s.
                 antennas: 0.15,
             },
             tracking: TrackingFaultConfig::default(),
@@ -186,6 +197,45 @@ impl Default for MotionConfig {
         }
     }
 }
+
+/// The tick rate the duration floors below are derived at, hertz.
+///
+/// The bench and the daemon both run the loop at fifty. A deployment that
+/// changed it would move every floor in proportion: what a step bound limits is
+/// the distance between two consecutive periods, so halving the rate doubles
+/// each step and doubles the shortest duration that fits.
+pub const FLOOR_TICK_HZ: f64 = 50.0;
+
+/// A min-jerk path's peak rate as a multiple of its average — fifteen eighths.
+///
+/// What makes a duration floor closed-form: a move covering `span` in
+/// `duration` peaks at this times `span / duration`, and the per-tick step at
+/// that peak is the largest one the guard will see.
+pub const MIN_JERK_PEAK_RATE: f64 = 1.875;
+
+/// The shortest a min-jerk move covering `span` radians can take without a
+/// single tick's step passing `max_step`, seconds.
+///
+/// Exact for a joint the path moves linearly in its own coordinate — the body
+/// yaw and the antennas. The legs move through the inverse kinematics and have
+/// no closed form; theirs is [`HEAD_GROUP_FLOOR_S`], derived by search.
+#[must_use]
+pub fn duration_floor_s(span: f64, max_step: f64, tick_hz: f64) -> f64 {
+    MIN_JERK_PEAK_RATE * span / (max_step * tick_hz)
+}
+
+/// The head group's duration floor: the shortest stow-to-neutral move whose
+/// every leg step at [`FLOOR_TICK_HZ`] stays inside the default
+/// `max_step.legs`, seconds, rounded up to the 10 ms its search steps in.
+///
+/// Derived rather than guessed — a test re-derives it through the inverse
+/// kinematics and fails when the geometry, the tick rate or the bound moves it
+/// — and public because it is the number both example configurations quote
+/// beside the durations an operator tunes, and the number a configuration test
+/// checks the shipped values against. Under it the guard faults rather than
+/// clamping, which is a stopped move and a de-torqued machine: a shipped
+/// duration below this is presence that never works.
+pub const HEAD_GROUP_FLOOR_S: f64 = 1.07;
 
 /// What the tick is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -262,6 +312,94 @@ pub enum Fault {
     },
 }
 
+/// How far a pose stands outside each envelope bound it can travel back inside
+/// of, radians, zero on a bound it is within.
+///
+/// The clearance floor is not among them. It has a baseline of its own, taken
+/// from the present pose on every live read, and the question it asks is
+/// different: an interpolated pose that merely holds a clearance already below
+/// the floor buys nothing, where a pose merely holding a yaw already past its
+/// cap is the machine standing still on its way out.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Excursion {
+    /// Per leg, how far the crank angle reaches past its travel window.
+    window: [f64; 6],
+    /// How far the body yaw's magnitude reaches past its cap.
+    body_yaw: f64,
+    /// How far the head-relative yaw's magnitude reaches past its cap.
+    relative_yaw: f64,
+    /// How far the head attitude reaches past the cone bound.
+    cone: f64,
+}
+
+/// How far `value` reaches past `limit`, zero when it does not reach past it.
+///
+/// A value nobody can place is infinitely far out, for the same reason
+/// [`outside_limit`] treats it as a violation: nothing can be decided from it,
+/// least of all that it is no worse than where the machine started.
+fn over(value: f64, limit: f64) -> f64 {
+    if value.is_nan() {
+        return f64::INFINITY;
+    }
+    (value - limit).max(0.0)
+}
+
+impl Excursion {
+    /// How far the pose `report` describes stands outside each bound.
+    ///
+    /// `report` is [`check_envelope`]'s own record, which is filled whether the
+    /// pose passed or not, so the numbers here and the verdict they qualify come
+    /// from one solve of one pose.
+    fn of(env: &EnvelopeConfig, report: &EnvelopeReport, body_yaw: f64) -> Self {
+        Self {
+            window: core::array::from_fn(|leg| {
+                let (lo, hi) = env.crank_windows[leg];
+                // A pose with no crank angle for this leg stands outside no
+                // window: there is no angle to be outside one. Such a sample is
+                // refused before any of this is consulted, because the tick has
+                // no six angles to command.
+                report.leg_angles.map_or(0.0, |LegAngles(angles)| {
+                    let angle = angles[leg];
+                    over(angle, hi).max(over(-angle, -lo))
+                })
+            }),
+            body_yaw: over(body_yaw.abs(), env.body_yaw_limit),
+            relative_yaw: over(report.relative_yaw.abs(), env.relative_yaw_limit),
+            cone: over(report.cone_angle.abs(), env.head_cone_limit),
+        }
+    }
+
+    /// Whether nothing here stands further out than it did at `start`.
+    fn no_further_out_than(&self, start: &Self) -> bool {
+        !self
+            .window
+            .iter()
+            .zip(start.window)
+            .any(|(now, then)| outside_limit(*now, then))
+            && !outside_limit(self.body_yaw, start.body_yaw)
+            && !outside_limit(self.relative_yaw, start.relative_yaw)
+            && !outside_limit(self.cone, start.cone)
+    }
+}
+
+/// How far the pose a move begins at stands outside the envelope.
+///
+/// The verdict is not the question here — a move is accepted or refused on its
+/// *target*, which [`take_command`] checks — so the error is dropped and only
+/// the distances are kept.
+fn start_excursion(cfg: &MotionConfig, start: &JointTargets) -> Excursion {
+    let mut report = EnvelopeReport::default();
+    let _ = check_envelope(
+        &cfg.geom,
+        &cfg.env,
+        &start.head_pose_body,
+        start.body_yaw,
+        None,
+        &mut report,
+    );
+    Excursion::of(&cfg.env, &report, start.body_yaw)
+}
+
 /// Counts the antennas' goal register reaches either side of its own zero, and
 /// the count that reads as zero radians.
 ///
@@ -289,15 +427,31 @@ pub const ANTENNA_GOAL_MAX_RAD: f64 =
 pub const ANTENNA_GOAL_MIN_RAD: f64 =
     -core::f64::consts::TAU * (ANTENNA_GOAL_COUNTS / COUNTS_PER_TURN) - core::f64::consts::PI;
 
+/// The physically sideways direction each antenna is kept from sweeping
+/// through, radians: right, then left.
+///
+/// Horizontal — a quarter turn either side of straight up — and signed by the
+/// side the antenna is mounted on, so each constant names its own antenna's
+/// outboard direction. That arc is the maximal-interference one: it sweeps the
+/// widest envelope around the machine exactly where objects sit beside it,
+/// while the inboard arc crosses the antennas harmlessly over the head at their
+/// different heights and disturbs almost nothing outside the head's footprint.
+///
+/// Deliberately not derived from the stow angles. The midpoint of the
+/// stow-to-neutral arc is ±1.525 rad, about 2.6° off horizontal; these are the
+/// physical direction and stay put if the stow angles ever move.
+pub const ANTENNA_OUTBOARD: [f64; 2] =
+    [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
+
 /// What a caller asks the tick to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MotionCommand {
-    /// Move to `target` over `duration`, shaped by `warp`.
+    /// Move to `target`, each group over its own duration, shaped by `warp`.
     MoveTo {
         /// Where to end up.
         target: JointTargets,
-        /// How long to take.
-        duration: Duration,
+        /// How long each mechanical group takes.
+        durations: MoveDurations,
         /// How to shape it.
         warp: Warp,
     },
@@ -309,10 +463,6 @@ pub enum MotionCommand {
 /// whatever mode it was already in.
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum CommandRejection {
-    /// A move was already running. One motion at a time; nothing here queues or
-    /// blends.
-    #[error("a move is already running")]
-    AlreadyMoving,
     /// The commanded target is not a pose this machine may hold.
     #[error("the commanded target is outside the envelope: {0}")]
     Envelope(EnvelopeViolations),
@@ -335,8 +485,12 @@ pub enum CommandDisposition {
     /// There was no command.
     #[default]
     None,
-    /// A move was accepted and started on this tick.
+    /// A move was accepted on this tick, from a machine that was holding.
     Started,
+    /// A move was accepted on this tick over one already running, which it
+    /// replaced. The new path starts at the setpoint the previous tick
+    /// commanded.
+    Retargeted,
     /// A hold was taken.
     Held,
     /// A command was refused, and nothing changed.
@@ -384,6 +538,10 @@ pub struct TickReport {
     /// Whether this tick's sample was the active move's own start — the pose
     /// already held — in which case nothing was checked and nothing emitted.
     pub start_sample: bool,
+    /// Whether the sampled pose failed an envelope bound and was commanded
+    /// anyway, standing no further outside it than the move's own start did.
+    /// A move travelling back inside the envelope, in other words.
+    pub recovering: bool,
     /// Whether goals were emitted. Holding writes nothing; the servos hold.
     pub emitted: bool,
     /// Whether an active move reached its endpoint on this tick.
@@ -409,6 +567,7 @@ impl Default for TickReport {
             command: CommandDisposition::None,
             envelope: None,
             start_sample: false,
+            recovering: false,
             emitted: false,
             completed: false,
             fault: None,
@@ -471,6 +630,7 @@ pub struct MotionState {
     last_targets: JointTargets,
     fk_seed: Isometry3<f64>,
     present_min_margin: f64,
+    start_excursion: Excursion,
     miss_count: u32,
     tracking: [Option<TrackingStreak>; JointId::COUNT],
 }
@@ -505,6 +665,10 @@ impl MotionState {
             },
             fk_seed: armed.head_pose_body,
             present_min_margin: armed.min_margin,
+            // No move is running, so no sample is being excused anything. The
+            // first command computes the allowance from the pose it starts at,
+            // which is this one.
+            start_excursion: Excursion::default(),
             miss_count: 0,
             tracking: [None; JointId::COUNT],
         }
@@ -582,9 +746,10 @@ pub fn motion_tick(
     out.report.mode = state.mode;
     out.report.present_min_margin = state.present_min_margin;
 
-    // A fault is absorbing. Commands are ignored and nothing is emitted; the
-    // servos hold their last goal, which is the only stopped state that does
-    // not drop the head.
+    // A fault is absorbing. Commands are ignored and nothing is emitted, and
+    // that is the whole of what this layer can do about one: it holds no wire,
+    // so torque is left exactly where the caller had it, and bringing the
+    // machine to the minimum risk condition — torque off — is the caller's job.
     //
     // TODO(fault-recovery): an explicit clear-fault command belongs here, once
     // there is an operator surface to issue one from.
@@ -780,14 +945,31 @@ pub fn motion_tick(
         &mut envelope,
     );
     out.report.envelope = Some(envelope);
-    // A path pose that fails after its target passed means the checker and the
-    // interpolation disagree about a pose already accepted. The second arm is
-    // that same disagreement in its other form: a verdict that passed without
-    // producing the angles it passed on.
-    let (Ok(()), Some(angles)) = (verdict, envelope.leg_angles) else {
+    // A move out of a pose the envelope refuses has to be able to leave it, and
+    // where the machine physically stands is not refusable — a hand or a crash
+    // can leave the body past its yaw cap or a crank outside its window, and
+    // stowing from there is the recovery. So a failing sample is judged against
+    // the move's own start rather than against the bounds alone: one standing no
+    // further out asks for nothing the machine is not already doing, and the
+    // target it travels to passed the bounds outright when the command was
+    // taken. Anything further out is the fault it always was.
+    //
+    // The second arm is a verdict that passed without producing the angles it
+    // passed on, and a pose with no angles is nothing this can command.
+    let recovering = verdict.is_err();
+    let admitted = match verdict {
+        Ok(()) => true,
+        Err(error) => {
+            !error.violations.margin
+                && Excursion::of(&cfg.env, &envelope, sampled.body_yaw)
+                    .no_further_out_than(&state.start_excursion)
+        }
+    };
+    let (true, Some(angles)) = (admitted, envelope.leg_angles) else {
         state.raise(Fault::Envelope(envelope.violations), out);
         return;
     };
+    out.report.recovering = recovering;
     let candidate = JointVector {
         body_yaw: sampled.body_yaw,
         legs: angles.0,
@@ -796,6 +978,11 @@ pub fn motion_tick(
 
     // Step guard. An oversized step is a slam, and the bug that produced it is
     // the thing worth reporting; it is never trimmed and sent.
+    //
+    // TODO(recovery-move-clock): the clock a move runs on is the caller's fixed
+    // duration, chosen for the spans an ordinary command covers, so a move out
+    // of a wide excursion — the recovery the admission above exists to allow —
+    // can step past this bound partway through and fault, which de-torques.
     for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(state.last_goal.joints()) {
         let delta = (angle - last).abs();
         if outside_limit(delta, cfg.max_step.for_joint(id)) {
@@ -833,7 +1020,7 @@ fn take_command(
 ) -> CommandDisposition {
     let MotionCommand::MoveTo {
         target,
-        duration,
+        durations,
         warp,
     } = command
     else {
@@ -842,31 +1029,31 @@ fn take_command(
         return CommandDisposition::Held;
     };
 
-    if matches!(state.mode, Mode::Moving { .. }) {
-        return CommandDisposition::Rejected(CommandRejection::AlreadyMoving);
-    }
-
     // An antenna target is a direction — a physical angle mod 2π — and the
     // machine's frame for it is continuous and unbounded. Each direction
-    // resolves here to the representative nearest where the last command left
-    // that antenna, so no commanded sweep exceeds half a turn and consecutive
-    // moves chain in one frame without a step. This is the only wrap arithmetic
-    // on the command path: the interpolation, the step guard and the tracking
-    // comparison all take plain linear differences in the frame it produces.
+    // resolves here to a representative within a turn of where the last command
+    // left that antenna, chosen to miss the outboard sideways point. This is the
+    // only wrap arithmetic on the command path: the interpolation, the step
+    // guard and the tracking comparison all take plain linear differences in the
+    // frame it produces.
     let mut target = *target;
     for (side, joint) in [JointId::AntennaRight, JointId::AntennaLeft]
         .into_iter()
         .enumerate()
     {
         let last = state.last_targets.antennas[side];
-        let angle = last + wrap_to_pi(target.antennas[side] - last);
-        if outside_limit(angle, ANTENNA_GOAL_MAX_RAD) || below_limit(angle, ANTENNA_GOAL_MIN_RAD) {
-            return CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
-                joint,
-                angle,
-            });
+        match resolve_antenna(last, target.antennas[side], ANTENNA_OUTBOARD[side]) {
+            Some(angle) => target.antennas[side] = angle,
+            None => {
+                // Both arcs land where no servo count reaches. The preferred one
+                // is what the operator asked for, so it is the number reported.
+                let angle = short_arc(last, target.antennas[side]);
+                return CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
+                    joint,
+                    angle,
+                });
+            }
         }
-        target.antennas[side] = angle;
     }
 
     let mut report = EnvelopeReport::default();
@@ -883,15 +1070,69 @@ fn take_command(
 
     // Start from the last commanded targets rather than the measured pose, so
     // consecutive moves chain without a step and a tracking lag is not written
-    // into the path.
-    match Trajectory::new(&state.last_targets, &target, *duration, *warp) {
+    // into the path. Mid-move that is the setpoint the previous tick commanded,
+    // which is what makes a retarget a splice rather than a jump.
+    let retarget = matches!(state.mode, Mode::Moving { .. });
+    match Trajectory::new(&state.last_targets, &target, *durations, *warp) {
         Ok(trajectory) => {
+            // How far outside the envelope this move begins, which is the
+            // allowance every sample of it is judged against. Recomputed per
+            // command, so a retarget mid-recovery tightens it to wherever the
+            // machine has got to.
+            state.start_excursion = start_excursion(cfg, &state.last_targets);
             state.trajectory = Some(trajectory);
             state.mode = Mode::Moving { started: now };
-            CommandDisposition::Started
+            if retarget {
+                CommandDisposition::Retargeted
+            } else {
+                CommandDisposition::Started
+            }
         }
         Err(error) => CommandDisposition::Rejected(CommandRejection::Trajectory(error)),
     }
+}
+
+/// The representative of direction `target` nearest `last`: the arc no longer
+/// than half a turn.
+fn short_arc(last: f64, target: f64) -> f64 {
+    last + wrap_to_pi(target - last)
+}
+
+/// Which representative of antenna direction `target` to sweep to from `last`,
+/// or `None` when no servo count reaches either candidate.
+///
+/// The short arc unless it would carry the antenna through `outboard` — the
+/// direction it must not sweep past — in which case the long way round, which
+/// costs at most a turn and keeps the antenna over the head instead of out to
+/// the side. Endpoints count as not crossing, so an antenna already standing at
+/// sideways takes the shortest path away from it, and one commanded exactly
+/// there arrives the short way.
+fn resolve_antenna(last: f64, target: f64, outboard: f64) -> Option<f64> {
+    let short = short_arc(last, target);
+    let sweep = short - last;
+    // Ground from `last` to `outboard` in the direction of travel, in
+    // `[0, 2π)`. Strictly inside the sweep is a crossing; zero is the antenna
+    // standing on the point, and `sweep` itself is it arriving there.
+    let to_outboard = if sweep >= 0.0 {
+        (outboard - last).rem_euclid(core::f64::consts::TAU)
+    } else {
+        (last - outboard).rem_euclid(core::f64::consts::TAU)
+    };
+    let crosses = to_outboard > 0.0 && to_outboard < sweep.abs();
+
+    let long = if sweep >= 0.0 {
+        short - core::f64::consts::TAU
+    } else {
+        short + core::f64::consts::TAU
+    };
+    let (preferred, fallback) = if crosses {
+        (long, short)
+    } else {
+        (short, long)
+    };
+    [preferred, fallback].into_iter().find(|angle| {
+        !(outside_limit(*angle, ANTENNA_GOAL_MAX_RAD) || below_limit(*angle, ANTENNA_GOAL_MIN_RAD))
+    })
 }
 
 #[cfg(test)]
@@ -1024,7 +1265,7 @@ mod tests {
     ) -> (u32, TickOutputs) {
         let command = MotionCommand::MoveTo {
             target: *target,
-            duration,
+            durations: MoveDurations::uniform(duration),
             warp: Warp::MinJerk,
         };
         let mut present = *start;
@@ -1042,6 +1283,105 @@ mod tests {
             }
         }
         (ticks, out)
+    }
+
+    /// The largest single-tick leg-goal step a stow-to-neutral move of
+    /// `duration` emits, sampled through the IK at the tick rate.
+    fn worst_leg_step(duration: f64) -> f64 {
+        // A step bound wide enough to never fire: this measures the steps
+        // rather than asking the guard about them.
+        let mut cfg = MotionConfig::default();
+        cfg.max_step.legs = f64::INFINITY;
+        cfg.max_step.body_yaw = f64::INFINITY;
+        cfg.max_step.antennas = f64::INFINITY;
+
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let (mut state, pinned) = armed_at(&cfg, &stow);
+        let neutral = JointTargets::default();
+
+        let command = MotionCommand::MoveTo {
+            target: neutral,
+            durations: MoveDurations::uniform(secs(duration)),
+            warp: Warp::MinJerk,
+        };
+        let period = 1.0 / FLOOR_TICK_HZ;
+        let mut present = pinned;
+        let mut worst: f64 = 0.0;
+        for n in 0..1000 {
+            let command = (n == 0).then_some(&command);
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * period),
+                &present,
+                command,
+            );
+            assert_eq!(out.report.fault, None, "at {duration}s, tick {n}");
+            if let Some(goal) = out.goal {
+                for (leg, angle) in goal.legs.iter().enumerate() {
+                    worst = worst.max((angle - present.legs[leg]).abs());
+                }
+                present = goal;
+            }
+            if out.report.completed {
+                return worst;
+            }
+        }
+        panic!("the move never completed at {duration}s");
+    }
+
+    /// The head group's floor, derived by running the move the daemon and the
+    /// bench both make — stow to neutral, through the IK, at the tick rate — at
+    /// decreasing durations until a leg step passes the bound.
+    ///
+    /// The number this pins is what the example TOMLs' comments cite. It is a
+    /// property of the geometry and the tick rate, so it moves only when one of
+    /// those does, and then this test says so.
+    #[test]
+    fn the_head_group_duration_floor_is_derived() {
+        let bound = MotionConfig::default().max_step.legs;
+        // Hundredths of a second, counted down as integers so the search grid
+        // is exact and the number it lands on is the number quoted.
+        let step = 0.01;
+        let mut floor = None;
+        for hundredths in (1..=200).rev() {
+            let candidate = f64::from(hundredths) / 100.0;
+            if worst_leg_step(candidate) > bound {
+                break;
+            }
+            floor = Some(candidate);
+        }
+        let floor = floor.expect("two seconds is inside the bound");
+        assert!(
+            (floor - HEAD_GROUP_FLOOR_S).abs() < 1e-9,
+            "the derived head-group floor is {floor}s, not the {HEAD_GROUP_FLOOR_S}s the example \
+             configurations quote"
+        );
+
+        // And the guard is what enforces it: a move one search step under the
+        // floor faults rather than being trimmed and sent.
+        let cfg = MotionConfig::default();
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let (mut state, pinned) = armed_at(&cfg, &stow);
+        let (_, out) = run_move(
+            &cfg,
+            &mut state,
+            &pinned,
+            &JointTargets::default(),
+            secs(floor - step),
+            1.0 / FLOOR_TICK_HZ,
+        );
+        assert!(
+            matches!(out.report.fault, Some(Fault::StepTooLarge { .. })),
+            "under the floor: {:?}",
+            out.report.fault
+        );
     }
 
     /// An armed machine holding still commands nothing at all. The servos hold
@@ -1107,7 +1447,7 @@ mod tests {
 
         let too_high = MotionCommand::MoveTo {
             target: pose_at(0.25),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&too_high));
@@ -1126,7 +1466,7 @@ mod tests {
 
         let good = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, Some(&good));
@@ -1183,7 +1523,7 @@ mod tests {
 
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         for n in 1..5 {
@@ -1510,7 +1850,7 @@ mod tests {
     fn move_to(target: JointTargets, duration: Duration) -> MotionCommand {
         MotionCommand::MoveTo {
             target,
-            duration,
+            durations: MoveDurations::uniform(duration),
             warp: Warp::MinJerk,
         }
     }
@@ -1970,37 +2310,79 @@ mod tests {
         );
     }
 
-    /// A second move while one is running is refused, and the running move is
-    /// untouched by the refusal.
+    /// A second move while one is running replaces it, from the setpoint the
+    /// last tick commanded. The machine follows the latest intent it was given;
+    /// nothing queues and nothing is refused for arriving mid-move.
     #[test]
-    fn a_move_while_moving_is_rejected() {
+    fn a_move_while_moving_retargets() {
         let cfg = MotionConfig::default();
         let start = JointTargets::default();
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
         assert_eq!(out.report.command, CommandDisposition::Started);
         assert_eq!(out.report.fault, None, "accepting it did not also fault");
-        let started = state.mode();
+
+        // Far enough in for the first path to be somewhere between its
+        // endpoints, so the splice has a setpoint that is neither.
+        let mut present = pinned;
+        for n in 1..30 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+        }
+        let spliced = *state.last_targets();
+        let travelled = spliced.head_pose_body.translation.z;
+        assert!(
+            travelled > 0.001 && travelled < 0.18,
+            "mid-flight at {travelled}"
+        );
 
         let other = MotionCommand::MoveTo {
             target: pose_at(0.15),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
-        let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, Some(&other));
+        let out = tick_with(&cfg, &mut state, secs(0.6), &present, Some(&other));
+        assert_eq!(out.report.command, CommandDisposition::Retargeted);
+        assert_eq!(out.report.fault, None, "and replacing it did not fault");
         assert_eq!(
-            out.report.command,
-            CommandDisposition::Rejected(CommandRejection::AlreadyMoving)
+            state.mode(),
+            Mode::Moving { started: secs(0.6) },
+            "the clock restarts with the new path"
         );
-        assert_eq!(out.report.fault, None, "refusing it did not fault either");
-        assert_eq!(state.mode(), started, "the running move is untouched");
-        assert!(out.report.envelope.is_some(), "and it still advanced");
+        // Zero elapsed time on the new path: it starts where the old one had
+        // got to, so this tick asks for nothing and emits nothing.
+        assert!(out.report.start_sample);
+        assert!(out.goal.is_none());
+        assert_eq!(
+            state.last_targets().head_pose_body.translation.z,
+            travelled,
+            "the splice is the setpoint, not a jump"
+        );
+
+        // And it carries to the new target, not the abandoned one.
+        let mut completed = false;
+        for n in 31..=131 {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &present, None);
+            if let Some(goal) = out.goal {
+                present = goal;
+            }
+            completed |= out.report.completed;
+        }
+        assert!(completed, "the replacement path reached its endpoint");
+        assert_eq!(state.mode(), Mode::Holding);
+        assert!(
+            (state.last_targets().head_pose_body.translation.z - 0.15).abs() < 1e-12,
+            "ended at {}",
+            state.last_targets().head_pose_body.translation.z
+        );
     }
 
     /// A move that cannot be shaped is refused the same way a bad target is: a
@@ -2012,7 +2394,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let instant = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: Duration::ZERO,
+            durations: MoveDurations::uniform(Duration::ZERO),
             warp: Warp::MinJerk,
         };
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&instant));
@@ -2035,7 +2417,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2084,7 +2466,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(0.5),
+            durations: MoveDurations::uniform(secs(0.5)),
             warp: Warp::Linear,
         };
 
@@ -2217,7 +2599,7 @@ mod tests {
         let lift = rest_targets(0.001);
         let command = MotionCommand::MoveTo {
             target: lift,
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
@@ -2230,7 +2612,7 @@ mod tests {
         let drop = rest_targets(-0.001);
         let command = MotionCommand::MoveTo {
             target: drop,
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
@@ -2260,7 +2642,7 @@ mod tests {
         let neutral = JointTargets::default();
         let command = MotionCommand::MoveTo {
             target: neutral,
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2307,6 +2689,159 @@ mod tests {
         );
     }
 
+    /// A machine found outside the envelope can be commanded back inside it.
+    ///
+    /// A hand or a crash can leave the body turned past its yaw cap, and taking
+    /// hold no longer refuses that — where the machine stands is not refusable.
+    /// What has to follow is the recovery: a stow whose every sample fails the
+    /// same cap the start fails, run to completion, never further out than where
+    /// it began.
+    #[test]
+    fn a_move_out_of_a_pose_the_envelope_refuses_runs() {
+        let cfg = MotionConfig::default();
+        let turned = cfg.env.body_yaw_limit + 0.05;
+        let crooked = JointTargets {
+            body_yaw: turned,
+            ..JointTargets::default()
+        };
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let square = JointTargets::default();
+
+        // Long enough that the yaw sweep back inside the cap clears the
+        // per-tick step bound: a recovery is a move like any other and its
+        // duration is floored by how far it has to travel.
+        let (ticks, out) = run_move(&cfg, &mut state, &pinned, &square, secs(4.0), 0.02);
+        assert_eq!(out.report.fault, None, "the recovery ran to its end");
+        assert!(out.report.completed, "it completed in {ticks} ticks");
+        assert_eq!(state.last_targets().body_yaw, 0.0, "square at the end");
+    }
+
+    /// The recovery is an allowance to travel back in, not a licence to stay
+    /// out: every sample it commands is checked against where the move began,
+    /// and the ticks that spend the allowance say so.
+    #[test]
+    fn a_recovering_move_never_commands_further_out_than_it_started() {
+        let cfg = MotionConfig::default();
+        let turned = cfg.env.body_yaw_limit + 0.05;
+        let crooked = JointTargets {
+            body_yaw: turned,
+            ..JointTargets::default()
+        };
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations::uniform(secs(4.0)),
+            warp: Warp::MinJerk,
+        };
+
+        let mut present = pinned;
+        let mut recovering = 0;
+        for n in 0..200 {
+            let out = tick_with(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                (n == 0).then_some(&command),
+            );
+            assert_eq!(out.report.fault, None, "tick {n}");
+            if out.report.recovering {
+                recovering += 1;
+                let envelope = out.report.envelope.expect("a checked sample");
+                assert!(envelope.violations.body_yaw, "tick {n} was out of the cap");
+            }
+            if let Some(goal) = out.goal {
+                assert!(
+                    goal.body_yaw <= turned,
+                    "tick {n} commanded {} rad, past the {turned} rad it started at",
+                    goal.body_yaw
+                );
+                present = goal;
+            }
+            if out.report.completed {
+                break;
+            }
+        }
+        assert!(
+            recovering > 0,
+            "the cap was outstanding for part of the move"
+        );
+        assert!(!state.is_faulted());
+
+        // And the allowance is spent by the end: with the machine square again,
+        // a move that would leave the cap is the fault it always was.
+        let over = JointTargets {
+            body_yaw: turned,
+            ..JointTargets::default()
+        };
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(10.0),
+            &present,
+            Some(&MotionCommand::MoveTo {
+                target: over,
+                durations: MoveDurations::uniform(secs(2.0)),
+                warp: Warp::MinJerk,
+            }),
+        );
+        assert!(
+            matches!(
+                out.report.command,
+                CommandDisposition::Rejected(CommandRejection::Envelope(_))
+            ),
+            "{:?}",
+            out.report.command
+        );
+    }
+
+    /// The excursion arithmetic, on the bounds a recovery is judged against.
+    #[test]
+    fn an_excursion_measures_how_far_outside_each_bound_a_pose_is() {
+        let env = EnvelopeConfig::default();
+        let (lo, hi) = env.crank_windows[2];
+        let mut report = EnvelopeReport {
+            leg_angles: Some(LegAngles(core::array::from_fn(|leg| {
+                let (lo, hi) = env.crank_windows[leg];
+                (lo + hi) / 2.0
+            }))),
+            relative_yaw: env.relative_yaw_limit + 0.2,
+            cone_angle: env.head_cone_limit - 0.1,
+            ..EnvelopeReport::default()
+        };
+
+        let inside = Excursion::of(&env, &report, 0.0);
+        assert_eq!(inside.window, [0.0; 6], "every crank is mid-window");
+        assert_eq!(inside.body_yaw, 0.0);
+        assert!((inside.relative_yaw - 0.2).abs() < 1e-12);
+        assert_eq!(inside.cone, 0.0, "inside the cone is no excursion at all");
+
+        // Past a window in either direction, and past the yaw cap.
+        let mut angles = report.leg_angles.expect("set above");
+        angles.0[2] = hi + 0.3;
+        report.leg_angles = Some(angles);
+        let above = Excursion::of(&env, &report, -env.body_yaw_limit - 0.4);
+        assert!((above.window[2] - 0.3).abs() < 1e-12);
+        assert!(
+            (above.body_yaw - 0.4).abs() < 1e-12,
+            "the cap is on magnitude"
+        );
+        angles.0[2] = lo - 0.5;
+        report.leg_angles = Some(angles);
+        let below = Excursion::of(&env, &report, 0.0);
+        assert!((below.window[2] - 0.5).abs() < 1e-12);
+
+        // A pose no further out than the start is admitted; one further out on
+        // any single bound is not, and a reading nobody can place never is.
+        assert!(above.no_further_out_than(&above));
+        assert!(inside.no_further_out_than(&above));
+        assert!(!above.no_further_out_than(&inside));
+        assert!(!below.no_further_out_than(&above));
+        let unplaceable = Excursion::of(&env, &report, f64::NAN);
+        assert_eq!(unplaceable.body_yaw, f64::INFINITY);
+        assert!(!unplaceable.no_further_out_than(&below));
+    }
+
     /// The tick that accepts a move samples the move's own start — the pose
     /// already held — so it checks nothing and commands nothing, and says so. The
     /// next tick is the first that asks anything of the machine.
@@ -2321,7 +2856,7 @@ mod tests {
         let held = *state.last_targets();
         let command = MotionCommand::MoveTo {
             target: JointTargets::default(),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2427,7 +2962,7 @@ mod tests {
 
         let command = MotionCommand::MoveTo {
             target: start,
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let mut completed = false;
@@ -2457,7 +2992,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(1.0),
+            durations: MoveDurations::uniform(secs(1.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2501,7 +3036,7 @@ mod tests {
         let arming_seed = *state.fk_seed();
         let command = MotionCommand::MoveTo {
             target: pose_at(0.195),
-            duration: secs(1.0),
+            durations: MoveDurations::uniform(secs(1.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2624,7 +3159,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2697,7 +3232,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &start);
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 
@@ -2755,7 +3290,7 @@ mod tests {
                 body_yaw: 0.5,
                 ..JointTargets::default()
             },
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
         let mut present = pinned;
@@ -2834,8 +3369,7 @@ mod tests {
             assert_eq!(fault.to_string(), expected);
         }
 
-        let refusals: [(CommandRejection, &str); 4] = [
-            (CommandRejection::AlreadyMoving, "a move is already running"),
+        let refusals: [(CommandRejection, &str); 3] = [
             (
                 CommandRejection::Envelope(violations),
                 "the commanded target is outside the envelope: leg 1 unreachable, toggle margin below the floor",
@@ -2908,6 +3442,151 @@ mod tests {
         );
     }
 
+    /// Every antenna goal a move emits, in order, for one side.
+    fn antenna_series(
+        cfg: &MotionConfig,
+        state: &mut MotionState,
+        start: &JointVector,
+        target: &JointTargets,
+        side: usize,
+    ) -> Vec<f64> {
+        let command = MotionCommand::MoveTo {
+            target: *target,
+            durations: MoveDurations::uniform(secs(2.0)),
+            warp: Warp::MinJerk,
+        };
+        let mut present = *start;
+        let mut series = Vec::new();
+        for n in 0..200 {
+            let command = (n == 0).then_some(&command);
+            let out = tick_with(cfg, state, secs(f64::from(n) * 0.02), &present, command);
+            assert_eq!(out.report.fault, None, "tick {n}");
+            if let Some(goal) = out.goal {
+                series.push(goal.antennas[side]);
+                present = goal;
+            }
+        }
+        series
+    }
+
+    /// The arc policy: a sweep takes the way round that misses the antenna's own
+    /// outboard sideways point, because that is the direction that sweeps the
+    /// widest envelope past whatever is standing beside the machine. Stow to
+    /// neutral and back is the move this exists for — the short way is 3.05 rad
+    /// straight through sideways, the way taken is 3.23 rad over the head.
+    #[test]
+    fn an_antenna_sweep_misses_its_outboard_point() {
+        let cfg = MotionConfig::default();
+        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
+            let stow = if side == 0 { -3.05 } else { 3.05 };
+            for (from, to) in [(stow, 0.0), (0.0, stow)] {
+                let mut antennas = [0.0; 2];
+                antennas[side] = from;
+                let start = antennas_at(antennas);
+                let (mut state, pinned) = armed_at(&cfg, &start);
+                antennas[side] = to;
+
+                let series =
+                    antenna_series(&cfg, &mut state, &pinned, &antennas_at(antennas), side);
+                assert!(!series.is_empty(), "antenna {side} was commanded");
+                for goal in &series {
+                    assert!(
+                        wrap_to_pi(goal - outboard).abs() > 0.5,
+                        "antenna {side} passed its outboard point at {goal} going {from} -> {to}"
+                    );
+                }
+                let landed = *series.last().expect("a last goal");
+                assert!(wrap_to_pi(landed - to).abs() < 1e-9, "landed at {landed}");
+                let swept = (landed - from).abs();
+                assert!(
+                    (swept - (core::f64::consts::TAU - 3.05)).abs() < 1e-9,
+                    "antenna {side} swept {swept} rad going {from} -> {to}"
+                );
+            }
+        }
+    }
+
+    /// An antenna already standing at its outboard point takes the shortest
+    /// path away from it: the endpoint counts as not crossing, so nothing sends
+    /// a sideways antenna the long way round to come down.
+    #[test]
+    fn an_antenna_at_sideways_takes_the_short_way() {
+        let cfg = MotionConfig::default();
+        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
+            let stow = if side == 0 { -3.05 } else { 3.05 };
+            let mut antennas = [0.0; 2];
+            antennas[side] = outboard;
+            let start = antennas_at(antennas);
+            let (mut state, pinned) = armed_at(&cfg, &start);
+
+            // Down to stow, which is the near side from sideways.
+            antennas[side] = stow;
+            let (_, out) = run_move(
+                &cfg,
+                &mut state,
+                &pinned,
+                &antennas_at(antennas),
+                secs(2.0),
+                0.02,
+            );
+            assert!(out.report.completed, "{:?}", out.report.fault);
+            let landed = state.last_targets().antennas[side];
+            let swept = (landed - outboard).abs();
+            assert!(
+                (swept - (3.05 - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
+                "antenna {side} swept {swept} rad from sideways"
+            );
+        }
+    }
+
+    /// And an antenna commanded *to* its outboard point arrives the short way,
+    /// for the same reason: arriving at the point is not passing through it.
+    #[test]
+    fn an_antenna_commanded_to_sideways_arrives_the_short_way() {
+        let cfg = MotionConfig::default();
+        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
+            let stow = if side == 0 { -3.05 } else { 3.05 };
+            let mut antennas = [0.0; 2];
+            antennas[side] = stow;
+            let start = antennas_at(antennas);
+            let (mut state, pinned) = armed_at(&cfg, &start);
+
+            antennas[side] = outboard;
+            let (_, out) = run_move(
+                &cfg,
+                &mut state,
+                &pinned,
+                &antennas_at(antennas),
+                secs(2.0),
+                0.02,
+            );
+            assert!(out.report.completed, "{:?}", out.report.fault);
+            let landed = state.last_targets().antennas[side];
+            let swept = (landed - stow).abs();
+            assert!(
+                (swept - (3.05 - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
+                "antenna {side} swept {swept} rad to sideways"
+            );
+        }
+    }
+
+    /// The outboard constants are the physical sideways direction — a quarter
+    /// turn either side of straight up — and not the midpoint of the arc the
+    /// stow angles happen to span, which is 2.6° off it. A machine whose stow
+    /// fold moved would keep the same two constants.
+    #[test]
+    fn the_outboard_directions_are_horizontal() {
+        assert_eq!(
+            ANTENNA_OUTBOARD,
+            [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2]
+        );
+        let stow_midpoint = 3.05 / 2.0;
+        assert!(
+            (stow_midpoint - core::f64::consts::FRAC_PI_2).abs() > 0.04,
+            "the stow arc's midpoint is {stow_midpoint}, which is not horizontal"
+        );
+    }
+
     /// A direction a whole turn from the frame is the direction the machine is
     /// already pointing, so it commands nothing at all.
     #[test]
@@ -2935,9 +3614,9 @@ mod tests {
 
     /// Consecutive moves chain in the continuous frame: a machine found ten
     /// turns out from zero takes stow, then neutral, then stow again, each a
-    /// sweep of half a turn or less, with no step and no fault. The frame it
-    /// ends in is ten turns from zero still — nothing renormalises it — and
-    /// every one of those poses points where it was asked to.
+    /// sweep under a whole turn, with no step and no fault. The frame it ends in
+    /// is ten turns from zero still — nothing renormalises it — and every one of
+    /// those poses points where it was asked to.
     #[test]
     fn antenna_moves_chain_in_the_continuous_frame() {
         let cfg = MotionConfig::default();
@@ -2968,11 +3647,11 @@ mod tests {
                 );
                 let swept = (landed[side] - previous[side]).abs();
                 assert!(
-                    swept <= core::f64::consts::PI,
+                    swept < core::f64::consts::TAU,
                     "antenna {side} swept {swept} rad"
                 );
                 assert!(
-                    (landed[side].abs() - turns).abs() < core::f64::consts::PI,
+                    (landed[side].abs() - turns).abs() < core::f64::consts::TAU,
                     "antenna {side} stayed in the frame it was found in: {}",
                     landed[side]
                 );
@@ -2984,9 +3663,10 @@ mod tests {
     /// The one limit an antenna has: extended position mode's goal register
     /// reaches ±1_048_575 counts and no further. The two ends are not mirror
     /// images — zero radians sits half a turn up the count frame — so each is
-    /// pinned in its own direction. A goal past either is a typed refusal, and
-    /// so is a direction nobody can place. Neither is saturated, and neither
-    /// disturbs a holding machine.
+    /// pinned in its own direction. A direction nobody can place is a typed
+    /// refusal; a direction whose preferred arc has no count takes the other
+    /// arc, which is a turn back inside the range. Neither is saturated, and
+    /// the refusal does not disturb a holding machine.
     #[test]
     fn an_antenna_goal_no_count_represents_is_refused() {
         let cfg = MotionConfig::default();
@@ -2998,16 +3678,10 @@ mod tests {
             let start = antennas_at([edge, 0.0]);
             let (mut state, pinned) = armed_at(&cfg, &start);
 
-            let cases = [
-                (past, false),
-                (f64::NAN, true),
-                (f64::INFINITY, true),
-                (f64::NEG_INFINITY, true),
-            ];
-            for (direction, unplaceable) in cases {
+            for direction in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let command = MotionCommand::MoveTo {
                     target: antennas_at([direction, 0.0]),
-                    duration: secs(2.0),
+                    durations: MoveDurations::uniform(secs(2.0)),
                     warp: Warp::MinJerk,
                 };
                 let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
@@ -3022,19 +3696,34 @@ mod tests {
                     );
                 };
                 assert_eq!(joint, JointId::AntennaRight);
-                if unplaceable {
-                    assert!(!angle.is_finite(), "{direction} resolved to {angle}");
-                } else {
-                    assert!(
-                        !(ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&angle),
-                        "{direction} -> {angle}"
-                    );
-                }
+                assert!(!angle.is_finite(), "{direction} resolved to {angle}");
                 // Refused, so nothing moved and nothing went out.
                 assert_eq!(out.report.mode, Mode::Holding);
                 assert!(out.goal.is_none());
                 assert_eq!(state.last_targets().antennas, start.antennas);
             }
+
+            // A placeable direction off the end of the register is not a
+            // refusal: the two candidate arcs are a turn apart and the range is
+            // 512 turns wide, so one of them is always inside it.
+            let (_, out) = run_move(
+                &cfg,
+                &mut state,
+                &pinned,
+                &antennas_at([past, 0.0]),
+                secs(2.0),
+                0.02,
+            );
+            assert!(out.report.completed, "{:?}", out.report.fault);
+            let goal = state.last_targets().antennas[0];
+            assert!(
+                (ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&goal),
+                "{past} resolved to {goal}"
+            );
+            assert!(
+                wrap_to_pi(goal - past).abs() < 1e-9,
+                "{past} resolved to {goal}, which points elsewhere"
+            );
 
             // The range's own edge is inside it: a bound admits its bound.
             let out = tick_with(
@@ -3044,7 +3733,7 @@ mod tests {
                 &pinned,
                 Some(&MotionCommand::MoveTo {
                     target: antennas_at([edge, 0.0]),
-                    duration: secs(2.0),
+                    durations: MoveDurations::uniform(secs(2.0)),
                     warp: Warp::MinJerk,
                 }),
             );
@@ -3071,7 +3760,7 @@ mod tests {
         let mut second = first.clone();
         let command = MotionCommand::MoveTo {
             target: pose_at(0.19),
-            duration: secs(2.0),
+            durations: MoveDurations::uniform(secs(2.0)),
             warp: Warp::MinJerk,
         };
 

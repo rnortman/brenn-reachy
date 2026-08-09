@@ -2,10 +2,10 @@
 //! motion commands.
 //!
 //! Everything else in this workspace is a library that owns no loop. This crate
-//! is the loop: it opens the port, drives the arm sequence to completion, then
-//! runs a fixed-rate cycle of read present positions, call the tick, write the
-//! goals that changed. It is also the only crate here that reads a configuration
-//! file, logs, or prints.
+//! is the loop: it opens the port, commissions the machine, polls it, takes
+//! hold of it, then runs a fixed-rate cycle of read present positions, call the
+//! tick, write the goals that changed. It is also the only crate here that
+//! reads a configuration file, logs, or prints.
 //!
 //! Two halves, and the order between them is the whole point:
 //!
@@ -16,15 +16,16 @@
 //!   written to a servo. One line per case, and a case that did not run counts as
 //!   a failure rather than as silence.
 //! - **The supervised commands.** Arm, raise, hold, stow, release, plus antenna
-//!   and base moves. Each is gated on the state before it, and none of them runs
-//!   at all without a green registry pass on record and a crank datum a human
-//!   has written into the configuration.
+//!   and base moves. Each re-establishes the machine for itself and needs a
+//!   crank datum a human has written into the configuration; nothing consults a
+//!   registry pass, because a record is evidence about a past moment and the
+//!   commissioning ceremony asks the machine in front of it.
 //!
-//! That gate is deliberate. The registry is how this project brings up hardware:
-//! write a case that asserts the behaviour we expect, let it fail, and read the
-//! discovery out of the failure. A confirmed value is then baked into the case,
-//! which stays as a permanent regression guard. An unexpected value gets human
-//! review before any case is changed to accept it.
+//! The registry is how this project brings up hardware: write a case that
+//! asserts the behaviour we expect, let it fail, and read the discovery out of
+//! the failure. A confirmed value is then baked into the case, which stays as a
+//! permanent regression guard. An unexpected value gets human review before any
+//! case is changed to accept it.
 //!
 //! The binary is a thin entry point over this library, so everything the bench
 //! decides — configuration and the registry's verdicts — is reachable from tests

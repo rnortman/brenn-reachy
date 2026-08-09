@@ -5,18 +5,17 @@
 //! every tick, emitted as bounded increments — because it is the one path where
 //! the head travels near the bottom of its range and the checks that matter
 //! there are the tick's. What is left over is what cannot be expressed as a
-//! trajectory: let the platform settle, confirm it is measured where stow put
-//! it, and release torque servo by servo with each release read back.
+//! trajectory: let the platform settle, measure where stow left it, and release
+//! torque servo by servo with each release read back.
 //!
-//! ## The settle comes before the check
+//! ## The settle comes before the measurement
 //!
 //! A move is over when its trajectory ends, not when the joints arrive, so a
 //! joint still closing the lag a proportional loop runs is legitimately short
 //! of its fold at the moment `off` starts — and `demo` reaches here at exactly
 //! that moment. The dwell exists to let the machine settle; waiting it out
 //! first is what makes the measurement that follows a measurement of where the
-//! head came to rest. The cost is that a machine genuinely somewhere else
-//! learns of its refusal one dwell later, with torque still holding it.
+//! head came to rest.
 //!
 //! ## Nothing happens after the last release
 //!
@@ -25,14 +24,32 @@
 //! no re-read, no confirmation pose, no tidying write. Anything issued after the
 //! release would be describing a machine that is still moving.
 //!
-//! ## Releasing away from stow drops the head
+//! ## Nothing gates the release
 //!
-//! Torque is what holds the head up. Releasing it anywhere but the pose the head
-//! can rest at means the head falls, so the stow check refuses by default and the
-//! only way past it is the operator saying so in as many words. That flag is
-//! recorded in the summary: a release that happened away from stow is a fact
-//! about the machine's history worth keeping, not a detail of how the command
-//! was invoked.
+//! Every phase here reports; none of them refuses. The measurement against stow
+//! says where the head was when torque came off, and a joint found somewhere
+//! else — or one that will not answer at all — is carried in the summary rather
+//! than stopping the sequence. A release write that goes unacknowledged is
+//! recorded and the walk carries on to the next servo, so all nine are always
+//! asked. The reason is the machine: stowed with torque held is its only pinch
+//! hazard, the head falls gently into near-stow under gearbox resistance
+//! wherever it is released from, and there is nothing a refusal here could be
+//! protecting.
+//!
+//! ## Two ways in
+//!
+//! [`DisarmSequencer::new`] is the orderly release — settle, measure, release —
+//! and it is what an expected ending runs: a commanded stow has just finished
+//! and the machine is trusted to be where it was told to go, so there is time
+//! to write down where that was.
+//!
+//! [`DisarmSequencer::immediate`] skips both and goes straight to the nine
+//! release writes. It is what a *fault* runs, and the reasoning is the same
+//! reasoning that makes the orderly form report rather than refuse: a fault
+//! means position feedback or motor control is no longer trusted, so the dwell
+//! is time spent holding torque for a measurement nobody could act on and the
+//! measurement itself is of doubtful provenance. The summary comes back with
+//! every joint unmeasured, which is the truth about what it looked at.
 
 use core::f64::consts::PI;
 use core::time::Duration;
@@ -41,8 +58,8 @@ use reachy_kin::{
     HeadGeometry, IkError, LegAngles, inverse_kinematics, outside_limit, stow_head_pose, wrap_to_pi,
 };
 
-use crate::arm::{angle_at, confirm_write};
-use crate::joints::{JointId, JointVector, worst_joint, worst_row};
+use crate::arm::{angle_at, confirm_write, placeable};
+use crate::joints::{JointId, JointVector, worst_joint};
 use crate::seq::{
     BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep, Sequencer, StepContext,
 };
@@ -97,22 +114,57 @@ pub struct DisarmConfig {
     pub tolerance: f64,
     /// How long to let the platform settle between reaching stow and releasing.
     pub dwell: Duration,
-    /// The operator's explicit acceptance that the head may fall. Without it a
-    /// machine that is not measured at stow is refused.
-    pub force_drop: bool,
+}
+
+/// Which of the two releases ran.
+///
+/// On the summary rather than inferred from it: a release that measured nothing
+/// is either one that deliberately did not look or one that looked at nine
+/// servos and got nine silences, and those call for opposite things from
+/// whoever reads the report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseForm {
+    /// Settle, measure, release — [`DisarmSequencer::new`].
+    Orderly,
+    /// The nine release writes and nothing else — [`DisarmSequencer::immediate`].
+    Immediate,
 }
 
 /// What disarming found, and what it did.
+///
+/// Every field is a report. Torque comes off whatever any of them say, so a
+/// summary describing a machine away from stow, a joint that would not answer,
+/// or a servo whose release went unacknowledged is the record of a release that
+/// happened anyway — the thing a caller alerts on, not a thing it could have
+/// prevented.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisarmSummary {
-    /// The nine angles measured before torque came off.
+    /// Which release ran, which is what says whether the measurement fields
+    /// below describe a failed look or no look at all.
+    pub form: ReleaseForm,
+    /// The nine angles measured before torque came off. A joint whose read did
+    /// not land keeps whatever the vector held, and `unmeasured` is what says
+    /// so.
     pub present: JointVector,
     /// How far each joint was from its stow angle, in bus order, radians;
-    /// circular on the antennas, linear elsewhere.
+    /// circular on the antennas, linear elsewhere. Zero for a joint that was
+    /// not measured.
     pub deviation: [f64; JointId::COUNT],
-    /// Whether every joint was inside the tolerance. A summary reporting
-    /// `false` exists only because the drop flag was set: torque was released
-    /// away from stow, deliberately.
+    /// Why each joint's position read produced no angle, in bus order, and
+    /// `None` where it produced one.
+    ///
+    /// The cause and not a bit: a servo gone silent, one refusing with a status
+    /// code, a frame mangled on the wire and a reading that is not a number are
+    /// four different problems with four different answers, and this is the one
+    /// diagnostic an unconditional release still produces. All `None` in the
+    /// immediate form, which read nothing and so failed at nothing — [`form`]
+    /// is what distinguishes that.
+    ///
+    /// [`form`]: DisarmSummary::form
+    pub unmeasured: [Option<SeqError>; JointId::COUNT],
+    /// Whether each servo acknowledged its torque-off write.
+    pub released: [bool; JointId::COUNT],
+    /// Whether every joint was measured and every one inside the tolerance.
     pub at_stow: bool,
 }
 
@@ -122,6 +174,78 @@ impl DisarmSummary {
     pub fn worst_deviation(&self) -> (JointId, f64) {
         worst_joint(&self.deviation)
     }
+
+    /// Whether the release looked at the machine before letting go.
+    #[must_use]
+    pub fn looked(&self) -> bool {
+        matches!(self.form, ReleaseForm::Orderly)
+    }
+
+    /// Whether the joint in bus row `row` was measured.
+    #[must_use]
+    pub fn measured(&self, row: usize) -> bool {
+        self.looked() && self.unmeasured[row].is_none()
+    }
+
+    /// Whether every joint's position read landed.
+    #[must_use]
+    pub fn measured_all(&self) -> bool {
+        (0..JointId::COUNT).all(|row| self.measured(row))
+    }
+
+    /// The joints a release looked at and could not read, each with why, in bus
+    /// order. Empty for a release that did not look.
+    pub fn unreadable(&self) -> impl Iterator<Item = (JointId, SeqError)> + '_ {
+        self.unmeasured
+            .iter()
+            .enumerate()
+            .filter(move |_| self.looked())
+            .filter_map(|(row, cause)| cause.map(|cause| (JointId::ALL[row], cause)))
+    }
+
+    /// Whether all nine servos acknowledged their torque-off write.
+    #[must_use]
+    pub fn all_released(&self) -> bool {
+        self.released.iter().all(|released| *released)
+    }
+
+    /// The joints whose torque-off write went unacknowledged, in bus order.
+    ///
+    /// These are the servos that may still be holding: the write was issued and
+    /// retried by the bus, and nothing came back to say it landed.
+    pub fn unreleased(&self) -> impl Iterator<Item = JointId> + '_ {
+        self.released
+            .iter()
+            .enumerate()
+            .filter(|(_, released)| !**released)
+            .map(|(row, _)| JointId::ALL[row])
+    }
+}
+
+/// Whether a pose measured elsewhere is at stow, joint by joint, within
+/// `cfg.tolerance`.
+///
+/// The comparison the orderly release makes, offered to a caller holding a
+/// sweep of its own: a resting watch can then tell a machine already folded
+/// from one a crash or a hand left standing, and re-stow the second without
+/// asking anything about the first. Never a verdict about whether anything may
+/// happen — where the machine stands gates nothing — only about whether there
+/// is something to put right.
+///
+/// Must agree with the sequencer's release verdict about where stow is:
+/// an angle nobody can place is not evidence that the head is folded.
+#[must_use]
+pub fn at_stow(cfg: &DisarmConfig, present: &JointVector) -> bool {
+    (0..JointId::COUNT).all(|row| {
+        !outside_limit(
+            deviation_from(
+                JointId::ALL[row],
+                angle_at(present, row),
+                angle_at(&cfg.stow_targets, row),
+            ),
+            cfg.tolerance,
+        )
+    })
 }
 
 /// How far one joint is from its stow angle, radians, never negative.
@@ -142,26 +266,24 @@ fn deviation_from(joint: JointId, present: f64, target: f64) -> f64 {
 }
 
 /// Which part of the sequence is running.
+///
+/// There is no failed phase: nothing in this sequence refuses, so the only way
+/// out is through the releases.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Dwell { waiting: bool },
     Verify { cursor: usize },
     Release { cursor: usize },
     Complete,
-    Failed(SeqError),
 }
 
 impl Phase {
-    /// The phase name a failure here is reported under.
+    /// The phase name this part of the sequence is reported under.
     fn step(self) -> SeqStep {
         match self {
             Self::Verify { .. } => SeqStep::VerifyAtStow,
             Self::Dwell { .. } => SeqStep::Dwell,
             Self::Release { .. } | Self::Complete => SeqStep::TorqueOff,
-            // A failure already carries the phase it happened in; taking the
-            // name from anywhere else would report a stow check that refused as
-            // a torque-off that did not happen.
-            Self::Failed(error) => error.context().step,
         }
     }
 }
@@ -170,28 +292,51 @@ impl Phase {
 ///
 /// Three phases in a fixed order: the settle waited out, every joint then
 /// measured against the stow pose, then torque released one servo at a time with
-/// each release read back. The order is the safety property — nothing is written
-/// until the settled platform is confirmed to be somewhere it can be left — and
-/// it lives here, testable against scripted replies.
+/// each release read back. The order is what makes the measurement mean
+/// something — it describes where the head was at the moment torque left it —
+/// and it lives here, testable against scripted replies.
 pub struct DisarmSequencer {
     cfg: DisarmConfig,
+    form: ReleaseForm,
     phase: Phase,
     pending: Option<BusRequest>,
     present: JointVector,
     deviation: [f64; JointId::COUNT],
+    unmeasured: [Option<SeqError>; JointId::COUNT],
+    released: [bool; JointId::COUNT],
     at_stow: bool,
 }
 
 impl DisarmSequencer {
-    /// A sequence ready to run against `cfg`.
+    /// A sequence ready to run against `cfg`: settle, measure, release.
     #[must_use]
     pub fn new(cfg: &DisarmConfig) -> Self {
+        Self::from(cfg, ReleaseForm::Orderly, Phase::Dwell { waiting: true })
+    }
+
+    /// A sequence that writes the nine releases and nothing else.
+    ///
+    /// The fault response. No settle and no measurement: whatever is wrong with
+    /// the machine, the answer is that torque comes off now, and both of the
+    /// things this skips exist only to describe a machine whose description can
+    /// still be believed. The summary reports every joint unmeasured and
+    /// `at_stow` false — not a verdict about where the head is, a statement
+    /// that nobody looked.
+    #[must_use]
+    pub fn immediate(cfg: &DisarmConfig) -> Self {
+        Self::from(cfg, ReleaseForm::Immediate, Phase::Release { cursor: 0 })
+    }
+
+    fn from(cfg: &DisarmConfig, form: ReleaseForm, phase: Phase) -> Self {
         Self {
             cfg: *cfg,
-            phase: Phase::Dwell { waiting: true },
+            form,
+            phase,
             pending: None,
             present: JointVector::default(),
             deviation: [0.0; JointId::COUNT],
+            unmeasured: [None; JointId::COUNT],
+            released: [false; JointId::COUNT],
             at_stow: false,
         }
     }
@@ -209,10 +354,6 @@ impl DisarmSequencer {
             reg: RegId::TorqueEnable,
             value: RegValue::U8(0),
         }
-    }
-
-    fn context(&self, row: usize, reg: RegId) -> StepContext {
-        StepContext::reg(self.phase.step(), self.cfg.ids[row], reg)
     }
 
     /// The next action, the previous one having been absorbed.
@@ -237,96 +378,84 @@ impl DisarmSequencer {
             Phase::Release { cursor } => self.release(cursor),
             Phase::Complete => {
                 return SeqAction::Done(DisarmSummary {
+                    form: self.form,
                     present: self.present,
                     deviation: self.deviation,
+                    unmeasured: self.unmeasured,
+                    released: self.released,
                     at_stow: self.at_stow,
                 });
             }
-            Phase::Failed(error) => return SeqAction::Fail(error),
         };
         self.pending = Some(request);
         SeqAction::Transact(request)
     }
 
     /// Take the previous transaction's result and move the cursor on.
-    fn absorb(&mut self, prior: Option<&BusResult>) -> Result<(), SeqError> {
+    ///
+    /// Infallible by construction. A transaction that brought nothing back, a
+    /// value of the wrong shape, a servo error, a reading that is not a number:
+    /// each is recorded against its own servo, with its cause, and the cursor
+    /// advances. Torque coming off the other eight is worth more than stopping
+    /// over the ninth — but the reason the ninth could not be described is kept,
+    /// because it is the only thing distinguishing an unplugged servo from an
+    /// overloaded one.
+    fn absorb(&mut self, prior: Option<&BusResult>) {
         let Some(request) = self.pending.take() else {
             // Nothing was outstanding — the first call, or the call after the
             // dwell. A result handed back here answers no request.
-            return Ok(());
+            return;
         };
         let context = StepContext {
             step: self.phase.step(),
             id: request.id(),
             reg: request.reg(),
         };
-        let Some(result) = prior else {
-            // A transaction ran and nothing came back, which from here is
-            // indistinguishable from silence on the wire.
-            return Err(SeqError::NoAnswer { context });
-        };
         match self.phase {
-            Phase::Verify { cursor } => self.absorb_verify(cursor, context, result),
+            Phase::Verify { cursor } => self.absorb_verify(cursor, context, prior),
             Phase::Release { cursor } => {
-                confirm_write(result, &request, context)?;
+                self.released[cursor] =
+                    prior.is_some_and(|result| confirm_write(result, &request, context).is_ok());
                 self.phase = if cursor + 1 < JointId::COUNT {
                     Phase::Release { cursor: cursor + 1 }
                 } else {
                     Phase::Complete
                 };
-                Ok(())
             }
             // Terminal, or waiting: nothing is ever outstanding in these.
-            Phase::Dwell { .. } | Phase::Complete | Phase::Failed(_) => Ok(()),
+            Phase::Dwell { .. } | Phase::Complete => {}
         }
     }
 
-    fn absorb_verify(
-        &mut self,
-        cursor: usize,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
+    fn absorb_verify(&mut self, cursor: usize, context: StepContext, prior: Option<&BusResult>) {
         let joint = JointId::ALL[cursor];
-        let angle = result.value(context)?.radians(context)?;
-        if !angle.is_finite() {
-            // Refused whatever the drop flag says. The flag excuses a head that
-            // is not at stow; it says nothing about a bus handing back numbers
-            // that are not angles, and a release still has to be written and
-            // read back over that same bus.
-            return Err(SeqError::UnplaceableAngle {
-                context,
-                joint,
-                angle,
-            });
+        let angle = prior
+            .ok_or(SeqError::NoAnswer { context })
+            .and_then(|result| placeable(cursor, context, result));
+        match angle {
+            Ok(angle) => {
+                self.present.set(joint, angle);
+                self.deviation[cursor] =
+                    deviation_from(joint, angle, angle_at(&self.cfg.stow_targets, cursor));
+            }
+            Err(cause) => self.unmeasured[cursor] = Some(cause),
         }
-        self.present.set(joint, angle);
-        self.deviation[cursor] =
-            deviation_from(joint, angle, angle_at(&self.cfg.stow_targets, cursor));
         if cursor + 1 < JointId::COUNT {
             self.phase = Phase::Verify { cursor: cursor + 1 };
-            return Ok(());
+            return;
         }
 
-        // Every joint is measured before any verdict, so a refusal reports the
-        // joint furthest from stow rather than the first one over the line.
-        self.at_stow = !self
-            .deviation
-            .iter()
-            .any(|deviation| outside_limit(*deviation, self.cfg.tolerance));
-        if !self.at_stow && !self.cfg.force_drop {
-            let row = worst_row(&self.deviation);
-            return Err(SeqError::NotAtStow {
-                context: self.context(row, RegId::PresentPosition),
-                joint: JointId::ALL[row],
-                present: angle_at(&self.present, row),
-                target: angle_at(&self.cfg.stow_targets, row),
-                deviation: self.deviation[row],
-                tolerance: self.cfg.tolerance,
-            });
-        }
+        // Every joint is measured before the verdict, so the summary describes
+        // the whole machine rather than stopping at the first joint over the
+        // line. A joint nobody could read is not at stow as far as this says:
+        // the claim is that the head was found where it can be left, and an
+        // unread joint is no evidence of that.
+        self.at_stow = self.unmeasured.iter().all(|cause| cause.is_none())
+            && !self
+                .deviation
+                .iter()
+                .any(|deviation| outside_limit(*deviation, self.cfg.tolerance));
         self.phase = Phase::Release { cursor: 0 };
-        Ok(())
     }
 }
 
@@ -334,9 +463,7 @@ impl Sequencer for DisarmSequencer {
     type Summary = DisarmSummary;
 
     fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<DisarmSummary> {
-        if let Err(error) = self.absorb(prior) {
-            self.phase = Phase::Failed(error);
-        }
+        self.absorb(prior);
         self.emit(now)
     }
 
@@ -358,7 +485,6 @@ mod tests {
             stow_targets: stow_targets(&HeadGeometry::default()).expect("stow is reachable"),
             tolerance: DEFAULT_STOW_TOLERANCE,
             dwell: DEFAULT_STOW_DWELL,
-            force_drop: false,
         }
     }
 
@@ -459,7 +585,10 @@ mod tests {
     }
 
     /// The shared driver, against this crate's disarming sequencer.
-    fn drive(cfg: &DisarmConfig, machine: &mut Machine) -> Result<DisarmSummary, SeqError> {
+    fn drive(
+        cfg: &DisarmConfig,
+        machine: &mut Machine,
+    ) -> Result<DisarmSummary, crate::seq::SeqError> {
         let mut seq = DisarmSequencer::new(cfg);
         crate::testutil::drive(&mut seq, machine)
     }
@@ -499,53 +628,46 @@ mod tests {
         );
 
         assert!(summary.at_stow);
+        assert_eq!(summary.form, ReleaseForm::Orderly);
         assert_eq!(summary.present, cfg.stow_targets);
         assert_eq!(summary.deviation, [0.0; JointId::COUNT]);
+        assert!(summary.measured_all());
+        assert_eq!(summary.unreadable().count(), 0);
+        assert_eq!(summary.released, [true; JointId::COUNT]);
+        assert!(summary.all_released());
+        assert_eq!(summary.unreleased().count(), 0);
         assert_eq!(summary.worst_deviation(), (JointId::BodyYaw, 0.0));
     }
 
-    /// A joint away from stow stops the sequence with nothing written: the head
-    /// is not where it can be left, and releasing torque would drop it.
+    /// A joint away from stow is reported and torque comes off anyway. The head
+    /// resting a few degrees off its fold is not a hazard; the head held up by
+    /// torque nobody is watching is the one this machine has.
     #[test]
-    fn a_joint_away_from_stow_stops_the_release() {
+    fn a_joint_away_from_stow_is_released_and_reported() {
         let cfg = config();
         let mut machine = bus();
         machine.present.legs[2] += 5.0_f64.to_radians();
 
-        let error = drive(&cfg, &mut machine).expect_err("five degrees is past the gate");
-        let SeqError::NotAtStow {
-            context,
-            joint,
-            present,
-            target,
-            deviation,
-            tolerance,
-        } = error
-        else {
-            panic!("expected a stow refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(2));
-        assert_eq!(context.id, SERVO_IDS[3]);
-        assert_eq!(context.step, SeqStep::VerifyAtStow);
-        assert!((present - target).abs() > tolerance);
-        // A leg is judged along the line, so its two figures are the same one.
-        assert!((deviation - (present - target).abs()).abs() < 1e-12);
-        assert!(
-            error.to_string().contains("leg 3"),
-            "the message names the crank the way the envelope does: {error}"
-        );
+        let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+        assert!(!summary.at_stow, "five degrees is past the tolerance");
+        assert!(summary.measured_all());
+        assert_eq!(summary.worst_deviation().0, JointId::Leg(2));
+        assert!((summary.deviation[3].to_degrees() - 5.0).abs() < 1e-9);
 
-        assert!(machine.writes().is_empty(), "nothing was written");
-        assert_eq!(machine.torque, [true; JointId::COUNT]);
         assert_eq!(
-            machine.waits.len(),
-            1,
-            "the settle ran first, and the joint is still away from stow after it"
+            machine.writes(),
+            SERVO_IDS
+                .iter()
+                .map(|id| (*id, RegValue::U8(0)))
+                .collect::<Vec<_>>()
         );
+        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert!(summary.all_released());
     }
 
-    /// Every joint is measured before the verdict, so the one named is the one
-    /// furthest from stow rather than the first one found over the line.
+    /// Every joint is measured before the verdict, so the joint the summary
+    /// names is the one furthest from stow rather than the first one over the
+    /// line.
     #[test]
     fn the_joint_named_is_the_one_furthest_from_stow() {
         let cfg = config();
@@ -553,25 +675,21 @@ mod tests {
         machine.present.legs[1] += 3.0_f64.to_radians();
         machine.present.antennas[1] -= 9.0_f64.to_radians();
 
-        let error = drive(&cfg, &mut machine).expect_err("both are past the gate");
-        let SeqError::NotAtStow { joint, .. } = error else {
-            panic!("expected a stow refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::AntennaLeft);
+        let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+        assert!(!summary.at_stow);
+        assert_eq!(summary.worst_deviation().0, JointId::AntennaLeft);
+        assert_eq!(machine.torque, [false; JointId::COUNT]);
     }
 
-    /// The drop flag is the operator accepting that the head falls: the check
-    /// still runs and still records what it found, and the release proceeds.
+    /// Released from the neutral pose — the head up, as far from stow as this
+    /// machine goes. The summary carries where it was; the release happens.
     #[test]
-    fn the_drop_flag_releases_from_anywhere() {
-        let cfg = DisarmConfig {
-            force_drop: true,
-            ..config()
-        };
+    fn a_release_from_anywhere_releases() {
+        let cfg = config();
         let mut machine = bus();
         machine.present = joints_at(&neutral_head_pose());
 
-        let summary = drive(&cfg, &mut machine).expect("the flag excuses the stow check");
+        let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow, "the machine was not at stow and says so");
         assert_eq!(summary.present, machine.present);
         assert_eq!(machine.torque, [false; JointId::COUNT]);
@@ -597,8 +715,8 @@ mod tests {
     /// Both antennas, and each read across the half turn from its own fold: a
     /// reading on the same side of it needs no wrapping to come out right, and
     /// `stow` folds the two symmetrically, so a rule reaching only one of them
-    /// would refuse every release of a machine whose other antenna was found a
-    /// turn out — with the operator holding the head up by hand.
+    /// would report every release of a machine whose other antenna was found a
+    /// turn out as a release away from stow.
     #[test]
     fn an_antenna_is_judged_around_the_circle() {
         let stow = stow_targets(&HeadGeometry::default()).expect("stow is reachable");
@@ -624,29 +742,20 @@ mod tests {
             );
             assert_eq!(machine.torque, [false; JointId::COUNT]);
 
-            // The same reading against the 2° gate is still refused, and by the
-            // circular figure: nothing here waives the check, it measures it.
+            // The same reading against the 2° tolerance reads as away from
+            // stow, and by the circular figure: nothing here waives the
+            // measurement, it measures it.
             let mut machine = bus();
             machine.present.antennas[side] = degrees.to_radians();
-            let error = drive(&config(), &mut machine).expect_err("23° is past a 2° gate");
-            let SeqError::NotAtStow {
-                joint: refused,
-                deviation,
-                ..
-            } = error
-            else {
-                panic!("expected a stow refusal, got {error}");
-            };
-            assert_eq!(refused, joint);
+            let summary = drive(&config(), &mut machine).expect("nothing here refuses");
+            assert!(!summary.at_stow, "23° is past a 2° tolerance");
+            assert_eq!(summary.worst_deviation().0, joint);
             assert!(
-                (deviation.to_degrees() - 23.0).abs() < 1e-3,
-                "the refusal reports the distance around the circle: {}°",
-                deviation.to_degrees()
+                (summary.deviation[row].to_degrees() - 23.0).abs() < 1e-3,
+                "the report carries the distance around the circle: {}°",
+                summary.deviation[row].to_degrees()
             );
-            assert!(
-                error.to_string().contains("23.000° apart"),
-                "and says so to the operator: {error}"
-            );
+            assert_eq!(machine.torque, [false; JointId::COUNT]);
         }
 
         // A leg keeps the linear difference: it is a windowed joint working far
@@ -654,41 +763,53 @@ mod tests {
         // broken reading rather than a leg at stow.
         let mut machine = bus();
         machine.present.legs[0] += core::f64::consts::TAU;
-        let error = drive(&wide, &mut machine).expect_err("a turn is not zero on a leg");
-        let SeqError::NotAtStow { joint, present, .. } = error else {
-            panic!("expected a stow refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(0));
-        assert!((present - stow.legs[0] - core::f64::consts::TAU).abs() < 1e-12);
+        let summary = drive(&wide, &mut machine).expect("nothing here refuses");
+        assert!(!summary.at_stow, "a turn is not zero on a leg");
+        assert_eq!(summary.worst_deviation().0, JointId::Leg(0));
+        assert!((summary.present.legs[0] - stow.legs[0] - core::f64::consts::TAU).abs() < 1e-12);
     }
 
-    /// A reading that is not an angle is refused whichever way the drop flag is
-    /// set: the flag excuses a head away from stow, not a bus handing back
-    /// numbers nothing can be decided from.
+    /// A reading that is not an angle places no joint, so it is carried as
+    /// unmeasured — and torque still comes off. A bus handing back numbers
+    /// nothing can be decided from is a reason to leave the machine limp, not a
+    /// reason to leave it holding.
     #[test]
-    fn a_reading_nobody_can_place_is_refused_even_with_the_drop_flag() {
+    fn a_reading_nobody_can_place_is_reported_and_the_release_runs() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            for force_drop in [false, true] {
-                let cfg = DisarmConfig {
-                    force_drop,
-                    ..config()
-                };
-                let mut machine = bus();
-                machine.present.antennas[0] = value;
+            let cfg = config();
+            let mut machine = bus();
+            machine.present.antennas[0] = value;
 
-                let error = drive(&cfg, &mut machine)
-                    .expect_err("a reading that is not an angle places no joint");
-                let SeqError::UnplaceableAngle { joint, angle, .. } = error else {
-                    panic!("expected an unplaceable reading, got {error}");
-                };
-                assert_eq!(joint, JointId::AntennaRight);
-                // Bit patterns, not `is_nan`: an infinity compared that way
-                // constrains nothing, and an infinity is exactly what a
-                // decode-scale slip hands back. The number the refusal carries
-                // is the number the bus produced.
-                assert_eq!(angle.to_bits(), value.to_bits());
-                assert!(machine.writes().is_empty(), "nothing was written");
-            }
+            let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+            assert!(!summary.measured(7), "the right antenna placed nothing");
+            assert_eq!(summary.deviation[7], 0.0);
+            assert!(
+                !summary.at_stow,
+                "an unread joint is no evidence the head can be left here"
+            );
+            // And the summary says *why* it placed nothing, which is what tells
+            // a decode-scale slip from a servo that has stopped answering.
+            assert!(
+                matches!(
+                    summary.unmeasured[7],
+                    Some(SeqError::UnplaceableAngle {
+                        joint: JointId::AntennaRight,
+                        angle,
+                        ..
+                    }) if angle.to_bits() == value.to_bits()
+                ),
+                "{:?}",
+                summary.unmeasured[7]
+            );
+            assert_eq!(
+                summary
+                    .unreadable()
+                    .map(|(joint, _)| joint)
+                    .collect::<Vec<_>>(),
+                vec![JointId::AntennaRight]
+            );
+            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert!(summary.all_released());
         }
     }
 
@@ -717,54 +838,116 @@ mod tests {
         assert_eq!(machine.log.len(), 2 * JointId::COUNT);
     }
 
-    /// A release the servo refuses stops the sequence where it stood: the servos
-    /// already released stay released, and the rest keep holding.
+    /// A release the servo refuses is recorded against that servo and the walk
+    /// carries on: the other eight come off, and the summary names the one that
+    /// may still be holding.
     #[test]
-    fn a_refused_release_stops_where_it_stood() {
+    fn a_refused_release_is_recorded_and_the_rest_still_come_off() {
         let cfg = config();
         let mut machine = bus();
         machine.fail_write = Some((SERVO_IDS[4], BusResult::ServoError { code: 0x04 }));
 
-        let error = drive(&cfg, &mut machine).expect_err("the release was refused");
-        let SeqError::Refused { context, code } = error else {
-            panic!("expected a refusal, got {error}");
-        };
-        assert_eq!(code, 0x04);
-        assert_eq!(context.id, SERVO_IDS[4]);
-        assert_eq!(context.step, SeqStep::TorqueOff);
-        assert_eq!(context.reg, Some(RegId::TorqueEnable));
+        let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+        assert_eq!(
+            summary.released,
+            [true, true, true, true, false, true, true, true, true]
+        );
+        assert!(!summary.all_released());
+        assert_eq!(
+            summary.unreleased().collect::<Vec<_>>(),
+            vec![JointId::Leg(3)]
+        );
 
+        // Nine writes went out, one per servo, in bus order.
+        assert_eq!(
+            machine.writes(),
+            SERVO_IDS
+                .iter()
+                .map(|id| (*id, RegValue::U8(0)))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             machine.torque,
-            [false, false, false, false, true, true, true, true, true]
+            [false, false, false, false, true, false, false, false, false]
         );
     }
 
-    /// A servo that does not answer the stow check stops the sequence before
-    /// anything is written: a joint nobody can measure is a joint nobody can
-    /// place at stow.
+    /// A servo that does not answer the stow check is carried as unmeasured and
+    /// the releases still run — including its own, which is the write that
+    /// matters most for a servo the bus is having trouble with.
     #[test]
-    fn a_silent_servo_at_the_stow_check_refuses() {
+    fn a_silent_servo_at_the_stow_check_does_not_stop_the_release() {
         let cfg = config();
         let mut machine = bus();
         machine.silent[6] = true;
 
-        let error = drive(&cfg, &mut machine).expect_err("a silent servo stops the check");
-        let SeqError::NoAnswer { context } = error else {
-            panic!("expected silence, got {error}");
-        };
-        assert_eq!(context.id, SERVO_IDS[6]);
-        assert_eq!(context.step, SeqStep::VerifyAtStow);
-        assert!(machine.writes().is_empty());
-        assert_eq!(machine.torque, [true; JointId::COUNT]);
+        let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+        assert!(!summary.measured(6));
+        assert!(
+            matches!(summary.unmeasured[6], Some(SeqError::NoAnswer { .. })),
+            "silence is reported as silence: {:?}",
+            summary.unmeasured[6]
+        );
+        assert!(!summary.at_stow);
+        assert_eq!(machine.writes().len(), JointId::COUNT);
+        // The silent servo never acknowledges its release either; the other
+        // eight are limp.
+        assert!(!summary.released[6]);
+        assert_eq!(
+            summary.unreleased().collect::<Vec<_>>(),
+            vec![JointId::Leg(5)]
+        );
+        assert_eq!(
+            machine.torque,
+            [false, false, false, false, false, false, true, false, false]
+        );
     }
 
-    /// A driver that runs a transaction and brings nothing back is reported as
-    /// silence rather than quietly retried: from in here the two are the same
-    /// observation, and inventing a retry would be the sequencer deciding a
-    /// policy that belongs to whoever owns the port.
+    /// Each way a stow reading can fail comes back as its own cause.
+    ///
+    /// `unmeasured: leg 3` is the whole of what an unconditional release tells
+    /// on-call about a joint it could not read, and a servo gone silent, one
+    /// refusing with a status code and a frame the wire mangled are three
+    /// problems with three different answers. Collapsing them to a bit would
+    /// throw away the one diagnostic this path still produces.
     #[test]
-    fn a_driver_that_brings_nothing_back_is_silence() {
+    fn every_way_a_stow_reading_fails_is_reported_as_itself() {
+        // Asserted on what the cause says, because what it says is what reaches
+        // whoever has to act on it.
+        for (answer, expected) in [
+            (BusResult::NoAnswer, "no answer"),
+            (
+                BusResult::ServoError { code: 0x20 },
+                "refused with status code 0x20",
+            ),
+            (BusResult::WireCorrupt, "the reply was corrupt on the wire"),
+        ] {
+            let cfg = config();
+            let mut machine = bus();
+            machine.fail_read = Some((SERVO_IDS[4], answer));
+
+            let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
+            let cause = summary.unmeasured[4].expect("leg 4 could not be read");
+            assert!(
+                cause.to_string().contains(expected),
+                "{answer:?} came back as {cause}"
+            );
+            assert_eq!(cause.context().id, SERVO_IDS[4], "named against its servo");
+            assert_eq!(cause.context().step, SeqStep::VerifyAtStow);
+            assert!(!summary.at_stow);
+            // And torque still came off all nine, which is the point of not
+            // refusing over any of this.
+            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert!(summary.all_released());
+        }
+    }
+
+    /// A driver that runs a transaction and brings nothing back leaves that one
+    /// joint undescribed and moves on. Silence on the wire is exactly the
+    /// condition under which the head most needs to end up limp, so it cannot
+    /// be the condition that stops the walk.
+    #[test]
+    fn a_driver_that_brings_nothing_back_does_not_stop_the_walk() {
         let cfg = config();
         let mut seq = DisarmSequencer::new(&cfg);
         let SeqAction::Wait { until } = seq.next(Duration::ZERO, None) else {
@@ -773,11 +956,99 @@ mod tests {
         let first = seq.next(until, None);
         assert!(matches!(first, SeqAction::Transact(_)));
 
-        let SeqAction::Fail(error) = seq.next(until, None) else {
-            panic!("expected a failure after an unanswered transaction");
+        // Every transaction unanswered, all the way through: the sequence still
+        // reaches its end, having asked every servo to release.
+        let mut action = seq.next(until, None);
+        let mut transactions = 1;
+        let summary = loop {
+            match action {
+                SeqAction::Transact(_) => {
+                    transactions += 1;
+                    assert!(transactions <= 2 * JointId::COUNT, "the walk does not loop");
+                    action = seq.next(until, None);
+                }
+                SeqAction::Done(summary) => break summary,
+                other => panic!("nothing here waits or fails: {other:?}"),
+            }
         };
-        assert!(matches!(error, SeqError::NoAnswer { .. }));
-        assert_eq!(seq.step(), SeqStep::VerifyAtStow);
+        assert_eq!(transactions, 2 * JointId::COUNT);
+        assert!(!summary.measured_all());
+        assert_eq!(summary.released, [false; JointId::COUNT]);
+        assert!(!summary.at_stow);
+
+        // Nine servos looked at and none of them readable — which the summary
+        // states as nine silences under the orderly form, not as a release that
+        // deliberately did not look.
+        assert_eq!(summary.form, ReleaseForm::Orderly);
+        assert_eq!(summary.unreadable().count(), JointId::COUNT);
+        assert!(
+            summary
+                .unmeasured
+                .iter()
+                .all(|cause| matches!(cause, Some(SeqError::NoAnswer { .. }))),
+            "{:?}",
+            summary.unmeasured
+        );
+    }
+
+    /// The fault release is nine writes: no settle, no reads, torque off in bus
+    /// order. This is the maneuver a fault takes, and every transaction it does
+    /// not make is time the head spends held up by motors nobody trusts.
+    #[test]
+    fn the_immediate_release_is_nine_writes_and_nothing_else() {
+        let cfg = config();
+        let mut machine = bus();
+        let mut seq = DisarmSequencer::immediate(&cfg);
+        let summary = crate::testutil::drive(&mut seq, &mut machine).expect("nothing here refuses");
+
+        assert!(machine.waits.is_empty(), "a fault waits for nothing");
+        let steps: Vec<SeqStep> = machine.log.iter().map(|(step, _)| *step).collect();
+        assert_eq!(steps, vec![SeqStep::TorqueOff; JointId::COUNT]);
+        assert_eq!(
+            machine.writes(),
+            SERVO_IDS
+                .iter()
+                .map(|id| (*id, RegValue::U8(0)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(machine.torque, [false; JointId::COUNT]);
+
+        // The summary says what it looked at, which is nothing. A machine
+        // physically at stow still reports `at_stow` false here: the claim
+        // would be a measurement, and there was none. And nothing is recorded
+        // as unreadable, because nothing was read — the form is what says that,
+        // so no reader has to infer it from nine empty measurements.
+        assert_eq!(summary.form, ReleaseForm::Immediate);
+        assert!(!summary.measured_all());
+        assert_eq!(summary.unmeasured, [None; JointId::COUNT]);
+        assert_eq!(summary.unreadable().count(), 0);
+        assert!(!summary.at_stow);
+        assert_eq!(summary.released, [true; JointId::COUNT]);
+        assert!(summary.all_released());
+    }
+
+    /// The fault release is as unstoppable as the orderly one: a servo that
+    /// refuses its own write and a servo that says nothing at all are both
+    /// recorded, and the other seven still come off.
+    #[test]
+    fn the_immediate_release_asks_every_servo_whatever_they_answer() {
+        let cfg = config();
+        let mut machine = bus();
+        machine.fail_write = Some((SERVO_IDS[2], BusResult::ServoError { code: 0x04 }));
+        machine.silent[5] = true;
+
+        let mut seq = DisarmSequencer::immediate(&cfg);
+        let summary = crate::testutil::drive(&mut seq, &mut machine).expect("nothing here refuses");
+
+        assert_eq!(
+            summary.unreleased().collect::<Vec<_>>(),
+            vec![JointId::Leg(1), JointId::Leg(4)]
+        );
+        assert_eq!(machine.writes().len(), JointId::COUNT);
+        assert_eq!(
+            machine.torque,
+            [false, false, true, false, false, true, false, false, false]
+        );
     }
 
     /// The stow pose disarming verifies against is a pose the envelope admits
@@ -819,5 +1090,55 @@ mod tests {
         assert_eq!(cfg.stow_targets.antennas, STOW_ANTENNAS);
         assert_eq!(cfg.stow_targets.legs, report.leg_angles.unwrap().0);
         assert_eq!(cfg.stow_targets.body_yaw, 0.0);
+    }
+
+    /// The standalone comparison, for a caller measuring the machine somewhere
+    /// other than in a release: same tolerance, same circular treatment of the
+    /// antennas, and the same answer the orderly release's own verify reaches
+    /// on the same nine angles.
+    #[test]
+    fn a_pose_measured_elsewhere_is_judged_against_stow_the_same_way() {
+        let cfg = config();
+        assert!(at_stow(&cfg, &cfg.stow_targets));
+
+        let mut folded_a_turn_further = cfg.stow_targets;
+        folded_a_turn_further.antennas[0] += 2.0 * PI;
+        assert!(
+            at_stow(&cfg, &folded_a_turn_further),
+            "an antenna is a direction: a whole turn is the same fold"
+        );
+
+        let mut leg_a_turn_out = cfg.stow_targets;
+        leg_a_turn_out.legs[3] += 2.0 * PI;
+        assert!(
+            !at_stow(&cfg, &leg_a_turn_out),
+            "a leg reading a turn from its target is a broken reading, not a joint at stow"
+        );
+
+        let mut just_inside = cfg.stow_targets;
+        just_inside.body_yaw += cfg.tolerance * 0.99;
+        assert!(at_stow(&cfg, &just_inside));
+        let mut just_outside = cfg.stow_targets;
+        just_outside.body_yaw += cfg.tolerance * 1.01;
+        assert!(!at_stow(&cfg, &just_outside));
+
+        // An angle nobody can place. Asserted rather than inherited from
+        // which way round the comparison happens to be written: a machine
+        // nobody can read is not a machine that may be called folded.
+        for unplaceable in [f64::NAN, f64::INFINITY] {
+            let mut unreadable = cfg.stow_targets;
+            unreadable.legs[0] = unplaceable;
+            assert!(
+                !at_stow(&cfg, &unreadable),
+                "an unplaceable angle is not evidence of a fold: {unplaceable}"
+            );
+        }
+
+        // The release's own verdict on the same machine, so the two cannot
+        // drift into disagreeing about where stow is.
+        let mut machine = bus();
+        machine.present = just_outside;
+        let summary = drive(&cfg, &mut machine).expect("a release always finishes");
+        assert_eq!(summary.at_stow, at_stow(&cfg, &just_outside));
     }
 }

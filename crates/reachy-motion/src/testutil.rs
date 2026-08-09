@@ -11,8 +11,7 @@ use std::time::Duration;
 use reachy_kin::EnvelopeConfig;
 
 use crate::arm::{
-    ArmConfig, DEFAULT_GAINS, DEFAULT_GOAL_SHADOW_TOLERANCE, DEFAULT_MAX_PIN_PULL_IN,
-    DEFAULT_MIN_ARM_VOLTAGE, DEFAULT_RECHECK_TOLERANCE, DEFAULT_VOLTAGE_BUDGET,
+    ArmConfig, DEFAULT_GAINS, DEFAULT_MIN_ARM_VOLTAGE, DEFAULT_VOLTAGE_BUDGET,
     DEFAULT_VOLTAGE_POLL_PERIOD, ProfileConfig, ProvisionTable, SERVO_IDS,
 };
 use crate::seq::{BusRequest, BusResult, SeqAction, SeqError, SeqStep, Sequencer};
@@ -37,7 +36,7 @@ pub(crate) fn leg_windows(env: &EnvelopeConfig) -> [(f64, f64); 6] {
     windows
 }
 
-/// Arming's configuration against the fences `env` implies.
+/// The torque-on path's configuration against the fences `env` implies.
 pub(crate) fn arm_config(env: &EnvelopeConfig) -> ArmConfig {
     ArmConfig {
         ids: SERVO_IDS,
@@ -50,9 +49,6 @@ pub(crate) fn arm_config(env: &EnvelopeConfig) -> ArmConfig {
             acceleration: 20,
             velocity: 50,
         },
-        max_pin_pull_in: DEFAULT_MAX_PIN_PULL_IN,
-        recheck_tolerance: DEFAULT_RECHECK_TOLERANCE,
-        goal_shadow_tolerance: DEFAULT_GOAL_SHADOW_TOLERANCE,
         leg_windows: leg_windows(env),
     }
 }

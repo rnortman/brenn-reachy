@@ -47,6 +47,11 @@ pub(crate) struct FakeMachine {
     /// checksum was taken, so the host sees bytes that disagree with
     /// themselves.
     pub(crate) damaged: Vec<(u8, u16)>,
+    /// Reads of a register this machine answers with one parameter byte more
+    /// than the request asked for: a well-formed frame of the wrong width,
+    /// which is what the tail of an abandoned exchange looks like when it lands
+    /// behind somebody else's answer.
+    pub(crate) verbose: Vec<(u8, u16)>,
     /// Servos whose Goal Position register stores what is written to it even
     /// with torque off, instead of reporting the present position. Not this
     /// platform: it is the firmware the goal-shadow case exists to catch, and
@@ -76,6 +81,7 @@ impl FakeMachine {
             ignored: Vec::new(),
             mute: HashMap::new(),
             damaged: Vec::new(),
+            verbose: Vec::new(),
             unmirrored: Vec::new(),
             delay: HashMap::new(),
             queued: HashMap::new(),
@@ -173,12 +179,19 @@ impl FakeMachine {
         }
     }
 
-    /// A status frame as a servo puts it on the wire, damaged after its
-    /// checksum if this register is one of the damaged ones.
+    /// A status frame as a servo puts it on the wire — damaged after its
+    /// checksum if this register is one of the damaged ones, and one byte wide
+    /// of the request if it is one of the verbose ones.
     fn answer(&mut self, id: u8, addr: u16, error: u8, params: &[u8]) {
         let damaged = self.damaged.contains(&(id, addr));
         let at = self.out.len() + HEADER.len() + 4;
-        self.reply(id, error, params);
+        if self.verbose.contains(&(id, addr)) {
+            let mut wide = params.to_vec();
+            wide.push(0);
+            self.reply(id, error, &wide);
+        } else {
+            self.reply(id, error, params);
+        }
         if damaged {
             // One byte flipped after the checksum was taken over the frame it
             // no longer describes, which is what a wire fault looks like from

@@ -155,8 +155,15 @@ bench-build:
 	tools/build-bench.sh
 
 # Give the unit the bench's configuration. Needs no build, so it can run before
-# or after one; idempotent, and the re-run after a reboot is the whole story —
-# the device's copy is in RAM.
+# or after one; idempotent, and the device's copy is in RAM.
+#
+# This is one file out of everything a reboot clears, and this target is true
+# about itself only. Bringing a rebooted unit all the way back — payload, both
+# daemons' configurations, the motion daemon's token, binary and unit — is
+# `make reachy-up` in brenn-pod, which pushes this file too, out of the same
+# BENCH_CONFIG copy. Its runbook, docs/runbooks/reachy-end-to-end.md there, is
+# the prose version. Use this one when the bench file is the only thing that
+# changed.
 .PHONY: bench-config
 bench-config: bench-host
 	tools/deploy-bench.sh $(REACHY_HOST) --config $(BENCH_CONFIG)

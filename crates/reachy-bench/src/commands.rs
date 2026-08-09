@@ -2,20 +2,30 @@
 //!
 //! Every command that moves the head has the same shape, and the shape is the
 //! safety property. Nothing is remembered between invocations — each is a fresh
-//! process — so a command re-drives the whole arm sequence, which verifies the
-//! nine servos, enables torque — which holds every joint where it stands — pins
-//! each joint there, and only then injects one `MoveTo` over the fixed-rate
-//! loop. A machine that has
-//! drifted, been handled, or was never armed at all is therefore re-established
-//! from scratch every time, and a command that cannot establish it does not
-//! move anything.
+//! process — so a command walks the whole path: it commissions the machine
+//! (which verifies the nine servos), polls to see where they are standing,
+//! engages — pinning each joint where it stands and enabling torque, which
+//! holds it there — and only then injects one `MoveTo` over the fixed-rate
+//! loop. A machine that has drifted, been handled, or was never armed at all is
+//! therefore re-established from scratch every time, and a command that cannot
+//! establish it does not move anything.
+//!
+//! ## What a command does when a run goes wrong
+//!
+//! A refusal leaves the machine holding: the tick would not accept the command,
+//! nothing was written, and where the head is standing is where the last
+//! accepted command put it. A *fault* is the other case — tracking lost, a step
+//! bound violated, the wire gone — and there the machine goes limp
+//! immediately, because a head held up by motors whose control loop has stopped
+//! is the one state this platform should never be left in. That is
+//! [`Engaged::disengage_now`], and it runs before the command exits with the
+//! fault that caused it.
 //!
 //! `off` is the exception, and deliberately: it releases torque, so re-arming
 //! first would enable torque in order to switch it off. It drives the disarm
-//! sequence against the machine as found, and that sequence's own first phase —
-//! nine positions measured against the stow pose — is the gate. A machine
-//! somewhere else is refused unless the operator has accepted that the head
-//! will fall.
+//! sequence against the machine as found. Nothing in that sequence refuses —
+//! the nine positions it measures against the stow pose are a report of where
+//! the head was when torque left it, not a condition on torque leaving.
 //!
 //! `provision` is the other exception: it writes a non-volatile register on a
 //! machine whose torque is off and moves nothing, so arming it first would be
@@ -32,14 +42,15 @@ use reachy_bus::{Bus, BusPort, BusTiming, MapError, ServoMap, reg_for, value_kin
 use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
-    ArmSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    JointId, JointTargets, MotionCommand, MotionState, RegId, RegValue, ValueKind, Warp,
+    CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
+    EngageSequencer, JointId, JointTargets, MotionCommand, MotionState, MoveDurations, PollCadence,
+    PollSequencer, Posture, RegId, RegValue, ValueKind, Warp,
 };
 
 use crate::config::Resolved;
 use crate::pump::{
     Clock, DISARM_ACTIONS, MotionPump, MoveSummary, PumpError, TickEvent, action_budget,
-    arm_report, drive,
+    commission_report, drive, drive_release, engage_report,
 };
 
 /// The shaping every bench move uses.
@@ -99,65 +110,305 @@ pub fn stow_pose_targets() -> JointTargets {
     }
 }
 
-/// A live session: an armed machine, and the loop that moves it.
+/// A commissioned machine: the bus, and the last thing the poll saw.
 ///
-/// Constructed only by [`Session::arm`], so holding one is the evidence that
-/// the nine servos answered, were found provisioned as recorded, are on a
-/// healthy rail, and are holding torque at a pose the envelope admits.
-pub struct Session<'a, P: BusPort> {
+/// Holding one is the evidence that the nine servos answered, were found
+/// provisioned as recorded, and took their gains — established once, because
+/// none of it changes while a process runs. Torque is not part of that
+/// evidence: a commissioned machine is ordinarily limp, and stays that way
+/// until something asks for a move.
+///
+/// It owns the bus for its whole life, which is what makes engaging and
+/// releasing repeatable: the port never changes hands, so a wake word costs an
+/// engage and not an open.
+pub struct Commissioned<'a, P: BusPort> {
     resolved: &'a Resolved,
     bus: Bus<P>,
-    state: MotionState,
-    pump: MotionPump<'a>,
+    posture: Posture,
+    /// Whether `posture` still describes the machine. False after a release
+    /// that did not measure all nine joints: the head went limp and settled
+    /// somewhere nobody looked at.
+    fresh: bool,
 }
 
-impl<'a, P: BusPort> Session<'a, P> {
-    /// Drive the arm sequence over `port` and take the machine holding where it
-    /// stands.
+/// Commission the machine over `port` and take one look at where it stands.
+///
+/// The once-per-process ceremony — presence, identity, the provisioned
+/// registers, the supply gate, the health sweep, the gains — followed by one
+/// resting sweep, so the returned machine already knows a pose to engage from.
+/// Around two hundred transactions, none of which touches torque in either
+/// direction.
+///
+/// The phases are announced as they are entered: the supply gate alone can take
+/// the whole of its configured budget, and a supervised run that said nothing
+/// until the end would look hung at exactly the moment an operator is deciding
+/// whether to reach for the power.
+pub fn commission<'a, P: BusPort>(
+    resolved: &'a Resolved,
+    port: P,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<Commissioned<'a, P>, PumpError> {
+    let mut bus = Bus::new(port, resolved.timing);
+    let budget = action_budget(&resolved.arm);
+
+    let mut commissioning = CommissionSequencer::new(&resolved.arm);
+    let commission = drive(
+        &mut bus,
+        &resolved.map,
+        &mut commissioning,
+        clock,
+        budget,
+        &mut |step| line(&format!("  {step}")),
+    )?;
+    line(commission_report(&commission).trim_end());
+
+    // The rail was read moments ago by the sweep that gated the gains writes,
+    // so the opening sweep asks about positions alone.
+    let mut polling = PollSequencer::new(&resolved.arm, commission.rail, PollCadence::Positions);
+    let posture = drive(
+        &mut bus,
+        &resolved.map,
+        &mut polling,
+        clock,
+        budget,
+        &mut |step| line(&format!("  {step}")),
+    )?;
+
+    Ok(Commissioned {
+        resolved,
+        bus,
+        posture,
+        fresh: true,
+    })
+}
+
+impl<'a, P: BusPort> Commissioned<'a, P> {
+    /// Where the last sweep found the machine, and what its rail read.
     ///
-    /// The phases are announced as they are entered: the supply gate alone can
-    /// take the whole of its configured budget, and a supervised run that said
-    /// nothing until the end would look hung at exactly the moment an operator
-    /// is deciding whether to reach for the power. The record of what arming
-    /// found is the last thing it has to say, and it is printed here rather
-    /// than by each caller, so no command can arm the machine without it.
-    pub fn arm(
-        resolved: &'a Resolved,
-        port: P,
+    /// Only as current as [`Self::fresh`] says: a release that measured nothing
+    /// leaves this describing the pose the head was held at rather than the one
+    /// it fell into.
+    #[must_use]
+    pub fn posture(&self) -> &Posture {
+        &self.posture
+    }
+
+    /// Whether [`Self::posture`] still describes the machine.
+    ///
+    /// False from the moment a release goes by without measuring every joint —
+    /// the fault release measures none — until the next sweep that does.
+    #[must_use]
+    pub fn fresh(&self) -> bool {
+        self.fresh
+    }
+
+    /// Take another look, and keep it.
+    ///
+    /// The resting watch. A hand can turn the head while the machine lies limp,
+    /// so the pose an engage plans from is only as good as the last sweep; the
+    /// rail and the error bits change on the timescale of a power supply, which
+    /// is why `cadence` exists — a caller polling ten times a second re-reads
+    /// them far less often than that.
+    pub fn poll(
+        &mut self,
+        cadence: PollCadence,
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
-    ) -> Result<Self, PumpError> {
-        let mut bus = Bus::new(port, resolved.timing);
-        let mut sequencer = ArmSequencer::new(
+    ) -> Result<Posture, PumpError> {
+        let mut polling = PollSequencer::new(&self.resolved.arm, self.posture.rail, cadence);
+        self.posture = drive(
+            &mut self.bus,
+            &self.resolved.map,
+            &mut polling,
+            clock,
+            action_budget(&self.resolved.arm),
+            &mut |step| line(&format!("  {step}")),
+        )?;
+        self.fresh = true;
+        Ok(self.posture)
+    }
+
+    /// Pin every joint where the last sweep found it and enable torque.
+    ///
+    /// Twenty-seven transactions and two pieces of arithmetic: the supply floor
+    /// and the error bits are judged against the poll already in hand, so
+    /// nothing here waits on the machine to answer a question before torque can
+    /// come on. A refusal costs the bus nothing and leaves the machine exactly
+    /// as it was.
+    ///
+    /// Everything that can fail *after* the first enable write is the one case
+    /// that needs undoing: some servos may be holding torque with nothing
+    /// driving them. Every such path takes the fault release on the way out, so
+    /// the error a caller sees always describes a limp machine.
+    ///
+    /// Twenty-seven is the count from a posture the machine is still in. A
+    /// posture left stale by a release that measured nothing costs a sweep of
+    /// nine reads first: those angles are written to the goal registers before
+    /// the enables, and pinning a limp head at where it *was* is the slam that
+    /// sweep exists to prevent.
+    pub fn engage(
+        &mut self,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<Engaged<'_, 'a, P>, PumpError> {
+        if !self.fresh {
+            self.poll(PollCadence::Positions, clock, line)?;
+        }
+        let resolved = self.resolved;
+        let mut engaging = EngageSequencer::new(
             &resolved.arm,
             &resolved.motion.geom,
-            &resolved.motion.env,
             &resolved.motion.fk,
+            &self.posture,
         );
-        let armed = drive(
-            &mut bus,
+        let engaged = match drive(
+            &mut self.bus,
             &resolved.map,
-            &mut sequencer,
+            &mut engaging,
             clock,
             action_budget(&resolved.arm),
             &mut |step| line(&format!("  {step}")),
-        )?;
-        line(arm_report(&armed).trim_end());
-        let pump = MotionPump::new(
+        ) {
+            Ok(engaged) => engaged,
+            Err(error) => {
+                if engaging.torque_written() {
+                    line("engage failed with torque possibly on; releasing immediately");
+                    self.detorque_now(clock, line);
+                }
+                return Err(error);
+            }
+        };
+
+        line(engage_report(&engaged).trim_end());
+        // Nine servos are holding by now, so anything that fails between here
+        // and the caller owning an `Engaged` is a machine torqued with no loop
+        // driving it — the same undoing the enable walk's own failures take.
+        let pump = match MotionPump::new(
             &resolved.motion,
             &resolved.map,
             resolved.tick_hz,
             resolved.health_poll_hz,
-            armed.armed.joints,
-        )?;
-        Ok(Self {
-            resolved,
-            state: MotionState::new_armed(&armed.armed),
-            bus,
+            engaged.armed.joints,
+        ) {
+            Ok(pump) => pump,
+            Err(error) => {
+                line("the control loop would not start with torque on; releasing immediately");
+                self.detorque_now(clock, line);
+                return Err(error);
+            }
+        };
+        Ok(Engaged {
+            state: MotionState::new_armed(&engaged.armed),
+            machine: self,
             pump,
         })
     }
 
+    /// Take the machine limp now, on a path that already has an error to
+    /// return.
+    ///
+    /// The release reports itself through `line` as it walks, so the failure
+    /// worth exiting with is the one that made the release necessary — except
+    /// for the single case the release cannot report, which is a walk that
+    /// never reached its end and therefore printed nothing at all.
+    fn detorque_now(&mut self, clock: &mut dyn Clock, line: &mut dyn FnMut(&str)) {
+        let immediate = DisarmSequencer::immediate(&self.resolved.disarm);
+        let outcome = self.detorque_with(immediate, clock, line);
+        report_release(outcome, line);
+    }
+
+    /// Run `sequencer` against the bus and keep what it measured.
+    ///
+    /// The positions a release measured, if it measured any, replace the
+    /// posture this machine was carrying: they are the freshest thing anyone
+    /// knows about where the head is, and the next engage plans from them.
+    ///
+    /// A joint the release did not measure is a joint nobody has looked at
+    /// since torque came off it, and torque coming off is exactly when a head
+    /// moves. The posture is stale from here until a sweep measures all nine.
+    fn detorque_with(
+        &mut self,
+        sequencer: DisarmSequencer,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<DisarmSummary, PumpError> {
+        let outcome = detorque(self.resolved, &mut self.bus, sequencer, clock, line);
+        self.fresh = false;
+        if let Ok(summary) = &outcome {
+            for row in 0..JointId::COUNT {
+                if summary.measured(row) {
+                    let joint = JointId::ALL[row];
+                    let angle = summary.present.get(joint).expect("nine joints");
+                    self.posture.present.set(joint, angle);
+                }
+            }
+            self.fresh = summary.measured_all();
+        }
+        outcome
+    }
+}
+
+/// What an orderly release's outcome leaves to be done.
+///
+/// The doctrine's fall-through: a refusal or fault during the settle-measure
+/// form takes the immediate one. The orderly walk is a convenience, and one
+/// that stopped part way through may have left servos holding with no sequence
+/// driving them — a head held up by a loop nobody is running is the state this
+/// whole path exists to avoid. An unacknowledged torque-off is the exception:
+/// every release was written, and writing them again would say no more.
+///
+/// A function of its own rather than a tail inside [`Engaged::disengage`],
+/// because the outcome it turns on is one the composed path cannot presently
+/// produce — the release driver absorbs every wire failure and the action
+/// budget is three orders of magnitude above the walk — and a rule this
+/// load-bearing has to be drivable directly to be checked at all.
+fn fall_through_to_immediate<P: BusPort>(
+    machine: &mut Commissioned<'_, P>,
+    outcome: Result<DisarmSummary, PumpError>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<DisarmSummary, PumpError> {
+    let Err(error) = outcome else {
+        return outcome;
+    };
+    if !error.is_fault() {
+        return Err(error);
+    }
+    line("the orderly release did not finish; releasing immediately");
+    machine.detorque_now(clock, line);
+    Err(error)
+}
+
+/// Say so when a release did not finish, and nothing when it did.
+///
+/// Every ending that runs a release has an error of its own to return — the
+/// fault, or the engage failure — and that is the one worth exiting with. What
+/// the release has to say it says through `line` servo by servo, including any
+/// servo that never acknowledged its own torque-off. The exception is a walk
+/// that ended early: it prints nothing, and dropping its error would leave the
+/// operator with no record that the machine may still be holding.
+fn report_release(outcome: Result<DisarmSummary, PumpError>, line: &mut dyn FnMut(&str)) {
+    match outcome {
+        Ok(_) | Err(PumpError::TorqueOffUnacked { .. }) => {}
+        Err(error) => line(&format!("  the release itself did not finish: {error}")),
+    }
+}
+
+/// A machine holding torque, and the loop that moves it.
+///
+/// Constructed only by [`Commissioned::engage`], so holding one is the evidence
+/// that nine servos took torque at the pose they reported. It borrows the
+/// commissioned machine rather than taking it, so the bus and the port never
+/// change hands across an engage/release cycle — a process can raise the head
+/// and let it go all day without reopening anything.
+pub struct Engaged<'m, 'a, P: BusPort> {
+    machine: &'m mut Commissioned<'a, P>,
+    state: MotionState,
+    pump: MotionPump<'a>,
+}
+
+impl<P: BusPort> Engaged<'_, '_, P> {
     /// The configuration the machine was last commanded to, which is where the
     /// next move starts.
     #[must_use]
@@ -165,25 +416,56 @@ impl<'a, P: BusPort> Session<'a, P> {
         *self.state.last_targets()
     }
 
-    /// Carry one move to its endpoint.
+    /// Carry one move to its endpoint, each mechanical group on its own clock.
     pub fn move_to(
         &mut self,
         target: JointTargets,
-        duration: Duration,
+        durations: MoveDurations,
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<MoveSummary, PumpError> {
+        self.move_retargeting(target, durations, clock, line, &mut || None)
+    }
+
+    /// Carry one move, asking `retarget` at every control period whether it is
+    /// still the move the caller wants.
+    ///
+    /// Answering `Some((target, durations))` replaces the move in flight: the
+    /// new path is shaped from the setpoint the last period commanded, so the
+    /// head turns around where it is rather than finishing the old move first.
+    /// The call returns when whichever move was last accepted reaches its
+    /// endpoint.
+    ///
+    /// This is what a caller executing a timeline it does not control needs:
+    /// the instruction can change while the head is halfway up, and waiting out
+    /// the raise before starting the fold is the head being late by a whole
+    /// move. [`Engaged::move_to`] is this with nothing to say.
+    pub fn move_retargeting(
+        &mut self,
+        target: JointTargets,
+        durations: MoveDurations,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
+    ) -> Result<MoveSummary, PumpError> {
         let command = MotionCommand::MoveTo {
             target,
-            duration,
+            durations,
             warp: WARP,
         };
-        let outcome = self.pump.run(
-            &mut self.bus,
+        let outcome = self.pump.run_retargeting(
+            &mut self.machine.bus,
             &mut self.state,
             command,
             clock,
             &mut |event| line(&format!("  {event}")),
+            &mut || {
+                retarget().map(|(target, durations)| MotionCommand::MoveTo {
+                    target,
+                    durations,
+                    warp: WARP,
+                })
+            },
         );
         self.report(line);
         outcome
@@ -239,67 +521,133 @@ impl<'a, P: BusPort> Session<'a, P> {
     /// reading a single bench run. The numbers are not lost either way; they
     /// come back in the summary, typed.
     ///
-    /// [`Session::hold`] is this with the bench's own policy applied.
+    /// [`Engaged::hold`] is this with the bench's own policy applied.
     pub fn hold_events(
         &mut self,
         duration: Duration,
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
-        self.pump
-            .hold(&mut self.bus, &mut self.state, duration, clock, event)
+        self.pump.hold(
+            &mut self.machine.bus,
+            &mut self.state,
+            duration,
+            clock,
+            event,
+        )
     }
 
-    /// Release torque, having verified the machine is at stow, and end the
-    /// session.
+    /// Let the machine settle, write down where it came to rest, and release
+    /// torque.
     ///
-    /// `force_drop` is the operator's explicit acceptance that the head falls;
-    /// without it a machine measured anywhere but stow is refused.
+    /// The orderly ending, for a move that finished where it was told to: the
+    /// dwell lets a joint still closing its lag arrive, the sweep measures the
+    /// nine, and then torque comes off. The measurement is a report and never a
+    /// condition — a machine found away from stow is released and said so.
     ///
-    /// Consumes the session, because a session is the evidence that nine servos
-    /// are holding torque and this is what makes that false: a released session
-    /// left callable would take a `move_to` and pump goal frames at a limp
+    /// Consumes the engagement, because an engagement is the evidence that nine
+    /// servos are holding torque and this is what makes that false: a released
+    /// one left callable would take a `move_to` and pump goal frames at a limp
     /// machine, diverging further every period until the tracking budget ran
     /// out.
-    pub fn release(
-        mut self,
-        force_drop: bool,
+    /// An orderly release that does not finish falls through to the immediate
+    /// one: the settle-and-measure form is a convenience, and a machine part
+    /// way through it is a machine that may still be holding torque with a
+    /// sequence nobody is driving.
+    pub fn disengage(
+        self,
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<DisarmSummary, PumpError> {
-        release(self.resolved, &mut self.bus, force_drop, clock, line)
+        let machine = self.machine;
+        let orderly = DisarmSequencer::new(&machine.resolved.disarm);
+        let outcome = machine.detorque_with(orderly, clock, line);
+        fall_through_to_immediate(machine, outcome, clock, line)
+    }
+
+    /// Write torque off to all nine servos now, and do nothing else.
+    ///
+    /// The fault ending. No settle and no measurement: whatever is wrong,
+    /// getting the motors unpowered is the whole of the answer, and the head
+    /// falls gently into near-stow under gearbox resistance from wherever it
+    /// is. Every servo is asked whatever the ones before it answered.
+    pub fn disengage_now(
+        self,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<DisarmSummary, PumpError> {
+        let machine = self.machine;
+        let immediate = DisarmSequencer::immediate(&machine.resolved.disarm);
+        machine.detorque_with(immediate, clock, line)
     }
 }
 
-/// Drive the disarm sequence against whatever is on `bus`.
+/// Drive a disarm sequence against whatever is on `bus`, and report it.
 ///
-/// Free of a [`Session`] because `off` must not arm to disarm: the sequence
-/// reads nine positions, compares them against the stow pose, settles, and then
-/// releases torque one servo at a time with each release read back. Nothing
-/// after the release: the platform settles limp into its true rest, which is
-/// the state the next boot's arm sequence is entitled to assume.
-pub fn release<P: BusPort>(
+/// Takes a sequencer rather than building one, because the two ways to release
+/// differ only in which one this runs: the orderly settle-measure-release, or
+/// the nine writes a fault takes. Nothing after the last release — the platform
+/// settles limp into its true rest, which is the state the next engage is
+/// entitled to measure.
+///
+/// Nothing here refuses, and nothing here stops it either: a transaction that
+/// fails in a way the sequencer has no vocabulary for is printed and the walk
+/// carries on to the next servo, so all nine are always asked whatever the wire
+/// does. The one error this can return is raised after all nine releases have
+/// been written, and says a servo never acknowledged its own — the report of an
+/// incomplete release rather than a release that did not happen.
+fn detorque<P: BusPort>(
     resolved: &Resolved,
     bus: &mut Bus<P>,
-    force_drop: bool,
+    mut sequencer: DisarmSequencer,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<DisarmSummary, PumpError> {
-    let mut cfg = resolved.disarm;
-    // The drop flag is given per invocation and never stored, so it is written
-    // here and nowhere else.
-    cfg.force_drop = force_drop;
-    let mut sequencer = DisarmSequencer::new(&cfg);
-    let summary = drive(
+    // Reported after the walk rather than during it: nine writes take
+    // milliseconds, and getting them out is worth more than narrating them.
+    let mut trouble: Vec<PumpError> = Vec::new();
+    let summary = drive_release(
         bus,
         &resolved.map,
         &mut sequencer,
         clock,
         DISARM_ACTIONS,
         &mut |step| line(&format!("  {step}")),
+        &mut trouble,
     )?;
+    for error in &trouble {
+        line(&format!("  wire trouble mid-release, carried on: {error}"));
+    }
     line(&disarm_line(&summary));
+    // After the report, not before it: the operator reads what the machine did
+    // and then the command's verdict on it.
+    if let Some(joint) = summary.unreleased().next() {
+        let row = joint.index().expect("a named joint has a bus row");
+        return Err(PumpError::TorqueOffUnacked {
+            id: resolved.disarm.ids[row],
+        });
+    }
     Ok(summary)
+}
+
+/// Release torque on the machine as found, without engaging it first.
+///
+/// What `off` runs: the bus is bare, nothing is commissioned, and nothing is
+/// commanded. Releasing must never require taking hold first — that would
+/// enable torque in order to switch it off.
+pub fn release<P: BusPort>(
+    resolved: &Resolved,
+    bus: &mut Bus<P>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<DisarmSummary, PumpError> {
+    detorque(
+        resolved,
+        bus,
+        DisarmSequencer::new(&resolved.disarm),
+        clock,
+        line,
+    )
 }
 
 /// What a move cost, as a run prints it.
@@ -331,18 +679,85 @@ fn lag_line(summary: &MoveSummary) -> String {
     format!("  worst lag [{}] deg", lags.join(", "))
 }
 
-/// Where the machine was when torque came off.
+/// Where the machine was when torque came off, and which servos said so.
+///
+/// The fault form gets a line of its own: it did not fail to measure the
+/// machine, it deliberately did not look, and that is a different report from
+/// the same nine joints going unread. Which one happened is read off the
+/// summary's form rather than inferred from empty measurements — a dead adapter
+/// during an orderly `off` produces the same nine blanks a fault release does,
+/// and printing it as a fault release would hide the bus having stopped
+/// answering.
 fn disarm_line(summary: &DisarmSummary) -> String {
-    let (joint, deviation) = summary.worst_deviation();
-    format!(
-        "  torque off; {at}, furthest joint {joint} at {:.3} deg from stow",
-        deviation.to_degrees(),
-        at = if summary.at_stow {
-            "at stow"
-        } else {
-            "away from stow, released on the drop flag"
-        },
-    )
+    if !summary.looked() {
+        return format!(
+            "  torque off, immediately; nothing was measured{}",
+            release_tail(summary)
+        );
+    }
+    let unreadable: Vec<String> = summary
+        .unreadable()
+        .map(|(joint, cause)| format!("{joint} ({cause})"))
+        .collect();
+    let mut out = if unreadable.len() == JointId::COUNT {
+        "  torque off; not one of the nine joints could be read".to_string()
+    } else {
+        let (joint, deviation) = summary.worst_deviation();
+        format!(
+            "  torque off; {at}, furthest measured joint {joint} at {:.3} deg from stow",
+            deviation.to_degrees(),
+            at = if summary.at_stow {
+                "at stow"
+            } else {
+                "not at stow"
+            },
+        )
+    };
+    if !unreadable.is_empty() {
+        out.push_str(&format!("\n  unmeasured: {}", unreadable.join(", ")));
+    }
+    out.push_str(&release_tail(summary));
+    out
+}
+
+/// Which servos acknowledged their torque-off write — the part of a release
+/// that decides whether a hand can go on the head.
+fn release_tail(summary: &DisarmSummary) -> String {
+    let unreleased: Vec<String> = summary.unreleased().map(|j| j.to_string()).collect();
+    if unreleased.is_empty() {
+        "\n  every servo acknowledged torque off".to_string()
+    } else {
+        format!(
+            "\n  NO ACKNOWLEDGEMENT of torque off: {} — may still be holding",
+            unreleased.join(", ")
+        )
+    }
+}
+
+/// How a bench command ends once it has finished with an engaged machine.
+///
+/// A clean run and a refusal both leave the head where it is, holding: the
+/// bench's model is that a command takes hold and `off` lets go, so an operator
+/// can chain `up`, `yaw`, `stow` without the head dropping in between, and a
+/// refused command changed nothing to undo. A fault is the exception and takes
+/// the machine limp immediately — the error that comes back describes a machine
+/// nobody has to catch.
+fn settle<T, P: BusPort>(
+    engaged: Engaged<'_, '_, P>,
+    outcome: Result<T, PumpError>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
+    let Err(error) = outcome else {
+        return Ok(());
+    };
+    if !error.is_fault() {
+        return Err(error);
+    }
+    line(&format!("fault: {error}"));
+    line("releasing torque now; the head settles into near-stow");
+    report_release(engaged.disengage_now(clock, line), line);
+    Err(error)
 }
 
 /// Verify the machine, pin every joint where it stands, and enable torque.
@@ -352,7 +767,8 @@ pub fn arm<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    machine.engage(clock, line)?;
     line("armed; torque is on and the machine is holding.");
     Ok(())
 }
@@ -364,10 +780,11 @@ pub fn up<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
     line("up: to the neutral configuration");
-    session.move_to(neutral_targets(), resolved.up_duration, clock, line)?;
-    Ok(())
+    let outcome = engaged.move_to(neutral_targets(), resolved.up_durations(), clock, line);
+    settle(engaged, outcome, clock, line)
 }
 
 /// Hold where the machine already is, and watch it do so.
@@ -377,10 +794,11 @@ pub fn hold<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
     line("hold: commanding nothing, measuring every period");
-    session.hold(resolved.hold_duration, clock, line)?;
-    Ok(())
+    let outcome = engaged.hold(resolved.hold_duration, clock, line);
+    settle(engaged, outcome, clock, line)
 }
 
 /// Move the head to the stow configuration, leaving torque on.
@@ -390,23 +808,23 @@ pub fn stow<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
     line("stow: to the stow configuration; torque stays on until `off`");
-    session.move_to(stow_pose_targets(), resolved.stow_duration, clock, line)?;
-    Ok(())
+    let outcome = engaged.move_to(stow_pose_targets(), resolved.stow_durations(), clock, line);
+    settle(engaged, outcome, clock, line)
 }
 
-/// Release torque, having verified the machine is at stow.
+/// Release torque, wherever the machine is.
 pub fn off<P: BusPort>(
     resolved: &Resolved,
     port: P,
-    force_drop: bool,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
     let mut bus = Bus::new(port, resolved.timing);
-    line("off: settling, verifying the machine is at stow, then releasing torque");
-    release(resolved, &mut bus, force_drop, clock, line)?;
+    line("off: settling, measuring against stow, then releasing torque");
+    release(resolved, &mut bus, clock, line)?;
     Ok(())
 }
 
@@ -520,14 +938,15 @@ pub fn yaw<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
     line(&format!("yaw: to {degrees:.1} deg"));
     let target = JointTargets {
         body_yaw: degrees.to_radians(),
-        ..session.targets()
+        ..engaged.targets()
     };
-    session.move_to(target, resolved.move_duration, clock, line)?;
-    Ok(())
+    let outcome = engaged.move_to(target, resolved.move_durations(), clock, line);
+    settle(engaged, outcome, clock, line)
 }
 
 /// Move the antennas to `right` and `left`, radians.
@@ -539,14 +958,15 @@ pub fn antennas<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
     line(&format!("antennas: to [{right:.3}, {left:.3}] rad"));
     let target = JointTargets {
         antennas: [right, left],
-        ..session.targets()
+        ..engaged.targets()
     };
-    session.move_to(target, resolved.move_duration, clock, line)?;
-    Ok(())
+    let outcome = engaged.move_to(target, resolved.move_durations(), clock, line);
+    settle(engaged, outcome, clock, line)
 }
 
 /// The milestone sequence, end to end: up, a dwell, the antennas, the body,
@@ -562,13 +982,33 @@ pub fn demo<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
-    let mut session = Session::arm(resolved, port, clock, line)?;
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
 
+    if let Err(error) = demo_moves(&mut engaged, resolved, clock, line) {
+        return settle(engaged, Err::<(), _>(error), clock, line);
+    }
+
+    line("demo 6/6: off");
+    engaged.disengage(clock, line)?;
+    Ok(())
+}
+
+/// The demo's five moving steps, from the lift to the stow.
+///
+/// Split out so the whole chain has one ending: a fault at any step takes the
+/// machine limp, and only a chain that ran clean reaches the orderly release.
+fn demo_moves<P: BusPort>(
+    engaged: &mut Engaged<'_, '_, P>,
+    resolved: &Resolved,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
     line("demo 1/6: up");
-    session.move_to(neutral_targets(), resolved.up_duration, clock, line)?;
+    engaged.move_to(neutral_targets(), resolved.up_durations(), clock, line)?;
 
     line("demo 2/6: holding");
-    session.hold(resolved.hold_duration, clock, line)?;
+    engaged.hold(resolved.hold_duration, clock, line)?;
 
     line("demo 3/6: antennas");
     for antennas in [
@@ -578,25 +1018,22 @@ pub fn demo<P: BusPort>(
     ] {
         let target = JointTargets {
             antennas,
-            ..session.targets()
+            ..engaged.targets()
         };
-        session.move_to(target, resolved.move_duration, clock, line)?;
+        engaged.move_to(target, resolved.move_durations(), clock, line)?;
     }
 
     line("demo 4/6: body yaw");
     for degrees in [DEMO_YAW_DEG, -DEMO_YAW_DEG, 0.0] {
         let target = JointTargets {
             body_yaw: degrees.to_radians(),
-            ..session.targets()
+            ..engaged.targets()
         };
-        session.move_to(target, resolved.move_duration, clock, line)?;
+        engaged.move_to(target, resolved.move_durations(), clock, line)?;
     }
 
     line("demo 5/6: stow");
-    session.move_to(stow_pose_targets(), resolved.stow_duration, clock, line)?;
-
-    line("demo 6/6: off");
-    session.release(false, clock, line)?;
+    engaged.move_to(stow_pose_targets(), resolved.stow_durations(), clock, line)?;
     Ok(())
 }
 
@@ -605,11 +1042,12 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use dxl_proto::frame::INST_WRITE;
+    use dxl_proto::frame::{INST_PING, INST_WRITE};
     use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
     use reachy_motion::{
         ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointVector,
-        SeqError,
+        Rail, RegId, RegValue, ReleaseForm, SeqError, SeqStep, ServoHealth, StepContext,
+        engage_gates,
     };
 
     use super::*;
@@ -695,10 +1133,11 @@ mod tests {
             }
         }
 
-        /// Nothing here armed the machine.
+        /// Nothing here took hold of the machine.
         ///
-        /// Arming is the only thing that prints the record of what it found, so
-        /// the record's absence is the absence of an arm sequence.
+        /// Engaging is the only thing that prints the record of what it found
+        /// and what it left, so the record's absence is the absence of an
+        /// engage.
         fn armed_nothing(&self) {
             assert!(
                 !self.printed.iter().any(|line| line.starts_with("found ")),
@@ -732,13 +1171,19 @@ mod tests {
     }
 
     /// Every servo's goal register, as the joint angles they encode.
+    ///
+    /// A servo whose goal register is absent is holding where it stands: its
+    /// present position is the goal it is on. This keeps the check on where
+    /// the machine ends up rather than on which registers happened to be
+    /// written.
     fn goals(cfg: &Resolved, run: &Run) -> JointVector {
         let machine = run.registers.borrow();
         let mut joints = JointVector::default();
         for (row, id) in cfg.map.ids().iter().enumerate() {
             let held = machine
                 .get(*id, reg_for(RegId::GoalPosition))
-                .expect("every servo has a goal");
+                .or_else(|| machine.get(*id, reg_for(RegId::PresentPosition)))
+                .expect("every servo has a position");
             let counts = i32::from_le_bytes(held.try_into().expect("a goal is four bytes"));
             joints.set(
                 JointId::ALL[row],
@@ -765,12 +1210,23 @@ mod tests {
     /// Two joint vectors agreeing to within the quantisation a goal register
     /// imposes — a servo holds whole counts, so a commanded angle and the angle
     /// read back from its goal register differ by up to half of one.
+    ///
+    /// An antenna is compared as the direction it points, which is how disarming
+    /// compares it: the frame it is counted in is unbounded, and which turn of
+    /// that frame an antenna ends on is a property of the arc it took rather
+    /// than of where it came to rest.
     fn within_a_count(left: &JointVector, right: &JointVector, what: &str) {
         let half_count = core::f64::consts::PI / 4096.0;
         for (joint, angle) in left.joints() {
             let other = right.get(joint).expect("nine joints");
+            let apart = match joint {
+                JointId::AntennaRight | JointId::AntennaLeft => {
+                    reachy_kin::wrap_to_pi(angle - other).abs()
+                }
+                _ => (angle - other).abs(),
+            };
             assert!(
-                (angle - other).abs() <= half_count,
+                apart <= half_count,
                 "{what}: {joint} at {angle} against {other}"
             );
         }
@@ -801,13 +1257,15 @@ mod tests {
         assert_eq!(commanded, cfg.disarm.stow_targets);
     }
 
-    /// Arming prints its record, whichever command did the arming.
+    /// Every command that takes hold prints both records: what commissioning
+    /// established, and what engaging found and left.
     ///
-    /// The record is the point of a supervised arm — where the machine was
-    /// found, what it was left holding, what had to be pulled — and it is
-    /// printed by the arming itself, so a command cannot leave it out.
+    /// They are two blocks because they happen at two different rates —
+    /// commissioning once per process, engaging once per wake — and each is
+    /// printed by the thing that did it, so a command cannot leave either out.
+    /// Once each, however many moves follow.
     #[test]
-    fn every_arming_command_prints_what_arming_found() {
+    fn every_arming_command_prints_both_records() {
         /// A command as the dispatch hands it one.
         type Command =
             fn(&Resolved, Spy, &mut dyn Clock, &mut dyn FnMut(&str)) -> Result<(), PumpError>;
@@ -826,26 +1284,23 @@ mod tests {
             });
             run.ok(name);
 
-            // The whole record goes out as one block, so it is one printed
-            // item, and it is printed exactly once however many moves follow.
-            let records: Vec<&String> = run
-                .printed
-                .iter()
-                .filter(|line| line.starts_with("found "))
-                .collect();
-            assert_eq!(records.len(), 1, "{name}: {:?}", run.printed);
-            for label in [
-                "armed",
-                "pull-in",
-                "droop",
-                "torque-on",
-                "models",
-                "supply",
-                "health",
-                "torque was",
-                "registers",
-            ] {
-                assert!(records[0].contains(label), "{name}: no {label} line");
+            let block = |prefix: &str| -> String {
+                let found: Vec<&String> = run
+                    .printed
+                    .iter()
+                    .filter(|line| line.starts_with(prefix))
+                    .collect();
+                assert_eq!(found.len(), 1, "{name}/{prefix}: {:?}", run.printed);
+                found[0].clone()
+            };
+
+            let engaged = block("found ");
+            for label in ["armed", "pull-in", "torque-on"] {
+                assert!(engaged.contains(label), "{name}: no {label} line");
+            }
+            let commissioned = block("models ");
+            for label in ["supply", "health", "registers"] {
+                assert!(commissioned.contains(label), "{name}: no {label} line");
             }
         }
     }
@@ -942,6 +1397,165 @@ mod tests {
         }
     }
 
+    /// A faulted move ends with the machine limp.
+    ///
+    /// The one assertion this whole shape exists for. A fault means the control
+    /// loop has stopped believing what it is told about the machine, and a head
+    /// left held up by motors under a loop nobody is driving is the single state
+    /// this platform must never be parked in — so torque comes off, from
+    /// wherever the head is, before the command exits with the fault.
+    #[test]
+    fn a_faulted_move_ends_with_torque_off() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        machine.stalled.push(cfg.map.ids()[2]);
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+
+        let error = run.err("a servo that takes its goals and does not move");
+        assert!(matches!(error, PumpError::Fault(_)), "{error}");
+        assert_eq!(
+            torque(&cfg, &run),
+            vec![0; JointId::COUNT],
+            "the fault left a servo holding: {:?}",
+            run.printed
+        );
+
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("releasing torque now")),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("torque off, immediately")),
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// A command the tick refuses is not a fault: nothing was written, the
+    /// machine is standing where the last accepted command put it, and it goes
+    /// on holding.
+    ///
+    /// The dividing line the fault release turns on, asserted from the other
+    /// side so that widening it into "any error releases" gets caught here.
+    #[test]
+    fn a_refused_command_leaves_the_machine_holding() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &neutral_legs());
+        let run = run(machine, |port, clock, line| {
+            yaw(&cfg, port, 90.0, clock, line)
+        });
+
+        let error = run.err("ninety degrees is past the cap");
+        assert!(matches!(error, PumpError::Rejected(_)), "{error}");
+        assert!(!error.is_fault());
+        assert!(
+            !error.is_gate_refusal(),
+            "a refused command is not one of the two torque-on gates"
+        );
+        assert_eq!(torque(&cfg, &run), vec![1; JointId::COUNT]);
+        assert!(
+            !run.printed.iter().any(|line| line.contains("torque off")),
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// Both torque-on gates classify as gate refusals, they are the only errors
+    /// that do, and none of them is also a fault.
+    ///
+    /// What an unattended caller turns on: a gate refusal wrote nothing, so the
+    /// machine is still limp where it was and the next request may simply ask
+    /// again, while everything else out of an engage leaves something to bring
+    /// back to the minimum risk condition. Built from `engage_gates` itself
+    /// rather than from hand-written variants, so a gate that changed shape is
+    /// caught here.
+    #[test]
+    fn the_two_torque_on_gates_are_the_only_gate_refusals() {
+        let cfg = resolved();
+        let healthy = Rail {
+            voltages: [12.0; JointId::COUNT],
+            health: [ServoHealth::default(); JointId::COUNT],
+        };
+        engage_gates(&cfg.arm, &healthy).expect("a healthy rail passes both gates");
+
+        let mut sagging = healthy;
+        sagging.voltages[4] = cfg.arm.min_arm_voltage - 0.5;
+        let mut latched = healthy;
+        latched.health[2].bits = 0x20;
+
+        for rail in [sagging, latched] {
+            let refused = engage_gates(&cfg.arm, &rail).expect_err("the gate refuses");
+            let error = PumpError::from(refused);
+            assert!(error.is_gate_refusal(), "{error}");
+            assert!(
+                !error.is_fault(),
+                "a gate refusal wrote nothing, so the fault path would de-torque and park a \
+                 machine that was never torqued: {error}"
+            );
+        }
+
+        // Two `Sequence` errors that are not gates, because without them
+        // relaxing the predicate to `Sequence(_)` passes: an engage that lost a
+        // servo mid-flight would then read as "nothing was written and the
+        // machine is limp where it stands", on a machine that may be part way
+        // through taking torque.
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        for other in [
+            PumpError::Sequence(SeqError::NoAnswer { context }),
+            PumpError::Sequence(SeqError::VerifyMismatch {
+                context,
+                expected: RegValue::U8(1),
+                read_back: RegValue::U8(0),
+            }),
+            PumpError::TorqueOffUnacked { id: 13 },
+            PumpError::Runaway { budget: 10 },
+            PumpError::Rate {
+                tick_hz: 0,
+                health_poll_hz: 0,
+            },
+        ] {
+            assert!(!other.is_gate_refusal(), "{other}");
+        }
+    }
+
+    /// An engage that dies after the first enable takes the machine limp on its
+    /// way out.
+    ///
+    /// Half-enabled is the worst state the torque-on path can reach: some
+    /// servos holding, no loop driving them, and a caller with an error and no
+    /// handle to release through. The releasing is the sequence's own to do.
+    #[test]
+    fn an_engage_that_fails_after_an_enable_releases_torque() {
+        let cfg = resolved();
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        // The last enable acknowledged and dropped, which is a read-back
+        // mismatch from the host: the eight before it took torque.
+        machine
+            .ignored
+            .push((cfg.map.ids()[8], reg_for(RegId::TorqueEnable).addr));
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+
+        run.err("an enable that does not land stops the engage");
+        assert_eq!(torque(&cfg, &run), vec![0; JointId::COUNT]);
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("releasing immediately")),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            run.addressed.borrow().is_empty(),
+            "nothing was ever commanded: {:?}",
+            run.addressed.borrow()
+        );
+    }
+
     /// A machine chasing its goals reports the lag it ran, and is not faulted
     /// for it.
     ///
@@ -987,6 +1601,107 @@ mod tests {
         assert_eq!(torque(&cfg, &run), vec![1; JointId::COUNT]);
     }
 
+    /// The line an operator reads after a release says where the machine was,
+    /// which joints could not be measured, and — the part that decides whether
+    /// a hand can go on the head — which servos never acknowledged torque off.
+    #[test]
+    fn the_release_report_names_the_servos_that_may_still_be_holding() {
+        let clean = DisarmSummary {
+            form: ReleaseForm::Orderly,
+            present: JointVector::default(),
+            deviation: [0.0; JointId::COUNT],
+            unmeasured: [None; JointId::COUNT],
+            released: [true; JointId::COUNT],
+            at_stow: true,
+        };
+        let printed = disarm_line(&clean);
+        assert!(printed.contains("at stow"), "{printed}");
+        assert!(
+            printed.contains("every servo acknowledged torque off"),
+            "{printed}"
+        );
+        assert!(!printed.contains("unmeasured"), "{printed}");
+
+        let mut ragged = clean;
+        ragged.at_stow = false;
+        ragged.unmeasured[7] = Some(SeqError::Refused {
+            context: StepContext::reg(SeqStep::VerifyAtStow, 41, RegId::PresentPosition),
+            code: 0x20,
+        });
+        ragged.released[4] = false;
+        ragged.released[8] = false;
+        let printed = disarm_line(&ragged);
+        assert!(printed.contains("not at stow"), "{printed}");
+        assert!(printed.contains("unmeasured: right antenna"), "{printed}");
+        // With the cause, not just the name: which of the several ways a read
+        // can fail this was is what decides the operator's next move.
+        assert!(printed.contains("status code 0x20"), "{printed}");
+        assert!(printed.contains("NO ACKNOWLEDGEMENT"), "{printed}");
+        assert!(printed.contains("leg 4"), "{printed}");
+        assert!(printed.contains("left antenna"), "{printed}");
+    }
+
+    /// Nine failed reads during an orderly release is not the fault release,
+    /// and does not print as one.
+    ///
+    /// A dead adapter or an unpowered rail during `off` leaves every joint
+    /// unread, which is exactly what the fault release's summary also carries.
+    /// Reading them as the same thing would tell an operator the machine was
+    /// deliberately let go without a look, when in fact the bus stopped
+    /// answering and the release writes may have gone nowhere either.
+    #[test]
+    fn an_orderly_release_that_could_read_nothing_says_so() {
+        let context = StepContext::reg(SeqStep::VerifyAtStow, 41, RegId::PresentPosition);
+        let blind = DisarmSummary {
+            form: ReleaseForm::Orderly,
+            present: JointVector::default(),
+            deviation: [0.0; JointId::COUNT],
+            unmeasured: [Some(SeqError::NoAnswer { context }); JointId::COUNT],
+            released: [true; JointId::COUNT],
+            at_stow: false,
+        };
+        let printed = disarm_line(&blind);
+        assert!(
+            !printed.contains("immediately"),
+            "this release looked and got nothing: {printed}"
+        );
+        assert!(
+            printed.contains("not one of the nine joints could be read"),
+            "{printed}"
+        );
+        assert!(printed.contains("unmeasured: "), "{printed}");
+        assert!(printed.contains("no answer"), "{printed}");
+    }
+
+    /// The fault release reads as what it is: a release that deliberately did
+    /// not look, rather than one whose nine reads all failed.
+    #[test]
+    fn the_fault_release_report_says_nothing_was_measured() {
+        let summary = DisarmSummary {
+            form: ReleaseForm::Immediate,
+            present: JointVector::default(),
+            deviation: [0.0; JointId::COUNT],
+            unmeasured: [None; JointId::COUNT],
+            released: [true; JointId::COUNT],
+            at_stow: false,
+        };
+        let printed = disarm_line(&summary);
+        assert!(printed.contains("torque off, immediately"), "{printed}");
+        assert!(printed.contains("nothing was measured"), "{printed}");
+        assert!(
+            !printed.contains("unmeasured:"),
+            "nine joint names would say the same thing worse: {printed}"
+        );
+        assert!(
+            !printed.contains("not at stow"),
+            "nothing here is a claim about where the head is: {printed}"
+        );
+        assert!(
+            printed.contains("every servo acknowledged torque off"),
+            "{printed}"
+        );
+    }
+
     /// `off` releases torque on a machine at stow, and never arms to do it: the
     /// only writes it makes are the releases themselves.
     #[test]
@@ -1005,9 +1720,7 @@ mod tests {
             machine.set(*id, reg_for(RegId::PresentPosition), &counts.to_le_bytes());
             machine.set(*id, reg_for(RegId::TorqueEnable), &[1]);
         }
-        let run = run(machine, |port, clock, line| {
-            off(&cfg, port, false, clock, line)
-        });
+        let run = run(machine, |port, clock, line| off(&cfg, port, clock, line));
         run.ok("a machine at stow releases");
 
         assert_eq!(torque(&cfg, &run), vec![0; JointId::COUNT]);
@@ -1056,9 +1769,7 @@ mod tests {
             machine.set(*id, reg_for(RegId::TorqueEnable), &[1]);
         }
 
-        let run = run(machine, |port, clock, line| {
-            off(&cfg, port, false, clock, line)
-        });
+        let run = run(machine, |port, clock, line| off(&cfg, port, clock, line));
         run.ok("a machine at its fold is at stow whichever turn it reads");
         assert_eq!(torque(&cfg, &run), vec![0; JointId::COUNT]);
         assert!(
@@ -1161,50 +1872,37 @@ mod tests {
         );
     }
 
-    /// A machine anywhere but stow is refused, with nothing released — and the
-    /// operator's explicit acceptance of a falling head is what changes that.
+    /// A machine anywhere but stow releases anyway, and says where it was.
+    /// `off` arms nothing and commands nothing on the way.
     #[test]
-    fn off_away_from_stow_is_refused_unless_the_head_may_fall() {
+    fn off_away_from_stow_still_releases() {
         let cfg = resolved();
-        let armed = || {
-            let mut machine = machine_at(&datumed_config(), &neutral_legs());
-            for id in cfg.map.ids() {
-                machine.set(id, reg_for(RegId::TorqueEnable), &[1]);
-            }
-            machine
-        };
+        let mut machine = machine_at(&datumed_config(), &neutral_legs());
+        for id in cfg.map.ids() {
+            machine.set(id, reg_for(RegId::TorqueEnable), &[1]);
+        }
 
-        let refused = run(armed(), |port, clock, line| {
-            off(&cfg, port, false, clock, line)
-        });
-        let error = refused.err("the head is not at stow");
+        let released = run(machine, |port, clock, line| off(&cfg, port, clock, line));
+        released.ok("nothing gates a release");
+        assert_eq!(torque(&cfg, &released), vec![0; JointId::COUNT]);
         assert!(
-            matches!(error, PumpError::Sequence(SeqError::NotAtStow { .. })),
-            "{error}"
-        );
-        assert_eq!(
-            torque(&cfg, &refused),
-            vec![1; JointId::COUNT],
-            "a refused release releases nothing"
-        );
-        refused.armed_nothing();
-        refused.commanded_nothing(&cfg);
-
-        let dropped = run(armed(), |port, clock, line| {
-            off(&cfg, port, true, clock, line)
-        });
-        dropped.ok("the drop flag accepts the fall");
-        assert_eq!(torque(&cfg, &dropped), vec![0; JointId::COUNT]);
-        assert!(
-            dropped
+            released
                 .printed
                 .iter()
-                .any(|line| line.contains("away from stow")),
+                .any(|line| line.contains("not at stow")),
             "{:?}",
-            dropped.printed
+            released.printed
         );
-        dropped.armed_nothing();
-        dropped.commanded_nothing(&cfg);
+        assert!(
+            released
+                .printed
+                .iter()
+                .any(|line| line.contains("every servo acknowledged torque off")),
+            "{:?}",
+            released.printed
+        );
+        released.armed_nothing();
+        released.commanded_nothing(&cfg);
     }
 
     /// `hold` commands nothing for the configured length of time, and measures
@@ -1288,9 +1986,10 @@ mod tests {
         let seen = events.clone();
         let measured = summary.clone();
         let run = run(machine, move |port, clock, line| {
-            let mut session = Session::arm(&cfg, port, clock, line)?;
+            let mut machine = commission(&cfg, port, clock, line)?;
+            let mut engaged = machine.engage(clock, line)?;
             line(ARMED);
-            let outcome = session.hold_events(cfg.hold_duration, clock, &mut |event| {
+            let outcome = engaged.hold_events(cfg.hold_duration, clock, &mut |event| {
                 seen.borrow_mut().push(event);
             })?;
             *measured.borrow_mut() = Some(outcome);
@@ -1330,6 +2029,83 @@ mod tests {
         assert_eq!(
             summary.ticks,
             u64::from(cfg.tick_hz) * cfg.hold_duration.as_secs() + 1
+        );
+    }
+
+    /// `move_retargeting` hands the caller the move in flight: answering with
+    /// another target turns the head around and the call returns at that one.
+    ///
+    /// The entry point a program executing a timeline it does not own needs.
+    /// The pump's own tests pin the periods; what this pins is the wrapper —
+    /// that the pair the caller answers with really becomes the command, both
+    /// halves of it, and that nothing about the reply is dropped on the way.
+    #[test]
+    fn a_move_the_caller_replaces_returns_at_the_replacement() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let asked = Rc::new(RefCell::new(0usize));
+        let asks = asked.clone();
+        let ran = Rc::new(RefCell::new(0u64));
+        let counted = ran.clone();
+        let run = run(machine, move |port, clock, line| {
+            let mut machine = commission(&cfg, port, clock, line)?;
+            let mut engaged = machine.engage(clock, line)?;
+            let summary = engaged.move_retargeting(
+                neutral_targets(),
+                cfg.up_durations(),
+                clock,
+                line,
+                &mut || {
+                    let mut asked = asks.borrow_mut();
+                    *asked += 1;
+                    (*asked == 20).then(|| (stow_pose_targets(), cfg.stow_durations()))
+                },
+            )?;
+            *counted.borrow_mut() = summary.ticks;
+            Ok(())
+        });
+        run.ok("the replacement carries the head back down");
+
+        assert!(
+            *asked.borrow() > 20,
+            "the caller is asked every period, not once: {}",
+            asked.borrow()
+        );
+        // The durations half of the caller's answer is what the replacement ran
+        // on. Dropping it — keeping the `durations` still in scope from the
+        // parameter list — reaches the same pose and completes after the same
+        // splice, so nothing else in this test would notice; what it changes is
+        // the fold's pace, and a fold carried faster than the clock its step
+        // bounds were sized against faults partway and drops the head.
+        let cfg = resolved();
+        let periods = |span: Duration| {
+            let period = Duration::from_secs(1) / cfg.tick_hz;
+            u64::try_from(span.as_nanos() / period.as_nanos()).expect("a small count")
+        };
+        let (turn_at, ticks) = (20, *ran.borrow());
+        assert!(
+            ticks >= turn_at + periods(cfg.stow_duration)
+                && ticks < turn_at + periods(cfg.up_duration),
+            "the fold ran on the fold's clock: {ticks} periods, turned at {turn_at}, fold {}, \
+             raise {}",
+            periods(cfg.stow_duration),
+            periods(cfg.up_duration),
+        );
+        within_a_count(
+            &goals(&resolved(), &run),
+            &JointVector {
+                body_yaw: 0.0,
+                legs: stow_legs(),
+                antennas: STOW_ANTENNAS,
+            },
+            "the machine came back to its fold",
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("replacing the move that was running")),
+            "the splice is narrated: {:?}",
+            run.printed
         );
     }
 
@@ -1433,13 +2209,13 @@ mod tests {
         assert!(frames.len() > 1, "{frames:?}");
     }
 
-    /// An antenna direction past the half turn is an ordinary command: it
-    /// resolves to the representative nearest the frame the machine is in and
-    /// sweeps the short way there. Four radians, from a machine found at zero,
-    /// is 2.283 rad of travel the other way — not four the long way, and not a
-    /// refusal.
+    /// An antenna direction past the half turn is an ordinary command, and the
+    /// bench command inherits the machine's one arc policy: four radians, from a
+    /// right antenna found at zero, sweeps four radians up over the head rather
+    /// than 2.283 the short way down through its own outboard point. The short
+    /// way is the maximal-interference arc, whoever asked for it.
     #[test]
-    fn an_antenna_direction_past_the_half_turn_takes_the_short_way() {
+    fn a_bench_antenna_command_takes_the_inboard_arc() {
         let cfg = resolved();
         let machine = machine_at(&datumed_config(), &neutral_legs());
         let run = run(machine, |port, clock, line| {
@@ -1450,15 +2226,11 @@ mod tests {
         let series = run.goal_series(&cfg, JointId::AntennaRight);
         assert!(!series.is_empty(), "the antenna was commanded");
         assert!(
-            series.iter().all(|goal| *goal <= 1e-9),
-            "the sweep went down through the near side: {series:?}"
+            series.iter().all(|goal| *goal >= -1e-9),
+            "the sweep went down through the outboard side: {series:?}"
         );
         let landed = *series.last().expect("a last goal");
-        let short_way = 4.0 - core::f64::consts::TAU;
-        assert!(
-            (landed - short_way).abs() < 0.01,
-            "landed at {landed}, asked for {short_way}"
-        );
+        assert!((landed - 4.0).abs() < 0.01, "landed at {landed}");
     }
 
     /// A machine as the vendor provisions it: every servo in single-turn
@@ -1593,9 +2365,9 @@ mod tests {
         assert_eq!(modes(&cfg, &run), vec![3; JointId::COUNT]);
     }
 
-    /// Every command that moves re-drives the whole arm sequence first, so a
-    /// machine that cannot be armed moves nothing — and says so as an arming
-    /// refusal rather than as a failed move.
+    /// Every command that moves commissions first, so a machine that cannot be
+    /// commissioned moves nothing — and says so as a commissioning refusal
+    /// rather than as a failed move.
     #[test]
     fn a_machine_that_will_not_arm_moves_nothing() {
         let cfg = resolved();
@@ -1664,5 +2436,502 @@ mod tests {
                 "the right antenna never reached {angle} rad"
             );
         }
+    }
+
+    /// A fixture and the two handles the typestate tests watch it through.
+    ///
+    /// `run` is about what a whole command left behind; these are about what
+    /// happens *between* one engage and the next, so they drive the typestate
+    /// directly and read the wire as they go.
+    struct Rig {
+        port: Spy,
+        registers: Rc<RefCell<FakeMachine>>,
+        log: Rc<RefCell<Vec<(u8, u8)>>>,
+    }
+
+    fn rig(machine: FakeMachine) -> Rig {
+        let port = Spy::new(machine);
+        let registers = port.machine();
+        let log = port.log();
+        Rig {
+            port,
+            registers,
+            log,
+        }
+    }
+
+    /// What the nine torque flags hold, in bus order — the one reading that
+    /// says whether a hand can go on the head.
+    fn torque_bits(cfg: &Resolved, registers: &Rc<RefCell<FakeMachine>>) -> Vec<u8> {
+        cfg.map
+            .ids()
+            .iter()
+            .map(|id| {
+                registers
+                    .borrow()
+                    .get(*id, reg_for(RegId::TorqueEnable))
+                    .map_or(0, |bytes| bytes[0])
+            })
+            .collect()
+    }
+
+    /// Commissioning is paid once and every engage after it is free of the
+    /// ceremony.
+    ///
+    /// The whole point of the split: a process that raises the head, puts it
+    /// down, and raises it again pings nine servos once, and the two lifts
+    /// either side of the release cost nothing but the pins, the enables and
+    /// the read-back.
+    #[test]
+    fn one_commissioning_serves_every_engage_over_the_same_bus() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let log = rig.log;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+
+        for pass in 0..2 {
+            let mut engaged = machine
+                .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+                .expect("the fixture engages");
+            let target = if pass == 0 {
+                neutral_targets()
+            } else {
+                stow_pose_targets()
+            };
+            engaged
+                .move_to(target, cfg.move_durations(), &mut clock, &mut |line| {
+                    printed.push(line.to_string());
+                })
+                .expect("the move runs");
+            engaged
+                .disengage(&mut clock, &mut |line| printed.push(line.to_string()))
+                .expect("the release runs");
+        }
+
+        let pings = log
+            .borrow()
+            .iter()
+            .filter(|(_, instruction)| *instruction == INST_PING)
+            .count();
+        assert_eq!(
+            pings,
+            JointId::COUNT,
+            "the roster is pinged once, by the one commissioning"
+        );
+        let count = |prefix: &str| {
+            printed
+                .iter()
+                .filter(|line| line.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(count("models "), 1, "{printed:?}");
+        assert_eq!(count("found "), 2, "{printed:?}");
+    }
+
+    /// A head somebody turned while the machine lay limp is where the next
+    /// engage pins it.
+    ///
+    /// The resting watch's whole job. Nothing about the pose is refused — the
+    /// machine is where it is — and the poll is what makes the difference
+    /// between planning from that and planning from a reading taken before a
+    /// hand touched it.
+    #[test]
+    fn a_head_turned_while_resting_is_where_the_next_engage_pins_it() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        assert!(machine.posture().present.body_yaw.abs() < 1e-9);
+
+        let turned = 12.0_f64.to_radians();
+        let counts = cfg.map.goal_counts(0, turned).expect("a yaw angle places");
+        registers.borrow_mut().set(
+            cfg.map.ids()[0],
+            reg_for(RegId::PresentPosition),
+            &counts.to_le_bytes(),
+        );
+
+        let posture = machine
+            .poll(PollCadence::Positions, &mut clock, &mut |line| {
+                printed.push(line.to_string());
+            })
+            .expect("the sweep reads");
+        let half_count = core::f64::consts::PI / 4096.0;
+        assert!(
+            (posture.present.body_yaw - turned).abs() <= half_count,
+            "the sweep found the body at {} deg",
+            posture.present.body_yaw.to_degrees()
+        );
+
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("a turned body is a measurement, not a refusal");
+        assert!(
+            (engaged.targets().body_yaw - turned).abs() <= half_count,
+            "the first move would start from {} deg",
+            engaged.targets().body_yaw.to_degrees()
+        );
+    }
+
+    /// An engage after a release that measured nothing measures first.
+    ///
+    /// The pin sweep writes the posture's angles into nine goal registers
+    /// *before* the enables, and it exists to stop a firmware that keeps a
+    /// stale goal from slamming the joint at torque-on. Pinning at a pose the
+    /// head has since fallen out of is that slam, delivered by the very sweep
+    /// meant to prevent it — and the release that leaves the posture stale is
+    /// the fault release, which is the one that leaves the head high up.
+    #[test]
+    fn an_engage_after_a_release_that_measured_nothing_looks_first() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let log = rig.log;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        assert!(machine.fresh(), "commissioning takes its own sweep");
+
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages");
+        engaged
+            .disengage_now(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("nothing gates a release");
+        assert!(
+            !machine.fresh(),
+            "a release that looked at nothing knows nothing about where the head is"
+        );
+
+        // The head settles somewhere else while limp, which is what the fault
+        // release leaves it doing.
+        let fallen = 12.0_f64.to_radians();
+        let counts = cfg.map.goal_counts(0, fallen).expect("a yaw angle places");
+        registers.borrow_mut().set(
+            cfg.map.ids()[0],
+            reg_for(RegId::PresentPosition),
+            &counts.to_le_bytes(),
+        );
+
+        let before = log.borrow().len();
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages again");
+        let half_count = core::f64::consts::PI / 4096.0;
+        assert!(
+            (engaged.targets().body_yaw - fallen).abs() <= half_count,
+            "the engage pinned {} deg, where the head was before the release",
+            engaged.targets().body_yaw.to_degrees(),
+        );
+        // Nine reads for the sweep, then the engage's own twenty-seven — of
+        // which the eighteen verified writes are two frames each on the wire.
+        let engage_frames = 5 * JointId::COUNT;
+        assert_eq!(
+            log.borrow().len() - before,
+            JointId::COUNT + engage_frames,
+            "a sweep of nine reads, then the engage"
+        );
+
+        // And the orderly release costs the next engage nothing: it measured
+        // all nine on its way out, so there is nothing to re-read.
+        engaged
+            .disengage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("nothing gates a release");
+        assert!(machine.fresh(), "the orderly release measured all nine");
+        let before = log.borrow().len();
+        machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages again");
+        assert_eq!(
+            log.borrow().len() - before,
+            engage_frames,
+            "the engage alone, with no sweep in front of it"
+        );
+    }
+
+    /// Nothing between the enable writes and the caller owning an `Engaged`
+    /// may return without taking the machine back to limp.
+    ///
+    /// Configuration refuses a zero control rate, so this is unreachable by any
+    /// route through the binary — which is the point: it is the only fallible
+    /// step in that window, and a machine left torqued with no loop driving it
+    /// is the state the doctrine names as this platform's only pinch hazard.
+    /// The next fallible step added there should find this test already
+    /// standing.
+    #[test]
+    fn an_engage_that_cannot_start_its_loop_releases_torque() {
+        let mut cfg = resolved();
+        cfg.tick_hz = 0;
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        let error = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .err()
+            .expect("a loop at zero hertz does not start");
+
+        assert!(
+            matches!(error, PumpError::Rate { tick_hz: 0, .. }),
+            "{error}"
+        );
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("releasing immediately")),
+            "{printed:?}"
+        );
+        assert_eq!(
+            torque_bits(&cfg, &registers),
+            vec![0; JointId::COUNT],
+            "nine servos were left holding with no loop driving them: {printed:?}"
+        );
+    }
+
+    /// The fault release waits for nothing and measures nothing: it is the
+    /// orderly release minus the settle and minus the nine reads, and those
+    /// nine transactions are exactly the difference.
+    #[test]
+    fn the_fault_release_is_the_orderly_one_without_the_looking() {
+        let cfg = resolved();
+
+        let mut transactions = Vec::new();
+        let mut dwells = Vec::new();
+        for immediate in [false, true] {
+            let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+            let log = rig.log;
+            let mut clock = TestClock::default();
+            let mut printed: Vec<String> = Vec::new();
+            let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+                printed.push(line.to_string());
+            })
+            .expect("the fixture commissions");
+            let engaged = machine
+                .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+                .expect("the fixture engages");
+
+            let before = log.borrow().len();
+            let waits = clock.waits.len();
+            let release = &mut |line: &str| printed.push(line.to_string());
+            let summary = if immediate {
+                engaged.disengage_now(&mut clock, release)
+            } else {
+                engaged.disengage(&mut clock, release)
+            }
+            .expect("nothing gates a release");
+
+            assert!(summary.all_released(), "every servo came off");
+            transactions.push(log.borrow().len() - before);
+            dwells.push(clock.waits.len() - waits);
+        }
+
+        assert_eq!(
+            transactions[1] + JointId::COUNT,
+            transactions[0],
+            "the difference is the nine positions the orderly form reads: {transactions:?}"
+        );
+        assert_eq!(dwells, vec![1, 0], "a fault waits out no settle");
+    }
+
+    /// An orderly release that does not finish takes the immediate one.
+    ///
+    /// The doctrine's MRM-A → MRM-B fall-through, and the state it exists for:
+    /// a walk that stopped part way through has left some servos holding with
+    /// no sequence driving them. The error the caller gets back is the one that
+    /// made the release necessary; what it must never get back is that error
+    /// over a machine still holding the head up.
+    #[test]
+    fn an_orderly_release_that_stops_short_falls_through_to_the_immediate_one() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let log = rig.log;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        // Torque on, and the engagement let go without a release: the machine an
+        // orderly release that stopped part way through leaves behind.
+        {
+            machine
+                .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+                .expect("the fixture engages");
+        }
+        assert_eq!(torque_bits(&cfg, &registers), vec![1; JointId::COUNT]);
+
+        let before = log.borrow().len();
+        let stopped = PumpError::Runaway { budget: 10_000 };
+        let outcome =
+            fall_through_to_immediate(&mut machine, Err(stopped), &mut clock, &mut |line| {
+                printed.push(line.to_string())
+            });
+
+        assert!(
+            matches!(
+                outcome.expect_err("the failure that made the release necessary"),
+                PumpError::Runaway { .. }
+            ),
+            "the original error comes back, not the release's"
+        );
+        assert_eq!(
+            torque_bits(&cfg, &registers),
+            vec![0; JointId::COUNT],
+            "{printed:?}"
+        );
+        assert_eq!(
+            log.borrow().len() - before,
+            2 * JointId::COUNT,
+            "nine verified torque-off writes and nothing else"
+        );
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("the orderly release did not finish")),
+            "{printed:?}"
+        );
+        assert!(
+            clock.waits.is_empty(),
+            "the fall-through waits out no settle"
+        );
+    }
+
+    /// An unacknowledged torque-off is not a fault, and does not buy a second
+    /// walk.
+    ///
+    /// The other side of the same rule. Every release was written; a servo that
+    /// did not answer its own is what the report says, and nine more writes
+    /// would say no more. Widening the fault classifier to include it would
+    /// double every ragged release silently.
+    #[test]
+    fn an_unacknowledged_release_is_not_walked_a_second_time() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let log = rig.log;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages");
+
+        // The third servo's torque-off read-back answers a byte too wide, so
+        // its release goes unacknowledged while all nine are still written.
+        registers
+            .borrow_mut()
+            .verbose
+            .push((cfg.map.ids()[2], reg_for(RegId::TorqueEnable).addr));
+        let before = log.borrow().len();
+        let outcome = engaged.disengage(&mut clock, &mut |line| printed.push(line.to_string()));
+
+        let error = outcome.expect_err("an unacknowledged release is reported");
+        assert!(
+            matches!(error, PumpError::TorqueOffUnacked { id } if id == cfg.map.ids()[2]),
+            "{error}"
+        );
+        assert!(
+            !error.is_fault(),
+            "the release happened; it was not aborted"
+        );
+        assert!(
+            !printed
+                .iter()
+                .any(|line| line.contains("the orderly release did not finish")),
+            "no second walk was announced: {printed:?}"
+        );
+        // The orderly walk and nothing after it: nine reads, then nine verified
+        // writes, of which the third's read-back is the wide reply.
+        assert_eq!(
+            log.borrow().len() - before,
+            3 * JointId::COUNT,
+            "{printed:?}"
+        );
+        assert_eq!(torque_bits(&cfg, &registers), vec![0; JointId::COUNT]);
+    }
+
+    /// A wire failure the sequencer has no word for does not end the release
+    /// walk. The driver is a layer too, and the doctrine binds it: a reply of
+    /// the wrong width from the third servo would otherwise abort the run and
+    /// leave the six after it holding the head up — the exact state a fault
+    /// release exists to get out of.
+    #[test]
+    fn a_reply_of_the_wrong_width_mid_release_does_not_stop_the_walk() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages");
+
+        // From here on the read-back of this servo's torque-off write answers a
+        // byte too wide: a frame that passed its own checksum and is nobody's
+        // answer. The fault this stands in for arrives mid-run, so it is put on
+        // the wire mid-run.
+        registers
+            .borrow_mut()
+            .verbose
+            .push((cfg.map.ids()[2], reg_for(RegId::TorqueEnable).addr));
+        let outcome = engaged.disengage_now(&mut clock, &mut |line| printed.push(line.to_string()));
+
+        assert_eq!(
+            torque_bits(&cfg, &registers),
+            vec![0; JointId::COUNT],
+            "the walk stopped at the servo that answered badly: {printed:?}"
+        );
+
+        // The servo is named rather than silently forgiven: its write went out,
+        // nothing came back to say it landed, and that is what the run reports.
+        let error = outcome.expect_err("an unacknowledged release is reported");
+        assert!(
+            matches!(error, PumpError::TorqueOffUnacked { id } if id == cfg.map.ids()[2]),
+            "{error}"
+        );
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("wire trouble mid-release, carried on")),
+            "{printed:?}"
+        );
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("NO ACKNOWLEDGEMENT of torque off")),
+            "{printed:?}"
+        );
     }
 }

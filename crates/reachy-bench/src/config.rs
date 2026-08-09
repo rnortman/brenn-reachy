@@ -18,10 +18,13 @@
 //! with one carrying no provenance line, resolves to a typed refusal and no
 //! command that moves anything runs.
 //!
-//! That gate and the self-test record's gate are one function here,
-//! [`arm_gates`], rather than a step in a binary: the bench is not the only
-//! host that commands this machine, and a second host has to run the gate
-//! itself and not a copy of it.
+//! That check lives in [`resolve_for_commanding`] rather than in a binary: the bench is not
+//! the only host that commands this machine, and a second host has to resolve
+//! the configuration itself and not a copy of it. It is the only thing standing
+//! before a command that moves something, and it is calibration rather than a
+//! safety gate — a datum nobody has checked makes every converted angle a
+//! guess, so there is nothing to command *with*, not something to protect the
+//! machine *from*.
 //!
 //! ## Two fences, one region
 //!
@@ -43,14 +46,15 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::selftest::SelftestRecord;
 use reachy_bus::{BusTiming, DEFAULT_BAUD, MapError, ServoMap};
 use reachy_kin::{EnvelopeConfig, FkOptions, HeadGeometry, IkError, baked};
 use reachy_motion::{
     ArmConfig, DisarmConfig, EXPECTED_OPERATING_MODES, Gains, GroupGains, JointId, JointStep,
-    MotionConfig, ProfileConfig, ProvisionExpect, ProvisionTable, RegId, RegValue,
+    MotionConfig, MoveDurations, ProfileConfig, ProvisionExpect, ProvisionTable, RegId, RegValue,
     TrackingFaultConfig, VENDOR_HOMING_OFFSETS, stow_targets,
 };
+#[cfg(test)]
+use reachy_motion::{FLOOR_TICK_HZ, HEAD_GROUP_FLOOR_S, duration_floor_s};
 
 /// One encoder count, radians — the finest distinction a position register can
 /// make, and the slack the two per-leg fences are allowed to differ by.
@@ -372,13 +376,23 @@ pub struct MotionSection {
     /// Consecutive ticks without a position read before the read-loss fault.
     /// Absent means one second at the tick rate.
     pub read_loss_ticks: Option<u32>,
-    /// How long the stow move takes, seconds.
+    /// How long the stow move takes, seconds. The head group: the head pose and
+    /// the body yaw, which the legs follow.
     pub stow_duration_s: f64,
-    /// How long the move from stow to the neutral pose takes, seconds.
+    /// How long the move from stow to the neutral pose takes, seconds. The head
+    /// group.
     pub up_duration_s: f64,
     /// How long a joint-space move — a yaw or an antenna command — takes,
-    /// seconds.
+    /// seconds. The head group.
     pub move_duration_s: f64,
+    /// How long the antennas take on any move, seconds. Absent means whatever
+    /// the head group takes.
+    ///
+    /// Its own knob because the antennas are mechanically independent of the
+    /// head and sweep further than it does: a lift tuned to be quick has no
+    /// business being floored by an antenna arc, and an arc long enough to stay
+    /// inside the per-tick step bound has no business slowing the lift.
+    pub antenna_duration_s: Option<f64>,
     /// How long a `hold` command watches the machine before returning, seconds.
     pub hold_duration_s: f64,
 }
@@ -408,6 +422,9 @@ impl Default for MotionSection {
             // pass through no near-singular configuration, so the length is a
             // matter of what is comfortable to watch rather than of mechanics.
             move_duration_s: 3.0,
+            // The head group's clock, which is what one clock for everything
+            // amounts to.
+            antenna_duration_s: None,
             // Long enough that a tracking fault or a health latch has periods
             // to appear in, short enough that a supervised operator is not left
             // waiting on a command that does nothing by design.
@@ -431,12 +448,6 @@ pub struct ArmSection {
     /// How long to wait for the rail before failing, seconds.
     #[serde(default = "default_voltage_budget_s")]
     pub voltage_budget_s: f64,
-    /// The largest distance a pin may pull a joint, degrees.
-    #[serde(default = "default_max_pin_pull_in_deg")]
-    pub max_pin_pull_in_deg: f64,
-    /// How far a joint may be from where the arrival check expects it, degrees.
-    #[serde(default = "default_recheck_tolerance_deg")]
-    pub recheck_tolerance_deg: f64,
     /// How far a limp servo's goal register may sit from its measured position,
     /// degrees.
     #[serde(default = "default_goal_shadow_tolerance_deg")]
@@ -495,14 +506,6 @@ fn default_voltage_budget_s() -> f64 {
 
 /// Whole degrees rather than the library's radians converted back; see
 /// [`EnvelopeSection::default`] for why.
-fn default_max_pin_pull_in_deg() -> f64 {
-    12.0
-}
-
-fn default_recheck_tolerance_deg() -> f64 {
-    0.5
-}
-
 fn default_goal_shadow_tolerance_deg() -> f64 {
     2.0
 }
@@ -673,21 +676,51 @@ pub struct Resolved {
     pub motion: MotionConfig,
     /// What arming verifies and writes.
     pub arm: ArmConfig,
-    /// What disarming compares against, with the drop flag clear — that flag is
-    /// the operator's, given per invocation and never stored.
+    /// What disarming compares against.
     pub disarm: DisarmConfig,
     /// Control periods per second.
     pub tick_hz: u32,
     /// Hardware-health sweeps per second.
     pub health_poll_hz: u32,
-    /// How long the stow move takes.
+    /// How long the stow move's head group takes.
     pub stow_duration: Duration,
-    /// How long the move from stow to neutral takes.
+    /// How long the move from stow to neutral takes, head group.
     pub up_duration: Duration,
-    /// How long a yaw or antenna move takes.
+    /// How long a yaw or antenna move takes, head group.
     pub move_duration: Duration,
     /// How long a `hold` command watches the machine.
     pub hold_duration: Duration,
+    /// How long the antennas take on any move, or `None` to give them the head
+    /// group's clock.
+    pub antenna_duration: Option<Duration>,
+}
+
+impl Resolved {
+    /// The stow move's per-group durations.
+    #[must_use]
+    pub fn stow_durations(&self) -> MoveDurations {
+        self.durations(self.stow_duration)
+    }
+
+    /// The raise's per-group durations.
+    #[must_use]
+    pub fn up_durations(&self) -> MoveDurations {
+        self.durations(self.up_duration)
+    }
+
+    /// A yaw or antenna command's per-group durations.
+    #[must_use]
+    pub fn move_durations(&self) -> MoveDurations {
+        self.durations(self.move_duration)
+    }
+
+    /// `head` for the head group, and the configured antenna clock beside it.
+    fn durations(&self, head: Duration) -> MoveDurations {
+        MoveDurations {
+            head,
+            antennas: self.antenna_duration.unwrap_or(head),
+        }
+    }
 }
 
 /// Read and parse a configuration file.
@@ -717,28 +750,24 @@ pub fn record_path_beside(config: &Path) -> PathBuf {
     config.parent().unwrap_or(Path::new("")).join(RECORD_NAME)
 }
 
-/// The two standing gates, and the configuration that survived them.
+/// The configuration a host needs in hand before it commands anything.
 ///
 /// Every host that commands this machine runs exactly this, before it opens the
-/// port: the configuration must resolve — which is where the recorded crank
-/// datum is required — and the self-test record at `record` must be one in
-/// which every case passed. It lives here rather than in a binary so a second
-/// host runs the gate itself and not a copy of it.
+/// port: the configuration must resolve, which is where the recorded crank datum
+/// is required. It lives here rather than in a binary so a second host runs it
+/// itself and not a copy of it.
 ///
-/// Separate from the run, so the refusals are testable without a port: they are
-/// the whole reason a motion command exists behind a read-only one.
-pub fn arm_gates(cfg: &BenchConfig, record: &Path) -> anyhow::Result<Resolved> {
-    let resolved = cfg.resolve()?;
-    let record = SelftestRecord::load(record).with_context(|| {
-        format!(
-            "reading the self-test record at {}; run `reachy-bench selftest` first",
-            record.display()
-        )
-    })?;
-    record
-        .admits_arm()
-        .context("the self-test record does not admit arming")?;
-    Ok(resolved)
+/// Nothing here is a safety gate, and the name says so. A datum nobody has
+/// checked makes every converted angle a guess, so what a failure means is that
+/// there is nothing to command *with* — the enumeration of what stands between a
+/// request to move and torque coming on is `engage_gates`, and it is elsewhere.
+/// A self-test record is not consulted either: the registry is a bring-up and
+/// diagnostic tool and a regression guard, and commissioning re-establishes on
+/// its own everything a record could assert about the machine in front of you.
+///
+/// Separate from the run, so the refusal is testable without a port.
+pub fn resolve_for_commanding(cfg: &BenchConfig) -> anyhow::Result<Resolved> {
+    cfg.resolve().map_err(Into::into)
 }
 
 impl BenchConfig {
@@ -999,18 +1028,6 @@ impl BenchConfig {
                 acceleration: arm_section.profile_acceleration,
                 velocity: arm_section.profile_velocity,
             },
-            max_pin_pull_in: positive("arm.max_pin_pull_in_deg", arm_section.max_pin_pull_in_deg)?
-                .to_radians(),
-            recheck_tolerance: positive(
-                "arm.recheck_tolerance_deg",
-                arm_section.recheck_tolerance_deg,
-            )?
-            .to_radians(),
-            goal_shadow_tolerance: positive(
-                "arm.goal_shadow_tolerance_deg",
-                arm_section.goal_shadow_tolerance_deg,
-            )?
-            .to_radians(),
             leg_windows,
         };
 
@@ -1019,7 +1036,6 @@ impl BenchConfig {
             stow_targets: stow_targets(&geom)?,
             tolerance: positive("disarm.tolerance_deg", self.disarm.tolerance_deg)?.to_radians(),
             dwell: duration_from_secs_non_negative("disarm.dwell_s", self.disarm.dwell_s)?,
-            force_drop: false,
         };
 
         Ok(Resolved {
@@ -1045,6 +1061,11 @@ impl BenchConfig {
                 "motion.hold_duration_s",
                 self.motion.hold_duration_s,
             )?,
+            antenna_duration: self
+                .motion
+                .antenna_duration_s
+                .map(|secs| duration_from_secs("motion.antenna_duration_s", secs))
+                .transpose()?,
         })
     }
 }
@@ -1267,6 +1288,114 @@ provenance = \"test fixture\"
         );
     }
 
+    /// An absent `antenna_duration_s` gives the antennas whichever head-group
+    /// clock the move is running on. Set, it governs the antennas on every
+    /// move and leaves the head group alone — the whole point of the split.
+    #[test]
+    fn the_antenna_clock_defaults_to_the_head_groups() {
+        let cfg = minimal();
+        let resolved = cfg.resolve().expect("the minimal configuration resolves");
+        assert_eq!(resolved.antenna_duration, None);
+        for (durations, head) in [
+            (resolved.up_durations(), resolved.up_duration),
+            (resolved.stow_durations(), resolved.stow_duration),
+            (resolved.move_durations(), resolved.move_duration),
+        ] {
+            assert_eq!(durations.head, head);
+            assert_eq!(durations.antennas, head);
+            assert_eq!(durations.longest(), head);
+        }
+
+        let mut cfg = minimal();
+        cfg.motion.antenna_duration_s = Some(1.5);
+        let resolved = cfg.resolve().expect("an antenna clock resolves");
+        assert_eq!(resolved.antenna_duration, Some(Duration::from_millis(1500)));
+        for (durations, head) in [
+            (resolved.up_durations(), resolved.up_duration),
+            (resolved.stow_durations(), resolved.stow_duration),
+            (resolved.move_durations(), resolved.move_duration),
+        ] {
+            assert_eq!(durations.head, head, "the head group is left alone");
+            assert_eq!(durations.antennas, Duration::from_millis(1500));
+        }
+    }
+
+    /// Every duration the bench ships clears the floor its own step bound sets.
+    ///
+    /// Resolution only checks that a duration is positive, and 0.1 s is
+    /// positive. What a duration too short for its span actually produces is a
+    /// step-bound fault mid-move — never a clamp — and after the gate audit a
+    /// fault de-torques: the head stops and falls. The floors are derived in
+    /// `reachy-motion` and quoted in the example file's comments; this is what
+    /// joins the three, so that editing a duration downward (which the speed
+    /// trials exist to do) cannot quietly cross one.
+    ///
+    /// All three step bounds are covered: the legs through the derived
+    /// head-group floor, the body yaw through its widest lawful sweep, and the
+    /// antennas through theirs. Each yaw and antenna span is the widest a
+    /// *command* can ask for; a machine found standing further out than that is
+    /// `TODO(recovery-move-clock)`.
+    #[test]
+    fn the_shipped_durations_clear_their_step_bound_floors() {
+        for (name, cfg) in [
+            ("the defaults", minimal()),
+            ("the example", example_resolved()),
+        ] {
+            let resolved = cfg.resolve().expect("the configuration resolves");
+            let motion = &resolved.motion;
+
+            // The head-group floor is derived at one tick rate against one leg
+            // bound; a configuration that moved either would need its own
+            // derivation rather than this number.
+            assert_eq!(f64::from(resolved.tick_hz), FLOOR_TICK_HZ, "{name}");
+            assert!(
+                (motion.max_step.legs - MotionConfig::default().max_step.legs).abs() < 1e-15,
+                "{name} moved the leg step bound the floor was derived against"
+            );
+
+            // The longest sweep either antenna can be commanded through: one
+            // arc short of a full turn, which the bench's own `antennas`
+            // command can ask for with an arbitrary target.
+            let antenna_floor = duration_floor_s(
+                core::f64::consts::TAU,
+                motion.max_step.antennas,
+                f64::from(resolved.tick_hz),
+            );
+
+            // The head duration must also clear the yaw's step bound — the
+            // body yaw shares the head group's clock. The longest sweep a
+            // lawful command can ask is cap to cap: a target beyond the cap is
+            // refused outright, so twice the cap bounds the span.
+            let yaw_floor = duration_floor_s(
+                2.0 * motion.env.body_yaw_limit,
+                motion.max_step.body_yaw,
+                f64::from(resolved.tick_hz),
+            );
+
+            for (move_name, durations) in [
+                ("up", resolved.up_durations()),
+                ("stow", resolved.stow_durations()),
+                ("move", resolved.move_durations()),
+            ] {
+                assert!(
+                    durations.head.as_secs_f64() >= HEAD_GROUP_FLOOR_S,
+                    "{name}: the {move_name} head clock is {:.3} s, under the {HEAD_GROUP_FLOOR_S} s floor",
+                    durations.head.as_secs_f64(),
+                );
+                assert!(
+                    durations.head.as_secs_f64() >= yaw_floor,
+                    "{name}: the {move_name} head clock is {:.3} s, under the {yaw_floor:.3} s cap-to-cap yaw floor",
+                    durations.head.as_secs_f64(),
+                );
+                assert!(
+                    durations.antennas.as_secs_f64() >= antenna_floor,
+                    "{name}: the {move_name} antenna clock is {:.3} s, under the {antenna_floor:.3} s floor",
+                    durations.antennas.as_secs_f64(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_defaults_are_the_libraries_own() {
         let cfg = minimal();
@@ -1296,20 +1425,6 @@ provenance = \"test fixture\"
         );
         assert_eq!(resolved.arm.gains, reachy_motion::arm::DEFAULT_GAINS);
         assert!(
-            (resolved.arm.max_pin_pull_in - reachy_motion::arm::DEFAULT_MAX_PIN_PULL_IN).abs()
-                < 1e-15
-        );
-        assert!(
-            (resolved.arm.recheck_tolerance - reachy_motion::arm::DEFAULT_RECHECK_TOLERANCE).abs()
-                < 1e-15
-        );
-        assert!(
-            (resolved.arm.goal_shadow_tolerance
-                - reachy_motion::arm::DEFAULT_GOAL_SHADOW_TOLERANCE)
-                .abs()
-                < 1e-15
-        );
-        assert!(
             (resolved.disarm.tolerance - reachy_motion::disarm::DEFAULT_STOW_TOLERANCE).abs()
                 < 1e-15
         );
@@ -1317,7 +1432,6 @@ provenance = \"test fixture\"
             resolved.disarm.dwell,
             reachy_motion::disarm::DEFAULT_STOW_DWELL
         );
-        assert!(!resolved.disarm.force_drop);
         assert_eq!(resolved.timing.baud, DEFAULT_BAUD);
         assert_eq!(resolved.timing, BusTiming::default());
     }
@@ -1548,9 +1662,12 @@ provenance = \"test fixture\"
         // Each key, mutated to something that is not a positive real number,
         // must come back naming itself. A key that silently accepted a zero
         // would put a zero step bound or a zero tick rate into the pump.
-        let cases: [Mutation; 15] = [
+        let cases: [Mutation; 16] = [
             ("motion.stow_duration_s", |c| {
                 c.motion.stow_duration_s = 0.0;
+            }),
+            ("motion.antenna_duration_s", |c| {
+                c.motion.antenna_duration_s = Some(0.0);
             }),
             ("motion.up_duration_s", |c| c.motion.up_duration_s = -1.0),
             ("motion.move_duration_s", |c| {
@@ -1830,6 +1947,21 @@ provenance = \"test fixture\"
         );
         let message = format!("{:#}", stale.expect_err("there is no such key"));
         assert!(message.contains("repin_tolerance_deg"), "{message}");
+
+        // Three keys whose gates are no longer in the binary. A live
+        // configuration carrying one describes a machine this binary no
+        // longer is, and leaves an operator believing a bound is configured
+        // that nothing enforces — the refusal by name turns that into a
+        // loud failure at load instead.
+        for (section, key, value) in [
+            ("arm", "max_pin_pull_in_deg", "12.0"),
+            ("arm", "recheck_tolerance_deg", "0.5"),
+            ("disarm", "force_drop", "true"),
+        ] {
+            let stale = parse(&format!("[{section}]\n{key} = {value}\n"));
+            let message = format!("{:#}", stale.expect_err("there is no such key"));
+            assert!(message.contains(key), "{message}");
+        }
 
         // `antenna_limit_rad` is not a recognised key: a file carrying it
         // says so rather than setting nothing.

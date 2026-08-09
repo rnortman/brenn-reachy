@@ -47,11 +47,11 @@ Give the tick an explicit clear-fault command, so a machine that stopped
 commanding can be told to resume without restarting the process.
 
 Deferral context: a fault is absorbing — the tick emits nothing and ignores
-every command thereafter — and the only way out today is to disarm, which drops
-the head unless it is stowed, or to restart the process and re-drive the whole
-arm sequence. Both are correct and neither is automatic, which is the property
-worth keeping: the head is held up by the goals the servos are still holding, so
-resuming is a decision a person makes with the machine in front of them. What is
+every command thereafter — and the only way out today is to disarm, which
+releases torque wherever the machine stands, or to restart the process and
+re-drive the whole arm sequence. Both are correct and neither is automatic,
+which is the property worth keeping: resuming is a decision a person makes with
+the machine in front of them. What is
 missing is not the mechanism but the operator surface to issue such a command
 deliberately and to show what is being cleared; the bench CLI runs one command
 per process and has nowhere to put it. Marked at the absorbing arm of
@@ -73,27 +73,6 @@ already a runtime configuration seam for exactly this substitution; what is
 missing is the measurement, which needs the machine. Marked at `HeadGeometry` in
 `crates/reachy-kin/src/geometry.rs`.
 
-## `arrival-far-corridor`
-
-Decide whether the far end of arming's arrival corridor stays at the arrival
-tolerance, once the standing position error of a loaded servo on this unit has
-been measured.
-
-Deferral context: a joint the pins pulled somewhere else passes if it reads
-anywhere between where it stood when torque came on and the goal it was sent to,
-widened by the arrival tolerance at both ends. The near end is the direction
-check — a joint moving away from its goal is fighting it — and costs nothing.
-The far end is the goal itself, so a joint whose load pushes it *past* the goal
-settles outside the corridor as soon as its standing error exceeds the
-tolerance, and arming refuses a servo behaving exactly the way a proportional
-loop with no integral term behaves. That refusal holds torque and stops the
-session, so it is the safe direction to be wrong in, and no reading from this
-unit says whether the case is reachable: the standing error is the figure a
-supervised arm now records per servo and nobody has yet read one. Widening the
-far end by a guess would put an unmeasured number in the one place the tolerance
-was written to stay out of. Marked at the arrival check in
-`crates/reachy-motion/src/arm.rs`.
-
 ## `health-read-budget`
 
 Decide whether a run of health sweeps that fall short should stop the tick loop
@@ -111,52 +90,6 @@ sweep really falls short on this bus is unmeasured — the first supervised runs
 with torque on are what say whether the answer is a budget, a config key beside
 `read_loss_ticks`, or a documented decision that a health gap never faults.
 Marked at `read_health` in `crates/reachy-bench/src/pump.rs`.
-
-## `held-goal-bound`
-
-Decide what bounds the gap between a torque-holding servo's goal register and
-its measured position on body yaw, where nothing bounds it today.
-
-Deferral context: a servo found already holding torque is pinned at the goal it
-is holding rather than at the position it has sagged to, so that re-arming does
-not ratchet the target down by the sag every time. The gap between the two is
-recorded per servo and judged on the legs only, by the pull-in gate, which is
-measured against the position. Body yaw is pinned at that goal untouched, so
-there the gap is bounded by nothing nearer than the envelope's yaw cap. What it
-usually costs is
-not a commanded slew — the servo already holds that goal, so writing it back
-commands nothing new — but an armed record that claims the pose the goals
-describe while the machine stands a sag away from it, and every trajectory then
-starts from a pose the machine is not at. The exception is a servo whose torque
-register says on while the servo is not holding anything: there the enable is
-what commands the gap, and the goal-shadow gate that would have caught it is the
-one thing a servo reporting torque is exempt from. The bound wants to be a
-plausibility figure rather than a fence, and the sag it has to be plausible
-against is unmeasured: it is the figure a supervised arm now records and nobody
-has yet read one. Marked at the goal-shadow sweep in
-`crates/reachy-motion/src/arm.rs`.
-
-## `pin-settle-dwell`
-
-Decide whether arming waits between writing the nine goals and reading back where
-the joints ended up, and for how long.
-
-Deferral context: the arrival check runs immediately — nine reads, a few
-milliseconds — so a joint whose goal pulled it somewhere else is read while it is
-still travelling. The check admits that: a pulled joint passes anywhere in the
-corridor between where it started and where it was sent, so being mid-travel is
-not a refusal, and a joint that was not pulled is compared against its own
-reading a sweep earlier and races nothing. What the corridor cannot separate is a
-joint that has stopped short of its goal from one still moving towards it, and
-that is the case a dwell would close. Off the machine the two are
-indistinguishable: a fixture can model an instant arrival or a slow one and
-neither is evidence. What separates them is how far this unit's rest really sits
-outside the travel windows and how long the profile-shaped pull takes, both of
-which are readings from a supervised arm. A dwell also has a cost — it is time
-with torque on and nothing verified — so the length wants to come from the
-measurement rather
-than from a guess. Marked at the arrival check in
-`crates/reachy-motion/src/arm.rs`.
 
 ## `provisioning-repair`
 
@@ -210,21 +143,38 @@ watching, and who owns the port when two things want it. None of it changes the
 libraries; it is a second host beside this one. Marked at the driver in
 `crates/reachy-bench/src/pump.rs`.
 
-## `selftest-staleness`
+## `recovery-move-clock`
 
-Decide when a self-test record stops counting as evidence, and refuse to command
-anything against one that has.
+Give a move out of a wide excursion a clock sized to the span it actually
+covers, so recovering from a pose the machine was left in cannot fault on the
+step guard.
 
-Deferral context: the record is what stands between an unverified machine and
-every command that moves something, and today a record that passed every case
-admits arming however old it is. Age is the obvious criterion and not obviously
-the right one — a machine nobody has touched since the run is in the same state
-it was, while one that has been unplugged, re-provisioned or taken apart is not,
-and neither of those is a duration. What separates them is which facts the
-record asserts that the arm sequence does not re-establish on its own, and that
-list is short: the arm sequence re-reads presence, provisioning, supply, health
-and the resting pose on every run. Settling it wants the first few bring-up runs
-to show what actually goes stale in practice, and a criterion invented before
-then would be a number nobody could defend. The record already carries the
-timestamp any such rule needs. Marked at `SelftestRecord::admits_arm` in
-`crates/reachy-bench/src/selftest.rs`.
+Deferral context: a move runs for the duration its caller names, and those
+durations are chosen for the spans an ordinary command covers — a yaw target is
+capped at 60°, so cap to cap is 2.09 rad and the shipped `stow_duration_s = 2.0`
+clears its 1.57 s floor. Where the machine physically *stands* is not capped:
+the yaw servo's provisioned range is the full turn, and a hand or a crash can
+leave the body anywhere in it. The envelope check now admits a move out of such
+a pose — that is the recovery — but the step guard still measures each tick
+against `max_step_body_yaw_rad`, and 2.0 s at 0.05 rad per tick covers 2.67 rad,
+about 153°. A body left further round than that stows, faults on
+`Fault::StepTooLarge` partway, and de-torques where it stopped. This is a
+regression against the pre-torque pose refusal that used to catch the same
+machine before torque came on, so it is a real loss and not just a gap.
+
+The blanket fixes are both wrong: raising the shipped stow duration to cover a
+half turn slows every presence stow to serve a rare recovery, and lowering the
+step bound slows everything. The right shape is a clock the *recovering* move
+derives from its own span — the tick already knows it is recovering, and
+`duration_floor_s` already says what a span needs — but that changes which side
+of the interface owns a move's duration, which is a design decision and not a
+local edit.
+
+Done = a move admitted as a recovery cannot fault its own step guard on the
+distance it was given to cover, with a test driving a body past 153° through a
+stow, and the operator caveat in `crates/reachy-bench/reachy-bench.example.toml`
+retired. Marked at the step guard in `crates/reachy-motion/src/tick.rs`, in the
+configuration test that pins the shipped durations against their floors
+(`crates/reachy-bench/src/config.rs`), and in the pod repo's `TODO.md` under
+this same slug — the daemon is where this path runs with nobody watching, so
+the two entries move together.

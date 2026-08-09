@@ -44,6 +44,11 @@ release="${store_mount}/releases/bench"
 
 service=brenn-app.service
 
+# The other long-lived process on that unit, and the only other thing on it that
+# opens the servo bus. It is deployed from brenn-pod and runs as a service, so a
+# bench run at the wrong moment meets a held port rather than a free one.
+motiond_service=reachy-motiond.service
+
 usage() {
 	die "usage: ${prog} <host> --config <file>|--run [args...]|--fetch <dir>"
 }
@@ -122,6 +127,7 @@ case "$mode" in
 		# The working directory is the account's home, because that is where
 		# the bench reads its configuration and writes its state.
 		remote="systemctl is-active --quiet ${service} && exit 3"
+		remote="${remote}; systemctl is-active --quiet ${motiond_service} && exit 4"
 		remote="${remote}; cd ${app_home} || exit 1"
 		remote="${remote}; exec setpriv --reuid ${app_user} --regid ${app_user}"
 		remote="${remote} --init-groups ${release}/reachy-bench"
@@ -137,6 +143,13 @@ case "$mode" in
 				die "${service} is running on ${host}, and a bench run will not share the servo bus with it." \
 					"Stop it, run the bench, and start it again when you are done:" \
 					"    ssh root@${host} systemctl stop ${service}"
+				;;
+			4)
+				die "${motiond_service} is running on ${host}, and it holds the servo bus." \
+					"Stop it, run the bench, and start it again when you are done:" \
+					"    ssh root@${host} systemctl stop ${motiond_service}" \
+					"    ssh root@${host} systemctl start ${motiond_service}" \
+					"(The port's own flock refuses either way; this is the message that says which process has it.)"
 				;;
 			255)
 				die "ssh to root@${host} failed; the bench did not run." \

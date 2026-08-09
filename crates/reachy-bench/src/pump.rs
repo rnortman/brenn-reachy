@@ -1,6 +1,6 @@
 //! The driver: the one place a sans-I/O sequencer meets a real port.
 //!
-//! Every library under this one refuses to own a loop. [`ArmSequencer`] and
+//! Every library under this one refuses to own a loop. [`CommissionSequencer`] and
 //! [`DisarmSequencer`] hand out one abstract request at a time and take back one
 //! result; the tick takes a measurement and hands back goals. Somebody has to
 //! execute those requests, spend the retry budget, watch the clock and decide
@@ -19,6 +19,11 @@
 //! asked for — is not a verdict about the machine and has no [`BusResult`] to be.
 //! Those stop the run as a [`PumpError`], because a sequencer told "no answer"
 //! when the truth is "the adapter is unplugged" would report an absent servo.
+//!
+//! One kind of run is exempt: a torque-off walk. [`drive_release`] carries on
+//! past any transaction failure, because a driver that stopped at servo three
+//! would leave six servos holding the head up — and nothing, at any layer, may
+//! condition writing torque off.
 //!
 //! ## The clock
 //!
@@ -40,9 +45,19 @@
 //! Two rules the loop does not bend. A grouped read is **all-or-nothing**: any
 //! servo short of a clean answer makes the whole period's measurement absent, and
 //! the tick's read-loss budget — not a retry here — is what decides how long
-//! blind motion may continue. And a fault **stops the loop without touching
-//! torque**: the servos hold their last goal, which is the only stopped state
-//! that does not drop the head, and recovery is the operator's next command.
+//! blind motion may continue. And a fault **stops the loop and hands the fault
+//! up**: the loop's own job ends there, and taking the machine to the minimum
+//! risk condition — torque off, immediately — belongs to whoever holds the
+//! engagement, because that is the thing with a release to run.
+//! [`PumpError::is_fault`] is how a caller tells the two endings apart.
+//!
+//! A run is not a commitment to the command that started it:
+//! [`MotionPump::run_retargeting`] asks its caller at every period whether the
+//! move in flight is still the one wanted, and a replacement is spliced in from
+//! the setpoint the last period commanded. A caller executing a timeline off a
+//! wire needs that — waiting out a raise before starting the fold makes the
+//! head late by a whole move — and the stall budget follows the replacement, so
+//! being steered is never mistaken for hanging.
 //!
 //! Neither grouped read goes absent quietly. The first miss of a run names the
 //! servos that fell short and what each did instead, so a bench session
@@ -60,10 +75,10 @@ use reachy_bus::{
 };
 use reachy_bus::{reg_for, with_retry};
 use reachy_motion::{
-    ArmConfig, ArmRecord, ArmSummary, BusRequest, BusResult, CommandDisposition, CommandRejection,
-    Fault, JointGroup, JointId, JointVector, Mode, MotionCommand, MotionConfig, MotionState, RegId,
-    RegValue, SeqAction, SeqError, SeqStep, Sequencer, ServoHealth, TickInputs, TickOutputs,
-    motion_tick,
+    ArmConfig, ArmRecord, BusRequest, BusResult, CommandDisposition, CommandRejection,
+    CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointVector, Mode, MotionCommand,
+    MotionConfig, MotionState, RegId, RegValue, SeqAction, SeqError, SeqStep, Sequencer,
+    ServoHealth, TickInputs, TickOutputs, motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -180,6 +195,17 @@ pub enum PumpError {
     #[error("{0}")]
     Sequence(#[from] SeqError),
 
+    /// A servo did not acknowledge its torque-off write, so it may still be
+    /// holding. Reported after the whole release has run — every servo is
+    /// always asked, and this is what the run has to say about the ones that
+    /// did not answer, not something it could have refused up front.
+    #[error("servo {id} did not acknowledge torque off and may still be holding")]
+    TorqueOffUnacked {
+        /// The lowest servo left unacknowledged; the run's own report lists all
+        /// of them.
+        id: u8,
+    },
+
     /// A transaction failed in a way that is not a verdict about the machine.
     #[error("servo {id}: {source}")]
     Bus {
@@ -240,8 +266,9 @@ pub enum PumpError {
         budget: usize,
     },
 
-    /// The tick stopped commanding. The servos hold their last goal and torque
-    /// is untouched; the operator's next command is the recovery.
+    /// The tick stopped commanding. Motor control or position feedback is no
+    /// longer trusted, so the machine goes limp and the operator's next command
+    /// is the recovery.
     #[error("the tick faulted: {0}")]
     Fault(#[from] Fault),
 
@@ -267,6 +294,49 @@ pub enum PumpError {
         /// Health sweeps per second.
         health_poll_hz: u32,
     },
+}
+
+impl PumpError {
+    /// Whether this ending means the machine can no longer be trusted to a
+    /// controlled stop.
+    ///
+    /// The dividing line an engaged caller acts on: a fault takes the machine
+    /// straight to torque-off, an expected refusal leaves it holding exactly
+    /// where it was. Three things are refusals — a command the tick would not
+    /// accept, a servo whose torque-off write went unacknowledged, which is the
+    /// tail end of a release that has already happened, and either torque-on
+    /// gate, which writes nothing at all. Everything else is the machine, the
+    /// wire, or the loop failing mid-flight, and none of those is a state to
+    /// leave a head held up in.
+    ///
+    /// No error is both this and a [gate refusal](Self::is_gate_refusal): the
+    /// two predicates partition the expected errors from the faults, and a
+    /// caller that took the fault path on a gate refusal would de-torque and
+    /// park a machine that was never torqued.
+    #[must_use]
+    pub fn is_fault(&self) -> bool {
+        !matches!(self, Self::Rejected(_) | Self::TorqueOffUnacked { .. })
+            && !self.is_gate_refusal()
+    }
+
+    /// Whether this is one of the two torque-on gates refusing.
+    ///
+    /// The rail below its floor and a latched hardware error are the whole
+    /// enumeration of what may stand between a request to move and torque
+    /// coming on, and both are raised by [`engage_gates`] before a single
+    /// transaction goes out: nothing was written, the machine is exactly where
+    /// it was, and asking again later is the correct response. An unattended
+    /// caller needs that apart from every other engage failure, which leaves a
+    /// machine to bring back to the minimum risk condition.
+    ///
+    /// [`engage_gates`]: reachy_motion::engage_gates
+    #[must_use]
+    pub fn is_gate_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Sequence(SeqError::SupplyBelowFloor { .. } | SeqError::UnhealthyServo { .. })
+        )
+    }
 }
 
 /// How many actions a sequence may take before the driver calls it stuck.
@@ -311,6 +381,58 @@ where
     P: BusPort,
     S: Sequencer,
 {
+    run(bus, map, seq, clock, budget, phase, &mut Err)
+}
+
+/// Run a torque-off sequence, and let nothing stop it short of its last write.
+///
+/// The same loop as [`drive`] with one rule inverted: a transaction that fails
+/// in a way no [`BusResult`] describes is handed to `absorbed` and the sequence
+/// is told the wire mangled that exchange, so it records the servo and walks on
+/// to the next. A long or short reply from one servo mid-release — the tail of
+/// an abandoned read landing after the line was cleared is exactly the condition
+/// a fault produces — would otherwise end the walk where it stood and leave the
+/// servos after it holding the head up, which is this machine's only pinch
+/// hazard.
+///
+/// The failures are not swallowed: each is pushed onto `absorbed` in the order
+/// it happened, for the caller to report once the machine is limp, and the
+/// servos that never acknowledged their release are in the summary the walk
+/// returns.
+pub fn drive_release<P, S>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    seq: &mut S,
+    clock: &mut dyn Clock,
+    budget: usize,
+    phase: &mut dyn FnMut(SeqStep),
+    absorbed: &mut Vec<PumpError>,
+) -> Result<S::Summary, PumpError>
+where
+    P: BusPort,
+    S: Sequencer,
+{
+    run(bus, map, seq, clock, budget, phase, &mut |error| {
+        absorbed.push(error);
+        Ok(BusResult::WireCorrupt)
+    })
+}
+
+/// The driver loop both entry points run, differing only in `recover` — what a
+/// transaction failure with no [`BusResult`] of its own becomes.
+fn run<P, S>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    seq: &mut S,
+    clock: &mut dyn Clock,
+    budget: usize,
+    phase: &mut dyn FnMut(SeqStep),
+    recover: &mut dyn FnMut(PumpError) -> Result<BusResult, PumpError>,
+) -> Result<S::Summary, PumpError>
+where
+    P: BusPort,
+    S: Sequencer,
+{
     let mut prior: Option<BusResult> = None;
     let mut reported: Option<SeqStep> = None;
 
@@ -323,7 +445,13 @@ where
         }
         prior = None;
         match action {
-            SeqAction::Transact(request) => prior = Some(execute(bus, map, request)?),
+            SeqAction::Transact(request) => {
+                let result = match execute(bus, map, request) {
+                    Ok(result) => result,
+                    Err(error) => recover(error)?,
+                };
+                prior = Some(result);
+            }
             SeqAction::Wait { until } => clock.sleep_until(until),
             SeqAction::Done(summary) => return Ok(summary),
             SeqAction::Fail(error) => return Err(PumpError::Sequence(error)),
@@ -399,19 +527,53 @@ fn verdict(id: u8, error: XactError) -> Result<BusResult, PumpError> {
     }
 }
 
-/// Arming's report, as a supervised run prints it.
+/// What commissioning established, as a supervised run prints it.
 ///
-/// Two records of the platform — where it was found and what it was left holding
-/// — because they are different poses whenever a pin had to pull a joint, and
-/// which one a reader is looking at matters. Everything else is the
-/// registers-of-record a bring-up wants written down.
+/// The registers-of-record a bring-up wants written down, and the rail the
+/// ceremony finished on. Printed once per process, because commissioning
+/// happens once per process — an engage that reprinted it would bury the two
+/// lines that differ between one wake and the next in eight that never do.
 #[must_use]
-pub fn arm_report(summary: &ArmSummary) -> String {
-    let mut out = String::new();
-    out.push_str(&record_lines("found", &summary.rest));
-    out.push_str(&record_lines("armed", &summary.armed));
+pub fn commission_report(commission: &CommissionSummary) -> String {
+    let mut out = format!("models     {:?}\n", commission.models);
+    let volts: Vec<String> = commission
+        .rail
+        .voltages
+        .iter()
+        .map(|v| format!("{v:.1}"))
+        .collect();
+    out.push_str(&format!(
+        "supply     [{}] V after {} poll(s)\n",
+        volts.join(", "),
+        commission.voltage_polls
+    ));
+    let health: Vec<String> = commission
+        .rail
+        .health
+        .iter()
+        .map(|servo| format!("{:#04x}", servo.bits))
+        .collect();
+    out.push_str(&format!("health     [{}]\n", health.join(", ")));
+    out.push_str(&format!(
+        "registers  {} provisioned cells read\n",
+        commission.provisioned.count()
+    ));
+    out
+}
 
-    let pulls: Vec<String> = summary
+/// The torque-on path's report, as a supervised run prints it.
+///
+/// Two records of the platform — where the poll found it and where it reported
+/// itself once torque was on — because they are different poses whenever torque
+/// coming on moved a joint, and which one a reader is looking at matters.
+#[must_use]
+pub fn engage_report(engage: &EngageSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&record_lines("found", &engage.rest));
+    out.push_str(&record_lines("armed", &engage.armed));
+
+    let pulls: Vec<String> = engage
+        .pins
         .pull_in
         .iter()
         .map(|rad| format!("{:.3}", rad.to_degrees()))
@@ -419,51 +581,16 @@ pub fn arm_report(summary: &ArmSummary) -> String {
     out.push_str(&format!(
         "pull-in    legs [{}] deg, worst {:.3} deg\n",
         pulls.join(", "),
-        summary.worst_pull_in().to_degrees()
+        engage.worst_pull_in().to_degrees()
     ));
-    // Two measurements rather than verdicts: nothing acts on either, and both
-    // are quantities this project has so far only guessed at.
-    let droop: Vec<String> = summary
-        .droop
-        .iter()
-        .map(|gap| {
-            gap.map_or_else(
-                || "limp".to_string(),
-                |rad| format!("{:.3}", rad.to_degrees()),
-            )
-        })
-        .collect();
-    out.push_str(&format!("droop      [{}] deg\n", droop.join(", ")));
-    let shift: Vec<String> = summary
+    // A measurement rather than a verdict: nothing acts on it, and it is a
+    // quantity this project has so far only guessed at.
+    let shift: Vec<String> = engage
         .post_enable_shift
         .iter()
         .map(|rad| format!("{:.3}", rad.to_degrees()))
         .collect();
     out.push_str(&format!("torque-on  [{}] deg of shift\n", shift.join(", ")));
-
-    out.push_str(&format!("models     {:?}\n", summary.models));
-    let volts: Vec<String> = summary.voltages.iter().map(|v| format!("{v:.1}")).collect();
-    out.push_str(&format!(
-        "supply     [{}] V after {} poll(s)\n",
-        volts.join(", "),
-        summary.voltage_polls
-    ));
-    let health: Vec<String> = summary
-        .health
-        .iter()
-        .map(|servo| format!("{:#04x}", servo.bits))
-        .collect();
-    out.push_str(&format!("health     [{}]\n", health.join(", ")));
-    let torque: Vec<String> = summary
-        .torque_before
-        .iter()
-        .map(|on| if *on { "on" } else { "off" }.to_string())
-        .collect();
-    out.push_str(&format!("torque was [{}]\n", torque.join(", ")));
-    out.push_str(&format!(
-        "registers  {} provisioned cells read\n",
-        summary.provisioned.count()
-    ));
     out
 }
 
@@ -651,6 +778,9 @@ impl fmt::Display for TickEvent {
         match self {
             Self::Command(CommandDisposition::None) => f.write_str("no command"),
             Self::Command(CommandDisposition::Started) => f.write_str("moving"),
+            Self::Command(CommandDisposition::Retargeted) => {
+                f.write_str("moving, replacing the move that was running")
+            }
             Self::Command(CommandDisposition::Held) => f.write_str("holding"),
             Self::Command(CommandDisposition::Rejected(why)) => write!(f, "refused: {why}"),
             Self::ReadLost { failed } => write!(f, "position read lost: {failed}"),
@@ -720,10 +850,18 @@ pub struct MoveSummary {
 }
 
 /// What ends a run of the fixed-rate loop.
-#[derive(Clone, Copy, Debug)]
-enum Until {
-    /// The machine is holding again: the move reached its endpoint.
-    Holding,
+///
+/// The caller's say over a run in flight lives on the endpoint arm and nowhere
+/// else, because that is the only run whose ending is a place rather than a
+/// time: a hold ends when its dwell is up and there is nothing about it to
+/// change.
+enum Until<'r> {
+    /// The machine is holding again: the move reached its endpoint. `retarget`
+    /// is asked at every period that has no command pending whether that
+    /// endpoint is still the right one.
+    Holding {
+        retarget: &'r mut dyn FnMut() -> Option<MotionCommand>,
+    },
     /// The dwell has elapsed. A hold is holding from its first period, so
     /// there is nothing else for it to wait for.
     Elapsed(Duration),
@@ -815,7 +953,7 @@ impl<'a> MotionPump<'a> {
     #[must_use]
     pub fn stall_budget(&self, command: &MotionCommand) -> u64 {
         match command {
-            MotionCommand::MoveTo { duration, .. } => self.budget_for(*duration),
+            MotionCommand::MoveTo { durations, .. } => self.budget_for(durations.longest()),
             // A hold commands no travel: it takes the period it is asked in.
             MotionCommand::Hold => self.budget_for(Duration::ZERO),
         }
@@ -844,7 +982,50 @@ impl<'a> MotionPump<'a> {
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
-        self.carry(bus, state, command, Until::Holding, clock, event)
+        self.carry(
+            bus,
+            state,
+            command,
+            Until::Holding {
+                retarget: &mut || None,
+            },
+            clock,
+            event,
+        )
+    }
+
+    /// Run `command` to completion, asking `retarget` at every control period
+    /// whether it has become the wrong command.
+    ///
+    /// `retarget` is consulted at the top of each period that has no command
+    /// pending, and answering `Some` replaces the move in flight: the tick
+    /// shapes the new path from the setpoint the previous period commanded, so
+    /// nothing jumps and the machine never stops on the way. The run then ends
+    /// when the *replacement* reaches its endpoint, and the stall budget is
+    /// re-sized to the replacement's own travel — a caller changing its mind is
+    /// not a loop that hung.
+    ///
+    /// [`MotionPump::run`] is this with nothing to say. Two entry points for the
+    /// same reason [`MotionPump::hold`] has two: a bench move is commanded once
+    /// and watched to its end, while a program taking instructions off a wire
+    /// has a schedule that can move under it mid-travel.
+    pub fn run_retargeting<P: BusPort>(
+        &mut self,
+        bus: &mut Bus<P>,
+        state: &mut MotionState,
+        command: MotionCommand,
+        clock: &mut dyn Clock,
+        event: &mut dyn FnMut(TickEvent),
+        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
+    ) -> Result<MoveSummary, PumpError> {
+        self.carry(
+            bus,
+            state,
+            command,
+            Until::Holding { retarget },
+            clock,
+            event,
+        )
     }
 
     /// Watch the machine hold for `dwell`, commanding nothing.
@@ -881,12 +1062,12 @@ impl<'a> MotionPump<'a> {
         bus: &mut Bus<P>,
         state: &mut MotionState,
         command: MotionCommand,
-        until: Until,
+        mut until: Until<'_>,
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
-        let budget = match until {
-            Until::Holding => self.stall_budget(&command),
+        let mut budget = match until {
+            Until::Holding { .. } => self.stall_budget(&command),
             Until::Elapsed(dwell) => self.budget_for(dwell),
         };
         let epoch = clock.now();
@@ -905,7 +1086,23 @@ impl<'a> MotionPump<'a> {
         // `None` when the periods run out, which is the stall.
         let mut ending: Option<Result<(), PumpError>> = None;
 
-        for tick in 0..budget {
+        let mut tick: u64 = 0;
+        while tick < budget {
+            // Asked before the period's read, so a replacement command reaches
+            // the same period's tick and the machine turns on the very next
+            // setpoint. Skipped while a command is already pending — the
+            // accepting period, and the one that accepts a replacement, have
+            // nothing to ask about yet.
+            if pending.is_none()
+                && let Until::Holding { retarget } = &mut until
+                && let Some(replacement) = retarget()
+            {
+                // Re-sized from here, not extended: what bounds the run is the
+                // travel still ahead of it, and a caller that keeps changing
+                // its mind is doing exactly what this entry point is for.
+                budget = tick.saturating_add(self.stall_budget(&replacement));
+                pending = Some(replacement);
+            }
             let now = clock.now();
             // A period that starts materially after it was due is one the loop
             // ran late for. It proceeds immediately rather than skipping the
@@ -928,7 +1125,7 @@ impl<'a> MotionPump<'a> {
                     break;
                 }
             };
-            let polled = if tick % self.health_every == 0 {
+            let polled = if tick.is_multiple_of(self.health_every) {
                 match self.read_health(bus) {
                     Ok(servos) => Some(servos),
                     Err(error) => {
@@ -1021,7 +1218,7 @@ impl<'a> MotionPump<'a> {
                 event(TickEvent::Completed);
             }
             let over = match until {
-                Until::Holding => matches!(state.mode(), Mode::Holding),
+                Until::Holding { .. } => matches!(state.mode(), Mode::Holding),
                 Until::Elapsed(dwell) => now.saturating_sub(epoch) >= dwell,
             };
             if over {
@@ -1029,6 +1226,7 @@ impl<'a> MotionPump<'a> {
                 break;
             }
 
+            tick += 1;
             due += self.period;
             clock.sleep_until(due);
         }
@@ -1220,7 +1418,10 @@ mod tests {
 
     use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE};
     use reachy_bus::reg_for;
-    use reachy_motion::{ArmSequencer, JointId, JointTargets, RegValue, Warp};
+    use reachy_motion::{
+        CommissionSequencer, EngageSequencer, JointId, JointTargets, PollCadence, PollSequencer,
+        Posture, RegValue, Warp,
+    };
 
     use super::*;
     use crate::config::Resolved;
@@ -1229,35 +1430,57 @@ mod tests {
         rest_legs, stow_legs, wind_down_bus,
     };
 
-    /// Drive an arm sequence against `machine`, handing back the outcome, the
-    /// phases as they were announced, and every instruction that crossed the
-    /// wire.
+    /// What the whole torque-on path handed back, in the order it ran.
+    #[derive(Debug)]
+    struct Armed {
+        commission: CommissionSummary,
+        posture: Posture,
+        engage: EngageSummary,
+    }
+
+    /// Commission, poll and engage the machine on `bus`, as a bench command
+    /// does, announcing phases through `phase`.
+    fn arm_over<P: BusPort>(
+        cfg: &Resolved,
+        bus: &mut Bus<P>,
+        clock: &mut dyn Clock,
+        phase: &mut dyn FnMut(SeqStep),
+    ) -> Result<Armed, PumpError> {
+        let budget = action_budget(&cfg.arm);
+        let mut commissioning = CommissionSequencer::new(&cfg.arm);
+        let commission = drive(bus, &cfg.map, &mut commissioning, clock, budget, phase)?;
+        let mut polling = PollSequencer::new(&cfg.arm, commission.rail, PollCadence::Positions);
+        let posture = drive(bus, &cfg.map, &mut polling, clock, budget, phase)?;
+        let mut engaging =
+            EngageSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.fk, &posture);
+        let engage = drive(bus, &cfg.map, &mut engaging, clock, budget, phase)?;
+        Ok(Armed {
+            commission,
+            posture,
+            engage,
+        })
+    }
+
+    /// Drive the whole torque-on path against `machine`, handing back the
+    /// outcome, the phases as they were announced, and every instruction that
+    /// crossed the wire.
     #[allow(clippy::type_complexity)]
     fn arm(
         cfg: &Resolved,
         machine: FakeMachine,
     ) -> (
-        Result<ArmSummary, PumpError>,
+        Result<Armed, PumpError>,
         Vec<SeqStep>,
         Rc<RefCell<Vec<(u8, u8)>>>,
     ) {
         let spy = Spy::new(machine);
         let log = spy.log();
         let mut bus = Bus::new(spy, cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
         let mut phases = Vec::new();
-        let outcome = drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |step| {
-                phases.push(step);
-            },
-        );
+        let outcome = arm_over(cfg, &mut bus, &mut clock, &mut |step| {
+            phases.push(step);
+        });
         (outcome, phases, log)
     }
 
@@ -1298,11 +1521,10 @@ mod tests {
         let summary = outcome.expect("a correct machine arms");
 
         // Nothing had to be pulled: this machine rests inside every window.
-        assert_eq!(summary.pull_in, [0.0; 6]);
-        // Nothing was found holding torque, so there is no droop to record.
-        assert!(summary.droop.iter().all(Option::is_none));
-        assert!(summary.torque_before.iter().all(|on| !on));
-        assert_eq!(summary.voltage_polls, 1);
+        assert_eq!(summary.engage.pins.pull_in, [0.0; 6]);
+        assert_eq!(summary.commission.voltage_polls, 1);
+        // A positions-only sweep carries the commissioning rail forward.
+        assert!(!summary.posture.rail_read);
 
         assert_eq!(
             phases,
@@ -1312,10 +1534,8 @@ mod tests {
                 SeqStep::Provision,
                 SeqStep::VoltageGate,
                 SeqStep::Health,
-                SeqStep::PoseAndDatum,
-                SeqStep::StateDiscovery,
-                SeqStep::GoalShadow,
                 SeqStep::GainsProfiles,
+                SeqStep::PoseAndDatum,
                 SeqStep::PinAndEnable,
             ]
         );
@@ -1332,63 +1552,54 @@ mod tests {
         assert!(reads_before, "nothing is written before the reads finish");
     }
 
-    /// The goals left in the servos are the angles arming says it pinned, read
-    /// back off the fixture's own register file rather than off the summary.
+    /// The pin sweep goes out before the enables, so on a platform whose goal
+    /// register mirrors its present position while limp it is dropped — and
+    /// engaging carries on regardless, leaving every servo holding torque where
+    /// it stood.
+    ///
+    /// Read off the fixture's own register file, which models the mirroring, so
+    /// this is a check on the machine rather than on the summary.
     #[test]
-    fn the_goals_left_in_the_servos_are_the_pins() {
+    fn the_pins_are_dropped_by_a_mirroring_register_and_the_engage_stands() {
         let cfg = resolved();
         let spy = Spy::new(machine_at(&datumed_config(), &stow_legs()));
         let registers = spy.machine();
         let mut bus = Bus::new(spy, cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
-        let summary = drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |_| {},
-        )
-        .expect("a correct machine arms");
+        let summary =
+            arm_over(&cfg, &mut bus, &mut clock, &mut |_| {}).expect("a correct machine engages");
 
         let machine = registers.borrow();
         for (row, id) in cfg.map.ids().iter().enumerate() {
-            let held = machine
-                .get(*id, reg_for(RegId::GoalPosition))
-                .expect("a goal was written to every servo");
-            let counts = i32::from_le_bytes(held.try_into().expect("a goal is four bytes"));
-            let pinned = JointId::from_index(row)
-                .and_then(|joint| summary.armed.joints.get(joint))
-                .expect("the bus rows are the nine joints");
-            let expected = cfg
-                .map
-                .goal_counts(row, pinned)
-                .expect("a pinned angle places");
-            assert_eq!(counts, expected, "servo {id}");
+            assert_eq!(
+                machine.get(*id, reg_for(RegId::GoalPosition)),
+                None,
+                "servo {id} kept a goal written while it was limp"
+            );
             assert_eq!(
                 machine.get(*id, reg_for(RegId::TorqueEnable)),
                 Some(&[1u8][..]),
                 "servo {id} holds torque"
             );
+            let armed = JointId::from_index(row)
+                .and_then(|joint| summary.engage.armed.joints.get(joint))
+                .expect("the bus rows are the nine joints");
+            let measured = JointId::from_index(row)
+                .and_then(|joint| summary.posture.present.get(joint))
+                .expect("the bus rows are the nine joints");
+            assert!((armed - measured).abs() < 1e-12, "servo {id}");
         }
     }
 
-    /// A second arm in one power cycle passes, over the machine the first one
+    /// A second run in one power cycle passes, over the machine the first one
     /// left behind.
     ///
-    /// The lifecycle re-arms in every process, so this is the ordinary case and
-    /// not an unusual one: the second arm finds the RAM the first wrote — the
-    /// configured profile in the profile registers — and every servo still
-    /// holding torque at the goal it was pinned to. Nothing about that is a
-    /// disagreement with the platform's provisioning, and a sweep that judged
-    /// those registers would refuse every command after the first arm until
-    /// somebody power-cycled the unit.
-    ///
-    /// It also carries the torqued-before path end to end: the shadow assertion
-    /// is skipped for a servo that is really holding, the droop is recorded, and
-    /// the pins come off the held goals rather than off the sagged positions.
+    /// A bench command is a fresh process every time, so this is the ordinary
+    /// case and not an unusual one: the second run finds the RAM the first wrote
+    /// — the configured profile in the profile registers — and every servo still
+    /// holding torque. Nothing about that is a disagreement with the platform's
+    /// provisioning, and a sweep that judged those registers would refuse every
+    /// command after the first until somebody power-cycled the unit.
     #[test]
     fn a_second_arm_in_one_power_cycle_passes_over_the_machine_the_first_left() {
         let cfg = resolved();
@@ -1396,21 +1607,11 @@ mod tests {
 
         let drive_one = |registers: &Rc<RefCell<FakeMachine>>| {
             let mut bus = Bus::new(Spy::sharing(Rc::clone(registers)), cfg.timing);
-            let mut seq =
-                ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
             let mut clock = TestClock::default();
-            drive(
-                &mut bus,
-                &cfg.map,
-                &mut seq,
-                &mut clock,
-                action_budget(&cfg.arm),
-                &mut |_| {},
-            )
+            arm_over(&cfg, &mut bus, &mut clock, &mut |_| {})
         };
 
-        let first = drive_one(&registers).expect("a correct machine arms");
-        assert!(first.torque_before.iter().all(|on| !on));
+        drive_one(&registers).expect("a correct machine engages");
 
         // What the first arm wrote is what the second one finds: the profile
         // registers hold the configured figures, not the zero a fresh power-on
@@ -1429,21 +1630,18 @@ mod tests {
             }
         }
 
-        let second = drive_one(&registers).expect("a second arm in one power cycle passes");
-        assert!(
-            second.torque_before.iter().all(|on| *on),
-            "the second arm finds the machine holding"
-        );
-        assert!(
-            second.droop.iter().all(Option::is_some),
-            "every held servo's droop is recorded"
-        );
-        // The pins did not ratchet: the second arm pinned where the first did.
-        for joint in JointId::ALL {
-            let before = first.armed.joints.get(joint).expect("a pinned joint");
-            let after = second.armed.joints.get(joint).expect("a pinned joint");
-            assert!((before - after).abs() < 1e-12, "{joint}");
+        let second = drive_one(&registers).expect("a second run in one power cycle passes");
+        for id in cfg.map.ids() {
+            assert_eq!(
+                registers.borrow().get(id, reg_for(RegId::TorqueEnable)),
+                Some(&[1u8][..]),
+                "servo {id} is still holding"
+            );
         }
+        assert_eq!(
+            second.engage.armed.joints, second.posture.present,
+            "the pose the tick starts from is the pose that was read back"
+        );
     }
 
     /// A silent servo is silence, and the sequence stops with the refusal it
@@ -1541,18 +1739,8 @@ mod tests {
         let spy = Spy::new(machine_at(&datumed_config(), &stow_legs()));
         let registers = spy.machine();
         let mut bus = Bus::new(spy, cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
-        drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |_| {},
-        )
-        .expect("a correct machine arms");
+        arm_over(&cfg, &mut bus, &mut clock, &mut |_| {}).expect("a correct machine engages");
 
         // The legs carry the head and are tuned apart from the other three, and
         // the two profile figures differ from each other — so a lookup that
@@ -1659,18 +1847,9 @@ mod tests {
             );
         }
         let mut bus = Bus::new(Spy::new(machine), cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
-        let refused = drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |_| {},
-        )
-        .expect_err("a rail under the floor does not arm");
+        let refused = arm_over(&cfg, &mut bus, &mut clock, &mut |_| {})
+            .expect_err("a rail under the floor does not arm");
 
         assert!(
             matches!(refused, PumpError::Sequence(SeqError::VoltageLow { .. })),
@@ -1692,18 +1871,9 @@ mod tests {
     fn a_port_failure_is_not_a_machine_verdict() {
         let cfg = resolved();
         let mut bus = Bus::new(BrokenPort, cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
-        let refused = drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |_| {},
-        )
-        .expect_err("a dead port does not arm");
+        let refused = arm_over(&cfg, &mut bus, &mut clock, &mut |_| {})
+            .expect_err("a dead port does not arm");
 
         let PumpError::Bus { id, source } = refused else {
             panic!("expected a bus failure, got {refused}");
@@ -1806,18 +1976,21 @@ mod tests {
     fn the_report_names_both_records_and_the_registers() {
         let cfg = resolved();
         let (outcome, _, _) = arm(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let printed = arm_report(&outcome.expect("a correct machine arms"));
+        let summary = outcome.expect("a correct machine engages");
+        let printed = format!(
+            "{}{}",
+            engage_report(&summary.engage),
+            commission_report(&summary.commission)
+        );
 
         for expected in [
             "found",
             "armed",
             "pull-in",
-            "droop",
             "torque-on",
             "models",
             "supply",
             "health",
-            "torque was",
             "registers",
         ] {
             assert!(
@@ -1850,10 +2023,14 @@ mod tests {
         machine.set(18, reg_for(RegId::PresentPosition), &4051i32.to_le_bytes());
         let (outcome, _, _) = arm(&cfg, machine);
         let summary = outcome.expect("a parked antenna is not a refusal");
-        let printed = arm_report(&summary);
+        let printed = format!(
+            "{}{}",
+            engage_report(&summary.engage),
+            commission_report(&summary.commission)
+        );
 
-        // Two records, not one printed twice: the legs were pulled into their
-        // windows and the head pose that holds moved with them.
+        // The pulls are the legs' own, in the legs' own order, and not a row of
+        // zeros: a report that lost the pin sweep would print six of those.
         let lines: Vec<&str> = printed.lines().collect();
         let found = lines
             .iter()
@@ -1863,10 +2040,13 @@ mod tests {
             .iter()
             .position(|line| line.starts_with("armed"))
             .expect("an armed record");
-        assert_ne!(
-            lines[found + 1],
-            lines[armed + 1],
-            "the two records are different poses:\n{printed}"
+        let pulls = lines
+            .iter()
+            .find(|line| line.starts_with("pull-in"))
+            .expect("a pull-in line");
+        assert!(
+            !pulls.contains("worst 0.000"),
+            "this machine's legs were pulled:\n{printed}"
         );
 
         // The antennas read the same on both, right then left, in degrees — the
@@ -1881,14 +2061,14 @@ mod tests {
         assert!(
             printed.contains(&format!(
                 "clearance {:.3} mm",
-                summary.armed.min_margin * 1000.0
+                summary.engage.armed.min_margin * 1000.0
             )),
             "the armed clearance is printed in millimetres:\n{printed}"
         );
         assert!(
             printed.contains(&format!(
                 "head {:.4} m",
-                summary.armed.head_pose_body.translation.z
+                summary.engage.armed.head_pose_body.translation.z
             )),
             "the armed height is printed in metres:\n{printed}"
         );
@@ -1976,27 +2156,18 @@ mod tests {
         let addressed = spy.addressed();
         let registers = spy.machine();
         let mut bus = Bus::new(spy, cfg.timing);
-        let mut seq =
-            ArmSequencer::new(&cfg.arm, &cfg.motion.geom, &cfg.motion.env, &cfg.motion.fk);
         let mut clock = TestClock::default();
-        let summary = drive(
-            &mut bus,
-            &cfg.map,
-            &mut seq,
-            &mut clock,
-            action_budget(&cfg.arm),
-            &mut |_| {},
-        )
-        .expect("the fixture machine arms");
+        let summary =
+            arm_over(cfg, &mut bus, &mut clock, &mut |_| {}).expect("the fixture machine engages");
 
-        // The arm sequence's own traffic is not this half's subject.
+        // The torque-on path's own traffic is not this half's subject.
         log.borrow_mut().clear();
         grouped.borrow_mut().clear();
         addressed.borrow_mut().clear();
         Bench {
             bus,
-            state: MotionState::new_armed(&summary.armed),
-            held: summary.armed.joints,
+            state: MotionState::new_armed(&summary.engage.armed),
+            held: summary.engage.armed.joints,
             log,
             grouped,
             addressed,
@@ -2016,13 +2187,17 @@ mod tests {
 
     /// The goal register of every servo, against the angle `goal` holds for the
     /// joint that servo carries.
+    ///
+    /// A servo whose goal register is absent is holding where it stands: its
+    /// present position is the goal it is on.
     fn goals_match(cfg: &Resolved, bench: &Bench, goal: &JointVector) {
         let machine = bench.registers.borrow();
         for (row, id) in cfg.map.ids().iter().enumerate() {
             let joint = JointId::ALL[row];
             let held = machine
                 .get(*id, reg_for(RegId::GoalPosition))
-                .expect("every servo has a goal");
+                .or_else(|| machine.get(*id, reg_for(RegId::PresentPosition)))
+                .expect("every servo has a position");
             let counts = i32::from_le_bytes(held.try_into().expect("a goal is four bytes"));
             let expected = cfg
                 .map
@@ -2043,7 +2218,7 @@ mod tests {
     fn to_neutral(cfg: &Resolved) -> MotionCommand {
         MotionCommand::MoveTo {
             target: JointTargets::default(),
-            duration: cfg.up_duration,
+            durations: cfg.up_durations(),
             warp: Warp::MinJerk,
         }
     }
@@ -2064,6 +2239,41 @@ mod tests {
             &mut |event| events.push(event),
         );
         (outcome, events)
+    }
+
+    /// Run `command` on `bench`, letting `retarget` replace it mid-travel.
+    fn run_retargeting(
+        bench: &mut Bench,
+        pump: &mut MotionPump<'_>,
+        command: MotionCommand,
+        clock: &mut dyn Clock,
+        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
+    ) -> (Result<MoveSummary, PumpError>, Vec<TickEvent>) {
+        let mut events = Vec::new();
+        let outcome = pump.run_retargeting(
+            &mut bench.bus,
+            &mut bench.state,
+            command,
+            clock,
+            &mut |event| events.push(event),
+            retarget,
+        );
+        (outcome, events)
+    }
+
+    /// How many control periods a span of travel occupies at `tick_hz`.
+    fn periods_for(span: Duration, tick_hz: u32) -> u64 {
+        let period = Duration::from_secs(1) / tick_hz;
+        u64::try_from(span.as_nanos() / period.as_nanos()).expect("a small count")
+    }
+
+    /// The move back down: the stow pose, over the configured fold clock.
+    fn to_stow(cfg: &Resolved) -> MotionCommand {
+        MotionCommand::MoveTo {
+            target: crate::commands::stow_pose_targets(),
+            durations: cfg.stow_durations(),
+            warp: Warp::MinJerk,
+        }
     }
 
     /// Hold `bench` for `dwell`, collecting the events it announced.
@@ -2224,7 +2434,7 @@ mod tests {
                     antennas: [0.3, -0.3],
                     ..JointTargets::default()
                 },
-                duration: cfg.up_duration,
+                durations: cfg.up_durations(),
                 warp: Warp::MinJerk,
             },
             &mut clock,
@@ -2268,7 +2478,7 @@ mod tests {
             &mut pump,
             MotionCommand::MoveTo {
                 target,
-                duration: cfg.up_duration,
+                durations: cfg.up_durations(),
                 warp: Warp::MinJerk,
             },
             &mut clock,
@@ -2304,7 +2514,7 @@ mod tests {
             let id = cfg.map.ids()[row];
             let held = machine
                 .get(id, reg_for(RegId::GoalPosition))
-                .expect("every servo has a goal");
+                .expect("every leg was commanded");
             let counts = i32::from_le_bytes(held.try_into().expect("a goal is four bytes"));
             let pin = cfg
                 .map
@@ -2447,7 +2657,7 @@ mod tests {
                     body_yaw: 3.0,
                     ..JointTargets::default()
                 },
-                duration: cfg.up_duration,
+                durations: cfg.up_durations(),
                 warp: Warp::MinJerk,
             },
             &mut clock,
@@ -3048,6 +3258,115 @@ mod tests {
         );
     }
 
+    /// A caller that changes its mind mid-travel gets the head turned around
+    /// where it is, and the run ends at the replacement.
+    ///
+    /// Without mid-travel replacement the head must finish going up before it
+    /// can come down — an instruction arriving mid-raise is late by a whole
+    /// move. One run, one endpoint — the replacement's.
+    #[test]
+    fn a_move_replaced_part_way_ends_at_the_replacement() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+        // Well into the raise and nowhere near its end: the antennas are the
+        // discriminator below, and by here they are away from both poses.
+        let turn_at = 40;
+        let mut periods = 0;
+
+        let (outcome, events) = run_retargeting(
+            &mut bench,
+            &mut pump,
+            to_neutral(&cfg),
+            &mut clock,
+            &mut || {
+                periods += 1;
+                (periods == turn_at).then(|| to_stow(&cfg))
+            },
+        );
+        let summary = outcome.expect("the replacement carries to its own endpoint");
+
+        let retargets = events
+            .iter()
+            .filter(|event| **event == TickEvent::Command(CommandDisposition::Retargeted))
+            .count();
+        assert_eq!(retargets, 1, "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == TickEvent::Completed)
+                .count(),
+            1,
+            "the first move never completed: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .position(|event| *event == TickEvent::Completed)
+                > events
+                    .iter()
+                    .position(|event| *event == TickEvent::Command(CommandDisposition::Retargeted)),
+            "the completion is the replacement's: {events:?}"
+        );
+        // Compared as directions: the fold's antenna sweep takes the inboard
+        // arc, so the goal that arrives at −3.05 rad is the one a turn above it.
+        let ended = bench.state.last_targets().antennas;
+        for (ended, stow) in ended
+            .into_iter()
+            .zip(crate::commands::stow_pose_targets().antennas)
+        {
+            let apart = (ended - stow).rem_euclid(core::f64::consts::TAU);
+            assert!(
+                apart < 1e-9 || core::f64::consts::TAU - apart < 1e-9,
+                "the run ended commanding the pose it was turned to: {ended} against {stow}"
+            );
+        }
+        // And it ran on the *replacement's* clock. Both halves of a replacement
+        // are the caller's — targets and durations — and the fixture's two
+        // clocks differ by a second, so a run that kept the raise's clock for
+        // the fold lands fifty periods further out than this.
+        let turn_at = u64::try_from(turn_at).expect("a small count");
+        let fold = periods_for(cfg.stow_duration, cfg.tick_hz);
+        let raise = periods_for(cfg.up_duration, cfg.tick_hz);
+        assert!(
+            summary.ticks >= turn_at + fold && summary.ticks < turn_at + raise,
+            "the fold's own clock is what ran: {} periods, turned at {turn_at}, fold {fold}, \
+             raise {raise}",
+            summary.ticks,
+        );
+    }
+
+    /// Replacing the move for longer than the original command's own stall
+    /// budget is a caller changing its mind, not a loop that hung.
+    ///
+    /// The budget follows the travel still ahead, so it is re-sized by every
+    /// replacement. A fixed one sized off the first command would abort a run
+    /// that was being steered, and report it as a stall — the one failure that
+    /// says the loop stopped advancing.
+    #[test]
+    fn a_move_replaced_over_and_over_is_not_a_stall() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+        let first = to_neutral(&cfg);
+        let budget = pump.stall_budget(&first);
+        let mut periods: u64 = 0;
+
+        let (outcome, _) = run_retargeting(&mut bench, &mut pump, first, &mut clock, &mut || {
+            periods += 1;
+            (periods <= budget + 10).then(|| to_neutral(&cfg))
+        });
+        let summary = outcome.expect("a steered move is not a stalled one");
+
+        assert!(
+            periods > budget,
+            "the fixture outlasted the first command's budget: {periods} against {budget}"
+        );
+        assert!(summary.ticks > budget, "{summary:?}");
+    }
+
     /// The tick is fed what the servos report, not what they were last told.
     ///
     /// The tracking monitor is the only thing that can tell a machine holding
@@ -3228,10 +3547,17 @@ mod tests {
         for (event, expected) in [
             (TickEvent::Command(CommandDisposition::None), "no command"),
             (TickEvent::Command(CommandDisposition::Started), "moving"),
+            (
+                TickEvent::Command(CommandDisposition::Retargeted),
+                "replacing the move that was running",
+            ),
             (TickEvent::Command(CommandDisposition::Held), "holding"),
             (
                 TickEvent::Command(CommandDisposition::Rejected(
-                    CommandRejection::AlreadyMoving,
+                    CommandRejection::AntennaUnreachable {
+                        joint: JointId::AntennaLeft,
+                        angle: 1e7,
+                    },
                 )),
                 "refused",
             ),

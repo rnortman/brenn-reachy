@@ -20,16 +20,17 @@
 //!   check on the sampled target, guard the per-tick step size, and emit goals.
 //!   Failure at any stage stops commanding and reports a typed cause.
 //! - **The sequencers** are state machines for the multi-transaction procedures
-//!   that do not fit one read and one write — arming touches many registers with
-//!   read-backs. They yield one abstract request at a time and are driven to
-//!   completion by whatever owns the port.
+//!   that do not fit one read and one write — commissioning touches many
+//!   registers with read-backs. They yield one abstract request at a time and
+//!   are driven to completion by whatever owns the port.
 //!
-//! The failure policy is deliberate and is not the platform's usual one. Elsewhere
-//! "better dead than wrong" means stop; here stopping the wrong way means the head
-//! falls. So a fault **stops commanding and holds torque**, reports loudly, and
-//! stays faulted until an operator says otherwise. It never auto-recovers and never
-//! auto-releases. Releasing is always an explicit command, and always documented as
-//! dropping the head unless it is already stowed.
+//! The failure policy is the fault doctrine in `docs/fault-management.md`: the
+//! minimum risk condition is head stowed, motors unpowered, and a fault reaches
+//! it by writing torque off immediately, best-effort, per servo. Holding torque
+//! is never a fault response, and nothing anywhere may refuse or condition a
+//! torque-off write. Torque *on* is gated, minimally: the supply floor and the
+//! latched error bits, both in `arm::engage_gates`, and nothing else — where the
+//! machine happens to be standing is never among them.
 //!
 //! Motion is shaped host-side because the servos have none of their own: a goal
 //! position is applied as an immediate step. Every gentle movement in this system
@@ -48,19 +49,23 @@ pub mod tick;
 pub mod traj;
 
 pub use arm::{
-    ArmConfig, ArmRecord, ArmSequencer, ArmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    Gains, GroupGains, PinOutcome, ProfileConfig, ProvisionExpect, ProvisionReadings,
-    ProvisionTable, VENDOR_HOMING_OFFSETS, pin_goals,
+    ArmConfig, ArmRecord, CommissionSequencer, CommissionSummary, EXPECTED_MODELS,
+    EXPECTED_OPERATING_MODES, EngageSequencer, EngageSummary, Gains, GroupGains, PinOutcome,
+    PollCadence, PollSequencer, Posture, ProfileConfig, ProvisionExpect, ProvisionReadings,
+    ProvisionTable, Rail, VENDOR_HOMING_OFFSETS, engage_gates, pin_goals,
 };
-pub use disarm::{DisarmConfig, DisarmSequencer, DisarmSummary, stow_targets};
+pub use disarm::{
+    DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow, stow_targets,
+};
 pub use joints::{JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth};
 pub use seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
     Sequencer, StepContext, ValueKind,
 };
 pub use tick::{
-    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, CommandRejection, Fault, Mode,
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, CommandDisposition,
+    CommandRejection, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE, Mode,
     MotionCommand, MotionConfig, MotionState, TickInputs, TickOutputs, TickReport,
-    TrackingFaultConfig, motion_tick,
+    TrackingFaultConfig, duration_floor_s, motion_tick,
 };
-pub use traj::{Trajectory, TrajectoryError, Warp};
+pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

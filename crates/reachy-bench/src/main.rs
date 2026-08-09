@@ -6,10 +6,8 @@
 //! shape, the port, the printing and the exit code.
 //!
 //! `selftest` is read-only. Everything else writes to a servo, so everything
-//! else is behind both standing gates: a self-test record in which every case
-//! passed, and a crank datum a human wrote into the configuration. Neither is
-//! remembered state — the record is a file and the datum is a config table —
-//! and both are checked before the port is opened.
+//! else is behind the standing gate: a crank datum a human wrote into the
+//! configuration, checked before the port is opened.
 
 #![forbid(unsafe_code)]
 
@@ -18,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use reachy_bench::commands;
-use reachy_bench::config::{self, RECORD_NAME, Resolved, arm_gates};
+use reachy_bench::config::{self, RECORD_NAME, Resolved, resolve_for_commanding};
 use reachy_bench::pump::{MonotonicClock, PumpError};
 use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
@@ -31,9 +29,6 @@ const DEFAULT_CONFIG: &str = "reachy-bench.toml";
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
-    /// The explicit acceptance that the head may fall, for `off` away from
-    /// stow. Given per invocation and never stored.
-    drop_head: bool,
     /// The words that were not flags: a yaw in degrees, or two antenna angles.
     operands: Vec<String>,
 }
@@ -41,8 +36,7 @@ struct Args {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH] \
-         [--drop-head]\n\
+        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH]\n\
          \n\
          commands:\n\
          \x20 selftest              read-only: pings and register reads, no torque, no motion\n\
@@ -51,18 +45,19 @@ fn usage() -> String {
          \x20 up                    lift the head to the neutral configuration\n\
          \x20 hold                  command nothing and measure the machine holding\n\
          \x20 stow                  move to the stow configuration; torque stays on\n\
-         \x20 off                   verify at stow, settle, release torque\n\
+         \x20 off                   settle, measure against stow, release torque\n\
          \x20 yaw <deg>             rotate the body\n\
          \x20 antennas <right> <left>   move the antennas, radians\n\
          \x20 demo                  up, hold, antennas, yaw, stow, off\n\
          \n\
-         Every command but `selftest`, `provision` and `off` re-drives the whole arm\n\
-         sequence first: nothing is remembered between invocations.\n\
+         Every command but `selftest`, `provision` and `off` commissions the machine,\n\
+         polls it and takes hold of it first: nothing is remembered between\n\
+         invocations.\n\
          \n\
-         Only `off` releases torque. At stow it releases outright; anywhere else it\n\
-         refuses unless `--drop-head` says the head may fall, and with that flag it\n\
-         releases wherever the machine is — the head falls the moment it does, so take\n\
-         its weight first. That is the way out of any session, at any moment.\n\
+         `off` always releases: wherever the machine is, torque comes off and where it\n\
+         was is reported. The head settles as it goes, so take its weight if it is up.\n\
+         That is the way out of any session, at any moment. A move that *faults* also\n\
+         releases, immediately and without measuring, and the head settles then too.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -142,9 +137,8 @@ impl Command {
         }
     }
 
-    /// What this command accepts beyond its own name: how many operands, and
-    /// whether `--drop-head` authorises anything for it.
-    fn accepts(self) -> (usize, bool) {
+    /// How many operands this command takes beyond its own name.
+    fn operands(self) -> usize {
         match self {
             Self::Selftest
             | Self::Provision
@@ -152,10 +146,10 @@ impl Command {
             | Self::Up
             | Self::Hold
             | Self::Stow
-            | Self::Demo => (0, false),
-            Self::Off => (0, true),
-            Self::Yaw => (1, false),
-            Self::Antennas => (2, false),
+            | Self::Off
+            | Self::Demo => 0,
+            Self::Yaw => 1,
+            Self::Antennas => 2,
         }
     }
 }
@@ -187,12 +181,9 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Command::Stow => moving(&args, name, |resolved, port, clock, line| {
             commands::stow(resolved, port, clock, line)
         }),
-        Command::Off => {
-            let drop_head = args.drop_head;
-            moving(&args, name, move |resolved, port, clock, line| {
-                commands::off(resolved, port, drop_head, clock, line)
-            })
-        }
+        Command::Off => moving(&args, name, |resolved, port, clock, line| {
+            commands::off(resolved, port, clock, line)
+        }),
         Command::Yaw => {
             let degrees = one_number(&args, "yaw <deg>")?;
             moving(&args, name, move |resolved, port, clock, line| {
@@ -216,7 +207,6 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
-        drop_head: false,
         operands: Vec::new(),
     };
     let mut argv = argv;
@@ -225,14 +215,8 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
             args.operands.push(word);
             continue;
         }
-        // `--drop-head` is an authorisation rather than a setting, so it takes
-        // no value: there is nothing to say about it but that it was given.
-        if word == "--drop-head" {
-            args.drop_head = true;
-            continue;
-        }
-        // Every other flag takes a value, so a missing one is an operator typo
-        // rather than shorthand for anything.
+        // Every flag takes a value, so a missing one is an operator typo rather
+        // than shorthand for anything.
         let value = argv
             .next()
             .with_context(|| format!("`{word}` needs a value\n\n{}", usage()))?;
@@ -245,29 +229,20 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     Ok(args)
 }
 
-/// Refuse an invocation carrying words or authorisations this command has no
-/// use for.
+/// Refuse an invocation carrying words this command has no use for.
 ///
 /// Unknown flags are already refused by name, and a stray word is the same kind
 /// of typo: `reachy-bench stow off` would otherwise run `stow`, discard `off`,
 /// and exit success with torque still on — an operator who believes the head is
-/// released ends the session by cutting power. A discarded `--drop-head` is an
-/// authorisation the operator believes they gave.
+/// released ends the session by cutting power.
 fn check_invocation(args: &Args, command: Command) -> anyhow::Result<()> {
-    let (operands, drop_head) = command.accepts();
+    let operands = command.operands();
     let name = command.name();
     if args.operands.len() > operands {
         bail!(
             "reachy-bench: `{name}` takes {operands} operand(s), {given} given\n\n{}",
             usage(),
             given = args.operands.len(),
-        );
-    }
-    if args.drop_head && !drop_head {
-        bail!(
-            "reachy-bench: `--drop-head` authorises nothing for `{name}`; only `off` \
-             releases torque, and only it can be told the head may fall\n\n{}",
-            usage()
         );
     }
     Ok(())
@@ -369,12 +344,9 @@ where
 
 /// Write the antennas' operating mode.
 ///
-/// Behind neither standing gate, and that is the point of it: the self-test's
-/// provisioning sweep is exactly what fails on a unit whose antennas are still
-/// in single-turn mode, so a record gate here would make the repair unreachable
-/// from the failure that calls for it. The crank datum gates what moves the
-/// machine, and this moves nothing — it needs no envelope, no kinematics and no
-/// torque, so it reads the roster and the bus timing straight out of the file.
+/// Not behind the datum gate, and deliberately: this moves nothing, so it needs
+/// no envelope, no kinematics and no torque, and reads the roster and the bus
+/// timing straight out of the file.
 fn provision(args: &Args) -> anyhow::Result<()> {
     let cfg = config::load(&args.config)?;
     let map = ServoMap::new(cfg.servo_ids()?);
@@ -383,8 +355,8 @@ fn provision(args: &Args) -> anyhow::Result<()> {
     println!(
         "provision over {} at {} baud. This writes one non-volatile register on the two \
          antenna servos and moves nothing.\n\
-         Torque must be off on both — release it with `off` (or `off --drop-head`, which \
-         releases anywhere and drops the head) and take the head's weight first.",
+         Torque must be off on both — release it with `off`, which releases wherever \
+         the machine is, and take the head's weight first.",
         cfg.bus.device, timing.baud
     );
 
@@ -404,23 +376,23 @@ fn provision(args: &Args) -> anyhow::Result<()> {
 fn preamble(command: &str, device: &str, baud: u32) -> String {
     format!(
         "{command} over {device} at {baud} baud. Every command but `selftest`, `provision` and \
-         `off` verifies the nine servos, enables torque — which holds every joint where it \
-         stands — and pins it there before it moves anything; a leg outside its travel window is \
-         pulled to the nearer bound.\n\
-         Only `off` releases torque. At stow it releases outright; anywhere else it refuses \
-         unless `--drop-head` is given, and with that flag it releases wherever the machine is. \
-         The head falls the moment torque goes, so take its weight first. That is the way out \
-         of any session, at any point — no session needs to end by cutting power."
+         `off` verifies the nine servos, measures where each one is standing, pins it there and \
+         enables torque — which holds it where it stands — before it moves anything; a leg \
+         outside its travel window is pulled to the nearer bound.\n\
+         `off` always releases: wherever the machine is, torque comes off and where it was is \
+         reported. A move that faults releases too, immediately and without measuring. The head \
+         settles as it goes, so take its weight if it is up. That is the way out of any session, \
+         at any point — no session needs to end by cutting power."
     )
 }
 
-/// Run a command that writes to a servo: check the gates, open the port, and
-/// hand both to the command.
+/// Run a command that writes to a servo: resolve the configuration, open the
+/// port, and hand both to the command.
 ///
-/// Both gates are checked before the port is opened, so a refusal costs the
-/// machine nothing: the configuration must resolve — which is where the recorded
-/// crank datum is required — and the self-test record beside it must be one in
-/// which every case passed.
+/// The configuration is resolved before the port is opened, so a refusal costs
+/// the machine nothing. That is where the recorded crank datum is required —
+/// without it every converted angle is a guess, so there is nothing to command
+/// with.
 fn moving<F>(args: &Args, command: &str, run: F) -> anyhow::Result<()>
 where
     F: FnOnce(
@@ -431,7 +403,7 @@ where
     ) -> Result<(), PumpError>,
 {
     let cfg = config::load(&args.config)?;
-    let resolved = arm_gates(&cfg, &record_path(args))?;
+    let resolved = resolve_for_commanding(&cfg)?;
 
     println!(
         "{}",
@@ -457,7 +429,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
 
-    use reachy_bench::selftest::{Case, CaseResult, Outcome, SelftestRecord};
+    use reachy_bench::selftest::{Case, Outcome, SelftestRecord};
     use reachy_bus::BusPort;
 
     use super::*;
@@ -616,20 +588,6 @@ mod tests {
         assert!(refused.to_string().contains("usage:"), "{refused}");
     }
 
-    /// The head-may-fall flag is an authorisation, not a setting: it takes no
-    /// value, and it is off unless it was given.
-    #[test]
-    fn the_drop_head_flag_takes_no_value() {
-        let args = parse_args(argv(&["--drop-head", "--config", "/etc/r.toml"]))
-            .expect("a valueless flag beside a valued one parses");
-        assert!(args.drop_head);
-        assert_eq!(args.config, PathBuf::from("/etc/r.toml"));
-        assert!(args.operands.is_empty());
-
-        let args = parse_args(argv(&[])).expect("no flags is a valid invocation");
-        assert!(!args.drop_head, "the head falls only when it was asked to");
-    }
-
     /// A command's numbers are the words that are not flags, in the order they
     /// were given, and they survive being written either side of a flag.
     #[test]
@@ -710,36 +668,34 @@ mod tests {
         }
     }
 
-    /// `--drop-head` authorises a falling head during `off` and nothing else,
-    /// so every other command refuses it instead of throwing it away.
+    /// There is no flag to authorise a release: `off` releases wherever the
+    /// machine is, so an operator typing one gets it refused by name rather
+    /// than silently accepted.
     #[test]
-    fn drop_head_is_refused_by_every_command_but_off() {
-        for command in ["selftest", "provision", "arm", "up", "hold", "stow", "demo"] {
-            let refused = dispatch(argv(&[command, "--drop-head"]))
-                .expect_err("that flag authorises nothing here");
+    fn there_is_no_flag_authorising_a_release() {
+        for command in [
+            "selftest",
+            "provision",
+            "arm",
+            "up",
+            "hold",
+            "stow",
+            "off",
+            "demo",
+        ] {
+            let refused =
+                dispatch(argv(&[command, "--drop-head"])).expect_err("no such flag exists");
             let printed = refused.to_string();
             assert!(printed.contains("--drop-head"), "{command}: {printed}");
             assert!(printed.contains("usage:"), "{command}: {printed}");
         }
-
-        // The flag is not the reason `off` stops here: it got past the shape
-        // check and refused on the configuration it could not read.
-        let refused = dispatch(argv(&[
-            "off",
-            "--drop-head",
-            "--config",
-            "/nonexistent/reachy-bench.toml",
-        ]))
-        .expect_err("there is no configuration there");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("configuration"), "{printed}");
     }
 
     /// An unknown command is still refused as one, whatever else is on the
     /// line: there is no shape to check it against.
     #[test]
     fn an_unknown_command_is_refused_by_name_whatever_follows_it() {
-        let refused = dispatch(argv(&["wiggle", "3", "--drop-head"]))
+        let refused = dispatch(argv(&["wiggle", "3", "--config", "/etc/r.toml"]))
             .expect_err("nobody defined that command");
         assert!(refused.to_string().contains("wiggle"), "{refused}");
     }
@@ -754,14 +710,18 @@ mod tests {
     #[test]
     fn the_operator_text_names_the_release_that_works_from_anywhere() {
         for text in [usage(), preamble("stow", "/dev/ttyAMA3", 1_000_000)] {
-            assert!(text.contains("--drop-head"), "{text}");
+            assert!(text.contains("`off`"), "{text}");
             assert!(
-                text.contains("anywhere else") || text.contains("refuses away from stow"),
-                "the flag is named, but not what it is for: {text}"
+                text.contains("always releases") && text.contains("wherever the machine is"),
+                "the release is named, but not that it works from anywhere: {text}"
             );
             assert!(
-                text.contains("falls") || text.contains("fall"),
-                "the flag is named, but not what it costs: {text}"
+                text.contains("weight"),
+                "the release is named, but not what it costs: {text}"
+            );
+            assert!(
+                !text.contains("--drop-head"),
+                "a flag that no longer exists: {text}"
             );
         }
 
@@ -833,71 +793,36 @@ mod tests {
     }
 
     /// Without a crank datum written into the configuration, arming refuses —
-    /// before it opens anything.
+    /// before it opens anything. Every converted angle rests on it, so there is
+    /// nothing to command with.
     #[test]
     fn arming_refuses_without_a_recorded_datum() {
-        let refused = arm_gates(&example_config(false), Path::new("/nonexistent"))
+        let refused = resolve_for_commanding(&example_config(false))
             .expect_err("the shipped example resolves no datum");
         assert!(refused.to_string().contains("datum"), "{refused}");
     }
 
-    /// With a datum but no self-test record, arming refuses and says which
-    /// command produces one.
+    /// A self-test record is not consulted, present or absent, passing or not.
+    /// The registry is a diagnostic and a regression guard; the arm sequence
+    /// re-establishes on its own everything a record could assert.
     #[test]
-    fn arming_refuses_without_a_record() {
-        let refused = arm_gates(&example_config(true), &scratch_path())
-            .expect_err("there is no record at a scratch path");
-        assert!(refused.to_string().contains("selftest"), "{refused}");
-    }
+    fn no_self_test_record_is_needed_to_command_the_machine() {
+        // Nothing at this path, and nothing looks for it.
+        let empty = scratch_path();
+        assert!(!empty.exists());
 
-    /// A record with a case short of a pass refuses by name: an empty record, a
-    /// run that stopped at the case that failed, and one predating a case the
-    /// registry has since gained all fail the same way.
-    #[test]
-    fn arming_refuses_on_a_record_that_did_not_pass() {
+        // A record that passed nothing, sitting where one would be looked for,
+        // changes nothing either.
         let path = scratch_path();
         Report::new()
             .into_record(1_754_000_000)
             .save(&path)
             .expect("the scratch record is written");
-
-        let refused =
-            arm_gates(&example_config(true), &path).expect_err("an empty record passed nothing");
-        std::fs::remove_file(&path).expect("the scratch record is removed");
-        // The whole chain: the outer context says the record refused, and the
-        // refusal itself names the case.
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("port-open"), "{printed}");
-    }
-
-    /// A record in which every case passed. `admits_arm` reads the case
-    /// verdicts and nothing else, so the readings a real run also carries are
-    /// left off.
-    fn green_record() -> SelftestRecord {
-        let mut report = Report::new();
-        for case in Case::ALL {
-            report.push(CaseResult::pass(case, "a test, not a unit"));
-        }
-        report.into_record(1_754_000_000)
-    }
-
-    /// The gate's one pass case. Every other test over it is a refusal, and a
-    /// gate that refused everything — an inverted record check, a `resolve`
-    /// that stopped resolving — would leave all of them green while leaving
-    /// every host unable to arm. What comes back is the configuration the
-    /// caller then opens, so the assertions are on that.
-    #[test]
-    fn arming_admits_a_resolved_config_with_a_green_record() {
-        let path = scratch_path();
-        green_record()
-            .save(&path)
-            .expect("the scratch record is written");
-
         let cfg = example_config(true);
-        let resolved = arm_gates(&cfg, &path);
+        let resolved = resolve_for_commanding(&cfg);
         std::fs::remove_file(&path).expect("the scratch record is removed");
 
-        let resolved = resolved.expect("a resolved datum and a green record admit arming");
+        let resolved = resolved.expect("a resolved datum is the whole of it");
         assert_eq!(resolved.device, cfg.bus.device);
         assert_eq!(resolved.timing.baud, cfg.bus.baud);
     }

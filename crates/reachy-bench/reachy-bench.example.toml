@@ -73,9 +73,13 @@ health_poll_hz = 1
 # whole 2.2 rad window peaks near 0.041 rad per tick at 50 Hz.
 max_step_legs_rad = 0.05
 max_step_body_yaw_rad = 0.05
-# An antenna target resolves to within half a turn of the frame the machine is
-# in, so the longest sweep it can be asked for is π: over two seconds that peaks
-# near 0.059 rad per tick at 50 Hz, and this leaves better than double the room.
+# An antenna sweeps the way round that misses its own outboard sideways point,
+# so the longest sweep it can be asked for is just under a full turn — 6.28 rad,
+# which peaks at exactly this bound over a 1.57 s move at 50 Hz. Shorter sweeps
+# need less: the stow-to-neutral presence arc is 3.23 rad (0.81 s), and
+# re-stowing an antenna left just inboard of sideways is 4.80 rad (1.21 s).
+# Whatever `antenna_duration_s` below resolves to has to clear the floor for the
+# sweep being asked for, because exceeding this bound is a fault, not a clamp.
 max_step_antennas_rad = 0.15
 # The tracking fault, in three numbers. A joint further than the threshold from
 # its goal is examined; over a window of that many ticks it must close at least
@@ -100,6 +104,26 @@ tracking_ticks = 10
 # Consecutive ticks with no position read before the read-loss fault. Omit for
 # one second at the tick rate.
 read_loss_ticks = 50
+# The three durations below govern the head group — the head pose and the body
+# yaw, which the six legs follow. Their floor is 1.07 s: below that a
+# stow-to-neutral move steps a leg further in one 50 Hz period than
+# `max_step_legs_rad` allows, and the guard faults the move rather than trimming
+# it. Derived by sampling the move through the IK at tick rate, and pinned by a
+# reachy-motion unit test, so it moves only when the geometry or the tick rate
+# does. A configuration test checks the three values here against it.
+#
+# The *yaw* has a floor of its own, and it is the one to watch: the body turns
+# through whatever angle is asked, against `max_step_body_yaw_rad`, so the floor
+# is 37.5 × the sweep in radians ÷ 50, and it is the whole sweep that counts —
+# not the head group's usual travel. Stowing from the 60° cap this file sets
+# needs 0.79 s, and the widest sweep a command can lawfully ask for — cap to
+# cap — needs 1.57 s, which the configuration test checks the three durations
+# here against. Stowing from a body a hand spun to the half turn while the
+# machine lay limp needs 2.36 s, and `stow_duration_s = 2.0` does not cover it:
+# a stow from beyond about 153° faults on the step bound, and after the gate
+# audit a fault de-torques, so the head stops and settles. Raise this, or yaw
+# back in stages, if that matters on your bench —
+# TODO(recovery-move-clock) is the fix.
 stow_duration_s = 2.0
 # Longer than the stow move: the lift is the one motion that starts from a
 # configuration close to a singular one, and there is no reason for it to be
@@ -109,6 +133,15 @@ up_duration_s = 3.0
 # no near-singular configuration, so the length is a matter of what is
 # comfortable to watch rather than of mechanics.
 move_duration_s = 3.0
+# What the antennas take on any move. Omit — as this file does — to give them
+# whichever head-group duration the move is running on. Set it when the head
+# should be quick and the antennas should not: they are mechanically
+# independent, and the
+# antennas sweep three times as far as the head does on the same move. The floor
+# is the sweep being commanded against `max_step_antennas_rad` above, and the
+# `antennas` command here can be asked for anything up to a full turn, so a
+# bench that sets this at all wants at least 1.57 s.
+# antenna_duration_s = 1.5
 # How long `hold` watches the machine before returning: long enough for a
 # tracking fault or a health latch to appear in, short enough that a supervised
 # operator is not left waiting on a command that does nothing by design.
@@ -124,21 +157,11 @@ min_arm_voltage = 6.0
 # polling faster returns the same number twice.
 voltage_poll_period_ms = 100
 voltage_budget_s = 30.0
-# The largest distance a pin may pull a joint before arming stops and asks for a
-# human. Sized above the worst per-leg overrun in the recorded resting pose,
-# which is around 10°.
-max_pin_pull_in_deg = 12.0
-# How far a joint may be from where the arrival check expects it: either side of
-# the corridor a pulled joint travels along, or away from where an unpulled one
-# was reading a moment earlier. Several counts of the servo's own 0.088°
-# resolution — wide enough not to chase quantisation, narrow enough that real
-# motion cannot hide inside it.
-recheck_tolerance_deg = 0.5
 # How far a limp servo's goal register may sit from its measured position. With
-# torque off these servos report their goal as their present position, and
-# arming enables torque before it writes any goal — so this gate is what says a
-# joint cannot be commanded anywhere when its torque comes on. Twenty-odd times
-# the one count of read wobble the register was observed to have.
+# torque off these servos report their goal as their present position, and the
+# self-test's goal-shadow case is what checks that they do. A diagnostic, not a
+# gate: nothing on the engage path consults it. Twenty-odd times the one count of
+# read wobble the register was observed to have.
 goal_shadow_tolerance_deg = 2.0
 
 # Position gains, written fresh at every arm because they live in RAM and

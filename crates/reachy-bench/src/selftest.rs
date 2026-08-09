@@ -220,9 +220,9 @@ impl fmt::Display for CaseResult {
 ///
 /// A case answered more than once reads as its first non-passing answer. A run
 /// pushes each case once, so this only bears on a record edited or concatenated
-/// on disk between the run that wrote it and the arm that reads it —
+/// on disk between the run that wrote it and a consumer that parses it —
 /// [`SelftestRecord::parse`] refuses those outright, and taking the worse
-/// answer here means the two gates cannot disagree.
+/// answer here means the two checks cannot disagree.
 fn outcome_of(cases: &[CaseResult], case: Case) -> Outcome {
     let mut verdict = None;
     for result in cases.iter().filter(|result| result.case == case) {
@@ -362,7 +362,7 @@ impl DatumRecord {
 ///
 /// Written beside the bench configuration. It is evidence about a moment, never
 /// a cache of machine state: every fact in it is re-established against the
-/// hardware by the arm sequence before anything moves.
+/// hardware by commissioning before anything moves.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelftestRecord {
@@ -407,17 +407,14 @@ impl SelftestRecord {
         outcome_of(&self.cases, case)
     }
 
-    /// Whether this record admits arming.
+    /// Whether every case in this record passed, and which one did not.
     ///
-    /// One condition: every case passed. The datum is one of those cases, and it
-    /// passes only when all nine homing offsets are the vendor's — so a machine
-    /// whose provisioning does not establish the datum has already failed here,
-    /// and there is no second record for a configured value to contradict. That
-    /// a person reviewed the evidence is the configuration's `[datum]` table,
-    /// checked separately at load.
-    ///
-    /// TODO(selftest-staleness): a record is admitted here however old it is.
-    pub fn admits_arm(&self) -> Result<(), RecordRefusal> {
+    /// A verdict for a reader, not a gate: nothing in this workspace conditions
+    /// arming or commanding on a record. The datum is one of the cases, and it
+    /// passes only when all nine homing offsets are the vendor's; that a person
+    /// reviewed that evidence is the configuration's `[datum]` table, which is
+    /// checked at load because every converted angle rests on it.
+    pub fn every_case_passed(&self) -> Result<(), RecordRefusal> {
         if let Some((case, outcome)) = first_not_passed(&self.cases) {
             return Err(RecordRefusal::CaseNotPassed { case, outcome });
         }
@@ -837,14 +834,16 @@ impl Registry {
     /// Every limp servo's Goal Position register against the position it is
     /// reporting.
     ///
-    /// This is the precondition the arm sequence's order rests on. Arming enables
-    /// torque before it writes any goal, and that is safe only because a servo
-    /// with torque off reports its goal as its present position: at the instant
-    /// torque comes on, the target it starts holding is where it already stands,
-    /// so an enable cannot slam. A servo answering otherwise is a machine this
-    /// project has no safety argument for, and it says so here — with no torque
-    /// on and nothing written, which is why the question is asked in the
-    /// read-only half rather than discovered mid-arm.
+    /// This is the precondition the whole torque-on path rests on. A servo with
+    /// torque off reports its goal as its present position, so at the instant
+    /// torque comes on the target it starts holding is where it already stands
+    /// and an enable cannot slam. Engaging writes the measured position to every
+    /// goal register first as insurance, but that write lands nowhere on a
+    /// mirroring servo — the mirroring is the safety property and the write is
+    /// the belt beside it. A servo answering otherwise is a machine this project
+    /// has no safety argument for, and it says so here — with no torque on and
+    /// nothing written, which is why the question is asked in the read-only half
+    /// rather than discovered mid-engage.
     ///
     /// A servo found holding torque is exempt: its goal is a target it really is
     /// holding, and the gap to its present position is the sag of a loaded
@@ -1411,7 +1410,7 @@ mod runner_tests {
             "a datum is written down only when the offsets establish one"
         );
         assert!(
-            record.admits_arm().is_err(),
+            record.every_case_passed().is_err(),
             "a machine whose provisioning does not establish the datum arms nothing"
         );
     }
@@ -1804,7 +1803,7 @@ mod tests {
         // that came first.
         assert_eq!(record.outcome(Case::Voltage), Outcome::Fail);
         assert_eq!(
-            record.admits_arm(),
+            record.every_case_passed(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::Voltage,
                 outcome: Outcome::Fail,
@@ -1812,16 +1811,16 @@ mod tests {
         );
     }
 
-    /// Every case must pass before anything is commanded, and the refusal names
-    /// the case and what the record says about it.
+    /// The verdict names the first case short of a pass and what the record
+    /// says about it.
     #[test]
-    fn a_case_short_of_a_pass_refuses_arming() {
-        assert_eq!(green().admits_arm(), Ok(()));
+    fn a_case_short_of_a_pass_is_named_by_the_verdict() {
+        assert_eq!(green().every_case_passed(), Ok(()));
 
         let mut record = green();
         record.cases.retain(|result| result.case != Case::Health);
         assert_eq!(
-            record.admits_arm(),
+            record.every_case_passed(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::Health,
                 outcome: Outcome::NotRun,
@@ -1834,20 +1833,21 @@ mod tests {
                 result.outcome = Outcome::Fail;
             }
         }
-        let refusal = record.admits_arm().expect_err("a failed case refuses");
+        let refusal = record
+            .every_case_passed()
+            .expect_err("a failed case is named");
         assert!(refusal.to_string().contains("voltage"), "{refusal}");
     }
 
-    /// A record written before the goal-shadow case existed does not admit
-    /// arming.
+    /// A record written before the goal-shadow case existed does not read as a
+    /// clean sweep.
     ///
-    /// The case is the precondition the arm sequence's enable-then-pin order
-    /// rests on, and a record that never asked the question has not established
-    /// it. Nothing migrates such a file: an absent case reads as not run, which
-    /// is a failure, and re-running the self-test is what re-qualifies the
-    /// machine.
+    /// The case establishes the precondition the torque-on path rests on, and a
+    /// record that never asked the question has not established it. Nothing
+    /// migrates such a file: an absent case reads as not run, which is a
+    /// failure, and re-running the self-test is what re-answers the question.
     #[test]
-    fn a_record_predating_the_shadow_case_does_not_admit_arming() {
+    fn a_record_predating_the_shadow_case_is_not_a_clean_sweep() {
         let mut record = green();
         record
             .cases
@@ -1856,7 +1856,7 @@ mod tests {
         let read = SelftestRecord::parse(&text).expect("an older record still parses");
         assert_eq!(read.outcome(Case::GoalShadow), Outcome::NotRun);
         assert_eq!(
-            read.admits_arm(),
+            read.every_case_passed(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::GoalShadow,
                 outcome: Outcome::NotRun,
@@ -1865,10 +1865,10 @@ mod tests {
     }
 
     /// The datum is one of the cases, so a machine whose offsets do not
-    /// establish it has already failed the sweep rather than needing a second
-    /// gate of its own.
+    /// establish it has already failed the sweep rather than needing a check of
+    /// its own.
     #[test]
-    fn a_failed_datum_case_is_what_refuses_arming() {
+    fn a_failed_datum_case_is_named_by_the_verdict() {
         let mut record = green();
         for result in &mut record.cases {
             if result.case == Case::Datum {
@@ -1877,7 +1877,7 @@ mod tests {
         }
         record.datum = None;
         assert_eq!(
-            record.admits_arm(),
+            record.every_case_passed(),
             Err(RecordRefusal::CaseNotPassed {
                 case: Case::Datum,
                 outcome: Outcome::Fail,

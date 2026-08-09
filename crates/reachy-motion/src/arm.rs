@@ -1,14 +1,26 @@
-//! Arming's configuration, its two records, and the one clamp in this repo.
+//! Taking hold of the platform: commission once, poll while resting, engage in
+//! milliseconds.
 //!
-//! Arming takes a limp platform to a platform holding itself up: nine servos
-//! verified register by register, the supply rail confirmed, the resting pose
-//! solved and found plausible, every limp servo's goal register confirmed to be
-//! mirroring its present position, and only then torque enabled — which holds
-//! each joint where it stands — and goals written there. The order of those
-//! transactions is the safety property and belongs to the state machine that
-//! yields them; what lives here is what that machine decides *with* — the
-//! configuration it reads, the records it produces, and the two decisions pure
-//! enough to be settled and tested on their own.
+//! Three sequencers, in the order a process runs them.
+//!
+//! - [`CommissionSequencer`] runs once, before any torque: every servo present,
+//!   every servo the kind it should be, every provisioned register as
+//!   configured, the supply rail up, nothing latched, and the gains and profiles
+//!   written. Around two hundred transactions, not one of which touches torque.
+//! - [`PollSequencer`] is the resting watch: nine position reads, and on a
+//!   slower cadence the supply and error-bit sweeps too. It keeps a [`Posture`]
+//!   fresh — where the machine physically is, and what its rail reads — so that
+//!   engaging has nothing left to find out.
+//! - [`EngageSequencer`] is the fast path: check the posture against the two
+//!   torque-on gates, write each goal register to the position its joint was
+//!   measured at, enable torque servo by servo, and read the nine positions back
+//!   to seed the trajectory. Twenty-seven transactions — tens of milliseconds at
+//!   1 Mbaud, which is what lets a wake word raise the head.
+//!
+//! The order of those transactions is the safety property and belongs to the
+//! state machines that yield them; what lives here beside them is what they
+//! decide *with* — the configuration they read, the records they produce, and
+//! the decisions pure enough to be settled and tested on their own.
 //!
 //! ## The pin, and why it may clamp
 //!
@@ -20,9 +32,11 @@
 //! an out-of-window goal is not settled — it may refuse the write with a
 //! data-range error, or take it and clamp, and those two look nothing alike from
 //! the host. So the goal written at arm time is pinned to the nearer bound of
-//! the window by us, deliberately, with the distance recorded and a gate above
-//! which arming stops for a human. The alternative is not "no clamp"; it is a
-//! write whose effect is unknown.
+//! the window by us, deliberately, with the distance recorded. The alternative
+//! is not "no clamp"; it is a write whose effect is unknown. The distance is a
+//! report and nothing more: a machine found somewhere unexpected is measured
+//! and moved out of there, never refused, because refusing it leaves the head
+//! exactly where it was with nothing able to recover it but a hand.
 //!
 //! The antennas are not pinned into anything. They are free rotors with no
 //! travel window in the servo, no linkage behind them, and no bound on the
@@ -34,23 +48,21 @@
 //!
 //! ## Two records, not one blur
 //!
-//! Arming produces two descriptions of the machine and they are not the same
-//! pose. The **rest** record is where the platform was found — the report's
-//! evidence, and the reason a tight rest does not refuse arming. The **armed**
-//! record is what arming left it holding, which is the rest pulled into every
-//! travel window. The tick starts from the armed record alone: a tick whose
+//! Engaging produces two descriptions of the machine and they are not the same
+//! pose. The **rest** record is where the poll found the platform — the report's
+//! evidence, and the reason a strange rest does not refuse anything. The
+//! **armed** record is where the nine servos reported themselves once their
+//! torque was on. The tick starts from the armed record alone: a tick whose
 //! goals came from one pose and whose Cartesian mirror came from the other would
 //! hand its first trajectory a start the machine is not at.
 
-use core::f64::consts::PI;
 use core::fmt;
 use core::time::Duration;
 
 use nalgebra::Isometry3;
 use reachy_kin::{
-    EnvelopeConfig, EnvelopeReport, EnvelopeViolations, FkError, FkOptions, HeadGeometry,
-    LegAngles, below_limit, check_envelope, forward_kinematics, min_margin, neutral_head_pose,
-    outside_limit, pose_margins, rest_head_pose, stow_head_pose,
+    FkError, FkOptions, HeadGeometry, LegAngles, below_limit, forward_kinematics, min_margin,
+    neutral_head_pose, pose_margins, rest_head_pose, stow_head_pose,
 };
 
 use crate::joints::{JointId, JointVector, ServoHealth};
@@ -111,7 +123,7 @@ pub const EXPECTED_OPERATING_MODES: [u8; JointId::COUNT] = [3, 3, 3, 3, 3, 3, 3,
 pub const VENDOR_HOMING_OFFSETS: [i32; JointId::COUNT] =
     [0, 1024, -1024, 1024, -1024, 1024, -1024, 0, 0];
 
-/// The supply floor arming refuses to proceed below, volts.
+/// The supply floor torque is not switched on below, volts.
 ///
 /// Provisional. It is a round number above the point where the servos' own
 /// minimum-voltage alarm sits, not a measurement: what the rail does under the
@@ -120,50 +132,15 @@ pub const VENDOR_HOMING_OFFSETS: [i32; JointId::COUNT] =
 /// TODO(rail-curve)
 pub const DEFAULT_MIN_ARM_VOLTAGE: f64 = 6.0;
 
-/// How often the supply voltage is re-read while waiting for the rail.
+/// How often the supply voltage is re-read while commissioning waits for the
+/// rail.
 ///
 /// The servos update their own voltage reading about ten times a second, so
 /// polling faster would return the same number twice.
 pub const DEFAULT_VOLTAGE_POLL_PERIOD: Duration = Duration::from_millis(100);
 
-/// How long arming waits for the rail before giving up.
+/// How long commissioning waits for the rail before giving up.
 pub const DEFAULT_VOLTAGE_BUDGET: Duration = Duration::from_secs(30);
-
-/// The largest distance a pin may pull a joint, radians (12°).
-///
-/// Sized above the worst per-leg overrun in the recorded resting pose, which is
-/// around 10°. A pull beyond this is not the documented case any more, and
-/// arming stops rather than dragging the head somewhere nobody predicted.
-pub const DEFAULT_MAX_PIN_PULL_IN: f64 = 12.0 * PI / 180.0;
-
-/// How far a joint may be from where the arrival check expects it, radians
-/// (0.5°).
-///
-/// It bounds two things: how far an unpulled joint may have moved between the
-/// read that follows torque coming on and the read that follows its goal being
-/// written — two readings taken under the same load, so the standing position
-/// error of a loaded proportional loop cancels out of the comparison and this
-/// figure does not have to cover it — and how far outside the corridor between
-/// those two readings a pulled joint may sit. The far end of that corridor is
-/// the goal, so on a pulled joint alone this figure does bound the standing
-/// error, in the direction the pull went. The figure is provisional: several
-/// counts of the servo's own 0.088° resolution, wide enough not to chase
-/// quantisation and narrow enough that real motion cannot hide inside it.
-pub const DEFAULT_RECHECK_TOLERANCE: f64 = 0.5 * PI / 180.0;
-
-/// How far an untorqued servo's goal register may sit from its measured
-/// position before arming refuses, radians (2°).
-///
-/// With torque off this platform's servos report Goal Position as their present
-/// position rather than as a stored target: a goal written before torque came on
-/// read back one count — 0.088° — from what was written, which is read wobble on
-/// a mirrored present and not a value the register kept. Arming depends on that
-/// mirroring, because it is what makes enabling torque safe: at the instant of
-/// enable the goal is where the joint already is, so no servo can slam. This is
-/// the gate that check runs against. Twenty-odd times the observed one-count
-/// wobble, and still far under the motion a hand would put into a joint between
-/// the position read and the enable.
-pub const DEFAULT_GOAL_SHADOW_TOLERANCE: f64 = 2.0 * PI / 180.0;
 
 /// The position loop's three gains for one servo.
 ///
@@ -400,14 +377,6 @@ pub struct ArmConfig {
     pub gains: GroupGains,
     /// The servo-side profile written alongside the gains.
     pub profile: ProfileConfig,
-    /// The largest pull a pin may apply, radians.
-    pub max_pin_pull_in: f64,
-    /// How far the arrival check tolerates a joint being from where it expects
-    /// it, radians.
-    pub recheck_tolerance: f64,
-    /// How far an untorqued servo's goal register may sit from its measured
-    /// position, radians.
-    pub goal_shadow_tolerance: f64,
     /// Each leg's travel window in model radians: the window the servo itself
     /// refuses to be commanded past, which is what a pin pins into.
     ///
@@ -455,9 +424,9 @@ impl PinOutcome {
 /// are pinned where they stand: the yaw servo's provisioned range is the whole
 /// turn and a body outside its cap is a state a hand made and a hand undoes, and
 /// an antenna is a free rotor whose reading is a direction in a continuous frame
-/// with no bound anywhere to bring it inside. A leg pulled beyond
-/// `cfg.max_pin_pull_in` stops arming, and so does a measured angle nobody can
-/// place: pinning a goal to a value that is not a number would send a
+/// with no bound anywhere to bring it inside. How far each leg was pulled is
+/// recorded and never judged. What does stop arming is a measured angle nobody
+/// can place: pinning a goal to a value that is not a number would send a
 /// meaningless write to a servo about to take the head's weight.
 pub fn pin_goals(cfg: &ArmConfig, present: &JointVector) -> Result<PinOutcome, SeqError> {
     pin_goals_from(cfg, present, present)
@@ -470,12 +439,10 @@ pub fn pin_goals(cfg: &ArmConfig, present: &JointVector) -> Result<PinOutcome, S
 /// present position, brought into range. They differ for a servo found already
 /// holding torque, whose honest pin is the target it is holding rather than the
 /// position it has sagged to under load — pinning at the sag would lower the
-/// target by that sag on every re-arm. The pull, and the gate on it, stay
-/// measured against where the joint actually is, so a *leg* whose held goal sits
-/// implausibly far from its measured position is refused rather than written.
-/// The gate is the legs' alone: body yaw and the antennas are pinned at their
-/// basis untouched, so on those three a held goal is bounded by nothing nearer
-/// than the envelope's own body-yaw cap.
+/// target by that sag on every re-arm. The pull stays measured against where the
+/// joint actually is, so the figure recorded for a leg says how far the write is
+/// about to move it. The legs alone carry one: body yaw and the antennas are
+/// pinned at their basis untouched.
 pub fn pin_goals_from(
     cfg: &ArmConfig,
     basis: &JointVector,
@@ -498,10 +465,9 @@ pub fn pin_goals_from(
 
     let mut pinned = *basis;
     let mut pull_in = [0.0; 6];
-    // Walked in bus order, so the joint named, the servo addressed and the leg
-    // pinned all come from the one ordering table rather than from an offset
-    // restated here.
-    for (row, (joint, target)) in basis.joints().into_iter().enumerate() {
+    // Walked in bus order, so the joint named and the leg pinned both come from
+    // the one ordering table rather than from an offset restated here.
+    for (joint, target) in basis.joints() {
         let JointId::Leg(leg) = joint else { continue };
         let leg = usize::from(leg);
         let (low, high) = cfg.leg_windows[leg];
@@ -515,15 +481,6 @@ pub fn pin_goals_from(
         };
         pinned.legs[leg] = angle;
         pull_in[leg] = (angle - measured.legs[leg]).abs();
-
-        if outside_limit(pull_in[leg], cfg.max_pin_pull_in) {
-            return Err(SeqError::PullInTooLarge {
-                context: StepContext::reg(SeqStep::PinAndEnable, cfg.ids[row], RegId::GoalPosition),
-                joint,
-                pull_in: pull_in[leg],
-                limit: cfg.max_pin_pull_in,
-            });
-        }
     }
 
     Ok(PinOutcome { pinned, pull_in })
@@ -622,85 +579,192 @@ impl ProvisionReadings {
     }
 }
 
-/// What arming found, and what it left the machine holding.
+/// What commissioning established about the machine.
 ///
-/// The bring-up output of a whole arm sequence: two records of the platform, the
-/// distances the pin had to pull, and every register-of-record read on the way.
-/// Held by value so a report can be printed after the sequencer is gone.
+/// Every register of record a bring-up wants written down, and nothing about
+/// where the platform is standing: the pose is the poll's subject and changes
+/// under a hand, while these are facts about how the unit was set up. Held by
+/// value so a report can be printed after the sequencer is gone.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ArmSummary {
-    /// Where the platform was found, before anything was pinned.
-    pub rest: ArmRecord,
-    /// What it was left holding, and what a tick starts from.
-    pub armed: ArmRecord,
-    /// Per leg, how far the first pin pulled it, radians.
-    pub pull_in: [f64; 6],
-    /// Per servo found already holding torque, its goal less its measured
-    /// position, radians; `None` for a servo found limp, whose goal register is
-    /// a mirror of its present position and says nothing.
-    ///
-    /// The standing position error of a loaded servo running a proportional
-    /// term alone. Nothing acts on it — it is the first measurement of a
-    /// quantity the tracking threshold is currently a guess about.
-    pub droop: [Option<f64>; JointId::COUNT],
-    /// Per joint, its position after torque came on less the position it was
-    /// resting at, radians.
-    ///
-    /// Enabling torque in position mode can renormalise a servo's reported
-    /// position onto a single turn, which shows up here as a jump of about a
-    /// whole turn on a joint that had settled past the half. Recorded rather
-    /// than refused: the pins are computed from the post-enable reading, so
-    /// whatever this says has already been absorbed.
-    pub post_enable_shift: [f64; JointId::COUNT],
+pub struct CommissionSummary {
     /// Each servo's model number, in bus order.
     pub models: [u16; JointId::COUNT],
-    /// Each servo's supply reading from the sweep that passed the gate, volts.
-    pub voltages: [f64; JointId::COUNT],
-    /// Each servo's hardware-error byte, as read.
-    pub health: [ServoHealth; JointId::COUNT],
-    /// Whether each servo was already holding torque when arming found it.
-    pub torque_before: [bool; JointId::COUNT],
+    /// The supply and error-bit readings commissioning finished on.
+    pub rail: Rail,
     /// The provisioned registers as they were found.
     pub provisioned: ProvisionReadings,
     /// How many sweeps the voltage gate took.
     pub voltage_polls: u32,
 }
 
-impl ArmSummary {
+/// The supply and the latched error bits, as one sweep read them.
+///
+/// The two torque-on gates read from here rather than from the wire, which is
+/// what makes engaging fast: the readings are already in hand from the resting
+/// watch, so the gate is arithmetic instead of eighteen transactions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rail {
+    /// Each servo's supply reading, volts.
+    pub voltages: [f64; JointId::COUNT],
+    /// Each servo's hardware-error byte, as read.
+    pub health: [ServoHealth; JointId::COUNT],
+}
+
+/// Where the machine is, and what its rail reads: one sweep of the resting
+/// watch.
+///
+/// Kept fresh while the platform rests limp, because a hand can move the head
+/// and the next engage plans from wherever it actually is. Never a verdict —
+/// nothing in a posture refuses anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Posture {
+    /// The nine measured angles, in bus order.
+    pub present: JointVector,
+    /// The supply and error bits: re-read by this sweep on the slow cadence,
+    /// carried over from the last one otherwise.
+    pub rail: Rail,
+    /// Whether this sweep read the rail itself rather than carrying it.
+    pub rail_read: bool,
+}
+
+/// What engaging wrote, and where it left the machine standing.
+///
+/// Two records of the platform, because they are different poses whenever a pin
+/// had to pull a joint or torque coming on moved one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EngageSummary {
+    /// Where the poll found the platform, before anything was written.
+    pub rest: ArmRecord,
+    /// Where the nine servos reported themselves once torque was on, and what a
+    /// tick starts from.
+    pub armed: ArmRecord,
+    /// The goals written to the servos, and how far each pin pulled a leg.
+    pub pins: PinOutcome,
+    /// Per joint, its position after torque came on less the position it was
+    /// resting at, radians.
+    ///
+    /// Enabling torque in position mode can renormalise a servo's reported
+    /// position onto a single turn, which shows up here as a jump of about a
+    /// whole turn on a joint that had settled past the half. Recorded rather
+    /// than refused: the armed record is read back after the enables, so
+    /// whatever this says is already in the pose the tick starts from.
+    pub post_enable_shift: [f64; JointId::COUNT],
+}
+
+impl EngageSummary {
     /// The largest distance the pin pulled any leg, radians. The legs alone:
     /// nothing else is pulled.
     #[must_use]
     pub fn worst_pull_in(&self) -> f64 {
-        self.pull_in.iter().copied().fold(0.0, f64::max)
+        self.pins.worst_pull_in()
     }
 }
 
-/// What the pin phase decided, carried by the phases that act on it.
+/// The two torque-on gates, against the readings a poll already has in hand.
 ///
-/// In the phase rather than beside it so that being in a pinning phase without
-/// pins to write is not a state this type can express.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Pinning {
-    /// The resting record the pins were computed from, and the solver seed.
-    rest: ArmRecord,
-    /// The angles the pins were clamped from: each servo's measured position,
-    /// or the goal a servo found holding torque is already holding.
-    basis: JointVector,
-    /// The goals currently written, or about to be.
-    pins: PinOutcome,
-    /// The pose those goals hold.
-    armed: ArmRecord,
-    /// Per leg, how far the pins will pull it off the position it was measured
-    /// at, radians.
-    pull_in: [f64; 6],
+/// The whole enumeration of what may stand between a request to move and torque
+/// coming on: a rail too low to lift the head without browning out, and a servo
+/// that has latched a hardware error. The machine's position is deliberately not
+/// among them — where it stands is measured and planned from, never refused —
+/// and nothing whatsoever gates torque going *off*.
+///
+/// A refusal here is an expected error, not a fault: nothing has been written,
+/// the machine is exactly where it was, and the next request tries again.
+pub fn engage_gates(cfg: &ArmConfig, rail: &Rail) -> Result<(), SeqError> {
+    let limit = cfg.min_arm_voltage;
+    if let Some((row, lowest)) = worst_below(&rail.voltages, limit) {
+        return Err(SeqError::SupplyBelowFloor {
+            context: StepContext::reg(
+                SeqStep::VoltageGate,
+                cfg.ids[row],
+                RegId::PresentInputVoltage,
+            ),
+            readings: rail.voltages,
+            lowest,
+            limit,
+        });
+    }
+
+    for (row, health) in rail.health.iter().enumerate() {
+        // No reboot, ever, and no clearing of the latch: a servo holding this
+        // head that is rebooted drops it.
+        if !health.healthy_or_voltage_only() {
+            return Err(SeqError::UnhealthyServo {
+                context: StepContext::reg(
+                    SeqStep::Health,
+                    cfg.ids[row],
+                    RegId::HardwareErrorStatus,
+                ),
+                bits: health.bits,
+            });
+        }
+    }
+    Ok(())
 }
 
-/// Which part of the sequence is running, and the cursor within it.
+/// The worst reading of a sweep that is under `limit`, and the row it came from.
+///
+/// The worst, not the first one under: the nine servos sit on different lengths
+/// of wiring and read differently, and the servo a report names has to be the
+/// one worst off. A reading nobody can place wins outright — `below_limit` is
+/// the bound test the whole project uses, so a NaN counts as "not up" rather
+/// than passing every comparison by default.
+///
+/// One home for the ordering, because both places that judge the rail — the
+/// supply gate commissioning polls against a budget, and the torque-on gate that
+/// judges the last resting sweep — have to agree about what "worst" means.
+fn worst_below(readings: &[f64; JointId::COUNT], limit: f64) -> Option<(usize, f64)> {
+    let mut low: Option<(usize, f64)> = None;
+    for (row, value) in readings.iter().copied().enumerate() {
+        if !below_limit(value, limit) {
+            continue;
+        }
+        let worse = match low {
+            None => true,
+            Some((_, lowest)) => lowest.is_finite() && (!value.is_finite() || value < lowest),
+        };
+        if worse {
+            low = Some((row, value));
+        }
+    }
+    low
+}
+
+/// Decode one servo's supply reading into its row of a rail sweep.
+///
+/// The rail's shape is a fact about the machine and not about which sequencer is
+/// asking, so commissioning's sweep and the resting watch's read it through the
+/// same pair of functions.
+fn absorb_volts(
+    row: usize,
+    into: &mut [f64; JointId::COUNT],
+    context: StepContext,
+    result: &BusResult,
+) -> Result<(), SeqError> {
+    into[row] = result.value(context)?.volts(context)?;
+    Ok(())
+}
+
+/// Decode one servo's latched error byte into its row of a rail sweep.
+fn absorb_health_bits(
+    row: usize,
+    id: u8,
+    into: &mut [ServoHealth; JointId::COUNT],
+    context: StepContext,
+    result: &BusResult,
+) -> Result<(), SeqError> {
+    into[row] = ServoHealth {
+        id,
+        bits: result.value(context)?.u8(context)?,
+    };
+    Ok(())
+}
+
+/// Which part of commissioning is running, and the cursor within it.
 ///
 /// Read phases carry a cursor over the nine servos; the provisioning sweep's
-/// cursor walks servos × registers; the write phases' cursors walk servos ×
-/// registers likewise. What each phase has learned travels in the phase where a
-/// later phase depends on it, and in the records otherwise.
+/// cursor walks servos × registers; the write phase's cursor walks servos ×
+/// registers likewise.
 #[derive(Clone, Copy, Debug)]
 enum Phase {
     Presence {
@@ -720,38 +784,10 @@ enum Phase {
     Health {
         cursor: usize,
     },
-    Pose {
-        cursor: usize,
-    },
-    Torque {
-        cursor: usize,
-        rest: ArmRecord,
-    },
-    GoalShadow {
-        cursor: usize,
-        rest: ArmRecord,
-    },
     GainsProfiles {
         cursor: usize,
-        rest: ArmRecord,
     },
-    Enable {
-        cursor: usize,
-        pinning: Pinning,
-    },
-    PostEnable {
-        cursor: usize,
-        pinning: Pinning,
-    },
-    PinGoals {
-        cursor: usize,
-        pinning: Pinning,
-    },
-    Arrival {
-        cursor: usize,
-        pinning: Pinning,
-    },
-    Complete(Pinning),
+    Complete,
     Failed(SeqError),
 }
 
@@ -764,62 +800,25 @@ impl Phase {
             Self::Provision { .. } => SeqStep::Provision,
             Self::Voltage { .. } => SeqStep::VoltageGate,
             Self::Health { .. } => SeqStep::Health,
-            Self::Pose { .. } => SeqStep::PoseAndDatum,
-            Self::Torque { .. } => SeqStep::StateDiscovery,
-            Self::GoalShadow { .. } => SeqStep::GoalShadow,
-            Self::GainsProfiles { .. } => SeqStep::GainsProfiles,
-            // The enable, the read that follows it, the goals and the arrival
-            // check are one phase as far as a report is concerned: they are the
-            // same decision, and the register named in the context is what
-            // separates them.
-            Self::Enable { .. }
-            | Self::PostEnable { .. }
-            | Self::PinGoals { .. }
-            | Self::Arrival { .. }
-            | Self::Complete(_) => SeqStep::PinAndEnable,
+            Self::GainsProfiles { .. } | Self::Complete => SeqStep::GainsProfiles,
             // A failure already carries the phase it happened in; taking the
             // name from anywhere else would report a supply gate that refused
-            // as a pin that never happened.
+            // as a write that never happened.
             Self::Failed(error) => error.context().step,
         }
     }
 }
 
-/// Everything the phases accumulate that no later phase needs in hand.
+/// Everything commissioning's phases accumulate that no later phase needs in
+/// hand.
 #[derive(Clone, Copy, Debug, Default)]
 struct Records {
     absent: [bool; JointId::COUNT],
     models: [u16; JointId::COUNT],
     voltages: [f64; JointId::COUNT],
     health: [ServoHealth; JointId::COUNT],
-    torque: [bool; JointId::COUNT],
     provisioned: ProvisionReadings,
-    present: JointVector,
-    goal: JointVector,
-    droop: [Option<f64>; JointId::COUNT],
-    post_enable: JointVector,
-    post_enable_shift: [f64; JointId::COUNT],
-    arrival: JointVector,
     polls: u32,
-}
-
-/// The bus row a set of envelope violations is best reported against.
-///
-/// The verdict names every failing check itself; this picks the one servo a
-/// report has room to address, in the order a reader would want it: the leg or
-/// the body whose own bound failed first, and the whole-pose checks — attitude
-/// and head-relative yaw — against the first crank, since they belong to the six
-/// legs together and a context names one servo.
-fn first_violated_row(violations: &EnvelopeViolations) -> usize {
-    for leg in 0..6 {
-        if violations.unreachable[leg] || violations.window[leg] {
-            return 1 + leg;
-        }
-    }
-    if violations.body_yaw {
-        return 0;
-    }
-    1
 }
 
 /// The angle at one row of the bus order.
@@ -845,51 +844,52 @@ fn rest_pose_seeds() -> [Isometry3<f64>; 3] {
     [stow_head_pose(), rest_head_pose(), neutral_head_pose()]
 }
 
-/// Arming, as a state machine that touches no port.
+/// The poses the post-enable solve is seeded from: the pose the machine was
+/// resting at, and then the standing list.
 ///
-/// Ten phases in a fixed order, one transaction at a time: every servo present,
+/// The resting record first, because the machine has ordinarily moved by a
+/// settle at most and that is a close solve. The standing seeds follow it rather
+/// than being replaced by it: torque coming on can renormalise a reported frame
+/// by a whole turn, and a solve that only ever tried the pose from before that
+/// would refuse a machine that is fine. Built from [`rest_pose_seeds`] so the
+/// two solves cannot drift apart — a pose the resting solve reaches and the
+/// armed one does not is a machine that engages and then refuses its own
+/// read-back.
+fn armed_pose_seeds(rest: Isometry3<f64>) -> [Isometry3<f64>; 4] {
+    let [stow, resting, neutral] = rest_pose_seeds();
+    [rest, stow, resting, neutral]
+}
+
+/// Commissioning, as a state machine that touches no port.
+///
+/// Six phases in a fixed order, one transaction at a time: every servo present,
 /// every servo the kind it should be, every provisioned register as configured,
-/// the supply up, nothing latched, the resting pose solved, the torque states
-/// recorded, every limp servo's goal register found mirroring its present
-/// position, the gains and profiles written, and only then torque enabled and
-/// the goals written.
+/// the supply up, nothing latched, and the gains and profiles written.
 ///
-/// The order is the safety property, and it is three properties: no write of any
-/// kind happens before the supply gate; every goal-shadow read happens before
-/// any torque is enabled; and no goal is written until torque is on. The first
-/// two are what make the third safe. A servo whose goal register mirrors its
-/// present position cannot slam when its torque comes on, because the target it
-/// picks up is where it already stands — and a goal written before that would
-/// not be stored anyway, since the register only keeps writes once torque is on.
-/// So the write that means anything is the one after the enable, and it is
-/// verified count-exact.
+/// **Torque is never touched here**, in either direction, and no position is
+/// read: this establishes that the machine on the bus is the machine this
+/// process was configured for, and stops there. It runs once per process, so its
+/// two hundred transactions are paid at startup rather than on every wake — the
+/// whole reason engaging is fast.
+///
+/// The one order property is that no write of any kind happens before the supply
+/// gate: the gains and profiles go into servo RAM, and writing them across a rail
+/// that is browning out is how a servo ends up holding half a configuration.
 ///
 /// It lives here, in one readable sequence, testable against scripted replies.
-pub struct ArmSequencer {
+pub struct CommissionSequencer {
     cfg: ArmConfig,
-    geom: HeadGeometry,
-    env: EnvelopeConfig,
-    fk: FkOptions,
     phase: Phase,
     pending: Option<BusRequest>,
     records: Records,
 }
 
-impl ArmSequencer {
+impl CommissionSequencer {
     /// A sequence ready to run against `cfg`.
-    ///
-    /// The geometry, the envelope and the solver options come separately because
-    /// the two records arming produces are solved poses, not angles, and because
-    /// the pose arming leaves the machine holding is checked against the same
-    /// fence the tick will enforce on every command afterwards. All three have to
-    /// be the ones the tick uses.
     #[must_use]
-    pub fn new(cfg: &ArmConfig, geom: &HeadGeometry, env: &EnvelopeConfig, fk: &FkOptions) -> Self {
+    pub fn new(cfg: &ArmConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            geom: geom.clone(),
-            env: *env,
-            fk: *fk,
             phase: Phase::Presence { cursor: 0 },
             pending: None,
             records: Records::default(),
@@ -911,12 +911,8 @@ impl ArmSequencer {
         }
     }
 
-    fn context(&self, row: usize, reg: RegId) -> StepContext {
-        StepContext::reg(self.phase.step(), self.cfg.ids[row], reg)
-    }
-
     /// The next action, given the previous transaction's result.
-    fn emit(&mut self, now: Duration) -> SeqAction<ArmSummary> {
+    fn emit(&mut self, now: Duration) -> SeqAction<CommissionSummary> {
         let request = match self.phase {
             Phase::Presence { cursor } => BusRequest::Ping {
                 id: self.cfg.ids[cursor],
@@ -943,10 +939,7 @@ impl ArmSequencer {
                 self.read(cursor, RegId::PresentInputVoltage)
             }
             Phase::Health { cursor } => self.read(cursor, RegId::HardwareErrorStatus),
-            Phase::Pose { cursor } => self.read(cursor, RegId::PresentPosition),
-            Phase::Torque { cursor, .. } => self.read(cursor, RegId::TorqueEnable),
-            Phase::GoalShadow { cursor, .. } => self.read(cursor, RegId::GoalPosition),
-            Phase::GainsProfiles { cursor, .. } => {
+            Phase::GainsProfiles { cursor } => {
                 if cursor < JointId::COUNT {
                     let gains = self.cfg.gains.for_joint(JointId::ALL[cursor]);
                     self.write(cursor, RegId::PositionGains, gains.into())
@@ -966,34 +959,20 @@ impl ArmSequencer {
                     self.write(index / 2, reg, value)
                 }
             }
-            Phase::Enable { cursor, .. } => {
-                self.write(cursor, RegId::TorqueEnable, RegValue::U8(1))
-            }
-            Phase::PostEnable { cursor, .. } | Phase::Arrival { cursor, .. } => {
-                self.read(cursor, RegId::PresentPosition)
-            }
-            Phase::PinGoals { cursor, pinning } => {
-                let goal = RegValue::Radians(angle_at(&pinning.pins.pinned, cursor));
-                self.write(cursor, RegId::GoalPosition, goal)
-            }
-            Phase::Complete(pinning) => return SeqAction::Done(self.summary(&pinning)),
+            Phase::Complete => return SeqAction::Done(self.summary()),
             Phase::Failed(error) => return SeqAction::Fail(error),
         };
         self.pending = Some(request);
         SeqAction::Transact(request)
     }
 
-    fn summary(&self, pinning: &Pinning) -> ArmSummary {
-        ArmSummary {
-            rest: pinning.rest,
-            armed: pinning.armed,
-            pull_in: pinning.pull_in,
-            droop: self.records.droop,
-            post_enable_shift: self.records.post_enable_shift,
+    fn summary(&self) -> CommissionSummary {
+        CommissionSummary {
             models: self.records.models,
-            voltages: self.records.voltages,
-            health: self.records.health,
-            torque_before: self.records.torque,
+            rail: Rail {
+                voltages: self.records.voltages,
+                health: self.records.health,
+            },
             provisioned: self.records.provisioned,
             voltage_polls: self.records.polls,
         }
@@ -1026,55 +1005,17 @@ impl ArmSequencer {
                 cursor, started, ..
             } => self.absorb_voltage(now, cursor, started, context, result),
             Phase::Health { cursor } => self.absorb_health(cursor, context, result),
-            Phase::Pose { cursor } => self.absorb_pose(cursor, context, result),
-            Phase::Torque { cursor, rest } => self.absorb_torque(cursor, rest, context, result),
-            Phase::GoalShadow { cursor, rest } => {
-                self.absorb_goal_shadow(cursor, rest, context, result)
-            }
-            Phase::GainsProfiles { cursor, rest } => {
+            Phase::GainsProfiles { cursor } => {
                 confirm_write(result, &request, context)?;
                 self.phase = if cursor + 1 < 3 * JointId::COUNT {
-                    Phase::GainsProfiles {
-                        cursor: cursor + 1,
-                        rest,
-                    }
+                    Phase::GainsProfiles { cursor: cursor + 1 }
                 } else {
-                    return self.enter_enable(rest);
+                    Phase::Complete
                 };
                 Ok(())
-            }
-            Phase::Enable { cursor, pinning } => {
-                confirm_write(result, &request, context)?;
-                self.phase = if cursor + 1 < JointId::COUNT {
-                    Phase::Enable {
-                        cursor: cursor + 1,
-                        pinning,
-                    }
-                } else {
-                    Phase::PostEnable { cursor: 0, pinning }
-                };
-                Ok(())
-            }
-            Phase::PostEnable { cursor, pinning } => {
-                self.absorb_post_enable(cursor, pinning, context, result)
-            }
-            Phase::PinGoals { cursor, pinning } => {
-                confirm_write(result, &request, context)?;
-                self.phase = if cursor + 1 < JointId::COUNT {
-                    Phase::PinGoals {
-                        cursor: cursor + 1,
-                        pinning,
-                    }
-                } else {
-                    Phase::Arrival { cursor: 0, pinning }
-                };
-                Ok(())
-            }
-            Phase::Arrival { cursor, pinning } => {
-                self.absorb_arrival(cursor, pinning, context, result)
             }
             // Terminal: nothing is ever outstanding, so this is unreachable.
-            Phase::Complete(_) | Phase::Failed(_) => Ok(()),
+            Phase::Complete | Phase::Failed(_) => Ok(()),
         }
     }
 
@@ -1210,7 +1151,7 @@ impl ArmSequencer {
         context: StepContext,
         result: &BusResult,
     ) -> Result<(), SeqError> {
-        self.records.voltages[cursor] = result.value(context)?.volts(context)?;
+        absorb_volts(cursor, &mut self.records.voltages, context, result)?;
         if cursor + 1 < JointId::COUNT {
             self.phase = Phase::Voltage {
                 cursor: cursor + 1,
@@ -1221,26 +1162,7 @@ impl ArmSequencer {
         }
         self.records.polls += 1;
         let limit = self.cfg.min_arm_voltage;
-        // The worst reading of the sweep, not the first one under the floor: the
-        // nine servos sit on different lengths of wiring and read differently, and
-        // the servo a report names has to be the one worst off. A reading nobody
-        // can place wins outright — `below_limit` is the bound test the whole
-        // project uses, so a NaN counts as "not up" rather than passing every
-        // comparison by default.
-        let mut low: Option<(usize, f64)> = None;
-        for (row, volts) in self.records.voltages.iter().copied().enumerate() {
-            if !below_limit(volts, limit) {
-                continue;
-            }
-            let worse = match low {
-                None => true,
-                Some((_, lowest)) => lowest.is_finite() && (!volts.is_finite() || volts < lowest),
-            };
-            if worse {
-                low = Some((row, volts));
-            }
-        }
-        let Some((row, lowest)) = low else {
+        let Some((row, lowest)) = worst_below(&self.records.voltages, limit) else {
             self.phase = Phase::Health { cursor: 0 };
             return Ok(());
         };
@@ -1266,394 +1188,55 @@ impl ArmSequencer {
         Ok(())
     }
 
+    /// One servo's latched error byte, recorded and not judged.
+    ///
+    /// A latch refuses torque coming on, and that refusal lives in
+    /// [`engage_gates`] where the rest of the torque-on gates are. Refusing here
+    /// as well would stop a process from commissioning at all over a servo that
+    /// is hurting nothing while the machine rests limp — and would give one gate
+    /// two sites to be inconsistent at.
     fn absorb_health(
         &mut self,
         cursor: usize,
         context: StepContext,
         result: &BusResult,
     ) -> Result<(), SeqError> {
-        let bits = result.value(context)?.u8(context)?;
-        let health = ServoHealth {
-            id: self.cfg.ids[cursor],
-            bits,
-        };
-        self.records.health[cursor] = health;
-        // No reboot, ever, and no clearing of the latch: a servo holding this
-        // head that is rebooted drops it.
-        if !health.healthy_or_voltage_only() {
-            return Err(SeqError::UnhealthyServo { context, bits });
-        }
+        absorb_health_bits(
+            cursor,
+            self.cfg.ids[cursor],
+            &mut self.records.health,
+            context,
+            result,
+        )?;
         self.phase = if cursor + 1 < JointId::COUNT {
             Phase::Health { cursor: cursor + 1 }
         } else {
-            Phase::Pose { cursor: 0 }
+            Phase::GainsProfiles { cursor: 0 }
         };
         Ok(())
     }
+}
 
-    fn absorb_pose(
-        &mut self,
-        cursor: usize,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
-        let joint = JointId::ALL[cursor];
-        let angle = self.placeable(cursor, context, result)?;
-        self.records.present.set(joint, angle);
-        if cursor + 1 < JointId::COUNT {
-            self.phase = Phase::Pose { cursor: cursor + 1 };
-            return Ok(());
-        }
-        // Failure is not a solver problem to retry with a perturbed seed: the
-        // angles are what nine servos reported, and angles that place no pose
-        // say the model and the machine disagree.
-        let rest = ArmRecord::solve(
-            &self.geom,
-            &self.fk,
-            &self.records.present,
-            &rest_pose_seeds(),
-        )
-        .map_err(|cause| SeqError::RestPoseImplausible {
-            // Named against the first crank: the failure belongs to the six of
-            // them together, and a context names one servo.
-            context: self.context(1, RegId::PresentPosition),
-            cause,
-        })?;
-        self.phase = Phase::Torque { cursor: 0, rest };
-        Ok(())
+/// An angle reading that is a number, or the refusal that says it is not.
+///
+/// A reading nobody can place decides nothing: it closes no linkage, sits inside
+/// no window, and would become a goal that means nothing. Every sweep of
+/// positions passes through here, so the refusal has one shape and names the
+/// joint that carried it.
+pub(crate) fn placeable(
+    row: usize,
+    context: StepContext,
+    result: &BusResult,
+) -> Result<f64, SeqError> {
+    let angle = result.value(context)?.radians(context)?;
+    if angle.is_finite() {
+        return Ok(angle);
     }
-
-    fn absorb_torque(
-        &mut self,
-        cursor: usize,
-        rest: ArmRecord,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
-        // Recorded per servo, never reduced to one boolean: a bus where three of
-        // nine hold torque is a state worth seeing, and "some do" is not.
-        self.records.torque[cursor] = result.value(context)?.u8(context)? != 0;
-        self.phase = if cursor + 1 < JointId::COUNT {
-            Phase::Torque {
-                cursor: cursor + 1,
-                rest,
-            }
-        } else {
-            Phase::GoalShadow { cursor: 0, rest }
-        };
-        Ok(())
-    }
-
-    /// Every limp servo's goal register against the position it was measured at,
-    /// before a byte is written to the machine.
-    ///
-    /// With torque off this platform's servos report Goal Position as their
-    /// present position, so a limp servo whose goal reads anywhere else is
-    /// either a machine that has moved since the position sweep or a firmware
-    /// that does not mirror — and the enable-then-pin order this sequence uses
-    /// is safe only because it does. Either way arming stops here, with every
-    /// servo's torque exactly as it was found.
-    ///
-    /// A servo already holding torque is exempt: its goal is a target it is
-    /// really holding, and the gap between that and its measured position is
-    /// the sag of a loaded servo, recorded rather than judged.
-    ///
-    /// TODO(held-goal-bound): that gap becomes the pin basis for the servo, and
-    /// on body yaw nothing bounds how far from the measured position it may sit
-    /// — the pull-in gate that bounds it on a leg is the legs' alone. What it
-    /// costs is an armed record claiming a pose the machine is not at, and — if
-    /// the torque register is what is wrong — an enable against a goal this
-    /// exemption is the reason nobody checked. What a plausible bound is worth
-    /// setting at wants the sag measured first.
-    fn absorb_goal_shadow(
-        &mut self,
-        cursor: usize,
-        rest: ArmRecord,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
-        let joint = JointId::ALL[cursor];
-        let goal = self.placeable(cursor, context, result)?;
-        let present = angle_at(&self.records.present, cursor);
-        self.records.goal.set(joint, goal);
-        if self.records.torque[cursor] {
-            self.records.droop[cursor] = Some(goal - present);
-        } else if outside_limit((goal - present).abs(), self.cfg.goal_shadow_tolerance) {
-            return Err(SeqError::GoalShadowMismatch {
-                context,
-                joint,
-                goal,
-                present,
-                tolerance: self.cfg.goal_shadow_tolerance,
-            });
-        }
-        self.phase = if cursor + 1 < JointId::COUNT {
-            Phase::GoalShadow {
-                cursor: cursor + 1,
-                rest,
-            }
-        } else {
-            Phase::GainsProfiles { cursor: 0, rest }
-        };
-        Ok(())
-    }
-
-    /// The angles the pins are clamped from, given a sweep of measured
-    /// positions.
-    ///
-    /// A servo found limp pins at where it is. A servo found holding torque pins
-    /// at the goal it is already holding: its measured position sits a sag below
-    /// that goal, and pinning at the sag would lower the target by that sag
-    /// every time the machine is re-armed, which over a session is a ratchet
-    /// nobody commanded.
-    fn pin_basis(&self, measured: &JointVector) -> JointVector {
-        let mut basis = *measured;
-        for (row, holding) in self.records.torque.into_iter().enumerate() {
-            if holding {
-                let joint = JointId::ALL[row];
-                basis.set(joint, angle_at(&self.records.goal, row));
-            }
-        }
-        basis
-    }
-
-    /// The pose a set of pins holds, and the envelope's verdict on it.
-    ///
-    /// The seed is the last pose this sequence solved: the pull is at most the
-    /// pull-in gate, which is millimetres of head motion, so it is a close one.
-    fn solve_pins(&self, pins: &PinOutcome, seed: &Isometry3<f64>) -> Result<ArmRecord, SeqError> {
-        // The context names the first crank and the register about to be
-        // written: the pins are what failed, and everything before them landed.
-        let armed =
-            ArmRecord::solve(&self.geom, &self.fk, &pins.pinned, &[*seed]).map_err(|cause| {
-                SeqError::PinnedPoseUnsolvable {
-                    context: StepContext::reg(
-                        SeqStep::PinAndEnable,
-                        self.cfg.ids[1],
-                        RegId::GoalPosition,
-                    ),
-                    cause,
-                }
-            })?;
-        self.check_armed_pose(&armed)?;
-        Ok(armed)
-    }
-
-    /// Compute provisional pins and check them, then start enabling torque.
-    ///
-    /// Nothing here is written and nothing is enabled: a pin that would pull too
-    /// far, an angle nobody can place, or a goal set that closes no linkage all
-    /// stop the sequence with the machine's torque exactly as it was found,
-    /// which is the state a hand can still put right. The pins are recomputed
-    /// after the enables against the positions measured then, because torque
-    /// coming on can move what a servo reports; these are what stands between a
-    /// grossly mishandled machine and having torque put on it at all.
-    fn enter_enable(&mut self, rest: ArmRecord) -> Result<(), SeqError> {
-        let basis = self.pin_basis(&self.records.present);
-        let pins = pin_goals_from(&self.cfg, &basis, &self.records.present)?;
-        let armed = self.solve_pins(&pins, &rest.head_pose_body)?;
-        self.phase = Phase::Enable {
-            cursor: 0,
-            pinning: Pinning {
-                rest,
-                basis,
-                pins,
-                armed,
-                pull_in: pins.pull_in,
-            },
-        };
-        Ok(())
-    }
-
-    /// Refuse a pinned pose the tick's own envelope would refuse.
-    ///
-    /// Every trajectory starts at the pose arming left the machine holding, so a
-    /// start outside the envelope is a move that faults on its second tick, at a
-    /// pose the machine is already standing in and with torque already on. The
-    /// legs are inside their windows by the pin; this is what covers the rest of
-    /// the verdict — body yaw, head attitude and head-relative yaw — none of
-    /// which the pin has any fence for.
-    /// It runs the whole envelope rather than the remainder, so a pin that ever
-    /// stopped establishing what it establishes is caught here rather than
-    /// passing unchecked.
-    ///
-    /// The clearance floor is excepted, and only it: the platform is known to
-    /// come to rest tighter than the floor, and what governs the move off such a
-    /// rest is the present clearance as a baseline, not the floor.
-    fn check_armed_pose(&self, armed: &ArmRecord) -> Result<(), SeqError> {
-        let mut report = EnvelopeReport::default();
-        let verdict = check_envelope(
-            &self.geom,
-            &self.env,
-            &armed.head_pose_body,
-            armed.joints.body_yaw,
-            None,
-            &mut report,
-        );
-        let Err(error) = verdict else { return Ok(()) };
-        let mut violations = error.violations;
-        violations.margin = false;
-        if !violations.any() {
-            return Ok(());
-        }
-        Err(SeqError::PinnedPoseOutsideEnvelope {
-            context: StepContext::reg(
-                SeqStep::PinAndEnable,
-                self.cfg.ids[first_violated_row(&violations)],
-                RegId::GoalPosition,
-            ),
-            violations,
-        })
-    }
-
-    /// One position reading from the sweep that follows the enables, and — on
-    /// the last of them — the final pins computed from that sweep.
-    ///
-    /// This read is where a position renormalisation at torque-on is absorbed:
-    /// the goals about to be written come from what the servos report now, not
-    /// from what they reported limp, so a servo that has moved its reported
-    /// frame is pinned where it now says it is. The shift is recorded per joint,
-    /// and the pull-in gate, the solver and the envelope judge the result — a
-    /// renormalisation is hypothesised firmware behaviour rather than an
-    /// anomaly, and refusing it outright would refuse an ordinary parked
-    /// antenna.
-    ///
-    /// A refusal from here on arrives with torque on and held. The machine keeps
-    /// standing where it stands and recovery is the operator's; the alternative,
-    /// cutting torque, drops the head.
-    fn absorb_post_enable(
-        &mut self,
-        cursor: usize,
-        pinning: Pinning,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
-        let joint = JointId::ALL[cursor];
-        let angle = self.placeable(cursor, context, result)?;
-        self.records.post_enable.set(joint, angle);
-        self.records.post_enable_shift[cursor] = angle - angle_at(&self.records.present, cursor);
-        if cursor + 1 < JointId::COUNT {
-            self.phase = Phase::PostEnable {
-                cursor: cursor + 1,
-                pinning,
-            };
-            return Ok(());
-        }
-        let basis = self.pin_basis(&self.records.post_enable);
-        let pins = pin_goals_from(&self.cfg, &basis, &self.records.post_enable)?;
-        let armed = self.solve_pins(&pins, &pinning.armed.head_pose_body)?;
-        self.phase = Phase::PinGoals {
-            cursor: 0,
-            pinning: Pinning {
-                basis,
-                pins,
-                armed,
-                pull_in: pins.pull_in,
-                ..pinning
-            },
-        };
-        Ok(())
-    }
-
-    /// One position reading from the sweep that follows the goal writes, and —
-    /// on the last of them — the verdict on the nine.
-    fn absorb_arrival(
-        &mut self,
-        cursor: usize,
-        pinning: Pinning,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<(), SeqError> {
-        let joint = JointId::ALL[cursor];
-        let angle = self.placeable(cursor, context, result)?;
-        self.records.arrival.set(joint, angle);
-        if cursor + 1 < JointId::COUNT {
-            self.phase = Phase::Arrival {
-                cursor: cursor + 1,
-                pinning,
-            };
-            return Ok(());
-        }
-        self.check_arrival(&pinning)?;
-        self.phase = Phase::Complete(pinning);
-        Ok(())
-    }
-
-    /// Every joint against where the goals should have left it.
-    ///
-    /// A joint whose goal is where it already was may not have moved at all: it
-    /// is compared against the reading the sweep before, and any motion is
-    /// motion nothing commanded. That comparison is between two readings taken
-    /// under the same load, so the standing offset a loaded proportional term
-    /// holds from its target cancels out of it rather than having to fit inside
-    /// the tolerance.
-    ///
-    /// A joint whose goal pulled it somewhere else has to be between the two, no
-    /// further out than the tolerance at either end — arrived, or on its way,
-    /// and going the right way. The far end of that corridor is the goal, so for
-    /// a pulled joint the tolerance does bound the standing offset in the
-    /// direction of the pull.
-    ///
-    /// TODO(arrival-far-corridor): a joint the load pushes past its goal settles
-    /// outside the far end once its standing offset exceeds the tolerance, and
-    /// is refused for behaving the way a proportional loop behaves. How large
-    /// that offset really is on this unit is unmeasured, so whether the far end
-    /// wants widening — and by what, drawn from what — waits on the droop
-    /// figures a supervised arm brings back.
-    ///
-    /// TODO(pin-settle-dwell): nothing waits between the last goal write and
-    /// this sweep, so a pulled joint is read while it is still travelling. The
-    /// corridor admits that. What it cannot tell is a joint that has stopped
-    /// short of its goal inside the corridor from one still moving towards it,
-    /// and how long this unit's pulls actually take is the measurement that
-    /// would settle whether a dwell belongs here.
-    fn check_arrival(&self, pinning: &Pinning) -> Result<(), SeqError> {
-        let tolerance = self.cfg.recheck_tolerance;
-        for (row, (joint, present)) in self.records.arrival.joints().into_iter().enumerate() {
-            let pin = angle_at(&pinning.pins.pinned, row);
-            let before = angle_at(&self.records.post_enable, row);
-            // The clamp either replaced the basis angle or left it untouched, so
-            // an unpulled joint's pin is that angle bit for bit.
-            let settled = if pin == angle_at(&pinning.basis, row) {
-                !outside_limit((present - before).abs(), tolerance)
-            } else {
-                present >= before.min(pin) - tolerance && present <= before.max(pin) + tolerance
-            };
-            if !settled {
-                return Err(SeqError::PinUnstable {
-                    context: self.context(row, RegId::PresentPosition),
-                    joint,
-                    pinned: pin,
-                    before,
-                    present,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// An angle reading that is a number, or the refusal that says it is not.
-    ///
-    /// A reading nobody can place decides nothing: it closes no linkage, sits
-    /// inside no window, and would become a goal that means nothing. Every
-    /// sweep of positions and goals passes through here, so the refusal has one
-    /// shape and names the joint that carried it.
-    fn placeable(
-        &self,
-        row: usize,
-        context: StepContext,
-        result: &BusResult,
-    ) -> Result<f64, SeqError> {
-        let angle = result.value(context)?.radians(context)?;
-        if angle.is_finite() {
-            return Ok(angle);
-        }
-        Err(SeqError::UnplaceableAngle {
-            context,
-            joint: JointId::ALL[row],
-            angle,
-        })
-    }
+    Err(SeqError::UnplaceableAngle {
+        context,
+        joint: JointId::ALL[row],
+        angle,
+    })
 }
 
 /// Confirm that a write landed, comparing against the value the request carried.
@@ -1675,10 +1258,10 @@ pub(crate) fn confirm_write(
     }
 }
 
-impl Sequencer for ArmSequencer {
-    type Summary = ArmSummary;
+impl Sequencer for CommissionSequencer {
+    type Summary = CommissionSummary;
 
-    fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<ArmSummary> {
+    fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<CommissionSummary> {
         if let Err(error) = self.absorb(now, prior) {
             self.phase = Phase::Failed(error);
         }
@@ -1690,8 +1273,423 @@ impl Sequencer for ArmSequencer {
     }
 }
 
+/// How much of the machine one poll sweep asks about.
+///
+/// The positions move under a hand and are read every sweep; the rail and the
+/// error bits change on the timescale of a power supply and are read on a slower
+/// cadence the caller sets. Both end in a complete [`Posture`] — a sweep that
+/// did not re-read the rail carries the last reading forward, so what the
+/// torque-on gates see is never half a picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollCadence {
+    /// Nine position reads.
+    Positions,
+    /// Nine position reads, then the supply and the error bits.
+    PositionsAndRail,
+}
+
+/// Which part of a poll sweep is running.
+#[derive(Clone, Copy, Debug)]
+enum PollPhase {
+    Position { cursor: usize },
+    Voltage { cursor: usize },
+    Health { cursor: usize },
+    Complete,
+    Failed(SeqError),
+}
+
+impl PollPhase {
+    fn step(self) -> SeqStep {
+        match self {
+            Self::Position { .. } | Self::Complete => SeqStep::PoseAndDatum,
+            Self::Voltage { .. } => SeqStep::VoltageGate,
+            Self::Health { .. } => SeqStep::Health,
+            Self::Failed(error) => error.context().step,
+        }
+    }
+}
+
+/// The resting watch: one sweep of where the machine is, and what its rail
+/// reads.
+///
+/// Runs against a limp machine and writes nothing, in either direction. It
+/// exists so that engaging has nothing left to find out: the pose it plans from
+/// and the readings its two gates judge are both already in hand, which is the
+/// difference between a wake word raising the head in tens of milliseconds and
+/// in several seconds.
+///
+/// Nothing here refuses anything about the machine's *state* — a head somebody
+/// turned by hand is a measurement, not a fault. What does stop a sweep is the
+/// bus failing to answer or answering with something that is not an angle,
+/// because a posture nobody can place is not a posture.
+pub struct PollSequencer {
+    cfg: ArmConfig,
+    phase: PollPhase,
+    pending: Option<BusRequest>,
+    present: JointVector,
+    rail: Rail,
+    rail_read: bool,
+}
+
+impl PollSequencer {
+    /// A sweep ready to run, carrying `rail` forward for a
+    /// [`PollCadence::Positions`] sweep that does not re-read it.
+    #[must_use]
+    pub fn new(cfg: &ArmConfig, rail: Rail, cadence: PollCadence) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            phase: PollPhase::Position { cursor: 0 },
+            pending: None,
+            present: JointVector::default(),
+            rail,
+            rail_read: matches!(cadence, PollCadence::PositionsAndRail),
+        }
+    }
+
+    fn read(&self, row: usize, reg: RegId) -> BusRequest {
+        BusRequest::ReadReg {
+            id: self.cfg.ids[row],
+            reg,
+        }
+    }
+
+    fn emit(&mut self) -> SeqAction<Posture> {
+        let request = match self.phase {
+            PollPhase::Position { cursor } => self.read(cursor, RegId::PresentPosition),
+            PollPhase::Voltage { cursor } => self.read(cursor, RegId::PresentInputVoltage),
+            PollPhase::Health { cursor } => self.read(cursor, RegId::HardwareErrorStatus),
+            PollPhase::Complete => {
+                return SeqAction::Done(Posture {
+                    present: self.present,
+                    rail: self.rail,
+                    rail_read: self.rail_read,
+                });
+            }
+            PollPhase::Failed(error) => return SeqAction::Fail(error),
+        };
+        self.pending = Some(request);
+        SeqAction::Transact(request)
+    }
+
+    fn absorb(&mut self, prior: Option<&BusResult>) -> Result<(), SeqError> {
+        let Some(request) = self.pending.take() else {
+            return Ok(());
+        };
+        let context = StepContext {
+            step: self.phase.step(),
+            id: request.id(),
+            reg: request.reg(),
+        };
+        let Some(result) = prior else {
+            return Err(SeqError::NoAnswer { context });
+        };
+        match self.phase {
+            PollPhase::Position { cursor } => {
+                let angle = placeable(cursor, context, result)?;
+                self.present.set(JointId::ALL[cursor], angle);
+                self.phase = if cursor + 1 < JointId::COUNT {
+                    PollPhase::Position { cursor: cursor + 1 }
+                } else if self.rail_read {
+                    PollPhase::Voltage { cursor: 0 }
+                } else {
+                    PollPhase::Complete
+                };
+            }
+            PollPhase::Voltage { cursor } => {
+                absorb_volts(cursor, &mut self.rail.voltages, context, result)?;
+                self.phase = if cursor + 1 < JointId::COUNT {
+                    PollPhase::Voltage { cursor: cursor + 1 }
+                } else {
+                    PollPhase::Health { cursor: 0 }
+                };
+            }
+            PollPhase::Health { cursor } => {
+                absorb_health_bits(
+                    cursor,
+                    self.cfg.ids[cursor],
+                    &mut self.rail.health,
+                    context,
+                    result,
+                )?;
+                self.phase = if cursor + 1 < JointId::COUNT {
+                    PollPhase::Health { cursor: cursor + 1 }
+                } else {
+                    PollPhase::Complete
+                };
+            }
+            PollPhase::Complete | PollPhase::Failed(_) => {}
+        }
+        Ok(())
+    }
+}
+
+impl Sequencer for PollSequencer {
+    type Summary = Posture;
+
+    fn next(&mut self, _now: Duration, prior: Option<&BusResult>) -> SeqAction<Posture> {
+        if let Err(error) = self.absorb(prior) {
+            self.phase = PollPhase::Failed(error);
+        }
+        self.emit()
+    }
+
+    fn step(&self) -> SeqStep {
+        self.phase.step()
+    }
+}
+
+/// Which part of engaging is running.
+#[derive(Clone, Copy, Debug)]
+enum EngagePhase {
+    Pin { cursor: usize },
+    Enable { cursor: usize },
+    Settle { cursor: usize },
+    Complete(ArmRecord),
+    Failed(SeqError),
+}
+
+impl EngagePhase {
+    fn step(self) -> SeqStep {
+        match self {
+            Self::Pin { .. } | Self::Enable { .. } | Self::Settle { .. } | Self::Complete(_) => {
+                SeqStep::PinAndEnable
+            }
+            Self::Failed(error) => error.context().step,
+        }
+    }
+}
+
+/// Taking hold of the machine, in twenty-seven transactions.
+///
+/// Three sweeps of nine, and nothing else: each goal register written to the
+/// position its joint was just measured at, each servo's torque enabled — which
+/// holds the joint where it stands — and each position read back to seed the
+/// trajectory the next move starts from.
+///
+/// **The goal write comes first and is belt-and-braces.** With torque off this
+/// platform's servos report Goal Position as their present position and keep
+/// nothing written to it, so the write ordinarily lands nowhere and the register
+/// the enable picks up is the mirror it already was. It is issued anyway, and
+/// its answer is deliberately not judged: a firmware that *does* keep a stale
+/// goal would slam the joint at the enable, and the cost of guarding against
+/// that is one sweep of writes nobody has to believe in. A mismatch there is the
+/// register mirroring, which is the expected case — treating it as a refusal
+/// would gate torque-on behind the very behaviour that makes torque-on safe.
+///
+/// **The measured pose is never refused.** Where the machine physically stands
+/// is the one fact nothing can argue with; a refusal would leave it standing
+/// there limp with nothing but a hand able to move it. The gates that do apply —
+/// the rail and the latched error bits — are checked in [`engage_gates`] before
+/// a single transaction is issued, so a refusal costs the bus nothing and leaves
+/// the machine exactly as it was.
+pub struct EngageSequencer {
+    cfg: ArmConfig,
+    geom: HeadGeometry,
+    fk: FkOptions,
+    phase: EngagePhase,
+    pending: Option<BusRequest>,
+    rest: ArmRecord,
+    pins: PinOutcome,
+    measured: JointVector,
+    post_enable: JointVector,
+    post_enable_shift: [f64; JointId::COUNT],
+    torque_written: bool,
+}
+
+impl EngageSequencer {
+    /// A sequence ready to take hold of the machine `posture` describes.
+    ///
+    /// Everything that can refuse is settled here, before any transaction: the
+    /// two torque-on gates, an angle nobody can place, and a set of angles that
+    /// closes no linkage. A sequence built over a refusal fails on its first
+    /// action having put nothing on the wire.
+    ///
+    /// The geometry and the solver options come separately because the records
+    /// this produces are solved poses, not angles, and both have to be the ones
+    /// the tick uses — a record solved against another geometry would hand the
+    /// first trajectory a start the machine is not at.
+    #[must_use]
+    pub fn new(cfg: &ArmConfig, geom: &HeadGeometry, fk: &FkOptions, posture: &Posture) -> Self {
+        let mut seq = Self {
+            cfg: cfg.clone(),
+            geom: geom.clone(),
+            fk: *fk,
+            phase: EngagePhase::Pin { cursor: 0 },
+            pending: None,
+            rest: ArmRecord {
+                joints: posture.present,
+                head_pose_body: Isometry3::identity(),
+                margins: [0.0; 6],
+                min_margin: 0.0,
+            },
+            pins: PinOutcome {
+                pinned: posture.present,
+                pull_in: [0.0; 6],
+            },
+            measured: posture.present,
+            post_enable: posture.present,
+            post_enable_shift: [0.0; JointId::COUNT],
+            torque_written: false,
+        };
+        if let Err(error) = seq.prepare(posture) {
+            seq.phase = EngagePhase::Failed(error);
+        }
+        seq
+    }
+
+    /// Whether an enable write has gone out, so the machine may be holding
+    /// torque with nobody controlling it.
+    ///
+    /// What a caller does with a *failed* engage turns on this. A sequence that
+    /// refused before its first enable left the machine limp and there is
+    /// nothing to undo; one that stopped after it has to be taken to the
+    /// minimum risk condition, which means writing torque off. Answered from
+    /// the enable that was issued rather than from the acknowledgement it got,
+    /// because a write nothing answered is exactly the case where the servo may
+    /// have taken it.
+    #[must_use]
+    pub fn torque_written(&self) -> bool {
+        self.torque_written
+    }
+
+    /// The gates, the pins and the resting record, all before the first write.
+    fn prepare(&mut self, posture: &Posture) -> Result<(), SeqError> {
+        engage_gates(&self.cfg, &posture.rail)?;
+        self.pins = pin_goals(&self.cfg, &posture.present)?;
+        // Failure is not a solver problem to retry with a perturbed seed: the
+        // angles are what nine servos reported, and angles that place no pose
+        // say the model and the machine disagree.
+        self.rest = ArmRecord::solve(&self.geom, &self.fk, &posture.present, &rest_pose_seeds())
+            .map_err(|cause| SeqError::RestPoseImplausible {
+                // Named against the first crank: the failure belongs to the six
+                // of them together, and a context names one servo.
+                context: StepContext::reg(
+                    SeqStep::PinAndEnable,
+                    self.cfg.ids[1],
+                    RegId::PresentPosition,
+                ),
+                cause,
+            })?;
+        Ok(())
+    }
+
+    fn write(&self, row: usize, reg: RegId, value: RegValue) -> BusRequest {
+        BusRequest::WriteRegVerified {
+            id: self.cfg.ids[row],
+            reg,
+            value,
+        }
+    }
+
+    fn emit(&mut self) -> SeqAction<EngageSummary> {
+        let request = match self.phase {
+            EngagePhase::Pin { cursor } => {
+                let goal = RegValue::Radians(angle_at(&self.pins.pinned, cursor));
+                self.write(cursor, RegId::GoalPosition, goal)
+            }
+            EngagePhase::Enable { cursor } => {
+                self.torque_written = true;
+                self.write(cursor, RegId::TorqueEnable, RegValue::U8(1))
+            }
+            EngagePhase::Settle { cursor } => BusRequest::ReadReg {
+                id: self.cfg.ids[cursor],
+                reg: RegId::PresentPosition,
+            },
+            EngagePhase::Complete(armed) => {
+                return SeqAction::Done(EngageSummary {
+                    rest: self.rest,
+                    armed,
+                    pins: self.pins,
+                    post_enable_shift: self.post_enable_shift,
+                });
+            }
+            EngagePhase::Failed(error) => return SeqAction::Fail(error),
+        };
+        self.pending = Some(request);
+        SeqAction::Transact(request)
+    }
+
+    fn absorb(&mut self, prior: Option<&BusResult>) -> Result<(), SeqError> {
+        let Some(request) = self.pending.take() else {
+            return Ok(());
+        };
+        let context = StepContext {
+            step: self.phase.step(),
+            id: request.id(),
+            reg: request.reg(),
+        };
+        match self.phase {
+            EngagePhase::Pin { cursor } => {
+                // Whatever came back — the mirrored present, silence, a refusal
+                // — the walk carries on. See the type's docs: this sweep is
+                // insurance against a stale goal register, not a check on one.
+                self.phase = if cursor + 1 < JointId::COUNT {
+                    EngagePhase::Pin { cursor: cursor + 1 }
+                } else {
+                    EngagePhase::Enable { cursor: 0 }
+                };
+                Ok(())
+            }
+            EngagePhase::Enable { cursor } => {
+                let Some(result) = prior else {
+                    return Err(SeqError::NoAnswer { context });
+                };
+                confirm_write(result, &request, context)?;
+                self.phase = if cursor + 1 < JointId::COUNT {
+                    EngagePhase::Enable { cursor: cursor + 1 }
+                } else {
+                    EngagePhase::Settle { cursor: 0 }
+                };
+                Ok(())
+            }
+            EngagePhase::Settle { cursor } => {
+                let Some(result) = prior else {
+                    return Err(SeqError::NoAnswer { context });
+                };
+                let angle = placeable(cursor, context, result)?;
+                self.post_enable.set(JointId::ALL[cursor], angle);
+                self.post_enable_shift[cursor] = angle - angle_at(&self.measured, cursor);
+                if cursor + 1 < JointId::COUNT {
+                    self.phase = EngagePhase::Settle { cursor: cursor + 1 };
+                    return Ok(());
+                }
+                let seeds = armed_pose_seeds(self.rest.head_pose_body);
+                let armed = ArmRecord::solve(&self.geom, &self.fk, &self.post_enable, &seeds)
+                    .map_err(|cause| SeqError::PinnedPoseUnsolvable {
+                        context: StepContext::reg(
+                            SeqStep::PinAndEnable,
+                            self.cfg.ids[1],
+                            RegId::PresentPosition,
+                        ),
+                        cause,
+                    })?;
+                self.phase = EngagePhase::Complete(armed);
+                Ok(())
+            }
+            EngagePhase::Complete(_) | EngagePhase::Failed(_) => Ok(()),
+        }
+    }
+}
+
+impl Sequencer for EngageSequencer {
+    type Summary = EngageSummary;
+
+    fn next(&mut self, _now: Duration, prior: Option<&BusResult>) -> SeqAction<EngageSummary> {
+        if let Err(error) = self.absorb(prior) {
+            self.phase = EngagePhase::Failed(error);
+        }
+        self.emit()
+    }
+
+    fn step(&self) -> SeqStep {
+        self.phase.step()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use core::f64::consts::PI;
+
     use super::*;
     use crate::testutil::ScriptedBus;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -1768,7 +1766,7 @@ mod tests {
             .map(|pull| (pull.to_degrees() * 1e3).round() / 1e3)
             .collect();
         assert_eq!(degrees, vec![7.543, 2.454, 0.0, 0.0, 0.767, 10.575]);
-        assert!(outcome.worst_pull_in() < cfg.max_pin_pull_in);
+        assert!((outcome.worst_pull_in().to_degrees() - 10.575).abs() < 1e-3);
         // The antennas were at zero and stayed there: the leg pull touches
         // nothing else.
         assert_eq!(outcome.pinned.antennas, present.antennas);
@@ -1824,36 +1822,36 @@ mod tests {
         }
     }
 
-    /// A pull beyond the gate stops arming, naming the leg, the servo, the
-    /// register about to be written, and both figures.
+    /// However far a pin has to pull, it pulls: the distance is recorded and
+    /// nothing judges it. A machine found in a pose nobody predicted is a
+    /// machine to take hold of and move, and refusing it leaves the head exactly
+    /// where it was with nothing but a hand able to shift it.
     #[test]
-    fn a_pull_beyond_the_gate_refuses() {
+    fn a_pull_of_any_size_is_recorded_and_never_refused() {
+        let narrow = 1.0_f64.to_radians();
         let cfg = ArmConfig {
-            max_pin_pull_in: 1.0_f64.to_radians(),
+            leg_windows: [(-narrow, narrow); 6],
             ..config()
         };
         let present = joints_at(&rest_head_pose());
-        let error = pin_goals(&cfg, &present).expect_err("the sixth leg is ten degrees out");
-        let SeqError::PullInTooLarge {
-            context,
-            joint,
-            pull_in,
-            limit,
-        } = error
-        else {
-            panic!("expected a pull-in refusal, got {error}");
-        };
-        // Leg 1 is the first one out, so it is the one reported.
-        assert_eq!(joint, JointId::Leg(0));
-        assert_eq!(context.id, 11);
-        assert_eq!(context.reg, Some(RegId::GoalPosition));
-        assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert!((pull_in.to_degrees() - 7.543).abs() < 1e-3);
-        assert_eq!(limit, cfg.max_pin_pull_in);
-        assert_eq!(
-            error.to_string(),
-            "pin and enable of servo 11, goal position: pinning leg 1 would pull it 7.54°, \
-             past the 1.00° gate"
+        let outcome = pin_goals(&cfg, &present).expect("nothing here refuses");
+
+        for (leg, angle) in outcome.pinned.legs.into_iter().enumerate() {
+            assert!(
+                angle.abs() <= narrow + 1e-12,
+                "leg {} pinned at {:.3}°",
+                leg + 1,
+                angle.to_degrees()
+            );
+            assert!(
+                (outcome.pull_in[leg] - (angle - present.legs[leg]).abs()).abs() < 1e-12,
+                "the recorded pull is the distance the write moves it"
+            );
+        }
+        assert!(
+            outcome.worst_pull_in().to_degrees() > 30.0,
+            "a pull far past anything the old gate admitted: {:.3}°",
+            outcome.worst_pull_in().to_degrees()
         );
     }
 
@@ -2046,6 +2044,15 @@ mod tests {
             let apart = (resting.translation.vector - neutral.translation.vector).norm();
             assert!(apart > 0.04, "the resting seed is {apart} m from neutral");
         }
+
+        // The post-enable solve is the same list with the resting record in
+        // front of it. A pose the resting solve reaches and the armed one does
+        // not would be a machine that engages and then refuses its own
+        // read-back, so the two lists cannot be maintained apart.
+        let measured = rest_head_pose();
+        let armed = armed_pose_seeds(measured);
+        assert_eq!(armed[0], measured);
+        assert_eq!(armed[1..], seeds);
     }
 
     /// A machine standing where a command left it arms, and the resting record
@@ -2054,21 +2061,22 @@ mod tests {
     /// Every command in this bench re-arms, so the pose phase six solves is
     /// whatever the previous command left the machine holding — neutral, after
     /// the lift, which is 44 mm and a pitch away from either resting candidate.
-    /// Driven through the sequence, so it is the solve phase six really runs
-    /// that lands there; which of the seeds carried it is not observable here
-    /// and the test above is what pins the list.
+    /// Driven through the sequence, so it is the solve engaging really runs that
+    /// lands there; which of the seeds carried it is not observable here and the
+    /// test above is what pins the list.
     #[test]
-    fn the_pose_a_command_leaves_the_machine_at_is_solved_at_phase_six() {
+    fn the_pose_a_command_leaves_the_machine_at_is_solved_when_engaging() {
         let neutral = reachy_kin::neutral_head_pose();
         let mut machine = bus();
         machine.present = joints_at(&neutral);
         machine.present.body_yaw = 0.35;
         machine.present.antennas = [0.20, -0.15];
 
-        let summary =
-            drive(&provisioned_config(), &mut machine).expect("a machine standing at neutral arms");
-        let gap =
-            (summary.rest.head_pose_body.translation.vector - neutral.translation.vector).norm();
+        let summary = drive(&provisioned_config(), &mut machine)
+            .expect("a machine standing at neutral engages");
+        let gap = (summary.engage.rest.head_pose_body.translation.vector
+            - neutral.translation.vector)
+            .norm();
         assert!(gap < 1e-6, "the resting record is {gap} m from neutral");
     }
 
@@ -2284,29 +2292,11 @@ mod tests {
         assert_eq!(DEFAULT_MIN_ARM_VOLTAGE, 6.0);
         assert_eq!(DEFAULT_VOLTAGE_POLL_PERIOD, Duration::from_millis(100));
         assert_eq!(DEFAULT_VOLTAGE_BUDGET, Duration::from_secs(30));
-        assert!((DEFAULT_MAX_PIN_PULL_IN.to_degrees() - 12.0).abs() < 1e-12);
-        assert!((DEFAULT_RECHECK_TOLERANCE.to_degrees() - 0.5).abs() < 1e-12);
-        assert!((DEFAULT_GOAL_SHADOW_TOLERANCE.to_degrees() - 2.0).abs() < 1e-12);
-        // The shadow gate is well above the servo's own resolution, so a count
-        // of read wobble on a mirrored register cannot trip it.
-        assert!(DEFAULT_GOAL_SHADOW_TOLERANCE > 20.0 * (0.088_f64).to_radians());
-        // And it is not the arrival tolerance under another name: swapping the
-        // two configuration keys would change both gates.
-        assert_ne!(
-            DEFAULT_GOAL_SHADOW_TOLERANCE.to_bits(),
-            DEFAULT_RECHECK_TOLERANCE.to_bits()
-        );
-        // The pull-in gate is above the worst overrun the recorded rest has, or
-        // arming would refuse the case it was sized for.
-        let cfg = config();
-        let present = joints_at(&rest_head_pose());
-        let outcome = pin_goals(&cfg, &present).expect("inside the gate");
-        assert!(outcome.worst_pull_in() < DEFAULT_MAX_PIN_PULL_IN);
     }
 
     /// A window narrower than the platform's own does not silently take over: a
     /// pin is against the servo-side fence, so a caller handing over the wrong
-    /// fence pulls the legs to it and the gate is what notices.
+    /// fence pulls the legs to it, and the recorded pull is what says so.
     #[test]
     fn the_pin_is_against_the_window_it_was_handed() {
         let narrow = 5.0_f64.to_radians();
@@ -2315,10 +2305,13 @@ mod tests {
             ..config()
         };
         let present = joints_at(&reachy_kin::neutral_head_pose());
-        // The neutral pose sits near ±36°, so every leg is pulled to the fence
-        // and the first one trips the gate.
-        let error = pin_goals(&cfg, &present).expect_err("thirty degrees is past the gate");
-        assert!(matches!(error, SeqError::PullInTooLarge { .. }));
+        // The neutral pose sits near ±36°, so every leg is pulled to the fence.
+        let pulled = pin_goals(&cfg, &present).expect("nothing here refuses");
+        assert_eq!(
+            pulled.pinned.legs,
+            [narrow, -narrow, narrow, -narrow, narrow, -narrow]
+        );
+        assert!(pulled.worst_pull_in().to_degrees() > 30.0);
 
         let wide = ArmConfig {
             leg_windows: [(-PI, PI); 6],
@@ -2342,12 +2335,6 @@ mod tests {
         assert_eq!(outcome.pull_in, [0.0; 6]);
         assert_eq!(outcome.pinned.legs, present.legs);
     }
-
-    /// How far a joint the goals pulled is short of its goal while it is still
-    /// travelling, in the machine below. Twice the arrival tolerance, so a
-    /// reading this far out is inside no tolerance and only the corridor admits
-    /// it.
-    const TRAVEL: f64 = 1.0 * PI / 180.0;
 
     /// Nine servos answering out of their own state, with a knob per thing a test
     /// wants to vary. The transaction log is what the phase-order assertions
@@ -2385,14 +2372,8 @@ mod tests {
         /// Per joint, how far below its goal a servo holding torque settles: the
         /// standing error of a loaded position loop with no integral term.
         load: [f64; JointId::COUNT],
-        /// Per joint, how far it reads from where it should once the goals are
-        /// written: motion nothing commanded.
-        stray: [f64; JointId::COUNT],
         /// What a provisioned register holds.
         provision: Vec<(RegId, RegValue)>,
-        /// Whether a joint the goals pulled is still travelling when it is read
-        /// back, rather than having arrived.
-        travelling: bool,
         /// One write to answer with something other than success. Separate from
         /// the read knob because several registers are both read and written in
         /// one sequence, and which of the two fails is the whole question.
@@ -2430,13 +2411,11 @@ mod tests {
             shadow_gap: [0.0; JointId::COUNT],
             enable_shift: [0.0; JointId::COUNT],
             load: [0.0; JointId::COUNT],
-            stray: [0.0; JointId::COUNT],
             provision: vec![
                 (RegId::OperatingMode, RegValue::U8(3)),
                 (RegId::HomingOffset, RegValue::I32(1024)),
                 (RegId::Shutdown, RegValue::U8(0x34)),
             ],
-            travelling: false,
             fail_write: None,
             fail_read: None,
             goals: JointVector::default(),
@@ -2500,8 +2479,7 @@ mod tests {
 
         /// Where a joint reads: at rest, plus whatever its torque coming on did
         /// to the reported frame, and a load below its written goal once one has
-        /// been written — short of that while it is still travelling there, and
-        /// off it by any stray motion the test asked for.
+        /// been written.
         fn position(&self, row: usize) -> f64 {
             let mut angle = angle_at(&self.present, row);
             if self.torque[row] != 0 {
@@ -2510,12 +2488,7 @@ mod tests {
             if !self.written[row] {
                 return angle;
             }
-            let settled = angle_at(&self.goals, row) - self.load[row];
-            if self.travelling && (settled - angle).abs() > TRAVEL {
-                // Short of where it is going, on the side it was pulled from.
-                return settled - TRAVEL.copysign(settled - angle) + self.stray[row];
-            }
-            settled + self.stray[row]
+            angle_at(&self.goals, row) - self.load[row]
         }
     }
 
@@ -2595,13 +2568,50 @@ mod tests {
         }
     }
 
-    /// The shared driver, against this crate's arming sequencer.
-    fn drive(cfg: &ArmConfig, machine: &mut Machine) -> Result<ArmSummary, SeqError> {
-        let mut seq = ArmSequencer::new(
+    /// What a whole torque-on path handed back, in the order it ran.
+    #[derive(Clone, Copy, Debug)]
+    struct Armed {
+        commission: CommissionSummary,
+        posture: Posture,
+        engage: EngageSummary,
+    }
+
+    /// Commission, poll and engage `machine`, as a process does: once, then a
+    /// resting sweep, then the fast path.
+    fn drive(cfg: &ArmConfig, machine: &mut Machine) -> Result<Armed, SeqError> {
+        let commission = commission(cfg, machine)?;
+        let posture = poll(cfg, machine, commission.rail, PollCadence::Positions)?;
+        let engage = engage(cfg, machine, &posture)?;
+        Ok(Armed {
+            commission,
+            posture,
+            engage,
+        })
+    }
+
+    fn commission(cfg: &ArmConfig, machine: &mut Machine) -> Result<CommissionSummary, SeqError> {
+        crate::testutil::drive(&mut CommissionSequencer::new(cfg), machine)
+    }
+
+    fn poll(
+        cfg: &ArmConfig,
+        machine: &mut Machine,
+        rail: Rail,
+        cadence: PollCadence,
+    ) -> Result<Posture, SeqError> {
+        crate::testutil::drive(&mut PollSequencer::new(cfg, rail, cadence), machine)
+    }
+
+    fn engage(
+        cfg: &ArmConfig,
+        machine: &mut Machine,
+        posture: &Posture,
+    ) -> Result<EngageSummary, SeqError> {
+        let mut seq = EngageSequencer::new(
             cfg,
             &HeadGeometry::default(),
-            &EnvelopeConfig::default(),
             &FkOptions::default(),
+            posture,
         );
         crate::testutil::drive(&mut seq, machine)
     }
@@ -2631,14 +2641,13 @@ mod tests {
             .count()
     }
 
-    /// The whole sequence against a machine that arms: the phase order, the
-    /// three order properties that are the safety content of it, and the records
-    /// it hands back.
+    /// The whole path against a machine that engages: the phase order, the
+    /// transaction counts, and the records each half hands back.
     #[test]
-    fn arming_runs_its_phases_in_order_and_records_what_it_found() {
+    fn the_torque_on_path_runs_its_phases_in_order_and_records_what_it_found() {
         let cfg = provisioned_config();
         let mut machine = bus();
-        let summary = drive(&cfg, &mut machine).expect("this machine arms");
+        let summary = drive(&cfg, &mut machine).expect("this machine engages");
 
         let mut phases: Vec<SeqStep> = Vec::new();
         for (step, _) in &machine.log {
@@ -2654,20 +2663,20 @@ mod tests {
                 SeqStep::Provision,
                 SeqStep::VoltageGate,
                 SeqStep::Health,
-                SeqStep::PoseAndDatum,
-                SeqStep::StateDiscovery,
-                SeqStep::GoalShadow,
                 SeqStep::GainsProfiles,
+                SeqStep::PoseAndDatum,
                 SeqStep::PinAndEnable,
             ]
         );
 
-        // No write of any kind precedes the supply gate.
+        // No write of any kind precedes the supply gate: the gains and profiles
+        // go into servo RAM, and a rail browning out is how a servo ends up
+        // holding half a configuration.
         let first_write = machine
             .log
             .iter()
             .position(|(_, request)| matches!(request, BusRequest::WriteRegVerified { .. }))
-            .expect("arming writes");
+            .expect("commissioning writes");
         let last_voltage = machine
             .log
             .iter()
@@ -2675,59 +2684,47 @@ mod tests {
             .expect("the gate ran");
         assert!(first_write > last_voltage);
 
-        // Every goal-shadow read precedes every enable: the check that says a
-        // servo cannot slam when its torque comes on is complete on all nine
-        // before any of them takes torque.
-        let last_shadow = machine
+        // Commissioning touches torque in neither direction, and reads no
+        // position: the machine it hands on is exactly the machine it met.
+        let commissioning =
+            |step: &SeqStep| !matches!(step, SeqStep::PoseAndDatum | SeqStep::PinAndEnable);
+        assert!(
+            machine
+                .log
+                .iter()
+                .filter(|(s, _)| commissioning(s))
+                .all(|(_, request)| request.reg() != Some(RegId::TorqueEnable)
+                    && request.reg() != Some(RegId::PresentPosition))
+        );
+
+        // Every goal is pinned before any torque is enabled, and every enable
+        // before the pose is read back. The pin sweep is belt-and-braces against
+        // a stale goal register; the read-back is what the tick starts from, so
+        // it has to see the machine with its torque already on.
+        let last_pin = machine
             .log
             .iter()
-            .rposition(|(step, _)| *step == SeqStep::GoalShadow)
-            .expect("the shadow reads ran");
+            .rposition(|(_, request)| request.reg() == Some(RegId::GoalPosition))
+            .expect("engaging pins");
         let first_enable = machine
             .log
             .iter()
-            .position(|(_, request)| {
-                matches!(
-                    request,
-                    BusRequest::WriteRegVerified {
-                        reg: RegId::TorqueEnable,
-                        ..
-                    }
-                )
-            })
-            .expect("arming enables torque");
-        assert!(last_shadow < first_enable);
-
-        // Every servo's torque is enabled before any servo's goal is written:
-        // with torque off the register does not keep a write, so a goal written
-        // there would be a write nobody could verify and nothing would store.
+            .position(|(_, request)| request.reg() == Some(RegId::TorqueEnable))
+            .expect("engaging enables torque");
         let last_enable = machine
             .log
             .iter()
-            .rposition(|(_, request)| {
-                matches!(
-                    request,
-                    BusRequest::WriteRegVerified {
-                        reg: RegId::TorqueEnable,
-                        ..
-                    }
-                )
-            })
-            .expect("arming enables torque");
-        let first_goal = machine
+            .rposition(|(_, request)| request.reg() == Some(RegId::TorqueEnable))
+            .expect("engaging enables torque");
+        let first_settle = machine
             .log
             .iter()
-            .position(|(_, request)| {
-                matches!(
-                    request,
-                    BusRequest::WriteRegVerified {
-                        reg: RegId::GoalPosition,
-                        ..
-                    }
-                )
+            .position(|(step, request)| {
+                *step == SeqStep::PinAndEnable && request.reg() == Some(RegId::PresentPosition)
             })
-            .expect("arming pins");
-        assert!(last_enable < first_goal);
+            .expect("engaging reads back");
+        assert!(last_pin < first_enable);
+        assert!(last_enable < first_settle);
 
         let count = |step| machine.log.iter().filter(|(s, _)| *s == step).count();
         assert_eq!(count(SeqStep::Presence), JointId::COUNT);
@@ -2735,46 +2732,55 @@ mod tests {
         assert_eq!(count(SeqStep::Provision), 3 * JointId::COUNT);
         assert_eq!(count(SeqStep::VoltageGate), JointId::COUNT);
         assert_eq!(count(SeqStep::Health), JointId::COUNT);
-        assert_eq!(count(SeqStep::PoseAndDatum), JointId::COUNT);
-        assert_eq!(count(SeqStep::StateDiscovery), JointId::COUNT);
-        assert_eq!(count(SeqStep::GoalShadow), JointId::COUNT);
         // Gains, then acceleration and velocity, per servo.
         assert_eq!(count(SeqStep::GainsProfiles), 3 * JointId::COUNT);
-        // An enable, a position read, a goal and the arrival read, per servo.
-        assert_eq!(count(SeqStep::PinAndEnable), 4 * JointId::COUNT);
+        // The resting sweep: nine positions and nothing else.
+        assert_eq!(count(SeqStep::PoseAndDatum), JointId::COUNT);
+        // A pin, an enable and a read-back, per servo. Twenty-seven
+        // transactions is the whole cost of a wake word reaching the head.
+        assert_eq!(count(SeqStep::PinAndEnable), 3 * JointId::COUNT);
 
-        let pins = pin_goals(&cfg, &machine.present).expect("inside the gate");
-        assert_eq!(summary.rest.joints, machine.present);
-        assert_eq!(summary.armed.joints, pins.pinned);
-        assert_eq!(
-            machine.goals, pins.pinned,
-            "the goals in the servos are the pins"
-        );
-        assert_eq!(summary.pull_in, pins.pull_in);
-        assert!(summary.worst_pull_in() < cfg.max_pin_pull_in);
-        // Nothing was found holding torque, so there is no droop to record, and
-        // this fixture's torque-on moves nothing.
-        assert_eq!(summary.droop, [None; JointId::COUNT]);
-        assert_eq!(summary.post_enable_shift, [0.0; JointId::COUNT]);
-        assert_eq!(summary.voltage_polls, 1);
+        let pins = pin_goals(&cfg, &machine.present).expect("inside the window");
+        assert_eq!(summary.posture.present, machine.present);
+        assert_eq!(summary.engage.rest.joints, machine.present);
+        assert_eq!(summary.engage.pins.pinned, pins.pinned);
+        assert_eq!(summary.engage.pins.pull_in, pins.pull_in);
+        // This fixture's torque-on moves nothing, so the pose read back is the
+        // pose that was measured.
+        assert_eq!(summary.engage.armed.joints, machine.present);
+        assert_eq!(summary.engage.post_enable_shift, [0.0; JointId::COUNT]);
+        assert_eq!(machine.enabled(), [true; JointId::COUNT]);
+
+        assert_eq!(summary.commission.voltage_polls, 1);
         assert_eq!(machine.waits, 0);
-        assert_eq!(summary.models, machine.models);
-        assert_eq!(summary.voltages, [7.4; JointId::COUNT]);
-        assert_eq!(summary.torque_before, [false; JointId::COUNT]);
-        assert_eq!(summary.health[0], ServoHealth { id: 10, bits: 0 });
+        assert_eq!(summary.commission.models, machine.models);
+        assert_eq!(summary.commission.rail.voltages, [7.4; JointId::COUNT]);
+        assert_eq!(
+            summary.commission.rail.health[0],
+            ServoHealth { id: 10, bits: 0 }
+        );
+        // A positions-only sweep carries the rail forward rather than leaving a
+        // gate to judge half a picture.
+        assert!(!summary.posture.rail_read);
+        assert_eq!(summary.posture.rail, summary.commission.rail);
         assert_eq!(
             summary
+                .commission
                 .provisioned
                 .at(JointId::Leg(5), RegId::OperatingMode),
             Some(RegValue::U8(3))
         );
         assert_eq!(
-            summary.provisioned.at(JointId::BodyYaw, RegId::Shutdown),
+            summary
+                .commission
+                .provisioned
+                .at(JointId::BodyYaw, RegId::Shutdown),
             Some(RegValue::U8(0x34))
         );
-        assert_eq!(summary.provisioned.count(), 3 * JointId::COUNT);
+        assert_eq!(summary.commission.provisioned.count(), 3 * JointId::COUNT);
         assert_eq!(
             summary
+                .commission
                 .provisioned
                 .at(JointId::BodyYaw, RegId::CurrentLimit),
             None
@@ -2783,102 +2789,262 @@ mod tests {
         // The armed record is what a tick is started from, and it is below the
         // clearance floor at this rest: the margin baseline is what carries the
         // first lift, exactly as it does off the fixture in `tick.rs`.
-        let state = crate::tick::MotionState::new_armed(&summary.armed);
-        assert_eq!(*state.last_goal(), pins.pinned);
-        assert!(summary.armed.min_margin > 0.0);
-        assert!(summary.armed.min_margin < EnvelopeConfig::default().min_toggle_margin);
+        let state = crate::tick::MotionState::new_armed(&summary.engage.armed);
+        assert_eq!(*state.last_goal(), machine.present);
+        assert!(summary.engage.armed.min_margin > 0.0);
+        assert!(summary.engage.armed.min_margin < EnvelopeConfig::default().min_toggle_margin);
     }
 
-    /// A limp servo whose goal register does not mirror its measured position
-    /// stops arming before any torque is enabled, naming the servo and both
-    /// values.
+    /// The pins go out before the enables, carrying the angles each joint was
+    /// measured at, and a machine that drops them all the same engages.
     ///
-    /// This is the property the whole enable-first order rests on: torque is put
-    /// on nine servos without a goal having been written, which is safe only
-    /// because each one's goal is where the joint already stands.
+    /// With torque off this platform's goal register mirrors the present
+    /// position and keeps nothing written to it — the fixture models exactly
+    /// that — so every one of these writes lands nowhere. That is the expected
+    /// case, and the sequence neither depends on the write sticking nor treats
+    /// the mirrored read-back as a refusal.
     #[test]
-    fn a_goal_that_does_not_shadow_its_present_stops_arming_before_any_torque() {
+    fn the_pin_sweep_is_issued_and_its_answers_are_not_judged() {
         let cfg = provisioned_config();
-        let mut shadow_gap = [0.0; JointId::COUNT];
-        shadow_gap[4] = 3.0_f64.to_radians();
+        let mut machine = bus();
+        let summary = drive(&cfg, &mut machine).expect("a mirroring register engages");
+
+        let pinned: Vec<f64> = machine
+            .log
+            .iter()
+            .filter_map(|(_, request)| match request {
+                BusRequest::WriteRegVerified {
+                    reg: RegId::GoalPosition,
+                    value: RegValue::Radians(angle),
+                    ..
+                } => Some(*angle),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<f64> = (0..JointId::COUNT)
+            .map(|row| angle_at(&summary.engage.pins.pinned, row))
+            .collect();
+        assert_eq!(pinned, expected);
+        assert!(
+            !machine.written.iter().any(|kept| *kept),
+            "the fixture kept a goal written to a limp servo"
+        );
+    }
+
+    /// A servo that refuses the pin write, or says nothing to it at all, does
+    /// not stop the machine being taken hold of.
+    ///
+    /// Nothing about the pin sweep is load-bearing, and a refusal there would
+    /// gate torque coming on behind the very register mirroring that makes
+    /// torque coming on safe.
+    #[test]
+    fn a_pin_write_that_goes_nowhere_does_not_stop_the_engage() {
+        let cfg = provisioned_config();
+        for answer in [
+            BusResult::NoAnswer,
+            BusResult::ServoError { code: 0x08 },
+            BusResult::VerifyMismatch {
+                read_back: RegValue::Radians(1.0),
+            },
+        ] {
+            let mut machine = Machine {
+                fail_write: Some((14, RegId::GoalPosition, answer)),
+                ..bus()
+            };
+            drive(&cfg, &mut machine).expect("a pin that goes nowhere is not a refusal");
+            assert_eq!(machine.enabled(), [true; JointId::COUNT]);
+        }
+    }
+
+    /// An enable that does not land stops the sequence where it stood: a servo
+    /// that did not take torque is not holding anything up.
+    #[test]
+    fn an_enable_that_does_not_land_stops_the_engage() {
+        let cfg = provisioned_config();
         let mut machine = Machine {
-            shadow_gap,
+            fail_write: Some((14, RegId::TorqueEnable, BusResult::NoAnswer)),
             ..bus()
         };
-        let error = drive(&cfg, &mut machine).expect_err("servo 14's goal is not its present");
-        let SeqError::GoalShadowMismatch {
-            context,
-            joint,
-            goal,
-            present,
-            tolerance,
+        let error = drive(&cfg, &mut machine).expect_err("servo 14 never took torque");
+        let SeqError::NoAnswer { context } = error else {
+            panic!("expected silence, got {error}");
+        };
+        assert_eq!(context.id, 14);
+        assert_eq!(context.step, SeqStep::PinAndEnable);
+    }
+
+    /// A failed engage says whether it may have left torque on, and that is
+    /// what decides whether the caller has a machine to take to the minimum
+    /// risk condition.
+    ///
+    /// Three endings, one question: a gate refusal put nothing on the wire; a
+    /// pin sweep that died mid-walk wrote goals to a limp machine; an enable
+    /// that went unanswered may have been taken. Only the third leaves torque
+    /// to write off, and it is the unacknowledged write — the one nobody can
+    /// say landed — that has to count as written.
+    #[test]
+    fn a_failed_engage_says_whether_torque_may_be_on() {
+        let cfg = provisioned_config();
+        let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
+        let posture = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect("the sweep reads");
+
+        let geom = HeadGeometry::default();
+        let fk = FkOptions::default();
+
+        let mut sagging = posture;
+        sagging.rail.voltages[4] = 5.5;
+        let mut seq = EngageSequencer::new(&cfg, &geom, &fk, &sagging);
+        crate::testutil::drive(&mut seq, &mut machine).expect_err("a low rail does not torque on");
+        assert!(!seq.torque_written(), "the gate refused before any write");
+
+        // The pin sweep is not judged, so nothing stops there on the machine's
+        // answers — the port itself going away is what ends a walk mid-pin, and
+        // the driver reports that rather than the sequencer. Standing in for it:
+        // a sequence stopped after one pin write has still written no torque.
+        let mut seq = EngageSequencer::new(&cfg, &geom, &fk, &posture);
+        assert!(matches!(
+            seq.next(Duration::ZERO, None),
+            SeqAction::Transact(BusRequest::WriteRegVerified {
+                reg: RegId::GoalPosition,
+                ..
+            })
+        ));
+        assert!(!seq.torque_written(), "a pin is not an enable");
+
+        let mut machine = Machine {
+            fail_write: Some((14, RegId::TorqueEnable, BusResult::NoAnswer)),
+            ..bus()
+        };
+        let mut seq = EngageSequencer::new(&cfg, &geom, &fk, &posture);
+        crate::testutil::drive(&mut seq, &mut machine).expect_err("servo 14 never answered");
+        assert!(
+            seq.torque_written(),
+            "an enable nobody answered may have landed"
+        );
+    }
+
+    /// The two torque-on gates are the whole enumeration, and they refuse
+    /// before a single transaction crosses the wire.
+    #[test]
+    fn the_torque_on_gates_refuse_without_touching_the_machine() {
+        let cfg = provisioned_config();
+        let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
+        let posture = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect("the sweep reads");
+        machine.log.clear();
+
+        let mut sagging = posture;
+        sagging.rail.voltages[4] = 5.5;
+        let error =
+            engage(&cfg, &mut machine, &sagging).expect_err("a low rail does not torque on");
+        let SeqError::SupplyBelowFloor {
+            context, lowest, ..
         } = error
         else {
-            panic!("expected a goal-shadow refusal, got {error}");
+            panic!("expected a supply refusal, got {error}");
         };
-        assert_eq!(joint, JointId::Leg(3));
-        assert_eq!(context.step, SeqStep::GoalShadow);
         assert_eq!(context.id, 14);
-        assert_eq!(context.reg, Some(RegId::GoalPosition));
-        assert!((goal - present - shadow_gap[4]).abs() < 1e-12);
-        assert_eq!(tolerance, cfg.goal_shadow_tolerance);
+        assert!((lowest - 5.5).abs() < 1e-12);
+        // The gate that waits and the gate that does not are different errors:
+        // this one never had a budget, so it does not report expiring one.
+        assert!(
+            !error.to_string().contains("after"),
+            "the engage refusal reads as a wait that expired: {error}"
+        );
 
-        // Not one servo took torque, and not one goal was written: the machine
-        // is exactly as it was found, which is the state a hand can still put
-        // right.
-        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
-        assert_eq!(machine.enabled(), [false; JointId::COUNT]);
-        // And the gains phase never ran either: the shadow reads come first.
-        assert_eq!(writes(&machine.log, RegId::PositionGains), 0);
-
-        // A gap inside the gate is ordinary read wobble and arms.
-        let mut shadow_gap = [0.0; JointId::COUNT];
-        shadow_gap[4] = 1.0_f64.to_radians();
-        let mut machine = Machine {
-            shadow_gap,
-            ..bus()
+        let mut latched = posture;
+        latched.rail.health[6] = ServoHealth { id: 16, bits: 0x20 };
+        let error = engage(&cfg, &mut machine, &latched).expect_err("a latch does not torque on");
+        let SeqError::UnhealthyServo { context, bits } = error else {
+            panic!("expected a health refusal, got {error}");
         };
-        drive(&cfg, &mut machine).expect("a gap inside the gate is wobble");
+        assert_eq!(context.id, 16);
+        assert_eq!(bits, 0x20);
+
+        assert!(machine.log.is_empty(), "a refused engage wrote nothing");
+        assert_eq!(machine.enabled(), [false; JointId::COUNT]);
+
+        // An input-voltage bit on its own is not a latch: it is what a rail
+        // recovering from a dip leaves behind, and the floor above is what
+        // judges the rail.
+        let mut dipped = posture;
+        dipped.rail.health[6] = ServoHealth { id: 16, bits: 0x01 };
+        engage(&cfg, &mut machine, &dipped).expect("an input-voltage bit alone engages");
     }
 
-    /// A servo found already holding torque is exempt from the shadow check —
-    /// its goal is a real target, not a mirror — pins at that goal rather than
-    /// at the position it has sagged to, and has the sag recorded.
+    /// A latched servo does not stop the process commissioning.
     ///
-    /// Pinning at the sag would lower the target by the sag on every re-arm, and
-    /// every command in this bench re-arms.
+    /// The latch refuses torque coming on, once, where the rest of the torque-on
+    /// gates live. Refusing here as well would stop a daemon from starting at
+    /// all over a servo hurting nothing while the machine rests limp.
     #[test]
-    fn a_servo_found_holding_torque_pins_at_its_goal_and_records_its_droop() {
+    fn commissioning_records_a_latched_servo_without_refusing_it() {
         let cfg = provisioned_config();
-        let droop = 0.6_f64.to_radians();
-        let mut machine = holding(droop);
-        let summary = drive(&cfg, &mut machine).expect("a holding machine re-arms");
+        let mut health = [0; JointId::COUNT];
+        health[3] = 0x20;
+        let mut machine = Machine { health, ..bus() };
+        let summary = commission(&cfg, &mut machine).expect("a latch does not stop commissioning");
+        assert_eq!(summary.rail.health[3], ServoHealth { id: 13, bits: 0x20 });
+        assert_eq!(machine.enabled(), [false; JointId::COUNT]);
+        assert!(engage_gates(&cfg, &summary.rail).is_err());
+    }
 
-        assert_eq!(summary.torque_before, [true; JointId::COUNT]);
-        for (row, recorded) in summary.droop.into_iter().enumerate() {
-            let gap = recorded.expect("every servo was found holding torque");
-            assert!((gap - droop).abs() < 1e-12, "servo {row} droops {gap}");
-        }
+    /// The slow cadence reads the rail itself; the fast one carries the last
+    /// reading forward. Both produce a posture a gate can judge.
+    #[test]
+    fn a_rail_sweep_reads_what_a_positions_sweep_carries() {
+        let cfg = config();
+        let mut machine = Machine {
+            sweeps: vec![7.1],
+            ..bus()
+        };
+        let carried = Rail {
+            voltages: [6.9; JointId::COUNT],
+            health: [ServoHealth { id: 0, bits: 0 }; JointId::COUNT],
+        };
 
-        // The pins are the held goals brought into their windows — not the
-        // sagged positions, which sit a droop below them.
-        let held = machine.held;
-        let expected = pin_goals_from(&cfg, &held, &machine.present).expect("inside the gate");
-        assert_eq!(summary.armed.joints, expected.pinned);
-        assert_eq!(machine.goals, expected.pinned);
-        // Re-arming twice does not ratchet the target down: the second arm pins
-        // at the same angles the first one left.
-        let first = summary.armed.joints;
-        let mut again = machine.clone();
-        again.log.clear();
-        let second = drive(&cfg, &mut again).expect("a second re-arm");
-        assert_eq!(second.armed.joints, first);
+        let fast = poll(&cfg, &mut machine, carried, PollCadence::Positions)
+            .expect("a positions sweep reads");
+        assert_eq!(fast.present, machine.present);
+        assert_eq!(fast.rail, carried);
+        assert!(!fast.rail_read);
+        assert_eq!(machine.log.len(), JointId::COUNT);
+
+        machine.log.clear();
+        let slow = poll(&cfg, &mut machine, carried, PollCadence::PositionsAndRail)
+            .expect("a rail sweep reads");
+        assert_eq!(slow.present, machine.present);
+        assert_eq!(slow.rail.voltages, [7.1; JointId::COUNT]);
+        assert_eq!(slow.rail.health[8], ServoHealth { id: 18, bits: 0 });
+        assert!(slow.rail_read);
+        assert_eq!(machine.log.len(), 3 * JointId::COUNT);
+    }
+
+    /// A hand moves the head while the machine rests, and the next sweep sees
+    /// it: the pose engaging plans from is the one that was last measured, not
+    /// the one commissioning met.
+    #[test]
+    fn a_poll_after_the_head_moves_is_what_engaging_plans_from() {
+        let cfg = provisioned_config();
+        let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
+
+        let moved = joints_at(&reachy_kin::neutral_head_pose());
+        machine.present = moved;
+        let posture = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect("the sweep reads");
+        let summary = engage(&cfg, &mut machine, &posture).expect("a moved head is not a refusal");
+
+        assert_eq!(summary.rest.joints, moved);
+        assert_eq!(summary.armed.joints, moved);
     }
 
     /// Torque coming on can renormalise a servo's reported position onto a
-    /// single turn. That is absorbed rather than refused: the pins are computed
-    /// from the reading taken after the enables, and the shift is recorded.
+    /// single turn. That is absorbed rather than refused: the pose the tick
+    /// starts from is read back after the enables, and the shift is recorded.
     #[test]
     fn a_position_that_jumps_when_torque_comes_on_is_absorbed_and_recorded() {
         let cfg = provisioned_config();
@@ -2895,208 +3061,45 @@ mod tests {
             enable_shift,
             ..bus()
         };
-        let summary = drive(&cfg, &mut machine).expect("a renormalised antenna arms");
+        let engage = drive(&cfg, &mut machine)
+            .expect("a renormalised antenna engages")
+            .engage;
 
-        assert!((summary.post_enable_shift[8] - core::f64::consts::TAU).abs() < 1e-12);
-        assert_eq!(summary.post_enable_shift[..8], [0.0; 8]);
-        // Where it was found, and where the pins put it: the record keeps the
-        // reading as it came, and the pin is off the post-enable frame.
-        assert_eq!(summary.rest.joints.antennas[1], present.antennas[1]);
-        assert!((summary.armed.joints.antennas[1] - (-0.15)).abs() < 1e-12);
-        assert_eq!(machine.goals.antennas[1], summary.armed.joints.antennas[1]);
+        assert!((engage.post_enable_shift[8] - core::f64::consts::TAU).abs() < 1e-12);
+        assert_eq!(engage.post_enable_shift[..8], [0.0; 8]);
+        // Where the poll found it, what was pinned there, and where it reported
+        // itself once torque was on. The pin went out in the frame the joint was
+        // measured in; the armed record — what the tick starts from — is the
+        // frame the servo renormalised onto, which is the whole reason the pose
+        // is read back after the enables rather than assumed.
+        assert_eq!(engage.rest.joints.antennas[1], present.antennas[1]);
+        assert_eq!(engage.pins.pinned.antennas[1], present.antennas[1]);
+        assert!((engage.armed.joints.antennas[1] - (-0.15)).abs() < 1e-12);
     }
 
-    /// The arrival check, three ways: a joint the pins did not move that moves
-    /// anyway is a fault; a pulled joint still travelling is inside the corridor
-    /// and passes; a pulled joint outside the corridor is a fault.
-    #[test]
-    fn the_arrival_check_admits_travel_and_refuses_uncommanded_motion() {
-        let cfg = provisioned_config();
-
-        // Nothing pulled this joint — its window is not what put it where it is
-        // — so any motion at all is motion nothing commanded.
-        let mut stray = [0.0; JointId::COUNT];
-        stray[0] = 1.0_f64.to_radians();
-        let mut machine = Machine { stray, ..bus() };
-        let error = drive(&cfg, &mut machine).expect_err("the body moved on its own");
-        let SeqError::PinUnstable {
-            context,
-            joint,
-            pinned,
-            before,
-            present,
-        } = error
-        else {
-            panic!("expected a pin-unstable refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::BodyYaw);
-        assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert_eq!(context.id, 10);
-        assert_eq!(pinned, before, "the body yaw pin is where it stood");
-        assert!((present - before - stray[0]).abs() < 1e-12);
-        // The goals were all written first: this is the read that follows them.
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
-
-        // The legs this rest puts outside their windows *are* pulled, and a
-        // reading between where they started and where they are going passes:
-        // being mid-travel is not a fault.
-        let mut machine = Machine {
-            travelling: true,
-            ..bus()
-        };
-        let summary = drive(&cfg, &mut machine).expect("mid-travel is inside the corridor");
-        let pins = pin_goals(&cfg, &machine.present).expect("inside the gate");
-        assert_eq!(summary.armed.joints, pins.pinned);
-        assert!(pins.worst_pull_in() > 0.0, "this rest pulls four legs");
-
-        // Past the far end of the corridor by more than the tolerance is a
-        // fault: overshoot is not arrival. This rest pulls the first leg
-        // upwards, so a stray above its pin is outside the corridor's far end.
-        let mut stray = [0.0; JointId::COUNT];
-        stray[1] = 2.0 * cfg.recheck_tolerance;
-        let mut machine = Machine { stray, ..bus() };
-        let error = drive(&cfg, &mut machine).expect_err("that leg overshot its goal");
-        let SeqError::PinUnstable { joint, .. } = error else {
-            panic!("expected a pin-unstable refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(0));
-
-        // And past the near end is a fault too: a pulled joint that ends up
-        // further from its goal than where it started is going the wrong way,
-        // which is a servo fighting its pin rather than travelling to it.
-        let mut stray = [0.0; JointId::COUNT];
-        stray[1] = -10.0_f64.to_radians();
-        let mut machine = Machine { stray, ..bus() };
-        let error = drive(&cfg, &mut machine).expect_err("that leg went the wrong way");
-        let SeqError::PinUnstable {
-            joint,
-            pinned,
-            before,
-            present,
-            ..
-        } = error
-        else {
-            panic!("expected a pin-unstable refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(0));
-        assert!(pinned > before, "this rest pulls that leg upwards");
-        assert!(
-            present < before,
-            "the reading has to be below where it started for this test to say \
-             anything: {present} against {before}"
-        );
-    }
-
-    /// The pull-in gate is measured against where the joint is, not against the
-    /// goal the pin came from.
+    /// A machine found still holding torque is engaged at where it stands.
     ///
-    /// A machine found holding torque pins at the goal it holds, so on a servo
-    /// that has been dragged well away from that goal — or is failing to reach
-    /// it — the pin and the basis agree while the position does not. The gate
-    /// bounds that gap, and it refuses before a single enable, which is what
-    /// keeps the machine hand-recoverable. Thirteen degrees of sag: past the
-    /// twelve-degree gate, and short of the sag that makes the resting pose
-    /// itself implausible.
+    /// Nothing discovers the torque state any more: the resting state is torque
+    /// off, so engaging a machine that is already holding is not the ordinary
+    /// case, and paying nine reads on every wake to detect it would be. The pins
+    /// are the positions the poll measured — a servo sagging under load pins at
+    /// its sag, which walks the target down by that sag each time it happens —
+    /// and nothing about that is refused.
     #[test]
-    fn a_held_goal_far_from_the_position_it_is_measured_at_stops_arming() {
+    fn a_machine_found_holding_torque_engages_at_the_positions_it_reports() {
         let cfg = provisioned_config();
-        let sag = 13.0_f64.to_radians();
+        let sag = 0.5_f64.to_radians();
         let mut machine = holding(sag);
-        let error = drive(&cfg, &mut machine).expect_err("that goal is nowhere near that leg");
-        let SeqError::PullInTooLarge {
-            context,
-            joint,
-            pull_in,
-            limit,
-        } = error
-        else {
-            panic!("expected a pull-in refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(0));
-        assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert_eq!(context.reg, Some(RegId::GoalPosition));
-        assert!((pull_in - sag).abs() < 1e-9, "the pull is the whole sag");
-        assert_eq!(limit, cfg.max_pin_pull_in);
-        // Before any enable: the servos are still exactly as they were found,
-        // which is the state a hand can put right.
-        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
-    }
+        let measured = machine.present;
+        let summary = drive(&cfg, &mut machine).expect("a machine already holding engages");
 
-    /// An antenna found holding torque is pinned at the goal it holds, not at
-    /// the position it has sagged to — the same rule as every other joint, and
-    /// the reason re-arming does not ratchet a target down by the sag each time.
-    #[test]
-    fn a_held_antenna_is_pinned_at_its_held_goal() {
-        let cfg = provisioned_config();
-        let reach = 0.25;
-        let mut machine = holding(2.0_f64.to_radians());
-        // One antenna sagging much further than the rest of the machine: its
-        // goal is where it is held, its position a quarter radian below.
-        machine.present.antennas[0] = machine.held.antennas[0] - reach;
-        machine.load[7] = reach;
-        let summary = drive(&cfg, &mut machine).expect("a sagging antenna is not a refusal");
-        assert!((summary.armed.joints.antennas[0] - machine.held.antennas[0]).abs() < 1e-12);
-        assert!((summary.rest.joints.antennas[0] - machine.present.antennas[0]).abs() < 1e-12);
-    }
-
-    /// A joint the pins did not move is judged against its own reading a sweep
-    /// earlier, not against the corridor a pulled joint gets.
-    ///
-    /// The two branches only differ on a machine found holding torque: there the
-    /// pin is the goal it holds and the reading before is a sag below it, so the
-    /// corridor is as wide as the sag while the unpulled comparison is the
-    /// arrival tolerance wide. A stray a fifth of the sag is inside that
-    /// corridor and outside the tolerance, so it separates them.
-    #[test]
-    fn an_unpulled_joint_is_not_judged_by_the_pulled_joint_corridor() {
-        let cfg = provisioned_config();
-        let droop = 5.0_f64.to_radians();
-        let mut stray = [0.0; JointId::COUNT];
-        stray[1] = 1.0_f64.to_radians();
-        let mut machine = Machine {
-            stray,
-            ..holding(droop)
-        };
-        let error = drive(&cfg, &mut machine).expect_err("that leg moved on its own");
-        let SeqError::PinUnstable {
-            joint,
-            pinned,
-            before,
-            present,
-            ..
-        } = error
-        else {
-            panic!("expected a pin-unstable refusal, got {error}");
-        };
-        assert_eq!(joint, JointId::Leg(0));
-        assert!((present - before - stray[1]).abs() < 1e-9);
-        assert!(
-            (pinned - before).abs() > 4.0 * cfg.recheck_tolerance,
-            "the sag has to be wide against the tolerance for this test to say \
-             anything: pin {pinned}, reading before {before}"
-        );
-        // Inside the corridor the pulled branch would draw, which is what makes
-        // the two branches distinguishable here.
-        assert!(present > before.min(pinned) && present < before.max(pinned));
-    }
-
-    /// The arrival check compares an unpulled joint against a reading taken
-    /// under the same load, so a servo holding a standing offset from its target
-    /// arms without the offset having to fit inside a tolerance nobody has
-    /// measured.
-    #[test]
-    fn a_droop_far_past_the_arrival_tolerance_is_not_a_refusal() {
-        let cfg = provisioned_config();
-        // Ten times the arrival tolerance and still inside the pull-in gate,
-        // which is what bounds a held goal sitting far from its position.
-        let droop = 10.0 * cfg.recheck_tolerance;
-        let mut machine = holding(droop);
-        let summary = drive(&cfg, &mut machine).expect("a drooping servo is not unstable");
-        assert!(
-            summary.droop[0].expect("found holding torque").abs() > cfg.recheck_tolerance,
-            "the droop has to exceed the tolerance for this test to say anything"
-        );
+        assert_eq!(summary.posture.present, measured);
+        assert_eq!(summary.engage.rest.joints, measured);
+        assert_eq!(summary.engage.pins.pinned, measured);
+        assert_eq!(machine.enabled(), [true; JointId::COUNT]);
+        // The walk-down, measured: the goal that went out is the sag below where
+        // the machine was already being held.
+        assert!((angle_at(&machine.held, 1) - angle_at(&machine.goals, 1) - sag).abs() < 1e-12);
     }
 
     /// Every servo is pinged before anything is decided, and the refusal names
@@ -3156,9 +3159,9 @@ mod tests {
             ..bus()
         };
         let summary = drive(&cfg, &mut machine).expect("the rail comes up");
-        assert_eq!(summary.voltage_polls, 3);
+        assert_eq!(summary.commission.voltage_polls, 3);
         assert_eq!(machine.waits, 2);
-        assert_eq!(summary.voltages, [7.4; JointId::COUNT]);
+        assert_eq!(summary.commission.rail.voltages, [7.4; JointId::COUNT]);
 
         let mut machine = Machine {
             sweeps: vec![5.0],
@@ -3184,18 +3187,22 @@ mod tests {
         assert_eq!(writes(&machine.log, RegId::PositionGains), 0);
     }
 
-    /// A resting position that is not a number stops arming where it is read.
+    /// A measured position that is not a number stops the sweep where it is
+    /// read.
     ///
     /// It closes no linkage, sits inside no travel window and would become a
     /// goal that means nothing, so it is refused at the sweep rather than
-    /// carried into the solver — which would report the same machine as a rest
-    /// pose nobody can place and name the wrong servo.
+    /// carried into the solver — which would report the same machine as a pose
+    /// nobody can place and name the wrong servo.
     #[test]
-    fn a_resting_reading_nobody_can_place_stops_arming() {
+    fn a_reading_nobody_can_place_stops_the_poll() {
+        let cfg = provisioned_config();
         let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
         machine.present.legs[3] = f64::NAN;
+        machine.log.clear();
 
-        let error = drive(&provisioned_config(), &mut machine)
+        let error = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
             .expect_err("a leg that reads as not-a-number is not a pose");
         let SeqError::UnplaceableAngle {
             context,
@@ -3219,27 +3226,21 @@ mod tests {
         );
     }
 
-    /// Each read phase's own refusal, and the property they share: a machine that
-    /// fails a check is never written to and never has its torque enabled.
+    /// Each commissioning check's own refusal, and the property they share: a
+    /// machine that fails one is never written to and never has its torque
+    /// enabled.
     #[test]
-    fn a_failed_check_stops_arming_with_nothing_written() {
+    fn a_failed_check_stops_commissioning_with_nothing_written() {
         let cfg = provisioned_config();
-        let mut unsolvable = bus();
-        unsolvable.present.legs[5] += 1.0;
         let cases = [
             bus().provisioned_as(RegId::OperatingMode, RegValue::U8(1)),
-            Machine {
-                health: [0, 0, 0, 0x20, 0, 0, 0, 0, 0],
-                ..bus()
-            },
-            unsolvable,
             Machine {
                 models: [1200, 1190, 1190, 1191, 1190, 1190, 1190, 1180, 1180],
                 ..bus()
             },
         ];
         for mut machine in cases {
-            let error = drive(&cfg, &mut machine).expect_err("this machine does not arm");
+            let error = drive(&cfg, &mut machine).expect_err("this machine does not commission");
             assert!(
                 !machine
                     .log
@@ -3247,6 +3248,7 @@ mod tests {
                     .any(|(_, request)| matches!(request, BusRequest::WriteRegVerified { .. })),
                 "{error} was raised after writing to the machine"
             );
+            assert_eq!(machine.enabled(), [false; JointId::COUNT]);
         }
 
         let mut machine = bus().provisioned_as(RegId::OperatingMode, RegValue::U8(1));
@@ -3257,17 +3259,24 @@ mod tests {
             "provisioning of servo 10, operating mode: provisioned as 3, holds 1"
         );
 
+        // A supply dip the servo rode out is recorded and engaged through: it is
+        // the one bit that means the platform is fine.
         let mut machine = Machine {
-            health: [0, 0, 0, 0x20, 0, 0, 0, 0, 0],
+            health: [1; JointId::COUNT],
             ..bus()
         };
+        let summary = drive(&cfg, &mut machine).expect("a voltage latch is not a fault");
         assert_eq!(
-            drive(&cfg, &mut machine)
-                .expect_err("an overload latch is not a warning")
-                .to_string(),
-            "health of servo 13, hardware error status: hardware error bits 0b00100000"
+            summary.commission.rail.health[4],
+            ServoHealth { id: 14, bits: 1 }
         );
+    }
 
+    /// Angles nobody can place a pose from stop the engage, named against the
+    /// legs they came from.
+    #[test]
+    fn a_measured_pose_that_closes_no_loop_stops_the_engage() {
+        let cfg = provisioned_config();
         let mut machine = bus();
         machine.present.legs[5] += 1.0;
         let error = drive(&cfg, &mut machine).expect_err("those angles close no loop");
@@ -3275,16 +3284,12 @@ mod tests {
             matches!(error, SeqError::RestPoseImplausible { .. }),
             "{error}"
         );
-        assert_eq!(error.context().step, SeqStep::PoseAndDatum);
-
-        // A supply dip the servo rode out is recorded and armed through: it is
-        // the one bit that means the platform is fine.
-        let mut machine = Machine {
-            health: [1; JointId::COUNT],
-            ..bus()
-        };
-        let summary = drive(&cfg, &mut machine).expect("a voltage latch is not a fault");
-        assert_eq!(summary.health[4], ServoHealth { id: 14, bits: 1 });
+        assert_eq!(error.context().step, SeqStep::PinAndEnable);
+        // The gates and the solve both run before the first write, so a machine
+        // whose pose places nothing is left exactly as it was found.
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
+        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
+        assert_eq!(machine.enabled(), [false; JointId::COUNT]);
     }
 
     /// The pose the record holds is the one the angles put the head at, to the
@@ -3312,40 +3317,37 @@ mod tests {
         assert!(axis_gap < 1e-9, "the orientation moved by {axis_gap} rad");
     }
 
-    /// The pins are what the tick's first trajectory starts from, so a pinned
-    /// pose the envelope refuses stops arming — on what the pin has no fence of
-    /// its own for, which is the body yaw a hand can turn anywhere in its cap.
+    /// A body a hand has turned past its cap is armed where it stands.
+    ///
+    /// The measured pose is physical reality; the envelope fences commanded
+    /// targets, which is the tick's job on every move afterwards. Refusing here
+    /// would leave the head limp in the very pose somebody needs it moved out
+    /// of, so arming measures it, takes hold of it, and hands the caller a
+    /// record saying where it is.
     #[test]
-    fn a_pinned_pose_outside_the_envelope_stops_arming() {
+    fn a_body_turned_past_its_cap_is_armed_where_it_stands() {
         let cfg = provisioned_config();
         let env = EnvelopeConfig::default();
 
         let mut machine = bus();
-        machine.present.body_yaw = env.body_yaw_limit + 0.05;
-        let error = drive(&cfg, &mut machine).expect_err("the body is turned past its cap");
-        let SeqError::PinnedPoseOutsideEnvelope {
-            context,
-            violations,
-        } = error
-        else {
-            panic!("expected an envelope refusal, got {error}");
-        };
-        assert!(violations.body_yaw);
-        assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert_eq!(context.id, 10);
-        assert_eq!(
-            error.to_string(),
-            "pin and enable of servo 10, goal position: the pinned pose is outside the \
-             envelope (body yaw out of range)"
-        );
-        // Refused before the pin was written and before any torque went on.
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
-        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
+        let turned = env.body_yaw_limit + 0.05;
+        machine.present.body_yaw = turned;
+        let engage = drive(&cfg, &mut machine)
+            .expect("reality is not refusable")
+            .engage;
 
-        // The rest the pin exists for still arms: below the clearance floor is
-        // the one verdict arming ignores.
-        let summary = drive(&cfg, &mut bus()).expect("a tight rest is not a refusal");
-        assert!(summary.armed.min_margin < env.min_toggle_margin);
+        assert_eq!(engage.rest.joints.body_yaw, turned);
+        assert_eq!(engage.armed.joints.body_yaw, turned);
+        assert_eq!(engage.pins.pinned.body_yaw, turned);
+        assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
+
+        // A rest tighter than the clearance floor engages too, and the record
+        // carries the margin it was found at.
+        let engage = drive(&cfg, &mut bus())
+            .expect("a tight rest is not a refusal")
+            .engage;
+        assert!(engage.armed.min_margin < env.min_toggle_margin);
     }
 
     /// The whole sequence over a machine found parked: both antennas resting
@@ -3365,48 +3367,44 @@ mod tests {
         ] {
             let mut machine = bus();
             machine.present.antennas = antennas;
-            let summary = drive(&cfg, &mut machine).expect("a parked antenna is not a refusal");
+            let engage = drive(&cfg, &mut machine)
+                .expect("a parked antenna is not a refusal")
+                .engage;
 
-            // Found and armed are the same angles: an antenna has nowhere to be
-            // pulled to.
-            assert_eq!(summary.rest.joints.antennas, antennas);
-            assert_eq!(summary.armed.joints.antennas, antennas);
-
-            // And those are the goals that reached the machine, on every servo.
-            assert_eq!(machine.goals.antennas, antennas);
+            // Found, pinned and armed are all the same angles: an antenna has
+            // nowhere to be pulled to.
+            assert_eq!(engage.rest.joints.antennas, antennas);
+            assert_eq!(engage.pins.pinned.antennas, antennas);
+            assert_eq!(engage.armed.joints.antennas, antennas);
             assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
             assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
         }
     }
 
-    /// Pins that close no linkage are refused before a byte of them is written,
-    /// and the refusal is reported against the pin, not against the writes that
-    /// came before it and all landed.
+    /// A machine that reports angles closing no linkage once its torque is on
+    /// is refused there — the trajectory the next move starts from would have
+    /// no start.
+    ///
+    /// The torque stays on. Reaching the minimum risk condition from here is a
+    /// caller's decision and a caller's write; nothing in a read-back sequence
+    /// is entitled to decide it.
     #[test]
-    fn pins_that_place_no_pose_are_refused_before_any_write() {
-        let mut cfg = provisioned_config();
-        cfg.max_pin_pull_in = PI;
+    fn a_pose_read_back_that_closes_no_loop_is_refused() {
+        let cfg = provisioned_config();
         let mut machine = bus();
-        // A window a radian off where the sixth leg is resting: the pin will pull
-        // it there, and those six angles close no loop.
-        let rest = angle_at(&machine.present, 6);
-        cfg.leg_windows[5] = (rest + 1.0, rest + 1.2);
+        machine.enable_shift[6] = 1.0;
 
-        let error = drive(&cfg, &mut machine).expect_err("those pins place no pose");
+        let error = drive(&cfg, &mut machine).expect_err("those angles place no pose");
         let SeqError::PinnedPoseUnsolvable { context, .. } = error else {
-            panic!("expected an unsolvable-pins refusal, got {error}");
+            panic!("expected an unsolvable-pose refusal, got {error}");
         };
         assert_eq!(context.step, SeqStep::PinAndEnable);
-        assert_eq!(context.reg, Some(RegId::GoalPosition));
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
-        assert_eq!(writes(&machine.log, RegId::TorqueEnable), 0);
-        // The phase before it ran in full, which is what makes this the pin's own
-        // refusal rather than an earlier check stopping the sequence.
-        assert_eq!(
-            writes(&machine.log, RegId::PositionGains),
-            JointId::COUNT,
-            "the gains phase completed before the pins were computed"
-        );
+        assert_eq!(context.reg, Some(RegId::PresentPosition));
+        // Every sweep before it ran in full, which is what makes this the
+        // read-back's own refusal rather than an earlier check stopping short.
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
+        assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
+        assert_eq!(machine.enabled(), [true; JointId::COUNT]);
     }
 
     /// A wrong servo at a roster address is named with what it answered and what
@@ -3506,7 +3504,7 @@ mod tests {
         );
 
         // The same knob on a read: a servo refusing the resting position read
-        // stops arming with the status code it sent, before any write at all.
+        // stops the sweep with the status code it sent, before any torque.
         let mut machine = Machine {
             fail_read: Some((
                 15,
@@ -3523,7 +3521,7 @@ mod tests {
                 code: 7,
             }
         );
-        assert_eq!(writes(&machine.log, RegId::PositionGains), 0);
+        assert_eq!(machine.enabled(), [false; JointId::COUNT]);
 
         // And a corrupt reply, which is never retried by anything below.
         let mut machine = Machine {
@@ -3540,51 +3538,45 @@ mod tests {
         assert_eq!(machine.enabled(), [false; JointId::COUNT]);
     }
 
-    /// A pose the envelope refuses only once torque is on is refused there, with
-    /// the machine holding what it holds and no goal written.
-    ///
-    /// The pins are recomputed from the reading taken after the enables, so the
-    /// envelope's verdict is on the state the machine is actually in — and a
-    /// refusal at that point cannot be un-refused by cutting torque, which drops
-    /// the head. It stands where it stands and recovery is the operator's.
+    /// The armed record is the reading taken after the enables, so a joint whose
+    /// reported frame moved when torque came on is recorded where it now says it
+    /// is — wherever that lands. Nothing judges it against the envelope: the
+    /// fence is on commanded targets, and this is a measurement.
     #[test]
-    fn a_pose_the_envelope_refuses_after_the_enables_stops_there_holding() {
+    fn a_pose_that_leaves_the_cap_once_torque_is_on_is_recorded_where_it_lands() {
         let cfg = provisioned_config();
         let env = EnvelopeConfig::default();
 
         let mut machine = bus();
         // Inside the cap where arming finds it, past the cap once torque is on.
-        machine.present.body_yaw = env.body_yaw_limit - 0.05;
+        let found = env.body_yaw_limit - 0.05;
+        machine.present.body_yaw = found;
         machine.enable_shift[0] = 0.1;
-        let error = drive(&cfg, &mut machine).expect_err("the body ends up past its cap");
-        let SeqError::PinnedPoseOutsideEnvelope { violations, .. } = error else {
-            panic!("expected an envelope refusal, got {error}");
-        };
-        assert!(violations.body_yaw);
-        // Every servo took torque and keeps it; not one goal was written.
+        let engage = drive(&cfg, &mut machine)
+            .expect("the post-enable reading is not judged")
+            .engage;
+
+        assert_eq!(engage.rest.joints.body_yaw, found);
+        assert_eq!(engage.pins.pinned.body_yaw, found);
+        assert!((engage.armed.joints.body_yaw - (found + 0.1)).abs() < 1e-12);
+        assert!(engage.armed.joints.body_yaw > env.body_yaw_limit);
         assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
-        assert_eq!(writes(&machine.log, RegId::GoalPosition), 0);
+        assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
         assert_eq!(machine.enabled(), [true; JointId::COUNT]);
     }
 
-    /// Each servo is enabled once and pinned once, and the pin is a verified
-    /// write with torque already on — which is the only condition under which
-    /// this platform's goal register keeps what it is given.
+    /// Each servo is enabled once and pinned once, and the pose is read back
+    /// once: twenty-seven transactions, no servo asked twice.
     #[test]
     fn every_servo_is_enabled_once_and_pinned_once() {
         let cfg = provisioned_config();
         let mut machine = bus();
-        drive(&cfg, &mut machine).expect("this machine arms");
+        drive(&cfg, &mut machine).expect("this machine engages");
 
         assert_eq!(writes(&machine.log, RegId::TorqueEnable), JointId::COUNT);
         assert_eq!(writes(&machine.log, RegId::GoalPosition), JointId::COUNT);
-        assert_eq!(
-            machine.written,
-            [true; JointId::COUNT],
-            "every goal was written with torque on, so every one was stored"
-        );
-        // Two position sweeps: the one after the enables that the pins are
-        // computed from, and the one after the goals that checks arrival.
+        // One position sweep in this phase: the read-back after the enables,
+        // which is what the trajectory starts from. Nothing is read after it.
         let positions = machine
             .log
             .iter()
@@ -3599,7 +3591,7 @@ mod tests {
                     )
             })
             .count();
-        assert_eq!(positions, 2 * JointId::COUNT);
+        assert_eq!(positions, JointId::COUNT);
     }
 
     /// A provisioning table that asks for nothing reads nothing and goes straight
@@ -3611,9 +3603,9 @@ mod tests {
         assert_eq!(cfg.expected.checks(), 0);
         assert_eq!(cfg.expected.reads(), 0);
         let mut machine = bus();
-        let summary = drive(&cfg, &mut machine).expect("this machine arms");
+        let summary = drive(&cfg, &mut machine).expect("this machine engages");
 
-        assert_eq!(summary.provisioned.count(), 0);
+        assert_eq!(summary.commission.provisioned.count(), 0);
         assert!(
             !machine
                 .log
@@ -3633,10 +3625,8 @@ mod tests {
                 SeqStep::Identity,
                 SeqStep::VoltageGate,
                 SeqStep::Health,
-                SeqStep::PoseAndDatum,
-                SeqStep::StateDiscovery,
-                SeqStep::GoalShadow,
                 SeqStep::GainsProfiles,
+                SeqStep::PoseAndDatum,
                 SeqStep::PinAndEnable,
             ]
         );
@@ -3647,12 +3637,7 @@ mod tests {
     /// outstanding rather than wherever a cursor had got to.
     #[test]
     fn a_driver_that_brings_nothing_back_is_silence() {
-        let mut seq = ArmSequencer::new(
-            &config(),
-            &HeadGeometry::default(),
-            &EnvelopeConfig::default(),
-            &FkOptions::default(),
-        );
+        let mut seq = CommissionSequencer::new(&config());
         assert_eq!(
             seq.next(Duration::ZERO, None),
             SeqAction::Transact(BusRequest::Ping { id: 10 })

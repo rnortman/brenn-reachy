@@ -37,7 +37,7 @@
 use core::fmt;
 use core::time::Duration;
 
-use reachy_kin::{EnvelopeViolations, FkError};
+use reachy_kin::FkError;
 use thiserror::Error;
 
 use crate::joints::JointId;
@@ -604,23 +604,19 @@ pub enum SeqStep {
     Identity,
     /// Every provisioned register holds what it should.
     Provision,
-    /// The supply rail is up.
+    /// The supply rail, read: a floor commissioning waits for and engaging
+    /// checks against.
     VoltageGate,
-    /// Nothing has latched a hardware error.
+    /// The latched hardware-error bytes, read.
     Health,
-    /// Where the platform is resting, and whether those angles place a pose at
+    /// Where the platform is standing, and whether those angles place a pose at
     /// all. What the datum itself rests on — the provisioned homing offsets — is
     /// verified in the provisioning phase, before anything here is read.
     PoseAndDatum,
-    /// Which servos are already holding torque.
-    StateDiscovery,
-    /// Every limp servo's goal register mirrors the position it was measured at,
-    /// which is what makes enabling its torque safe.
-    GoalShadow,
     /// The position gains and motion profiles, written fresh.
     GainsProfiles,
-    /// Torque enabled, which holds every joint where it stands, then goals
-    /// pinned there.
+    /// Goals pinned where the joints stand, then torque enabled — which holds
+    /// every joint where it is — then the pose read back.
     PinAndEnable,
     /// Waiting out the settle, before the stow pose is measured at all.
     Dwell,
@@ -631,19 +627,18 @@ pub enum SeqStep {
 }
 
 impl SeqStep {
-    /// Every phase either sequencer has, arming's in order and then disarming's.
+    /// Every phase any sequencer has, the torque-on ones in order and then
+    /// disarming's.
     ///
     /// Exhaustive: a phase added without a name is caught by the name guard
     /// rather than escaping it.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 11] = [
         Self::Presence,
         Self::Identity,
         Self::Provision,
         Self::VoltageGate,
         Self::Health,
         Self::PoseAndDatum,
-        Self::StateDiscovery,
-        Self::GoalShadow,
         Self::GainsProfiles,
         Self::PinAndEnable,
         Self::Dwell,
@@ -660,9 +655,7 @@ impl fmt::Display for SeqStep {
             Self::Provision => "provisioning",
             Self::VoltageGate => "voltage gate",
             Self::Health => "health",
-            Self::PoseAndDatum => "resting pose and datum",
-            Self::StateDiscovery => "torque state discovery",
-            Self::GoalShadow => "goal shadow",
+            Self::PoseAndDatum => "measured pose and datum",
             Self::GainsProfiles => "gains and profiles",
             Self::PinAndEnable => "pin and enable",
             Self::VerifyAtStow => "stow verification",
@@ -777,24 +770,6 @@ pub enum SeqError {
         /// The shape that arrived.
         observed: ValueKind,
     },
-    /// Pinning a joint at arm time would pull it further than arming permits.
-    /// Past this distance the platform is not resting where anything predicted,
-    /// and dragging it there under torque is a decision for a person.
-    #[error(
-        "{context}: pinning {joint} would pull it {:.2}°, past the {:.2}° gate",
-        pull_in.to_degrees(),
-        limit.to_degrees()
-    )]
-    PullInTooLarge {
-        /// Where this happened.
-        context: StepContext,
-        /// The joint the pin would have pulled.
-        joint: JointId,
-        /// How far, radians.
-        pull_in: f64,
-        /// The largest pull permitted, radians.
-        limit: f64,
-    },
     /// A measured angle is not a number, so nothing can be decided from it: it
     /// is inside no window, closes no linkage, and would become a meaningless
     /// goal.
@@ -840,9 +815,11 @@ pub enum SeqError {
         /// What it holds.
         observed: RegValue,
     },
-    /// The supply never reached the arming floor within the budget. Every
-    /// reading of the last sweep travels with it, because one low servo and nine
-    /// low servos point at different halves of the wiring.
+    /// The supply never reached the arming floor within the budget — the
+    /// commissioning gate, which polls and waits. A rail found low by a gate
+    /// that does neither is [`SeqError::SupplyBelowFloor`]. Every reading of the
+    /// last sweep travels with it, because one low servo and nine low servos
+    /// point at different halves of the wiring.
     #[error(
         "{context}: {lowest:.1} V is below the {limit:.1} V arming floor after {:.1} s",
         waited.as_secs_f64()
@@ -858,6 +835,22 @@ pub enum SeqError {
         limit: f64,
         /// How long the gate waited.
         waited: Duration,
+    },
+    /// The last sweep of the rail read below the arming floor, so torque was not
+    /// enabled. Nothing waited and nothing was written: the reading is whatever
+    /// the resting watch brought back, and the next request judges a fresh one.
+    /// Every reading travels with it, because one low servo and nine low servos
+    /// point at different halves of the wiring.
+    #[error("{context}: {lowest:.1} V is below the {limit:.1} V arming floor; torque stays off")]
+    SupplyBelowFloor {
+        /// Where this happened; the servo reporting `lowest`.
+        context: StepContext,
+        /// The sweep's readings, in bus order, volts.
+        readings: [f64; JointId::COUNT],
+        /// The lowest of them, volts.
+        lowest: f64,
+        /// The floor, volts.
+        limit: f64,
     },
     /// A servo has latched a hardware error beyond a supply dip it rode out.
     /// Never followed by a reboot: rebooting a servo holding this head drops it.
@@ -879,108 +872,14 @@ pub enum SeqError {
         /// What the solver said.
         cause: FkError,
     },
-    /// The goals arming was about to write place no pose. Nothing is written:
-    /// a goal set that describes no configuration of the linkage is not something
-    /// to hand nine servos and find out.
-    #[error("{context}: the pinned angles place no pose ({cause}); nothing was written")]
+    /// The angles the machine reported once its torque was on place no pose.
+    /// The trajectory the next move starts from would have no start.
+    #[error("{context}: the angles place no pose ({cause})")]
     PinnedPoseUnsolvable {
         /// Where this happened.
         context: StepContext,
         /// What the solver said.
         cause: FkError,
-    },
-    /// The pose the goals arming was about to write would hold is outside the
-    /// envelope every commanded pose is checked against. Every trajectory starts
-    /// from the pose arming left the machine at, so a start the envelope refuses
-    /// is a machine that faults on its first move, holding torque at the pose the
-    /// fault refused. Clearance below the floor is not this: a rest tighter than
-    /// the floor arms, and the clearance the machine is at is what the first move
-    /// is measured against.
-    #[error("{context}: the pinned pose is outside the envelope ({violations})")]
-    PinnedPoseOutsideEnvelope {
-        /// Where this happened; the servo of the first joint named below.
-        context: StepContext,
-        /// Every check the pinned pose failed, the clearance floor excepted.
-        violations: EnvelopeViolations,
-    },
-    /// A joint is not where stow put it, so torque cannot come off here: the
-    /// head is held up by the torque about to be released, and stow is the pose
-    /// it can be left resting in. Overridden only by the operator's explicit
-    /// acceptance that the head falls.
-    #[error(
-        "{context}: {joint} reads {:.3}° and stow is {:.3}°, {:.3}° apart and past the {:.3}° gate",
-        present.to_degrees(),
-        target.to_degrees(),
-        deviation.to_degrees(),
-        tolerance.to_degrees()
-    )]
-    NotAtStow {
-        /// Where this happened; the servo of the joint furthest from stow.
-        context: StepContext,
-        /// That joint.
-        joint: JointId,
-        /// Where it reads, radians.
-        present: f64,
-        /// Where stow puts it, radians.
-        target: f64,
-        /// How far apart those two are, radians, measured the way this joint is
-        /// judged — around the circle for a free rotor, along the line for a
-        /// windowed joint. Carried rather than recomputed here, so the figure
-        /// the operator reads is the one the gate refused on.
-        deviation: f64,
-        /// How far from stow a joint may be, radians.
-        tolerance: f64,
-    },
-    /// A joint did not end up where writing its goal should have left it: it
-    /// moved when nothing asked it to, or it is somewhere other than between
-    /// where it started and where it was sent. Either way the machine is not
-    /// standing where arming believes it is, and nothing should start commanding
-    /// it.
-    #[error(
-        "{context}: {joint} was pinned at {:.3}°, read {:.3}° before the goal was written \
-         and {:.3}° after",
-        pinned.to_degrees(),
-        before.to_degrees(),
-        present.to_degrees()
-    )]
-    PinUnstable {
-        /// Where this happened.
-        context: StepContext,
-        /// The joint that did not settle.
-        joint: JointId,
-        /// Where it was pinned, radians.
-        pinned: f64,
-        /// Where it read once torque was on and before its goal was written,
-        /// radians.
-        before: f64,
-        /// Where it reads now, radians.
-        present: f64,
-    },
-    /// A servo that is not holding torque has a goal register that does not
-    /// mirror its measured position. Arming enables torque before it writes any
-    /// goal, and that is safe only because a limp servo's goal is where the
-    /// joint already stands — a goal anywhere else means the joint has moved
-    /// since it was measured, or this firmware does not mirror at all, and
-    /// enabling torque would command the difference.
-    #[error(
-        "{context}: {joint} is limp and its goal reads {:.3}° against a position of {:.3}°, \
-         {:.3}° apart and past the {:.3}° gate",
-        goal.to_degrees(),
-        present.to_degrees(),
-        (goal - present).abs().to_degrees(),
-        tolerance.to_degrees()
-    )]
-    GoalShadowMismatch {
-        /// Where this happened.
-        context: StepContext,
-        /// The joint whose goal does not mirror.
-        joint: JointId,
-        /// What its goal register holds, radians.
-        goal: f64,
-        /// Where it was measured, radians.
-        present: f64,
-        /// How far apart the two may be, radians.
-        tolerance: f64,
     },
 }
 
@@ -995,19 +894,15 @@ impl SeqError {
             | Self::VerifyMismatch { context, .. }
             | Self::WrongAnswer { context, .. }
             | Self::WrongValue { context, .. }
-            | Self::PullInTooLarge { context, .. }
             | Self::UnplaceableAngle { context, .. }
             | Self::AbsentServos { context, .. }
             | Self::IdentityMismatch { context, .. }
             | Self::ProvisionMismatch { context, .. }
             | Self::VoltageLow { context, .. }
+            | Self::SupplyBelowFloor { context, .. }
             | Self::UnhealthyServo { context, .. }
             | Self::RestPoseImplausible { context, .. }
-            | Self::PinnedPoseUnsolvable { context, .. }
-            | Self::PinnedPoseOutsideEnvelope { context, .. }
-            | Self::NotAtStow { context, .. }
-            | Self::PinUnstable { context, .. }
-            | Self::GoalShadowMismatch { context, .. } => *context,
+            | Self::PinnedPoseUnsolvable { context, .. } => *context,
         }
     }
 }
