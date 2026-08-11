@@ -12,14 +12,21 @@
 //!
 //! ## What a command does when a run goes wrong
 //!
-//! A refusal leaves the machine holding: the tick would not accept the command,
-//! nothing was written, and where the head is standing is where the last
-//! accepted command put it. A *fault* is the other case — tracking lost, a step
-//! bound violated, the wire gone — and there the machine goes limp
-//! immediately, because a head held up by motors whose control loop has stopped
-//! is the one state this platform should never be left in. That is
-//! [`Engaged::disengage_now`], and it runs before the command exits with the
-//! fault that caused it.
+//! What an ending asks for is [`PumpError::class`], and the command carries it
+//! out. A refusal leaves the machine holding: nothing was written, and where
+//! the head is standing is where the last accepted command put it. So does a
+//! defect of ours with a healthy machine — a step bound violated, a budget run
+//! out — because an operator is standing here, `off` is one command away, and
+//! the bench ticks nothing between commands, so a held pose cannot re-raise.
+//!
+//! A fault is the other case, and it comes in two shapes. Where the motors
+//! still command — a grabbed head, a servo dropping out of a six-crank
+//! platform — the machine winds down under control and then releases: yielding
+//! is what helps a hand pushing the head down, and holding torque against it
+//! would be a fault answered by holding. Where control itself is what stopped
+//! being trustworthy — no feedback, no pose, no wire — torque comes off on the
+//! spot, because a head held up by motors whose loop has stopped is the one
+//! state this platform should never be left in.
 //!
 //! `off` is the exception, and deliberately: it releases torque, so re-arming
 //! first would enable torque in order to switch it off. It drives the disarm
@@ -46,14 +53,14 @@ use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    EngageSequencer, JointId, JointTargets, MotionCommand, MotionState, MoveDurations, PollCadence,
-    PollSequencer, Posture, RegId, RegValue, ValueKind, Warp,
+    EngageSequencer, Fault, JointGroup, JointId, JointTargets, MotionCommand, MotionState,
+    MoveDurations, PollCadence, PollSequencer, Posture, RegId, RegValue, ValueKind, Warp,
 };
 
 use crate::config::Resolved;
 use crate::pump::{
-    Clock, DISARM_ACTIONS, MotionPump, MoveSummary, PumpError, TickEvent, action_budget,
-    commission_report, drive, drive_release, engage_report,
+    Clock, DISARM_ACTIONS, Disposition, ErrorClass, MotionPump, MoveSummary, Phase, PumpError,
+    TickEvent, action_budget, commission_report, drive, drive_release, engage_phase, engage_report,
 };
 use crate::trace;
 
@@ -292,7 +299,13 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
         ) {
             Ok(engaged) => engaged,
             Err(error) => {
-                if engaging.torque_written() {
+                // The one path that crosses the torque line mid-run, so the
+                // phase its ending is classified in is the sequencer's own
+                // record of whether an enable went out. There is no engagement
+                // yet and so no tick to drive a controlled stow with: what a
+                // half-enabled machine gets is the release, whatever the class
+                // would ask of a caller that had one.
+                if engage_phase(engaging.torque_written()) == Phase::UnderTorque {
                     line("engage failed with torque possibly on; releasing immediately");
                     self.detorque_now(clock, line);
                 }
@@ -396,7 +409,13 @@ fn fall_through_to_immediate<P: BusPort>(
     let Err(error) = outcome else {
         return outcome;
     };
-    if !error.is_fault() {
+    // A refusal wrote nothing, so there is nothing part way through. An
+    // unacknowledged torque-off is the other exception, and a degenerate one:
+    // every servo was asked and every write retried, so writing them again
+    // would say no more than the report already does.
+    if error.class(Phase::UnderTorque) == ErrorClass::Refuse
+        || matches!(error, PumpError::TorqueOffUnacked { .. })
+    {
         return Err(error);
     }
     line("the orderly release did not finish; releasing immediately");
@@ -438,6 +457,16 @@ impl<P: BusPort> Engaged<'_, '_, P> {
     #[must_use]
     pub fn targets(&self) -> JointTargets {
         *self.state.last_targets()
+    }
+
+    /// Whether every joint that carries the head has been taken out of service.
+    ///
+    /// The end of the mask's growth: with the cranks and the body yaw all
+    /// released there is nothing left to stow the head with, and what a
+    /// wind-down has to do is what it was always going to end with.
+    fn head_released(&self) -> bool {
+        let masked = self.state.masked();
+        masked.covers(JointGroup::Legs) && masked.covers(JointGroup::BodyYaw)
     }
 
     /// Carry one move to its endpoint, each mechanical group on its own clock.
@@ -742,13 +771,14 @@ pub fn release<P: BusPort>(
 fn move_line(summary: &MoveSummary) -> String {
     format!(
         "  {ticks} period(s), {goals} commanding, {frames} frame(s), {misses} blind, \
-         {overruns} overrun(s), worst jitter {jitter:.1} ms, {elapsed:.2} s",
+         {overruns} overrun(s), worst jitter {jitter:.1} ms, {slip:.1} ms slip, {elapsed:.2} s",
         ticks = summary.ticks,
         goals = summary.goals,
         frames = summary.frames,
         misses = summary.misses,
         overruns = summary.overruns,
         jitter = summary.worst_jitter.as_secs_f64() * 1e3,
+        slip = summary.slip.as_secs_f64() * 1e3,
         elapsed = summary.elapsed.as_secs_f64(),
     )
 }
@@ -852,12 +882,15 @@ fn release_tail(summary: &DisarmSummary) -> String {
 
 /// How a bench command ends once it has finished with an engaged machine.
 ///
-/// A clean run and a refusal both leave the head where it is, holding: the
-/// bench's model is that a command takes hold and `off` lets go, so an operator
-/// can chain `up`, `yaw`, `stow` without the head dropping in between, and a
-/// refused command changed nothing to undo. A fault is the exception and takes
-/// the machine limp immediately — the error that comes back describes a machine
-/// nobody has to catch.
+/// A clean run leaves the head where it is, holding: the bench's model is that
+/// a command takes hold and `off` lets go, so an operator can chain `up`,
+/// `yaw`, `stow` without the head dropping in between. So does every ending
+/// that names no condition of the machine — a refusal changed nothing, and a
+/// defect of ours leaves a healthy machine an operator is standing next to.
+///
+/// A fault is what ends differently, and by which maneuver its class asks for:
+/// a wind-down under control where the motors still command, torque off on the
+/// spot where they no longer can be trusted to.
 fn settle<T, P: BusPort>(
     engaged: Engaged<'_, '_, P>,
     outcome: Result<T, PumpError>,
@@ -867,13 +900,126 @@ fn settle<T, P: BusPort>(
     let Err(error) = outcome else {
         return Ok(());
     };
-    if !error.is_fault() {
-        return Err(error);
+    let class = error.class(Phase::UnderTorque);
+    let faulted = error.fault(Phase::UnderTorque).is_some();
+    match class {
+        ErrorClass::Refuse => {}
+        // The abort-class endings: the plan was wrong and the platform is
+        // fine. Stowing them would be a machine winding itself down over a
+        // bug in front of somebody who can read the message and type `off`.
+        ErrorClass::SlowStowToRest if !faulted => {
+            line(&format!("the run did not finish: {error}"));
+            line("the machine is healthy and still holding; `off` releases it");
+        }
+        ErrorClass::SlowStowToRest | ErrorClass::MaskedSlowStowToPark => {
+            line(&format!("fault: {error}"));
+            report_disposition(wind_down(engaged, class.disposition(), clock, line), line);
+        }
+        ErrorClass::ImmediateAllTorqueOffToRest | ErrorClass::ImmediateAllTorqueOffToPark => {
+            line(&format!("fault: {error}"));
+            line("releasing torque now; the head settles into near-stow");
+            report_release(engaged.disengage_now(clock, line), line);
+            report_disposition(class.disposition(), line);
+        }
     }
-    line(&format!("fault: {error}"));
-    line("releasing torque now; the head settles into near-stow");
-    report_release(engaged.disengage_now(clock, line), line);
     Err(error)
+}
+
+/// Stow under control on the tick state the fault left commanding, then release
+/// everything.
+///
+/// The maneuver both controlled responses run. The raise that brought us here
+/// dropped the move and left the tick holding at its last goal — and, for a
+/// servo that dropped out, released that servo and took it out of every check —
+/// so the stow is commanded on the same live state rather than on a fresh
+/// engage of a machine nobody has looked at.
+///
+/// A head servo dropping out mid-stow expands the maneuver instead of ending
+/// it: that servo is already released by the time the ending arrives here, and
+/// the stow is re-commanded from where the machine now stands, on what is left
+/// of the clock this started with. The clock never restarts, so however many
+/// servos go, the whole maneuver is bounded by the one stow it began as — and
+/// a wind-down the machine defeats, or one whose clock runs out, falls through
+/// to the immediate release. Every path through here ends with torque off.
+///
+/// The disposition is the sticky maximum: a head servo dropping out latches,
+/// so a wind-down that started for a grabbed head and lost a servo on the way
+/// down ends parked rather than at rest.
+fn wind_down<P: BusPort>(
+    mut engaged: Engaged<'_, '_, P>,
+    disposition: Disposition,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Disposition {
+    let stow = engaged.machine.resolved.stow_durations();
+    // The stow's own clock plus the window its arrival is measured in: the
+    // whole of what one stow is allowed, spent once across every expansion.
+    let deadline = clock
+        .now()
+        .saturating_add(stow.longest())
+        .saturating_add(engaged.machine.resolved.settle.timeout);
+    let mut disposition = disposition;
+    let stowed = loop {
+        if engaged.head_released() {
+            // Not a stow: there is nothing left to drive one with, and saying
+            // the head came down under control when every joint that carries
+            // it has gone limp is the one claim this record must not make.
+            line("  no head joint is still commanded; releasing torque now");
+            break false;
+        }
+        let left = deadline.saturating_sub(clock.now());
+        if left.is_zero() {
+            line("  the stow clock is spent; releasing torque now");
+            break false;
+        }
+        line("  stowing under control on what still commands");
+        match engaged.move_to(stow_pose_targets(), within(stow, left), clock, line) {
+            Ok(_) => break true,
+            Err(error) => match error.fault(Phase::UnderTorque) {
+                // The mask grew. Nothing about the maneuver changes but which
+                // servos carry the head the rest of the way down.
+                Some(fault @ Fault::HeadServoFault { .. }) => {
+                    line(&format!("  {fault}; the stow carries on without it"));
+                    disposition = Disposition::Park;
+                }
+                _ => {
+                    line(&format!("  the stow did not finish: {error}"));
+                    break false;
+                }
+            },
+        }
+    };
+    if stowed {
+        line("  stowed; releasing torque");
+    }
+    report_release(engaged.disengage_now(clock, line), line);
+    disposition
+}
+
+/// The same move clocks, with nothing over `left` on any of them.
+///
+/// What a re-commanded stow is asked for: the maneuver's clock is the one it
+/// started with, so an expansion gets the remainder of it rather than a fresh
+/// one. A remainder shorter than the move can be run in is floored by the
+/// guard, as any other under-clocked move is, and the deadline catches the
+/// overrun on the next pass.
+fn within(durations: MoveDurations, left: Duration) -> MoveDurations {
+    MoveDurations {
+        head: durations.head.min(left),
+        antennas: durations.antennas.map(|antenna| antenna.min(left)),
+    }
+}
+
+/// What the machine is left waiting for.
+///
+/// The disposition and nothing else: a park is asked for by five endings,
+/// and a line that guessed which one would send an operator whose bus died,
+/// or whose torque-off went unacknowledged, to look at the servos.
+fn report_disposition(disposition: Disposition, line: &mut dyn FnMut(&str)) {
+    line(match disposition {
+        Disposition::Rest => "  at rest; the next command engages the machine again",
+        Disposition::Park => "  parked: look at the machine before arming it again",
+    });
 }
 
 /// Verify the machine, pin every joint where it stands, and enable torque.
@@ -1730,7 +1876,9 @@ mod tests {
             .find(|line| line.contains("period(s)"))
             .expect("the faulted run reports its periods");
         assert!(
-            summary.contains("blind") && summary.contains("worst jitter"),
+            summary.contains("blind")
+                && summary.contains("worst jitter")
+                && summary.contains("slip"),
             "{summary}"
         );
 
@@ -1752,22 +1900,32 @@ mod tests {
         }
     }
 
-    /// A faulted move ends with the machine limp.
+    /// An obstruction the machine cannot get out from under still ends with the
+    /// machine limp.
     ///
-    /// The one assertion this whole shape exists for. A fault means the control
-    /// loop has stopped believing what it is told about the machine, and a head
-    /// left held up by motors under a loop nobody is driving is the single state
-    /// this platform must never be parked in — so torque comes off, from
-    /// wherever the head is, before the command exits with the fault.
+    /// The one assertion this whole shape exists for, and the fall-through that
+    /// guarantees it. A grabbed head is answered by yielding under control, so
+    /// the stow is tried first — but a jam that defeats the stow re-raises
+    /// inside it, and there the wind-down gives up and torque comes off from
+    /// wherever the head is. A head left held up by motors under a loop nobody
+    /// is driving is the single state this platform must never be parked in.
     #[test]
-    fn a_faulted_move_ends_with_torque_off() {
+    fn an_obstruction_that_defeats_the_stow_ends_with_torque_off() {
         let cfg = resolved();
         let mut machine = machine_at(&datumed_config(), &stow_legs());
         machine.stalled.push(cfg.map.ids()[2]);
         let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
 
         let error = run.err("a servo that takes its goals and does not move");
-        assert!(matches!(error, PumpError::Fault(_)), "{error}");
+        assert!(
+            matches!(error, PumpError::Fault(Fault::HeadObstructed { .. })),
+            "{error}"
+        );
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::SlowStowToRest,
+            "the motors still command, so the answer is a controlled stow"
+        );
         assert_eq!(
             torque(&cfg, &run),
             vec![0; JointId::COUNT],
@@ -1775,20 +1933,18 @@ mod tests {
             run.printed
         );
 
-        assert!(
-            run.printed
-                .iter()
-                .any(|line| line.contains("releasing torque now")),
-            "{:?}",
-            run.printed
-        );
-        assert!(
-            run.printed
-                .iter()
-                .any(|line| line.contains("torque off, immediately")),
-            "{:?}",
-            run.printed
-        );
+        for said in [
+            "stowing under control",
+            "the stow did not finish",
+            "torque off, immediately",
+            "at rest",
+        ] {
+            assert!(
+                run.printed.iter().any(|line| line.contains(said)),
+                "no {said:?} line: {:?}",
+                run.printed
+            );
+        }
     }
 
     /// A command the tick refuses is not a fault: nothing was written, the
@@ -1807,10 +1963,11 @@ mod tests {
 
         let error = run.err("ninety degrees is past the cap");
         assert!(matches!(error, PumpError::Rejected(_)), "{error}");
-        assert!(!error.is_fault());
-        assert!(
-            !error.is_gate_refusal(),
-            "a refused command is not one of the two torque-on gates"
+        assert_eq!(error.class(Phase::UnderTorque), ErrorClass::Refuse);
+        assert_eq!(
+            error.fault(Phase::UnderTorque),
+            None,
+            "a command the tick would not take says nothing about the machine"
         );
         assert_eq!(torque(&cfg, &run), vec![1; JointId::COUNT]);
         assert!(
@@ -1820,17 +1977,20 @@ mod tests {
         );
     }
 
-    /// Both torque-on gates classify as gate refusals, they are the only errors
-    /// that do, and none of them is also a fault.
+    /// Both torque-on gates refuse whichever phase they are classified in, and
+    /// they name no condition of the machine.
     ///
-    /// What an unattended caller turns on: a gate refusal wrote nothing, so the
-    /// machine is still limp where it was and the next request may simply ask
-    /// again, while everything else out of an engage leaves something to bring
-    /// back to the minimum risk condition. Built from `engage_gates` itself
-    /// rather than from hand-written variants, so a gate that changed shape is
-    /// caught here.
+    /// What an unattended caller turns on: a gate wrote nothing, so the machine
+    /// is still limp where it was and the next request may simply ask again,
+    /// while everything else out of an engage leaves something to bring back to
+    /// the minimum risk condition. The phase is stated both ways here because
+    /// the gates are the case where it must not matter — both are judged before
+    /// a transaction goes out, so a caller that got the derivation wrong must
+    /// still not de-torque and park a machine that was never torqued. Built
+    /// from `engage_gates` itself rather than from hand-written variants, so a
+    /// gate that changed shape is caught here.
     #[test]
-    fn the_two_torque_on_gates_are_the_only_gate_refusals() {
+    fn the_two_torque_on_gates_refuse_in_either_phase() {
         let cfg = resolved();
         let healthy = Rail {
             voltages: [12.0; JointId::COUNT],
@@ -1846,19 +2006,22 @@ mod tests {
         for rail in [sagging, latched] {
             let refused = engage_gates(&cfg.arm, &rail).expect_err("the gate refuses");
             let error = PumpError::from(refused);
-            assert!(error.is_gate_refusal(), "{error}");
-            assert!(
-                !error.is_fault(),
-                "a gate refusal wrote nothing, so the fault path would de-torque and park a \
-                 machine that was never torqued: {error}"
-            );
+            for phase in [Phase::PreTorque, Phase::UnderTorque] {
+                assert_eq!(
+                    error.class(phase),
+                    ErrorClass::Refuse,
+                    "a gate wrote nothing, so de-torquing and parking would be a machine that \
+                     was never torqued: {error}"
+                );
+                assert_eq!(error.fault(phase), None, "{error}");
+            }
         }
 
         // Two `Sequence` errors that are not gates, because without them
-        // relaxing the predicate to `Sequence(_)` passes: an engage that lost a
-        // servo mid-flight would then read as "nothing was written and the
-        // machine is limp where it stands", on a machine that may be part way
-        // through taking torque.
+        // relaxing the arm to `Sequence(_)` passes: an engage that lost a servo
+        // mid-flight would then read as "nothing was written and the machine is
+        // limp where it stands", on a machine that may be part way through
+        // taking torque.
         let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
         for other in [
             PumpError::Sequence(SeqError::NoAnswer { context }),
@@ -1868,13 +2031,12 @@ mod tests {
                 read_back: RegValue::U8(0),
             }),
             PumpError::TorqueOffUnacked { id: 13 },
-            PumpError::Runaway { budget: 10 },
-            PumpError::Rate {
-                tick_hz: 0,
-                health_poll_hz: 0,
-            },
         ] {
-            assert!(!other.is_gate_refusal(), "{other}");
+            assert_ne!(
+                other.class(Phase::UnderTorque),
+                ErrorClass::Refuse,
+                "{other}"
+            );
         }
     }
 
@@ -2038,7 +2200,7 @@ mod tests {
         let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
 
         let error = run.err("nothing closes a whole radian in a window");
-        assert!(error.is_fault(), "{error}");
+        assert!(error.fault(Phase::UnderTorque).is_some(), "{error}");
         let text = std::fs::read_to_string(&path).expect("the trace is where it was said to be");
         std::fs::remove_file(&path).expect("the scratch file goes away");
 
@@ -2064,7 +2226,14 @@ mod tests {
             .expect("and still writes its periods");
         assert_eq!(periods(appended.trim()), turned, "{appended}");
         assert!(appended.contains("as run 0"), "{appended}");
-        assert_eq!(text.lines().count(), turned + 1, "the header and the rows");
+        // Run 0's rows, and not the file's: the wind-down that answers the
+        // fault is a run of its own and appends its own periods behind these.
+        let rows = text
+            .lines()
+            .skip(1)
+            .filter(|row| row.starts_with("0,"))
+            .count();
+        assert_eq!(rows, turned, "the faulted run's rows");
     }
 
     /// A trace that cannot be written is said, and the move that ran still ran.
@@ -3940,9 +4109,18 @@ mod tests {
             matches!(error, PumpError::TorqueOffUnacked { id } if id == cfg.map.ids()[2]),
             "{error}"
         );
-        assert!(
-            !error.is_fault(),
-            "the release happened; it was not aborted"
+        // The release ran and every servo was asked, so the class is the
+        // degenerate one: park and alert over a minimum risk condition nobody
+        // could confirm, and no second walk to write the same nine writes again.
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::ImmediateAllTorqueOffToPark
+        );
+        assert_eq!(
+            error.fault(Phase::UnderTorque),
+            Some(Fault::TorqueOffUnconfirmed {
+                id: cfg.map.ids()[2]
+            })
         );
         assert!(
             !printed
@@ -3958,6 +4136,482 @@ mod tests {
             "{printed:?}"
         );
         assert_eq!(torque_bits(&cfg, &registers), vec![0; JointId::COUNT]);
+    }
+
+    /// The last angle a run commanded `row`'s servo to, if it ever commanded
+    /// it one.
+    ///
+    /// The registers only hold where a machine ended, and a servo released part
+    /// way through stops taking goals at all — so the frames are the only
+    /// record of which joints a stow was actually driven on.
+    fn last_commanded(
+        cfg: &Resolved,
+        commanded: &Rc<RefCell<Vec<GroupedWrite>>>,
+        row: usize,
+    ) -> Option<f64> {
+        let id = cfg.map.ids()[row];
+        let goal = reg_for(RegId::GoalPosition).addr;
+        commanded
+            .borrow()
+            .iter()
+            .filter(|write| write.addr == goal)
+            .filter_map(|write| {
+                let (_, bytes) = write.entries.iter().find(|(servo, _)| *servo == id)?;
+                let counts =
+                    i32::from_le_bytes(bytes.as_slice().try_into().expect("a goal is four"));
+                cfg.map.present_rad(row, counts).ok()
+            })
+            .next_back()
+    }
+
+    /// Take a fixture machine to holding torque and run `body` against the
+    /// engagement, with the registers reachable while it runs.
+    ///
+    /// What the whole-command harness cannot do: a servo that latches an error
+    /// *after* the gates looked at it is the only way a head servo drops out
+    /// mid-move, and the gates refuse a machine that was already flagging.
+    fn engaged_run<F>(cfg: &Resolved, machine: FakeMachine, body: F) -> Engagement
+    where
+        F: FnOnce(
+            Engaged<'_, '_, Spy>,
+            &Rc<RefCell<FakeMachine>>,
+            &mut dyn Clock,
+            &mut dyn FnMut(&str),
+        ) -> Result<(), PumpError>,
+    {
+        let rig = rig(machine);
+        let registers = Rc::clone(&rig.registers);
+        let commanded = rig.port.commanded();
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+        let mut say = |line: &str| printed.push(line.to_string());
+
+        let mut commissioned =
+            commission(cfg, rig.port, &mut clock, &mut say).expect("the fixture commissions");
+        let engaged = commissioned
+            .engage(&mut clock, &mut say)
+            .expect("the fixture engages");
+        let outcome = body(engaged, &registers, &mut clock, &mut say);
+        drop(commissioned);
+        Engagement {
+            outcome,
+            registers,
+            commanded,
+            printed,
+        }
+    }
+
+    /// What an engagement left behind.
+    struct Engagement {
+        outcome: Result<(), PumpError>,
+        registers: Rc<RefCell<FakeMachine>>,
+        commanded: Rc<RefCell<Vec<GroupedWrite>>>,
+        printed: Vec<String>,
+    }
+
+    /// A head servo dropping out mid-move stows on the eight that still
+    /// command, releases everything, and leaves the machine for an operator.
+    ///
+    /// The semi-controlled descent. The servo that flagged is released on the
+    /// spot and never commanded again — nothing reboots it, because a reboot of
+    /// a servo holding this head drops it — and the head comes down on what is
+    /// left rather than falling out of the sky.
+    #[test]
+    fn a_head_servo_fault_stows_on_what_still_commands_and_parks() {
+        let cfg = resolved();
+        let dropped = 4;
+        let held = 3;
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                // A leg latching an overload once the machine is holding: the
+                // gates looked at a healthy machine, which is the only way this
+                // reaches a move at all.
+                registers.borrow_mut().set(
+                    cfg.map.ids()[dropped],
+                    reg_for(RegId::HardwareErrorStatus),
+                    &[0x20],
+                );
+                let outcome = engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line);
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        let error = ended
+            .outcome
+            .expect_err("a servo dropping out ends the move");
+        assert!(
+            matches!(error, PumpError::Fault(Fault::HeadServoFault { .. })),
+            "{error}"
+        );
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::MaskedSlowStowToPark
+        );
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+
+        // The stow ran on the eight that still commanded, and the ninth was
+        // never given another goal.
+        let stow = cfg.disarm.stow_targets.legs;
+        let half_count = core::f64::consts::PI / 4096.0;
+        let arrived = |row: usize| {
+            last_commanded(&cfg, &ended.commanded, row)
+                .is_some_and(|goal| (goal - stow[row - 1]).abs() <= half_count)
+        };
+        assert!(
+            arrived(held),
+            "the stow was commanded on the legs that hold"
+        );
+        assert!(
+            !arrived(dropped),
+            "a released servo took another goal: {:?}",
+            ended.printed
+        );
+        for said in ["stowing under control", "stowed", "look at the machine"] {
+            assert!(
+                ended.printed.iter().any(|line| line.contains(said)),
+                "no {said:?} line: {:?}",
+                ended.printed
+            );
+        }
+    }
+
+    /// A second servo dropping out mid-stow expands the maneuver rather than
+    /// ending it.
+    ///
+    /// The quick-succession case the bench saw. Each servo that goes is
+    /// released and dropped from the stow, which carries on with what is left —
+    /// the alternative is going limp over the second of nine failures, on a
+    /// machine still perfectly able to put the head down.
+    #[test]
+    fn a_second_servo_dropping_out_expands_the_stow() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                // Two legs flagging together. The health sweep names the first
+                // in bus order, so the second is found by the stow's own polls.
+                for row in [4, 5] {
+                    registers.borrow_mut().set(
+                        cfg.map.ids()[row],
+                        reg_for(RegId::HardwareErrorStatus),
+                        &[0x20],
+                    );
+                }
+                let outcome = engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line);
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        ended
+            .outcome
+            .expect_err("a servo dropping out ends the move");
+        let carried_on = ended
+            .printed
+            .iter()
+            .filter(|line| line.contains("the stow carries on without it"))
+            .count();
+        assert_eq!(carried_on, 1, "{:?}", ended.printed);
+        assert_eq!(
+            ended
+                .printed
+                .iter()
+                .filter(|line| line.contains("stowing under control"))
+                .count(),
+            2,
+            "the stow is re-commanded on what is left: {:?}",
+            ended.printed
+        );
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("look at the machine")),
+            "{:?}",
+            ended.printed
+        );
+    }
+
+    /// A clock that runs on while it is being read: every look at it costs
+    /// `per_look`.
+    ///
+    /// A maneuver bounded by a wall clock needs a wall clock that can outrun
+    /// it, and the periods a run turns are not where the time goes — the pump
+    /// counts its budgets in periods, and a run that faults on its first one
+    /// waits for nothing at all. This is the machine whose recovery is taking
+    /// far longer than the work it is doing, which is the only condition the
+    /// deadline exists for.
+    struct RunningClock {
+        now: std::cell::Cell<Duration>,
+        per_look: Duration,
+    }
+
+    impl Clock for RunningClock {
+        fn now(&self) -> Duration {
+            let now = self.now.get();
+            self.now.set(now.saturating_add(self.per_look));
+            now
+        }
+
+        fn sleep_until(&mut self, until: Duration) {
+            self.now.set(until.max(self.now.get()));
+        }
+    }
+
+    /// A re-commanded stow is asked for what is left of the clock the maneuver
+    /// began with, and a clock with room to spare is handed on untouched.
+    #[test]
+    fn an_expanded_stow_is_clamped_to_the_clock_that_is_left() {
+        let stow = MoveDurations {
+            head: Duration::from_millis(2000),
+            antennas: [Duration::from_millis(1500), Duration::from_millis(700)],
+        };
+        let left = Duration::from_millis(900);
+
+        assert_eq!(
+            within(stow, left),
+            MoveDurations {
+                head: left,
+                antennas: [left, Duration::from_millis(700)],
+            },
+            "every clock over what is left is cut to it, and the short one is not"
+        );
+        assert_eq!(
+            within(stow, Duration::from_secs(30)),
+            stow,
+            "a maneuver with time in hand asks for its own clocks"
+        );
+    }
+
+    /// A wind-down whose clock runs out releases torque rather than starting
+    /// another stow.
+    ///
+    /// The deadline is the only thing bounding an expanding maneuver: a machine
+    /// shedding a servo per attempt would otherwise be re-commanded a
+    /// full-length stow for as many attempts as it has servos, torque on
+    /// throughout, and never reach the release that ends it.
+    #[test]
+    fn a_wind_down_that_runs_out_of_clock_releases_torque() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, _clock, line| {
+                for row in [4, 5] {
+                    registers.borrow_mut().set(
+                        cfg.map.ids()[row],
+                        reg_for(RegId::HardwareErrorStatus),
+                        &[0x20],
+                    );
+                }
+                // A second of wall time per look at the clock: the maneuver
+                // has its whole deadline — one stow clock plus one settle
+                // window — when it commands its first stow, and none of it by
+                // the time that stow comes back with a second servo gone.
+                let mut clock = RunningClock {
+                    now: std::cell::Cell::new(Duration::ZERO),
+                    per_look: Duration::from_secs(1),
+                };
+                let outcome =
+                    engaged.move_to(neutral_targets(), cfg.up_durations(), &mut clock, line);
+                settle(engaged, outcome, &mut clock, line)
+            },
+        );
+
+        ended
+            .outcome
+            .expect_err("a servo dropping out ends the move");
+        let said = |text: &str| {
+            ended
+                .printed
+                .iter()
+                .filter(|line| line.contains(text))
+                .count()
+        };
+        assert_eq!(
+            said("the stow carries on without it"),
+            1,
+            "{:?}",
+            ended.printed
+        );
+        assert_eq!(
+            said("stowing under control"),
+            1,
+            "a second stow was commanded on a clock that was spent: {:?}",
+            ended.printed
+        );
+        assert_eq!(said("the stow clock is spent"), 1, "{:?}", ended.printed);
+        assert_eq!(
+            said("stowed; releasing torque"),
+            0,
+            "a maneuver that ran out of clock is not a stow: {:?}",
+            ended.printed
+        );
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+        assert_eq!(said("look at the machine"), 1, "{:?}", ended.printed);
+    }
+
+    /// A wind-down that runs out of head joints releases torque rather than
+    /// commanding a stow nothing can carry.
+    ///
+    /// The end of the mask's growth, and the one place the maneuver's two
+    /// outcomes are furthest apart: with the cranks and the yaw all released
+    /// there is nothing left to put the head down with, and a `move_to` over a
+    /// fully masked machine would emit nothing, finish on its first period and
+    /// report a controlled descent that never happened.
+    #[test]
+    fn a_wind_down_with_no_head_left_releases_torque_and_says_so() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                // Every joint that carries the head flagging, one health sweep
+                // apart: the sweep names the first unmasked one in bus order,
+                // so the mask grows by one servo per stow attempt.
+                for row in 0..=6 {
+                    registers.borrow_mut().set(
+                        cfg.map.ids()[row],
+                        reg_for(RegId::HardwareErrorStatus),
+                        &[0x20],
+                    );
+                }
+                let outcome = engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line);
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        ended
+            .outcome
+            .expect_err("a servo dropping out ends the move");
+        let position = |text: &str| {
+            ended
+                .printed
+                .iter()
+                .position(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} line: {:?}", ended.printed))
+        };
+        let out_of_joints = position("no head joint is still commanded");
+        let said = |text: &str| {
+            ended
+                .printed
+                .iter()
+                .filter(|line| line.contains(text))
+                .count()
+        };
+        assert_eq!(
+            said("no head joint is still commanded"),
+            1,
+            "{:?}",
+            ended.printed
+        );
+        // It gave up only when there was nothing left: every head joint but the
+        // one the move itself lost was stowed on and then dropped out in turn.
+        let head_joints = JointId::ALL
+            .into_iter()
+            .filter(|joint| joint.group() != JointGroup::Antennas)
+            .count();
+        assert_eq!(
+            said("stowing under control"),
+            head_joints - 1,
+            "the maneuver stopped stowing while joints still commanded: {:?}",
+            ended.printed
+        );
+        assert!(
+            !ended.printed[out_of_joints..]
+                .iter()
+                .any(|line| line.contains("stowing under control")),
+            "a stow was commanded on a machine with nothing to stow with: {:?}",
+            ended.printed
+        );
+        assert_eq!(
+            ended
+                .printed
+                .iter()
+                .filter(|line| line.contains("stowed; releasing torque"))
+                .count(),
+            0,
+            "nothing stowed the head: {:?}",
+            ended.printed
+        );
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("look at the machine")),
+            "{:?}",
+            ended.printed
+        );
+    }
+
+    /// A run that ended on a defect of ours leaves the bench machine holding.
+    ///
+    /// The whole reason the classification is not a yes-or-no about faulting.
+    /// Nothing here says the machine stopped being commandable: our accounting
+    /// ran out, in front of an operator who can read the message and type
+    /// `off`. Winding the head down over it would be a machine that flinches at
+    /// its own bugs.
+    #[test]
+    fn a_defect_of_ours_leaves_the_bench_machine_holding() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |engaged, _registers, clock, line| {
+                let outcome: Result<(), PumpError> = Err(PumpError::Runaway { budget: 10 });
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        let error = ended.outcome.expect_err("the run's own error comes back");
+        assert_eq!(error.class(Phase::UnderTorque), ErrorClass::SlowStowToRest);
+        assert_eq!(error.fault(Phase::UnderTorque), None);
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![1; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+        assert!(
+            !ended
+                .printed
+                .iter()
+                .any(|line| line.contains("torque off") || line.contains("stowing")),
+            "{:?}",
+            ended.printed
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("still holding")),
+            "{:?}",
+            ended.printed
+        );
     }
 
     /// A wire failure the sequencer has no word for does not end the release

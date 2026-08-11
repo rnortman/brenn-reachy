@@ -350,6 +350,98 @@ pub enum JointGroup {
 impl JointGroup {
     /// Every group, in bus order of its first joint.
     pub const ALL: [JointGroup; 3] = [Self::BodyYaw, Self::Legs, Self::Antennas];
+
+    /// The joints this group covers, in bus order.
+    #[must_use]
+    pub fn joints(self) -> JointSet {
+        let mut set = JointSet::EMPTY;
+        for joint in JointId::ALL {
+            if joint.group() == self {
+                set.insert(joint);
+            }
+        }
+        set
+    }
+}
+
+/// A set of joints, one bit per bus row.
+///
+/// What names the joints a decision covers without allocating or fixing an
+/// order on the caller: the servos a fault took out of service, the rows a
+/// write skips. Membership is by bus row, so a leg index past the sixth — a
+/// [`JointId`] no machine carries — is in no set and cannot be put in one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JointSet(u16);
+
+impl JointSet {
+    /// The set with nothing in it.
+    pub const EMPTY: Self = Self(0);
+
+    /// Add `joint`, reporting whether it was not already there.
+    ///
+    /// The return is what makes an entry an event: a fault that names a servo
+    /// already in the set is the same fault standing, not a new one.
+    pub fn insert(&mut self, joint: JointId) -> bool {
+        let Some(index) = joint.index() else {
+            return false;
+        };
+        let bit = 1 << index;
+        let fresh = self.0 & bit == 0;
+        self.0 |= bit;
+        fresh
+    }
+
+    /// Whether `joint` is in the set.
+    #[must_use]
+    pub fn contains(self, joint: JointId) -> bool {
+        joint
+            .index()
+            .is_some_and(|index| self.0 & (1 << index) != 0)
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// How many joints are in it.
+    #[must_use]
+    pub fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Whether every joint of `group` is in the set.
+    #[must_use]
+    pub fn covers(self, group: JointGroup) -> bool {
+        JointId::ALL
+            .into_iter()
+            .filter(|joint| joint.group() == group)
+            .all(|joint| self.contains(joint))
+    }
+
+    /// Everything in the set, in bus order.
+    pub fn iter(self) -> impl Iterator<Item = JointId> {
+        JointId::ALL
+            .into_iter()
+            .filter(move |joint| self.contains(*joint))
+    }
+}
+
+impl core::fmt::Display for JointSet {
+    /// The joints by name, comma-separated, or `nothing` for an empty set.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_empty() {
+            return f.write_str("nothing");
+        }
+        for (written, joint) in self.iter().enumerate() {
+            if written > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{joint}")?;
+        }
+        Ok(())
+    }
 }
 
 impl core::fmt::Display for JointId {
@@ -616,6 +708,64 @@ mod tests {
         }
         assert_eq!(seen, JointId::COUNT);
         assert_eq!(first_row, vec![0, 1, 7]);
+    }
+
+    /// Membership, in bus order, with the second entry of a joint reported as
+    /// the no-op it is — the distinction a fault raise turns on.
+    #[test]
+    fn a_joint_set_admits_each_joint_once() {
+        let mut set = JointSet::EMPTY;
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+        assert!(set.insert(JointId::AntennaLeft), "the first entry is news");
+        assert!(!set.insert(JointId::AntennaLeft), "the second is not");
+        assert!(set.insert(JointId::Leg(2)));
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(JointId::Leg(2)) && !set.contains(JointId::Leg(3)));
+        assert_eq!(
+            set.iter().collect::<Vec<JointId>>(),
+            vec![JointId::Leg(2), JointId::AntennaLeft],
+            "bus order, whatever order they went in"
+        );
+        assert_eq!(format!("{set}"), "leg 3, left antenna");
+        assert_eq!(format!("{}", JointSet::EMPTY), "nothing");
+    }
+
+    /// A leg index no machine carries is in no set: it has no bus row to be a
+    /// bit of, and a set that swallowed it would answer `contains` false for
+    /// something it claimed to hold.
+    #[test]
+    fn a_joint_set_holds_only_joints_that_exist() {
+        let mut set = JointSet::EMPTY;
+        assert!(!set.insert(JointId::Leg(9)));
+        assert!(set.is_empty());
+        assert!(!set.contains(JointId::Leg(9)));
+    }
+
+    /// Group coverage, which is what says a mask has taken a whole group out of
+    /// service.
+    #[test]
+    fn a_joint_set_covers_a_group_only_when_it_holds_all_of_it() {
+        let mut set = JointSet::EMPTY;
+        set.insert(JointId::AntennaRight);
+        assert!(!set.covers(JointGroup::Antennas));
+        set.insert(JointId::AntennaLeft);
+        assert!(set.covers(JointGroup::Antennas));
+        assert!(!set.covers(JointGroup::Legs));
+        assert!(!set.covers(JointGroup::BodyYaw));
+        for group in JointGroup::ALL {
+            let whole = group.joints();
+            assert!(whole.covers(group));
+            assert_eq!(
+                whole.len(),
+                JointId::ALL
+                    .into_iter()
+                    .filter(|joint| joint.group() == group)
+                    .count()
+                    .try_into()
+                    .expect("nine joints fit in a u32"),
+            );
+        }
     }
 
     /// The default target set is a configuration the machine can hold, not a

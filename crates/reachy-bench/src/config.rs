@@ -92,22 +92,6 @@ pub enum ConfigError {
         key: &'static str,
     },
 
-    /// A per-tick step bound wider than the tracking threshold, which would let
-    /// a goal move past an open tracking run's anchor in one period and fault a
-    /// joint that is following.
-    #[error(
-        "{key} is {step} rad, wider than motion.tracking_threshold_rad ({threshold} rad): a goal \
-         stepping that far in one period can be read as a joint running away from it"
-    )]
-    StepPastTrackingThreshold {
-        /// The step bound's configuration key, in `table.key` form.
-        key: &'static str,
-        /// What the file said the step bound is, radians.
-        step: f64,
-        /// The threshold it must not exceed, radians.
-        threshold: f64,
-    },
-
     /// A positive number of seconds that is longer than a duration can hold.
     #[error("{key} is {secs} seconds, which is longer than a duration can hold")]
     DurationOutOfRange {
@@ -945,27 +929,6 @@ impl BenchConfig {
             )?,
             ticks: positive_int("motion.tracking_ticks", section.tracking_ticks)?,
         };
-        // The tracking monitor measures a joint's progress from where it stood
-        // when its run opened, signed toward the goal, so a goal that moves
-        // past that anchor in one period reverses the sign on a joint that is
-        // following healthily. What keeps a goal from getting there is the step
-        // guard: a per-tick step no wider than the threshold cannot cross the
-        // band of tolerated error around the joint, and a run inside that band
-        // has already cleared. The two bounds are therefore checked against
-        // each other rather than only for positivity.
-        for (key, step) in [
-            ("motion.max_step_legs_rad", max_step.legs),
-            ("motion.max_step_body_yaw_rad", max_step.body_yaw),
-            ("motion.max_step_antennas_rad", max_step.antennas),
-        ] {
-            if step > tracking.threshold_rad {
-                return Err(ConfigError::StepPastTrackingThreshold {
-                    key,
-                    step,
-                    threshold: tracking.threshold_rad,
-                });
-            }
-        }
         Ok(MotionConfig {
             geom,
             env,
@@ -1306,6 +1269,10 @@ mod tests {
 
     /// A key and the edit that makes it invalid.
     type Mutation = (&'static str, fn(&mut BenchConfig));
+
+    /// A key, an edit that widens that step bound, and the resolved field it
+    /// has to come through on.
+    type StepCase = (&'static str, fn(&mut BenchConfig), fn(&JointStep) -> f64);
 
     /// The smallest file that resolves: the two profile figures, and a datum.
     const MINIMAL: &str = "\
@@ -1926,59 +1893,46 @@ provenance = \"test fixture\"
         assert_eq!(timing.retry_spacing, Duration::ZERO);
     }
 
-    /// A step bound wider than the tracking threshold refuses, naming both
-    /// numbers.
+    /// A step bound wider than the tracking threshold resolves.
     ///
-    /// Nothing in the file's own numbers says the two are related, so
-    /// lowering the threshold has to be refused rather than silently arming
-    /// a spurious fault.
+    /// The two knobs are independent, and this is the file that proves it: the
+    /// tracking monitor re-anchors a run whose goal crosses it, so no width of
+    /// per-tick step can make a following joint read as a stalled one. A
+    /// resolver that refused this combination refused the speed trials that
+    /// measured the machine.
     #[test]
-    fn a_step_bound_wider_than_the_tracking_band_refuses() {
-        let shipped = minimal();
-        shipped
-            .resolve()
-            .expect("the shipped numbers hold the invariant");
-
-        let cases: [Mutation; 3] = [
-            ("motion.max_step_legs_rad", |c| {
-                c.motion.max_step_legs_rad = 0.2;
-            }),
-            ("motion.max_step_body_yaw_rad", |c| {
-                c.motion.max_step_body_yaw_rad = 0.2;
-            }),
-            ("motion.max_step_antennas_rad", |c| {
-                c.motion.max_step_antennas_rad = 0.2;
-            }),
+    fn a_step_bound_wider_than_the_tracking_band_resolves() {
+        let wide = 0.6;
+        let cases: [StepCase; 3] = [
+            (
+                "motion.max_step_legs_rad",
+                |c| c.motion.max_step_legs_rad = 0.6,
+                |step| step.legs,
+            ),
+            (
+                "motion.max_step_body_yaw_rad",
+                |c| c.motion.max_step_body_yaw_rad = 0.6,
+                |step| step.body_yaw,
+            ),
+            (
+                "motion.max_step_antennas_rad",
+                |c| c.motion.max_step_antennas_rad = 0.6,
+                |step| step.antennas,
+            ),
         ];
-        for (key, mutate) in cases {
+        for (key, mutate, bound) in cases {
             let mut cfg = minimal();
             mutate(&mut cfg);
             cfg.motion.tracking_threshold_rad = 0.1;
-            let error = cfg.resolve().unwrap_err();
-            assert_eq!(
-                error,
-                ConfigError::StepPastTrackingThreshold {
-                    key,
-                    step: 0.2,
-                    threshold: 0.1,
-                },
-                "{key}"
-            );
-            let printed = error.to_string();
-            assert!(printed.contains(key), "{printed}");
-            assert!(
-                printed.contains("motion.tracking_threshold_rad"),
-                "{printed}"
-            );
+            let resolved = cfg
+                .resolve()
+                .unwrap_or_else(|error| panic!("{key} is not the threshold's business: {error}"));
+            // Both knobs come through as they were typed: a resolver that
+            // narrowed the wide one to the threshold would silently couple
+            // two independent limits.
+            assert_eq!(bound(&resolved.motion.max_step), wide, "{key}");
+            assert_eq!(resolved.motion.tracking.threshold_rad, 0.1, "{key}");
         }
-
-        // Equal is the shipped relationship and is admitted: a goal step of
-        // exactly the threshold reaches the edge of the band, not past it.
-        let mut cfg = minimal();
-        cfg.motion.max_step_legs_rad = 0.15;
-        cfg.motion.tracking_threshold_rad = 0.15;
-        cfg.resolve()
-            .expect("a step of exactly the band is admitted");
     }
 
     /// A number of seconds no duration can hold is a refusal naming the key, not

@@ -68,7 +68,10 @@ tick_hz = 50
 # The servos update their hardware-error byte far slower than they update
 # position; once a second catches a latch and costs nothing in the tick budget.
 health_poll_hz = 1
-# Per-tick step bounds. Exceeding one is a fault, never a clamp. A shaped move's
+# Per-tick step bounds. What they bound is the plan: a goal past one of them
+# abandons the move where it stands and is never clamped and sent. The machine
+# keeps its torque — a step this wide is a planner defect, not a motor that
+# stopped answering. A shaped move's
 # peak rate is 1.875 times its average, so a two-second move spanning a crank's
 # whole 2.2 rad window peaks near 0.041 rad per tick at 50 Hz.
 max_step_legs_rad = 0.05
@@ -79,7 +82,8 @@ max_step_body_yaw_rad = 0.05
 # need less: the stow-to-neutral presence arc is 3.23 rad (0.81 s), and
 # re-stowing an antenna left just inboard of sideways is 4.80 rad (1.21 s).
 # Whatever `antenna_duration_s` below resolves to has to clear the floor for the
-# sweep being asked for, because exceeding this bound is a fault, not a clamp.
+# sweep being asked for, because exceeding this bound kills the move, and no
+# antenna reaches where it was going.
 max_step_antennas_rad = 0.15
 # The tracking fault, in three numbers. A joint further than the threshold from
 # its goal is examined; over a window of that many ticks it must close at least
@@ -91,10 +95,11 @@ max_step_antennas_rad = 0.15
 #
 # The threshold and the window stay provisional, sized rather than measured;
 # every move records its per-joint worst lag, and those are the numbers that
-# will ground them. Lowering the threshold below any of the three step bounds
-# above is refused by name: progress is measured from where a joint stood when
-# its lag began, and a goal able to step past that point in one tick would read
-# a following joint as one running away. The progress minimum is about 6.5 of
+# will ground them. It is independent of the step bounds above, and may be set
+# anywhere without regard to them: progress is measured from where a joint stood
+# when its lag began, and a goal that moves to the far side of that point
+# restarts the measurement there rather than reading a following joint as one
+# running away. The progress minimum is about 6.5 of
 # the servos' 0.088° counts: over ten ticks at 50 Hz it asks a lagging joint for
 # 0.05 rad/s of closing speed, an order of magnitude under the fastest leg
 # motion this bench commands.

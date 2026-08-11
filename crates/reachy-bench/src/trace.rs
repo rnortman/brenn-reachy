@@ -17,7 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use reachy_motion::{JointId, JointVector};
+use reachy_motion::{JointId, JointSet, JointVector};
 
 use crate::pump::TickSample;
 
@@ -81,6 +81,24 @@ fn blanks(row: &mut String) {
     }
 }
 
+/// The nine goals, with a released servo's cell left empty.
+///
+/// A servo taken out of service is torqued off and never written again, so it
+/// is holding no goal — the same absence a blind read is, and rendered the same
+/// way. The number that would otherwise stand there is the last goal it was
+/// sent before the mask, repeated for every remaining period of the run, and a
+/// reader differencing it against the measured column would see a command error
+/// that was never on the wire.
+fn goals(row: &mut String, joints: &JointVector, released: JointSet) {
+    for (joint, angle) in joints.joints() {
+        if released.contains(joint) {
+            row.push(',');
+        } else {
+            row.push_str(&format!(",{angle:.6}"));
+        }
+    }
+}
+
 /// One sample as its row, without its newline.
 fn row(run: u64, sample: &TickSample) -> String {
     let mut row = format!(
@@ -97,7 +115,7 @@ fn row(run: u64, sample: &TickSample) -> String {
         Some(present) => angles(&mut row, present),
         None => blanks(&mut row),
     }
-    angles(&mut row, &sample.goal);
+    goals(&mut row, &sample.goal, sample.released);
     row
 }
 
@@ -234,6 +252,7 @@ mod tests {
                 antennas: [angle; 2],
             }),
             goal: JointVector::default(),
+            released: JointSet::EMPTY,
             settling,
         }
     }
@@ -278,6 +297,48 @@ mod tests {
         }
     }
 
+    /// A servo that has been released is commanded nothing, so its goal cell is
+    /// empty while its measured cell keeps recording.
+    ///
+    /// This is the trace's job at exactly the moment it is the diagnostic of
+    /// record: a degraded pair drifts limp for the rest of the run, and the
+    /// last goal it was sent before the mask, held in the cell and repeated, is
+    /// a command that was never on the wire.
+    #[test]
+    fn a_released_servo_is_commanded_nothing_and_keeps_measuring() {
+        let mut released = JointSet::EMPTY;
+        released.insert(JointId::AntennaRight);
+        released.insert(JointId::AntennaLeft);
+        let angles = JointVector {
+            body_yaw: 0.5,
+            legs: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            antennas: [7.0, 8.0],
+        };
+        let mut out = Vec::new();
+        let sample = TickSample {
+            tick: 4,
+            at: Duration::from_millis(80),
+            present: Some(angles),
+            goal: angles,
+            released,
+            settling: false,
+        };
+        write_csv(&mut out, 0, &[sample], false).expect("a vector takes writes");
+        let text = String::from_utf8(out).expect("the row is text");
+
+        let cells: Vec<&str> = text.trim_end().split(',').collect();
+        for (index, (joint, angle)) in angles.joints().into_iter().enumerate() {
+            let measured = cells[4 + index];
+            let commanded = cells[4 + JointId::COUNT + index];
+            assert_eq!(measured, format!("{angle:.6}"), "{joint} measured: {text}");
+            if released.contains(joint) {
+                assert!(commanded.is_empty(), "{joint} commanded: {text}");
+            } else {
+                assert_eq!(commanded, format!("{angle:.6}"), "{joint} commanded");
+            }
+        }
+    }
+
     /// Every measured column stands over the joint the header names, and every
     /// commanded column over the same joint again.
     ///
@@ -298,6 +359,7 @@ mod tests {
             at: Duration::ZERO,
             present: Some(angles),
             goal: angles,
+            released: JointSet::EMPTY,
             settling: false,
         };
         write_csv(&mut out, 0, &[written], true).expect("a vector takes writes");

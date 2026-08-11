@@ -45,11 +45,12 @@
 //! Two rules the loop does not bend. A grouped read is **all-or-nothing**: any
 //! servo short of a clean answer makes the whole period's measurement absent, and
 //! the tick's read-loss budget — not a retry here — is what decides how long
-//! blind motion may continue. And a fault **stops the loop and hands the fault
-//! up**: the loop's own job ends there, and taking the machine to the minimum
-//! risk condition — torque off, immediately — belongs to whoever holds the
-//! engagement, because that is the thing with a release to run.
-//! [`PumpError::is_fault`] is how a caller tells the two endings apart.
+//! blind motion may continue. And an ending **stops the loop and hands the
+//! reason up**: the loop's own job ends there, and the maneuver that answers it
+//! — a stow under control, or torque off on the spot — belongs to whoever holds
+//! the engagement, because that is the thing with a release to run.
+//! [`PumpError::class`] is what that caller acts on, and it names one of the
+//! doctrine's responses rather than a yes-or-no about faulting.
 //!
 //! A run is not a commitment to the command that started it:
 //! [`MotionPump::run_retargeting`] asks its caller at every period whether the
@@ -92,9 +93,10 @@ use reachy_bus::{
 use reachy_bus::{reg_for, with_retry};
 use reachy_motion::{
     ArmConfig, ArmRecord, BusRequest, BusResult, ClockStretch, CommandDisposition,
-    CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointVector,
-    Mode, MotionCommand, MotionConfig, MotionState, RegId, RegValue, SeqAction, SeqError, SeqStep,
-    Sequencer, ServoHealth, TickInputs, TickOutputs, floor_move_clock, motion_tick,
+    CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointSet,
+    JointVector, Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, RegId, RegValue,
+    Response, SeqAction, SeqError, SeqStep, Sequencer, ServoHealth, TickInputs, TickOutputs,
+    floor_move_clock, motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -354,6 +356,11 @@ pub enum PumpError {
     #[error("the tick faulted: {0}")]
     Fault(#[from] Fault),
 
+    /// The tick abandoned the move. The plan was wrong; the machine is healthy,
+    /// still holding the last goal it was written, and still commandable.
+    #[error("the move was abandoned: {0}")]
+    Aborted(#[from] MoveAbort),
+
     /// The tick refused the command. Nothing changed, and the machine is in
     /// whatever mode it was already in.
     #[error("the command was refused: {0}")]
@@ -392,46 +399,291 @@ pub enum PumpError {
     },
 }
 
-impl PumpError {
-    /// Whether this ending means the machine can no longer be trusted to a
-    /// controlled stop.
-    ///
-    /// The dividing line an engaged caller acts on: a fault takes the machine
-    /// straight to torque-off, an expected refusal leaves it holding exactly
-    /// where it was. Three things are refusals — a command the tick would not
-    /// accept, a servo whose torque-off write went unacknowledged, which is the
-    /// tail end of a release that has already happened, and either torque-on
-    /// gate, which writes nothing at all. Everything else is the machine, the
-    /// wire, or the loop failing mid-flight, and none of those is a state to
-    /// leave a head held up in.
-    ///
-    /// No error is both this and a [gate refusal](Self::is_gate_refusal): the
-    /// two predicates partition the expected errors from the faults, and a
-    /// caller that took the fault path on a gate refusal would de-torque and
-    /// park a machine that was never torqued.
-    #[must_use]
-    pub fn is_fault(&self) -> bool {
-        !matches!(self, Self::Rejected(_) | Self::TorqueOffUnacked { .. })
-            && !self.is_gate_refusal()
+/// Whether torque was on when a run stopped.
+///
+/// The one thing a classification cannot read off the error itself. The same
+/// unanswered transaction is a request declined when nothing is energized and a
+/// machine that can no longer be manoeuvred when nine servos are holding the
+/// head up, and the error carries no record of which it was.
+///
+/// Call sites that never write torque — commissioning, the register sweeps,
+/// provisioning, the reboot command — pass [`Self::PreTorque`], and ones that
+/// only ever run with servos holding pass [`Self::UnderTorque`]. The engage
+/// drive is the one path that crosses the line mid-run; [`engage_phase`] is
+/// where it decides which side it was on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Nothing is energized: the machine is limp and stays where it stands.
+    PreTorque,
+    /// Servos are holding, so an ending leaves something to bring back to the
+    /// minimum risk condition.
+    UnderTorque,
+}
+
+/// What a run's ending asks its caller to do.
+///
+/// The response vocabulary of the fault doctrine, less the one response that is
+/// not an ending: degrading the antennas leaves the move running, and travels
+/// in the tick's report rather than as an error.
+///
+/// Every [`PumpError`] maps onto one of these, so what a caller does about an
+/// ending is decided once, here, at compile time — never by a caller reading a
+/// message, and never by a default that a new variant falls into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// The ask is declined and nothing changes.
+    Refuse,
+    /// Abandon the move, stow every joint that still commands with the checks
+    /// live, then release. The machine is trusted to command.
+    SlowStowToRest,
+    /// Immediate best-effort torque-off of all nine; the next wake engages
+    /// normally.
+    ImmediateAllTorqueOffToRest,
+    /// Release the faulted servo on the spot, stow on what still commands, then
+    /// release everything and wait for an operator.
+    MaskedSlowStowToPark,
+    /// Immediate best-effort torque-off of all nine, then wait for an operator.
+    ImmediateAllTorqueOffToPark,
+}
+
+impl ErrorClass {
+    /// The ending that carries out `response`.
+    fn answering(response: Response) -> Self {
+        match response {
+            Response::Refuse => Self::Refuse,
+            Response::SlowStowToRest => Self::SlowStowToRest,
+            Response::ImmediateAllTorqueOffToRest => Self::ImmediateAllTorqueOffToRest,
+            Response::MaskedSlowStowToPark => Self::MaskedSlowStowToPark,
+            Response::ImmediateAllTorqueOffToPark => Self::ImmediateAllTorqueOffToPark,
+            // Degrading a pair is not an ending: the antennas go limp and the
+            // move carries on, reported through the tick. An error that
+            // nonetheless names this response says the head is healthy and
+            // still commanding, and a stow under control is what that gets.
+            Response::DegradeAntennas => Self::SlowStowToRest,
+        }
     }
 
-    /// Whether this is one of the two torque-on gates refusing.
+    /// Whether the machine this response leaves behind may be engaged again by
+    /// whatever asks next, or has to wait for a person.
     ///
-    /// The rail below its floor and a latched hardware error are the whole
-    /// enumeration of what may stand between a request to move and torque
-    /// coming on, and both are raised by [`engage_gates`] before a single
-    /// transaction goes out: nothing was written, the machine is exactly where
-    /// it was, and asking again later is the correct response. An unattended
-    /// caller needs that apart from every other engage failure, which leaves a
-    /// machine to bring back to the minimum risk condition.
-    ///
-    /// [`engage_gates`]: reachy_motion::engage_gates
+    /// A refusal changed nothing, so there is nothing to wait for.
     #[must_use]
-    pub fn is_gate_refusal(&self) -> bool {
-        matches!(
-            self,
-            Self::Sequence(SeqError::SupplyBelowFloor { .. } | SeqError::UnhealthyServo { .. })
-        )
+    pub fn disposition(self) -> Disposition {
+        match self {
+            Self::Refuse | Self::SlowStowToRest | Self::ImmediateAllTorqueOffToRest => {
+                Disposition::Rest
+            }
+            Self::MaskedSlowStowToPark | Self::ImmediateAllTorqueOffToPark => Disposition::Park,
+        }
+    }
+}
+
+/// Where a response leaves the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Torque off, and the next wake engages as usual.
+    Rest,
+    /// Torque off, and nothing engages until an operator has been.
+    Park,
+}
+
+/// Which side of the torque line an engage failure fell on.
+///
+/// The voltage and health polls precede any torque write, while a write that
+/// fails on the enable walk lands with servos already energized. The first
+/// enable going out is the boundary, and the sequencer is what knows whether it
+/// did.
+#[must_use]
+pub fn engage_phase(torque_written: bool) -> Phase {
+    if torque_written {
+        Phase::UnderTorque
+    } else {
+        Phase::PreTorque
+    }
+}
+
+/// What a sequencer's verdict says about the machine.
+///
+/// The one partition of [`SeqError`], and the only place a variant of it is
+/// judged: both the condition an ending names and the response it asks for are
+/// read off this, so the two cannot come to disagree about a variant. A
+/// sequencer error added tomorrow is one decision, made here, at compile time.
+enum SeqVerdict {
+    /// A condition of the machine, which carries its own response.
+    Fault(Fault),
+    /// Judged before a single transaction writes torque, so nothing was
+    /// written, the machine is exactly where it was, and asking again later is
+    /// the whole answer — whatever a caller says about the phase.
+    Declined,
+    /// Our own tables and our own asks, with a machine that is answering
+    /// perfectly.
+    Defect,
+}
+
+/// What `error` says about the machine.
+///
+/// Two families reach a fault. A transaction that failed says the bus is no
+/// longer carrying commands; a pose the solver could not place says the
+/// mechanism is outside its own model. They take the same response and would be
+/// the same alert, which is exactly why they are told apart here: an operator
+/// sent to the cabling over an unsolvable pose is an operator looking at the
+/// wrong half of the machine.
+fn sequence_verdict(error: &SeqError) -> SeqVerdict {
+    match error {
+        // The wire: silence, a refusal, a mangled reply, a register that does
+        // not hold what was written, servos that answered no ping. A reading
+        // that is not a number is here too — it came off the wire in that
+        // shape, and no mechanism produces it.
+        SeqError::NoAnswer { .. }
+        | SeqError::Refused { .. }
+        | SeqError::WireCorrupt { .. }
+        | SeqError::VerifyMismatch { .. }
+        | SeqError::AbsentServos { .. }
+        | SeqError::UnplaceableAngle { .. } => {
+            SeqVerdict::Fault(Fault::BusFailure { source: *error })
+        }
+        // The mechanism: angles that place no pose. One verdict, from one
+        // measurement, which is what the sequencer took.
+        SeqError::RestPoseImplausible { cause, .. }
+        | SeqError::PinnedPoseUnsolvable { cause, .. } => {
+            SeqVerdict::Fault(Fault::MeasuredPoseInvalid {
+                failures: 1,
+                source: *cause,
+            })
+        }
+        // The two torque-on gates and the poll behind them, plus the identity
+        // and provisioning verdicts: all read before anything is energized.
+        SeqError::IdentityMismatch { .. }
+        | SeqError::ProvisionMismatch { .. }
+        | SeqError::VoltageLow { .. }
+        | SeqError::SupplyBelowFloor { .. }
+        | SeqError::UnhealthyServo { .. } => SeqVerdict::Declined,
+        // The step and the register table disagree about what a register is:
+        // our defect, with a machine that is answering perfectly.
+        SeqError::WrongAnswer { .. } | SeqError::WrongValue { .. } => SeqVerdict::Defect,
+    }
+}
+
+/// What a sequencer's verdict names about the machine, once torque is on.
+fn sequence_fault(error: &SeqError) -> Option<Fault> {
+    match sequence_verdict(error) {
+        SeqVerdict::Fault(fault) => Some(fault),
+        SeqVerdict::Declined | SeqVerdict::Defect => None,
+    }
+}
+
+/// What a sequencer's verdict asks for.
+fn sequence_class(error: &SeqError, phase: Phase) -> ErrorClass {
+    match phase {
+        // Nothing is energized, so whatever the verdict there is nothing to
+        // bring back and nothing to undo.
+        Phase::PreTorque => ErrorClass::Refuse,
+        Phase::UnderTorque => match sequence_verdict(error) {
+            SeqVerdict::Fault(fault) => ErrorClass::answering(fault.response()),
+            SeqVerdict::Declined => ErrorClass::Refuse,
+            SeqVerdict::Defect => ErrorClass::SlowStowToRest,
+        },
+    }
+}
+
+impl PumpError {
+    /// What this ending asks its caller to do, given whether torque was on.
+    ///
+    /// The classification point on the driver side, and exhaustive by
+    /// construction: a new variant is a decision made here, at compile time,
+    /// and never a default anybody falls through to. Where the ending names a
+    /// condition of the machine ([`Self::fault`]), that fault's own response is
+    /// what this returns — the two never disagree, because only one of them
+    /// decides.
+    ///
+    /// Before torque almost everything is a refusal: nothing is energized, so
+    /// there is nothing to bring back and asking again later is correct. The
+    /// exceptions are the endings that are about torque itself.
+    #[must_use]
+    pub fn class(&self, phase: Phase) -> ErrorClass {
+        // A defect of ours with a healthy machine: it stows under control once
+        // it is holding, and costs nothing at all before that.
+        let defect = match phase {
+            Phase::PreTorque => ErrorClass::Refuse,
+            Phase::UnderTorque => ErrorClass::SlowStowToRest,
+        };
+        match self {
+            Self::Sequence(error) => sequence_class(error, phase),
+            // Degenerate: the release already ran, every servo was asked and
+            // every write retried. What is left is the park and the alert,
+            // because a minimum risk condition nobody confirmed must never be
+            // reported as rest.
+            Self::TorqueOffUnacked { .. } => ErrorClass::ImmediateAllTorqueOffToPark,
+            // The port, the encoder or the frame. Under torque this is a
+            // machine that can no longer be commanded, and nothing controlled
+            // can be attempted over a wire that is not carrying.
+            Self::Bus { .. } => match phase {
+                Phase::PreTorque => ErrorClass::Refuse,
+                Phase::UnderTorque => ErrorClass::ImmediateAllTorqueOffToPark,
+            },
+            // Our own arithmetic, our own roster, our own rates and windows.
+            Self::Map { .. }
+            | Self::UnknownServo { .. }
+            | Self::Rate { .. }
+            | Self::Settle { .. } => defect,
+            // Our own accounting ran out. Whether the machine is stuck is
+            // unproven either way, and a stow that meets a stuck one trips
+            // tracking or the bus and escalates from there.
+            Self::Runaway { .. } | Self::Stalled { .. } => defect,
+            // The provisioning and reboot paths, where torque is off by
+            // construction: the non-volatile writes refuse the whole roster
+            // unless every servo is released, and nothing on the reboot path
+            // enables torque.
+            Self::WrongPart { .. }
+            | Self::TorqueHeld { .. }
+            | Self::OffRoster { .. }
+            | Self::NotBack { .. }
+            | Self::NotRestarted { .. }
+            | Self::RestartUnconfirmed { .. } => ErrorClass::Refuse,
+            Self::Fault(fault) => ErrorClass::answering(fault.response()),
+            // The plan was wrong and the platform is fine: the move dies and
+            // the machine stows.
+            Self::Aborted(_) => defect,
+            // The tick would not take the command. Nothing was changed, so
+            // there is nothing to undo.
+            Self::Rejected(_) => ErrorClass::Refuse,
+        }
+    }
+
+    /// The condition of the machine this ending names, if it names one.
+    ///
+    /// The slug an operator hears and a report carries. Most endings name none:
+    /// a refusal, a planner defect and an exhausted budget are all statements
+    /// about our own asks. The ones that do are the tick's faults, which arrive
+    /// already named, and the transactions that failed with servos holding.
+    #[must_use]
+    pub fn fault(&self, phase: Phase) -> Option<Fault> {
+        match self {
+            Self::Sequence(error) => match phase {
+                Phase::PreTorque => None,
+                Phase::UnderTorque => sequence_fault(error),
+            },
+            Self::TorqueOffUnacked { id } => Some(Fault::TorqueOffUnconfirmed { id: *id }),
+            Self::Fault(fault) => Some(*fault),
+            // A verdict about the port, not about the machine, and one with no
+            // sequencer context to carry: it is its own detail, and its class
+            // says what the wire failing under torque means.
+            Self::Bus { .. }
+            | Self::Map { .. }
+            | Self::WrongPart { .. }
+            | Self::TorqueHeld { .. }
+            | Self::UnknownServo { .. }
+            | Self::OffRoster { .. }
+            | Self::NotBack { .. }
+            | Self::NotRestarted { .. }
+            | Self::RestartUnconfirmed { .. }
+            | Self::Runaway { .. }
+            | Self::Aborted(_)
+            | Self::Rejected(_)
+            | Self::Stalled { .. }
+            | Self::Rate { .. }
+            | Self::Settle { .. } => None,
+        }
     }
 }
 
@@ -896,6 +1148,15 @@ pub enum TickEvent {
     },
     /// The tick stopped commanding.
     Faulted(Fault),
+    /// The antennas were taken out of service over this fault: neither is
+    /// commanded again this session and the move carries on without them.
+    ///
+    /// Emitted on the period the tick raised it, before the release those
+    /// joints are owed goes on the wire — so a release that fails is reported
+    /// after this rather than instead of it.
+    AntennasDegraded(Fault),
+    /// The tick abandoned the move and went back to holding.
+    Aborted(MoveAbort),
 }
 
 impl fmt::Display for TickEvent {
@@ -963,6 +1224,13 @@ impl fmt::Display for TickEvent {
                 write!(f, "trace buffer full at {samples} period(s); not recording")
             }
             Self::Faulted(fault) => write!(f, "faulted: {fault}"),
+            Self::AntennasDegraded(fault) => {
+                write!(
+                    f,
+                    "antennas out of service and left out of the move: {fault}"
+                )
+            }
+            Self::Aborted(abort) => write!(f, "move abandoned: {abort}"),
         }
     }
 }
@@ -994,12 +1262,25 @@ pub struct MoveSummary {
     /// scale a loop's wake latency runs at, which is what says whether the
     /// overrun tolerance is the right size on a given host.
     pub worst_jitter: Duration,
+    /// Wall time the run spent that the move's clock was not credited with:
+    /// per period, whatever it began more than one period after the last one
+    /// did.
+    ///
+    /// A move's trajectory advances by at most a nominal period per period, so
+    /// a loop that stalls delays the gesture by the stall instead of jumping
+    /// the path. This is how much of that happened — the difference between the
+    /// timeline the caller scripted and the one the machine ran.
+    pub slip: Duration,
     /// The furthest each joint was measured behind the goal it had been
     /// written, in bus order, radians, over every period with a live read.
     ///
     /// A measurement and not a verdict: what a proportional loop runs behind a
     /// moving goal is the quantity the tracking threshold, the window and the
     /// stow tolerance have all been guessed against, and every move produces it.
+    ///
+    /// A joint stops contributing once it is masked: it is written nothing from
+    /// there on, and the distance from where it was released to a goal row
+    /// nobody sent it is not a lag anything can be calibrated against.
     pub worst_lag: [f64; JointId::COUNT],
     /// Wall time from the first period to the last.
     pub elapsed: Duration,
@@ -1058,10 +1339,31 @@ pub struct TickSample {
     /// short.
     pub present: Option<JointVector>,
     /// The nine goals the servos were holding when this period read them.
+    ///
+    /// A servo in `released` holds none of it: its cell is whatever it was last
+    /// commanded, kept only so the vector stays nine wide, and the trace blanks
+    /// it rather than writing it out.
     pub goal: JointVector,
+    /// The servos that were torqued off when this period read them, and so were
+    /// holding no goal at all.
+    pub released: JointSet,
     /// Whether commanding had already finished and the period was one of those
     /// spent waiting for the machine to arrive.
     pub settling: bool,
+}
+
+/// What the servos were holding while a period's read was taken.
+///
+/// One statement about the wire, captured once per period and before that
+/// period's write, because the write is the answer to the measurement rather
+/// than part of it: the goals standing on the servos, and the servos standing
+/// on no goal at all because they have been released.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    /// The nine goals, of which a released servo's is only the last it was sent.
+    goal: JointVector,
+    /// The servos that are torqued off and commanded nothing.
+    released: JointSet,
 }
 
 /// What ends a run of the fixed-rate loop.
@@ -1284,9 +1586,17 @@ impl<'a> MotionPump<'a> {
     /// An error that will not compare — a joint whose measurement or goal is
     /// unplaceable — is outside every tolerance there is, which is what the
     /// negated comparison says.
-    fn straying(&self, present: &JointVector) -> Option<(JointId, f64)> {
+    ///
+    /// A joint in `masked` is skipped. It was released and is commanded no
+    /// further, so where it came to rest is not a measurement of this run
+    /// arriving, and waiting for it would end every degraded move at the window
+    /// with a joint nobody expected to move named as the one that did not.
+    fn straying(&self, present: &JointVector, masked: JointSet) -> Option<(JointId, f64)> {
         let mut worst: Option<(JointId, f64)> = None;
         for ((joint, angle), (_, goal)) in present.joints().into_iter().zip(self.written.joints()) {
+            if masked.contains(joint) {
+                continue;
+            }
             let error = (angle - goal).abs();
             if error <= self.settle.tolerance {
                 continue;
@@ -1323,7 +1633,7 @@ impl<'a> MotionPump<'a> {
         tick: u64,
         at: Duration,
         present: Option<&JointVector>,
-        goal: JointVector,
+        held: Held,
         settling: bool,
         event: &mut dyn FnMut(TickEvent),
     ) {
@@ -1343,7 +1653,8 @@ impl<'a> MotionPump<'a> {
             tick,
             at,
             present: present.copied(),
-            goal,
+            goal: held.goal,
+            released: held.released,
             settling,
         });
     }
@@ -1463,6 +1774,9 @@ impl<'a> MotionPump<'a> {
         };
         let epoch = clock.now();
         let mut due = epoch;
+        // Where the previous period actually began, which is what the move's
+        // clock advanced on.
+        let mut prev_now = epoch;
         let mut pending = Some(command);
         // The run's own record, and never the last run's: a caller reading it
         // after a command refused on the accepting period — which ends the run
@@ -1478,6 +1792,13 @@ impl<'a> MotionPump<'a> {
         let mut health_misses: u32 = 0;
         let mut reported_health: Option<[ServoHealth; JointId::COUNT]> = None;
         let mut overrun_reported = false;
+        // Which servos were already out of service when the current period's
+        // read was taken. Trails the tick's own mask by the period the mask is
+        // raised on: a servo is released partway through that period, so the
+        // read at the top of it still measured a servo holding the goal in
+        // `written`, and that period is the whole diagnosis of why it was
+        // masked.
+        let mut released = JointSet::EMPTY;
         // How the loop ended, filled by the one period that ends it. Still
         // `None` when the periods run out, which is the stall.
         let mut ending: Option<Result<(), PumpError>> = None;
@@ -1517,16 +1838,26 @@ impl<'a> MotionPump<'a> {
             let now = clock.now();
             // A period that starts materially after it was due is one the loop
             // ran late for. It proceeds immediately rather than skipping the
-            // next one: the reads stay one per period and the trajectory is
-            // sampled at the time it is actually being sampled at.
+            // next one: the reads stay one per period, and the move's clock
+            // takes the delay as a delay.
             let late = now.saturating_sub(due);
             summary.worst_jitter = summary.worst_jitter.max(late);
+            summary.slip += now.saturating_sub(prev_now).saturating_sub(self.period);
+            prev_now = now;
             if late >= self.period / OVERRUN_DIVISOR {
                 summary.overruns += 1;
                 if !overrun_reported {
                     event(TickEvent::Overrun { tick, late });
                     overrun_reported = true;
                 }
+            }
+            // Past a whole period behind, the missed slots are abandoned rather
+            // than replayed: the grid re-bases on where the loop actually is.
+            // Marching through the backlog at bus-limited rate would spend a
+            // read and a goal on each of them, running the machine through that
+            // stretch of the path as fast as the wire allows.
+            if late > self.period {
+                due = now;
             }
 
             let present = match self.read_present(bus) {
@@ -1572,6 +1903,7 @@ impl<'a> MotionPump<'a> {
 
             let inputs = TickInputs {
                 now,
+                period: self.period,
                 present: present.as_ref(),
                 command: pending.as_ref(),
                 health: health.as_ref(),
@@ -1580,16 +1912,43 @@ impl<'a> MotionPump<'a> {
             let asked = pending.take().is_some();
             summary.ticks += 1;
 
-            // What the servos were holding while this period's read was taken,
-            // which is the goal that measurement belongs against. Captured
-            // before the write, because the write is this period's answer to it.
-            let held = self.written;
+            let held = Held {
+                goal: self.written,
+                released,
+            };
             let elapsed = now.saturating_sub(epoch);
             // The period that finished commanding is a commanding period: it
             // put the last goal out. The ones after it are the settle.
             let settling = commanded_at.is_some_and(|since| since < elapsed);
+
+            // Servos the tick took out of service are released here, before
+            // anything else goes on the wire: the tick decided they are no
+            // longer commanded, and a joint that is not commanded and still
+            // torqued is holding a position nobody is watching.
+            let masked = self.outputs.report.masked;
+            let newly_masked = self.outputs.report.newly_masked;
+            // Said before the wire work it obliges, because the release can
+            // fail and its ending names the bus rather than the servo that
+            // flagged.
+            if let Some(fault) = self.outputs.report.degraded {
+                event(TickEvent::AntennasDegraded(fault));
+            }
+            if !newly_masked.is_empty()
+                && let Err(error) = self.release(bus, newly_masked)
+            {
+                // Same reason, for the fault that ends a run: the branch below
+                // that would have announced it is not reached from here.
+                if let Some(fault) = self.outputs.report.fault {
+                    event(TickEvent::Faulted(fault));
+                }
+                self.record(tick, elapsed, present.as_ref(), held, settling, event);
+                ending = Some(Err(error));
+                break;
+            }
+            released = masked;
+
             if let Some(goal) = self.outputs.goal {
-                match self.write_goals(bus, &goal) {
+                match self.write_goals(bus, &goal, masked) {
                     Ok(frames) => summary.frames += frames,
                     Err(error) => {
                         // Kept before the break, like every other period the
@@ -1606,7 +1965,19 @@ impl<'a> MotionPump<'a> {
 
             let report = self.outputs.report;
             if let Some(errors) = report.tracking_errors {
-                for (worst, error) in summary.worst_lag.iter_mut().zip(errors) {
+                for (joint, (worst, error)) in JointId::ALL
+                    .into_iter()
+                    .zip(summary.worst_lag.iter_mut().zip(errors))
+                {
+                    // A masked joint is written nothing further while the plan
+                    // its goal row follows keeps moving, so the difference the
+                    // tick measures for it after the mask is against a command
+                    // that never went out. The trace blanks that cell for the
+                    // same reason; a lag figure the guards are calibrated
+                    // against must not carry it either.
+                    if masked.contains(joint) {
+                        continue;
+                    }
                     *worst = worst.max(error);
                 }
             }
@@ -1642,6 +2013,15 @@ impl<'a> MotionPump<'a> {
                 ending = Some(Err(PumpError::Fault(fault)));
                 break;
             }
+            if let Some(abort) = report.aborted {
+                event(TickEvent::Aborted(abort));
+                // The period that produced the sample nobody would emit, kept
+                // for the same reason a faulted one is: it is the whole
+                // diagnosis of a planner that went wrong.
+                self.record(tick, elapsed, present.as_ref(), held, settling, event);
+                ending = Some(Err(PumpError::Aborted(abort)));
+                break;
+            }
             if report.completed {
                 event(TickEvent::Completed);
             }
@@ -1661,7 +2041,10 @@ impl<'a> MotionPump<'a> {
                     // A blind period judges nothing: the tick's read-loss budget
                     // is what a run of them ends in, and it is shorter than any
                     // sane window.
-                    match present.as_ref().map(|present| self.straying(present)) {
+                    match present
+                        .as_ref()
+                        .map(|present| self.straying(present, masked))
+                    {
                         Some(None) => {
                             summary.settled = Some(elapsed);
                             event(TickEvent::Settled { after: waited });
@@ -1793,13 +2176,17 @@ impl<'a> MotionPump<'a> {
         &mut self,
         bus: &mut Bus<P>,
         goal: &JointVector,
+        masked: JointSet,
     ) -> Result<u64, PumpError> {
         let mut frames = 0;
         for group in JointGroup::ALL {
             let mut rows = [0usize; JointId::COUNT];
             let mut in_group = 0;
             for (row, joint) in JointId::ALL.into_iter().enumerate() {
-                if joint.group() == group {
+                // A masked servo has been torqued off and is never commanded
+                // again, so its row leaves the frame entirely — the write is
+                // one place, and this is it.
+                if joint.group() == group && !masked.contains(joint) {
                     rows[in_group] = row;
                     in_group += 1;
                 }
@@ -1842,6 +2229,31 @@ impl<'a> MotionPump<'a> {
         Ok(frames)
     }
 
+    /// Release `joints`, one acknowledged write each.
+    ///
+    /// The rule every servo entering the mask goes through: masked is
+    /// de-torqued, not merely unspoken to. What a servo's torque actually is
+    /// after it flags an error is not something to be assumed, so the release
+    /// is commanded and verified rather than believed, through the same retry
+    /// policy every other write on this bus uses. Only failure past that policy
+    /// ends the run — a bus that cannot release one servo cannot be trusted to
+    /// carry the head down either.
+    fn release<P: BusPort>(&mut self, bus: &mut Bus<P>, joints: JointSet) -> Result<(), PumpError> {
+        for joint in joints.iter() {
+            let row = joint.index().expect(BUS_ORDER_IS_NINE_JOINTS);
+            let id = self.servo_at(row);
+            let raw = self
+                .map
+                .encode_value(row, RegId::TorqueEnable, RegValue::U8(0))
+                .map_err(|source| self.map_failure(row, RegId::TorqueEnable, source))?;
+            with_retry(bus, |bus| {
+                bus.write_reg_verified(id, reg_for(RegId::TorqueEnable), &raw)
+            })
+            .map_err(|source| PumpError::Bus { id, source })?;
+        }
+        Ok(())
+    }
+
     /// The servo a bus row addresses.
     fn servo_at(&self, row: usize) -> u8 {
         self.map
@@ -1880,9 +2292,10 @@ mod tests {
 
     use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE};
     use reachy_bus::reg_for;
+    use reachy_kin::FkError;
     use reachy_motion::{
-        CommissionSequencer, EngageSequencer, HEAD_GROUP_FLOOR_S, JointId, JointTargets,
-        MoveDurations, PollCadence, PollSequencer, Posture, RegValue, Warp,
+        CommissionSequencer, EngageSequencer, HEAD_GROUP_FLOOR_S, JointId, JointStep, JointTargets,
+        MoveDurations, PollCadence, PollSequencer, Posture, RegValue, StepContext, ValueKind, Warp,
     };
 
     use super::*;
@@ -3055,7 +3468,7 @@ mod tests {
         let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
         let error = outcome.expect_err("a machine that never moves is not tracking");
         assert!(
-            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            matches!(error, PumpError::Fault(Fault::HeadObstructed { .. })),
             "{error}"
         );
 
@@ -3335,7 +3748,7 @@ mod tests {
         let (outcome, _) = run(&mut bench, &mut driver, to_neutral(&cfg), &mut clock);
         let error = outcome.expect_err("nothing closes a whole radian in a window");
         assert!(
-            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            matches!(error, PumpError::Fault(Fault::HeadObstructed { .. })),
             "{error}"
         );
     }
@@ -3633,8 +4046,10 @@ mod tests {
             })
             .expect("half a second cannot carry the fold");
         assert_eq!(stretch.requested, MoveDurations::uniform(asked));
+        // The head clock lands on the fold's exact floor, which sits inside the
+        // last hundredth of a second the published figure's search stepped in.
         assert!(
-            stretch.effective.head.as_secs_f64() >= HEAD_GROUP_FLOOR_S,
+            stretch.effective.head.as_secs_f64() > HEAD_GROUP_FLOOR_S - 0.01,
             "{stretch:?}"
         );
         // The stretch is announced before anything the loop did, so an operator
@@ -3755,6 +4170,67 @@ mod tests {
         );
     }
 
+    /// A replacement issued while the loop is running late lands like any
+    /// other: right-sized, spliced from the setpoint the last period commanded,
+    /// and carried to its own endpoint.
+    ///
+    /// The lateness cannot reach the new path either — the replacement's clock
+    /// starts at zero and advances a period at a time, so the splice is the
+    /// same one an on-time loop makes, arriving later.
+    #[test]
+    fn a_replacement_under_lateness_reaches_its_endpoint() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        // Three quarters of a period late, every period: an overrun each time,
+        // and never enough to rebase the grid.
+        let mut clock = LateClock {
+            now: Duration::ZERO,
+            late: pump.period() * 3 / 4,
+        };
+
+        let mut periods = 0;
+        let (outcome, events) = run_retargeting(
+            &mut bench,
+            &mut pump,
+            to_neutral(&cfg),
+            &mut clock,
+            &mut || {
+                periods += 1;
+                (periods == 10).then(|| to_stow(&cfg))
+            },
+        );
+        let summary = outcome.expect("the replacement reaches its own endpoint");
+
+        assert!(
+            events.contains(&TickEvent::Command(CommandDisposition::Retargeted)),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+        assert!(events.contains(&TickEvent::Completed));
+        assert!(matches!(bench.state.mode(), Mode::Holding));
+        assert!(summary.slip > Duration::ZERO, "{summary:?}");
+        // Its *own* endpoint, which is the whole claim: a replacement dropped
+        // on the floor leaves the raise to finish, and everything above is
+        // true of that run too. The antennas are the discriminator — by the
+        // turn they are away from both poses — and the fold's sweep takes the
+        // inboard arc, so the goal that arrives a turn below stow is stow.
+        let ended = bench.state.last_targets().antennas;
+        for (ended, stow) in ended
+            .into_iter()
+            .zip(crate::commands::stow_pose_targets().antennas)
+        {
+            let apart = (ended - stow).rem_euclid(core::f64::consts::TAU);
+            assert!(
+                apart < 1e-9 || core::f64::consts::TAU - apart < 1e-9,
+                "the run ended at {ended} rad, not the {stow} rad it was turned to"
+            );
+        }
+    }
+
     /// A target the envelope refuses stops the run without commanding
     /// anything, and leaves the machine armed and holding rather than faulted.
     #[test]
@@ -3804,7 +4280,7 @@ mod tests {
 
         let budget = cfg.motion.read_loss_ticks;
         assert!(
-            matches!(error, PumpError::Fault(Fault::ReadLoss { misses }) if misses == budget + 1),
+            matches!(error, PumpError::Fault(Fault::PositionFeedbackLost { misses }) if misses == budget + 1),
             "{error}"
         );
         assert!(
@@ -3862,7 +4338,7 @@ mod tests {
             let mut goal = held;
             goal.set(JointId::ALL[row], f64::NAN);
             let refused = pump
-                .write_goals(&mut bus, &goal)
+                .write_goals(&mut bus, &goal, JointSet::EMPTY)
                 .expect_err("no count holds that angle");
             let PumpError::Map { id, reg, source } = refused else {
                 panic!("expected a refused conversion, got {refused}");
@@ -3956,7 +4432,7 @@ mod tests {
         let error = outcome.expect_err("one period past the budget is a fault");
 
         assert!(
-            matches!(error, PumpError::Fault(Fault::ReadLoss { misses }) if misses == outage),
+            matches!(error, PumpError::Fault(Fault::PositionFeedbackLost { misses }) if misses == outage),
             "{error}"
         );
     }
@@ -4096,10 +4572,12 @@ mod tests {
         );
     }
 
-    /// A hardware error beyond the input-voltage bit stops the loop, and
-    /// nothing here reboots or releases anything.
+    /// A head servo's hardware error beyond the input-voltage bit stops the
+    /// move and releases that servo — and only that servo. Nothing here reboots
+    /// anything, and the eight that still command keep their torque: the
+    /// maneuver this ending asks for is a stow driven on them.
     #[test]
-    fn a_hardware_error_stops_the_loop_with_torque_held() {
+    fn a_head_servo_error_stops_the_move_and_releases_that_servo() {
         let cfg = resolved();
         let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
         bench
@@ -4115,7 +4593,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                PumpError::Fault(Fault::HardwareError { id: 14, bits: 0x20 })
+                PumpError::Fault(Fault::HeadServoFault {
+                    joint: JointId::Leg(3),
+                    id: 14,
+                    bits: 0x20
+                })
             ),
             "{error}"
         );
@@ -4125,16 +4607,85 @@ mod tests {
                 .any(|event| matches!(event, TickEvent::Faulted(_))),
             "{events:?}"
         );
-        assert!(bench.state.is_faulted());
-        // Torque is where arming left it: the loop wrote no torque register.
+        assert!(
+            !bench.state.is_faulted() && bench.state.mode() == Mode::Holding,
+            "the stow that answers this runs on this same state"
+        );
+        assert_eq!(
+            bench.state.masked().iter().collect::<Vec<_>>(),
+            vec![JointId::Leg(3)]
+        );
         let machine = bench.registers.borrow();
-        for id in cfg.map.ids() {
+        for (row, id) in cfg.map.ids().into_iter().enumerate() {
+            let torque: &[u8] = if row == 4 { &[0] } else { &[1] };
             assert_eq!(
                 machine.get(id, reg_for(RegId::TorqueEnable)),
-                Some(&[1u8][..]),
+                Some(torque),
                 "servo {id}"
             );
         }
+    }
+
+    /// A release the bus will not carry ends the run, and still says which
+    /// servo had flagged.
+    ///
+    /// "Masked" means released, not merely unspoken to. Four mechanisms start
+    /// acting on that the moment the tick raises the mask — the goal frames
+    /// drop the row, the settle stops waiting for it, the trace blanks its goal
+    /// cell, and the tick checks it for nothing — so a release that does not
+    /// land leaves a servo torqued, holding a frozen goal, that nothing is
+    /// watching or commanding. The bus cannot be trusted to carry the head down
+    /// either, and the ending says so.
+    ///
+    /// The ending names the wire, which is not the diagnosis: the servo that
+    /// flagged is what a reader came for, and the fault branch that would have
+    /// announced it is not reached from here.
+    #[test]
+    fn a_release_the_bus_will_not_carry_ends_the_run_and_names_the_fault() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let flagged = cfg.map.ids()[4];
+        {
+            let mut registers = bench.registers.borrow_mut();
+            registers.set(flagged, reg_for(RegId::HardwareErrorStatus), &[0x20]);
+            // From here the read-back of this servo's torque-off answers a byte
+            // too wide: a frame that passes its own checksum and is nobody's
+            // answer, so the verified write fails past every retry.
+            registers
+                .verbose
+                .push((flagged, reg_for(RegId::TorqueEnable).addr));
+        }
+        let mut pump = pump(&cfg, bench.held);
+        pump.record_trace(true);
+        let mut clock = TestClock::default();
+
+        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("a release that cannot be written ends the run");
+
+        assert!(
+            matches!(error, PumpError::Bus { id, .. } if id == flagged),
+            "{error}"
+        );
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::ImmediateAllTorqueOffToPark,
+            "a bus that cannot release one servo carries no maneuver"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TickEvent::Faulted(Fault::HeadServoFault { id, .. }) if *id == flagged
+            )),
+            "the servo that flagged went unreported: {events:?}"
+        );
+        // The run stopped where the release did — well short of the move — and
+        // the period it stopped on is in the record.
+        let summary = pump.last_summary();
+        assert!(
+            summary.ticks < u64::from(cfg.tick_hz) * cfg.up_duration.as_secs(),
+            "the run carried on past the release it could not write: {summary:?}"
+        );
+        assert_eq!(pump.last_trace().len() as u64, summary.ticks);
     }
 
     /// A clock that stopped advancing is a bench session that would otherwise
@@ -4179,7 +4730,7 @@ mod tests {
         let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
         let error = outcome.expect_err("a servo that takes its goals and does not move");
         assert!(
-            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            matches!(error, PumpError::Fault(Fault::HeadObstructed { .. })),
             "{error}"
         );
 
@@ -4192,15 +4743,62 @@ mod tests {
             "the stalled leg's lag is what the fault was raised on: {faulted:?}"
         );
 
-        // A faulted machine stops the next run on its standing fault, and what
-        // that run leaves behind is its own single period rather than the
-        // faulted run's numbers read a second time.
+        // An obstruction leaves the machine commanding, so the next run is a
+        // run. With the leg turning again it finishes, and what it leaves
+        // behind is its own numbers rather than the faulted run's read a second
+        // time.
+        bench.registers.borrow_mut().stalled.clear();
         let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
-        outcome.expect_err("a faulted machine commands nothing");
+        outcome.expect("the obstruction is gone and the machine still commands");
         let after = pump.last_summary();
-        assert_eq!(after.ticks, 1, "{after:?}");
-        assert_eq!(after.goals, 0, "{after:?}");
-        assert_eq!(after.worst_lag, [0.0; JointId::COUNT], "{after:?}");
+        assert!(after.settled.is_some(), "{after:?}");
+        assert_eq!(
+            after.ticks,
+            u64::from(cfg.tick_hz) * cfg.up_duration.as_secs() + 1,
+            "its own periods, not the faulted run's counted a second time: {after:?}"
+        );
+    }
+
+    /// A step the guard will not pass ends the run without faulting the
+    /// machine: the sample never goes out, the trajectory is dropped, and the
+    /// tick is left holding the last goal it wrote. The distinction is the
+    /// whole point of the abort — nothing about the machine has gone wrong, so
+    /// nothing about it needs to be given up.
+    #[test]
+    fn a_step_the_guard_stops_abandons_the_move_and_leaves_the_machine_holding() {
+        let mut cfg = resolved();
+        // Far under any step a shaped move takes, so the first commanded
+        // period trips it.
+        cfg.motion.max_step = JointStep {
+            legs: 1e-5,
+            body_yaw: 1e-5,
+            antennas: 1e-5,
+        };
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut guarded = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, events) = run(&mut bench, &mut guarded, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("a step past the bound is never emitted");
+        assert!(
+            matches!(error, PumpError::Aborted(MoveAbort::StepTooLarge { .. })),
+            "{error}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Aborted(_))),
+            "{events:?}"
+        );
+        assert!(!bench.state.is_faulted(), "the machine is healthy");
+        assert!(matches!(bench.state.mode(), Mode::Holding));
+
+        // Which the next command proves: the same state takes a wind-down, on
+        // the bounds the shipped configuration carries.
+        let relaxed = resolved();
+        let mut wind_down = pump(&relaxed, *bench.state.last_goal());
+        let (outcome, _) = run(&mut bench, &mut wind_down, to_neutral(&relaxed), &mut clock);
+        outcome.expect("an abandoned move leaves a machine that still commands");
     }
 
     /// A move slower than any fixed watchdog would allow runs to its target.
@@ -4374,6 +4972,71 @@ mod tests {
         );
     }
 
+    /// A whole second lost mid-move delays the move by a second and costs it
+    /// nothing else: no fault, no burst of periods run back to back to catch
+    /// up, and the slip reported.
+    ///
+    /// The stall is the scale the control loop was measured stalling at on the
+    /// machine. Replaying the missed grid slots would run fifty periods at
+    /// whatever rate the bus allows, and under a move clock that advances per
+    /// period that is the head crossing that stretch of its path at bus speed.
+    #[test]
+    fn a_stall_mid_move_delays_the_move_and_replays_nothing() {
+        let cfg = resolved();
+        let stall = Duration::from_secs(1);
+
+        let mut clean_bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut clean_pump = pump(&cfg, clean_bench.held);
+        let mut clean_clock = TestClock::default();
+        let (outcome, _) = run(
+            &mut clean_bench,
+            &mut clean_pump,
+            to_neutral(&cfg),
+            &mut clean_clock,
+        );
+        let undisturbed = outcome.expect("the fixture move lands");
+        assert_eq!(undisturbed.slip, Duration::ZERO, "{undisturbed:?}");
+
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = StallClock {
+            now: Duration::ZERO,
+            stall,
+            at: 10,
+            woken: 0,
+            behind: 0,
+        };
+        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let summary = outcome.expect("a stalled loop still reaches the target");
+
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+        assert!(events.contains(&TickEvent::Completed));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TickEvent::Overrun { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            clock.behind, 0,
+            "the loop was sent back through periods that were already due"
+        );
+        assert_eq!(summary.slip, stall, "{summary:?}");
+        // The move arrives a stall later, having run the same periods it would
+        // have run without one.
+        assert_eq!(summary.ticks, undisturbed.ticks, "{summary:?}");
+        assert_eq!(
+            summary.elapsed,
+            undisturbed.elapsed + stall,
+            "{summary:?} against {undisturbed:?}"
+        );
+    }
+
     /// A caller that changes its mind mid-travel gets the head turned around
     /// where it is, and the run ends at the replacement.
     ///
@@ -4506,13 +5169,13 @@ mod tests {
         let error = outcome.expect_err("a machine that never arrives is not tracking");
 
         assert!(
-            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            matches!(error, PumpError::Fault(Fault::HeadObstructed { .. })),
             "{error}"
         );
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, TickEvent::Faulted(Fault::TrackingLost { .. }))),
+                .any(|event| matches!(event, TickEvent::Faulted(Fault::HeadObstructed { .. }))),
             "{events:?}"
         );
         // Stopped, not released: the head is still held where it got to.
@@ -4710,6 +5373,7 @@ mod tests {
     #[test]
     fn every_event_says_what_happened() {
         let servos = [ServoHealth { id: 10, bits: 1 }; JointId::COUNT];
+        let mut said = [false; 19];
         for (event, expected) in [
             (TickEvent::Command(CommandDisposition::None), "no command"),
             (TickEvent::Command(CommandDisposition::Started), "moving"),
@@ -4769,8 +5433,29 @@ mod tests {
                 "120000 period(s)",
             ),
             (
-                TickEvent::Faulted(Fault::ReadLoss { misses: 51 }),
+                TickEvent::Faulted(Fault::PositionFeedbackLost { misses: 51 }),
                 "faulted",
+            ),
+            (
+                TickEvent::Stretched(ClockStretch {
+                    requested: MoveDurations::uniform(Duration::from_millis(300)),
+                    effective: MoveDurations::uniform(Duration::from_millis(800)),
+                }),
+                "clock stretched",
+            ),
+            (
+                TickEvent::AntennasDegraded(Fault::AntennaObstructed {
+                    joint: JointId::AntennaRight,
+                    error: 0.5,
+                }),
+                "antennas out of service",
+            ),
+            (
+                TickEvent::Aborted(MoveAbort::StepTooLarge {
+                    joint: JointId::Leg(2),
+                    delta: 0.4,
+                }),
+                "move abandoned",
             ),
         ] {
             let printed = event.to_string();
@@ -4778,6 +5463,41 @@ mod tests {
                 printed.contains(expected),
                 "{event:?} rendered as {printed}"
             );
+            said[event_slot(&event)] = true;
+        }
+        // An array of instances is not an enumeration: without this, a variant
+        // added tomorrow renders however it renders and nothing here notices.
+        assert!(
+            said.iter().all(|seen| *seen),
+            "an event renders unread by this test: {said:?}"
+        );
+    }
+
+    /// Which event this is, as a slot in the coverage above.
+    ///
+    /// Wildcard-free, so a new event does not compile until it is named here,
+    /// and does not pass until the table above renders it.
+    fn event_slot(event: &TickEvent) -> usize {
+        match event {
+            TickEvent::Command(CommandDisposition::None) => 0,
+            TickEvent::Command(CommandDisposition::Started) => 1,
+            TickEvent::Command(CommandDisposition::Retargeted) => 2,
+            TickEvent::Command(CommandDisposition::Held) => 3,
+            TickEvent::Command(CommandDisposition::Rejected(_)) => 4,
+            TickEvent::ReadLost { .. } => 5,
+            TickEvent::ReadRestored { .. } => 6,
+            TickEvent::HealthLost { .. } => 7,
+            TickEvent::HealthRestored { .. } => 8,
+            TickEvent::Health(_) => 9,
+            TickEvent::Overrun { .. } => 10,
+            TickEvent::Stretched(_) => 11,
+            TickEvent::Completed => 12,
+            TickEvent::Settled { .. } => 13,
+            TickEvent::Unsettled { .. } => 14,
+            TickEvent::TraceFull { .. } => 15,
+            TickEvent::Faulted(_) => 16,
+            TickEvent::AntennasDegraded(_) => 17,
+            TickEvent::Aborted(_) => 18,
         }
     }
 
@@ -4818,6 +5538,38 @@ mod tests {
         }
     }
 
+    /// A clock that stalls once, for as long as it is told, and keeps every
+    /// deadline it was handed.
+    struct StallClock {
+        now: Duration,
+        stall: Duration,
+        /// Which wake stalls, counted from one.
+        at: u64,
+        woken: u64,
+        /// Deadlines that were already in the past when the loop asked to wait
+        /// for them: periods the loop would run back to back.
+        behind: u64,
+    }
+
+    impl Clock for StallClock {
+        fn now(&self) -> Duration {
+            self.now
+        }
+
+        fn sleep_until(&mut self, until: Duration) {
+            self.woken += 1;
+            if until <= self.now {
+                self.behind += 1;
+            }
+            let late = if self.woken == self.at {
+                self.stall
+            } else {
+                Duration::ZERO
+            };
+            self.now = (until + late).max(self.now);
+        }
+    }
+
     /// A clock that always wakes late, by a fixed amount.
     struct LateClock {
         now: Duration,
@@ -4832,5 +5584,522 @@ mod tests {
         fn sleep_until(&mut self, until: Duration) {
             self.now = (until + self.late).max(self.now);
         }
+    }
+
+    /// Every way a run can end, and the response each asks for on either side
+    /// of the torque line.
+    ///
+    /// The classification written out by hand, so what the code decides and
+    /// what somebody decided are two things that have to agree. A variant added
+    /// to `PumpError` does not compile until `class` names it and does not pass
+    /// until it is judged here.
+    #[test]
+    fn every_ending_names_the_response_it_asks_for() {
+        use ErrorClass::{
+            ImmediateAllTorqueOffToPark as OffPark, MaskedSlowStowToPark as MaskedPark,
+            Refuse as No, SlowStowToRest as Stow,
+        };
+
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        let waited = Duration::from_millis(5);
+        let table: Vec<(PumpError, ErrorClass, ErrorClass)> = vec![
+            // The wire failing under torque is a machine that can no longer be
+            // manoeuvred; before torque it is a machine nobody asked to move.
+            (SeqError::NoAnswer { context }.into(), No, OffPark),
+            (
+                PumpError::Bus {
+                    id: 13,
+                    source: XactError::Timeout { id: 13, waited },
+                },
+                No,
+                OffPark,
+            ),
+            // A release nobody could confirm is never reported as rest.
+            (PumpError::TorqueOffUnacked { id: 13 }, OffPark, OffPark),
+            // Our own tables, roster, rates, windows and budgets: a healthy
+            // machine and a defect of ours.
+            (
+                PumpError::Map {
+                    id: 13,
+                    reg: RegId::GoalPosition,
+                    source: MapError::UnknownJoint { joint: 11 },
+                },
+                No,
+                Stow,
+            ),
+            (PumpError::UnknownServo { id: 99 }, No, Stow),
+            (
+                PumpError::Rate {
+                    tick_hz: 0,
+                    health_poll_hz: 0,
+                },
+                No,
+                Stow,
+            ),
+            (
+                PumpError::Settle {
+                    tolerance: 0.0,
+                    timeout: Duration::ZERO,
+                },
+                No,
+                Stow,
+            ),
+            (PumpError::Runaway { budget: 10 }, No, Stow),
+            (PumpError::Stalled { budget: 10 }, No, Stow),
+            (
+                MoveAbort::StepTooLarge {
+                    joint: JointId::Leg(2),
+                    delta: 0.4,
+                }
+                .into(),
+                No,
+                Stow,
+            ),
+            // Provisioning and reboot: torque is off by construction on both
+            // paths, so both phases decline.
+            (
+                PumpError::WrongPart {
+                    id: 13,
+                    model: 1,
+                    expected: 1200,
+                },
+                No,
+                No,
+            ),
+            (PumpError::TorqueHeld { id: 13 }, No, No),
+            (
+                PumpError::OffRoster {
+                    id: 99,
+                    roster: [10, 11, 12, 13, 14, 15, 16, 17, 18],
+                },
+                No,
+                No,
+            ),
+            (
+                PumpError::NotBack {
+                    id: 13,
+                    polls: 3,
+                    waited,
+                    source: XactError::Timeout { id: 13, waited },
+                },
+                No,
+                No,
+            ),
+            (PumpError::NotRestarted { id: 13 }, No, No),
+            (
+                PumpError::RestartUnconfirmed {
+                    id: 13,
+                    source: XactError::Timeout { id: 13, waited },
+                },
+                No,
+                No,
+            ),
+            // The tick's own answers, which the classification takes verbatim.
+            //
+            // The two antenna conditions are the only ones whose response is
+            // not an ending. They arrive here from a caller that surfaces the
+            // tick's degrade as one, and what they ask for is the stow a
+            // healthy, still-commanding head can run.
+            (
+                Fault::AntennaObstructed {
+                    joint: JointId::AntennaRight,
+                    error: 0.5,
+                }
+                .into(),
+                Stow,
+                Stow,
+            ),
+            (
+                Fault::AntennaServoFault {
+                    joint: JointId::AntennaLeft,
+                    id: 18,
+                    bits: 0x20,
+                }
+                .into(),
+                Stow,
+                Stow,
+            ),
+            (
+                Fault::HeadObstructed {
+                    joint: JointId::Leg(2),
+                    error: 0.3,
+                }
+                .into(),
+                Stow,
+                Stow,
+            ),
+            (
+                Fault::MeasuredPoseInvalid {
+                    failures: 1,
+                    source: FkError::NoConvergence {
+                        iters: 8,
+                        residual: 1e-3,
+                    },
+                }
+                .into(),
+                OffPark,
+                OffPark,
+            ),
+            (
+                Fault::TorqueOffUnconfirmed { id: 13 }.into(),
+                OffPark,
+                OffPark,
+            ),
+            (
+                Fault::HeadServoFault {
+                    joint: JointId::Leg(2),
+                    id: 13,
+                    bits: 0x20,
+                }
+                .into(),
+                MaskedPark,
+                MaskedPark,
+            ),
+            (
+                Fault::PositionFeedbackLost { misses: 51 }.into(),
+                OffPark,
+                OffPark,
+            ),
+            (
+                CommandRejection::AntennaUnreachable {
+                    joint: JointId::AntennaLeft,
+                    angle: 9.0,
+                }
+                .into(),
+                No,
+                No,
+            ),
+        ];
+
+        let mut judged = [false; 8];
+        for (error, before, under) in table {
+            assert_eq!(
+                error.class(Phase::PreTorque),
+                before,
+                "before torque: {error}"
+            );
+            assert_eq!(
+                error.class(Phase::UnderTorque),
+                under,
+                "under torque: {error}"
+            );
+            // One classification, not two: where an ending names a condition,
+            // that condition's own response is what the class is.
+            for phase in [Phase::PreTorque, Phase::UnderTorque] {
+                if let Some(fault) = error.fault(phase) {
+                    judged[fault_slot(&fault)] = true;
+                    assert_eq!(
+                        error.class(phase),
+                        ErrorClass::answering(fault.response()),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        // The agreement check above compares the classification against
+        // itself, so it holds nothing on its own: what makes the hand-written
+        // column above the judgement is that every condition reaches it.
+        assert!(
+            judged.iter().all(|seen| *seen),
+            "a fault named no ending in the table: {judged:?}"
+        );
+    }
+
+    /// Which condition this is, as a slot in the coverage above.
+    ///
+    /// Wildcard-free, so a fault added to the doctrine cannot be left out of
+    /// the ending table by the table simply not mentioning it.
+    fn fault_slot(fault: &Fault) -> usize {
+        match fault {
+            Fault::AntennaObstructed { .. } => 0,
+            Fault::AntennaServoFault { .. } => 1,
+            Fault::HeadObstructed { .. } => 2,
+            Fault::HeadServoFault { .. } => 3,
+            Fault::PositionFeedbackLost { .. } => 4,
+            Fault::MeasuredPoseInvalid { .. } => 5,
+            Fault::BusFailure { .. } => 6,
+            Fault::TorqueOffUnconfirmed { .. } => 7,
+        }
+    }
+
+    /// A sequencer's verdict under torque names the wire or the mechanism, and
+    /// the two are told apart even though they take the same response.
+    ///
+    /// They are the same maneuver and would be the same alert, which is exactly
+    /// why: an operator sent to the cabling over a pose the solver could not
+    /// place is an operator looking at the wrong half of the machine.
+    #[test]
+    fn a_sequencer_verdict_under_torque_names_the_wire_or_the_mechanism() {
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        let wire = PumpError::Sequence(SeqError::VerifyMismatch {
+            context,
+            expected: RegValue::U8(1),
+            read_back: RegValue::U8(0),
+        });
+        let mechanism = PumpError::Sequence(SeqError::PinnedPoseUnsolvable {
+            context,
+            cause: FkError::NoConvergence {
+                iters: 8,
+                residual: 1e-3,
+            },
+        });
+        let ours = PumpError::Sequence(SeqError::WrongValue {
+            context,
+            expected: ValueKind::U8,
+            observed: ValueKind::I32,
+        });
+
+        assert!(matches!(
+            wire.fault(Phase::UnderTorque),
+            Some(Fault::BusFailure { .. })
+        ));
+        assert!(matches!(
+            mechanism.fault(Phase::UnderTorque),
+            Some(Fault::MeasuredPoseInvalid { .. })
+        ));
+        // A register table that disagrees with the step is a defect of ours,
+        // with a machine that answered perfectly.
+        assert_eq!(ours.fault(Phase::UnderTorque), None);
+        assert_eq!(ours.class(Phase::UnderTorque), ErrorClass::SlowStowToRest);
+
+        for error in [&wire, &mechanism] {
+            assert_eq!(
+                error.class(Phase::UnderTorque),
+                ErrorClass::ImmediateAllTorqueOffToPark,
+                "{error}"
+            );
+            assert_eq!(error.fault(Phase::PreTorque), None, "{error}");
+            assert_eq!(error.class(Phase::PreTorque), ErrorClass::Refuse, "{error}");
+        }
+    }
+
+    /// The engage drive is pre-torque until its first enable goes out.
+    ///
+    /// The one path that crosses the line mid-run, and the difference the
+    /// crossing makes: the same failing write is a wake that may be asked for
+    /// again, or nine servos energized with nobody driving them.
+    #[test]
+    fn an_engage_is_pre_torque_until_its_first_enable() {
+        assert_eq!(engage_phase(false), Phase::PreTorque);
+        assert_eq!(engage_phase(true), Phase::UnderTorque);
+
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        let failed_enable = PumpError::Sequence(SeqError::VerifyMismatch {
+            context,
+            expected: RegValue::U8(1),
+            read_back: RegValue::U8(0),
+        });
+        assert_eq!(
+            failed_enable.class(engage_phase(false)),
+            ErrorClass::Refuse,
+            "nothing was energized"
+        );
+        assert_eq!(
+            failed_enable.class(engage_phase(true)),
+            ErrorClass::ImmediateAllTorqueOffToPark,
+            "servos are holding and the wire is not carrying"
+        );
+    }
+
+    /// A configuration that takes the antennas out of service on a sweep they
+    /// run behind on: a threshold a following joint crosses and a progress
+    /// minimum nothing closes, so a joint that merely lags reads as one that
+    /// stopped following.
+    fn degrading_cfg() -> Resolved {
+        let mut cfg = resolved();
+        cfg.motion.tracking.threshold_rad = 0.02;
+        cfg.motion.tracking.progress_min_rad = 1.0;
+        cfg
+    }
+
+    /// What a run that degraded its antennas left behind.
+    struct Degraded {
+        summary: MoveSummary,
+        events: Vec<TickEvent>,
+        trace: Vec<TickSample>,
+    }
+
+    impl Degraded {
+        /// The period the pair was taken out of service, located by the goal
+        /// column rather than by the released one — the column under test in
+        /// two of the assertions below.
+        ///
+        /// Nothing writes a masked servo, so the wire's picture of the pair's
+        /// goals stops moving on the period the mask went up and every later
+        /// period repeats it. The sweep is monotone, so the first period
+        /// carrying the value the run ends on is that one.
+        fn raised_at(&self) -> usize {
+            let frozen = self.trace.last().expect("a recorded run").goal.antennas;
+            self.trace
+                .iter()
+                .position(|sample| sample.goal.antennas == frozen)
+                .expect("the last period carries it")
+        }
+
+        /// How far the pair had drifted from the goals it was last written by
+        /// the end of the run.
+        fn parting(&self) -> [f64; 2] {
+            let last = self.trace.last().expect("a recorded run");
+            let measured = last.present.expect("a released servo is still read");
+            [0, 1].map(|side| (measured.antennas[side] - last.goal.antennas[side]).abs())
+        }
+    }
+
+    /// A lift that also sweeps both antennas, with the pair following far
+    /// enough behind to be taken out of service part way up.
+    ///
+    /// A move the antennas do not make is one they cannot fall behind on, so
+    /// the sweep is what makes this the incident the bench saw. Only the pair
+    /// is delayed, so the head tracks perfectly and the move finishes.
+    fn a_degrading_sweep(cfg: &Resolved) -> Degraded {
+        let mut bench = armed(cfg, machine_at(&datumed_config(), &stow_legs()));
+        for id in [cfg.map.ids()[7], cfg.map.ids()[8]] {
+            bench.registers.borrow_mut().delay.insert(id, 6);
+        }
+        let mut pump = pump(cfg, bench.held);
+        pump.record_trace(true);
+        let mut clock = TestClock::default();
+
+        let sweeping = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [1.2, 1.2],
+                ..JointTargets::default()
+            },
+            durations: cfg.up_durations(),
+            warp: Warp::MinJerk,
+        };
+        let (outcome, events) = run(&mut bench, &mut pump, sweeping, &mut clock);
+        let summary = outcome.expect("a degraded pair does not end the head's move");
+        Degraded {
+            summary,
+            events,
+            trace: pump.last_trace().to_vec(),
+        }
+    }
+
+    /// A degraded pair is not waited for at the settle.
+    ///
+    /// An antenna the tick took out of service was released where it stood and
+    /// is commanded no further, so it never arrives at the goal it was
+    /// abandoned at. Waiting for it would end every degraded move at the window
+    /// naming a joint nobody expected to move, and hide the head arriving.
+    #[test]
+    fn a_degraded_pair_is_not_waited_for_at_the_settle() {
+        let cfg = degrading_cfg();
+        let ended = a_degrading_sweep(&cfg);
+
+        assert!(
+            ended
+                .events
+                .iter()
+                .any(|event| matches!(event, TickEvent::AntennasDegraded(_))),
+            "{:?}",
+            ended.events
+        );
+        // The gap the exclusion is about: the pair came to rest well outside
+        // the tolerance of the goal each was last written, which is what the
+        // settle would otherwise spend its whole window on.
+        for (side, parting) in ended.parting().into_iter().enumerate() {
+            assert!(
+                parting > cfg.settle.tolerance,
+                "antenna {side} was left {parting} rad short of its goal"
+            );
+        }
+        assert!(
+            ended.summary.settled.is_some(),
+            "the head arrived and was measured there: {:?}",
+            ended.summary
+        );
+        assert_eq!(
+            ended.summary.unsettled, None,
+            "a released antenna is not a joint that failed to arrive"
+        );
+    }
+
+    /// A released servo stops contributing to the run's worst lag.
+    ///
+    /// The tick keeps advancing a masked joint's goal row with the plan — the
+    /// mask decides what reaches the wire, not what the trajectory says — so
+    /// the difference it measures for that joint afterwards is against a
+    /// command that never went out. Reported, it would put the whole remaining
+    /// sweep into the one figure the tracking threshold, the window and the
+    /// stow tolerance are all calibrated against.
+    #[test]
+    fn a_released_servo_stops_counting_toward_the_worst_lag() {
+        let cfg = degrading_cfg();
+        let ended = a_degrading_sweep(&cfg);
+
+        for (side, parting) in ended.parting().into_iter().enumerate() {
+            let row = 7 + side;
+            let lag = ended.summary.worst_lag[row];
+            // What the pair really ran behind before it went: the delay it was
+            // given, which is what tripped the tracking monitor.
+            assert!(
+                lag > cfg.motion.tracking.threshold_rad,
+                "antenna {side} lagged {lag} rad, never enough to be taken out"
+            );
+            assert!(
+                lag < parting,
+                "antenna {side} reports {lag} rad of lag, past the {parting} rad it was left \
+                 from a goal it was never sent"
+            );
+        }
+        // The head, which was never masked, keeps every period it measured.
+        assert!(
+            ended.summary.worst_lag[..7].iter().any(|lag| *lag > 0.0),
+            "the head's lag went missing: {:?}",
+            ended.summary.worst_lag
+        );
+    }
+
+    /// The trace stops commanding a released servo from the period after the
+    /// one that released it, and keeps measuring it throughout.
+    ///
+    /// The trace is the diagnostic of record for a degrade, and what it must
+    /// not show is a torqued-off servo under a goal: the last one it was
+    /// written stays in the pump's picture of the wire, and repeated down the
+    /// column it reads as a command error nothing ever committed. The period
+    /// the mask is raised on is the exception and is not blanked — the servo
+    /// was holding that goal when the period's read was taken, and that read is
+    /// the whole diagnosis of why it went.
+    #[test]
+    fn a_released_servo_is_traced_as_commanded_nothing() {
+        let cfg = degrading_cfg();
+        let ended = a_degrading_sweep(&cfg);
+        let trace = &ended.trace;
+        let raised_at = ended.raised_at();
+        assert!(raised_at > 0, "the run started with everything commanded");
+
+        // The boundary itself: the period the mask went up still carries the
+        // pair's goals, because the servos were holding them when its read was
+        // taken, and the period after it is the first that carries none.
+        for sample in &trace[..=raised_at] {
+            assert!(
+                sample.released.is_empty(),
+                "period {} was commanded and holding",
+                sample.tick
+            );
+        }
+        for sample in &trace[raised_at + 1..] {
+            for joint in [JointId::AntennaRight, JointId::AntennaLeft] {
+                assert!(
+                    sample.released.contains(joint),
+                    "{joint} at period {}",
+                    sample.tick
+                );
+            }
+            assert!(
+                sample.present.is_some(),
+                "a released servo is still measured at period {}",
+                sample.tick
+            );
+        }
+        // The number the blanking keeps out of the file: the pair's goal cell
+        // does not move again after the mask, because nothing writes it.
+        assert_eq!(
+            trace.last().expect("the run has periods").goal.antennas,
+            trace[raised_at].goal.antennas,
+            "the goal a released servo carries is the last one it was sent"
+        );
     }
 }

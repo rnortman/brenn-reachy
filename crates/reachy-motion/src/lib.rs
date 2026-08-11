@@ -57,7 +57,9 @@ pub use arm::{
 pub use disarm::{
     DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow, stow_targets,
 };
-pub use joints::{JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth};
+pub use joints::{
+    JointGroup, JointId, JointSet, JointStep, JointTargets, JointVector, ServoHealth,
+};
 pub use seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
     Sequencer, StepContext, ValueKind,
@@ -65,7 +67,7 @@ pub use seq::{
 pub use tick::{
     ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, ClockStretch, CommandDisposition,
     CommandRejection, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE, Mode,
-    MotionCommand, MotionConfig, MotionState, TickInputs, TickOutputs, TickReport,
-    TrackingFaultConfig, duration_floor_s, floor_move_clock, motion_tick,
+    MotionCommand, MotionConfig, MotionState, MoveAbort, Response, TickInputs, TickOutputs,
+    TickReport, TrackingFaultConfig, duration_floor_s, floor_move_clock, motion_tick,
 };
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
