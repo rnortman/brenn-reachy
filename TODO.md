@@ -41,22 +41,6 @@ publishes at three fidelities plus a segment-distance test that the envelope
 does not currently carry. Marked at `EnvelopeConfig` in
 `crates/reachy-kin/src/envelope.rs`.
 
-## `fault-recovery`
-
-Give the tick an explicit clear-fault command, so a machine that stopped
-commanding can be told to resume without restarting the process.
-
-Deferral context: a fault is absorbing — the tick emits nothing and ignores
-every command thereafter — and the only way out today is to disarm, which
-releases torque wherever the machine stands, or to restart the process and
-re-drive the whole arm sequence. Both are correct and neither is automatic,
-which is the property worth keeping: resuming is a decision a person makes with
-the machine in front of them. What is
-missing is not the mechanism but the operator surface to issue such a command
-deliberately and to show what is being cleared; the bench CLI runs one command
-per process and has nowhere to put it. Marked at the absorbing arm of
-`motion_tick` in `crates/reachy-motion/src/tick.rs`.
-
 ## `geometry-fit`
 
 Measure this unit's crank length, rod length, base radius and platform radius on

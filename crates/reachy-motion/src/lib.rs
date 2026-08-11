@@ -30,7 +30,15 @@
 //! is never a fault response, and nothing anywhere may refuse or condition a
 //! torque-off write. Torque *on* is gated, minimally: the supply floor and the
 //! latched error bits, both in `arm::engage_gates`, and nothing else — where the
-//! machine happens to be standing is never among them.
+//! machine happens to be standing is never among them. The bits gate by group:
+//! a servo that carries the head refuses the engagement, an antenna is left out
+//! of service for it.
+//!
+//! What was found and what was done about it are reported through one channel,
+//! `timeline`: the session keeps an append-only record of every fault raised
+//! and every maneuver that answered one, typed, readable while it runs and
+//! deliverable to a subscriber as it grows. An operator line, a status file and
+//! an alert are all renderings of those entries; none of them is the record.
 //!
 //! Motion is shaped host-side because the servos have none of their own: a goal
 //! position is applied as an immediate step. Every gentle movement in this system
@@ -46,6 +54,7 @@ pub mod seq;
 #[cfg(test)]
 mod testutil;
 pub mod tick;
+pub mod timeline;
 pub mod traj;
 
 pub use arm::{
@@ -70,4 +79,5 @@ pub use tick::{
     MotionCommand, MotionConfig, MotionState, MoveAbort, Response, TickInputs, TickOutputs,
     TickReport, TrackingFaultConfig, duration_floor_s, floor_move_clock, motion_tick,
 };
+pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome};
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

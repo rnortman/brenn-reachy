@@ -44,6 +44,7 @@
 //! reason.
 
 use core::time::Duration;
+use std::sync::mpsc::Receiver;
 
 use dxl_proto::{HardwareError, counts_to_rad};
 use reachy_bus::{
@@ -53,8 +54,9 @@ use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    EngageSequencer, Fault, JointGroup, JointId, JointTargets, MotionCommand, MotionState,
-    MoveDurations, PollCadence, PollSequencer, Posture, RegId, RegValue, ValueKind, Warp,
+    EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointTargets, Maneuver,
+    MotionCommand, MotionState, MoveDurations, Outcome, PollCadence, PollSequencer, Posture, RegId,
+    RegValue, ValueKind, Warp,
 };
 
 use crate::config::Resolved;
@@ -269,11 +271,12 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
     /// driving them. Every such path takes the fault release on the way out, so
     /// the error a caller sees always describes a limp machine.
     ///
-    /// Twenty-seven is the count from a posture the machine is still in. A
-    /// posture left stale by a release that measured nothing costs a sweep of
-    /// nine reads first: those angles are written to the goal registers before
-    /// the enables, and pinning a limp head at where it *was* is the slam that
-    /// sweep exists to prevent.
+    /// Twenty-seven is the count from a posture the machine is still in, with
+    /// nothing out of service — an antenna the error bits leave limp takes
+    /// three fewer. A posture left stale by a release that measured nothing
+    /// costs a sweep of nine reads first: those angles are written to the goal
+    /// registers before the enables, and pinning a limp head at where it *was*
+    /// is the slam that sweep exists to prevent.
     pub fn engage(
         &mut self,
         clock: &mut dyn Clock,
@@ -307,7 +310,9 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
                 // would ask of a caller that had one.
                 if engage_phase(engaging.torque_written()) == Phase::UnderTorque {
                     line("engage failed with torque possibly on; releasing immediately");
-                    self.detorque_now(clock, line);
+                    // Nowhere to record it: there is no engagement, and so
+                    // no session record. The release reports through `line`.
+                    let _ = self.detorque_now(clock, line);
                 }
                 return Err(error);
             }
@@ -331,12 +336,14 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
             }
             Err(error) => {
                 line("the control loop would not start with torque on; releasing immediately");
-                self.detorque_now(clock, line);
+                // As above: nine servos are holding but nothing owns a record
+                // of this session yet.
+                let _ = self.detorque_now(clock, line);
                 return Err(error);
             }
         };
         Ok(Engaged {
-            state: MotionState::new_armed(&engaged.armed),
+            state: MotionState::new_armed(&engaged.armed, engaged.degraded),
             machine: self,
             pump,
         })
@@ -349,10 +356,19 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
     /// worth exiting with is the one that made the release necessary — except
     /// for the single case the release cannot report, which is a walk that
     /// never reached its end and therefore printed nothing at all.
-    fn detorque_now(&mut self, clock: &mut dyn Clock, line: &mut dyn FnMut(&str)) {
+    ///
+    /// What it answered comes back all the same, for a caller with a record to
+    /// put it in: whether the torque-off was confirmed is the one fact about a
+    /// release that a story of the session has to carry.
+    fn detorque_now(
+        &mut self,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<DisarmSummary, PumpError> {
         let immediate = DisarmSequencer::immediate(&self.resolved.disarm);
         let outcome = self.detorque_with(immediate, clock, line);
-        report_release(outcome, line);
+        report_release(&outcome, line);
+        outcome
     }
 
     /// Run `sequencer` against the bus and keep what it measured.
@@ -403,6 +419,7 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
 fn fall_through_to_immediate<P: BusPort>(
     machine: &mut Commissioned<'_, P>,
     outcome: Result<DisarmSummary, PumpError>,
+    timeline: &mut FaultTimeline,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<DisarmSummary, PumpError> {
@@ -419,8 +436,28 @@ fn fall_through_to_immediate<P: BusPort>(
         return Err(error);
     }
     line("the orderly release did not finish; releasing immediately");
-    machine.detorque_now(clock, line);
+    let released = machine.detorque_now(clock, line);
+    timeline.response(
+        Maneuver::ImmediateAllTorqueOff,
+        release_outcome(&released),
+        clock.now(),
+    );
     Err(error)
+}
+
+/// How far a torque-off got, from what the release answered.
+///
+/// Every servo is asked whatever the ones before it answered, so the walk
+/// always runs; what an error takes away is the confirmation that it landed. A
+/// minimum risk condition nobody confirmed is never recorded as one that was
+/// reached — the same rule the classification of an unacknowledged release
+/// already follows.
+fn release_outcome(outcome: &Result<DisarmSummary, PumpError>) -> Outcome {
+    if outcome.is_ok() {
+        Outcome::Completed
+    } else {
+        Outcome::Unconfirmed
+    }
 }
 
 /// Say so when a release did not finish, and nothing when it did.
@@ -431,7 +468,7 @@ fn fall_through_to_immediate<P: BusPort>(
 /// servo that never acknowledged its own torque-off. The exception is a walk
 /// that ended early: it prints nothing, and dropping its error would leave the
 /// operator with no record that the machine may still be holding.
-fn report_release(outcome: Result<DisarmSummary, PumpError>, line: &mut dyn FnMut(&str)) {
+fn report_release(outcome: &Result<DisarmSummary, PumpError>, line: &mut dyn FnMut(&str)) {
     match outcome {
         Ok(_) | Err(PumpError::TorqueOffUnacked { .. }) => {}
         Err(error) => line(&format!("  the release itself did not finish: {error}")),
@@ -671,15 +708,30 @@ impl<P: BusPort> Engaged<'_, '_, P> {
     /// one: the settle-and-measure form is a convenience, and a machine part
     /// way through it is a machine that may still be holding torque with a
     /// sequence nobody is driving.
+    ///
+    /// Ends with the session's record, like every other way an engagement
+    /// ends. A run that came through this one clean may still have a story —
+    /// an obstructed antenna pair goes out of service and the head carries on
+    /// — and that story would otherwise die with the engagement that made it.
     pub fn disengage(
         self,
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<DisarmSummary, PumpError> {
-        let machine = self.machine;
+        let Self { machine, state, .. } = self;
+        let mut timeline = state.into_timeline();
         let orderly = DisarmSequencer::new(&machine.resolved.disarm);
         let outcome = machine.detorque_with(orderly, clock, line);
-        fall_through_to_immediate(machine, outcome, clock, line)
+        // A servo that never acknowledged its own torque-off is a condition of
+        // the machine, found here and nowhere else.
+        if let Err(error) = &outcome
+            && let Some(fault) = error.unrecorded_fault(Phase::UnderTorque)
+        {
+            timeline.fault(fault, clock.now());
+        }
+        let outcome = fall_through_to_immediate(machine, outcome, &mut timeline, clock, line);
+        report_incident(&timeline, line);
+        outcome
     }
 
     /// Write torque off to all nine servos now, and do nothing else.
@@ -693,9 +745,63 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<DisarmSummary, PumpError> {
-        let machine = self.machine;
+        self.conclude(clock, line).1
+    }
+
+    /// The same immediate torque-off, handing back the session's record of what
+    /// happened.
+    ///
+    /// Nothing gates a torque-off and nothing here may report one as not having
+    /// been attempted. A servo that never acknowledged its own is a condition
+    /// of the machine, so it goes in as a fault of its own — and the maneuver
+    /// closes as unconfirmed rather than completed, because the record's last
+    /// word about a machine that may still be holding must not be that the
+    /// release landed.
+    fn conclude(
+        self,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+    ) -> (FaultTimeline, Result<DisarmSummary, PumpError>) {
+        let Self { machine, state, .. } = self;
+        let mut timeline = state.into_timeline();
         let immediate = DisarmSequencer::immediate(&machine.resolved.disarm);
-        machine.detorque_with(immediate, clock, line)
+        let outcome = machine.detorque_with(immediate, clock, line);
+        if let Err(error) = &outcome
+            && let Some(fault) = error.unrecorded_fault(Phase::UnderTorque)
+        {
+            timeline.fault(fault, clock.now());
+        }
+        timeline.response(
+            Maneuver::ImmediateAllTorqueOff,
+            release_outcome(&outcome),
+            clock.now(),
+        );
+        (timeline, outcome)
+    }
+
+    /// What this session has raised and what was done about it, so far.
+    ///
+    /// Readable while the engagement runs, as data: a caller watching a script
+    /// execute sees the antennas go out of service on the entry that says so,
+    /// not by reading a printed line back.
+    #[must_use]
+    pub fn timeline(&self) -> &FaultTimeline {
+        self.state.timeline()
+    }
+
+    /// Receive each timeline entry as it appends.
+    pub fn subscribe_timeline(&mut self) -> Receiver<Entry> {
+        self.state.subscribe_timeline()
+    }
+
+    /// Record a condition of the machine that only this layer could see.
+    fn record_fault(&mut self, fault: Fault, at: Duration) {
+        self.state.record_fault(fault, at);
+    }
+
+    /// Record how far the maneuver answering a fault has got.
+    fn record_response(&mut self, maneuver: Maneuver, outcome: Outcome, at: Duration) {
+        self.state.record_response(maneuver, outcome, at);
     }
 }
 
@@ -891,35 +997,52 @@ fn release_tail(summary: &DisarmSummary) -> String {
 /// A fault is what ends differently, and by which maneuver its class asks for:
 /// a wind-down under control where the motors still command, torque off on the
 /// spot where they no longer can be trusted to.
+///
+/// Every path through here delivers the session's record, including the ones
+/// that end well. The fault the doctrine deliberately does not end a run over
+/// — an antenna pair gone out of service, with the head carrying on — reaches
+/// this function as a success, and it is the one incident whose record would
+/// otherwise never be read at all.
 fn settle<T, P: BusPort>(
-    engaged: Engaged<'_, '_, P>,
+    mut engaged: Engaged<'_, '_, P>,
     outcome: Result<T, PumpError>,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), PumpError> {
     let Err(error) = outcome else {
+        report_incident(engaged.timeline(), line);
         return Ok(());
     };
     let class = error.class(Phase::UnderTorque);
     let faulted = error.fault(Phase::UnderTorque).is_some();
+    // A bus failure is found here, not in the tick; the session keeps one
+    // record either way.
+    if let Some(fault) = error.unrecorded_fault(Phase::UnderTorque) {
+        engaged.record_fault(fault, clock.now());
+    }
     match class {
-        ErrorClass::Refuse => {}
+        ErrorClass::Refuse => report_incident(engaged.timeline(), line),
         // The abort-class endings: the plan was wrong and the platform is
         // fine. Stowing them would be a machine winding itself down over a
         // bug in front of somebody who can read the message and type `off`.
         ErrorClass::SlowStowToRest if !faulted => {
             line(&format!("the run did not finish: {error}"));
             line("the machine is healthy and still holding; `off` releases it");
+            report_incident(engaged.timeline(), line);
         }
         ErrorClass::SlowStowToRest | ErrorClass::MaskedSlowStowToPark => {
             line(&format!("fault: {error}"));
-            report_disposition(wind_down(engaged, class.disposition(), clock, line), line);
+            let (timeline, disposition) = wind_down(engaged, class, clock, line);
+            report_disposition(disposition, line);
+            report_incident(&timeline, line);
         }
         ErrorClass::ImmediateAllTorqueOffToRest | ErrorClass::ImmediateAllTorqueOffToPark => {
             line(&format!("fault: {error}"));
             line("releasing torque now; the head settles into near-stow");
-            report_release(engaged.disengage_now(clock, line), line);
+            let (timeline, released) = engaged.conclude(clock, line);
+            report_release(&released, line);
             report_disposition(class.disposition(), line);
+            report_incident(&timeline, line);
         }
     }
     Err(error)
@@ -947,10 +1070,10 @@ fn settle<T, P: BusPort>(
 /// down ends parked rather than at rest.
 fn wind_down<P: BusPort>(
     mut engaged: Engaged<'_, '_, P>,
-    disposition: Disposition,
+    class: ErrorClass,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
-) -> Disposition {
+) -> (FaultTimeline, Disposition) {
     let stow = engaged.machine.resolved.stow_durations();
     // The stow's own clock plus the window its arrival is measured in: the
     // whole of what one stow is allowed, spent once across every expansion.
@@ -958,23 +1081,38 @@ fn wind_down<P: BusPort>(
         .now()
         .saturating_add(stow.longest())
         .saturating_add(engaged.machine.resolved.settle.timeout);
-    let mut disposition = disposition;
-    let stowed = loop {
+    // Start the maneuver only if the mask entry didn't already open one; a
+    // grabbed head masked nothing, so the stow it takes starts here. Which
+    // maneuver that is belongs to the class, not to this caller.
+    if engaged.timeline().open_maneuver().is_none()
+        && let Some(maneuver) = class.maneuver()
+    {
+        engaged.record_response(maneuver, Outcome::Started, clock.now());
+    }
+    let mut disposition = class.disposition();
+    let closing = loop {
         if engaged.head_released() {
-            // Not a stow: there is nothing left to drive one with, and saying
-            // the head came down under control when every joint that carries
-            // it has gone limp is the one claim this record must not make.
+            // Not a stow: there is nothing left to drive one with. The
+            // maneuver is over all the same — the mask growing to cover the
+            // head is the torque-off it was walking towards — but nothing put
+            // the head down and nothing measured where it came to rest, so the
+            // record says as much. Saying the head came down under control
+            // when every joint that carries it has gone limp is the one claim
+            // this record must not make, in the printed line or in the entry.
             line("  no head joint is still commanded; releasing torque now");
-            break false;
+            break Outcome::Unconfirmed;
         }
         let left = deadline.saturating_sub(clock.now());
         if left.is_zero() {
             line("  the stow clock is spent; releasing torque now");
-            break false;
+            break Outcome::FellThrough;
         }
         line("  stowing under control on what still commands");
         match engaged.move_to(stow_pose_targets(), within(stow, left), clock, line) {
-            Ok(_) => break true,
+            Ok(_) => {
+                line("  stowed; releasing torque");
+                break Outcome::Completed;
+            }
             Err(error) => match error.fault(Phase::UnderTorque) {
                 // The mask grew. Nothing about the maneuver changes but which
                 // servos carry the head the rest of the way down.
@@ -984,16 +1122,26 @@ fn wind_down<P: BusPort>(
                 }
                 _ => {
                     line(&format!("  the stow did not finish: {error}"));
-                    break false;
+                    // A condition the tick never raised reaches the record here
+                    // or nowhere: this ending is consumed inside the maneuver
+                    // rather than handed back to the caller that records the
+                    // others.
+                    if let Some(fault) = error.unrecorded_fault(Phase::UnderTorque) {
+                        engaged.record_fault(fault, clock.now());
+                    }
+                    break Outcome::FellThrough;
                 }
             },
         }
     };
-    if stowed {
-        line("  stowed; releasing torque");
+    // Only if the maneuver is still open; a closed one was already recorded
+    // by whoever closed it.
+    if let Some(open) = engaged.timeline().open_maneuver() {
+        engaged.record_response(open, closing, clock.now());
     }
-    report_release(engaged.disengage_now(clock, line), line);
-    disposition
+    let (timeline, released) = engaged.conclude(clock, line);
+    report_release(&released, line);
+    (timeline, disposition)
 }
 
 /// The same move clocks, with nothing over `left` on any of them.
@@ -1020,6 +1168,19 @@ fn report_disposition(disposition: Disposition, line: &mut dyn FnMut(&str)) {
         Disposition::Rest => "  at rest; the next command engages the machine again",
         Disposition::Park => "  parked: look at the machine before arming it again",
     });
+}
+
+/// The session's whole record of what went wrong, in one line.
+///
+/// The lines above it are the incident as it happened, period by period and
+/// interleaved with everything else the run printed; this is the same entries
+/// read back as the sequence they were, which is what an operator quotes and
+/// what a report attaches.
+fn report_incident(timeline: &FaultTimeline, line: &mut dyn FnMut(&str)) {
+    if timeline.is_empty() {
+        return;
+    }
+    line(&format!("  incident: {timeline}"));
 }
 
 /// Verify the machine, pin every joint where it stands, and enable torque.
@@ -1545,9 +1706,9 @@ mod tests {
     use dxl_proto::frame::{INST_PING, INST_REBOOT, INST_WRITE};
     use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
     use reachy_motion::{
-        ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointVector,
-        Rail, RegId, RegValue, ReleaseForm, SeqError, SeqStep, ServoHealth, StepContext,
-        engage_gates,
+        ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointSet,
+        JointVector, Rail, RegId, RegValue, ReleaseForm, SeqError, SeqStep, ServoHealth,
+        StepContext, engage_gates,
     };
 
     use super::*;
@@ -4037,10 +4198,14 @@ mod tests {
 
         let before = log.borrow().len();
         let stopped = PumpError::Runaway { budget: 10_000 };
-        let outcome =
-            fall_through_to_immediate(&mut machine, Err(stopped), &mut clock, &mut |line| {
-                printed.push(line.to_string())
-            });
+        let mut timeline = FaultTimeline::new();
+        let outcome = fall_through_to_immediate(
+            &mut machine,
+            Err(stopped),
+            &mut timeline,
+            &mut clock,
+            &mut |line| printed.push(line.to_string()),
+        );
 
         assert!(
             matches!(
@@ -4068,6 +4233,14 @@ mod tests {
         assert!(
             clock.waits.is_empty(),
             "the fall-through waits out no settle"
+        );
+        // The release that took over is a maneuver, and the record says it ran
+        // and that every servo answered.
+        assert_eq!(
+            timeline.to_string(),
+            "immediate_all_torque_off completed",
+            "{:?}",
+            timeline.entries()
         );
     }
 
@@ -4136,6 +4309,140 @@ mod tests {
             "{printed:?}"
         );
         assert_eq!(torque_bits(&cfg, &registers), vec![0; JointId::COUNT]);
+        // The condition reaches the record, and the release ends the session
+        // whether or not anything else went wrong during it.
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("incident: torque_off_unconfirmed")),
+            "{printed:?}"
+        );
+    }
+
+    /// A torque-off nobody confirmed is recorded as one nobody confirmed.
+    ///
+    /// The record's last word about a machine that may still be holding the
+    /// head up must not be that the release landed — a consumer keying on the
+    /// last outcome is the cheapest read there is, and the one this has to
+    /// survive.
+    #[test]
+    fn an_unconfirmed_torque_off_is_not_recorded_as_completed() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        let engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages");
+        registers
+            .borrow_mut()
+            .verbose
+            .push((cfg.map.ids()[2], reg_for(RegId::TorqueEnable).addr));
+
+        let (timeline, outcome) =
+            engaged.conclude(&mut clock, &mut |line| printed.push(line.to_string()));
+        outcome.expect_err("an unacknowledged release is reported");
+
+        let unconfirmed = Fault::TorqueOffUnconfirmed {
+            id: cfg.map.ids()[2],
+        };
+        assert_eq!(
+            timeline.to_string(),
+            format!(
+                "torque_off_unconfirmed: {unconfirmed} → \
+                 immediate_all_torque_off ran unconfirmed"
+            ),
+        );
+        // Unconfirmed still ends the maneuver: nothing is left running.
+        assert_eq!(timeline.open_maneuver(), None);
+    }
+
+    /// The one fault a command survives still tells its story.
+    ///
+    /// An obstructed antenna pair goes out of service and the head's move
+    /// finishes, so the command returns `Ok` — and the record of the whole
+    /// incident would go with the engagement if a clean ending did not read it
+    /// out.
+    #[test]
+    fn a_degraded_pair_is_reported_by_a_command_that_succeeds() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                registers.borrow_mut().set(
+                    cfg.map.ids()[7],
+                    reg_for(RegId::HardwareErrorStatus),
+                    &[0x20],
+                );
+                let outcome = engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line);
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        ended
+            .outcome
+            .expect("a degraded pair does not end the head's move");
+        let incident = ended
+            .printed
+            .iter()
+            .find(|line| line.contains("incident:"))
+            .unwrap_or_else(|| panic!("no incident was reported: {:?}", ended.printed));
+        assert!(incident.contains("antenna_servo_fault"), "{incident}");
+        assert!(
+            incident.contains("antenna_torque_off started"),
+            "{incident}"
+        );
+        assert!(
+            incident.contains("antenna_torque_off completed"),
+            "{incident}"
+        );
+    }
+
+    /// The orderly release ends the session, so it ends with the session's
+    /// record.
+    ///
+    /// The same story, out the other ending: `demo` and anything else that
+    /// lets go cleanly goes through here, and a degraded pair is exactly the
+    /// state a clean release is reached in.
+    #[test]
+    fn an_orderly_release_reads_out_the_session_record() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                registers.borrow_mut().set(
+                    cfg.map.ids()[8],
+                    reg_for(RegId::HardwareErrorStatus),
+                    &[0x20],
+                );
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                engaged.disengage(clock, line).map(|_| ())
+            },
+        );
+
+        ended.outcome.expect("the orderly release finishes");
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "{:?}",
+            ended.printed
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("incident: antenna_servo_fault")),
+            "{:?}",
+            ended.printed
+        );
     }
 
     /// The last angle a run commanded `row`'s servo to, if it ever commanded
@@ -4209,6 +4516,26 @@ mod tests {
         printed: Vec<String>,
     }
 
+    impl Engagement {
+        /// The session's record, as the incident line delivered it.
+        ///
+        /// The typed entries are inside the engagement the ending consumed, so
+        /// this rendering is what a test sees of them — and it is also what an
+        /// operator reads, which makes it the right thing to assert on.
+        fn incident(&self) -> &str {
+            self.printed
+                .iter()
+                .find_map(|line| line.split_once("incident: "))
+                .map(|(_, record)| record)
+                .unwrap_or_else(|| panic!("no incident was reported: {:?}", self.printed))
+        }
+
+        /// How many times `text` appears in the record.
+        fn recorded(&self, text: &str) -> usize {
+            self.incident().matches(text).count()
+        }
+    }
+
     /// A head servo dropping out mid-move stows on the eight that still
     /// command, releases everything, and leaves the machine for an operator.
     ///
@@ -4240,6 +4567,7 @@ mod tests {
 
         let error = ended
             .outcome
+            .as_ref()
             .expect_err("a servo dropping out ends the move");
         assert!(
             matches!(error, PumpError::Fault(Fault::HeadServoFault { .. })),
@@ -4280,6 +4608,20 @@ mod tests {
                 ended.printed
             );
         }
+        // One condition, one answer, and the answer ran to its end: the record
+        // a consumer keys on rather than the sentences above it.
+        assert_eq!(
+            ended.incident(),
+            format!(
+                "head_servo_fault: {} → masked_slow_stow started → \
+                 masked_slow_stow completed → immediate_all_torque_off completed",
+                Fault::HeadServoFault {
+                    joint: JointId::ALL[dropped],
+                    id: cfg.map.ids()[dropped],
+                    bits: 0x20,
+                }
+            ),
+        );
     }
 
     /// A second servo dropping out mid-stow expands the maneuver rather than
@@ -4312,6 +4654,7 @@ mod tests {
 
         ended
             .outcome
+            .as_ref()
             .expect_err("a servo dropping out ends the move");
         let carried_on = ended
             .printed
@@ -4342,6 +4685,37 @@ mod tests {
                 .any(|line| line.contains("look at the machine")),
             "{:?}",
             ended.printed
+        );
+
+        // The ladder's own rule, in the record: one answer to one incident,
+        // grown by the second servo rather than replaced by a second stow.
+        let mut second = JointSet::EMPTY;
+        second.insert(JointId::ALL[5]);
+        assert_eq!(
+            ended.recorded("masked_slow_stow started"),
+            1,
+            "two answers to one incident: {}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("head_servo_fault"),
+            2,
+            "{}",
+            ended.incident()
+        );
+        assert!(
+            ended
+                .incident()
+                .contains(&format!("masked_slow_stow expanded, released {second}")),
+            "the expansion names the servo that went: {}",
+            ended.incident()
+        );
+        assert!(
+            ended
+                .incident()
+                .ends_with("masked_slow_stow completed → immediate_all_torque_off completed"),
+            "{}",
+            ended.incident()
         );
     }
 
@@ -4433,6 +4807,7 @@ mod tests {
 
         ended
             .outcome
+            .as_ref()
             .expect_err("a servo dropping out ends the move");
         let said = |text: &str| {
             ended
@@ -4467,6 +4842,15 @@ mod tests {
             ended.printed
         );
         assert_eq!(said("look at the machine"), 1, "{:?}", ended.printed);
+        // A maneuver given up on, in the record: the immediate release is what
+        // took over, and nothing here reached its end.
+        assert!(
+            ended
+                .incident()
+                .ends_with("masked_slow_stow fell through → immediate_all_torque_off completed"),
+            "{}",
+            ended.incident()
+        );
     }
 
     /// A wind-down that runs out of head joints releases torque rather than
@@ -4501,6 +4885,7 @@ mod tests {
 
         ended
             .outcome
+            .as_ref()
             .expect_err("a servo dropping out ends the move");
         let position = |text: &str| {
             ended
@@ -4566,6 +4951,36 @@ mod tests {
             "{:?}",
             ended.printed
         );
+
+        // The record must not read as a stow that landed. Nothing put this head
+        // down: the mask grew until nothing was left commanding it, so the
+        // maneuver reached its own end with nobody able to say where the head
+        // came to rest — which is what `ran unconfirmed` is for.
+        assert!(
+            ended
+                .incident()
+                .ends_with("masked_slow_stow ran unconfirmed → immediate_all_torque_off completed"),
+            "{}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("masked_slow_stow completed"),
+            0,
+            "{}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("masked_slow_stow started"),
+            1,
+            "one answer, grown: {}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("expanded, released"),
+            head_joints - 1,
+            "every servo after the first is an expansion: {}",
+            ended.incident()
+        );
     }
 
     /// A run that ended on a defect of ours leaves the bench machine holding.
@@ -4611,6 +5026,229 @@ mod tests {
                 .any(|line| line.contains("still holding")),
             "{:?}",
             ended.printed
+        );
+    }
+
+    /// A condition only the wire-holding layer can see reaches the record
+    /// through the ending that names it.
+    ///
+    /// The tick never raised this one, so nothing appended it where it
+    /// happened; the ending is the whole of the evidence, and the layer that
+    /// consumes the ending is the record's only chance of hearing about it.
+    #[test]
+    fn a_condition_found_on_the_wire_reaches_the_record_through_the_ending() {
+        let cfg = resolved();
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |engaged, _registers, clock, line| {
+                let outcome: Result<(), PumpError> =
+                    Err(PumpError::Sequence(SeqError::NoAnswer { context }));
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        let error = ended
+            .outcome
+            .as_ref()
+            .expect_err("the run's own error comes back");
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::ImmediateAllTorqueOffToPark
+        );
+        assert!(
+            ended.incident().starts_with("bus_failure: "),
+            "{}",
+            ended.incident()
+        );
+        assert!(
+            ended
+                .incident()
+                .ends_with("immediate_all_torque_off completed"),
+            "{}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("bus_failure"),
+            1,
+            "recorded once, by the one layer that saw it: {}",
+            ended.incident()
+        );
+    }
+
+    /// A refusal on a session that already has a story still delivers it.
+    ///
+    /// The one ending with no release to report through: nothing is wound
+    /// down, nothing is torqued off, and the incident line is the only place
+    /// the pair that went out of service earlier gets said.
+    #[test]
+    fn a_refusal_still_delivers_a_session_that_already_degraded() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                registers.borrow_mut().set(
+                    cfg.map.ids()[7],
+                    reg_for(RegId::HardwareErrorStatus),
+                    &[0x20],
+                );
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                // Ninety degrees of yaw, past the cap: a command the tick will
+                // not take, arriving on a machine whose pair is already limp.
+                let refused = engaged.move_to(
+                    JointTargets {
+                        body_yaw: 90.0_f64.to_radians(),
+                        ..engaged.targets()
+                    },
+                    cfg.up_durations(),
+                    clock,
+                    line,
+                );
+                settle(engaged, refused, clock, line)
+            },
+        );
+
+        let error = ended.outcome.as_ref().expect_err("the command is refused");
+        assert_eq!(error.class(Phase::UnderTorque), ErrorClass::Refuse);
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![1, 1, 1, 1, 1, 1, 1, 0, 0],
+            "a refusal changes nothing, and the pair stays limp: {:?}",
+            ended.printed
+        );
+        assert!(
+            ended.incident().contains("antenna_servo_fault"),
+            "{}",
+            ended.incident()
+        );
+        assert!(
+            ended.incident().contains("antenna_torque_off completed"),
+            "{}",
+            ended.incident()
+        );
+    }
+
+    /// A defect of ours on a session that already has a story delivers it too.
+    ///
+    /// The other ending that leaves the machine holding. Our accounting running
+    /// out changes nothing about the pair that went limp earlier, and this line
+    /// is the only place an operator hears about it.
+    #[test]
+    fn a_defect_of_ours_still_delivers_a_session_that_already_degraded() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                registers.borrow_mut().set(
+                    cfg.map.ids()[7],
+                    reg_for(RegId::HardwareErrorStatus),
+                    &[0x20],
+                );
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                let ours: Result<(), PumpError> = Err(PumpError::Runaway { budget: 10 });
+                settle(engaged, ours, clock, line)
+            },
+        );
+
+        let error = ended.outcome.as_ref().expect_err("our budget ran out");
+        assert_eq!(error.class(Phase::UnderTorque), ErrorClass::SlowStowToRest);
+        assert_eq!(
+            error.fault(Phase::UnderTorque),
+            None,
+            "an exhausted budget of ours is no condition of the machine"
+        );
+        assert!(
+            ended.incident().contains("antenna_servo_fault"),
+            "{}",
+            ended.incident()
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("still holding")),
+            "{:?}",
+            ended.printed
+        );
+    }
+
+    /// A run with nothing wrong with it says nothing about incidents.
+    ///
+    /// The other half of delivering the record from every ending: `settle`'s
+    /// clean path reads the timeline out too, so an empty one has to stay
+    /// silent — otherwise every successful bench command grows a line.
+    #[test]
+    fn a_clean_run_reports_no_incident() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                let outcome = engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line);
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        ended.outcome.as_ref().expect("a healthy machine arrives");
+        assert!(
+            !ended.printed.iter().any(|line| line.contains("incident:")),
+            "{:?}",
+            ended.printed
+        );
+    }
+
+    /// A subscriber taken on the engagement hears what the session records.
+    ///
+    /// The bench's half of the push channel — the seam a daemon turns a fault
+    /// into an alert through, without polling. The record is inside the tick
+    /// state the engagement borrows, so what this pins is that subscribing
+    /// through the engagement reaches *that* record and not a copy of it.
+    #[test]
+    fn a_subscriber_on_the_engagement_hears_the_session() {
+        let cfg = resolved();
+        let rig = rig(machine_at(&datumed_config(), &stow_legs()));
+        let registers = rig.registers;
+        let mut clock = TestClock::default();
+        let mut printed: Vec<String> = Vec::new();
+
+        let mut machine = commission(&cfg, rig.port, &mut clock, &mut |line| {
+            printed.push(line.to_string());
+        })
+        .expect("the fixture commissions");
+        let mut engaged = machine
+            .engage(&mut clock, &mut |line| printed.push(line.to_string()))
+            .expect("the fixture engages");
+
+        let entries = engaged.subscribe_timeline();
+        registers.borrow_mut().set(
+            cfg.map.ids()[7],
+            reg_for(RegId::HardwareErrorStatus),
+            &[0x20],
+        );
+        engaged
+            .move_to(
+                neutral_targets(),
+                cfg.up_durations(),
+                &mut clock,
+                &mut |line| printed.push(line.to_string()),
+            )
+            .expect("a degraded pair does not end the head's move");
+
+        let pushed: Vec<Entry> = entries.try_iter().collect();
+        assert_eq!(
+            pushed,
+            engaged.timeline().entries(),
+            "the subscription is on the session's own record"
+        );
+        assert!(
+            pushed
+                .iter()
+                .any(|entry| matches!(entry, Entry::Fault { fault, .. }
+                    if matches!(fault, Fault::AntennaServoFault { .. }))),
+            "{pushed:?}"
         );
     }
 

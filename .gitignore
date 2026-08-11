@@ -27,6 +27,14 @@ reachy-bench.state.toml
 calibration/
 *.csv
 
+# Except the trace fixtures: a handful of recorded runs kept as test data, so
+# the measurements the guards are sized against are replayed by the suite
+# instead of remembered. The wide rules above still cover every trace a bench
+# session writes. Two lines because a file cannot be re-included out of an
+# excluded directory: `traces/` above has to be taken back first.
+!crates/reachy-bench/fixtures/traces/
+!crates/reachy-bench/fixtures/traces/*.csv
+
 # Personal Claude Code settings (settings.json is shared)
 .claude/settings.local.json
 

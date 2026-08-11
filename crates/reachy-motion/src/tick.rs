@@ -117,6 +117,7 @@
 //! is sizing exactly that.
 
 use core::time::Duration;
+use std::sync::mpsc::Receiver;
 
 use nalgebra::Isometry3;
 use reachy_kin::{
@@ -131,6 +132,7 @@ use crate::joints::{
     JointGroup, JointId, JointSet, JointStep, JointTargets, JointVector, ServoHealth, worst_joint,
 };
 use crate::seq::SeqError;
+use crate::timeline::{Entry, FaultTimeline, Maneuver, Outcome};
 use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 
 /// When a joint is far enough from its goal, for long enough, without closing
@@ -404,6 +406,26 @@ pub enum Response {
     ImmediateAllTorqueOffToPark,
 }
 
+impl Response {
+    /// What this response does to the machine, less where it leaves it.
+    ///
+    /// The half of a response that is worth watching happen, and so the half
+    /// the timeline records. A refusal has none: nothing is done to a machine
+    /// whose ask was declined.
+    #[must_use]
+    pub fn maneuver(self) -> Option<Maneuver> {
+        match self {
+            Self::Refuse => None,
+            Self::SlowStowToRest => Some(Maneuver::SlowStow),
+            Self::DegradeAntennas => Some(Maneuver::AntennaTorqueOff),
+            Self::MaskedSlowStowToPark => Some(Maneuver::MaskedSlowStow),
+            Self::ImmediateAllTorqueOffToRest | Self::ImmediateAllTorqueOffToPark => {
+                Some(Maneuver::ImmediateAllTorqueOff)
+            }
+        }
+    }
+}
+
 /// A condition of the machine that a maneuver has to answer.
 ///
 /// One variant per named condition, and the name is the vocabulary the whole
@@ -507,6 +529,26 @@ pub enum Fault {
 }
 
 impl Fault {
+    /// The fault's slug — the name it is reported, alerted and logged under.
+    ///
+    /// One name per condition, everywhere: the timeline entry, the operator
+    /// line and the daemon's fault cell all say this word, so an operator
+    /// reading a log and an operator reading a status file are reading about
+    /// the same thing.
+    #[must_use]
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::AntennaObstructed { .. } => "antenna_obstructed",
+            Self::AntennaServoFault { .. } => "antenna_servo_fault",
+            Self::HeadObstructed { .. } => "head_obstructed",
+            Self::HeadServoFault { .. } => "head_servo_fault",
+            Self::PositionFeedbackLost { .. } => "position_feedback_lost",
+            Self::MeasuredPoseInvalid { .. } => "measured_pose_invalid",
+            Self::BusFailure { .. } => "bus_failure",
+            Self::TorqueOffUnconfirmed { .. } => "torque_off_unconfirmed",
+        }
+    }
+
     /// The maneuver and post-state this fault is answered with.
     ///
     /// The single classification point in the stack. Exhaustive by
@@ -952,6 +994,12 @@ pub struct MotionState {
     pose_failures: u32,
     tracking: [Option<TrackingStreak>; JointId::COUNT],
     masked: JointSet,
+    /// What this session has raised and what was done about it.
+    ///
+    /// Here because the session is the story's scope and this struct is the
+    /// session: a state built by arming and dropped by the release that ends
+    /// the engagement bounds the record exactly.
+    timeline: FaultTimeline,
 }
 
 impl MotionState {
@@ -969,10 +1017,15 @@ impl MotionState {
     /// trajectory a start the machine is not at — outside the travel windows
     /// every later sample is checked against.
     ///
+    /// `degraded` is what arming left out of service — the antennas whose
+    /// latched error bits the health gate found and engaged around, limp and
+    /// never enabled. They start in the mask, so nothing here ever commands
+    /// them, checks them or raises on their standing bits.
+    ///
     /// There is no other way to build one, and that is the point: a tick can
     /// only run on a machine somebody armed.
     #[must_use]
-    pub fn new_armed(armed: &ArmRecord) -> Self {
+    pub fn new_armed(armed: &ArmRecord, degraded: JointSet) -> Self {
         Self {
             mode: Mode::Holding,
             trajectory: None,
@@ -992,9 +1045,8 @@ impl MotionState {
             miss_count: 0,
             pose_failures: 0,
             tracking: [None; JointId::COUNT],
-            // A freshly armed machine commands all nine: arming refuses a
-            // machine whose servos flag, so nothing is out of service yet.
-            masked: JointSet::EMPTY,
+            masked: degraded,
+            timeline: FaultTimeline::new(),
         }
     }
 
@@ -1041,8 +1093,59 @@ impl MotionState {
         self.masked
     }
 
+    /// What this session has raised and what was done about it, so far.
+    ///
+    /// The pull half of the reporting rule: readable at any point while the
+    /// session runs, and read as data — the entries are typed, and nothing
+    /// downstream is asked to parse a sentence.
+    #[must_use]
+    pub fn timeline(&self) -> &FaultTimeline {
+        &self.timeline
+    }
+
+    /// Receive each timeline entry as it appends.
+    ///
+    /// The push half. A daemon that alerts on faults subscribes once, at the
+    /// top of the session, and never polls.
+    pub fn subscribe_timeline(&mut self) -> Receiver<Entry> {
+        self.timeline.subscribe()
+    }
+
+    /// The record, kept past the session that made it.
+    #[must_use]
+    pub fn into_timeline(self) -> FaultTimeline {
+        self.timeline
+    }
+
+    /// Record a fault nothing in here could see.
+    ///
+    /// For conditions only the wire-holding layer can see — bus failures,
+    /// unconfirmed torque-off — that belong in the same record as the faults
+    /// the tick records itself via [`Self::raise`] and [`Self::degrade`].
+    pub fn record_fault(&mut self, fault: Fault, at: Duration) {
+        self.timeline.fault(fault, at);
+    }
+
+    /// Record how far the maneuver answering a fault has got.
+    ///
+    /// Called by the layer driving the wire — the only one that knows whether
+    /// a stow reached stow.
+    pub fn record_response(&mut self, maneuver: Maneuver, outcome: Outcome, at: Duration) {
+        self.timeline.response(maneuver, outcome, at);
+    }
+
+    /// When the tick now executing began, on the caller's own epoch.
+    ///
+    /// Stamped at the top of every tick, so within one this is that tick's own
+    /// `now` — the instant a fault raised here is recorded at — and between
+    /// ticks it is the previous one's, which is what the move clock advances
+    /// from. Zero before the first tick has run.
+    fn now(&self) -> Duration {
+        self.prev_now.unwrap_or(Duration::ZERO)
+    }
+
     /// Raise `fault`, leaving the machine in whatever state its response has to
-    /// be driven from.
+    /// be driven from. Records the fault in the timeline.
     ///
     /// Two shapes, chosen by the fault itself. One stops commanding for good:
     /// control is not trusted, so the only thing left is for the caller to cut
@@ -1065,9 +1168,11 @@ impl MotionState {
         out.goal = None;
         out.report.mode = self.mode;
         out.report.fault = Some(fault);
+        self.timeline.fault(fault, self.now());
     }
 
-    /// Take `joints` out of service over `fault`, and carry on.
+    /// Take `joints` out of service over `fault`, and carry on. Records the
+    /// fault in the timeline when joints are newly masked.
     ///
     /// The move keeps running on what remains. Masked joints are commanded
     /// nothing and checked for nothing from here on, including by the raise
@@ -1084,6 +1189,13 @@ impl MotionState {
         }
         out.report.masked = self.masked;
         out.report.degraded = Some(fault);
+        // On the mask entry and not on the condition: a group already out of
+        // service is a fault already recorded, and a timeline that grew every
+        // time a latched servo answered a health poll would bury the story in
+        // its own repetitions.
+        if !out.report.newly_masked.is_empty() {
+            self.timeline.fault(fault, self.now());
+        }
     }
 
     /// Take one servo out of service over `fault`, and abandon the move.
@@ -1165,8 +1277,15 @@ pub fn motion_tick(
     // so torque is left exactly where the caller had it, and bringing the
     // machine to the minimum risk condition — torque off — is the caller's job.
     //
-    // TODO(fault-recovery): an explicit clear-fault command belongs here, once
-    // there is an operator surface to issue one from.
+    // There is no clearing it, by design. A state is built by arming and dies
+    // with the engagement, so recovery is either the next wake building a fresh
+    // one — which is what every rest-disposition response leaves the machine
+    // ready for — or a person, for the ones that park. Nothing resumes
+    // commanding on the state that stopped.
+    //
+    // Recorded once, at the raise: the standing fault is repeated in every
+    // report from here on, and repeating it in the timeline would grow the
+    // record at tick rate.
     if let Mode::Faulted(fault) = state.mode {
         out.report.fault = Some(fault);
         return;
@@ -2095,7 +2214,10 @@ mod tests {
             )
             .expect("the pinned angles close the linkage")
         };
-        (MotionState::new_armed(&record), outcome.pinned)
+        (
+            MotionState::new_armed(&record, JointSet::EMPTY),
+            outcome.pinned,
+        )
     }
 
     /// One tick with a live read.
@@ -3362,6 +3484,105 @@ mod tests {
         }
     }
 
+    /// Every condition says one word, and no two say the same one.
+    ///
+    /// The slug is the join: the timeline entry, the operator line and the
+    /// daemon's fault cell all carry it, so a typo makes a condition nobody can
+    /// alert on and a copy-pasted duplicate conflates two of them. Neither is
+    /// visible by reading. Driven off a wildcard-free slot function, so a fault
+    /// added to the doctrine cannot be left out of the table.
+    #[test]
+    fn every_fault_names_itself_and_no_other() {
+        let table = [
+            (
+                Fault::AntennaObstructed {
+                    joint: JointId::AntennaRight,
+                    error: 0.5,
+                },
+                "antenna_obstructed",
+            ),
+            (
+                Fault::AntennaServoFault {
+                    joint: JointId::AntennaLeft,
+                    id: 18,
+                    bits: 0x20,
+                },
+                "antenna_servo_fault",
+            ),
+            (
+                Fault::HeadObstructed {
+                    joint: JointId::BodyYaw,
+                    error: 0.5,
+                },
+                "head_obstructed",
+            ),
+            (
+                Fault::HeadServoFault {
+                    joint: JointId::Leg(2),
+                    id: 13,
+                    bits: 0x20,
+                },
+                "head_servo_fault",
+            ),
+            (
+                Fault::PositionFeedbackLost { misses: 51 },
+                "position_feedback_lost",
+            ),
+            (
+                Fault::MeasuredPoseInvalid {
+                    failures: 51,
+                    source: FkError::NoConvergence {
+                        iters: 7,
+                        residual: 1.5e-4,
+                    },
+                },
+                "measured_pose_invalid",
+            ),
+            (
+                Fault::BusFailure {
+                    source: SeqError::NoAnswer {
+                        context: StepContext::reg(SeqStep::PinAndEnable, 13, RegId::GoalPosition),
+                    },
+                },
+                "bus_failure",
+            ),
+            (
+                Fault::TorqueOffUnconfirmed { id: 14 },
+                "torque_off_unconfirmed",
+            ),
+        ];
+
+        let mut seen = [false; 8];
+        let mut slugs: Vec<&str> = Vec::new();
+        for (fault, slug) in &table {
+            seen[fault_slot(fault)] = true;
+            assert_eq!(fault.slug(), *slug, "{fault}");
+            slugs.push(slug);
+        }
+        assert!(seen.iter().all(|named| *named), "a fault went unnamed");
+        slugs.sort_unstable();
+        let distinct = slugs.len();
+        slugs.dedup();
+        assert_eq!(slugs.len(), distinct, "two faults share a slug: {slugs:?}");
+    }
+
+    /// Which condition this is, as a slot in the table above.
+    ///
+    /// Wildcard-free, so a fault added to the enum leaves the slug table one
+    /// slot short rather than silently unasserted.
+    fn fault_slot(fault: &Fault) -> usize {
+        match fault {
+            Fault::AntennaObstructed { .. } => 0,
+            Fault::AntennaServoFault { .. } => 1,
+            Fault::HeadObstructed { .. } => 2,
+            Fault::HeadServoFault { .. } => 3,
+            Fault::PositionFeedbackLost { .. } => 4,
+            Fault::MeasuredPoseInvalid { .. } => 5,
+            Fault::BusFailure { .. } => 6,
+            Fault::TorqueOffUnconfirmed { .. } => 7,
+        }
+    }
+
     /// The bench incident, pinned: the antennas interfere mid-move, and the
     /// head keeps its presence.
     ///
@@ -3426,6 +3647,76 @@ mod tests {
             u32::try_from(degraded_at).expect("a short run") > cfg.tracking.ticks,
             "the run had to be sustained to trip"
         );
+    }
+
+    /// One period can carry both a degrade and a raise, and reports both.
+    ///
+    /// The tracking sweep runs before the health poll and only a *head*
+    /// exhaustion returns out of it, so an antenna running its window out on
+    /// the period a leg's error bits are read leaves `degraded` and `fault`
+    /// both set and the mask carrying all three joints. The layer that turns a
+    /// mask entry into a record has to choose between them, so the period it
+    /// chooses on is pinned here as a reachable one.
+    #[test]
+    fn an_antenna_running_out_as_a_leg_flags_reports_both() {
+        let cfg = tracking_cfg(0.1, 0.01, 3);
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        let command = move_to(
+            JointTargets {
+                head_pose_body: Isometry3::translation(0.0, 0.0, 0.19),
+                antennas: [1.0, 1.0],
+                ..JointTargets::default()
+            },
+            secs(1.0),
+        );
+
+        // The right antenna held where it stands, so its window runs out part
+        // way up; the leg's bits are set for the period that window closes on.
+        let mut present = pinned;
+        let mut flag_now = false;
+        let mut both = None;
+        for n in 0..1000 {
+            let mut health = healthy_servos();
+            if flag_now {
+                health[4].bits = 0x20;
+            }
+            let out = tick_with_health(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &present,
+                &health,
+                (n == 0).then_some(&command),
+            );
+            if out.report.degraded.is_some() && out.report.fault.is_some() {
+                both = Some(out.report);
+                break;
+            }
+            flag_now = out.report.tracking_count + 1 == cfg.tracking.ticks;
+            if let Some(goal) = out.goal {
+                present = goal;
+                present.antennas[0] = pinned.antennas[0];
+            }
+        }
+
+        let report = both.expect("the window closes on the period the leg flags");
+        assert!(
+            matches!(report.degraded, Some(Fault::AntennaObstructed { .. })),
+            "{:?}",
+            report.degraded
+        );
+        assert!(
+            matches!(report.fault, Some(Fault::HeadServoFault { .. })),
+            "{:?}",
+            report.fault
+        );
+        assert!(
+            report.newly_masked.covers(JointGroup::Antennas),
+            "the pair went with the leg: {}",
+            report.newly_masked
+        );
+        assert!(report.newly_masked.contains(JointId::Leg(3)));
+        assert_eq!(report.newly_masked.len(), 3);
     }
 
     /// A head servo flagging takes that servo out of service and abandons the
@@ -3533,6 +3824,119 @@ mod tests {
             vec![JointId::Leg(4)]
         );
         assert_eq!(state.masked().len(), 2);
+    }
+
+    /// Every fault the tick raises is in the session's record, stamped with the
+    /// period it was raised on — and each of them once.
+    #[test]
+    fn every_fault_the_tick_raises_is_recorded_where_it_happened() {
+        let cfg = MotionConfig::default();
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        assert!(state.timeline().is_empty(), "nothing has gone wrong yet");
+
+        // An antenna flagging: the pair goes out of service, and that is one
+        // entry.
+        let mut health = healthy_servos();
+        health[7].bits = 0x20;
+        let out = tick_with_health(&cfg, &mut state, secs(0.02), &pinned, &health, None);
+        let degraded = out.report.degraded.expect("the pair is degraded");
+        assert_eq!(
+            state.timeline().entries(),
+            [Entry::Fault {
+                fault: degraded,
+                at: secs(0.02),
+            }]
+        );
+
+        // A leg flagging on a later poll: a second entry, at its own instant.
+        health[2].bits = 0x04;
+        let out = tick_with_health(&cfg, &mut state, secs(0.06), &pinned, &health, None);
+        let raised = out.report.fault.expect("a head servo dropping out");
+        assert_eq!(state.timeline().last_fault(), Some(raised));
+        assert_eq!(state.timeline().entries().len(), 2);
+        assert_eq!(state.timeline().entries()[1].at(), secs(0.06));
+        assert_eq!(
+            state.timeline().open_maneuver(),
+            None,
+            "nothing answers yet"
+        );
+    }
+
+    /// The bits stay latched for the rest of the session; the record does not
+    /// grow with them.
+    ///
+    /// The mask-scope rule as the reporting channel sees it: a timeline that
+    /// took an entry per poll would bury the story of an incident under the
+    /// standing condition that started it.
+    #[test]
+    fn a_standing_fault_is_recorded_once_and_not_at_poll_rate() {
+        let cfg = MotionConfig::default();
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        let mut health = healthy_servos();
+        health[7].bits = 0x20;
+
+        for n in 0..8 {
+            tick_with_health(
+                &cfg,
+                &mut state,
+                secs(f64::from(n) * 0.02),
+                &pinned,
+                &health,
+                None,
+            );
+        }
+        assert_eq!(state.timeline().entries().len(), 1, "{}", state.timeline());
+
+        // And the same for a fault that stops the tick commanding: the report
+        // repeats it every period, the record does not.
+        let mut blind = MotionState::new_armed(
+            &record_at(&cfg, &pinned, &Isometry3::translation(0.0, 0.0, 0.15)),
+            JointSet::EMPTY,
+        );
+        let mut out = TickOutputs::default();
+        for n in 0..u64::from(cfg.read_loss_ticks) + 4 {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a tick count this small is exact in f64"
+            )]
+            let now = secs(n as f64 * 0.02);
+            motion_tick(
+                &cfg,
+                &mut blind,
+                &TickInputs {
+                    now,
+                    period: PERIOD,
+                    present: None,
+                    command: None,
+                    health: None,
+                },
+                &mut out,
+            );
+        }
+        assert!(matches!(
+            out.report.fault,
+            Some(Fault::PositionFeedbackLost { .. })
+        ));
+        assert_eq!(blind.timeline().entries().len(), 1, "{}", blind.timeline());
+    }
+
+    /// A subscriber hears the entries as they are made.
+    #[test]
+    fn a_subscriber_hears_the_faults_as_they_are_raised() {
+        let cfg = MotionConfig::default();
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+        let entries = state.subscribe_timeline();
+        let mut health = healthy_servos();
+        health[2].bits = 0x20;
+        let out = tick_with_health(&cfg, &mut state, secs(0.04), &pinned, &health, None);
+
+        assert_eq!(
+            entries.try_iter().collect::<Vec<_>>(),
+            vec![Entry::Fault {
+                fault: out.report.fault.expect("a servo dropped out"),
+                at: secs(0.04),
+            }]
+        );
     }
 
     /// An antenna servo flagging degrades the pair and the move carries on;
@@ -5388,7 +5792,10 @@ mod tests {
 
         let mut pinned = present;
         pinned.legs[3] = f64::NAN;
-        let mut state = MotionState::new_armed(&record_at(&cfg, &pinned, &targets.head_pose_body));
+        let mut state = MotionState::new_armed(
+            &record_at(&cfg, &pinned, &targets.head_pose_body),
+            JointSet::EMPTY,
+        );
 
         let out = tick_with(&cfg, &mut state, secs(0.0), &present, None);
         let Some(Fault::HeadObstructed { joint, error }) = out.report.fault else {

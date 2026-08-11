@@ -4,14 +4,16 @@
 //! machine arrived. The question that needs the rest is what the motion looked
 //! like: where each joint was at every period, against the goal it was being
 //! held to. That is a velocity profile in the only form this loop can honestly
-//! produce one, sampled at the rate the servos were actually read at, and
-//! differencing it is the reader's job rather than this crate's.
+//! produce one, sampled at the rate the servos were actually read at.
+//! [`metrics`] is the reader that differences it.
 //!
 //! Written once per run, not once per period. The loop keeps its samples in
 //! memory and this renders them afterwards, so nothing in a control period ever
 //! waits on a file. For the same reason the destination belongs on a memory
 //! filesystem — `/run` on the machine this drives — and never on the device's
 //! flash.
+
+pub mod metrics;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -49,6 +51,20 @@ fn column(joint: JointId) -> String {
     }
 }
 
+/// The heading a joint's measured angle is written under.
+///
+/// Spelled here and nowhere else: the writer builds the header from it and
+/// [`metrics`] finds its columns by it, so the file format is one string rather
+/// than an agreement between two files that a rename would break silently.
+pub(crate) fn present_heading(joint: JointId) -> String {
+    format!("{}_present_rad", column(joint))
+}
+
+/// The heading a joint's commanded angle is written under.
+pub(crate) fn goal_heading(joint: JointId) -> String {
+    format!("{}_goal_rad", column(joint))
+}
+
 /// The header row, without its newline.
 ///
 /// `run` distinguishes the moves appended to one file, including moves from
@@ -58,10 +74,10 @@ fn column(joint: JointId) -> String {
 fn header() -> String {
     let mut row = String::from("run,tick,t_s,phase");
     for joint in JointId::ALL {
-        row.push_str(&format!(",{}_present_rad", column(joint)));
+        row.push_str(&format!(",{}", present_heading(joint)));
     }
     for joint in JointId::ALL {
-        row.push_str(&format!(",{}_goal_rad", column(joint)));
+        row.push_str(&format!(",{}", goal_heading(joint)));
     }
     row
 }

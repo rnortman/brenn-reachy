@@ -47,6 +47,27 @@ pub(crate) fn scratch_path(name: &str) -> PathBuf {
     ))
 }
 
+/// A run recorded on real hardware, read back from the fixture of that name.
+///
+/// The recordings are checked in beside the crate, one file per bench session
+/// and one or more runs per file; `crates/reachy-bench/fixtures/traces` says
+/// what each holds. They are the measurements this machine's guards are sized
+/// against, so replaying them is how a change that would false-trip a validated
+/// gesture — or miss the one collision on record — fails here rather than on
+/// the machine.
+///
+/// Panics rather than answers: a fixture that will not read is a broken
+/// checkout, not a test case.
+pub(crate) fn trace_fixture(name: &str) -> crate::trace::metrics::Trace {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/traces")
+        .join(format!("{name}.csv"));
+    match crate::trace::metrics::Trace::read(&path) {
+        Ok(trace) => trace,
+        Err(error) => panic!("the {name} trace fixture reads: {error}"),
+    }
+}
+
 /// A scripted machine: nine servos with a register file, answering pings, reads
 /// and writes over the port seam.
 ///

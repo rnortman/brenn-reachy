@@ -62,9 +62,10 @@ use crate::pump::SettleConfig;
 /// make, and the slack the two per-leg fences are allowed to differ by.
 ///
 /// Derived from the encoder resolution the conversions themselves are built on,
-/// so the fence tolerance and the counts-to-radians conversion can never
-/// disagree about how wide a count is.
-const ONE_COUNT_RAD: f64 = core::f64::consts::TAU / dxl_proto::conv::COUNTS_PER_REV as f64;
+/// so the fence tolerance, the counts-to-radians conversion and the trace
+/// reader's noise floor can never disagree about how wide a count is.
+pub(crate) const ONE_COUNT_RAD: f64 =
+    core::f64::consts::TAU / dxl_proto::conv::COUNTS_PER_REV as f64;
 
 /// The highest servo ID a unicast request may name: the address one below the
 /// broadcast address.
@@ -537,13 +538,13 @@ fn gains_section(gains: Gains) -> GainsSection {
 /// standing there, degrees.
 ///
 /// One figure because there is one question: the distance at which this machine
-/// is where it was told to be. Two places ask it — the verified torque-off tail
-/// comparing against stow, and a move waiting for the machine to arrive — and
-/// they have no cause to answer it differently, so they resolve from here rather
-/// than from two literals that a re-derivation could move apart. The two TOML
-/// keys stay separate: an operator splitting them is a deliberate act, and this
-/// is only what they default to.
-const ARRIVED_TOLERANCE_DEG: f64 = 2.0;
+/// is where it was told to be. Three places ask it — the verified torque-off
+/// tail comparing against stow, a move waiting for the machine to arrive, and a
+/// recorded run measured back off its trace — and they have no cause to answer
+/// it differently, so they resolve from here rather than from literals that a
+/// re-derivation could move apart. The two TOML keys stay separate: an operator
+/// splitting them is a deliberate act, and this is only what they default to.
+pub(crate) const ARRIVED_TOLERANCE_DEG: f64 = 2.0;
 
 /// `[disarm]` — what the verified torque-off tail compares against.
 #[derive(Clone, Debug, Deserialize, PartialEq)]

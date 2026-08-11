@@ -65,7 +65,7 @@ use reachy_kin::{
     neutral_head_pose, pose_margins, rest_head_pose, stow_head_pose,
 };
 
-use crate::joints::{JointId, JointVector, ServoHealth};
+use crate::joints::{JointGroup, JointId, JointSet, JointVector, ServoHealth};
 use crate::seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
     Sequencer, StepContext,
@@ -649,6 +649,13 @@ pub struct EngageSummary {
     /// than refused: the armed record is read back after the enables, so
     /// whatever this says is already in the pose the tick starts from.
     pub post_enable_shift: [f64; JointId::COUNT],
+    /// The joints this engagement left out of service: never enabled, never
+    /// commanded, still measured.
+    ///
+    /// Only ever antennas — bits on a servo that carries the head refuse the
+    /// engagement outright ([`engage_gates`]) — and the set a tick starts its
+    /// mask from.
+    pub degraded: JointSet,
 }
 
 impl EngageSummary {
@@ -670,7 +677,17 @@ impl EngageSummary {
 ///
 /// A refusal here is an expected error, not a fault: nothing has been written,
 /// the machine is exactly where it was, and the next request tries again.
-pub fn engage_gates(cfg: &ArmConfig, rail: &Rail) -> Result<(), SeqError> {
+///
+/// The error-bit gate answers by group, and what comes back on the passing side
+/// is the set of joints the engagement leaves out of service. Bits on a servo
+/// that carries the head refuse outright: it is holding the head up, there is no
+/// rebooting it, and lifting on a servo already flagging is exactly the hazard
+/// the gate is here for. Bits on an antenna alone refuse nothing. The pair
+/// carries no load and is its own mechanism, so one latched overload — the
+/// residue an antenna interference incident leaves behind — must not cost every
+/// wake until somebody walks over and cycles the power. That antenna is named
+/// here, never enabled, and never commanded for the rest of the engagement.
+pub fn engage_gates(cfg: &ArmConfig, rail: &Rail) -> Result<JointSet, SeqError> {
     let limit = cfg.min_arm_voltage;
     if let Some((row, lowest)) = worst_below(&rail.voltages, limit) {
         return Err(SeqError::SupplyBelowFloor {
@@ -685,21 +702,24 @@ pub fn engage_gates(cfg: &ArmConfig, rail: &Rail) -> Result<(), SeqError> {
         });
     }
 
+    let mut degraded = JointSet::EMPTY;
     for (row, health) in rail.health.iter().enumerate() {
+        if health.healthy_or_voltage_only() {
+            continue;
+        }
+        let joint = JointId::ALL[row];
+        if joint.group() == JointGroup::Antennas {
+            degraded.insert(joint);
+            continue;
+        }
         // No reboot, ever, and no clearing of the latch: a servo holding this
         // head that is rebooted drops it.
-        if !health.healthy_or_voltage_only() {
-            return Err(SeqError::UnhealthyServo {
-                context: StepContext::reg(
-                    SeqStep::Health,
-                    cfg.ids[row],
-                    RegId::HardwareErrorStatus,
-                ),
-                bits: health.bits,
-            });
-        }
+        return Err(SeqError::UnhealthyServo {
+            context: StepContext::reg(SeqStep::Health, cfg.ids[row], RegId::HardwareErrorStatus),
+            bits: health.bits,
+        });
     }
-    Ok(())
+    Ok(degraded)
 }
 
 /// The worst reading of a sweep that is under `limit`, and the row it came from.
@@ -1239,6 +1259,45 @@ pub(crate) fn placeable(
     })
 }
 
+/// How many times a sweep reads a position again after one came back
+/// unplaceable, before it refuses.
+///
+/// Two, which is the difference between a corrupt frame and a servo that has
+/// stopped reporting where it is. The cost of being wrong either way is small:
+/// two extra reads on a bus that answers in tens of microseconds, against a
+/// wake refused over one bad byte.
+pub(crate) const PLACE_REREADS: u32 = 2;
+
+/// A position reading, or the instruction to read it again.
+///
+/// The bounded retry [`placeable`] does not do on its own, because the counter
+/// belongs to the sweep that is walking the servos and not to the judgement
+/// about one reading. `Ok(None)` means the same register is read again;
+/// `attempts` counts the re-reads already spent on this joint and is reset by
+/// the reading that lands.
+///
+/// Only an unplaceable *number* is retried. Silence and a malformed answer come
+/// back from the bus with its own retry policy already spent on them, and a
+/// sweep re-reading those would be a second, quieter policy over the top.
+pub(crate) fn placeable_or_again(
+    row: usize,
+    context: StepContext,
+    result: &BusResult,
+    attempts: &mut u32,
+) -> Result<Option<f64>, SeqError> {
+    match placeable(row, context, result) {
+        Ok(angle) => {
+            *attempts = 0;
+            Ok(Some(angle))
+        }
+        Err(SeqError::UnplaceableAngle { .. }) if *attempts < PLACE_REREADS => {
+            *attempts += 1;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Confirm that a write landed, comparing against the value the request carried.
 pub(crate) fn confirm_write(
     result: &BusResult,
@@ -1329,6 +1388,8 @@ pub struct PollSequencer {
     present: JointVector,
     rail: Rail,
     rail_read: bool,
+    /// Re-reads already spent on the joint the position sweep is at.
+    rereads: u32,
 }
 
 impl PollSequencer {
@@ -1343,6 +1404,7 @@ impl PollSequencer {
             present: JointVector::default(),
             rail,
             rail_read: matches!(cadence, PollCadence::PositionsAndRail),
+            rereads: 0,
         }
     }
 
@@ -1385,7 +1447,12 @@ impl PollSequencer {
         };
         match self.phase {
             PollPhase::Position { cursor } => {
-                let angle = placeable(cursor, context, result)?;
+                let Some(angle) = placeable_or_again(cursor, context, result, &mut self.rereads)?
+                else {
+                    // The phase is left where it is, so the next action reads
+                    // the same register again.
+                    return Ok(());
+                };
                 self.present.set(JointId::ALL[cursor], angle);
                 self.phase = if cursor + 1 < JointId::COUNT {
                     PollPhase::Position { cursor: cursor + 1 }
@@ -1459,6 +1526,43 @@ impl EngagePhase {
     }
 }
 
+/// Which joint a write sweep is at, or `None` where nothing is being written.
+///
+/// The read sweep and the two endings are not write sweeps: the settle reads
+/// all nine whatever the health gate said, and a finished or failed sequence
+/// has no cursor at all.
+fn write_cursor(phase: EngagePhase) -> Option<usize> {
+    match phase {
+        EngagePhase::Pin { cursor } | EngagePhase::Enable { cursor } => Some(cursor),
+        EngagePhase::Settle { .. } | EngagePhase::Complete(_) | EngagePhase::Failed(_) => None,
+    }
+}
+
+/// Where a write sweep stands once it is done with the joint at its cursor.
+///
+/// The order of the write sweeps, in one place: the goal writes run the nine
+/// and hand over to the enables, the enables run the nine and hand over to the
+/// settle reads. Two callers step it — the walk itself, as each answer comes
+/// back, and the skip that steps past a joint nothing is written to — and a
+/// second copy of the order is a copy that can be left behind by a sweep added
+/// to only one of them.
+///
+/// A cursor never reaches [`JointId::COUNT`]: the last joint of a sweep hands
+/// over rather than counting past the end.
+fn advanced(phase: EngagePhase) -> EngagePhase {
+    match phase {
+        EngagePhase::Pin { cursor } if cursor + 1 < JointId::COUNT => {
+            EngagePhase::Pin { cursor: cursor + 1 }
+        }
+        EngagePhase::Pin { .. } => EngagePhase::Enable { cursor: 0 },
+        EngagePhase::Enable { cursor } if cursor + 1 < JointId::COUNT => {
+            EngagePhase::Enable { cursor: cursor + 1 }
+        }
+        EngagePhase::Enable { .. } => EngagePhase::Settle { cursor: 0 },
+        EngagePhase::Settle { .. } | EngagePhase::Complete(_) | EngagePhase::Failed(_) => phase,
+    }
+}
+
 /// Taking hold of the machine, in twenty-seven transactions.
 ///
 /// Three sweeps of nine, and nothing else: each goal register written to the
@@ -1482,6 +1586,12 @@ impl EngagePhase {
 /// the rail and the latched error bits — are checked in [`engage_gates`] before
 /// a single transaction is issued, so a refusal costs the bus nothing and leaves
 /// the machine exactly as it was.
+///
+/// **A degraded antenna costs three of the twenty-seven.** The health gate hands
+/// back the joints it left out of service, and those take neither the goal write
+/// nor the enable — they stay limp for the whole engagement — while the settle
+/// sweep still reads all nine, because where a limp joint sits is a measurement
+/// like any other and the record the tick starts from wants it.
 pub struct EngageSequencer {
     cfg: ArmConfig,
     geom: HeadGeometry,
@@ -1494,6 +1604,11 @@ pub struct EngageSequencer {
     post_enable: JointVector,
     post_enable_shift: [f64; JointId::COUNT],
     torque_written: bool,
+    /// The joints the health gate left out of service: their torque is never
+    /// enabled, so masked here means limp rather than merely uncommanded.
+    degraded: JointSet,
+    /// Re-reads already spent on the joint the settle sweep is at.
+    rereads: u32,
 }
 
 impl EngageSequencer {
@@ -1530,6 +1645,8 @@ impl EngageSequencer {
             post_enable: posture.present,
             post_enable_shift: [0.0; JointId::COUNT],
             torque_written: false,
+            degraded: JointSet::EMPTY,
+            rereads: 0,
         };
         if let Err(error) = seq.prepare(posture) {
             seq.phase = EngagePhase::Failed(error);
@@ -1554,7 +1671,7 @@ impl EngageSequencer {
 
     /// The gates, the pins and the resting record, all before the first write.
     fn prepare(&mut self, posture: &Posture) -> Result<(), SeqError> {
-        engage_gates(&self.cfg, &posture.rail)?;
+        self.degraded = engage_gates(&self.cfg, &posture.rail)?;
         self.pins = pin_goals(&self.cfg, &posture.present)?;
         // Failure is not a solver problem to retry with a perturbed seed: the
         // angles are what nine servos reported, and angles that place no pose
@@ -1581,7 +1698,24 @@ impl EngageSequencer {
         }
     }
 
+    /// Step a write sweep's cursor past the joints nothing is written to.
+    ///
+    /// A degraded joint is written neither a goal nor an enable: it is out of
+    /// service for this engagement, and a goal register belonging to a servo
+    /// that will never hold torque is a register nothing reads. Stepping over
+    /// it here is what makes "never commanded" true on the wire rather than
+    /// only in the tick.
+    fn skip_degraded(&mut self) {
+        while let Some(cursor) = write_cursor(self.phase) {
+            if !self.degraded.contains(JointId::ALL[cursor]) {
+                return;
+            }
+            self.phase = advanced(self.phase);
+        }
+    }
+
     fn emit(&mut self) -> SeqAction<EngageSummary> {
+        self.skip_degraded();
         let request = match self.phase {
             EngagePhase::Pin { cursor } => {
                 let goal = RegValue::Radians(angle_at(&self.pins.pinned, cursor));
@@ -1601,6 +1735,7 @@ impl EngageSequencer {
                     armed,
                     pins: self.pins,
                     post_enable_shift: self.post_enable_shift,
+                    degraded: self.degraded,
                 });
             }
             EngagePhase::Failed(error) => return SeqAction::Fail(error),
@@ -1619,34 +1754,31 @@ impl EngageSequencer {
             reg: request.reg(),
         };
         match self.phase {
-            EngagePhase::Pin { cursor } => {
+            EngagePhase::Pin { .. } => {
                 // Whatever came back — the mirrored present, silence, a refusal
                 // — the walk carries on. See the type's docs: this sweep is
                 // insurance against a stale goal register, not a check on one.
-                self.phase = if cursor + 1 < JointId::COUNT {
-                    EngagePhase::Pin { cursor: cursor + 1 }
-                } else {
-                    EngagePhase::Enable { cursor: 0 }
-                };
+                self.phase = advanced(self.phase);
                 Ok(())
             }
-            EngagePhase::Enable { cursor } => {
+            EngagePhase::Enable { .. } => {
                 let Some(result) = prior else {
                     return Err(SeqError::NoAnswer { context });
                 };
                 confirm_write(result, &request, context)?;
-                self.phase = if cursor + 1 < JointId::COUNT {
-                    EngagePhase::Enable { cursor: cursor + 1 }
-                } else {
-                    EngagePhase::Settle { cursor: 0 }
-                };
+                self.phase = advanced(self.phase);
                 Ok(())
             }
             EngagePhase::Settle { cursor } => {
                 let Some(result) = prior else {
                     return Err(SeqError::NoAnswer { context });
                 };
-                let angle = placeable(cursor, context, result)?;
+                let Some(angle) = placeable_or_again(cursor, context, result, &mut self.rereads)?
+                else {
+                    // The phase is left where it is, so the next action reads
+                    // the same register again.
+                    return Ok(());
+                };
                 self.post_enable.set(JointId::ALL[cursor], angle);
                 self.post_enable_shift[cursor] = angle - angle_at(&self.measured, cursor);
                 if cursor + 1 < JointId::COUNT {
@@ -2380,6 +2512,10 @@ mod tests {
         fail_write: Option<(u8, RegId, BusResult)>,
         /// One read to answer with something other than success.
         fail_read: Option<(u8, RegId, BusResult)>,
+        /// Per servo, how many further position reads answer with something
+        /// nobody can place, counted down as they arrive: the corrupt frame a
+        /// sweep re-reads past, rather than a joint that has stopped reporting.
+        nan_reads: [usize; JointId::COUNT],
         /// The goals the servos are holding, once each has been written.
         goals: JointVector,
         written: [bool; JointId::COUNT],
@@ -2418,6 +2554,7 @@ mod tests {
             ],
             fail_write: None,
             fail_read: None,
+            nan_reads: [0; JointId::COUNT],
             goals: JointVector::default(),
             written: [false; JointId::COUNT],
             poll: 0,
@@ -2448,7 +2585,13 @@ mod tests {
                 }
                 RegId::HardwareErrorStatus => RegValue::U8(self.health[row]),
                 RegId::TorqueEnable => RegValue::U8(self.torque[row]),
-                RegId::PresentPosition => RegValue::Radians(self.position(row)),
+                RegId::PresentPosition => {
+                    if self.nan_reads[row] > 0 {
+                        self.nan_reads[row] -= 1;
+                        return RegValue::Radians(f64::NAN);
+                    }
+                    RegValue::Radians(self.position(row))
+                }
                 RegId::GoalPosition => RegValue::Radians(self.goal(row)),
                 other => self
                     .provision
@@ -2633,6 +2776,22 @@ mod tests {
         }
     }
 
+    /// How many times `id`'s position was read, which is what a re-read shows
+    /// up as.
+    fn reads_of(log: &[(SeqStep, BusRequest)], id: u8) -> usize {
+        log.iter()
+            .filter(|(_, request)| {
+                matches!(
+                    request,
+                    BusRequest::ReadReg {
+                        id: read,
+                        reg: RegId::PresentPosition,
+                    } if *read == id
+                )
+            })
+            .count()
+    }
+
     fn writes(log: &[(SeqStep, BusRequest)], reg: RegId) -> usize {
         log.iter()
             .filter(|(_, request)| {
@@ -2789,7 +2948,8 @@ mod tests {
         // The armed record is what a tick is started from, and it is below the
         // clearance floor at this rest: the margin baseline is what carries the
         // first lift, exactly as it does off the fixture in `tick.rs`.
-        let state = crate::tick::MotionState::new_armed(&summary.engage.armed);
+        let state =
+            crate::tick::MotionState::new_armed(&summary.engage.armed, summary.engage.degraded);
         assert_eq!(*state.last_goal(), machine.present);
         assert!(summary.engage.armed.min_margin > 0.0);
         assert!(summary.engage.armed.min_margin < EnvelopeConfig::default().min_toggle_margin);
@@ -2990,6 +3150,224 @@ mod tests {
         assert_eq!(summary.rail.health[3], ServoHealth { id: 13, bits: 0x20 });
         assert_eq!(machine.enabled(), [false; JointId::COUNT]);
         assert!(engage_gates(&cfg, &summary.rail).is_err());
+    }
+
+    /// The health gate answers by group: a head servo refuses, an antenna is
+    /// named and engaged around.
+    ///
+    /// A servo carrying the head that has flagged is the one thing torque must
+    /// not come on over. An antenna is not carrying anything, and one latched
+    /// overload — what an interference incident leaves behind — must not make
+    /// the head un-armable until somebody cycles the power.
+    #[test]
+    fn the_health_gate_refuses_a_head_servo_and_names_an_antenna() {
+        let cfg = config();
+        let healthy = Rail {
+            voltages: [7.4; JointId::COUNT],
+            health: [ServoHealth::default(); JointId::COUNT],
+        };
+        assert_eq!(
+            engage_gates(&cfg, &healthy).expect("nothing flags"),
+            JointSet::EMPTY
+        );
+
+        // A leg and an antenna together: the head decides, and it refuses.
+        let mut both = healthy;
+        both.health[3] = ServoHealth { id: 13, bits: 0x20 };
+        both.health[8] = ServoHealth { id: 18, bits: 0x20 };
+        let error = engage_gates(&cfg, &both).expect_err("a crank that has flagged refuses");
+        let SeqError::UnhealthyServo { context, bits } = error else {
+            panic!("expected a health refusal, got {error}");
+        };
+        assert_eq!(context.id, 13);
+        assert_eq!(bits, 0x20);
+
+        // Body yaw is a head joint like the six cranks.
+        let mut yaw = healthy;
+        yaw.health[0] = ServoHealth { id: 10, bits: 0x20 };
+        assert!(
+            engage_gates(&cfg, &yaw).is_err(),
+            "the body yaw carries too"
+        );
+
+        // Both antennas flagging is still an engagement, with both named.
+        let mut pair = healthy;
+        pair.health[7] = ServoHealth { id: 17, bits: 0x20 };
+        pair.health[8] = ServoHealth { id: 18, bits: 0x10 };
+        let degraded = engage_gates(&cfg, &pair).expect("the antennas refuse nothing");
+        assert!(degraded.covers(JointGroup::Antennas));
+        assert_eq!(degraded.len(), 2);
+    }
+
+    /// A latched antenna is engaged around: no goal, no enable, still measured,
+    /// and masked in the state the tick starts from.
+    ///
+    /// Masked here means limp rather than merely uncommanded, and it means it
+    /// by construction: the servo is never enabled in the first place, so
+    /// nothing has to be written to take it back out of service.
+    #[test]
+    fn a_latched_antenna_engages_the_head_and_stays_limp() {
+        let cfg = provisioned_config();
+        let mut health = [0; JointId::COUNT];
+        health[7] = 0x20;
+        let mut machine = Machine { health, ..bus() };
+        let summary = drive(&cfg, &mut machine).expect("an antenna latch does not refuse the head");
+
+        assert_eq!(
+            summary.engage.degraded.iter().collect::<Vec<_>>(),
+            vec![JointId::AntennaRight]
+        );
+        let mut expected = [true; JointId::COUNT];
+        expected[7] = false;
+        assert_eq!(machine.enabled(), expected);
+
+        let engaging: Vec<&BusRequest> = machine
+            .log
+            .iter()
+            .filter(|(step, request)| {
+                *step == SeqStep::PinAndEnable && request.id() == SERVO_IDS[7]
+            })
+            .map(|(_, request)| request)
+            .collect();
+        assert!(
+            engaging
+                .iter()
+                .all(|request| matches!(request, BusRequest::ReadReg { .. })),
+            "a joint out of service is written nothing: {engaging:?}"
+        );
+        // Read exactly once, by the settle sweep: where a limp joint sits is a
+        // measurement like any other, and the armed record wants it.
+        assert_eq!(engaging.len(), 1);
+        assert_eq!(
+            summary.engage.armed.joints.antennas[0],
+            machine.present.antennas[0]
+        );
+
+        // Nothing commands or checks it from here: the tick starts masked.
+        let state =
+            crate::tick::MotionState::new_armed(&summary.engage.armed, summary.engage.degraded);
+        assert!(state.masked().contains(JointId::AntennaRight));
+        assert!(!state.masked().contains(JointId::AntennaLeft));
+
+        // Both of them flagging leaves seven servos holding the head up.
+        let mut health = [0; JointId::COUNT];
+        health[7] = 0x20;
+        health[8] = 0x20;
+        let mut machine = Machine { health, ..bus() };
+        let summary = drive(&cfg, &mut machine).expect("a flagging pair does not refuse the head");
+        assert!(summary.engage.degraded.covers(JointGroup::Antennas));
+        assert_eq!(machine.enabled()[..7], [true; 7]);
+        assert_eq!(machine.enabled()[7..], [false; 2]);
+    }
+
+    /// A degradation lasts the engagement, and the next one judges the bits
+    /// again.
+    ///
+    /// Nothing clears one in session — there is no clear-fault command in this
+    /// stack by design — and nothing needs to: the gate reads the latched bits
+    /// every time it runs, so an antenna whose latch a power cycle or a REBOOT
+    /// cleared is back in service at the next wake, and one whose latch stands
+    /// is not.
+    #[test]
+    fn a_degradation_is_judged_again_at_the_next_engagement() {
+        let cfg = provisioned_config();
+        let mut health = [0; JointId::COUNT];
+        health[8] = 0x20;
+        let mut machine = Machine { health, ..bus() };
+        let first = drive(&cfg, &mut machine).expect("the head engages");
+        assert!(first.engage.degraded.contains(JointId::AntennaLeft));
+
+        // A latch that still stands degrades the same joint again.
+        machine.torque = [0; JointId::COUNT];
+        let again = drive(&cfg, &mut machine).expect("the head engages again");
+        assert_eq!(again.engage.degraded, first.engage.degraded);
+
+        // What a REBOOT leaves behind: no latch, and the joint back in service.
+        machine.health[8] = 0;
+        machine.torque = [0; JointId::COUNT];
+        let cleared = drive(&cfg, &mut machine).expect("the head engages once more");
+        assert_eq!(cleared.engage.degraded, JointSet::EMPTY);
+        assert_eq!(machine.enabled(), [true; JointId::COUNT]);
+    }
+
+    /// A position that comes back unplaceable is read again before it refuses.
+    ///
+    /// One corrupt frame is not a servo that has stopped reporting where it is,
+    /// and this sweep is the one standing between a wake word and the head
+    /// moving. Persistence still refuses: the pose is what everything else is
+    /// planned from.
+    #[test]
+    fn a_position_nobody_can_place_is_read_again_before_it_refuses() {
+        let cfg = provisioned_config();
+        let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
+        let spent = usize::try_from(PLACE_REREADS).expect("a small count");
+
+        // One bad frame each on three joints, counted rather than derived from
+        // the bound: a sweep that re-read nothing refuses on the first of them,
+        // and one whose count the landing reading does not reset refuses on the
+        // third. The allowance belongs to the joint being read.
+        for row in [2, 4, 6] {
+            machine.nan_reads[row] = 1;
+        }
+        machine.log.clear();
+        let posture = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect("a corrupt frame does not cost the sweep");
+        assert_eq!(posture.present.legs[3], machine.present.legs[3]);
+        for row in [2, 4, 6] {
+            assert_eq!(reads_of(&machine.log, SERVO_IDS[row]), 2, "servo row {row}");
+        }
+        assert_eq!(reads_of(&machine.log, SERVO_IDS[5]), 1, "a clean joint");
+
+        // One frame more than the sweep will re-read, and it refuses: a joint
+        // answering nothing placeable is not a pose to plan from.
+        machine.nan_reads[4] = spent + 1;
+        machine.log.clear();
+        let error = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect_err("a joint that keeps answering nothing placeable is refused");
+        let SeqError::UnplaceableAngle { joint, .. } = error else {
+            panic!("expected an unplaceable reading, got {error}");
+        };
+        assert_eq!(joint, JointId::Leg(3));
+        assert_eq!(reads_of(&machine.log, SERVO_IDS[4]), 1 + spent);
+    }
+
+    /// The settle sweep re-reads on the same terms, and for a sharper reason:
+    /// a refusal there is a machine already holding torque, taken straight back
+    /// off again over one bad frame.
+    #[test]
+    fn a_settle_frame_nobody_can_place_is_read_again() {
+        let cfg = provisioned_config();
+        let mut machine = bus();
+        let commission = commission(&cfg, &mut machine).expect("commissioning passes");
+        let posture = poll(&cfg, &mut machine, commission.rail, PollCadence::Positions)
+            .expect("the sweep reads");
+        machine.nan_reads[8] = 1;
+        machine.log.clear();
+        let summary = engage(&cfg, &mut machine, &posture)
+            .expect("a corrupt settle frame does not cost the engagement");
+        assert_eq!(
+            summary.armed.joints.antennas[1],
+            machine.present.antennas[1]
+        );
+        assert_eq!(reads_of(&machine.log, SERVO_IDS[8]), 2);
+        assert_eq!(machine.enabled(), [true; JointId::COUNT]);
+
+        // And persistence there still refuses, with the machine holding torque
+        // — the caller's release is what answers that, not the sweep.
+        machine.nan_reads[8] = usize::try_from(PLACE_REREADS).expect("a small count") + 1;
+        let error = engage(&cfg, &mut machine, &posture)
+            .expect_err("a joint that keeps answering nothing placeable is refused");
+        assert!(
+            matches!(
+                error,
+                SeqError::UnplaceableAngle {
+                    joint: JointId::AntennaLeft,
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 
     /// The slow cadence reads the rail itself; the fast one carries the last
