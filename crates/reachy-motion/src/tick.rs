@@ -44,10 +44,13 @@
 //! and a move out of a pose a hand or a crash left the machine in can span far
 //! more. [`floor_move_clock`] right-sizes such a move before it is commanded —
 //! it dry-samples the candidate path at the control rate and stretches
-//! whichever group clock cannot carry its own span inside the per-tick step
-//! bounds. Clocks are only ever lengthened, so the path is preserved exactly
-//! and merely traversed more slowly, which is the right degradation for a move
-//! whose only sin is starting further away than the knob assumed. The step
+//! whichever clock cannot carry its own span inside the per-tick step bounds.
+//! The head group, the right antenna and the left antenna are each judged and
+//! stretched on their own, so a pair of antennas deliberately staggered onto
+//! different clocks stays staggered. Clocks are only ever lengthened, so the
+//! path is preserved exactly and merely traversed more slowly, which is the
+//! right degradation for a move whose only sin is starting further away than
+//! the knob assumed. The step
 //! guard below is untouched by any of it and stays the backstop for genuine
 //! runaway bugs.
 //!
@@ -86,9 +89,7 @@ use reachy_kin::{
 use thiserror::Error;
 
 use crate::arm::ArmRecord;
-use crate::joints::{
-    JointGroup, JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint,
-};
+use crate::joints::{JointId, JointStep, JointTargets, JointVector, ServoHealth, worst_joint};
 use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 
 /// When a joint is far enough from its goal, for long enough, without closing
@@ -1127,27 +1128,29 @@ const MAX_DRY_SAMPLES: u32 = 100_000;
 pub struct ClockStretch {
     /// The durations the caller commanded.
     pub requested: MoveDurations,
-    /// The durations the move runs on instead: long enough, per group, to carry
+    /// The durations the move runs on instead: long enough, per clock, to carry
     /// the move's own span inside the per-tick step bounds.
     pub effective: MoveDurations,
 }
 
-/// The worst per-tick step one dry pass saw, per group clock, as a fraction of
-/// the bound that group is judged against.
+/// The worst per-tick step one dry pass saw, per clock, as a fraction of the
+/// bound the joints on that clock are judged against.
 ///
 /// At or under one is a clock that fits. The head clock drives the body yaw and
 /// the six legs, which are bounded separately and reduced together here because
-/// one duration governs them both.
+/// one duration governs them both; each antenna is its own clock and its own
+/// ratio, so a side asked for a clock too short for its arc stretches without
+/// dragging the other side out with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct StepRatios {
     head: f64,
-    antennas: f64,
+    antennas: [f64; 2],
 }
 
 impl StepRatios {
-    /// Whether both clocks carry their spans.
+    /// Whether every clock carries its span.
     fn fit(self) -> bool {
-        self.head <= 1.0 && self.antennas <= 1.0
+        self.head <= 1.0 && self.antennas.iter().all(|ratio| *ratio <= 1.0)
     }
 }
 
@@ -1229,13 +1232,16 @@ pub fn floor_move_clock(
     )
 }
 
-/// `durations` with each group that overran its bound scaled past it, and the
-/// group that did not left alone. `None` when the arithmetic leaves the range a
+/// `durations` with each clock that overran its bound scaled past it, and the
+/// clocks that did not left alone. `None` when the arithmetic leaves the range a
 /// duration can hold.
 fn stretched(durations: MoveDurations, ratios: StepRatios) -> Option<MoveDurations> {
     Some(MoveDurations {
         head: scale_past(durations.head, ratios.head)?,
-        antennas: scale_past(durations.antennas, ratios.antennas)?,
+        antennas: [
+            scale_past(durations.antennas[0], ratios.antennas[0])?,
+            scale_past(durations.antennas[1], ratios.antennas[1])?,
+        ],
     })
 }
 
@@ -1249,7 +1255,8 @@ fn scale_past(duration: Duration, ratio: f64) -> Option<Duration> {
 }
 
 /// The worst per-tick step the move from `start` to `target` would emit on
-/// `durations`, per group, as a fraction of that group's bound.
+/// `durations`, per clock, as a fraction of the bound its joints are judged
+/// against.
 ///
 /// `None` when the path cannot be measured at all: an unshapeable move, a
 /// sample the inverse kinematics has no answer for, a bound of zero, or a clock
@@ -1294,11 +1301,14 @@ fn worst_step_ratios(
             if !ratio.is_finite() {
                 return None;
             }
-            let group = match id.group() {
-                JointGroup::Antennas => &mut ratios.antennas,
-                JointGroup::BodyYaw | JointGroup::Legs => &mut ratios.head,
+            // Which clock this joint rides, not which group it belongs to: the
+            // two antennas share a bound and a group and nothing else here.
+            let clock = match id {
+                JointId::AntennaRight => &mut ratios.antennas[0],
+                JointId::AntennaLeft => &mut ratios.antennas[1],
+                JointId::BodyYaw | JointId::Leg(_) => &mut ratios.head,
             };
-            *group = group.max(ratio);
+            *clock = clock.max(ratio);
         }
         previous = candidate;
     }
@@ -1749,21 +1759,22 @@ mod tests {
     /// what a stretch lands on is [`duration_floor_s`] of the span it covers —
     /// within the margin the stretch adds and never under the floor itself.
     ///
-    /// Two independent clocks, checked one at a time: a yaw sweep leaves the
-    /// antenna clock alone and an antenna sweep leaves the head clock alone,
-    /// which is the whole point of the split.
+    /// Three independent clocks, checked one at a time: a yaw sweep leaves both
+    /// antenna clocks alone, and one antenna's sweep leaves the head clock and
+    /// the other antenna's alone, which is the whole point of the split.
     #[test]
     fn the_yaw_and_antenna_stretches_land_on_their_closed_forms() {
         let cfg = MotionConfig::default();
         let (state, _) = armed_at(&cfg, &JointTargets::default());
         let requested = MoveDurations {
             head: secs(0.5),
-            antennas: secs(0.3),
+            antennas: [secs(0.3), secs(0.35)],
         };
 
         let yaw_span = 1.0;
         let antenna_span = 3.0;
-        for (name, target, span, bound, group) in [
+        // `None` is the head clock; `Some(side)` is that antenna's own.
+        for (name, target, span, bound, clock) in [
             (
                 "yaw",
                 JointTargets {
@@ -1772,17 +1783,30 @@ mod tests {
                 },
                 yaw_span,
                 cfg.max_step.body_yaw,
-                JointGroup::BodyYaw,
+                None,
             ),
             (
-                "antenna",
+                "right antenna",
                 JointTargets {
                     antennas: [antenna_span, 0.0],
                     ..JointTargets::default()
                 },
                 antenna_span,
                 cfg.max_step.antennas,
-                JointGroup::Antennas,
+                Some(0),
+            ),
+            (
+                // Mirrored, so the arc is the direct one: the left antenna's
+                // outboard point sits where the right's does reflected, and a
+                // positive sweep this wide would be sent the long way round it.
+                "left antenna",
+                JointTargets {
+                    antennas: [0.0, -antenna_span],
+                    ..JointTargets::default()
+                },
+                antenna_span,
+                cfg.max_step.antennas,
+                Some(1),
             ),
         ] {
             let command = MotionCommand::MoveTo {
@@ -1795,21 +1819,9 @@ mod tests {
             let stretch = stretch.expect("the span does not fit the clock it was given");
 
             let floor = duration_floor_s(span, bound, FLOOR_TICK_HZ);
-            let antennas_moved = group == JointGroup::Antennas;
-            let (moved, asked, untouched, left) = if antennas_moved {
-                (
-                    stretch.effective.antennas,
-                    requested.antennas,
-                    stretch.effective.head,
-                    requested.head,
-                )
-            } else {
-                (
-                    stretch.effective.head,
-                    requested.head,
-                    stretch.effective.antennas,
-                    requested.antennas,
-                )
+            let (moved, asked) = match clock {
+                None => (stretch.effective.head, requested.head),
+                Some(side) => (stretch.effective.antennas[side], requested.antennas[side]),
             };
             assert!(
                 moved.as_secs_f64() >= floor,
@@ -1824,8 +1836,69 @@ mod tests {
                 moved > asked,
                 "{name}: {moved:?} is not longer than {asked:?}"
             );
-            assert_eq!(untouched, left, "{name}: the other group's clock moved");
+            if clock.is_some() {
+                assert_eq!(
+                    stretch.effective.head, requested.head,
+                    "{name}: the head clock moved"
+                );
+            }
+            for side in 0..requested.antennas.len() {
+                if clock != Some(side) {
+                    assert_eq!(
+                        stretch.effective.antennas[side], requested.antennas[side],
+                        "{name}: the other antenna's clock moved"
+                    );
+                }
+            }
         }
+    }
+
+    /// A move giving the two antennas different clocks is judged per side: the
+    /// side whose clock cannot carry its own arc is stretched, and the side
+    /// whose clock can is left exactly as asked. Staggering the pair — which is
+    /// what stops two inboard sweeps meeting at the crossing point — must not
+    /// collapse back onto one clock the first time one side is right-sized.
+    #[test]
+    fn one_antennas_short_clock_stretches_only_that_side() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &JointTargets::default());
+        // The right sweeps far on a short clock; the left barely moves on a
+        // shorter one and still fits.
+        let requested = MoveDurations {
+            head: secs(2.0),
+            antennas: [secs(0.3), secs(0.2)],
+        };
+        let command = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [3.0, 0.05],
+                ..JointTargets::default()
+            },
+            durations: requested,
+            warp: Warp::MinJerk,
+        };
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("the right antenna's arc does not fit its clock");
+        assert_eq!(stretch.requested, requested);
+        assert!(
+            stretch.effective.antennas[0] > requested.antennas[0],
+            "the right antenna's clock is {:?}",
+            stretch.effective.antennas[0]
+        );
+        assert_eq!(stretch.effective.antennas[1], requested.antennas[1]);
+        assert_eq!(stretch.effective.head, requested.head);
+        assert!(
+            stretch.effective.antennas[0] > stretch.effective.antennas[1],
+            "the two sides are still on different clocks"
+        );
+
+        // And the command handed on is the stretched one, unresolved target and
+        // all.
+        let MotionCommand::MoveTo { durations, .. } = floored else {
+            panic!("a stretched move is still a move");
+        };
+        assert_eq!(durations, stretch.effective);
     }
 
     /// The recovery this exists for: a body a hand spun to the half turn while
@@ -2079,7 +2152,7 @@ mod tests {
 
         let long_floor = duration_floor_s(long_arc, cfg.max_step.antennas, FLOOR_TICK_HZ);
         let short_floor = duration_floor_s(short_arc.abs(), cfg.max_step.antennas, FLOOR_TICK_HZ);
-        let moved = stretch.effective.antennas.as_secs_f64();
+        let moved = stretch.effective.antennas[0].as_secs_f64();
         assert!(
             moved >= long_floor,
             "stretched to {moved:.4} s, under the {long_floor:.4} s the long way round needs"

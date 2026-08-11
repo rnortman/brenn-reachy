@@ -13,13 +13,15 @@
 //! overran its period simply ask for the time it actually is instead of
 //! catching up.
 //!
-//! Shape: the same warp runs over two independent clocks, one per mechanical
-//! group. The head group — translation, rotation and body yaw, which the legs
-//! follow through the IK — shares one duration and stays in phase throughout;
-//! the antennas, which are free rotors bolted to the same skull and share
-//! nothing else with it, get their own. Both groups start together and each
-//! finishes on its own clock, so the head's lift is not floored by however long
-//! an antenna sweep takes. Rotation follows the geodesic between the two
+//! Shape: the same warp runs over independent clocks. The head group —
+//! translation, rotation and body yaw, which the legs follow through the IK —
+//! shares one duration and stays in phase throughout; each antenna, a free rotor
+//! bolted to the same skull and sharing nothing else with it, gets one of its
+//! own. Every clock starts together and each finishes on its own, so the head's
+//! lift is not floored by however long an antenna sweep takes, and the two
+//! antennas need not arrive together — a pair sweeping inboard on one clock
+//! reaches the point where their arcs cross in phase, and their tips can meet
+//! there instead of passing. Rotation follows the geodesic between the two
 //! orientations; translation and the scalars are straight lines.
 //!
 //! Two things this deliberately does differently from the vendor's open
@@ -86,36 +88,74 @@ pub enum TrajectoryError {
     NonFinite,
 }
 
-/// How long each mechanical group takes to cover its part of a move.
+/// How long each independently clocked part of a move takes to cover its span.
 ///
-/// Two clocks rather than one because the head and the antennas are
-/// mechanically independent: they share a skull and nothing else, and tying the
-/// head's lift to the antennas' sweep is an implementation detail's grip on the
-/// machine's behaviour, not a property of it.
+/// Three clocks rather than one because the head and the two antennas are
+/// mechanically independent: they share a skull and nothing else. Tying the
+/// head's lift to an antenna's sweep is an implementation detail's grip on the
+/// machine's behaviour, not a property of it, and tying the two antennas to each
+/// other puts their tips at the point where their inboard arcs cross at the same
+/// instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveDurations {
     /// The head pose and the body yaw, which the six legs follow through the
     /// IK.
     pub head: Duration,
-    /// Both antennas.
-    pub antennas: Duration,
+    /// Each antenna's own clock, right then left.
+    pub antennas: [Duration; 2],
 }
 
 impl MoveDurations {
-    /// Both groups on one clock — what a caller with nothing to say about the
+    /// Everything on one clock — what a caller with nothing to say about the
     /// antennas asks for.
     #[must_use]
     pub fn uniform(duration: Duration) -> Self {
         Self {
             head: duration,
-            antennas: duration,
+            antennas: [duration; 2],
         }
     }
 
-    /// The group clock that finishes last, which is when the move is over.
+    /// `head` for the head group and `antennas` for both antennas.
+    ///
+    /// Test-only. A configuration resolves antenna clocks through
+    /// [`Self::resolved`], and a caller with nothing to say about the antennas
+    /// asks for [`Self::uniform`]; what this shape is good for is a case that
+    /// wants one clock for the head and another for the pair, said in one line.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn split(head: Duration, antennas: Duration) -> Self {
+        Self {
+            head,
+            antennas: [antennas; 2],
+        }
+    }
+
+    /// `head` for the head group, with each antenna taking the first clock a
+    /// configuration states for it: its own, then `shared`, then the head's.
+    ///
+    /// The fallback chain lives here because more than one configuration
+    /// resolves it — the bench's file and the daemon's — and two hand-written
+    /// copies of it would be free to disagree about what a file naming one
+    /// antenna key means for the other side. The clocks this returns are what
+    /// the pair's stagger is, so a divergence here is a divergence in how the
+    /// two tips pass each other.
+    #[must_use]
+    pub fn resolved(
+        head: Duration,
+        shared: Option<Duration>,
+        sides: [Option<Duration>; 2],
+    ) -> Self {
+        Self {
+            head,
+            antennas: sides.map(|side| side.or(shared).unwrap_or(head)),
+        }
+    }
+
+    /// The clock that finishes last, which is when the move is over.
     #[must_use]
     pub fn longest(self) -> Duration {
-        self.head.max(self.antennas)
+        self.head.max(self.antennas[0]).max(self.antennas[1])
     }
 }
 
@@ -125,7 +165,7 @@ pub struct Trajectory {
     start: JointTargets,
     target: JointTargets,
     head_s: f64,
-    antennas_s: f64,
+    antennas_s: [f64; 2],
     warp: Warp,
     /// The geodesic from the start orientation to the target one, as a rotation
     /// vector in the *start's* frame. Precomputed: it costs a square root and
@@ -134,11 +174,11 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
-    /// Shape a move from `start` to `target`, each group over its own duration.
+    /// Shape a move from `start` to `target`, each clock over its own duration.
     ///
     /// # Errors
     ///
-    /// [`TrajectoryError::NonPositiveDuration`] if either group's duration is
+    /// [`TrajectoryError::NonPositiveDuration`] if any clock's duration is
     /// zero, and [`TrajectoryError::NonFinite`] if either endpoint carries a
     /// non-finite number.
     pub fn new(
@@ -147,7 +187,7 @@ impl Trajectory {
         durations: MoveDurations,
         warp: Warp,
     ) -> Result<Self, TrajectoryError> {
-        if durations.head.is_zero() || durations.antennas.is_zero() {
+        if durations.head.is_zero() || durations.antennas.iter().any(Duration::is_zero) {
             return Err(TrajectoryError::NonPositiveDuration);
         }
         if !start.is_finite() || !target.is_finite() {
@@ -160,7 +200,7 @@ impl Trajectory {
             start: *start,
             target: *target,
             head_s: durations.head.as_secs_f64(),
-            antennas_s: durations.antennas.as_secs_f64(),
+            antennas_s: durations.antennas.map(|d| d.as_secs_f64()),
             warp,
             rotvec_rel: relative.scaled_axis(),
         })
@@ -178,12 +218,12 @@ impl Trajectory {
         &self.start
     }
 
-    /// The path's per-group durations.
+    /// The path's per-clock durations.
     #[must_use]
     pub fn durations(&self) -> MoveDurations {
         MoveDurations {
             head: Duration::from_secs_f64(self.head_s),
-            antennas: Duration::from_secs_f64(self.antennas_s),
+            antennas: self.antennas_s.map(Duration::from_secs_f64),
         }
     }
 
@@ -193,19 +233,19 @@ impl Trajectory {
         self.warp
     }
 
-    /// Whether `t` is at or past the end of both groups' clocks.
+    /// Whether `t` is at or past the end of every clock.
     #[must_use]
     pub fn done(&self, t: Duration) -> bool {
         let secs = t.as_secs_f64();
-        secs >= self.head_s && secs >= self.antennas_s
+        secs >= self.head_s && self.antennas_s.iter().all(|end| secs >= *end)
     }
 
     /// The command set at elapsed time `t`, written into `out`.
     ///
-    /// At or past a group's duration that group is the target's own bits, so a
-    /// move that ran to completion commands exactly what was asked for and a
-    /// subsequent move chains from it without a step. The group that finishes
-    /// first sits at its target while the other carries on.
+    /// At or past a clock's duration what that clock drives is the target's own
+    /// bits, so a move that ran to completion commands exactly what was asked
+    /// for and a subsequent move chains from it without a step. Whatever
+    /// finishes first sits at its target while the rest carries on.
     pub fn sample(&self, t: Duration, out: &mut JointTargets) {
         let secs = t.as_secs_f64();
 
@@ -224,18 +264,18 @@ impl Trajectory {
             out.body_yaw = lerp(self.start.body_yaw, self.target.body_yaw, s);
         }
 
-        if secs >= self.antennas_s {
-            out.antennas = self.target.antennas;
-        } else {
-            let s = self.progress(secs, self.antennas_s);
-            out.antennas = [
-                lerp(self.start.antennas[0], self.target.antennas[0], s),
-                lerp(self.start.antennas[1], self.target.antennas[1], s),
-            ];
+        for side in 0..out.antennas.len() {
+            let end = self.antennas_s[side];
+            out.antennas[side] = if secs >= end {
+                self.target.antennas[side]
+            } else {
+                let s = self.progress(secs, end);
+                lerp(self.start.antennas[side], self.target.antennas[side], s)
+            };
         }
     }
 
-    /// Warped progress at `secs` on a group clock of `duration_s`.
+    /// Warped progress at `secs` on a clock of `duration_s`.
     ///
     /// The caller has already excluded the upper end, so the cap covers the
     /// rounding in the division alone, and it is on elapsed time, never on a
@@ -341,21 +381,23 @@ mod tests {
         assert_eq!(bits(&resumed), bits(&landed));
     }
 
-    /// Either group's clock at zero is refused, not just both: a head duration
-    /// of zero with a live antenna clock would divide by it on the first sample
-    /// of the group nobody was thinking about.
+    /// Any one clock at zero is refused, not just all of them: a head duration
+    /// of zero with live antenna clocks would divide by it on the first sample
+    /// of the group nobody was thinking about, and so would one antenna's.
     #[test]
     fn zero_duration_is_refused() {
         let (a, b) = (neutral(), stow());
         for durations in [
             MoveDurations::uniform(Duration::ZERO),
+            MoveDurations::split(Duration::ZERO, secs(1.0)),
+            MoveDurations::split(secs(1.0), Duration::ZERO),
             MoveDurations {
-                head: Duration::ZERO,
-                antennas: secs(1.0),
+                head: secs(1.0),
+                antennas: [Duration::ZERO, secs(1.0)],
             },
             MoveDurations {
                 head: secs(1.0),
-                antennas: Duration::ZERO,
+                antennas: [secs(1.0), Duration::ZERO],
             },
         ] {
             assert_eq!(
@@ -616,7 +658,7 @@ mod tests {
         let (a, b) = (neutral(), stow());
         let durations = MoveDurations {
             head: secs(3.5),
-            antennas: secs(1.25),
+            antennas: [secs(1.25), secs(0.75)],
         };
         let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
         assert_eq!(bits(traj.start()), bits(&a));
@@ -626,16 +668,13 @@ mod tests {
         assert_eq!(traj.warp(), Warp::Linear);
     }
 
-    /// The two clocks are independent: at any sample the head group's progress
-    /// is read off its own duration and the antennas' off theirs. This is the
-    /// whole point of the split — a lift that no longer waits on a sweep.
+    /// The clocks are independent: at any sample the head group's progress is
+    /// read off its own duration and the antennas' off theirs. This is the whole
+    /// point of the split — a lift that no longer waits on a sweep.
     #[test]
     fn group_clocks_run_independently() {
         let (a, b) = (neutral(), stow());
-        let durations = MoveDurations {
-            head: secs(1.0),
-            antennas: secs(4.0),
-        };
+        let durations = MoveDurations::split(secs(1.0), secs(4.0));
         let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
 
         let mut out = JointTargets::default();
@@ -660,10 +699,7 @@ mod tests {
     #[test]
     fn the_short_group_waits_at_its_target() {
         let (a, b) = (neutral(), stow());
-        let durations = MoveDurations {
-            head: secs(1.0),
-            antennas: secs(4.0),
-        };
+        let durations = MoveDurations::split(secs(1.0), secs(4.0));
         let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
 
         let mut out = JointTargets::default();
@@ -692,10 +728,7 @@ mod tests {
     #[test]
     fn either_group_may_be_the_shorter_one() {
         let (a, b) = (neutral(), stow());
-        let durations = MoveDurations {
-            head: secs(3.0),
-            antennas: secs(0.5),
-        };
+        let durations = MoveDurations::split(secs(3.0), secs(0.5));
         let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
 
         let mut out = JointTargets::default();
@@ -706,6 +739,122 @@ mod tests {
         assert!(
             (out.head_pose_body.translation.vector.z - b.head_pose_body.translation.vector.z).abs()
                 > 1e-6
+        );
+    }
+
+    /// Each antenna reads its progress off its own clock. Two inboard arcs on
+    /// one clock put both tips at the crossing point at the same instant; two
+    /// clocks a tenth of a second apart put one there first, which is the whole
+    /// reason each side carries a duration.
+    #[test]
+    fn each_antenna_runs_on_its_own_clock() {
+        let a = neutral();
+        let mut b = neutral();
+        b.antennas = [2.0, -2.0];
+        let durations = MoveDurations {
+            head: secs(1.0),
+            antennas: [secs(0.8), secs(0.7)],
+        };
+        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
+
+        let mut out = JointTargets::default();
+        for step in 1..7 {
+            let t = f64::from(step) / 10.0;
+            traj.sample(secs(t), &mut out);
+            let right = out.antennas[0] / b.antennas[0];
+            let left = out.antennas[1] / b.antennas[1];
+            assert!((right - t / 0.8).abs() < 1e-12, "right at {t}s: {right}");
+            assert!((left - t / 0.7).abs() < 1e-12, "left at {t}s: {left}");
+        }
+
+        // The faster side lands and waits while the slower one is still
+        // travelling, and the move is over when the last clock is.
+        traj.sample(secs(0.7), &mut out);
+        assert_eq!(out.antennas[1].to_bits(), b.antennas[1].to_bits());
+        assert!((out.antennas[0] - b.antennas[0]).abs() > 1e-6);
+        assert!(!traj.done(secs(0.7)));
+        assert!(!traj.done(secs(0.8)), "the head clock still has 0.2 s");
+        assert!(traj.done(secs(1.0)));
+        traj.sample(secs(1.0), &mut out);
+        assert_eq!(bits(&out), bits(&b));
+    }
+
+    /// The longest clock is the move's, whichever of the three it is.
+    #[test]
+    fn the_longest_clock_is_any_of_the_three() {
+        assert_eq!(
+            MoveDurations {
+                head: secs(2.0),
+                antennas: [secs(0.8), secs(0.7)],
+            }
+            .longest(),
+            secs(2.0)
+        );
+        assert_eq!(
+            MoveDurations {
+                head: secs(0.5),
+                antennas: [secs(0.8), secs(0.7)],
+            }
+            .longest(),
+            secs(0.8)
+        );
+        assert_eq!(
+            MoveDurations {
+                head: secs(0.5),
+                antennas: [secs(0.7), secs(0.9)],
+            }
+            .longest(),
+            secs(0.9)
+        );
+        assert_eq!(MoveDurations::uniform(secs(1.5)).longest(), secs(1.5));
+        assert_eq!(
+            MoveDurations::split(secs(1.5), secs(0.5)),
+            MoveDurations {
+                head: secs(1.5),
+                antennas: [secs(0.5); 2],
+            }
+        );
+    }
+
+    /// Each side resolves its clock independently, and a side that states
+    /// nothing takes the shared clock, then the head's.
+    ///
+    /// All four combinations, because this is the one function every
+    /// configuration in this workspace resolves antenna clocks through: a side
+    /// that quietly took the other side's key would collapse a staggered pair
+    /// to one clock, which is the arrangement that puts the two tips at their
+    /// crossing point together.
+    #[test]
+    fn each_antenna_takes_its_own_clock_then_the_shared_one_then_the_head() {
+        let head = secs(2.0);
+        assert_eq!(
+            MoveDurations::resolved(head, None, [None, None]),
+            MoveDurations::uniform(head)
+        );
+        assert_eq!(
+            MoveDurations::resolved(head, Some(secs(1.5)), [None, None]),
+            MoveDurations::split(head, secs(1.5))
+        );
+        assert_eq!(
+            MoveDurations::resolved(head, Some(secs(1.5)), [Some(secs(0.7)), None]),
+            MoveDurations {
+                head,
+                antennas: [secs(0.7), secs(1.5)],
+            }
+        );
+        assert_eq!(
+            MoveDurations::resolved(head, None, [Some(secs(0.7)), Some(secs(0.3))]),
+            MoveDurations {
+                head,
+                antennas: [secs(0.7), secs(0.3)],
+            }
+        );
+        assert_eq!(
+            MoveDurations::resolved(head, Some(secs(1.5)), [None, Some(secs(0.3))]),
+            MoveDurations {
+                head,
+                antennas: [secs(1.5), secs(0.3)],
+            }
         );
     }
 }

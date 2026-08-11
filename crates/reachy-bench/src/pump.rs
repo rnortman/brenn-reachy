@@ -59,6 +59,22 @@
 //! head late by a whole move — and the stall budget follows the replacement, so
 //! being steered is never mistaken for hanging.
 //!
+//! A run does not end when the trajectory does. The last goal going out says
+//! only that commanding is over; the machine is still on its way there, and on
+//! a move whose commanded clock is shorter than the machine's own response that
+//! gap is most of the motion. So the loop keeps turning — reading every period,
+//! commanding nothing — until every joint is measured within the settle
+//! tolerance of the goal it was left on, and the summary carries both instants
+//! so the gap is visible. A joint that never arrives ends the run at the window
+//! and is named: an outcome and not a fault, because nothing here may gate or
+//! delay what a caller does about torque.
+//!
+//! A run can also record itself: [`MotionPump::record_trace`] keeps one
+//! [`TickSample`] per period — the nine measured angles and the nine goals they
+//! were measured against — which is the whole velocity profile of a move at the
+//! rate it was actually sampled at. Off by default, so an ordinary run still
+//! allocates nothing while it turns.
+//!
 //! Neither grouped read goes absent quietly. The first miss of a run names the
 //! servos that fell short and what each did instead, so a bench session
 //! diagnoses one flaky servo from the run it is already having rather than from
@@ -122,6 +138,15 @@ const STALL_MARGIN_SECS: u64 = 5;
 /// the period's budget is gone to matter; the worst lateness seen is recorded
 /// separately whatever its size, so the jitter itself is not lost.
 const OVERRUN_DIVISOR: u32 = 2;
+
+/// How many periods of trace one run may record before recording stops.
+///
+/// A ceiling and not a target: a bench move records a few hundred samples and a
+/// long hold a few thousand, while a run steered by a caller that keeps
+/// retargeting has no length of its own at all. At the bench's fifty hertz this
+/// is forty minutes of motion and a few tens of megabytes, which is far past
+/// any run worth reading and well short of a host running out of memory.
+const MAX_TRACE_SAMPLES: usize = 120_000;
 
 /// Bus order covers the nine joints, so a row lookup here cannot miss.
 ///
@@ -258,6 +283,63 @@ pub enum PumpError {
         id: u8,
     },
 
+    /// A command was asked for a servo the configured roster does not carry.
+    /// Whatever holds that ID is not one of this machine's nine joints, so it
+    /// is refused by name rather than skipped or addressed anyway.
+    #[error("servo {id} is not in the configured roster {roster:?}")]
+    OffRoster {
+        /// The ID asked for.
+        id: u8,
+        /// The servos the configuration carries, in bus order.
+        roster: [u8; JointId::COUNT],
+    },
+
+    /// A rebooted servo never answered again within the budget it was given.
+    /// Nothing on the reboot path holds torque, so nothing is released in
+    /// response: this is a report, and the servo is either still restarting or
+    /// gone.
+    #[error("servo {id} answered none of {polls} pings over {waited:?} after its reboot: {source}")]
+    NotBack {
+        /// The servo that stayed silent.
+        id: u8,
+        /// Pings it was asked.
+        polls: u32,
+        /// How long those pings took.
+        waited: Duration,
+        /// What the last of them failed with.
+        source: XactError,
+    },
+
+    /// A rebooted servo answered again but came back still holding torque, so
+    /// it never restarted: the instruction was lost on the wire, or refused.
+    /// Nothing on the reboot path enables torque, so this is torque the servo
+    /// held all along and the reboot did not take — reported rather than
+    /// written off, because the command's whole promise is that what it reaches
+    /// lets go.
+    #[error("servo {id} answered after its reboot still holding torque, so it did not restart")]
+    NotRestarted {
+        /// The servo that kept its torque.
+        id: u8,
+    },
+
+    /// A servo neither acknowledged its reboot nor came back with torque to
+    /// drop, so nothing observed says it restarted. The case is a machine
+    /// already limp — which is what a latched shutdown leaves, and the state an
+    /// operator reaches for `reboot` in: a servo that never took the
+    /// instruction answers pings exactly as one that did, and the torque that
+    /// tells them apart was already off. Reported rather than passed, because
+    /// the alternative is a success line over a latch that is still set.
+    #[error(
+        "servo {id} did not acknowledge its reboot and came back holding nothing, so no reading \
+         says it restarted: {source}"
+    )]
+    RestartUnconfirmed {
+        /// The servo whose restart could not be established.
+        id: u8,
+        /// What its reboot instruction failed with.
+        source: XactError,
+    },
+
     /// The sequence neither finished nor failed within its action budget — the
     /// supply gate's configured polling, plus the fixed phases.
     #[error("the sequence took more than {budget} actions without finishing")]
@@ -293,6 +375,20 @@ pub enum PumpError {
         tick_hz: u32,
         /// Health sweeps per second.
         health_poll_hz: u32,
+    },
+
+    /// A settle policy no comparison can be made against: a tolerance that is
+    /// not a positive number, or a window of no time at all. Configuration
+    /// refuses both, so reaching this means a caller built a pump by hand.
+    #[error(
+        "a settle tolerance must be a positive number of radians and its window a positive \
+         duration: {tolerance} rad over {timeout:?}"
+    )]
+    Settle {
+        /// How far a joint may be from its goal and still count as arrived.
+        tolerance: f64,
+        /// How long arrival is waited for.
+        timeout: Duration,
     },
 }
 
@@ -771,8 +867,33 @@ pub enum TickEvent {
     /// to fit before the move was commanded. Emitted for the command that
     /// starts a run and for every replacement that retargets one.
     Stretched(ClockStretch),
-    /// The move reached its endpoint.
+    /// The trajectory reached its endpoint: the last goal has gone out and
+    /// nothing further will be commanded. Where the machine physically is at
+    /// this moment is a separate question, answered by [`Self::Settled`].
     Completed,
+    /// Every joint has been measured within the settle tolerance of the goal it
+    /// was left on, this long after commanding finished.
+    Settled {
+        /// The gap between commanding finishing and the machine arriving.
+        after: Duration,
+    },
+    /// The settle window ran out with a joint still outside the tolerance. A
+    /// report and not a fault: the run ends saying where the machine actually
+    /// got to.
+    Unsettled {
+        /// The joint furthest from its goal when the window ran out.
+        joint: JointId,
+        /// How far out it was, radians.
+        error: f64,
+        /// The window that ran out.
+        waited: Duration,
+    },
+    /// The per-period trace filled its buffer and recording stopped. The
+    /// periods themselves carry on unaffected.
+    TraceFull {
+        /// How many periods were recorded before it stopped.
+        samples: usize,
+    },
     /// The tick stopped commanding.
     Faulted(Fault),
 }
@@ -812,15 +933,35 @@ impl fmt::Display for TickEvent {
             Self::Stretched(stretch) => {
                 write!(
                     f,
-                    "clock stretched to fit the span: head {:.3} s to {:.3} s, antennas {:.3} s \
-                     to {:.3} s",
+                    "clock stretched to fit the span: head {:.3} s to {:.3} s, right antenna \
+                     {:.3} s to {:.3} s, left antenna {:.3} s to {:.3} s",
                     stretch.requested.head.as_secs_f64(),
                     stretch.effective.head.as_secs_f64(),
-                    stretch.requested.antennas.as_secs_f64(),
-                    stretch.effective.antennas.as_secs_f64(),
+                    stretch.requested.antennas[0].as_secs_f64(),
+                    stretch.effective.antennas[0].as_secs_f64(),
+                    stretch.requested.antennas[1].as_secs_f64(),
+                    stretch.effective.antennas[1].as_secs_f64(),
                 )
             }
-            Self::Completed => f.write_str("at the target"),
+            Self::Completed => f.write_str("commanding finished"),
+            Self::Settled { after } => write!(
+                f,
+                "measurably at the goal, {:.2} s after commanding finished",
+                after.as_secs_f64()
+            ),
+            Self::Unsettled {
+                joint,
+                error,
+                waited,
+            } => write!(
+                f,
+                "{:.2} s after commanding finished {joint} is still {:.2}° from its goal",
+                waited.as_secs_f64(),
+                error.to_degrees()
+            ),
+            Self::TraceFull { samples } => {
+                write!(f, "trace buffer full at {samples} period(s); not recording")
+            }
             Self::Faulted(fault) => write!(f, "faulted: {fault}"),
         }
     }
@@ -862,6 +1003,65 @@ pub struct MoveSummary {
     pub worst_lag: [f64; JointId::COUNT],
     /// Wall time from the first period to the last.
     pub elapsed: Duration,
+    /// When the trajectory stopped commanding — the first period that found the
+    /// machine holding — from the run's first period.
+    ///
+    /// `None` for a run that never got there, and for a timed hold, which
+    /// commands nothing and so has no such instant.
+    pub commanded: Option<Duration>,
+    /// When every joint was first measured within the settle tolerance of the
+    /// goal it was left on, from the run's first period.
+    ///
+    /// The instant the machine physically arrived, as against
+    /// [`commanded`](Self::commanded), which is when the last goal went out. The
+    /// gap between them is the settle, and on a move whose clock is shorter than
+    /// the machine's own response it is most of the motion.
+    pub settled: Option<Duration>,
+    /// The joint furthest from its goal when the settle window ran out, and how
+    /// far out it was in radians. `None` unless the window ran out.
+    pub unsettled: Option<(JointId, f64)>,
+}
+
+/// How close the machine has to be measured to the goals it was left on before
+/// a run is over, and how long that is waited for.
+///
+/// The tolerance answers a different question from the tick's tracking
+/// threshold, which is why it is a separate and much tighter figure: tracking
+/// asks whether the position loop is keeping up with a *moving* goal, this asks
+/// where the machine physically came to rest once the goal stopped moving.
+///
+/// The window is bounded because a joint that never arrives — a stalled motor,
+/// an antenna held by hand — must end the run with that reported rather than
+/// leave the loop turning. Running out is an outcome, not a fault: nothing here
+/// gates or delays what a caller does about torque.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettleConfig {
+    /// How far a joint may be from its goal and still count as arrived,
+    /// radians.
+    pub tolerance: f64,
+    /// How long after commanding finished arrival is waited for.
+    pub timeout: Duration,
+}
+
+/// One control period as it was measured, for the trace a run can record.
+///
+/// Both halves of the period are here because a velocity profile is only
+/// readable against what was asked for: the measured angles, and the goals the
+/// servos were holding when those angles were read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TickSample {
+    /// Periods since the run's first, counted from zero.
+    pub tick: u64,
+    /// When the period began, on the run's own epoch.
+    pub at: Duration,
+    /// The nine measured angles, or `None` for a period whose grouped read fell
+    /// short.
+    pub present: Option<JointVector>,
+    /// The nine goals the servos were holding when this period read them.
+    pub goal: JointVector,
+    /// Whether commanding had already finished and the period was one of those
+    /// spent waiting for the machine to arrive.
+    pub settling: bool,
 }
 
 /// What ends a run of the fixed-rate loop.
@@ -898,11 +1098,24 @@ pub struct MotionPump<'a> {
     period: Duration,
     health_every: u64,
     stall_margin: u64,
+    settle: SettleConfig,
     written: JointVector,
     outputs: TickOutputs,
     present: SyncReadOutcome,
     health: SyncReadOutcome,
     summary: MoveSummary,
+    /// Whether a run records a sample per period. Off unless a caller asked,
+    /// because the loop otherwise allocates nothing while it runs.
+    tracing: bool,
+    /// The last run's per-period samples, oldest first.
+    trace: Vec<TickSample>,
+    /// How many samples one run may keep before recording stops.
+    /// [`MAX_TRACE_SAMPLES`] unless a test wound it down: a ceiling only
+    /// reachable after forty minutes of motion is a ceiling no test can drive
+    /// the loop to.
+    max_samples: usize,
+    /// Whether this run has already said the buffer filled.
+    trace_full: bool,
 }
 
 impl<'a> MotionPump<'a> {
@@ -917,11 +1130,23 @@ impl<'a> MotionPump<'a> {
         tick_hz: u32,
         health_poll_hz: u32,
         held: JointVector,
+        settle: SettleConfig,
     ) -> Result<Self, PumpError> {
         if tick_hz == 0 || health_poll_hz == 0 {
             return Err(PumpError::Rate {
                 tick_hz,
                 health_poll_hz,
+            });
+        }
+        // An unplaceable tolerance is refused with the rest: an infinite one
+        // makes every joint arrive the instant commanding stops, and a
+        // comparison against a NaN answers false for every joint, so no run
+        // would ever arrive at all.
+        let comparable = settle.tolerance.is_finite() && settle.tolerance > 0.0;
+        if !comparable || settle.timeout.is_zero() {
+            return Err(PumpError::Settle {
+                tolerance: settle.tolerance,
+                timeout: settle.timeout,
             });
         }
         Ok(Self {
@@ -933,12 +1158,45 @@ impl<'a> MotionPump<'a> {
             // tick rate polls every period.
             health_every: u64::from((tick_hz / health_poll_hz).max(1)),
             stall_margin: u64::from(tick_hz) * STALL_MARGIN_SECS,
+            settle,
             written: held,
             outputs: TickOutputs::default(),
             present: SyncReadOutcome::new(),
             health: SyncReadOutcome::new(),
             summary: MoveSummary::default(),
+            tracing: false,
+            trace: Vec::new(),
+            max_samples: MAX_TRACE_SAMPLES,
+            trace_full: false,
         })
+    }
+
+    /// Wind the trace buffer's ceiling down to `samples`, for a test that has
+    /// to reach it.
+    #[cfg(test)]
+    fn trace_ceiling(&mut self, samples: usize) {
+        self.max_samples = samples;
+    }
+
+    /// Record a sample per control period from the next run onward, or stop.
+    ///
+    /// Off by default: a run that records nothing allocates nothing per period,
+    /// and the trace exists for the diagnostic question — where the machine
+    /// actually was, period by period — rather than for routine operation.
+    pub fn record_trace(&mut self, on: bool) {
+        self.tracing = on;
+        if !on {
+            self.trace = Vec::new();
+        }
+    }
+
+    /// The last run's per-period samples, oldest first.
+    ///
+    /// Empty when the run was not recorded. Cleared at the start of every run,
+    /// like the summary: this is never the previous run's motion.
+    #[must_use]
+    pub fn last_trace(&self) -> &[TickSample] {
+        &self.trace
     }
 
     /// The control period.
@@ -1004,12 +1262,101 @@ impl<'a> MotionPump<'a> {
             .saturating_add(self.stall_margin)
     }
 
+    /// How many periods the settle window spans, and one more so the period
+    /// that finds the window over is inside the budget rather than outside it.
+    ///
+    /// Without this a settle would be spent out of the move's own stall budget
+    /// and a machine that took its time arriving would be reported as a loop
+    /// that hung.
+    fn settle_periods(&self) -> u64 {
+        let periods = self
+            .settle
+            .timeout
+            .as_nanos()
+            .div_ceil(self.period.as_nanos());
+        u64::try_from(periods).unwrap_or(u64::MAX).saturating_add(1)
+    }
+
+    /// The joint furthest outside the settle tolerance of the goal it was last
+    /// written, and how far out it is — or nothing, when every joint is inside
+    /// it and the machine has measurably arrived.
+    ///
+    /// An error that will not compare — a joint whose measurement or goal is
+    /// unplaceable — is outside every tolerance there is, which is what the
+    /// negated comparison says.
+    fn straying(&self, present: &JointVector) -> Option<(JointId, f64)> {
+        let mut worst: Option<(JointId, f64)> = None;
+        for ((joint, angle), (_, goal)) in present.joints().into_iter().zip(self.written.joints()) {
+            let error = (angle - goal).abs();
+            if error <= self.settle.tolerance {
+                continue;
+            }
+            if worst.is_none_or(|(_, out)| error > out) {
+                worst = Some((joint, error));
+            }
+        }
+        worst
+    }
+
+    /// Ready the trace buffer for a run of at most `budget` periods.
+    ///
+    /// The whole run's room is taken here rather than grown period by period,
+    /// so a recorded run allocates no more often than an unrecorded one — which
+    /// allocates not at all.
+    fn start_trace(&mut self, budget: u64) {
+        self.trace.clear();
+        self.trace_full = false;
+        if !self.tracing {
+            return;
+        }
+        let wanted = usize::try_from(budget).unwrap_or(self.max_samples);
+        self.trace.reserve(wanted.min(self.max_samples));
+    }
+
+    /// Keep this period's measurement, if the run is being recorded.
+    ///
+    /// The buffer's ceiling is announced once, on the period that reaches it:
+    /// a trace that stops halfway through a run is a fact about the trace and
+    /// says nothing about the machine, so the periods carry on either way.
+    fn record(
+        &mut self,
+        tick: u64,
+        at: Duration,
+        present: Option<&JointVector>,
+        goal: JointVector,
+        settling: bool,
+        event: &mut dyn FnMut(TickEvent),
+    ) {
+        if !self.tracing {
+            return;
+        }
+        if self.trace.len() >= self.max_samples {
+            if !self.trace_full {
+                self.trace_full = true;
+                event(TickEvent::TraceFull {
+                    samples: self.trace.len(),
+                });
+            }
+            return;
+        }
+        self.trace.push(TickSample {
+            tick,
+            at,
+            present: present.copied(),
+            goal,
+            settling,
+        });
+    }
+
     /// Run `command` to completion.
     ///
-    /// Returns when the machine is holding again — the move reached its
-    /// endpoint, or the command was a hold — and refuses on anything else: a
-    /// refused command, a fault, a transaction that is not a machine verdict.
-    /// Nothing here touches torque on the way out, whichever exit is taken.
+    /// Returns when the machine has measurably arrived — the trajectory
+    /// finished commanding and every joint has since been read within the
+    /// settle tolerance of its goal — or when the settle window ran out with a
+    /// joint still short of it, which comes back as a summary saying so rather
+    /// than as an error. It refuses on anything else: a refused command, a
+    /// fault, a transaction that is not a machine verdict. Nothing here touches
+    /// torque on the way out, whichever exit is taken.
     pub fn run<P: BusPort>(
         &mut self,
         bus: &mut Bus<P>,
@@ -1037,9 +1384,13 @@ impl<'a> MotionPump<'a> {
     /// pending, and answering `Some` replaces the move in flight: the tick
     /// shapes the new path from the setpoint the previous period commanded, so
     /// nothing jumps and the machine never stops on the way. The run then ends
-    /// when the *replacement* reaches its endpoint, and the stall budget is
-    /// re-sized to the replacement's own travel — a caller changing its mind is
-    /// not a loop that hung.
+    /// when the *replacement* has been carried and arrived at, and the stall
+    /// budget is re-sized to the replacement's own travel — a caller changing
+    /// its mind is not a loop that hung.
+    ///
+    /// `retarget` is asked during the settle too, so a caller is never made to
+    /// wait out an arrival it has already changed its mind about; a replacement
+    /// taken there puts the run back to commanding.
     ///
     /// [`MotionPump::run`] is this with nothing to say. Two entry points for the
     /// same reason [`MotionPump::hold`] has two: a bench move is commanded once
@@ -1117,6 +1468,11 @@ impl<'a> MotionPump<'a> {
         // after a command refused on the accepting period — which ends the run
         // before any of it was measured — gets zeros.
         self.summary = MoveSummary::default();
+        self.start_trace(budget);
+        // When commanding finished, on the run's epoch. `Some` puts the run in
+        // its settle phase: the periods after the last goal, which command
+        // nothing and read every one of them.
+        let mut commanded_at: Option<Duration> = None;
         let mut summary = MoveSummary::default();
         let mut last_misses = 0;
         let mut health_misses: u32 = 0;
@@ -1150,6 +1506,13 @@ impl<'a> MotionPump<'a> {
                 // its mind is doing exactly what this entry point is for.
                 budget = tick.saturating_add(self.stall_budget(&replacement));
                 pending = Some(replacement);
+                // A run in its settle phase is commanding again, so what it had
+                // measured about arriving is about a goal that is no longer the
+                // one it is heading for.
+                commanded_at = None;
+                summary.commanded = None;
+                summary.settled = None;
+                summary.unsettled = None;
             }
             let now = clock.now();
             // A period that starts materially after it was due is one the loop
@@ -1217,10 +1580,23 @@ impl<'a> MotionPump<'a> {
             let asked = pending.take().is_some();
             summary.ticks += 1;
 
+            // What the servos were holding while this period's read was taken,
+            // which is the goal that measurement belongs against. Captured
+            // before the write, because the write is this period's answer to it.
+            let held = self.written;
+            let elapsed = now.saturating_sub(epoch);
+            // The period that finished commanding is a commanding period: it
+            // put the last goal out. The ones after it are the settle.
+            let settling = commanded_at.is_some_and(|since| since < elapsed);
             if let Some(goal) = self.outputs.goal {
                 match self.write_goals(bus, &goal) {
                     Ok(frames) => summary.frames += frames,
                     Err(error) => {
+                        // Kept before the break, like every other period the
+                        // run counted: the trace is a sample per period turned,
+                        // and the period a run ends badly on is the one a reader
+                        // came for.
+                        self.record(tick, elapsed, present.as_ref(), held, settling, event);
                         ending = Some(Err(error));
                         break;
                     }
@@ -1259,6 +1635,10 @@ impl<'a> MotionPump<'a> {
             }
             if let Some(fault) = report.fault {
                 event(TickEvent::Faulted(fault));
+                // The measurement that crossed the line, kept: for a tracking
+                // fault this period is the whole diagnosis, and a trace ending
+                // one period short of it says nothing about why.
+                self.record(tick, elapsed, present.as_ref(), held, settling, event);
                 ending = Some(Err(PumpError::Fault(fault)));
                 break;
             }
@@ -1266,9 +1646,43 @@ impl<'a> MotionPump<'a> {
                 event(TickEvent::Completed);
             }
             let over = match until {
-                Until::Holding { .. } => matches!(state.mode(), Mode::Holding),
-                Until::Elapsed(dwell) => now.saturating_sub(epoch) >= dwell,
+                Until::Holding { .. } if matches!(state.mode(), Mode::Holding) => {
+                    // The first such period is where commanding ended; the ones
+                    // after it are the settle, and they command nothing.
+                    let since = *commanded_at.get_or_insert_with(|| {
+                        summary.commanded = Some(elapsed);
+                        // The budget was sized for travel that is now over, so
+                        // the window gets periods of its own rather than
+                        // spending what is left of the move's.
+                        budget = budget.max(tick.saturating_add(self.settle_periods()));
+                        elapsed
+                    });
+                    let waited = elapsed.saturating_sub(since);
+                    // A blind period judges nothing: the tick's read-loss budget
+                    // is what a run of them ends in, and it is shorter than any
+                    // sane window.
+                    match present.as_ref().map(|present| self.straying(present)) {
+                        Some(None) => {
+                            summary.settled = Some(elapsed);
+                            event(TickEvent::Settled { after: waited });
+                            true
+                        }
+                        Some(Some((joint, error))) if waited >= self.settle.timeout => {
+                            summary.unsettled = Some((joint, error));
+                            event(TickEvent::Unsettled {
+                                joint,
+                                error,
+                                waited,
+                            });
+                            true
+                        }
+                        _ => waited >= self.settle.timeout,
+                    }
+                }
+                Until::Holding { .. } => false,
+                Until::Elapsed(dwell) => elapsed >= dwell,
             };
+            self.record(tick, elapsed, present.as_ref(), held, settling, event);
             if over {
                 ending = Some(Ok(()));
                 break;
@@ -1461,7 +1875,7 @@ fn bus_failure(source: XactError) -> PumpError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE};
@@ -2257,8 +2671,15 @@ mod tests {
 
     /// A pump at the configured rates.
     fn pump<'a>(cfg: &'a Resolved, held: JointVector) -> MotionPump<'a> {
-        MotionPump::new(&cfg.motion, &cfg.map, cfg.tick_hz, cfg.health_poll_hz, held)
-            .expect("the configured rates are positive")
+        MotionPump::new(
+            &cfg.motion,
+            &cfg.map,
+            cfg.tick_hz,
+            cfg.health_poll_hz,
+            held,
+            cfg.settle,
+        )
+        .expect("the configured rates and settle policy are positive")
     }
 
     /// The move every `up` command makes: stow to neutral, over the configured
@@ -2382,6 +2803,497 @@ mod tests {
         // the target's own angles.
         let last = *bench.state.last_goal();
         goals_match(&cfg, &bench, &last);
+    }
+
+    /// A yaw-only move off wherever the machine is standing, over `span`.
+    ///
+    /// One joint moves, which is what makes a settle readable: the other eight
+    /// are already on their goals, so what the run waits for is the one servo
+    /// the case is about.
+    fn yaw_by(state: &MotionState, degrees: f64, span: Duration) -> MotionCommand {
+        let mut target = *state.last_targets();
+        target.body_yaw = degrees.to_radians();
+        MotionCommand::MoveTo {
+            target,
+            durations: MoveDurations::uniform(span),
+            warp: Warp::MinJerk,
+        }
+    }
+
+    /// The servo a joint's goals go to.
+    fn servo_for(cfg: &Resolved, joint: JointId) -> u8 {
+        let row = joint.index().expect("a named joint has a bus row");
+        cfg.map.ids()[row]
+    }
+
+    /// How far a servo is measured from the goal it holds, radians.
+    fn error_at(cfg: &Resolved, bench: &Bench, joint: JointId) -> f64 {
+        let row = joint.index().expect("a named joint has a bus row");
+        let id = servo_for(cfg, joint);
+        let machine = bench.registers.borrow();
+        let counts = |reg| {
+            let bytes: [u8; 4] = machine
+                .get(id, reg_for(reg))
+                .expect("the servo has the register")
+                .try_into()
+                .expect("a position is four bytes");
+            cfg.map
+                .present_rad(row, i32::from_le_bytes(bytes))
+                .expect("a stored count places")
+        };
+        (counts(RegId::PresentPosition) - counts(RegId::GoalPosition)).abs()
+    }
+
+    /// A move is not over when the last goal goes out. The loop keeps reading
+    /// until the machine is measured at the goal, and reports both instants.
+    ///
+    /// The case a hardware run showed: a servo still closing on a goal that
+    /// stopped moving, while the run that commanded it had already declared
+    /// itself finished. The gap between the two instants is the settle, and a
+    /// run that ended at the first is a run whose elapsed time described the
+    /// trajectory rather than the machine.
+    #[test]
+    fn a_move_ends_when_the_machine_arrives_and_not_when_commanding_does() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        // A count a period: slower than the goal moves, so the servo is behind
+        // when commanding ends and takes periods of its own to close.
+        bench
+            .registers
+            .borrow_mut()
+            .creep
+            .insert(servo_for(&cfg, JointId::BodyYaw), 1);
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let command = yaw_by(&bench.state, 6.0, Duration::from_millis(500));
+        let (outcome, events) = run(&mut bench, &mut pump, command, &mut clock);
+        let summary = outcome.expect("a servo closing on its goal arrives");
+
+        let commanded = summary.commanded.expect("the trajectory finished");
+        let settled = summary.settled.expect("and the machine got there");
+        assert!(
+            settled > commanded,
+            "the settle took periods of its own: {summary:?}"
+        );
+        assert_eq!(summary.unsettled, None, "{summary:?}");
+        assert_eq!(
+            summary.elapsed, settled,
+            "the run ended on the period that measured it there: {summary:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TickEvent::Settled { after } if *after == settled - commanded
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+        assert!(
+            error_at(&cfg, &bench, JointId::BodyYaw) <= cfg.settle.tolerance,
+            "the machine really is within the tolerance it was waited on"
+        );
+    }
+
+    /// A joint that never arrives ends the move at the settle window with that
+    /// reported, and the run is a run that finished rather than one that failed.
+    ///
+    /// The distinction matters at the layer above: a fault takes the machine
+    /// straight to torque off, and a servo sitting a few degrees from its goal
+    /// is not that. The window is what stops the loop turning forever over a
+    /// stalled motor.
+    #[test]
+    fn a_joint_that_never_arrives_ends_the_move_at_the_window() {
+        let mut cfg = resolved();
+        cfg.settle.timeout = Duration::from_millis(400);
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench
+            .registers
+            .borrow_mut()
+            .stalled
+            .push(servo_for(&cfg, JointId::BodyYaw));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let command = yaw_by(&bench.state, 6.0, Duration::from_millis(500));
+        let (outcome, events) = run(&mut bench, &mut pump, command, &mut clock);
+        let summary = outcome.expect("a joint short of its goal is a report, not a refusal");
+
+        let commanded = summary.commanded.expect("the trajectory finished");
+        assert_eq!(summary.settled, None, "{summary:?}");
+        let (joint, error) = summary.unsettled.expect("the window ran out on a joint");
+        assert_eq!(joint, JointId::BodyYaw);
+        assert!(
+            (error - 6f64.to_radians()).abs() < 1e-3,
+            "the whole commanded travel is what it never made: {error}"
+        );
+        assert!(
+            summary.elapsed >= commanded + cfg.settle.timeout,
+            "the window was spent before the run gave up: {summary:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Unsettled { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "a joint that did not arrive is not a fault: {events:?}"
+        );
+    }
+
+    /// A recorded run keeps one sample per period: the nine measured angles,
+    /// the nine goals they were measured against, and which side of the end of
+    /// commanding the period fell.
+    #[test]
+    fn a_recorded_run_keeps_every_period_it_turned() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench
+            .registers
+            .borrow_mut()
+            .creep
+            .insert(servo_for(&cfg, JointId::BodyYaw), 1);
+        let mut pump = pump(&cfg, bench.held);
+        pump.record_trace(true);
+        let mut clock = TestClock::default();
+
+        let command = yaw_by(&bench.state, 6.0, Duration::from_millis(500));
+        let (outcome, _) = run(&mut bench, &mut pump, command, &mut clock);
+        let summary = outcome.expect("a servo closing on its goal arrives");
+
+        let trace = pump.last_trace();
+        assert_eq!(
+            trace.len() as u64,
+            summary.ticks,
+            "a sample for every period the run turned"
+        );
+        for (index, sample) in trace.iter().enumerate() {
+            assert_eq!(sample.tick as usize, index, "periods in order");
+            assert!(sample.present.is_some(), "every period read the machine");
+        }
+        assert_eq!(trace[0].at, Duration::ZERO);
+        assert_eq!(
+            trace.last().expect("the run turned periods").at,
+            summary.elapsed
+        );
+
+        // The phases either side of commanding ending, and the boundary between
+        // them where the summary says it is.
+        let commanded = summary.commanded.expect("the trajectory finished");
+        assert!(!trace[0].settling, "the first period was commanding");
+        let settling: Vec<&TickSample> = trace.iter().filter(|s| s.settling).collect();
+        assert!(!settling.is_empty(), "and some periods were the settle");
+        for sample in settling {
+            assert!(sample.at > commanded, "{sample:?}");
+        }
+
+        // The body yaw's goal ends where the move sent it, and the last
+        // measurement of it is within the tolerance the run waited on.
+        let last = trace.last().expect("the run turned periods");
+        let present = last.present.expect("the last period read the machine");
+        let error = (present.body_yaw - last.goal.body_yaw).abs();
+        assert!(error <= cfg.settle.tolerance, "{last:?}");
+    }
+
+    /// A run that records nothing keeps nothing, and a run recorded after one
+    /// that was not is not carrying the other's periods.
+    #[test]
+    fn an_unrecorded_run_keeps_no_periods() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        outcome.expect("the move runs");
+        assert!(pump.last_trace().is_empty());
+
+        pump.record_trace(true);
+        let (outcome, _) = hold(
+            &mut bench,
+            &mut pump,
+            Duration::from_millis(200),
+            &mut clock,
+        );
+        let summary = outcome.expect("the hold runs");
+        assert_eq!(pump.last_trace().len() as u64, summary.ticks);
+        // A hold commands nothing, so no period of one is ever a settle.
+        assert!(pump.last_trace().iter().all(|sample| !sample.settling));
+        assert_eq!(summary.commanded, None, "{summary:?}");
+        assert_eq!(summary.settled, None, "{summary:?}");
+
+        // And switching recording off empties what it kept: the samples a
+        // caller can still reach after that would be a run it did not ask
+        // about.
+        pump.record_trace(false);
+        assert!(pump.last_trace().is_empty(), "the buffer went with it");
+    }
+
+    /// The period a run faults on is in the trace.
+    ///
+    /// A tracking fault is the one the trace exists to explain, and the
+    /// measurement that crossed the line is the last period before the loop
+    /// stops. A trace ending one period short of it costs the reader the whole
+    /// diagnosis — and disagrees by one with the period count the summary
+    /// reports for the same run.
+    #[test]
+    fn a_faulted_run_keeps_the_period_it_faulted_on() {
+        let mut cfg = resolved();
+        cfg.motion.tracking.threshold_rad = 0.02;
+        cfg.motion.tracking.ticks = 5;
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench.registers.borrow_mut().stalled = cfg.map.ids().to_vec();
+        let mut pump = pump(&cfg, bench.held);
+        pump.record_trace(true);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("a machine that never moves is not tracking");
+        assert!(
+            matches!(error, PumpError::Fault(Fault::TrackingLost { .. })),
+            "{error}"
+        );
+
+        let summary = pump.last_summary();
+        let trace = pump.last_trace();
+        assert_eq!(
+            trace.len() as u64,
+            summary.ticks,
+            "a sample for every period the run turned, faulting period included"
+        );
+        // The kept period is the one that faulted: its measurement is the goal
+        // it never followed, past the threshold the run was watching.
+        let last = trace.last().expect("the run turned periods");
+        let present = last.present.expect("the faulting period read the machine");
+        let lag = present
+            .joints()
+            .into_iter()
+            .zip(last.goal.joints())
+            .map(|((_, angle), (_, goal))| (angle - goal).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            lag > cfg.motion.tracking.threshold_rad,
+            "the period the fault was raised on: {last:?}"
+        );
+    }
+
+    /// The trace buffer's ceiling stops the recording and nothing else: it is
+    /// announced once, and the run carries on to its endpoint.
+    ///
+    /// The ceiling is what stands between a run with no length of its own — one
+    /// steered by a caller that keeps retargeting — and a host filling its
+    /// memory with periods nobody will read.
+    #[test]
+    fn a_trace_that_fills_stops_recording_and_says_so_once() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let ceiling = 7;
+        pump.record_trace(true);
+        pump.trace_ceiling(ceiling);
+        let mut clock = TestClock::default();
+
+        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let summary = outcome.expect("a full trace buffer is not a failed move");
+
+        assert_eq!(pump.last_trace().len(), ceiling, "recording stopped at it");
+        assert!(
+            summary.ticks > ceiling as u64,
+            "and the periods carried on: {summary:?}"
+        );
+        let full: Vec<&TickEvent> = events
+            .iter()
+            .filter(|event| matches!(event, TickEvent::TraceFull { .. }))
+            .collect();
+        assert_eq!(
+            full,
+            vec![&TickEvent::TraceFull { samples: ceiling }],
+            "announced once, on the period that reached it: {events:?}"
+        );
+    }
+
+    /// A caller that steers the run after the machine has arrived gets a
+    /// summary about the goal it steered to, not the one it abandoned.
+    ///
+    /// `retarget` is asked during the settle as well as during travel, and a
+    /// replacement taken there puts the run back to commanding. What the run
+    /// had measured about arriving belongs to a goal it is no longer heading
+    /// for, and a caller reading `commanded`/`settled` off that summary would
+    /// be reading instants from a move that was abandoned.
+    #[test]
+    fn a_move_replaced_during_its_settle_reports_the_replacement() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        // A count a period: the machine is still closing on its goal when
+        // commanding ends, so the settle spans periods a replacement can
+        // arrive in.
+        bench
+            .registers
+            .borrow_mut()
+            .creep
+            .insert(servo_for(&cfg, JointId::BodyYaw), 1);
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let span = Duration::from_millis(500);
+        let first = yaw_by(&bench.state, 6.0, span);
+        let second = yaw_by(&bench.state, 3.0, span);
+        let arrived = Cell::new(false);
+        let mut events = Vec::new();
+        let mut steered = false;
+        let outcome = pump.run_retargeting(
+            &mut bench.bus,
+            &mut bench.state,
+            first,
+            &mut clock,
+            &mut |event| {
+                if event == TickEvent::Completed {
+                    arrived.set(true);
+                }
+                events.push(event);
+            },
+            &mut || {
+                // Only once the first move has finished commanding, which is
+                // what puts the replacement inside the settle.
+                (arrived.get() && !std::mem::replace(&mut steered, true)).then_some(second)
+            },
+        );
+        let summary = outcome.expect("the replacement carries to its own endpoint");
+
+        // Two commands and two completions: the replacement was taken after the
+        // first move had finished commanding, which is the settle phase and not
+        // travel — so the tick starts it rather than splicing it.
+        let started: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| **event == TickEvent::Command(CommandDisposition::Started))
+            .map(|(at, _)| at)
+            .collect();
+        let completed: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| **event == TickEvent::Completed)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(started.len(), 2, "{events:?}");
+        assert_eq!(completed.len(), 2, "{events:?}");
+        assert!(started[1] > completed[0], "{events:?}");
+
+        let commanded = summary.commanded.expect("the replacement finished too");
+        assert!(
+            commanded > span,
+            "the instants are the replacement's, not the abandoned move's: {summary:?}"
+        );
+        let settled = summary.settled.expect("and the machine got there");
+        assert!(settled >= commanded, "{summary:?}");
+        assert_eq!(summary.unsettled, None, "{summary:?}");
+        assert!(
+            (bench.state.last_targets().body_yaw - 3f64.to_radians()).abs() < 1e-9,
+            "the run ended on the replacement's endpoint: {:?}",
+            bench.state.last_targets().body_yaw
+        );
+    }
+
+    /// A settle window longer than the loop's stall margin is a machine taking
+    /// its time, not a loop that hung.
+    ///
+    /// The budget left when commanding ends was sized for travel that is over.
+    /// Without the window getting periods of its own, a configuration whose
+    /// settle window outlasts the stall margin would end every unsettled run as
+    /// `Stalled` — a loop fault reported for a servo that was merely slow.
+    #[test]
+    fn a_settle_window_past_the_stall_margin_still_reports_the_joint() {
+        let mut cfg = resolved();
+        cfg.settle.timeout = Duration::from_secs(STALL_MARGIN_SECS + 1);
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench
+            .registers
+            .borrow_mut()
+            .stalled
+            .push(servo_for(&cfg, JointId::BodyYaw));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let command = yaw_by(&bench.state, 6.0, Duration::from_millis(500));
+        let (outcome, _) = run(&mut bench, &mut pump, command, &mut clock);
+        let summary = outcome.expect("a joint short of its goal is a report, not a stall");
+
+        let (joint, _) = summary.unsettled.expect("the window ran out on a joint");
+        assert_eq!(joint, JointId::BodyYaw);
+        assert!(
+            summary.elapsed >= cfg.settle.timeout,
+            "the whole window was spent, past the margin the travel carried: {summary:?}"
+        );
+    }
+
+    /// A run whose reads fall away across the end of its settle window ends
+    /// with no verdict at all, and says so by having none.
+    ///
+    /// A blind period judges nothing, so a dropout straddling the window
+    /// boundary leaves a run that neither arrived nor was found short. It is
+    /// `Ok` with `commanded` set and both verdicts empty, which is what a
+    /// caller reading `unsettled.is_none()` as arrival would get wrong.
+    #[test]
+    fn a_run_blind_at_the_end_of_its_window_returns_no_verdict() {
+        let mut cfg = resolved();
+        cfg.settle.timeout = Duration::from_millis(200);
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench
+            .registers
+            .borrow_mut()
+            .stalled
+            .push(servo_for(&cfg, JointId::BodyYaw));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        // The dropout starts when commanding ends and outlasts the window,
+        // while staying well inside the read-loss budget the tick faults on.
+        let outage = 30;
+        assert!(outage < cfg.motion.read_loss_ticks, "inside the budget");
+        let registers = Rc::clone(&bench.registers);
+        let position = reg_for(RegId::PresentPosition).addr;
+        let servo = servo_for(&cfg, JointId::BodyYaw);
+        let mut events = Vec::new();
+        let command = yaw_by(&bench.state, 6.0, Duration::from_millis(500));
+        let outcome = pump.run(
+            &mut bench.bus,
+            &mut bench.state,
+            command,
+            &mut clock,
+            &mut |event| {
+                if event == TickEvent::Completed {
+                    registers
+                        .borrow_mut()
+                        .mute
+                        .insert((servo, position), outage);
+                }
+                events.push(event);
+            },
+        );
+        let summary = outcome.expect("a run that measured nothing at the end is not a failure");
+
+        assert!(summary.commanded.is_some(), "{summary:?}");
+        assert_eq!(summary.settled, None, "nothing measured it arrived");
+        assert_eq!(summary.unsettled, None, "and nothing measured it short");
+        assert!(
+            summary.misses > 0,
+            "the window was spent blind: {summary:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TickEvent::Settled { .. } | TickEvent::Unsettled { .. })),
+            "no verdict was announced either: {events:?}"
+        );
     }
 
     /// A machine that follows its goals a few periods behind carries the move
@@ -3699,12 +4611,62 @@ mod tests {
                 tick_hz,
                 health_poll_hz,
                 JointVector::default(),
+                cfg.settle,
             )
             .err()
             .expect("a zero rate is refused");
             assert!(
                 matches!(refused, PumpError::Rate { .. }),
                 "{tick_hz}/{health_poll_hz}: {refused}"
+            );
+        }
+    }
+
+    /// A settle policy nothing can be judged against is refused the same way a
+    /// rate of zero is.
+    ///
+    /// Each of these fails differently if it is let through: an infinite or
+    /// negative tolerance calls every joint arrived the instant commanding
+    /// stops, a NaN one calls none of them arrived ever, and a window of no
+    /// time gives the machine no periods to arrive in.
+    #[test]
+    fn a_settle_policy_nothing_can_be_measured_against_is_refused() {
+        let cfg = resolved();
+        for settle in [
+            SettleConfig {
+                tolerance: 0.0,
+                ..cfg.settle
+            },
+            SettleConfig {
+                tolerance: -0.1,
+                ..cfg.settle
+            },
+            SettleConfig {
+                tolerance: f64::NAN,
+                ..cfg.settle
+            },
+            SettleConfig {
+                tolerance: f64::INFINITY,
+                ..cfg.settle
+            },
+            SettleConfig {
+                timeout: Duration::ZERO,
+                ..cfg.settle
+            },
+        ] {
+            let refused = MotionPump::new(
+                &cfg.motion,
+                &cfg.map,
+                cfg.tick_hz,
+                cfg.health_poll_hz,
+                JointVector::default(),
+                settle,
+            )
+            .err()
+            .expect("an unusable settle policy is refused");
+            assert!(
+                matches!(refused, PumpError::Settle { .. }),
+                "{settle:?}: {refused}"
             );
         }
     }
@@ -3787,7 +4749,25 @@ mod tests {
                 },
                 "7",
             ),
-            (TickEvent::Completed, "target"),
+            (TickEvent::Completed, "commanding finished"),
+            (
+                TickEvent::Settled {
+                    after: Duration::from_millis(620),
+                },
+                "0.62 s after commanding finished",
+            ),
+            (
+                TickEvent::Unsettled {
+                    joint: JointId::Leg(2),
+                    error: 0.1,
+                    waited: Duration::from_secs(2),
+                },
+                "still 5.73° from its goal",
+            ),
+            (
+                TickEvent::TraceFull { samples: 120_000 },
+                "120000 period(s)",
+            ),
             (
                 TickEvent::Faulted(Fault::ReadLoss { misses: 51 }),
                 "faulted",

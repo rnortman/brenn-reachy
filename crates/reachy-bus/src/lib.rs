@@ -2,8 +2,10 @@
 //!
 //! Nine servos share one half-duplex serial bus. This crate owns the port and the
 //! transaction semantics on top of it: ping, unicast read, verified unicast
-//! write, the grouped read that gathers nine positions in one request, and the
-//! grouped write that streams nine goals. Blocking and synchronous, on one
+//! write, the grouped read that gathers nine positions in one request, the
+//! grouped write that streams nine goals, and the reboot that restarts a servo
+//! — which drops the torque it was holding, so nothing here sends one on its
+//! own initiative. Blocking and synchronous, on one
 //! thread, by design — a request-response bus at a fixed baud rate is an owned
 //! loop under every host substrate, and pretending otherwise buys nothing.
 //!

@@ -38,7 +38,10 @@
 
 use core::time::Duration;
 
-use reachy_bus::{Bus, BusPort, BusTiming, MapError, ServoMap, reg_for, value_kind, with_retry};
+use dxl_proto::{HardwareError, counts_to_rad};
+use reachy_bus::{
+    Bus, BusPort, BusTiming, MapError, ServoMap, XactError, reg_for, value_kind, with_retry,
+};
 use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
@@ -52,6 +55,7 @@ use crate::pump::{
     Clock, DISARM_ACTIONS, MotionPump, MoveSummary, PumpError, TickEvent, action_budget,
     commission_report, drive, drive_release, engage_report,
 };
+use crate::trace;
 
 /// The shaping every bench move uses.
 ///
@@ -71,6 +75,15 @@ const DEMO_YAW_DEG: f64 = 30.0;
 /// The joints `provision` writes: the two antennas, whose extended-position
 /// mode is this project's own provisioning rather than the vendor's.
 const PROVISIONED_JOINTS: [JointId; 2] = [JointId::AntennaRight, JointId::AntennaLeft];
+
+/// Pings before a rebooted servo is reported as gone.
+///
+/// Spaced by the bus's own retry spacing, each one costing an exchange deadline
+/// when nothing answers, so the budget is a couple of seconds at the shipped
+/// timing. How long one of these servos takes to come back is not something
+/// this project has measured — the count is set well above any restart a
+/// reboot is likely to take, and the run prints what it actually waited.
+const BOOT_POLLS: u32 = 100;
 
 /// How far the demo swings the antennas, radians either side of upright.
 ///
@@ -297,8 +310,12 @@ impl<'a, P: BusPort> Commissioned<'a, P> {
             resolved.tick_hz,
             resolved.health_poll_hz,
             engaged.armed.joints,
+            resolved.settle,
         ) {
-            Ok(pump) => pump,
+            Ok(mut pump) => {
+                pump.record_trace(resolved.trace.is_some());
+                pump
+            }
             Err(error) => {
                 line("the control loop would not start with torque on; releasing immediately");
                 self.detorque_now(clock, line);
@@ -513,7 +530,50 @@ impl<P: BusPort> Engaged<'_, '_, P> {
             return;
         }
         line(&move_line(&summary));
+        if let Some(settle) = settle_line(&summary) {
+            line(&settle);
+        }
         line(&lag_line(&summary));
+        self.write_trace(line);
+    }
+
+    /// Append this run's per-period trace to the file the session was given, if
+    /// it was given one.
+    ///
+    /// A trace that cannot be written is said and nothing more: it is
+    /// diagnostic output, and a move that ran is not undone by a file that
+    /// would not open. Which run in the file this move became is said too: the
+    /// number comes from the file rather than from this session, so an operator
+    /// reading rows back knows which ones this command wrote. A file that was
+    /// already ending mid-row is said as well — the rows in it are not all what
+    /// they claim to be, and that is worth hearing before the analysis and not
+    /// after.
+    fn write_trace(&self, line: &mut dyn FnMut(&str)) {
+        let Some(path) = &self.machine.resolved.trace else {
+            return;
+        };
+        let samples = self.pump.last_trace();
+        match trace::append_csv(path, samples) {
+            Ok(appended) => {
+                line(&format!(
+                    "  {} period(s) of trace appended to {} as run {}",
+                    samples.len(),
+                    path.display(),
+                    appended.run
+                ));
+                if appended.mended {
+                    line(&format!(
+                        "  {} ended mid-row before this — an earlier trace was cut short, and \
+                         that row is damaged",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) => line(&format!(
+                "  the trace could not be written to {}: {error}",
+                path.display()
+            )),
+        }
     }
 
     /// Watch the machine hold for `duration`, commanding nothing.
@@ -691,6 +751,34 @@ fn move_line(summary: &MoveSummary) -> String {
         jitter = summary.worst_jitter.as_secs_f64() * 1e3,
         elapsed = summary.elapsed.as_secs_f64(),
     )
+}
+
+/// The two instants a move ends on: when the last goal went out, and when the
+/// machine was measured to have got there.
+///
+/// The gap between them is the settle, and it is the part of a move the elapsed
+/// time alone hides — a move commanded over a hundredth of a second reports its
+/// commanding over in a twentieth, with the head still on its way up. Nothing is
+/// printed for a run that never finished commanding: a hold has no such instant,
+/// and a faulted move's is a moment it did not reach.
+fn settle_line(summary: &MoveSummary) -> Option<String> {
+    let commanded = summary.commanded?;
+    let head = format!("  commanding finished {:.2} s in", commanded.as_secs_f64());
+    Some(match (summary.settled, summary.unsettled) {
+        (Some(settled), _) => format!(
+            "{head}; measurably at the goal {:.2} s later, at {:.2} s",
+            settled.saturating_sub(commanded).as_secs_f64(),
+            settled.as_secs_f64(),
+        ),
+        (None, Some((joint, error))) => format!(
+            "{head}; {joint} was still {:.2}° from its goal when the settle window ran out",
+            error.to_degrees(),
+        ),
+        // The run ended during the settle for a reason of its own — a fault, a
+        // lost wire, a caller that steered elsewhere. Where the machine got to
+        // is a question this run did not finish asking.
+        (None, None) => format!("{head}; the run ended before the machine was measured there"),
+    })
 }
 
 /// How far each joint ran behind its goal at worst, in bus order.
@@ -928,6 +1016,244 @@ pub fn provision<P: BusPort>(
     Ok(())
 }
 
+/// Restart the servos, and report what they come back holding.
+///
+/// The way to clear a latched hardware error — an overload above all — without
+/// cutting the machine's power. A restart clears Torque Enable, so every servo
+/// this reaches lets go of whatever it was holding.
+///
+/// Nothing here arms, enables torque or asks the machine's permission: a reboot
+/// is a de-torque, and nothing gates a de-torque. The one refusal is a servo ID
+/// the configured roster does not carry, which is a command line to correct
+/// rather than a machine to judge.
+///
+/// The instruction is sent to every target first and the whole set polled
+/// afterwards, so nine servos restart alongside each other rather than one at a
+/// time. What each one is holding when it answers again — the error byte the
+/// reboot was sent to clear, the torque a restart drops, and the position it
+/// came back at — is read once they are all back.
+///
+/// Answering is not restarting: a servo that never took the instruction answers
+/// exactly as one that took it and came back, and the only difference on the
+/// wire is the torque it is still holding. So the torque is read rather than
+/// assumed, and a servo still holding it fails the command — otherwise a
+/// corrupted frame ends in a success and a report of a restart that did not
+/// happen.
+///
+/// Torque cannot tell them apart on a machine that was already limp, and that
+/// is the machine this command is usually run on: a latched shutdown de-torques
+/// the servo it latches on, and every fault response de-torques the lot. So the
+/// acknowledgement is kept too. A servo that answered its reboot and came back
+/// limp restarted; one that answered nothing and came back limp is
+/// indeterminate, and an indeterminate restart fails the command rather than
+/// riding out on the closing line — an operator scripting a recovery around the
+/// exit code is owed the difference.
+pub fn reboot<P: BusPort>(
+    map: &ServoMap,
+    timing: BusTiming,
+    port: P,
+    target: Option<u8>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
+    let targets = reboot_targets(map, target)?;
+    let mut bus = Bus::new(port, timing);
+
+    line(
+        "reboot: every servo addressed restarts, which clears its Torque Enable — whatever it \
+         was holding, it lets go of. The head settles as it goes, so take its weight if it is \
+         up. Where the machine is standing gates nothing here.",
+    );
+
+    // Which servos never acknowledged the instruction, by row. Kept because it
+    // is half of the restart verdict below: a servo that acknowledged took the
+    // reboot, and one that did not has only its torque left to say so.
+    let mut unacked: Vec<(u8, XactError)> = Vec::new();
+    for (_, id) in &targets {
+        match bus.reboot(*id) {
+            Ok(()) => line(&format!("  servo {id}: reboot sent")),
+            // The frame is on the wire either way, and a servo that took it has
+            // no answer left to give. Whether it restarted is what the poll
+            // below establishes, so nothing stops here.
+            Err(source) => {
+                line(&format!(
+                    "  servo {id}: reboot sent, unacknowledged ({source})"
+                ));
+                unacked.push((*id, source));
+            }
+        }
+    }
+
+    let mut trouble: Option<PumpError> = None;
+    let mut back = Vec::with_capacity(targets.len());
+    for (row, id) in &targets {
+        match wait_for(&mut bus, *id, clock) {
+            Ok(waited) => {
+                line(&format!(
+                    "  servo {id}: answering {:.2} s after the instruction went out",
+                    waited.as_secs_f64()
+                ));
+                back.push((*row, *id));
+            }
+            Err(error) => {
+                line(&format!(
+                    "  servo {id}: NO ANSWER since its reboot ({error})"
+                ));
+                trouble.get_or_insert(error);
+            }
+        }
+    }
+
+    for (row, id) in back {
+        match reading(&mut bus, map, row, id) {
+            Ok(read) => {
+                line(&read.report);
+                if read.holding {
+                    trouble.get_or_insert(PumpError::NotRestarted { id });
+                } else if let Some(at) = unacked.iter().position(|(deaf, _)| *deaf == id) {
+                    let (_, source) = unacked.remove(at);
+                    line(&format!(
+                        "  servo {id}: it took no acknowledgement and had no torque to drop, so \
+                         nothing here says it restarted"
+                    ));
+                    trouble.get_or_insert(PumpError::RestartUnconfirmed { id, source });
+                }
+            }
+            Err(error) => {
+                line(&format!(
+                    "  servo {id}: answered, but reads back as {error}"
+                ));
+                trouble.get_or_insert(error);
+            }
+        }
+    }
+
+    match trouble {
+        Some(error) => Err(error),
+        None => {
+            line("rebooted; every servo that came back is limp. `selftest` reads the machine.");
+            Ok(())
+        }
+    }
+}
+
+/// The servos a reboot addresses: the one asked for, or the whole roster in bus
+/// order.
+///
+/// Each carries its row, because the row is what turns a reading into the
+/// register widths and the joint it belongs to.
+fn reboot_targets(map: &ServoMap, target: Option<u8>) -> Result<Vec<(usize, u8)>, PumpError> {
+    let roster = map.ids();
+    let all = || roster.iter().copied().enumerate().collect();
+    let Some(id) = target else {
+        return Ok(all());
+    };
+    match roster.iter().position(|held| *held == id) {
+        Some(row) => Ok(vec![(row, id)]),
+        None => Err(PumpError::OffRoster { id, roster }),
+    }
+}
+
+/// Ping `id` until it answers again, and say how long that took.
+///
+/// A servo that is restarting answers nothing at all, so every poll before it
+/// is back fails on its own deadline; the pause between them is the bus's own
+/// retry spacing, which is the cadence this configuration carries for exactly
+/// this — asking again in a moment.
+fn wait_for<P: BusPort>(
+    bus: &mut Bus<P>,
+    id: u8,
+    clock: &mut dyn Clock,
+) -> Result<Duration, PumpError> {
+    let started = clock.now();
+    let spacing = bus.timing().retry_spacing;
+    let mut asked = 0;
+    loop {
+        let failed = match bus.ping(id) {
+            Ok(_) => return Ok(clock.now().saturating_sub(started)),
+            Err(error) => error,
+        };
+        asked += 1;
+        if asked >= BOOT_POLLS {
+            return Err(PumpError::NotBack {
+                id,
+                polls: asked,
+                waited: clock.now().saturating_sub(started),
+                source: failed,
+            });
+        }
+        clock.sleep_until(clock.now() + spacing);
+    }
+}
+
+/// What one servo came back holding.
+struct Reading {
+    /// The line an operator reads.
+    report: String,
+    /// Whether it is still holding torque, which a restart clears — so a servo
+    /// that answers holding it did not restart.
+    holding: bool,
+}
+
+/// What a servo holds now: the hardware-error byte, its torque, and where it is
+/// standing.
+///
+/// The error byte is the operator's reason for rebooting at all, and this is
+/// the reading that says whether it went. Torque is the restart's own
+/// observable: a servo comes back with it cleared, so reading it is how
+/// answering is told from restarting. The position is reported as the servo's
+/// own count and the angle that count is, unshifted by anything the host knows.
+/// Neither the byte nor the position is compared against an expectation: what a
+/// restart does to a latched byte or to a position is not something this
+/// project has established on its own hardware, so both are reported as they
+/// read.
+fn reading<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+    id: u8,
+) -> Result<Reading, PumpError> {
+    let bits = read_byte(bus, map, row, RegId::HardwareErrorStatus)?;
+    let torque = read_byte(bus, map, row, RegId::TorqueEnable)?;
+    let counts = read_counts(bus, id)?;
+    let latched = if bits == 0 {
+        "clear".to_string()
+    } else if HardwareError(bits).healthy_or_voltage_only() {
+        "input voltage only".to_string()
+    } else {
+        format!("still latched: {bits:#04x}")
+    };
+    let holding = torque != 0;
+    let torque = if holding {
+        "STILL HOLDING TORQUE, so it did not restart"
+    } else {
+        "limp"
+    };
+    Ok(Reading {
+        report: format!(
+            "  servo {id}: hardware error {bits:#04x} ({latched}), {torque}, at {counts} counts, \
+             {:.3} deg unshifted",
+            counts_to_rad(counts).to_degrees()
+        ),
+        holding,
+    })
+}
+
+/// One servo's present position, as the count it reports.
+///
+/// Unshifted, which is why this reads the register rather than going through
+/// the map's decoding: what a restart left in the servo is the count, and the
+/// host's own idea of where zero is would be an interpretation laid over it.
+fn read_counts<P: BusPort>(bus: &mut Bus<P>, id: u8) -> Result<i32, PumpError> {
+    let entry = reg_for(RegId::PresentPosition);
+    let raw = with_retry(bus, |bus| bus.read_reg(id, entry))
+        .map_err(|source| PumpError::Bus { id, source })?;
+    // A successful read is exactly the register's declared width, and this
+    // register is four bytes wide, so this only fails if the two have drifted
+    // apart.
+    Ok(raw.i32().expect("a position register is four bytes wide"))
+}
+
 /// One servo's one-byte register, with retry.
 ///
 /// The width the answer must have is the map's to know, not this function's.
@@ -1070,7 +1396,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use dxl_proto::frame::{INST_PING, INST_WRITE};
+    use dxl_proto::frame::{INST_PING, INST_REBOOT, INST_WRITE};
     use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
     use reachy_motion::{
         ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointVector,
@@ -1611,6 +1937,212 @@ mod tests {
             );
         }
         assert_eq!([lags[0], lags[7], lags[8]], [0.0; 3], "{lags:?}");
+    }
+
+    /// A session asked for a trace gets a row for every control period it
+    /// turned, in order, and is told where they went.
+    ///
+    /// The rows are the point: a summary says a move took two seconds, and only
+    /// the periods say what the machine was doing during them.
+    #[test]
+    fn a_traced_session_writes_a_row_for_every_period() {
+        let path = crate::testutil::scratch_path("session.csv");
+        let mut cfg = resolved();
+        cfg.trace = Some(path.clone());
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+        run.ok("the fixture machine lifts");
+
+        let text = std::fs::read_to_string(&path).expect("the trace is where it was said to be");
+        std::fs::remove_file(&path).expect("the scratch file goes away");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("run,tick,t_s,phase"), "{}", lines[0]);
+        assert!(lines.len() > 1, "{text}");
+        for (period, row) in lines[1..].iter().enumerate() {
+            let cells: Vec<&str> = row.split(',').collect();
+            assert_eq!(cells[0], "0", "one run in this session: {row}");
+            assert_eq!(cells[1], period.to_string(), "periods in order: {row}");
+        }
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("{}", path.display()))),
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// Two commands appending to one trace file write two runs, not two copies
+    /// of run zero.
+    ///
+    /// This is the workflow the file format exists for — `up --trace f.csv`
+    /// then `stow --trace f.csv` — and each command engages the machine for
+    /// itself, so nothing in the process carries a count between them. A reader
+    /// grouping rows by `run` has to get two series out of this file.
+    #[test]
+    fn two_commands_sharing_a_trace_file_write_two_runs() {
+        let path = crate::testutil::scratch_path("two-commands.csv");
+        let mut cfg = resolved();
+        cfg.trace = Some(path.clone());
+
+        let first = run(
+            machine_at(&datumed_config(), &stow_legs()),
+            |port, clock, line| up(&cfg, port, clock, line),
+        );
+        first.ok("the fixture machine lifts");
+        let second = run(
+            machine_at(&datumed_config(), &stow_legs()),
+            |port, clock, line| stow(&cfg, port, clock, line),
+        );
+        second.ok("the fixture machine folds");
+
+        let text = std::fs::read_to_string(&path).expect("the trace is where it was said to be");
+        std::fs::remove_file(&path).expect("the scratch file goes away");
+        let runs: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .map(|row| row.split(',').next().expect("a row has a first cell"))
+            .collect();
+        assert!(runs.contains(&"0"), "{text}");
+        assert!(
+            runs.contains(&"1"),
+            "the second command reused the first's run number: {text}"
+        );
+        assert!(
+            second.printed.iter().any(|line| line.contains("as run 1")),
+            "{:?}",
+            second.printed
+        );
+    }
+
+    /// A run that faulted writes its trace too — and the trace is one row per
+    /// period the run turned.
+    ///
+    /// This is the trace's headline use: the periods of the run that lost the
+    /// machine are what says why. Reporting on the success path only, or
+    /// returning before the report on a fault, would lose exactly the runs
+    /// worth reading.
+    #[test]
+    fn a_faulted_run_still_writes_its_trace() {
+        let path = crate::testutil::scratch_path("faulted.csv");
+        let mut cfg = resolved();
+        cfg.trace = Some(path.clone());
+        cfg.motion.tracking.threshold_rad = 0.02;
+        cfg.motion.tracking.progress_min_rad = 1.0;
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        // Nine servos following their goals a few periods behind, against a
+        // progress minimum nothing closes: the tracking monitor gives up.
+        for id in cfg.map.ids() {
+            machine.delay.insert(id, 4);
+        }
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+
+        let error = run.err("nothing closes a whole radian in a window");
+        assert!(error.is_fault(), "{error}");
+        let text = std::fs::read_to_string(&path).expect("the trace is where it was said to be");
+        std::fs::remove_file(&path).expect("the scratch file goes away");
+
+        // The count the summary reports and the count that reached the file are
+        // the same count, faulting period included.
+        let periods = |line: &str| {
+            line.split_whitespace()
+                .next()
+                .expect("a report line starts with its count")
+                .parse::<usize>()
+                .expect("a count")
+        };
+        let turned = run
+            .printed
+            .iter()
+            .find(|line| line.contains("period(s), ") && line.contains("commanding"))
+            .map(|line| periods(line.trim()))
+            .expect("a faulted run still reports what it measured");
+        let appended = run
+            .printed
+            .iter()
+            .find(|line| line.contains("appended to"))
+            .expect("and still writes its periods");
+        assert_eq!(periods(appended.trim()), turned, "{appended}");
+        assert!(appended.contains("as run 0"), "{appended}");
+        assert_eq!(text.lines().count(), turned + 1, "the header and the rows");
+    }
+
+    /// A trace that cannot be written is said, and the move that ran still ran.
+    ///
+    /// `--trace` takes any path an operator types, so a destination that will
+    /// not open is an ordinary typo. Diagnostic output failing is not the
+    /// machine failing.
+    #[test]
+    fn a_trace_that_cannot_be_written_does_not_undo_the_move() {
+        let path = crate::testutil::scratch_path("no-such-directory").join("session.csv");
+        let mut cfg = resolved();
+        cfg.trace = Some(path.clone());
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+        run.ok("a file that will not open is not the machine's problem");
+
+        assert!(
+            run.printed.iter().any(|line| {
+                line.contains("could not be written")
+                    && line.contains(&format!("{}", path.display()))
+            }),
+            "{:?}",
+            run.printed
+        );
+        assert!(!path.exists(), "and nothing was created on the way");
+    }
+
+    /// A session that asked for no trace writes none, and says nothing about
+    /// one.
+    #[test]
+    fn an_untraced_session_writes_nothing() {
+        let cfg = resolved();
+        assert_eq!(cfg.trace, None);
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
+        run.ok("the fixture machine lifts");
+        assert!(
+            !run.printed.iter().any(|line| line.contains("trace")),
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// The two instants a move reports, in the three shapes a run can end in.
+    ///
+    /// A run whose elapsed time is all the operator gets cannot tell a move that
+    /// finished commanding quickly from a machine that got there quickly, and on
+    /// this platform those differ by most of the motion.
+    #[test]
+    fn the_settle_line_says_when_commanding_ended_and_when_the_machine_arrived() {
+        let arrived = MoveSummary {
+            commanded: Some(Duration::from_millis(50)),
+            settled: Some(Duration::from_millis(670)),
+            ..MoveSummary::default()
+        };
+        let line = settle_line(&arrived).expect("a move that finished commanding says so");
+        assert!(line.contains("0.05 s"), "{line}");
+        assert!(line.contains("0.62 s later"), "{line}");
+        assert!(line.contains("0.67 s"), "{line}");
+
+        let short = MoveSummary {
+            commanded: Some(Duration::from_millis(50)),
+            unsettled: Some((JointId::Leg(3), 0.1)),
+            ..MoveSummary::default()
+        };
+        let line = settle_line(&short).expect("a move that finished commanding says so");
+        assert!(line.contains("leg 4"), "{line}");
+        assert!(line.contains("5.73°"), "{line}");
+
+        let cut = MoveSummary {
+            commanded: Some(Duration::from_millis(50)),
+            ..MoveSummary::default()
+        };
+        let line = settle_line(&cut).expect("a move that finished commanding says so");
+        assert!(line.contains("ended before"), "{line}");
+
+        // A hold commands nothing, so it has no such instant and says nothing.
+        assert_eq!(settle_line(&MoveSummary::default()), None);
     }
 
     /// `stow` puts the machine at the pose disarming verifies, and leaves
@@ -2317,6 +2849,58 @@ mod tests {
         assert!((landed - 4.0).abs() < 0.01, "landed at {landed}");
     }
 
+    /// Staggered antenna clocks reach the machine: the side given the shorter
+    /// clock lands first and waits, and the other is still sweeping. Two
+    /// inboard arcs on one clock put both tips at the point where they cross at
+    /// the same instant, which is how a pair meets tip to tip and stalls.
+    #[test]
+    fn staggered_antenna_clocks_land_one_side_before_the_other() {
+        let mut cfg = datumed_config();
+        crate::testutil::wind_down_bus(&mut cfg);
+        cfg.motion.antenna_duration_right_s = Some(1.6);
+        cfg.motion.antenna_duration_left_s = Some(1.2);
+        let cfg = cfg.resolve().expect("staggered antenna clocks resolve");
+        assert_eq!(
+            cfg.move_durations().antennas,
+            [Duration::from_millis(1600), Duration::from_millis(1200)]
+        );
+
+        let machine = machine_at(&datumed_config(), &neutral_legs());
+        let run = run(machine, |port, clock, line| {
+            antennas(&cfg, port, 1.0, -1.0, clock, line)
+        });
+        run.ok("a staggered antenna command runs");
+
+        let half_count = core::f64::consts::PI / 4096.0;
+        let right = run.goal_series(&cfg, JointId::AntennaRight);
+        let left = run.goal_series(&cfg, JointId::AntennaLeft);
+        // The period each side first commanded its endpoint.
+        let arrival = |series: &[f64], joint, target: f64| {
+            series
+                .iter()
+                .position(|goal| (goal - target).abs() <= half_count)
+                .unwrap_or_else(|| panic!("{joint} never reached {target}: {series:?}"))
+        };
+        let right_at = arrival(&right, JointId::AntennaRight, 1.0);
+        let left_at = arrival(&left, JointId::AntennaLeft, -1.0);
+        assert!(
+            left_at < right_at,
+            "the left antenna landed at period {left_at}, the right at {right_at}"
+        );
+
+        // The landed side then sits on its endpoint while the other travels.
+        assert!(
+            left[left_at..]
+                .iter()
+                .all(|goal| (goal + 1.0).abs() <= half_count),
+            "the left antenna moved after landing: {left:?}"
+        );
+        assert!(
+            (right[left_at] - 1.0).abs() > half_count,
+            "the right antenna was already there at period {left_at}: {right:?}"
+        );
+    }
+
     /// A machine as the vendor provisions it: every servo in single-turn
     /// position mode, torque off.
     fn unprovisioned(cfg: &Resolved) -> FakeMachine {
@@ -2447,6 +3031,371 @@ mod tests {
         };
         assert_eq!((*id, *model, *expected), (cfg.map.ids()[7], 1200, 1190));
         assert_eq!(modes(&cfg, &run), vec![3; JointId::COUNT]);
+    }
+
+    /// A machine holding torque on all nine, with one servo carrying a latched
+    /// overload — the state an operator reaches for `reboot` in.
+    fn overloaded(cfg: &Resolved) -> FakeMachine {
+        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        for id in cfg.map.ids() {
+            machine.set(id, reg_for(RegId::TorqueEnable), &[1]);
+        }
+        machine.set(
+            cfg.map.ids()[3],
+            reg_for(RegId::HardwareErrorStatus),
+            &[0x20],
+        );
+        machine
+    }
+
+    /// Which servos a run sent the reboot instruction to, in the order it went
+    /// out.
+    fn rebooted(run: &Run) -> Vec<u8> {
+        run.log
+            .borrow()
+            .iter()
+            .filter(|(_, instruction)| *instruction == INST_REBOOT)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// `reboot` restarts every servo in bus order, waits for each to answer
+    /// again, and reports the error byte and the position it came back with.
+    ///
+    /// The torque that comes off is the restart's doing and not a write: an
+    /// operator reboots to clear a latch, and a command that quietly wrote
+    /// torque off as well would be doing something they did not ask for on a
+    /// machine whose head is in their hand.
+    #[test]
+    fn reboot_restarts_every_servo_and_reports_what_each_came_back_with() {
+        let cfg = resolved();
+        let run = run(overloaded(&cfg), |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+        run.ok("a machine that answers reboots");
+
+        assert_eq!(rebooted(&run), cfg.map.ids().to_vec());
+        assert_eq!(
+            torque(&cfg, &run),
+            vec![0; JointId::COUNT],
+            "a restart drops torque"
+        );
+        assert!(
+            !run.log
+                .borrow()
+                .iter()
+                .any(|(_, instruction)| *instruction == INST_WRITE),
+            "nothing was written: {:?}",
+            run.log.borrow()
+        );
+        run.armed_nothing();
+        run.commanded_nothing(&cfg);
+
+        // What the operator came for: the byte, per servo, read after the
+        // restart rather than assumed to have gone.
+        for id in cfg.map.ids() {
+            let reading = run
+                .printed
+                .iter()
+                .find(|line| line.contains(&format!("servo {id}: hardware error")))
+                .unwrap_or_else(|| panic!("servo {id} was not reported: {:?}", run.printed));
+            assert!(reading.contains("counts"), "{reading}");
+            assert!(reading.contains("deg"), "{reading}");
+        }
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("0x20") && line.contains("still latched")),
+            "a byte that survived the restart is reported as it read: {:?}",
+            run.printed
+        );
+        // The torque is measured, not assumed: the closing line claims every
+        // servo that came back is limp, and this is what makes that a reading.
+        for id in cfg.map.ids() {
+            let reading = run
+                .printed
+                .iter()
+                .find(|line| line.contains(&format!("servo {id}: hardware error")))
+                .unwrap_or_else(|| panic!("servo {id} was not reported: {:?}", run.printed));
+            assert!(reading.contains("limp"), "{reading}");
+        }
+    }
+
+    /// A servo the reboot instruction never reached is caught by its torque,
+    /// and the command fails rather than reporting a restart that did not
+    /// happen.
+    ///
+    /// A lost or corrupted frame leaves a servo answering pings exactly as one
+    /// that restarted does, so the poll cannot tell them apart. What can is the
+    /// torque a restart clears — and an operator scripting a recovery around
+    /// this command needs the exit code to mean what it says.
+    #[test]
+    fn a_servo_that_never_took_its_reboot_is_caught_by_the_torque_it_kept() {
+        let cfg = resolved();
+        let deaf = cfg.map.ids()[2];
+        let mut machine = overloaded(&cfg);
+        machine.deaf_to_reboot.push(deaf);
+        let run = run(machine, |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("a servo still holding torque did not restart");
+        let PumpError::NotRestarted { id } = error else {
+            panic!("expected a servo that did not restart, got {error}");
+        };
+        assert_eq!(*id, deaf);
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {deaf}: reboot sent, unacknowledged"))),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {deaf}"))
+                    && line.contains("STILL HOLDING TORQUE")),
+            "{:?}",
+            run.printed
+        );
+        // The eight that did restart are still read, and the run does not claim
+        // the machine is limp.
+        for id in cfg.map.ids().iter().filter(|id| **id != deaf) {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|line| line.contains(&format!("servo {id}: hardware error"))
+                        && line.contains("limp")),
+                "servo {id} went unreported: {:?}",
+                run.printed
+            );
+        }
+        assert!(
+            !run.printed.iter().any(|line| line.contains("rebooted;")),
+            "{:?}",
+            run.printed
+        );
+    }
+
+    /// A servo that acknowledged nothing and had no torque to drop is not a
+    /// restart anybody observed, and the command says so instead of passing.
+    ///
+    /// This is the command's own primary scenario: a latched overload is in the
+    /// shutdown mask, so the servo has already switched its own torque off, and
+    /// every fault response de-torques the rest. On that machine the torque
+    /// check cannot fire — a servo that never took the instruction is limp
+    /// exactly like one that restarted — and the acknowledgement is the only
+    /// thing left that distinguishes them.
+    #[test]
+    fn a_reboot_unacknowledged_by_a_limp_servo_is_not_a_confirmed_restart() {
+        let cfg = resolved();
+        // The servo carrying the latch, in the state a latch leaves it: shut
+        // down, holding nothing.
+        let deaf = cfg.map.ids()[3];
+        let mut machine = overloaded(&cfg);
+        machine.set(deaf, reg_for(RegId::TorqueEnable), &[0]);
+        machine.deaf_to_reboot.push(deaf);
+        let run = run(machine, |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("an unobserved restart is not a restart");
+        let PumpError::RestartUnconfirmed { id, .. } = error else {
+            panic!("expected an unconfirmed restart, got {error}");
+        };
+        assert_eq!(*id, deaf);
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {deaf}"))
+                    && line.contains("nothing here says it restarted")),
+            "{:?}",
+            run.printed
+        );
+        // The latch it was rebooted for is still reported as it reads, and the
+        // command does not close by calling the machine restarted.
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains("0x20") && line.contains("still latched")),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            !run.printed.iter().any(|line| line.contains("rebooted;")),
+            "{:?}",
+            run.printed
+        );
+        // The eight that did acknowledge came back limp and pass.
+        for id in cfg.map.ids().iter().filter(|id| **id != deaf) {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|line| line.contains(&format!("servo {id}: hardware error"))
+                        && line.contains("limp")),
+                "servo {id} went unreported: {:?}",
+                run.printed
+            );
+        }
+    }
+
+    /// A servo whose only latched bit is input voltage is reported as that and
+    /// not as a fault, and one that answers its ping but fails a register read
+    /// is named without stopping the other eight being read.
+    ///
+    /// The voltage rendering is what tells an operator the reboot cleared what
+    /// they rebooted for; the read-error arm is the path a bus failure takes in
+    /// the middle of a report.
+    #[test]
+    fn a_reboot_reports_a_voltage_only_byte_and_a_servo_that_will_not_read() {
+        let cfg = resolved();
+        let voltage = cfg.map.ids()[1];
+        let unreadable = cfg.map.ids()[5];
+        let mut machine = overloaded(&cfg);
+        machine.set(
+            voltage,
+            reg_for(RegId::HardwareErrorStatus),
+            &[dxl_proto::conv::HW_INPUT_VOLTAGE],
+        );
+        // Answers its ping, answers nothing about where it is standing.
+        machine
+            .mute
+            .insert((unreadable, reg_for(RegId::PresentPosition).addr), u32::MAX);
+        let run = run(machine, |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("a servo that will not read is not a clean reboot");
+        let PumpError::Bus { id, .. } = error else {
+            panic!("expected a bus failure, got {error}");
+        };
+        assert_eq!(*id, unreadable);
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {voltage}"))
+                    && line.contains("input voltage only")),
+            "{:?}",
+            run.printed
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {unreadable}"))
+                    && line.contains("reads back as")),
+            "{:?}",
+            run.printed
+        );
+        // The one that would not read did not take the other eight with it.
+        for id in cfg.map.ids().iter().filter(|id| **id != unreadable) {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|line| line.contains(&format!("servo {id}: hardware error"))),
+                "servo {id} went unreported: {:?}",
+                run.printed
+            );
+        }
+    }
+
+    /// The command says what a reboot costs before it sends one: torque goes,
+    /// the head settles, and nothing about where the machine is standing stops
+    /// it.
+    #[test]
+    fn reboot_says_the_head_will_settle_before_it_sends_anything() {
+        let cfg = resolved();
+        let run = run(overloaded(&cfg), |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+        run.ok("a machine that answers reboots");
+
+        let warning = &run.printed[0];
+        for word in ["Torque Enable", "settles", "weight"] {
+            assert!(warning.contains(word), "no {word}: {warning}");
+        }
+    }
+
+    /// A named servo is the only one restarted; the other eight are still
+    /// holding when it is over.
+    #[test]
+    fn a_reboot_of_one_servo_leaves_the_other_eight_holding() {
+        let cfg = resolved();
+        let one = cfg.map.ids()[4];
+        let run = run(overloaded(&cfg), |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, Some(one), clock, line)
+        });
+        run.ok("one servo reboots");
+
+        assert_eq!(rebooted(&run), vec![one]);
+        let held: Vec<u8> = torque(&cfg, &run);
+        for (row, holding) in held.iter().enumerate() {
+            let expected = u8::from(cfg.map.ids()[row] != one);
+            assert_eq!(*holding, expected, "row {row}");
+        }
+    }
+
+    /// A servo ID the roster does not carry is refused by name, and nothing
+    /// goes out to whatever holds it.
+    #[test]
+    fn a_reboot_of_a_servo_off_the_roster_sends_nothing() {
+        let cfg = resolved();
+        let stranger = 99;
+        assert!(!cfg.map.ids().contains(&stranger));
+        let run = run(overloaded(&cfg), |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, Some(stranger), clock, line)
+        });
+
+        let error = run.err("that servo is not on this machine");
+        let PumpError::OffRoster { id, roster } = error else {
+            panic!("expected a roster refusal, got {error}");
+        };
+        assert_eq!((*id, *roster), (stranger, cfg.map.ids()));
+        assert!(run.log.borrow().is_empty(), "{:?}", run.log.borrow());
+        assert_eq!(
+            torque(&cfg, &run),
+            vec![1; JointId::COUNT],
+            "a refused reboot left the machine exactly as it was"
+        );
+    }
+
+    /// A servo that takes its reboot and never answers again is named, the run
+    /// fails, and the eight that did come back are still read and reported.
+    ///
+    /// The command has nothing to release and nothing to catch: no torque was
+    /// ever enabled on this path, and the eight that answered are limp because
+    /// they restarted. What is left is the report and a non-zero exit.
+    #[test]
+    fn a_servo_that_never_comes_back_is_named_and_the_rest_still_reported() {
+        let cfg = resolved();
+        let lost = cfg.map.ids()[6];
+        let mut machine = overloaded(&cfg);
+        machine.gone_on_reboot.push(lost);
+        let run = run(machine, |port, clock, line| {
+            reboot(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("a servo that never answered is not a success");
+        let PumpError::NotBack { id, polls, .. } = error else {
+            panic!("expected a servo that did not come back, got {error}");
+        };
+        assert_eq!((*id, *polls), (lost, BOOT_POLLS));
+        assert!(
+            run.printed
+                .iter()
+                .any(|line| line.contains(&format!("servo {lost}: NO ANSWER"))),
+            "{:?}",
+            run.printed
+        );
+        for id in cfg.map.ids().iter().filter(|id| **id != lost) {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|line| line.contains(&format!("servo {id}: hardware error"))),
+                "servo {id} went unreported: {:?}",
+                run.printed
+            );
+        }
     }
 
     /// Every command that moves commissions first, so a machine that cannot be

@@ -32,7 +32,7 @@ use dxl_proto::frame::{CRC_LEN, MAX_STATUS_PARAMS, PREAMBLE_LEN};
 use dxl_proto::regs::TORQUE_ENABLE;
 use dxl_proto::{
     BROADCAST_ID, DecodeStep, MAX_FRAME_BUF, MAX_INSTR_FRAME, Reg, StatusDecoder, StatusError,
-    encode_ping, encode_read, encode_sync_read, encode_sync_write, encode_write,
+    encode_ping, encode_read, encode_reboot, encode_sync_read, encode_sync_write, encode_write,
 };
 
 use crate::error::{IdOutcome, SyncReadOutcome, XactError};
@@ -285,6 +285,28 @@ impl<P: BusPort> Bus<P> {
             model: u16::from_le_bytes([params[0], params[1]]),
             firmware: params[2],
         })
+    }
+
+    /// Reboots `id`, and takes the acknowledgement it answers with before it
+    /// goes.
+    ///
+    /// A restart clears Torque Enable, so a servo that was holding stops
+    /// holding. Nothing in this crate decides to send one: the caller owns that
+    /// decision and whatever the machine is resting on.
+    ///
+    /// The acknowledgement says the instruction was taken, not that the servo is
+    /// back. It answers nothing while it restarts, so a caller that needs to
+    /// know it has returned pings it until it does.
+    pub fn reboot(&mut self, id: u8) -> Result<(), XactError> {
+        let tx_len =
+            encode_reboot(id, &mut self.tx).map_err(|source| XactError::Encode { id, source })?;
+        let mut params = [0u8; MAX_STATUS_PARAMS];
+        let reply = self.exchange(id, tx_len, 0, &mut params)?;
+        self.check_status(id, reply.error)?;
+        // A reboot is acknowledged with no parameters, as a write is. Anything
+        // else answers a different question, and taking it would report an
+        // instruction as accepted that no servo has answered for.
+        check_length(id, 0, reply.len)
     }
 
     /// Reads `reg` from `id`.
@@ -736,8 +758,8 @@ mod tests {
     use std::io;
 
     use dxl_proto::frame::{
-        HEADER, IDX_ID, IDX_INSTRUCTION, INST_READ, INST_STATUS, INST_SYNC_WRITE, INST_WRITE,
-        MIN_STATUS_LEN,
+        HEADER, IDX_ID, IDX_INSTRUCTION, INST_READ, INST_REBOOT, INST_STATUS, INST_SYNC_WRITE,
+        INST_WRITE, MIN_STATUS_LEN,
     };
     use dxl_proto::regs::{
         GOAL_POSITION, HARDWARE_ERROR_STATUS, HOMING_OFFSET, OPERATING_MODE, PRESENT_POSITION,
@@ -888,6 +910,58 @@ mod tests {
             }
         );
         assert_eq!(bus.counters(), BusCounters::default());
+    }
+
+    /// A reboot goes out as the reboot instruction and comes back acknowledged
+    /// with nothing in it.
+    #[test]
+    fn a_reboot_is_the_reboot_instruction_and_an_empty_acknowledgement() {
+        let mut bus = bus_over(&[status(11, 0, &[])]);
+        bus.reboot(11).expect("the servo took the instruction");
+        let frame = &bus.port.writes[0];
+        assert_eq!(frame[IDX_ID], 11);
+        assert_eq!(frame[IDX_INSTRUCTION], INST_REBOOT);
+    }
+
+    /// A servo with a hardware error latched sets the alert bit on every reply,
+    /// the reboot's acknowledgement included — and that servo is precisely the
+    /// one a reboot is sent to. The bit is counted, not acted on.
+    #[test]
+    fn a_latched_alert_does_not_fail_the_reboot_that_clears_it() {
+        let mut bus = bus_over(&[status(11, 0x80, &[])]);
+        bus.reboot(11).expect("the alert bit is not a refusal");
+        assert_eq!(bus.counters().alerts, 1);
+    }
+
+    /// Silence fails the reboot rather than reporting one that no servo
+    /// answered for.
+    #[test]
+    fn a_silent_servo_fails_its_reboot() {
+        let mut bus = bus_over(&[Vec::new()]);
+        let failed = bus.reboot(11).expect_err("nothing answered");
+        assert!(
+            matches!(failed, XactError::Timeout { id: 11, .. }),
+            "{failed}"
+        );
+    }
+
+    /// A reply carrying parameters is some other exchange's, and a reboot that
+    /// accepted it would say an instruction was taken on that evidence.
+    #[test]
+    fn a_wide_reply_is_not_a_reboot_acknowledgement() {
+        let mut bus = bus_over(&[status(11, 0, &[0x0A, 0x04, 0x2C])]);
+        let failed = bus.reboot(11).expect_err("that is a ping's reply");
+        assert!(
+            matches!(
+                failed,
+                XactError::LongReply {
+                    id: 11,
+                    expected: 0,
+                    actual: 3
+                }
+            ),
+            "{failed}"
+        );
     }
 
     #[test]

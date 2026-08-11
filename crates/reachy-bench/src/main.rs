@@ -29,6 +29,8 @@ const DEFAULT_CONFIG: &str = "reachy-bench.toml";
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
+    /// Where every run of this invocation appends its per-period trace.
+    trace: Option<PathBuf>,
     /// The words that were not flags: a yaw in degrees, or two antenna angles.
     operands: Vec<String>,
 }
@@ -36,11 +38,14 @@ struct Args {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH]\n\
+        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH] \
+         [--trace PATH]\n\
          \n\
          commands:\n\
          \x20 selftest              read-only: pings and register reads, no torque, no motion\n\
          \x20 provision             write the antennas' operating mode; no torque, no motion\n\
+         \x20 reboot [id]           restart every servo, or one; clears a latched error and \
+         drops torque\n\
          \x20 arm                   verify, pin every joint where it stands, enable torque\n\
          \x20 up                    lift the head to the neutral configuration\n\
          \x20 hold                  command nothing and measure the machine holding\n\
@@ -50,14 +55,25 @@ fn usage() -> String {
          \x20 antennas <right> <left>   move the antennas, radians\n\
          \x20 demo                  up, hold, antennas, yaw, stow, off\n\
          \n\
-         Every command but `selftest`, `provision` and `off` commissions the machine,\n\
-         polls it and takes hold of it first: nothing is remembered between\n\
+         Every command but `selftest`, `provision`, `reboot` and `off` commissions the\n\
+         machine, polls it and takes hold of it first: nothing is remembered between\n\
          invocations.\n\
+         \n\
+         `reboot` restarts the servos, which is how a latched hardware error — an\n\
+         overload above all — is cleared without cutting power. A restart drops torque,\n\
+         so the head settles: take its weight if it is up. It gates on nothing.\n\
          \n\
          `off` always releases: wherever the machine is, torque comes off and where it\n\
          was is reported. The head settles as it goes, so take its weight if it is up.\n\
          That is the way out of any session, at any moment. A move that *faults* also\n\
          releases, immediately and without measuring, and the head settles then too.\n\
+         \n\
+         `--trace PATH` writes one CSV row per control period — every joint's measured\n\
+         angle against the goal it was being held to, which is the move's velocity\n\
+         profile at the rate it was sampled. Each run of the invocation appends. Give it\n\
+         a path on a memory filesystem, `/run/reachy-trace.csv` on the machine itself:\n\
+         it is written once per run rather than once per period, and nothing this\n\
+         produces belongs on the device's flash.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -78,6 +94,7 @@ fn main() -> anyhow::Result<()> {
 enum Command {
     Selftest,
     Provision,
+    Reboot,
     Arm,
     Up,
     Hold,
@@ -91,9 +108,10 @@ enum Command {
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 10] = [
+    const ALL: [Command; 11] = [
         Self::Selftest,
         Self::Provision,
+        Self::Reboot,
         Self::Arm,
         Self::Up,
         Self::Hold,
@@ -109,6 +127,7 @@ impl Command {
         Some(match word {
             "selftest" => Self::Selftest,
             "provision" => Self::Provision,
+            "reboot" => Self::Reboot,
             "arm" => Self::Arm,
             "up" => Self::Up,
             "hold" => Self::Hold,
@@ -126,6 +145,7 @@ impl Command {
         match self {
             Self::Selftest => "selftest",
             Self::Provision => "provision",
+            Self::Reboot => "reboot",
             Self::Arm => "arm",
             Self::Up => "up",
             Self::Hold => "hold",
@@ -137,7 +157,11 @@ impl Command {
         }
     }
 
-    /// How many operands this command takes beyond its own name.
+    /// How many operands this command takes beyond its own name, at most.
+    ///
+    /// The bound is what a stray word is refused against. A command that needs
+    /// every one of them says so where it reads them — `yaw` without its angle
+    /// is a refusal there, while `reboot` without its servo means all of them.
     fn operands(self) -> usize {
         match self {
             Self::Selftest
@@ -148,7 +172,7 @@ impl Command {
             | Self::Stow
             | Self::Off
             | Self::Demo => 0,
-            Self::Yaw => 1,
+            Self::Reboot | Self::Yaw => 1,
             Self::Antennas => 2,
         }
     }
@@ -169,6 +193,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
     match command {
         Command::Selftest => selftest(&args),
         Command::Provision => provision(&args),
+        Command::Reboot => reboot(&args, optional_id(&args)?),
         Command::Arm => moving(&args, name, |resolved, port, clock, line| {
             commands::arm(resolved, port, clock, line)
         }),
@@ -207,6 +232,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
+        trace: None,
         operands: Vec::new(),
     };
     let mut argv = argv;
@@ -223,6 +249,7 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         match word.as_str() {
             "--config" => args.config = PathBuf::from(value),
             "--record" => args.record = Some(PathBuf::from(value)),
+            "--trace" => args.trace = Some(PathBuf::from(value)),
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
@@ -262,6 +289,22 @@ fn two_numbers(args: &Args, shape: &str) -> anyhow::Result<[f64; 2]> {
         bail!("reachy-bench: {shape} takes two numbers\n\n{}", usage());
     };
     Ok([number(first)?, number(second)?])
+}
+
+/// The servo a command was pointed at, or nothing for all of them.
+///
+/// A servo ID is a whole number the protocol can address, so a word that is not
+/// one is refused here rather than reaching the roster check as an ID nobody
+/// configured — the two refusals say different things, and an operator who
+/// typed `reboot leg3` needs the first one.
+fn optional_id(args: &Args) -> anyhow::Result<Option<u8>> {
+    let [only] = args.operands.as_slice() else {
+        return Ok(None);
+    };
+    let id: u8 = only
+        .parse()
+        .with_context(|| format!("`{only}` is not a servo id\n\n{}", usage()))?;
+    Ok(Some(id))
 }
 
 /// An operand as the number it has to be.
@@ -367,6 +410,30 @@ fn provision(args: &Args) -> anyhow::Result<()> {
         .map_err(|error| anyhow::Error::new(error).context("`provision`"))
 }
 
+/// Restart the servos and report what they come back holding.
+///
+/// Not behind the datum gate, and deliberately: a reboot commands no angle, so
+/// it needs no conversion, no envelope and no kinematics — only the roster and
+/// the bus timing. It is also a de-torque, and nothing gates a de-torque.
+fn reboot(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
+    let cfg = config::load(&args.config)?;
+    let map = ServoMap::new(cfg.servo_ids()?);
+    let timing = cfg.bus_timing()?;
+
+    // The header only: what a reboot costs is said once, by the command itself,
+    // where every caller of it hears the same words.
+    println!("reboot over {} at {} baud.", cfg.bus.device, timing.baud);
+
+    let port = SerialBusPort::open(&cfg.bus.device, timing.baud)
+        .with_context(|| format!("opening {}", cfg.bus.device))?;
+    let mut clock = MonotonicClock::new();
+
+    commands::reboot(&map, timing, port, target, &mut clock, &mut |line| {
+        println!("{line}")
+    })
+    .map_err(|error| anyhow::Error::new(error).context("`reboot`"))
+}
+
 /// What every command that touches a servo says before it does.
 ///
 /// It describes the machine that ships, the way out included: an operator
@@ -375,9 +442,9 @@ fn provision(args: &Args) -> anyhow::Result<()> {
 /// way to end it.
 fn preamble(command: &str, device: &str, baud: u32) -> String {
     format!(
-        "{command} over {device} at {baud} baud. Every command but `selftest`, `provision` and \
-         `off` verifies the nine servos, measures where each one is standing, pins it there and \
-         enables torque — which holds it where it stands — before it moves anything; a leg \
+        "{command} over {device} at {baud} baud. Every command but `selftest`, `provision`, \
+         `reboot` and `off` verifies the nine servos, measures where each one is standing, \
+         pins it there and enables torque — which holds it where it stands — before it moves anything; a leg \
          outside its travel window is pulled to the nearer bound.\n\
          `off` always releases: wherever the machine is, torque comes off and where it was is \
          reported. A move that faults releases too, immediately and without measuring. The head \
@@ -403,7 +470,10 @@ where
     ) -> Result<(), PumpError>,
 {
     let cfg = config::load(&args.config)?;
-    let resolved = resolve_for_commanding(&cfg)?;
+    let mut resolved = resolve_for_commanding(&cfg)?;
+    // The one thing about a commanding run that comes from the command line
+    // rather than the file: which run an operator wants the periods of.
+    resolved.trace = args.trace.clone();
 
     println!(
         "{}",
@@ -576,6 +646,53 @@ mod tests {
         assert_eq!(record_path(&args), PathBuf::from("/tmp/r"));
     }
 
+    /// Nothing is traced unless a run was asked for it, and the flag is what
+    /// asks.
+    ///
+    /// A trace is diagnostic output an operator wants on a particular run and
+    /// on a filesystem of their choosing, which is why it is a flag and not a
+    /// key in the configuration file the device carries.
+    #[test]
+    fn a_trace_is_written_only_where_a_run_was_told_to_write_one() {
+        let args = parse_args(argv(&[])).expect("no flags is a valid invocation");
+        assert_eq!(args.trace, None);
+
+        let args = parse_args(argv(&["--trace", "/run/reachy-trace.csv"])).expect("it parses");
+        assert_eq!(args.trace, Some(PathBuf::from("/run/reachy-trace.csv")));
+        assert!(usage().contains("--trace"), "{}", usage());
+    }
+
+    /// `reboot` on its own means every servo, and `reboot <id>` means that one.
+    ///
+    /// The two are one command and not two, so the absent operand has to mean
+    /// the whole roster somewhere: here, before any configuration is read.
+    #[test]
+    fn a_reboot_with_no_servo_named_means_every_servo() {
+        let args = parse_args(argv(&[])).expect("no operand is a valid invocation");
+        assert_eq!(optional_id(&args).expect("nothing to parse"), None);
+
+        let args = parse_args(argv(&["11"])).expect("one operand is a valid invocation");
+        assert_eq!(optional_id(&args).expect("11 is an id"), Some(11));
+    }
+
+    /// A word that is not a servo ID is refused as one, rather than reaching
+    /// the roster check as an ID nobody configured.
+    ///
+    /// `256` is the case that matters: it is a number, and it is not an ID, so
+    /// a refusal that only checked for digits would send it to the roster and
+    /// report it as a servo this machine does not carry — which is true of
+    /// every number and tells the operator nothing about what they typed.
+    #[test]
+    fn a_word_that_is_not_a_servo_id_is_refused_as_one() {
+        for word in ["leg3", "256", "-1", "1.5", ""] {
+            let args = parse_args(argv(&[word])).expect("it is an operand, whatever it says");
+            let refused = optional_id(&args).expect_err("that is not a servo id");
+            let printed = format!("{refused:#}");
+            assert!(printed.contains("not a servo id"), "{word}: {printed}");
+            assert!(printed.contains("usage:"), "{word}: {printed}");
+        }
+    }
+
     /// A flag with no value, and a flag nobody defined, are both refused with
     /// the usage rather than assumed away.
     #[test]
@@ -652,6 +769,7 @@ mod tests {
         for words in [
             vec!["selftest", "extra"],
             vec!["provision", "now"],
+            vec!["reboot", "11", "12"],
             vec!["arm", "up"],
             vec!["up", "now"],
             vec!["hold", "10"],
@@ -676,6 +794,7 @@ mod tests {
         for command in [
             "selftest",
             "provision",
+            "reboot",
             "arm",
             "up",
             "hold",
@@ -743,8 +862,9 @@ mod tests {
     #[test]
     fn the_operator_text_excepts_every_command_that_does_not_arm() {
         // `selftest` reads registers, `provision` writes one non-volatile
-        // register, and `off` releases; none of the three arms.
-        let excepted = "Every command but `selftest`, `provision` and `off`";
+        // register, `reboot` restarts the servos and `off` releases; none of
+        // the four arms.
+        let excepted = "Every command but `selftest`, `provision`, `reboot` and `off`";
         for text in [usage(), preamble("up", "/dev/ttyAMA3", 1_000_000)] {
             assert!(
                 text.contains(excepted),
@@ -760,6 +880,8 @@ mod tests {
     fn every_writing_command_is_gated_before_the_port() {
         for words in [
             vec!["provision"],
+            vec!["reboot"],
+            vec!["reboot", "11"],
             vec!["arm"],
             vec!["up"],
             vec!["hold"],

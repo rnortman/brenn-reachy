@@ -39,3 +39,4 @@ pub mod pump;
 pub mod selftest;
 #[cfg(test)]
 mod testutil;
+pub mod trace;

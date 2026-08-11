@@ -56,6 +56,8 @@ use reachy_motion::{
 #[cfg(test)]
 use reachy_motion::{FLOOR_TICK_HZ, HEAD_GROUP_FLOOR_S, duration_floor_s};
 
+use crate::pump::SettleConfig;
+
 /// One encoder count, radians — the finest distinction a position register can
 /// make, and the slack the two per-leg fences are allowed to differ by.
 ///
@@ -261,6 +263,9 @@ pub struct BenchConfig {
     /// What disarming compares against.
     #[serde(default)]
     pub disarm: DisarmSection,
+    /// What the end of a move compares against.
+    #[serde(default)]
+    pub settle: SettleSection,
     /// What the provisioned registers must hold.
     #[serde(default)]
     pub provision: ProvisionSection,
@@ -393,6 +398,18 @@ pub struct MotionSection {
     /// business being floored by an antenna arc, and an arc long enough to stay
     /// inside the per-tick step bound has no business slowing the lift.
     pub antenna_duration_s: Option<f64>,
+    /// How long the right antenna takes on any move, seconds. Absent falls back
+    /// to `antenna_duration_s`, and absent again to the head group's clock.
+    ///
+    /// The pair exists to stagger the two antennas. Swept inboard on one clock
+    /// their tips reach the point where their arcs cross at the same instant and
+    /// can meet there instead of passing; a tenth of a second between the clocks
+    /// puts one through first.
+    pub antenna_duration_right_s: Option<f64>,
+    /// How long the left antenna takes on any move, seconds. Absent falls back
+    /// to `antenna_duration_s`, and absent again to the head group's clock. See
+    /// `antenna_duration_right_s`.
+    pub antenna_duration_left_s: Option<f64>,
     /// How long a `hold` command watches the machine before returning, seconds.
     pub hold_duration_s: f64,
 }
@@ -423,8 +440,10 @@ impl Default for MotionSection {
             // matter of what is comfortable to watch rather than of mechanics.
             move_duration_s: 3.0,
             // The head group's clock, which is what one clock for everything
-            // amounts to.
+            // amounts to, and no stagger between the two sides.
             antenna_duration_s: None,
+            antenna_duration_right_s: None,
+            antenna_duration_left_s: None,
             // Long enough that a tracking fault or a health latch has periods
             // to appear in, short enough that a supervised operator is not left
             // waiting on a command that does nothing by design.
@@ -530,6 +549,18 @@ fn gains_section(gains: Gains) -> GainsSection {
     }
 }
 
+/// How far a joint may be from the angle it was sent to and still count as
+/// standing there, degrees.
+///
+/// One figure because there is one question: the distance at which this machine
+/// is where it was told to be. Two places ask it — the verified torque-off tail
+/// comparing against stow, and a move waiting for the machine to arrive — and
+/// they have no cause to answer it differently, so they resolve from here rather
+/// than from two literals that a re-derivation could move apart. The two TOML
+/// keys stay separate: an operator splitting them is a deliberate act, and this
+/// is only what they default to.
+const ARRIVED_TOLERANCE_DEG: f64 = 2.0;
+
 /// `[disarm]` — what the verified torque-off tail compares against.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -545,8 +576,38 @@ pub struct DisarmSection {
 impl Default for DisarmSection {
     fn default() -> Self {
         Self {
-            tolerance_deg: 2.0,
+            tolerance_deg: ARRIVED_TOLERANCE_DEG,
             dwell_s: reachy_motion::disarm::DEFAULT_STOW_DWELL.as_secs_f64(),
+        }
+    }
+}
+
+/// `[settle]` — how a move decides the machine has actually got there.
+///
+/// A trajectory finishing says the last goal has gone out, not that the machine
+/// is where it was sent: the servos are still closing on it, and a move
+/// commanded over a clock shorter than the machine's own response spends most of
+/// its motion after the last goal. These two figures are what the loop waits on
+/// before it calls a move over.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SettleSection {
+    /// How far a joint may be from the goal it was left on and still count as
+    /// having arrived, degrees.
+    pub tolerance_deg: f64,
+    /// How long to wait for that after commanding finished, seconds. A joint
+    /// that never arrives ends the move with that reported.
+    pub timeout_s: f64,
+}
+
+impl Default for SettleSection {
+    fn default() -> Self {
+        Self {
+            tolerance_deg: ARRIVED_TOLERANCE_DEG,
+            // Longer than any settle the bench has watched, and short enough
+            // that a joint which is never going to arrive is reported while an
+            // operator is still watching the move it belongs to.
+            timeout_s: 2.0,
         }
     }
 }
@@ -678,6 +739,15 @@ pub struct Resolved {
     pub arm: ArmConfig,
     /// What disarming compares against.
     pub disarm: DisarmConfig,
+    /// What the end of a move waits for.
+    pub settle: SettleConfig,
+    /// Where each run of this invocation appends its per-period trace, or
+    /// `None` for a session that records none.
+    ///
+    /// Not from the file: it comes off the command line, because a trace is
+    /// something an operator asks a particular run for. It lives here so a
+    /// command that drives the machine needs no second channel to be told.
+    pub trace: Option<PathBuf>,
     /// Control periods per second.
     pub tick_hz: u32,
     /// Hardware-health sweeps per second.
@@ -691,8 +761,11 @@ pub struct Resolved {
     /// How long a `hold` command watches the machine.
     pub hold_duration: Duration,
     /// How long the antennas take on any move, or `None` to give them the head
-    /// group's clock.
+    /// group's clock. A side with a clock of its own overrides it.
     pub antenna_duration: Option<Duration>,
+    /// Each antenna's own clock, right then left, or `None` for a side that
+    /// takes `antenna_duration`.
+    pub antenna_durations: [Option<Duration>; 2],
 }
 
 impl Resolved {
@@ -714,12 +787,13 @@ impl Resolved {
         self.durations(self.move_duration)
     }
 
-    /// `head` for the head group, and the configured antenna clock beside it.
+    /// `head` for the head group, and each antenna's own clock beside it.
+    ///
+    /// The fallback chain — own key, shared key, head clock — is
+    /// [`MoveDurations::resolved`]'s, so this file and the daemon's resolve
+    /// antenna clocks by the same rule rather than by two copies of it.
     fn durations(&self, head: Duration) -> MoveDurations {
-        MoveDurations {
-            head,
-            antennas: self.antenna_duration.unwrap_or(head),
-        }
+        MoveDurations::resolved(head, self.antenna_duration, self.antenna_durations)
     }
 }
 
@@ -1038,6 +1112,11 @@ impl BenchConfig {
             dwell: duration_from_secs_non_negative("disarm.dwell_s", self.disarm.dwell_s)?,
         };
 
+        let settle = SettleConfig {
+            tolerance: positive("settle.tolerance_deg", self.settle.tolerance_deg)?.to_radians(),
+            timeout: duration_from_secs("settle.timeout_s", self.settle.timeout_s)?,
+        };
+
         Ok(Resolved {
             device: self.bus.device.clone(),
             timing: self.bus_timing()?,
@@ -1046,6 +1125,10 @@ impl BenchConfig {
             motion,
             arm,
             disarm,
+            settle,
+            // Set by whoever parsed the command line, if they were asked for
+            // one; a file has nothing to say about it.
+            trace: None,
             tick_hz: self.motion.tick_hz,
             health_poll_hz: positive_int("motion.health_poll_hz", self.motion.health_poll_hz)?,
             stow_duration: duration_from_secs(
@@ -1066,6 +1149,16 @@ impl BenchConfig {
                 .antenna_duration_s
                 .map(|secs| duration_from_secs("motion.antenna_duration_s", secs))
                 .transpose()?,
+            antenna_durations: [
+                self.motion
+                    .antenna_duration_right_s
+                    .map(|secs| duration_from_secs("motion.antenna_duration_right_s", secs))
+                    .transpose()?,
+                self.motion
+                    .antenna_duration_left_s
+                    .map(|secs| duration_from_secs("motion.antenna_duration_left_s", secs))
+                    .transpose()?,
+            ],
         })
     }
 }
@@ -1261,6 +1354,7 @@ provenance = \"test fixture\"
         assert_eq!(example.bus, defaults.bus);
         assert_eq!(example.envelope, defaults.envelope);
         assert_eq!(example.disarm, defaults.disarm);
+        assert_eq!(example.settle, defaults.settle);
         assert_eq!(example.provision, defaults.provision);
         // The one key the example states outright rather than leaving to its
         // fallback, because the fallback is derived from another key and a file
@@ -1302,7 +1396,7 @@ provenance = \"test fixture\"
             (resolved.move_durations(), resolved.move_duration),
         ] {
             assert_eq!(durations.head, head);
-            assert_eq!(durations.antennas, head);
+            assert_eq!(durations.antennas, [head; 2]);
             assert_eq!(durations.longest(), head);
         }
 
@@ -1316,7 +1410,42 @@ provenance = \"test fixture\"
             (resolved.move_durations(), resolved.move_duration),
         ] {
             assert_eq!(durations.head, head, "the head group is left alone");
-            assert_eq!(durations.antennas, Duration::from_millis(1500));
+            assert_eq!(durations.antennas, [Duration::from_millis(1500); 2]);
+            assert_eq!(
+                durations.longest(),
+                head.max(Duration::from_millis(1500)),
+                "and the move is over when the last of the two clocks is up"
+            );
+        }
+    }
+
+    /// A per-side key reaches the side it names and no other.
+    ///
+    /// The fallback chain itself — own key, then the shared one, then the head
+    /// group's — is [`MoveDurations::resolved`]'s and is pinned there, over all
+    /// four combinations. What this layer can still get wrong is the wiring:
+    /// the two sides swapped, or the shared key passed in a side's slot. So the
+    /// case is asymmetric on purpose — a mirror-image answer is exactly the
+    /// failure, and the staggered pair collapsing to one clock is what puts the
+    /// two tips at their crossing point together.
+    #[test]
+    fn the_per_side_key_reaches_the_side_it_names() {
+        let mut cfg = minimal();
+        cfg.motion.antenna_duration_s = Some(1.5);
+        cfg.motion.antenna_duration_right_s = Some(0.8);
+        let resolved = cfg.resolve().expect("a right antenna clock resolves");
+
+        assert_eq!(
+            resolved.antenna_durations,
+            [Some(Duration::from_millis(800)), None]
+        );
+        let staggered = [Duration::from_millis(800), Duration::from_millis(1500)];
+        for durations in [
+            resolved.up_durations(),
+            resolved.stow_durations(),
+            resolved.move_durations(),
+        ] {
+            assert_eq!(durations.antennas, staggered);
         }
     }
 
@@ -1389,11 +1518,13 @@ provenance = \"test fixture\"
                     "{name}: the {move_name} head clock is {:.3} s, under the {yaw_floor:.3} s cap-to-cap yaw floor",
                     durations.head.as_secs_f64(),
                 );
-                assert!(
-                    durations.antennas.as_secs_f64() >= antenna_floor,
-                    "{name}: the {move_name} antenna clock is {:.3} s, under the {antenna_floor:.3} s floor",
-                    durations.antennas.as_secs_f64(),
-                );
+                for (side, clock) in ["right", "left"].into_iter().zip(durations.antennas) {
+                    assert!(
+                        clock.as_secs_f64() >= antenna_floor,
+                        "{name}: the {move_name} {side} antenna clock is {:.3} s, under the {antenna_floor:.3} s floor",
+                        clock.as_secs_f64(),
+                    );
+                }
             }
         }
     }
@@ -1436,6 +1567,33 @@ provenance = \"test fixture\"
         );
         assert_eq!(resolved.timing.baud, DEFAULT_BAUD);
         assert_eq!(resolved.timing, BusTiming::default());
+    }
+
+    /// The settle tolerance resolves to radians, sits under the tracking
+    /// threshold, and is the same distance disarming counts as being at stow.
+    ///
+    /// The last of those is the point: both ask where the machine physically
+    /// is once the goal stopped moving, and two different answers in one file
+    /// would be a distinction nobody chose. Tracking asks something else — how
+    /// far behind a *moving* goal is tolerable — and is wider on purpose, so a
+    /// settle tolerance at or above it would be met by joints the tick is about
+    /// to fault over.
+    #[test]
+    fn the_settle_tolerance_is_the_distance_this_machine_counts_as_arrived() {
+        let resolved = minimal()
+            .resolve()
+            .expect("the minimal configuration resolves");
+        assert!((resolved.settle.tolerance - 2f64.to_radians()).abs() < 1e-15);
+        assert!((resolved.settle.tolerance - resolved.disarm.tolerance).abs() < 1e-15);
+        assert!(
+            resolved.settle.tolerance < resolved.motion.tracking.threshold_rad,
+            "{} against a {} threshold",
+            resolved.settle.tolerance,
+            resolved.motion.tracking.threshold_rad
+        );
+        assert_eq!(resolved.settle.timeout, Duration::from_secs(2));
+        // Nothing in a file says where a trace goes; a command line does.
+        assert_eq!(resolved.trace, None);
     }
 
     #[test]
@@ -1664,12 +1822,18 @@ provenance = \"test fixture\"
         // Each key, mutated to something that is not a positive real number,
         // must come back naming itself. A key that silently accepted a zero
         // would put a zero step bound or a zero tick rate into the pump.
-        let cases: [Mutation; 16] = [
+        let cases: [Mutation; 20] = [
             ("motion.stow_duration_s", |c| {
                 c.motion.stow_duration_s = 0.0;
             }),
             ("motion.antenna_duration_s", |c| {
                 c.motion.antenna_duration_s = Some(0.0);
+            }),
+            ("motion.antenna_duration_right_s", |c| {
+                c.motion.antenna_duration_right_s = Some(-0.8);
+            }),
+            ("motion.antenna_duration_left_s", |c| {
+                c.motion.antenna_duration_left_s = Some(f64::INFINITY);
             }),
             ("motion.up_duration_s", |c| c.motion.up_duration_s = -1.0),
             ("motion.move_duration_s", |c| {
@@ -1710,6 +1874,12 @@ provenance = \"test fixture\"
             }),
             ("disarm.tolerance_deg", |c| {
                 c.disarm.tolerance_deg = 0.0;
+            }),
+            ("settle.tolerance_deg", |c| {
+                c.settle.tolerance_deg = 0.0;
+            }),
+            ("settle.timeout_s", |c| {
+                c.settle.timeout_s = -1.0;
             }),
         ];
         for (key, mutate) in cases {

@@ -151,6 +151,22 @@ move_duration_s = 3.0
 # bench that sets this at all wants at least 1.57 s to avoid being stretched
 # there on the wide sweeps.
 # antenna_duration_s = 1.5
+# One clock per antenna, overriding `antenna_duration_s` for that side alone;
+# omit a side to leave it on whatever the line above resolves to. Each side
+# resolves independently: its own key, else `antenna_duration_s`, else the
+# head-group duration of the move.
+#
+# What they are for is staggering the pair. The two antennas sweep inboard over
+# the head, and their arcs cross; on one clock both tips reach that crossing at
+# the same instant and can meet there instead of sliding past, which stalls the
+# servos. Two clocks a tenth of a second apart put one tip through the crossing
+# before the other arrives. Something of the shape 0.8 and 0.7 is the intent —
+# a stagger comparable to the time a tip spends near the crossing, not a
+# measured figure. Each side still has to clear the floor for its own sweep
+# against `max_step_antennas_rad`, and each is stretched on its own if it does
+# not, so a stagger set too tight survives as a stagger.
+# antenna_duration_right_s = 0.8
+# antenna_duration_left_s = 0.7
 # How long `hold` watches the machine before returning: long enough for a
 # tracking fault or a health latch to appear in, short enough that a supervised
 # operator is not left waiting on a command that does nothing by design.
@@ -212,6 +228,22 @@ tolerance_deg = 2.0
 # than where it was the instant the stow trajectory ended — a joint still
 # closing the lag its position loop runs is not a joint away from stow.
 dwell_s = 2.0
+
+[settle]
+# How a move decides the machine has actually got where it was sent. A finished
+# trajectory means the last goal has gone out, not that the servos are there yet:
+# a move commanded over a hundredth of a second reports its commanding over in a
+# twentieth, with the head still rising. The loop keeps reading — commanding
+# nothing — until every joint is this close to the goal it was left on, and the
+# report carries both instants so the gap is visible.
+#
+# The same figure as the disarm tolerance, for the same reason: it is the
+# distance at which this machine counts as being where it was told to be.
+tolerance_deg = 2.0
+# How long that is waited for. A joint that never arrives ends the move with
+# which joint and how far out it was — a report, not a fault: nothing here gates
+# or delays releasing torque.
+timeout_s = 2.0
 
 [provision]
 # What the servos must already hold for this project to command them at all.

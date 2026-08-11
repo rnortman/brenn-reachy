@@ -11,11 +11,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use dxl_proto::frame::{
-    HEADER, INST_PING, INST_READ, INST_STATUS, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE,
+    HEADER, INST_PING, INST_READ, INST_REBOOT, INST_STATUS, INST_SYNC_READ, INST_SYNC_WRITE,
+    INST_WRITE,
 };
 use dxl_proto::{Reg, crc16, rad_to_counts};
 use reachy_bus::{BusPort, ServoMap, reg_for};
@@ -27,6 +30,22 @@ use crate::pump::Clock;
 
 /// A rail comfortably over the arm floor, in the register's tenths of a volt.
 const HEALTHY_RAIL: u16 = 118;
+
+/// A path in the system temporary directory that nothing else in this run is
+/// using, ending in `name`.
+///
+/// One scheme rather than one per module: the crate's tests run in parallel in
+/// one process, so uniqueness has to hold across all of them at once, and a
+/// counter they share is what gives that. The caller names what the file is
+/// for, so one left behind by a panic says which test left it.
+pub(crate) fn scratch_path(name: &str) -> PathBuf {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    std::env::temp_dir().join(format!(
+        "reachy-bench-{}-{}-{name}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// A scripted machine: nine servos with a register file, answering pings, reads
 /// and writes over the port seam.
@@ -65,10 +84,23 @@ pub(crate) struct FakeMachine {
     pub(crate) delay: HashMap<u8, usize>,
     /// Goals written to a delayed servo and not yet reached, oldest first.
     queued: HashMap<u8, VecDeque<Vec<u8>>>,
+    /// Per servo, how many counts it closes on its goal each time its position
+    /// is read: a servo that arrives *over time* rather than on the write that
+    /// commanded it. A goal write moves one of these nowhere by itself, which is
+    /// what makes the periods after a trajectory ends visible — the machine
+    /// still on its way to a goal that has stopped moving.
+    pub(crate) creep: HashMap<u8, i32>,
     /// Servos that take their goals and do not move: a stalled motor, or a
     /// write the servo never applied. Nothing on the wire distinguishes the
     /// two, which is why the tick watches positions at all.
     pub(crate) stalled: Vec<u8>,
+    /// Servos that acknowledge a reboot and are never heard from again: a
+    /// restart that did not come back.
+    pub(crate) gone_on_reboot: Vec<u8>,
+    /// Servos the reboot instruction never reaches — a frame lost or corrupted
+    /// on the wire. They answer nothing to it and go on holding what they were
+    /// holding, which is exactly how a servo that restarted answers a ping.
+    pub(crate) deaf_to_reboot: Vec<u8>,
     out: VecDeque<u8>,
 }
 
@@ -85,7 +117,10 @@ impl FakeMachine {
             unmirrored: Vec::new(),
             delay: HashMap::new(),
             queued: HashMap::new(),
+            creep: HashMap::new(),
             stalled: Vec::new(),
+            gone_on_reboot: Vec::new(),
+            deaf_to_reboot: Vec::new(),
             out: VecDeque::new(),
         }
     }
@@ -138,6 +173,7 @@ impl FakeMachine {
             }
             if self.torqued(id)
                 && !self.stalled.contains(&id)
+                && !self.creep.contains_key(&id)
                 && let Some(reached) = self.arriving(id, &data)
             {
                 self.regs
@@ -162,6 +198,46 @@ impl FakeMachine {
             return queue.pop_front();
         }
         None
+    }
+
+    /// Move a creeping servo one step of its own toward the goal it holds.
+    ///
+    /// Called on every read of its position, which is once per control period,
+    /// so a step is per period and the servo arrives after as many periods as
+    /// the distance divides into. A servo without a creep set, without torque,
+    /// or with either register unwritten stands exactly where it was.
+    fn crept(&mut self, id: u8) {
+        let Some(step) = self.creep.get(&id).copied() else {
+            return;
+        };
+        if !self.torqued(id) {
+            return;
+        }
+        let (Some(at), Some(to)) = (
+            self.counts(id, RegId::PresentPosition),
+            self.counts(id, RegId::GoalPosition),
+        ) else {
+            return;
+        };
+        let remaining = to - at;
+        let moved = if remaining > step {
+            step
+        } else if remaining < -step {
+            -step
+        } else {
+            remaining
+        };
+        self.set(
+            id,
+            reg_for(RegId::PresentPosition),
+            &(at + moved).to_le_bytes(),
+        );
+    }
+
+    /// What `id`'s four-byte position register holds, as the signed count it is.
+    fn counts(&self, id: u8, reg: RegId) -> Option<i32> {
+        let bytes: [u8; 4] = self.get(id, reg_for(reg))?.try_into().ok()?;
+        Some(i32::from_le_bytes(bytes))
     }
 
     /// Whether this servo answers a read of `addr` at all, spending one count
@@ -240,6 +316,9 @@ impl BusPort for FakeMachine {
                 if self.hushed(id, addr) {
                     return Ok(());
                 }
+                if addr == reg_for(RegId::PresentPosition).addr {
+                    self.crept(id);
+                }
                 let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
                 let source = self.source(id, addr);
                 let mut value = self.regs.get(&(id, source)).cloned().unwrap_or_default();
@@ -255,6 +334,26 @@ impl BusPort for FakeMachine {
                 // A write is acknowledged with no parameters at all.
                 self.reply(id, error, &[]);
             }
+            INST_REBOOT => {
+                // A servo the instruction never reached answers nothing and
+                // restarts nothing: it is still there, still holding, and a
+                // ping cannot tell it from one that came back.
+                if self.deaf_to_reboot.contains(&id) {
+                    return Ok(());
+                }
+                // Acknowledged with no parameters, then the servo restarts: it
+                // comes back with Torque Enable cleared, holding nothing. The
+                // position register and the latched hardware-error byte are
+                // left exactly as they were — what a restart does to either is
+                // not something this project has established on its own
+                // hardware, so the fixture claims nothing about it.
+                self.reply(id, 0, &[]);
+                if self.gone_on_reboot.contains(&id) {
+                    self.silent.push(id);
+                    return Ok(());
+                }
+                self.set(id, reg_for(RegId::TorqueEnable), &[0]);
+            }
             INST_SYNC_READ => {
                 // Broadcast: address, width, then the servos asked. Each answers
                 // in the order it was asked, and a silent one does not.
@@ -263,6 +362,9 @@ impl BusPort for FakeMachine {
                 for &asked in &params[4..] {
                     if self.hushed(asked, addr) {
                         continue;
+                    }
+                    if addr == reg_for(RegId::PresentPosition).addr {
+                        self.crept(asked);
                     }
                     let error = self.errors.get(&(asked, addr)).copied().unwrap_or(0);
                     let source = self.source(asked, addr);
