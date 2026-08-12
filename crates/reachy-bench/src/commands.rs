@@ -2074,7 +2074,12 @@ mod tests {
     fn an_obstruction_that_defeats_the_stow_ends_with_torque_off() {
         let cfg = resolved();
         let mut machine = machine_at(&datumed_config(), &stow_legs());
-        machine.stalled.push(cfg.map.ids()[2]);
+        // The whole head group: the six cranks drive one rigid body through a
+        // parallel linkage, so a hand on the head holds all of them, and the
+        // pose they report between them stays one the machine can hold.
+        for leg in 1..=6 {
+            machine.stalled.push(cfg.map.ids()[leg]);
+        }
         let run = run(machine, |port, clock, line| up(&cfg, port, clock, line));
 
         let error = run.err("a servo that takes its goals and does not move");
@@ -2976,7 +2981,7 @@ mod tests {
         let (turn_at, ticks) = (20, *ran.borrow());
         assert!(
             ticks >= turn_at + periods(cfg.stow_duration)
-                && ticks < turn_at + periods(cfg.up_duration),
+                && ticks < turn_at + 2 * periods(cfg.stow_duration),
             "the fold ran on the fold's clock: {ticks} periods, turned at {turn_at}, fold {}, \
              raise {}",
             periods(cfg.stow_duration),
@@ -4169,7 +4174,8 @@ mod tests {
 
     /// An orderly release that does not finish takes the immediate one.
     ///
-    /// The doctrine's MRM-A → MRM-B fall-through, and the state it exists for:
+    /// The doctrine's fall-through to `immediate_all_torque_off`, and the state
+    /// it exists for:
     /// a walk that stopped part way through has left some servos holding with
     /// no sequence driving them. The error the caller gets back is the one that
     /// made the release necessary; what it must never get back is that error

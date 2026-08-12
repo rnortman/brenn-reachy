@@ -26,6 +26,7 @@ help:
 	@echo "REACHY_HOST naming a reachable unit:"
 	@echo "  make bench-build     the aarch64 binary, built in the pinned container"
 	@echo "  make bench-config    push the bench's configuration into the unit's RAM"
+	@echo "  make bench-run       build, push, run the bench on the unit (ARGS=...)"
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
 	@echo "  make bench-fetch     bring a run's state file back, timestamped"
 
@@ -60,6 +61,25 @@ check-scripts:
 	git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -x -P SCRIPTDIR --
 	shellcheck -x -P SCRIPTDIR -- .githooks/pre-commit .githooks/pre-push
 
+# The scripts' own self-checks: a `*.test.sh` beside the script it exercises,
+# run as a plain program, exit status is the verdict. They stub the commands
+# that reach a device, so they touch no hardware and no network and belong in
+# the gate beside the Rust tests.
+#
+# Their decisions are refusals — a stale binary, a held bus — and a refusal
+# that stops working is a refusal nobody notices until a bench night is spent
+# on the run it should have stopped.
+#
+# The set arrives NUL-separated for the reason the shellcheck sweep's does, and
+# through a loop rather than xargs because each script is a program to run
+# rather than an argument to one.
+.PHONY: test-scripts
+test-scripts:
+	@while IFS= read -r -d '' script; do \
+	    echo "$$script"; \
+	    "./$$script"; \
+	done < <(git ls-files -z '*.test.sh')
+
 # The whole gate. One workspace at the repo root, every crate a default member,
 # so --workspace and a bare invocation cover the same set.
 #
@@ -69,7 +89,7 @@ check-scripts:
 # The scripts go first: they are seconds of work, and a broken deploy script is
 # not something to discover after a full test run.
 .PHONY: check
-check: check-scripts
+check: check-scripts test-scripts
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
@@ -167,6 +187,19 @@ bench-build:
 .PHONY: bench-config
 bench-config: bench-host
 	tools/deploy-bench.sh $(REACHY_HOST) --config $(BENCH_CONFIG)
+
+# Build, push, and run the bench on the unit. ARGS is the command and its
+# arguments, passed verbatim:
+#
+#     make bench-run ARGS="up --trace /var/lib/brenn-app/reachy-trace.csv"
+#
+# The build is a prerequisite rather than a step to remember, which is what
+# makes this the entry point that cannot go stale — deploy-bench.sh refuses a
+# binary older than the newest commit, and this target is why that refusal
+# should never fire.
+.PHONY: bench-run
+bench-run: bench-host bench-build
+	tools/deploy-bench.sh $(REACHY_HOST) --run $(ARGS)
 
 # Build, push, and run the read-only self-test registry on the unit. ARGS is
 # passed to the bench verbatim.

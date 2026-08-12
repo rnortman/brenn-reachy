@@ -71,31 +71,43 @@ health_poll_hz = 1
 # Per-tick step bounds. What they bound is the plan: a goal past one of them
 # abandons the move where it stands and is never clamped and sent. The machine
 # keeps its torque — a step this wide is a planner defect, not a motor that
-# stopped answering. A shaped move's
-# peak rate is 1.875 times its average, so a two-second move spanning a crank's
-# whole 2.2 rad window peaks near 0.041 rad per tick at 50 Hz.
-max_step_legs_rad = 0.05
-max_step_body_yaw_rad = 0.05
-# An antenna sweeps the way round that misses its own outboard sideways point,
-# so the longest sweep it can be asked for is just under a full turn — 6.28 rad,
-# which peaks at exactly this bound over a 1.57 s move at 50 Hz. Shorter sweeps
-# need less: the stow-to-neutral presence arc is 3.23 rad (0.81 s), and
-# re-stowing an antenna left just inboard of sideways is 4.80 rad (1.21 s).
-# Whatever `antenna_duration_s` below resolves to has to clear the floor for the
-# sweep being asked for, because exceeding this bound kills the move, and no
-# antenna reaches where it was going.
-max_step_antennas_rad = 0.15
+# stopped answering. A shaped move's peak rate is 1.875 times its average, and
+# the loop advances a move by at most one period of its clock however late it
+# wakes, so what a bound has to admit is the plan's own peak and nothing on top
+# of it.
+#
+# Measured: the validated 0.8 s presence gesture plans 0.067 rad per leg per
+# 50 Hz period, and this is better than twice that.
+max_step_legs_rad = 0.15
+# Analogy rather than measurement — no yaw speed trial has been run. The body
+# yaw is the legs' servo model, unloaded and moving linearly in its own
+# coordinate, so it carries their figure until a supervised fold measures its
+# own.
+max_step_body_yaw_rad = 0.15
+# The fastest sweep on record — an antenna crossing 3.22 rad in 0.3 s, 855°/s —
+# plans a peak of 0.403 rad per period at 50 Hz; this is better than half as
+# much again. An antenna sweeps the way round that misses its own outboard
+# sideways point, so the longest sweep it can be asked for is just under a full
+# turn — 6.28 rad, which needs 0.36 s to stay inside this bound. Shorter sweeps
+# need less: the stow-to-neutral presence arc is 3.23 rad (0.19 s), and
+# re-stowing an antenna left just inboard of sideways is 4.80 rad (0.28 s).
+# Whatever the antenna durations below resolve to has to clear the floor for the
+# sweep being asked for, or the clock is stretched to fit before the move goes
+# out.
+max_step_antennas_rad = 0.65
 # The tracking fault, in three numbers. A joint further than the threshold from
 # its goal is examined; over a window of that many ticks it must close at least
 # the progress minimum on where its goal lies, or the tick faults and stops
-# commanding. Distance alone says nothing: these servos run a proportional loop
-# with no integral term, so a joint chasing a streamed goal sits behind it in
-# proportion to commanded speed — 0.43 rad on an antenna moving at 4.91 rad/s,
-# while following it perfectly. Closing is what separates that from a stall.
+# commanding. Distance alone says nothing: what the gains below close is a
+# standing error and not a moving one, so a joint chasing a streamed goal sits
+# behind it in proportion to commanded speed — 0.43 rad on an antenna moving at
+# 4.91 rad/s, while following it perfectly. Closing is what separates that from
+# a stall.
 #
-# The threshold and the window stay provisional, sized rather than measured;
-# every move records its per-joint worst lag, and those are the numbers that
-# will ground them. It is independent of the step bounds above, and may be set
+# The threshold is measured: 28.6° of crank is better than twice the worst lag
+# any head joint ran at on a healthy recorded gesture, 0.245 rad on a loaded leg
+# whose goal was moving at 3.3 rad/s. The window stays sized rather than
+# measured. The threshold is independent of the step bounds above and may be set
 # anywhere without regard to them: progress is measured from where a joint stood
 # when its lag began, and a goal that moves to the far side of that point
 # restarts the measurement there rather than reading a following joint as one
@@ -103,9 +115,32 @@ max_step_antennas_rad = 0.15
 # the servos' 0.088° counts: over ten ticks at 50 Hz it asks a lagging joint for
 # 0.05 rad/s of closing speed, an order of magnitude under the fastest leg
 # motion this bench commands.
-tracking_threshold_rad = 0.15
+tracking_threshold_rad = 0.5
 tracking_progress_min_rad = 0.01
 tracking_ticks = 10
+# The antennas' tip crossing, in two numbers. The two rods sweep in planes a
+# little either side of the skull's centre line and their arcs cross over the
+# head; a pair arriving there together meets tip to tip instead of passing,
+# which stalls both servos until an overload latches. The resolver measures
+# every commanded pair where their arcs cross and lengthens the later side
+# until they are far enough apart in phase — see the antenna clocks below.
+#
+# The band is how near vertical a tip has to be for the two to be able to touch
+# at all: 60° either side, the crossing itself with a margin around the four
+# degrees of spread the recorded stalls covered (every one sat between 52° and
+# 56°). The separation is how far from mirrored the pair has to stand when the
+# second of them reaches that edge, and it bounds the *plan* rather than the
+# tips: 0.60 rad is 34° of commanded angle, measured off the two recorded
+# pairs — the clocks that clashed (0.8 s against 0.7 s) plan an offset that
+# never exceeds 0.44 rad anywhere on the sweep, and the clocks that swept clean
+# (0.7 s against 0.3 s) plan 0.88 rad at the edge. The tips' own separation is
+# smaller than the plan's, because the servos lag.
+#
+# Both are the geometry of one machine, measured on one machine: a different
+# rod length or rotor spacing moves them, and a re-measurement after a soak is
+# a line here rather than a library change.
+antenna_contact_band_rad = 1.0471975511965976
+antenna_phase_separation_rad = 0.6
 # Consecutive ticks with no position read before the read-loss fault. Omit for
 # one second at the tick rate.
 read_loss_ticks = 50
@@ -116,32 +151,41 @@ read_loss_ticks = 50
 # in. The path is unchanged; it is traversed more slowly. So a duration set too
 # low costs a slower move and a line of output, never a fault mid-travel.
 #
+# The clock a move actually runs on is whichever is longer of the one asked for
+# here and the floor for the span it covers. There is no band between the two
+# where a move is quietly slowed, and nothing is added on top of the floor to
+# cover the loop's own timing: a period that starts late advances the move by
+# one period like any other, so lateness delays the arrival and cannot enlarge
+# a step. A run's summary line reports the slip that cost.
+#
 # What the floors are still for is knowing when that happens. The head group's
-# is 1.07 s: below that a stow-to-neutral move steps a leg further in one 50 Hz
+# is 0.36 s: below that a stow-to-neutral move steps a leg further in one 50 Hz
 # period than `max_step_legs_rad` allows. Derived by sampling the move through
 # the IK at tick rate, and pinned by a reachy-motion unit test, so it moves only
-# when the geometry or the tick rate does. A configuration test checks the three
-# values here against it, so the shipped durations are the ones no ordinary
-# command has to be stretched out of.
+# when the geometry, the tick rate or that bound does. A configuration test
+# checks the three values here against it, so the shipped durations are the ones
+# no ordinary command has to be stretched out of.
 #
 # The *yaw* has a floor of its own, and it is the one that moves: the body turns
 # through whatever angle is asked, against `max_step_body_yaw_rad`, so the floor
-# is 37.5 × the sweep in radians ÷ 50, and it is the whole sweep that counts —
+# is 1.875 × the sweep in radians ÷ (`max_step_body_yaw_rad` × 50) — written out
+# rather than reduced to one number, because that number moves with the bound
+# and a stale one is worse than the arithmetic. It is the whole sweep that counts —
 # not the head group's usual travel. Stowing from the 60° cap this file sets
-# needs 0.79 s, and the widest sweep a command can lawfully ask for — cap to
-# cap — needs 1.57 s, which the configuration test checks these durations
+# needs 0.26 s, and the widest sweep a command can lawfully ask for — cap to
+# cap — needs 0.52 s, which the configuration test checks these durations
 # against. Where the machine physically *stands* is not capped, though: stowing
 # from a body a hand spun to the half turn while the machine lay limp needs
-# 2.36 s, well past `stow_duration_s = 2.0`, and that fold is the one the
-# stretch exists for. A stretched clock is sized past the bare floor rather than
-# onto it — a control loop that begins a period late covers more of the path in
-# it, and a clock with no headroom would fault on that alone — so the fold takes
-# something over four seconds instead of two, once, and lands.
+# 0.79 s. The calm stow below carries that outright; a quicker gesture's clock
+# would not, and the stretch is what turns it into a slower fold rather than a
+# move abandoned partway round.
 stow_duration_s = 2.0
-# Longer than the stow move: the lift is the one motion that starts from a
-# configuration close to a singular one, and there is no reason for it to be
-# quick.
-up_duration_s = 3.0
+# The validated presence gesture: measured on the machine, arriving with no
+# settling period after the last goal went out. The lift is the one motion that
+# starts from a configuration close to a singular one, so it is the one worth
+# measuring rather than guessing at — and measured, the head is physically up in
+# 0.6 s, with shaped motion costing only the difference.
+up_duration_s = 0.8
 # A yaw or an antenna command moves joints that carry no load and pass through
 # no near-singular configuration, so the length is a matter of what is
 # comfortable to watch rather than of mechanics.
@@ -153,7 +197,7 @@ move_duration_s = 3.0
 # antennas sweep three times as far as the head does on the same move. The floor
 # is the sweep being commanded against `max_step_antennas_rad` above, and the
 # `antennas` command here can be asked for anything up to a full turn, so a
-# bench that sets this at all wants at least 1.57 s to avoid being stretched
+# bench that sets this at all wants at least 0.36 s to avoid being stretched
 # there on the wide sweeps.
 # antenna_duration_s = 1.5
 # One clock per antenna, overriding `antenna_duration_s` for that side alone;
@@ -163,15 +207,33 @@ move_duration_s = 3.0
 #
 # What they are for is staggering the pair. The two antennas sweep inboard over
 # the head, and their arcs cross; on one clock both tips reach that crossing at
-# the same instant and can meet there instead of sliding past, which stalls the
-# servos. Two clocks a tenth of a second apart put one tip through the crossing
-# before the other arrives. Something of the shape 0.8 and 0.7 is the intent —
-# a stagger comparable to the time a tip spends near the crossing, not a
-# measured figure. Each side still has to clear the floor for its own sweep
+# the same instant and meet there instead of sliding past, which stalls both
+# servos and latches an overload — the one collision on record, and it recurred
+# about one inboard sweep in three. What separates the tips is a large ratio
+# between the two clocks rather than a fixed offset between them: the pair
+# commented out below is the one that swept clean, and the pair that clashed was
+# 0.8 against 0.7. Each side still has to clear the floor for its own sweep
 # against `max_step_antennas_rad`, and each is stretched on its own if it does
 # not, so a stagger set too tight survives as a stagger.
-# antenna_duration_right_s = 0.8
-# antenna_duration_left_s = 0.7
+#
+# Setting them is not what makes the pair safe. The separation is enforced: a
+# move that carries both antennas across the edge of the contact band is
+# measured there, and a pair too near in phase has its later side lengthened
+# until it is not — on whatever clocks the command resolved to, after any
+# floor stretch, and it says which of the two it did. So the shipped
+# configuration leaves these omitted, the pair rides the head clock, and the
+# resolver parts it; a mirrored 0.8 s gesture costs one antenna a clock near
+# a second, and nothing else. Set them when a particular stagger is wanted,
+# not to avoid the collision.
+#
+# What the enforcement does not cover is a sweep with no band edge to measure
+# at: both tips already inside the band and staying there, or one parked inside
+# it while the other sweeps through — where delaying the moving side cannot
+# change a stationary tip's angle. Those fall to the servos' own overload
+# protection, the degrade that takes the pair out of service without disturbing
+# the head, and `reachy-bench reboot` to clear the latch.
+# antenna_duration_right_s = 0.7
+# antenna_duration_left_s = 0.3
 # How long `hold` watches the machine before returning: long enough for a
 # tracking fault or a health latch to appear in, short enough that a supervised
 # operator is not left waiting on a command that does nothing by design.
@@ -195,38 +257,47 @@ voltage_budget_s = 30.0
 goal_shadow_tolerance_deg = 2.0
 
 # Position gains, written fresh at every arm because they live in RAM and
-# power-on clears them. The values the vendor's own stack writes at startup,
-# which is the only evidence anyone has about what this linkage wants. Integral
-# and derivative are zero: the load is a linkage holding a head up against
-# gravity, and the proportional term plus the servo's own profile is what shapes
-# it.
-leg_gains = { p = 300, i = 0, d = 0 }
+# power-on clears them.
+#
+# Tuned on the bench against recorded step responses, except the yaw, which
+# carries the value the vendor's own stack writes at startup: nothing has ever
+# implicated it. A proportional term alone cannot hold the head's weight up this
+# linkage — at the vendor's P-only 300 the two most loaded cranks park 3.9–4.3°
+# short of their goal and stay there. The integral term is what closes that
+# (measured: inside 1.3°) and the derivative term is what stops it hunting. The
+# antennas hold nothing up, so they have no standing error to integrate away;
+# what they need is enough stiffness to carry a 0.3 s sweep.
+#
+# One machine's measurement. A second unit's linkage friction and antenna
+# balance are its own, and these are the numbers to re-derive first if it
+# behaves differently.
+leg_gains = { p = 800, i = 100, d = 300 }
 yaw_gains = { p = 200, i = 0, d = 0 }
-antenna_gains = { p = 200, i = 0, d = 0 }
+antenna_gains = { p = 500, i = 0, d = 100 }
 
 # The servo-side motion profile, the backstop under host-side shaping. No
 # default: host-side interpolation is what makes motion gentle, and this is what
 # bounds a goal step the host got wrong, so it has to be sized against the moves
 # this bench actually makes rather than invented.
 #
-# Provisional, from arithmetic and not from a measurement. Velocity is in units
-# of 0.229 rev/min: the fastest motion this bench can command is an antenna's
-# half-turn sweep in two seconds — every antenna target resolves to within half a
-# turn of the frame — whose shaped peak is 2.95 rad/s, or 28.1 rev/min, or 123
-# units, and 300 leaves better than double that while still stopping a full-scale
-# jump. Acceleration is in units of 214.577 rev/min²: the same sweep peaks at
-# 4.53 rad/s², or 12.1 units, and 50 is four times that. Both want revisiting
-# against what the first supervised arm measures.
-profile_acceleration = 50
-profile_velocity = 300
+# Trial-validated: the values the bench ran its speed trials at, including the
+# 855°/s antenna sweep and the 0.8 s gesture. Sized generously on purpose. A
+# profile tight enough to be a meaningful second bound on a host-side step is
+# also tight enough to throttle the shaped motion itself, and a gesture the
+# servos are quietly slewing rather than following is one whose recorded timing
+# says nothing about the plan. Velocity is in units of 0.229 rev/min and
+# acceleration in units of 214.577 rev/min².
+profile_acceleration = 400
+profile_velocity = 600
 
 [disarm]
 # How far a joint may be from its stow angle and still count as being at stow.
 # Deliberately tighter than the tracking threshold, because the two ask different
 # questions: tracking asks whether the position loop is keeping up with a moving
 # goal, this asks where the head physically is before the thing holding it up is
-# switched off. Provisional — what error the legs settle to under the head's
-# weight at stow has not been measured.
+# switched off. Measured: at the leg gains above, the most loaded cranks settle
+# 1.0–1.3° short of where they were sent, so this leaves them room and not much
+# more.
 tolerance_deg = 2.0
 # How long the platform is left to settle before it is measured against stow.
 # The settle runs first, so the check judges where the head came to rest rather

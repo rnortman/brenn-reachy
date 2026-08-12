@@ -201,12 +201,29 @@ impl GroupGains {
 
 /// The gains this platform is armed with.
 ///
-/// The values the vendor's own stack writes at startup, which is the only
-/// evidence anyone has about what this linkage wants.
+/// Tuned on the bench against recorded step responses, except the yaw, which
+/// still carries the value the vendor's own stack writes at startup — nothing
+/// has ever implicated it.
 pub const DEFAULT_GAINS: GroupGains = GroupGains {
-    legs: Gains { p: 300, i: 0, d: 0 },
+    // A proportional term alone cannot hold the head's weight up this linkage:
+    // at the vendor's P-only 300 the two most loaded cranks park 3.9–4.3° short
+    // of their goal and stay there. The integral term is what closes that, and
+    // the derivative term is what stops it hunting; measured, the pair settles
+    // inside 1.3° with no oscillation.
+    legs: Gains {
+        p: 800,
+        i: 100,
+        d: 300,
+    },
     yaw: Gains { p: 200, i: 0, d: 0 },
-    antennas: Gains { p: 200, i: 0, d: 0 },
+    // Stiff enough to carry a 0.3 s sweep, which the vendor's 200 lags badly
+    // enough to overshoot the crossing. No integral term: an antenna holds
+    // nothing up, so there is no standing error to integrate away.
+    antennas: Gains {
+        p: 500,
+        i: 0,
+        d: 100,
+    },
 };
 
 /// The servo-side motion profile, the backstop under host-side shaping.
@@ -2393,27 +2410,34 @@ mod tests {
         }
     }
 
-    /// The legs are tuned harder than the joints carrying nothing, and both
-    /// cross the boundary as the gain span the wire layer writes.
+    /// The legs are tuned harder than the joints carrying nothing, and all
+    /// three cross the boundary as the gain span the wire layer writes.
+    ///
+    /// The legs are the only group with an integral term, and they are the only
+    /// group holding a weight up: the measured droop a proportional term alone
+    /// leaves is what that term is there to close, so a leg gain set without one
+    /// is the configuration that droop was measured on.
     #[test]
     fn gains_are_per_group() {
         let gains = DEFAULT_GAINS;
         assert_eq!(gains.for_joint(JointId::Leg(3)), gains.legs);
         assert_eq!(gains.for_joint(JointId::BodyYaw), gains.yaw);
         assert_eq!(gains.for_joint(JointId::AntennaLeft), gains.antennas);
-        assert!(gains.legs.p > gains.yaw.p);
+        assert!(gains.legs.p > gains.antennas.p);
+        assert!(gains.antennas.p > gains.yaw.p);
+        assert!(gains.legs.i > 0, "the loaded group integrates its error");
+        assert_eq!((gains.yaw.i, gains.antennas.i), (0, 0));
         for group in [gains.legs, gains.yaw, gains.antennas] {
-            assert_eq!((group.i, group.d), (0, 0));
             assert_eq!(
                 RegValue::from(group),
                 RegValue::Gains {
                     p: group.p,
-                    i: 0,
-                    d: 0
+                    i: group.i,
+                    d: group.d
                 }
             );
         }
-        assert_eq!(DEFAULT_GAINS.legs.to_string(), "P 300 I 0 D 0");
+        assert_eq!(DEFAULT_GAINS.legs.to_string(), "P 800 I 100 D 300");
     }
 
     /// The provisional thresholds are the values the comments say they are. A

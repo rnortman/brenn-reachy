@@ -27,7 +27,7 @@ use core::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use reachy_motion::{JointId, JointSet, JointVector};
+use reachy_motion::{JointId, JointSet, JointVector, PhaseSeparation, PhaseWatch, mirror_offset};
 use thiserror::Error;
 
 use crate::config::{ARRIVED_TOLERANCE_DEG, ONE_COUNT_RAD};
@@ -268,6 +268,64 @@ impl Run {
     /// advance is a fresh move either way.
     fn follows(&self, next: &Sample) -> bool {
         self.samples.last().is_none_or(|last| next.tick > last.tick)
+    }
+
+    /// How far from mirrored the antennas stood when the second of them reached
+    /// the contact band, over one of the run's two series.
+    ///
+    /// The same measurement the resolver holds a planned pair to, taken over a
+    /// recording: `Sample::goal_of` reads what was commanded, which is what a
+    /// clock pair can be judged by, and `Sample::present_of` reads where the
+    /// tips actually were, which is what a collision is decided by. A period
+    /// missing either cell — a read that did not arrive, an antenna out of
+    /// service — is skipped rather than guessed at.
+    ///
+    /// The band is the configured one, so a recording is read against the same
+    /// geometry the live resolver measures against.
+    ///
+    /// `None` for a run that does not carry both antennas across the band's
+    /// edge, a pair jammed inside it included.
+    #[must_use]
+    pub fn separation(
+        &self,
+        contact_band_rad: f64,
+        cell: fn(&Sample, JointId) -> Option<f64>,
+    ) -> Option<PhaseSeparation> {
+        let mut watch = PhaseWatch::new(contact_band_rad);
+        for sample in &self.samples {
+            if let (Some(right), Some(left)) = (
+                cell(sample, JointId::AntennaRight),
+                cell(sample, JointId::AntennaLeft),
+            ) {
+                watch.look(sample.at, [right, left]);
+            }
+        }
+        watch.separation()
+    }
+
+    /// The widest the pair ever stood from mirrored over one of the run's
+    /// series, radians.
+    ///
+    /// What a clock pair is capable of, as against what it happened to be
+    /// showing at the band's edge: a pair whose widest is under the separation
+    /// the tips need is one no phasing of that shape ever clears.
+    ///
+    /// `None` when no period carried both cells — an antenna out of service, a
+    /// stretch of dropped reads, a column the writer left blank. A run nothing
+    /// was measured over is not a run that stood mirrored throughout, and a
+    /// caller asserting an upper bound on this figure has to be able to tell
+    /// the two apart.
+    #[must_use]
+    pub fn widest_offset(&self, cell: fn(&Sample, JointId) -> Option<f64>) -> Option<f64> {
+        self.samples
+            .iter()
+            .filter_map(|sample| {
+                Some(mirror_offset(
+                    cell(sample, JointId::AntennaRight)?,
+                    cell(sample, JointId::AntennaLeft)?,
+                ))
+            })
+            .reduce(f64::max)
     }
 
     /// Everything this run measured, joint by joint.
@@ -872,6 +930,43 @@ mod tests {
         let right = metrics.joint(JointId::AntennaRight).expect("it moved");
         assert!(!right.released);
         assert_eq!(right.residual, Some(0.2));
+    }
+
+    /// A run nothing could be measured over answers nothing, rather than the
+    /// zero a perfectly mirrored pair would read as.
+    ///
+    /// The widest offset is what a calibration asserts an upper bound against
+    /// — the clashing pair never gets near the shipped separation — and a fold
+    /// that starts at zero would let a run with an antenna out of service, or
+    /// a stretch of dropped reads, satisfy that bound by measuring nothing.
+    #[test]
+    fn a_pair_that_was_never_both_read_is_not_a_mirrored_pair() {
+        let mut released = JointSet::EMPTY;
+        released.insert(JointId::AntennaLeft);
+        let period = |tick: u64, released: JointSet| TickSample {
+            tick,
+            at: PERIOD * u32::try_from(tick).expect("a short run"),
+            present: Some(JointVector {
+                antennas: [1.2, -0.1],
+                ..JointVector::default()
+            }),
+            goal: JointVector {
+                antennas: [1.2, -0.1],
+                ..JointVector::default()
+            },
+            released,
+            settling: false,
+        };
+        let trace = parsed(&[period(0, released), period(1, released)]);
+        let run = trace.run(0).expect("one run");
+
+        assert_eq!(run.widest_offset(Sample::goal_of), None);
+        // The measurement the same run does carry, so the `None` above is
+        // about the missing goal cells and not about the run.
+        let measured = run
+            .widest_offset(Sample::present_of)
+            .expect("both antennas were read every period");
+        assert!((measured - 1.1).abs() < 1e-9, "{measured}");
     }
 
     /// Runs written under one number are still told apart, because the period

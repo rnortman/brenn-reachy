@@ -30,14 +30,15 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use dxl_proto::conv::COUNTS_PER_REV;
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
 use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, reg_for, with_retry};
 use reachy_kin::{
     FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose, stow_head_pose,
 };
 use reachy_motion::{
-    ArmRecord, EXPECTED_MODELS, JointId, JointVector, ProvisionExpect, ProvisionTable, RegId,
-    RegValue, VENDOR_HOMING_OFFSETS,
+    ArmRecord, EXPECTED_MODELS, JointGroup, JointId, JointVector, ProvisionExpect, ProvisionTable,
+    RegId, RegValue, VENDOR_HOMING_OFFSETS,
 };
 
 use crate::config::{BenchConfig, ConfigError, DatumSetting, positive};
@@ -106,6 +107,8 @@ pub enum Case {
     /// The provisioned homing offsets are the vendor's, so a converted count is
     /// the model's crank angle.
     Datum,
+    /// Each antenna is resting inside the one turn a boot fold leaves it in.
+    AntennaFold,
     /// The clearance the resting pose leaves from the linkage's singular
     /// configurations.
     RestMargins,
@@ -113,7 +116,7 @@ pub enum Case {
 
 impl Case {
     /// Every case, in run order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::PortOpen,
         Self::Presence,
         Self::Identity,
@@ -123,6 +126,7 @@ impl Case {
         Self::RestPose,
         Self::GoalShadow,
         Self::Datum,
+        Self::AntennaFold,
         Self::RestMargins,
     ];
 
@@ -139,6 +143,7 @@ impl Case {
             Self::RestPose => "rest-pose",
             Self::GoalShadow => "goal-shadow",
             Self::Datum => "datum",
+            Self::AntennaFold => "antenna-fold",
             Self::RestMargins => "rest-margins",
         }
     }
@@ -602,6 +607,7 @@ impl Registry {
         };
         self.goal_shadow(&mut bus, report);
         self.datum(&mut bus, report);
+        self.antenna_fold(&counts, report);
         self.rest_margins(&counts, report);
     }
 
@@ -962,6 +968,61 @@ impl Registry {
             report.push(CaseResult::fail(
                 Case::Datum,
                 format!("{}; {detail}", wrong.join("; ")),
+            ));
+        }
+    }
+
+    /// Each antenna's resting count against the single turn a boot fold leaves
+    /// it in.
+    ///
+    /// The antennas are the two joints in extended position mode, so their
+    /// position register counts turns rather than wrapping: a sweep past the
+    /// count frame's boundary keeps counting, and the register can stand
+    /// hundreds of turns from zero. Powering the servos up folds that count
+    /// back into one turn, and so does the `reboot` command — two power-on
+    /// observations and the reboot's own behaviour are what that is measured
+    /// on. Everything downstream assumes it: a resting antenna's converted
+    /// angle is where the antenna physically is exactly when the fold has
+    /// happened, and a sweep planned from a count several turns out is a sweep
+    /// several turns long.
+    ///
+    /// Read off the resting-pose sweep rather than asked for again — this is a
+    /// second question about the counts that case already recorded, and the
+    /// antennas are free rotors nothing is holding still between two reads.
+    ///
+    /// One reading of 545° immediately after a hard power cycle is on record
+    /// and unexplained. If this case fails, that observation has recurred, and
+    /// it is a person's to look at: the count frame is the datum every antenna
+    /// command is planned in, and a bound widened to admit an unfolded reading
+    /// would launder the anomaly into accepted behaviour.
+    fn antenna_fold(&self, counts: &[i32; JointId::COUNT], report: &mut Report) {
+        let mut readings = Vec::new();
+        let mut unfolded = Vec::new();
+        for (row, joint) in JointId::ALL.into_iter().enumerate() {
+            if joint.group() != JointGroup::Antennas {
+                continue;
+            }
+            let (id, count) = (self.ids[row], counts[row]);
+            let degrees = counts_to_rad(count).to_degrees();
+            readings.push(format!("{id}: {count} counts ({degrees:.3} deg)"));
+            if !(0..COUNTS_PER_REV).contains(&count) {
+                unfolded.push(format!(
+                    "servo {id}: {count} counts, {degrees:.3} deg, is outside the turn a fold \
+                     leaves"
+                ));
+            }
+        }
+
+        let detail = format!(
+            "against the {COUNTS_PER_REV}-count turn a fold leaves: {}",
+            readings.join("; ")
+        );
+        if unfolded.is_empty() {
+            report.push(CaseResult::pass(Case::AntennaFold, detail));
+        } else {
+            report.push(CaseResult::fail(
+                Case::AntennaFold,
+                format!("{}; {detail}", unfolded.join("; ")),
             ));
         }
     }
@@ -1413,6 +1474,115 @@ mod runner_tests {
             record.every_case_passed().is_err(),
             "a machine whose provisioning does not establish the datum arms nothing"
         );
+    }
+
+    /// An antenna resting outside the turn a boot fold leaves it in fails the
+    /// fold case, naming that servo and its reading.
+    ///
+    /// 8250 counts is the 545° one antenna reported immediately after a hard
+    /// power cycle on the bench — the one observation on record that says the
+    /// fold did not happen, and the reason this case exists. A run that meets it
+    /// again fails here rather than planning a sweep in a count frame a turn and
+    /// a half from the one the antenna is physically in.
+    #[test]
+    fn an_antenna_outside_its_turn_fails_the_fold_case_by_name() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(17, reg_for(RegId::PresentPosition), &8250i32.to_le_bytes());
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::AntennaFold), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("servo 17: 8250 counts"), "{printed}");
+        assert!(printed.contains("545.098 deg"), "{printed}");
+        // The other antenna is reported and not accused: a fold is per servo.
+        assert!(printed.contains("18: 2048 counts"), "{printed}");
+        assert!(!printed.contains("servo 18:"), "{printed}");
+        assert!(
+            report.into_record(1).every_case_passed().is_err(),
+            "a machine whose count frame is unknown arms nothing"
+        );
+    }
+
+    /// The fold case judges the two extended-position joints and nothing else.
+    ///
+    /// The seven others are single-turn joints whose registers cannot leave one
+    /// revolution, so a count outside it there is a reading to diagnose
+    /// elsewhere and not a fold that failed. Asserted with a leg parked at a
+    /// count no fold would leave, which the clearance case below it does object
+    /// to.
+    #[test]
+    fn the_fold_case_judges_only_the_antennas() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(13, reg_for(RegId::PresentPosition), &9000i32.to_le_bytes());
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::AntennaFold), Outcome::Pass);
+        let printed = report.to_string();
+        let line = printed
+            .lines()
+            .find(|line| line.starts_with(Case::AntennaFold.slug()))
+            .expect("the fold case printed a line");
+        assert!(line.contains("17:") && line.contains("18:"), "{line}");
+        assert!(!line.contains("13:"), "{line}");
+        assert_ne!(
+            report.outcome(Case::RestMargins),
+            Outcome::Pass,
+            "a leg nine thousand counts out is still a machine nobody should arm"
+        );
+    }
+
+    /// The turn's two edges are where the case turns over, counted exactly.
+    ///
+    /// The whole case is a boundary — a fold leaves a count in `[0, one turn)`
+    /// and anything else says the fold did not happen — so an off-by-one at
+    /// either end is the case admitting the reading it exists to catch. One
+    /// count past the turn is the shape the 545° anomaly took; one count below
+    /// zero is the same reading from the other side.
+    #[test]
+    fn the_fold_case_turns_over_at_the_edges_of_the_turn() {
+        for (count, expected) in [
+            (0, Outcome::Pass),
+            (COUNTS_PER_REV - 1, Outcome::Pass),
+            (-1, Outcome::Fail),
+            (COUNTS_PER_REV, Outcome::Fail),
+        ] {
+            let cfg = undatumed_config();
+            let mut machine = machine_at(&cfg, &stow_legs());
+            machine.set(17, reg_for(RegId::PresentPosition), &count.to_le_bytes());
+            let (report, _) = run(&cfg, machine);
+
+            assert_eq!(
+                report.outcome(Case::AntennaFold),
+                expected,
+                "{count} counts against the {COUNTS_PER_REV}-count turn"
+            );
+        }
+    }
+
+    /// Both antennas unfolded are both named, and the fold case is one line —
+    /// so the second one is not lost behind the first.
+    #[test]
+    fn two_unfolded_antennas_are_both_named_on_one_line() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(17, reg_for(RegId::PresentPosition), &6000i32.to_le_bytes());
+        machine.set(
+            18,
+            reg_for(RegId::PresentPosition),
+            &(-100i32).to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::AntennaFold), Outcome::Fail);
+        let printed = report.to_string();
+        let line = printed
+            .lines()
+            .find(|line| line.starts_with(Case::AntennaFold.slug()))
+            .expect("the fold case printed a line");
+        assert!(line.contains("servo 17: 6000 counts"), "{line}");
+        assert!(line.contains("servo 18: -100 counts"), "{line}");
     }
 
     /// The clearance case reads the resting counts under the bare conversion and

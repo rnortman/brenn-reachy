@@ -3,7 +3,7 @@
 # Put the built bench binary on a device and run it there.
 #
 #   tools/deploy-bench.sh <host> --config <file>
-#   tools/deploy-bench.sh <host> --run [args...]
+#   tools/deploy-bench.sh <host> --run [--stale-ok] [args...]
 #   tools/deploy-bench.sh <host> --fetch <dir>
 #
 #   --config  push the bench's configuration into the account's home on the
@@ -11,7 +11,11 @@
 #             rarely and a bench session is many runs.
 #   --run     run the binary out of the pushed release, as the account the
 #             payload runs as, with everything after --run passed to it
-#             verbatim. Pushes the binary first.
+#             verbatim. Pushes the binary first, and refuses a binary older
+#             than the newest commit to the workspace.
+#   --stale-ok  run the old binary anyway. This script's own flag, so it has to
+#             be the first token after --run; everything from the next one on
+#             belongs to the bench.
 #   --fetch   copy the state file the bench writes back to a local directory,
 #             named for the moment it was fetched so a session's runs
 #             accumulate rather than overwrite.
@@ -49,8 +53,48 @@ service=brenn-app.service
 # bench run at the wrong moment meets a held port rather than a free one.
 motiond_service=reachy-motiond.service
 
+# What the device binary is built out of. The container definition is in it:
+# the builder image is named for that file's content, so editing it produces a
+# different toolchain and a different binary.
+workspace_paths=(crates containers Cargo.toml Cargo.lock rust-toolchain.toml)
+
 usage() {
-	die "usage: ${prog} <host> --config <file>|--run [args...]|--fetch <dir>"
+	die "usage: ${prog} <host> --config <file>|--run [--stale-ok] [args...]|--fetch <dir>"
+}
+
+# Refuse a device binary built before the newest commit that touched the
+# workspace.
+#
+# The trap this closes cost a bench night: `bench-build` was taken for a
+# once-per-session step, and a run whose findings looked like the machine's was
+# reading a binary several commits old. Commit time against file time catches
+# exactly that — it does not catch uncommitted edits, which is why `make
+# bench-run` builds first and is the entry point to prefer.
+#
+# The rebuild this prescribes is what clears it, always: build-bench.sh stamps
+# the artifact once it has verified it, because cargo leaves an output it did
+# not have to relink untouched and a commit that changes no linked code would
+# otherwise leave a current binary refused with no way through but --stale-ok.
+#
+# A tree with no history for those paths (a tarball, a shallow clone that
+# excluded them) is not evidence of staleness, so it says what it could not
+# decide and runs.
+freshness() {
+	local commit built
+	commit=$(git -C "$repo_root" log -1 --format=%ct -- "${workspace_paths[@]}" 2>/dev/null) || commit=
+	if [ -z "$commit" ]; then
+		echo "${prog}: no commit history for the workspace here, so the binary's age is unknown" >&2
+		return 0
+	fi
+	built=$(stat -c %Y -- "$binary") ||
+		die "cannot read the age of ${binary}"
+	[ "$built" -lt "$commit" ] || return 0
+	die "the device binary is older than the newest commit to the workspace, so a run of it is not a run of this tree." \
+		"Built $(date -d "@${built}" '+%Y-%m-%d %H:%M:%S'), newest commit $(date -d "@${commit}" '+%Y-%m-%d %H:%M:%S')." \
+		"Rebuild it:" \
+		"    make bench-build" \
+		"or, to run the old binary deliberately:" \
+		"    ${prog} ${host} --run --stale-ok ..."
 }
 
 host=${1:-}
@@ -102,6 +146,13 @@ case "$mode" in
 		[ -x "$binary" ] || die \
 			"no device binary at ${binary}" \
 			"Build one first: make bench-build"
+
+		if [ "${1:-}" = "--stale-ok" ]; then
+			shift
+			echo "${prog}: --stale-ok: the binary's age is not being checked" >&2
+		else
+			freshness
+		fi
 
 		echo "${prog}: pushing ${binary} to ${host}:${release}/" >&2
 		ssh_root mkdir -p -- "$release"

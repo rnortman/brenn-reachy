@@ -1192,9 +1192,10 @@ pub enum TickEvent {
         /// How far behind the fixed rate it started.
         late: Duration,
     },
-    /// A move's clock was too short for the span it covers, and was stretched
-    /// to fit before the move was commanded. Emitted for the command that
-    /// starts a run and for every replacement that retargets one.
+    /// The clocks a move was accepted on were not the ones asked for, or the
+    /// antenna pair reached its crossing nearer mirrored than the tips clear
+    /// each other by. Emitted for the command that starts a run and for every
+    /// replacement that retargets one.
     Stretched(ClockStretch),
     /// The trajectory reached its endpoint: the last goal has gone out and
     /// nothing further will be commanded. Where the machine physically is at
@@ -1269,17 +1270,43 @@ impl fmt::Display for TickEvent {
                 )
             }
             Self::Stretched(stretch) => {
-                write!(
-                    f,
-                    "clock stretched to fit the span: head {:.3} s to {:.3} s, right antenna \
-                     {:.3} s to {:.3} s, left antenna {:.3} s to {:.3} s",
-                    stretch.requested.head.as_secs_f64(),
-                    stretch.effective.head.as_secs_f64(),
-                    stretch.requested.antennas[0].as_secs_f64(),
-                    stretch.effective.antennas[0].as_secs_f64(),
-                    stretch.requested.antennas[1].as_secs_f64(),
-                    stretch.effective.antennas[1].as_secs_f64(),
-                )
+                if stretch.requested != stretch.effective {
+                    let why = if stretch.dephased {
+                        "to fit the span and de-phase the antennas"
+                    } else {
+                        "to fit the span"
+                    };
+                    write!(
+                        f,
+                        "clock stretched {why}: head {:.3} s to {:.3} s, right antenna \
+                         {:.3} s to {:.3} s, left antenna {:.3} s to {:.3} s",
+                        stretch.requested.head.as_secs_f64(),
+                        stretch.effective.head.as_secs_f64(),
+                        stretch.requested.antennas[0].as_secs_f64(),
+                        stretch.effective.antennas[0].as_secs_f64(),
+                        stretch.requested.antennas[1].as_secs_f64(),
+                        stretch.effective.antennas[1].as_secs_f64(),
+                    )?;
+                }
+                // Said whenever the pass measured one, because the number that
+                // matters to an operator watching the tips cross is what the
+                // pair came to and not whether a clock moved.
+                let Some(pair) = stretch.separation else {
+                    return Ok(());
+                };
+                if stretch.requested != stretch.effective {
+                    f.write_str("; ")?;
+                }
+                write!(f, "the antennas cross {:.2} rad apart", pair.offset)?;
+                if pair.met(stretch.separation_required) {
+                    Ok(())
+                } else {
+                    write!(
+                        f,
+                        ", under the {:.2} rad that keeps their tips clear",
+                        stretch.separation_required
+                    )
+                }
             }
             Self::Completed => f.write_str("commanding finished"),
             Self::Settled { after } => write!(
@@ -2395,8 +2422,8 @@ mod tests {
     use reachy_kin::FkError;
     use reachy_motion::{
         CommissionSequencer, EngageSequencer, Entry, HEAD_GROUP_FLOOR_S, JointId, JointStep,
-        JointTargets, MoveDurations, PollCadence, PollSequencer, Posture, RegValue, StepContext,
-        ValueKind, Warp,
+        JointTargets, MoveDurations, PhaseSeparation, PollCadence, PollSequencer, Posture,
+        RegValue, StepContext, ValueKind, Warp,
     };
 
     use super::*;
@@ -3562,7 +3589,7 @@ mod tests {
         // One period per tick of the configured rate for the whole duration,
         // plus the accepting period, which samples the move's own start and
         // commands nothing.
-        let periods = cfg.up_duration.as_secs() * u64::from(cfg.tick_hz);
+        let periods = periods_for(cfg.up_duration, cfg.tick_hz);
         assert_eq!(summary.ticks, periods + 1, "{summary:?}");
         assert_eq!(summary.misses, 0);
         assert_eq!(summary.overruns, 0);
@@ -4387,7 +4414,7 @@ mod tests {
         let mut pump = pump(&cfg, bench.held);
         let mut clock = TestClock::default();
 
-        let asked = Duration::from_millis(500);
+        let asked = Duration::from_millis(200);
         let (outcome, events) = run(
             &mut bench,
             &mut pump,
@@ -4406,7 +4433,7 @@ mod tests {
                 TickEvent::Stretched(stretch) => Some(*stretch),
                 _ => None,
             })
-            .expect("half a second cannot carry the fold");
+            .expect("a fifth of a second cannot carry the fold");
         assert_eq!(stretch.requested, MoveDurations::uniform(asked));
         // The head clock lands on the fold's exact floor, which sits inside the
         // last hundredth of a second the published figure's search stepped in.
@@ -4445,7 +4472,7 @@ mod tests {
         let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
         let mut pump = pump(&cfg, bench.held);
 
-        let asked = Duration::from_millis(500);
+        let asked = Duration::from_millis(200);
         let command = MotionCommand::MoveTo {
             target: JointTargets::default(),
             durations: MoveDurations::uniform(asked),
@@ -4486,8 +4513,9 @@ mod tests {
         let mut pump = pump(&cfg, bench.held);
         let mut clock = TestClock::default();
 
-        // A minute in: long enough that the replacement lands well inside the
-        // first move, and slow enough that the first move needs no stretch.
+        // A quarter of the way in: far enough that the replacement lands well
+        // inside the first move, which itself needs no stretch.
+        let replacement = Duration::from_millis(100);
         let mut periods = 0;
         let (outcome, events) = run_retargeting(
             &mut bench,
@@ -4498,7 +4526,7 @@ mod tests {
                 periods += 1;
                 (periods == 10).then(|| MotionCommand::MoveTo {
                     target: crate::commands::stow_pose_targets(),
-                    durations: MoveDurations::uniform(Duration::from_millis(300)),
+                    durations: MoveDurations::uniform(replacement),
                     warp: Warp::MinJerk,
                 })
             },
@@ -4513,13 +4541,11 @@ mod tests {
             })
             .collect();
         assert_eq!(stretches.len(), 1, "{events:?}");
-        assert_eq!(
-            stretches[0].requested,
-            MoveDurations::uniform(Duration::from_millis(300))
-        );
+        assert_eq!(stretches[0].requested, MoveDurations::uniform(replacement));
         let ClockStretch {
             requested,
             effective,
+            ..
         } = stretches[0];
         assert!(effective.longest() > requested.longest(), "{stretches:?}");
         assert!(
@@ -4869,7 +4895,10 @@ mod tests {
         let mut pump = pump(&cfg, bench.held);
         let mut clock = TestClock::default();
 
-        let (outcome, events) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        // The calm fold rather than the quick raise: the sweep runs at its own
+        // hertz, so a run has to be long enough to hold a run of them and the
+        // one that comes back.
+        let (outcome, events) = run(&mut bench, &mut pump, to_stow(&cfg), &mut clock);
         let summary = outcome.expect("the move finishes");
 
         assert_eq!(summary.health_misses, u64::from(sweeps));
@@ -5044,7 +5073,7 @@ mod tests {
         // the period it stopped on is in the record.
         let summary = pump.last_summary();
         assert!(
-            summary.ticks < u64::from(cfg.tick_hz) * cfg.up_duration.as_secs(),
+            summary.ticks < periods_for(cfg.up_duration, cfg.tick_hz),
             "the run carried on past the release it could not write: {summary:?}"
         );
         assert_eq!(pump.last_trace().len() as u64, summary.ticks);
@@ -5142,7 +5171,8 @@ mod tests {
 
         // The budget is the move's own travel plus the margin, and the move
         // never advances a period's worth of it.
-        let budget = u64::from(cfg.tick_hz) * (cfg.up_duration.as_secs() + STALL_MARGIN_SECS);
+        let budget =
+            periods_for(cfg.up_duration, cfg.tick_hz) + u64::from(cfg.tick_hz) * STALL_MARGIN_SECS;
         assert_eq!(pump.stall_budget(&to_neutral(&cfg)), budget);
         assert!(
             matches!(error, PumpError::Stalled { budget: ran } if ran == budget),
@@ -5161,8 +5191,15 @@ mod tests {
     fn a_faulted_run_keeps_its_record_and_the_next_one_starts_clean() {
         let cfg = resolved();
         let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let stuck = cfg.map.ids()[2];
-        bench.registers.borrow_mut().stalled.push(stuck);
+        // The whole head group, which is what a hand on the head is: the six
+        // cranks drive one rigid body through a parallel linkage, so a pose
+        // with five legs where the plan wants them and one where it does not is
+        // a pose the machine cannot hold and the measurement layer answers
+        // first. Held at stow, every leg is exactly where the others say it is.
+        for leg in 1..=6 {
+            let stuck = cfg.map.ids()[leg];
+            bench.registers.borrow_mut().stalled.push(stuck);
+        }
         let mut pump = pump(&cfg, bench.held);
         let mut clock = TestClock::default();
 
@@ -5193,8 +5230,44 @@ mod tests {
         assert!(after.settled.is_some(), "{after:?}");
         assert_eq!(
             after.ticks,
-            u64::from(cfg.tick_hz) * cfg.up_duration.as_secs() + 1,
+            periods_for(cfg.up_duration, cfg.tick_hz) + 1,
             "its own periods, not the faulted run's counted a second time: {after:?}"
+        );
+    }
+
+    /// One crank that stops while the other five follow the plan is not an
+    /// obstruction: it is a set of six angles no rigid head can hold, and the
+    /// measurement layer is what answers it.
+    ///
+    /// The six drive one body through a parallel linkage, so the pose stops
+    /// solving long before the stalled leg has lagged its goal by the tracking
+    /// threshold — and a frame nobody can place is a frame the tracking
+    /// comparison never sees, because there is no measured pose to compare
+    /// against. What ends the run is the run of unplaceable frames. Both
+    /// answers end with the machine limp; this one parks rather than stowing,
+    /// which is the right way round for a machine whose measurements have
+    /// stopped meaning anything.
+    #[test]
+    fn a_single_crank_that_stops_is_a_pose_nobody_can_place() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        bench.registers.borrow_mut().stalled.push(cfg.map.ids()[2]);
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+
+        let (outcome, _) = run(&mut bench, &mut pump, to_neutral(&cfg), &mut clock);
+        let error = outcome.expect_err("five legs cannot hold a pose the sixth refuses");
+        assert!(
+            matches!(
+                error,
+                PumpError::Fault(Fault::MeasuredPoseInvalid { failures, .. })
+                    if failures > cfg.motion.read_loss_ticks
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::ImmediateAllTorqueOffToPark
         );
     }
 
@@ -5541,14 +5614,14 @@ mod tests {
             );
         }
         // And it ran on the *replacement's* clock. Both halves of a replacement
-        // are the caller's — targets and durations — and the fixture's two
-        // clocks differ by a second, so a run that kept the raise's clock for
-        // the fold lands fifty periods further out than this.
+        // are the caller's — targets and durations — and the fixture's calm
+        // fold takes more than twice the quick raise, so a run that kept the
+        // raise's clock for the fold lands sixty periods short of this.
         let turn_at = u64::try_from(turn_at).expect("a small count");
         let fold = periods_for(cfg.stow_duration, cfg.tick_hz);
         let raise = periods_for(cfg.up_duration, cfg.tick_hz);
         assert!(
-            summary.ticks >= turn_at + fold && summary.ticks < turn_at + raise,
+            summary.ticks >= turn_at + fold && summary.ticks < turn_at + 2 * fold,
             "the fold's own clock is what ran: {} periods, turned at {turn_at}, fold {fold}, \
              raise {raise}",
             summary.ticks,
@@ -5879,6 +5952,9 @@ mod tests {
                 TickEvent::Stretched(ClockStretch {
                     requested: MoveDurations::uniform(Duration::from_millis(300)),
                     effective: MoveDurations::uniform(Duration::from_millis(800)),
+                    separation: None,
+                    separation_required: shipped_separation(),
+                    dephased: false,
                 }),
                 "clock stretched",
             ),
@@ -5910,6 +5986,95 @@ mod tests {
             said.iter().all(|seen| *seen),
             "an event renders unread by this test: {said:?}"
         );
+    }
+
+    /// The three things the clock line can say, said in the operator's words:
+    /// a clock lengthened for its span, a pair parted at its crossing, and a
+    /// pair nothing could part.
+    ///
+    /// The last of them changes no clock at all, so the line is the whole
+    /// report: a move that runs with its tips converging says so or says
+    /// nothing.
+    #[test]
+    fn the_clock_line_says_which_of_the_two_it_did() {
+        let requested = MoveDurations::uniform(Duration::from_millis(800));
+        let stretched = MoveDurations {
+            head: Duration::from_millis(800),
+            antennas: [Duration::from_millis(970), Duration::from_millis(800)],
+        };
+        let parted = PhaseSeparation {
+            offset: 0.61,
+            later: JointId::AntennaRight,
+            at: Duration::from_millis(580),
+            leader_rate: 5.0,
+        };
+        let converging = PhaseSeparation {
+            offset: 0.09,
+            ..parted
+        };
+
+        let span = TickEvent::Stretched(ClockStretch {
+            requested,
+            effective: stretched,
+            separation: None,
+            separation_required: shipped_separation(),
+            dephased: false,
+        })
+        .to_string();
+        assert!(
+            span.contains("clock stretched to fit the span") && !span.contains("antennas cross"),
+            "{span}"
+        );
+
+        let phase = TickEvent::Stretched(ClockStretch {
+            requested,
+            effective: stretched,
+            separation: Some(parted),
+            separation_required: shipped_separation(),
+            dephased: true,
+        })
+        .to_string();
+        assert!(
+            phase.contains("to fit the span and de-phase the antennas")
+                && phase.contains("right antenna 0.800 s to 0.970 s")
+                && phase.contains("the antennas cross 0.61 rad apart")
+                && !phase.contains("under the"),
+            "{phase}"
+        );
+
+        let unmet = TickEvent::Stretched(ClockStretch {
+            requested,
+            effective: requested,
+            separation: Some(converging),
+            separation_required: shipped_separation(),
+            dephased: false,
+        })
+        .to_string();
+        assert_eq!(
+            unmet,
+            "the antennas cross 0.09 rad apart, under the 0.60 rad that keeps their tips clear"
+        );
+
+        // The figure it says the pair fell short of is the one the pass was
+        // holding them to, whatever a configuration set it to — the line is
+        // read by an operator who moved it.
+        let widened = TickEvent::Stretched(ClockStretch {
+            requested,
+            effective: requested,
+            separation: Some(parted),
+            separation_required: 0.9,
+            dephased: false,
+        })
+        .to_string();
+        assert_eq!(
+            widened,
+            "the antennas cross 0.61 rad apart, under the 0.90 rad that keeps their tips clear"
+        );
+    }
+
+    /// The separation the shipped configuration holds a pair to.
+    fn shipped_separation() -> f64 {
+        reachy_motion::AntennaPhaseConfig::default().separation_rad
     }
 
     /// Which event this is, as a slot in the coverage above.

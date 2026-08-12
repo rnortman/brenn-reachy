@@ -17,13 +17,19 @@ binding on every change in this repo.
 - **Fault management follows `docs/fault-management.md`.** Read it before
   touching anything that arms, disarms, or handles a fault. The short form:
   the Minimum Risk Condition is *stowed and de-torqued*; a fault response
-  de-torques the motors (a controlled stow first when control is trusted,
-  an immediate best-effort torque-off when it is not); **nothing ever gates
-  de-torquing**, and holding torque is never a fault response — stowed with
-  torque held is this machine's only pinch hazard.
-- **No automatic fault recovery.** A fault is never auto-cleared and never
-  retried with perturbed inputs; re-arming after a fault is a command.
-  Reaching the Minimum Risk Condition itself is autonomous, not a recovery.
+  de-torques the motors it covers (a controlled stow first when control is
+  trusted, an immediate best-effort torque-off when it is not); **nothing ever
+  gates de-torquing**, and holding torque is never a fault response — stowed
+  with torque held is this machine's only pinch hazard. "The motors it covers"
+  is load-bearing: a response may be scoped to one group, and an antenna pair
+  going limp while the head keeps its presence is a fault answered, not an
+  exception to this rule.
+- **No automatic fault recovery.** Nothing clears a fault, and nothing retries
+  a failed operation with perturbed inputs. The park-class responses wait for
+  an operator to restart the process. The rest-class ones end the session
+  instead: the machine is at the Minimum Risk Condition and the next wake
+  builds a fresh session, which is a new engagement rather than a recovery of
+  the one that stopped. Reaching the MRC itself is always autonomous.
 
 ## Gates
 
@@ -64,6 +70,10 @@ health, resting pose — runs with no torque and no motion. The registry is a
 diagnostic and a regression guard; it does **not** gate arming or commanding.
 Gating routine operation on self-test records was bring-up caution, retired by
 `docs/fault-management.md`.
+
+Getting the bench onto a real unit — the build and deploy path, which services
+hold the servo bus, the trace workflow, the soak, and the anomalies nobody has
+explained yet — is `docs/bench-runbook.md`.
 
 ## Device deployment doctrine (dev cycles)
 

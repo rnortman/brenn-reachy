@@ -140,6 +140,17 @@ verify() {
 		"The container ran on the wrong architecture; the device cannot execute this."
 
 	chmod 0755 -- "$binary"
+
+	# Stamp the verified artifact with the moment this build finished, because
+	# cargo leaves an output it did not have to relink exactly as it found it.
+	# A commit that changes nothing the binary links — a checked-in trace
+	# fixture, a test-only edit, a comment in the builder definition — would
+	# otherwise leave a freshly built binary older than the newest commit, and
+	# deploy-bench.sh would refuse the very binary this build just produced with
+	# a prescription (rebuild it) that cannot clear it. After the checks and
+	# never before: a stamp on an artifact nothing verified is a lie about the
+	# only thing the age is asked about.
+	touch -- "$binary"
 }
 
 report() {

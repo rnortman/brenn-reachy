@@ -26,7 +26,10 @@
 //!
 //! The failure policy is the fault doctrine in `docs/fault-management.md`: the
 //! minimum risk condition is head stowed, motors unpowered, and a fault reaches
-//! it by writing torque off immediately, best-effort, per servo. Holding torque
+//! it by the maneuver its response names — a stow under control where the
+//! motors still command, an immediate best-effort torque-off where they cannot
+//! be trusted to, and either of those scoped to the group that failed where the
+//! rest of the machine is sound. Holding torque
 //! is never a fault response, and nothing anywhere may refuse or condition a
 //! torque-off write. Torque *on* is gated, minimally: the supply floor and the
 //! latched error bits, both in `arm::engage_gates`, and nothing else — where the
@@ -50,6 +53,7 @@
 pub mod arm;
 pub mod disarm;
 pub mod joints;
+pub mod phase;
 pub mod seq;
 #[cfg(test)]
 mod testutil;
@@ -69,15 +73,20 @@ pub use disarm::{
 pub use joints::{
     JointGroup, JointId, JointSet, JointStep, JointTargets, JointVector, ServoHealth,
 };
+pub use phase::{
+    ANTENNA_CONTACT_BAND_RAD, ANTENNA_PHASE_SEPARATION_RAD, AntennaPhaseConfig, PhaseSeparation,
+    PhaseWatch, mirror_offset,
+};
 pub use seq::{
     AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
     Sequencer, StepContext, ValueKind,
 };
 pub use tick::{
     ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, ClockStretch, CommandDisposition,
-    CommandRejection, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE, Mode,
-    MotionCommand, MotionConfig, MotionState, MoveAbort, Response, TickInputs, TickOutputs,
-    TickReport, TrackingFaultConfig, duration_floor_s, floor_move_clock, motion_tick,
+    CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE,
+    Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Response, TickInputs, TickOutputs,
+    TickReport, TrackingFaultConfig, TrackingLook, TrackingMonitor, dry_pass_peaks,
+    dry_pass_separation, duration_floor_s, floor_move_clock, motion_tick,
 };
 pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome};
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

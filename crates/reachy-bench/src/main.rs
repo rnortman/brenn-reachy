@@ -71,7 +71,8 @@ fn usage() -> String {
          `--trace PATH` writes one CSV row per control period — every joint's measured\n\
          angle against the goal it was being held to, which is the move's velocity\n\
          profile at the rate it was sampled. Each run of the invocation appends. Give it\n\
-         a path on a memory filesystem, `/run/reachy-trace.csv` on the machine itself:\n\
+         a path on a memory filesystem the account this runs as can write, \
+         `/var/lib/brenn-app/reachy-trace.csv` on the machine itself:\n\
          it is written once per run rather than once per period, and nothing this\n\
          produces belongs on the device's flash.\n\
          \n\

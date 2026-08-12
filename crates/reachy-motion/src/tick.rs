@@ -68,7 +68,9 @@
 //! whichever clock cannot carry its own span inside the per-tick step bounds.
 //! The head group, the right antenna and the left antenna are each judged and
 //! stretched on their own, so a pair of antennas deliberately staggered onto
-//! different clocks stays staggered. Clocks are only ever lengthened, so the
+//! different clocks stays staggered — and a pair that is *not* staggered enough
+//! to keep its tips from meeting at their crossing is staggered there, on the
+//! clocks the move ends up with. Clocks are only ever lengthened, so the
 //! path is preserved exactly and merely traversed more slowly, which is the
 //! right degradation for a move whose only sin is starting further away than
 //! the knob assumed. The step
@@ -131,6 +133,7 @@ use crate::arm::ArmRecord;
 use crate::joints::{
     JointGroup, JointId, JointSet, JointStep, JointTargets, JointVector, ServoHealth, worst_joint,
 };
+use crate::phase::{AntennaPhaseConfig, PhaseSeparation, PhaseWatch};
 use crate::seq::SeqError;
 use crate::timeline::{Entry, FaultTimeline, Maneuver, Outcome};
 use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
@@ -144,9 +147,10 @@ use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 /// position error that does not close, whether the write landed or the motor
 /// stalled.
 ///
-/// Distance alone cannot say that. The servos run a proportional position loop
-/// with no integral term, so a joint chasing a streamed goal sits behind it by
-/// roughly the commanded velocity times the loop's own time constant. At the
+/// Distance alone cannot say that. What a servo's integral term closes is a
+/// standing error and not a moving one, so a joint chasing a streamed goal sits
+/// behind it by roughly the commanded velocity times the loop's own time
+/// constant, whatever the gains. At the
 /// bench, leg 2 ran 0.246 rad behind a goal moving near 0.71 rad/s, and the
 /// right antenna 0.430 rad behind one moving near 4.91 rad/s, both while
 /// following perfectly well. Lag scales with commanded speed, so no constant
@@ -175,15 +179,19 @@ pub struct TrackingFaultConfig {
 }
 
 impl Default for TrackingFaultConfig {
-    /// Provisional bench figures. The threshold and the window are sized rather
-    /// than measured; every move records its per-joint worst lag, and those are
-    /// the numbers that will ground them.
+    /// The threshold is measured off the recorded runs this repo keeps as
+    /// fixtures; the window and the progress minimum are sized rather than
+    /// measured.
     fn default() -> Self {
         Self {
-            // 8.6° of crank. Only a screen for which joints are worth
-            // examining, not a verdict: the bench has seen 0.43 rad of healthy
-            // lag on an antenna at speed.
-            threshold_rad: 0.15,
+            // 28.6° of crank, better than twice the worst lag any head joint
+            // ran at on a healthy recorded gesture (0.245 rad on a loaded leg
+            // at 3.3 rad/s of commanded speed). Only a screen for which joints
+            // are worth examining, not a verdict: the antennas cross it while
+            // following perfectly — 1.38 rad behind an 855°/s sweep — and
+            // re-anchor rather than fault, because what decides a stall is
+            // whether the joint is closing.
+            threshold_rad: 0.5,
             // About 6.5 of the servos' 0.088° counts, comfortably above the
             // half-count quantisation floor of 7.7e-4 rad. Over the ten-tick
             // window at the bench's 50 Hz that asks a joint sitting past the
@@ -282,6 +290,9 @@ pub struct MotionConfig {
     pub max_step: JointStep,
     /// When to call tracking lost.
     pub tracking: TrackingFaultConfig,
+    /// Where the antennas' tips can meet, and how far apart in phase a
+    /// commanded pair has to cross there.
+    pub phase: AntennaPhaseConfig,
     /// Consecutive ticks without a position read before the read-loss fault.
     pub read_loss_ticks: u32,
 }
@@ -294,24 +305,29 @@ impl Default for MotionConfig {
             geom: HeadGeometry::default(),
             env: EnvelopeConfig::default(),
             fk: FkOptions::default(),
-            // The shaped move's peak rate is 1.875 times its average, so a two
-            // second move spanning a crank's whole 2.2 rad window peaks at
-            // about 0.041 rad per tick at 50 Hz. The milestone's moves are a
-            // fraction of that; 0.05 leaves the fastest legitimate one room and
-            // still catches a step the linkage would take as a slam.
+            // What these bound is the plan, so they are sized off the fastest
+            // motion the machine is known to make well and left wide enough
+            // that only a discontinuity reaches them.
             max_step: JointStep {
-                legs: 0.05,
-                body_yaw: 0.05,
-                // An antenna sweep takes the arc that misses its outboard
-                // direction, so a commandable sweep runs to just under a full
-                // turn — 6.28 rad, peaking near 0.15 at 50 Hz over a 1.57 s
-                // move. That is this bound exactly, and it is why an antenna
-                // duration has a floor: the presence sweep of 3.23 rad needs
-                // 0.81 s, and re-stowing an antenna left inboard of sideways
-                // (4.80 rad) needs 1.21 s.
-                antennas: 0.15,
+                // The validated 0.8 s presence gesture peaks at 0.067 rad per
+                // leg per period at 50 Hz, dry-sampled through the inverse
+                // kinematics. Better than twice that.
+                legs: 0.15,
+                // Analogy rather than measurement: no yaw speed trial has been
+                // run. The body yaw is the legs' servo model, unloaded and
+                // moving linearly in its own coordinate, so it carries their
+                // figure until a supervised fold measures its own.
+                body_yaw: 0.15,
+                // The fastest sweep on record — an antenna crossing 3.22 rad in
+                // 0.3 s, 855°/s — plans a peak of 0.403 rad per period at
+                // 50 Hz. Better than half as much again. A sweep takes the arc
+                // that misses its outboard direction, so the widest one
+                // commandable is just under a full turn: 6.28 rad, which needs
+                // 0.36 s to stay inside this.
+                antennas: 0.65,
             },
             tracking: TrackingFaultConfig::default(),
+            phase: AntennaPhaseConfig::default(),
             // One second of silence at 50 Hz.
             read_loss_ticks: 50,
         }
@@ -355,7 +371,7 @@ pub fn duration_floor_s(span: f64, max_step: f64, tick_hz: f64) -> f64 {
 /// checks the shipped values against. Under it the guard abandons the move
 /// rather than clamping it: a shipped duration below this is presence that
 /// never works.
-pub const HEAD_GROUP_FLOOR_S: f64 = 1.07;
+pub const HEAD_GROUP_FLOOR_S: f64 = 0.36;
 
 /// What the tick is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -992,7 +1008,7 @@ pub struct MotionState {
     start_excursion: Excursion,
     miss_count: u32,
     pose_failures: u32,
-    tracking: [Option<TrackingStreak>; JointId::COUNT],
+    tracking: TrackingMonitor,
     masked: JointSet,
     /// What this session has raised and what was done about it.
     ///
@@ -1044,7 +1060,7 @@ impl MotionState {
             start_excursion: Excursion::default(),
             miss_count: 0,
             pose_failures: 0,
-            tracking: [None; JointId::COUNT],
+            tracking: TrackingMonitor::new(),
             masked: degraded,
             timeline: FaultTimeline::new(),
         }
@@ -1163,7 +1179,7 @@ impl MotionState {
             // stands: the runs open against a goal that is about to stop
             // moving, and carrying them into the stow would spend a window
             // that was already half gone.
-            self.tracking = [None; JointId::COUNT];
+            self.tracking.clear();
         }
         out.goal = None;
         out.report.mode = self.mode;
@@ -1183,9 +1199,7 @@ impl MotionState {
             if self.masked.insert(joint) {
                 out.report.newly_masked.insert(joint);
             }
-            if let Some(row) = joint.index() {
-                self.tracking[row] = None;
-            }
+            self.tracking.forget(joint);
         }
         out.report.masked = self.masked;
         out.report.degraded = Some(fault);
@@ -1222,23 +1236,162 @@ impl MotionState {
         // The open runs go with the move, for the same reason a raise clears
         // them: the maneuver that answers this measures from where the machine
         // now stands, and a run already half spent would fault it early.
-        self.tracking = [None; JointId::COUNT];
+        self.tracking.clear();
         out.goal = None;
         out.report.mode = self.mode;
         out.report.aborted = Some(abort);
     }
 }
 
-/// The longest open run across the nine joints, or zero when none is open.
+/// What one period of the tracking comparison found.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackingLook {
+    /// How far each joint stands from the goal it was last written, radians, in
+    /// bus order.
+    pub errors: [f64; JointId::COUNT],
+    /// The joints whose window ran out on this period without closing.
+    pub exhausted: JointSet,
+    /// The longest open run afterwards, periods.
+    pub longest: u32,
+}
+
+/// The tracking comparison, carried across periods.
 ///
-/// The single number the report carries about nine independent runs: the one
-/// closest to raising the fault.
-fn longest_streak(streaks: &[Option<TrackingStreak>; JointId::COUNT]) -> u32 {
-    streaks
-        .iter()
-        .filter_map(|streak| streak.map(|open| open.count))
-        .max()
-        .unwrap_or(0)
+/// One open run per joint, advanced by [`TrackingMonitor::look`] once per live
+/// read. It is public because it is the guard: a recorded run replayed through
+/// this type is judged by exactly what the tick judges a live one by, so a
+/// bound or a threshold that would false-trip a gesture the machine is known to
+/// make well can be caught away from the machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrackingMonitor {
+    runs: [Option<TrackingStreak>; JointId::COUNT],
+}
+
+impl TrackingMonitor {
+    /// A monitor with nothing open.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Forget every open run.
+    ///
+    /// What a joint was doing against a goal that has been abandoned says
+    /// nothing about what it does against the next one.
+    pub fn clear(&mut self) {
+        self.runs = [None; JointId::COUNT];
+    }
+
+    /// Forget one joint's open run, for a joint leaving service.
+    pub fn forget(&mut self, joint: JointId) {
+        if let Some(row) = joint.index() {
+            self.runs[row] = None;
+        }
+    }
+
+    /// The longest open run across the nine joints, or zero when none is open.
+    ///
+    /// The single number a report carries about nine independent runs: the one
+    /// closest to raising the fault.
+    #[must_use]
+    pub fn longest(&self) -> u32 {
+        self.runs
+            .iter()
+            .filter_map(|run| run.map(|open| open.count))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Advance every joint's run by one live read of `present` against the
+    /// `goal` those joints were last written, and say what ran out.
+    ///
+    /// Only for live reads: a stale reading compared against a fresh goal is a
+    /// difference nobody measured, and a caller that skips the period leaves
+    /// every run where it stands rather than growing or clearing it. A masked
+    /// joint is commanded nothing, so the distance between where it stands and
+    /// the last goal it was written measures the machine's own drift and closes
+    /// its run.
+    pub fn look(
+        &mut self,
+        cfg: &TrackingFaultConfig,
+        masked: JointSet,
+        present: &JointVector,
+        goal: &JointVector,
+    ) -> TrackingLook {
+        let mut errors = [0.0; JointId::COUNT];
+        let mut exhausted = JointSet::default();
+        for (row, ((id, angle), (_, goal))) in
+            present.joints().into_iter().zip(goal.joints()).enumerate()
+        {
+            errors[row] = (angle - goal).abs();
+            if masked.contains(id) {
+                self.runs[row] = None;
+                continue;
+            }
+            let run = &mut self.runs[row];
+            if !outside_limit(errors[row], cfg.threshold_rad) {
+                // Within the threshold is healthy, whatever came before it.
+                *run = None;
+                continue;
+            }
+            let (count, closing) = match run {
+                // Progress is measured from where the joint stands now.
+                None => {
+                    *run = Some(TrackingStreak {
+                        anchor: angle,
+                        side: Side::of(goal, angle),
+                        count: 1,
+                    });
+                    (1, false)
+                }
+                Some(open) => {
+                    // Ground covered since the anchor, signed toward the goal:
+                    // positive is closing, negative is running away, and a goal
+                    // that has arrived at the anchor leaves no direction to
+                    // close in. An unplaceable number closes nothing.
+                    let side = Side::of(goal, open.anchor);
+                    let advance = side.advance(angle - open.anchor);
+                    if side.crossed_from(open.side) {
+                        // The goal has moved to the far side of the anchor, so
+                        // the distance this run was measuring no longer exists
+                        // and every step the joint takes toward the new goal
+                        // reads as a step away from the old one. The run
+                        // restarts where the joint stands: a stalled joint
+                        // under a goal that keeps going faults one window
+                        // later, and a following joint is never blamed for the
+                        // goal turning round under it.
+                        open.anchor = angle;
+                        open.side = Side::of(goal, angle);
+                        open.count = 1;
+                        (1, true)
+                    } else if advance >= cfg.progress_min_rad {
+                        // Sitting behind a moving goal is what a proportional
+                        // loop does, not what this fault is for.
+                        open.anchor = angle;
+                        open.side = Side::of(goal, angle);
+                        open.count = 1;
+                        (1, true)
+                    } else {
+                        // A goal that started on the anchor takes its side from
+                        // wherever it first lands off it.
+                        if open.side == Side::Unplaced {
+                            open.side = side;
+                        }
+                        open.count += 1;
+                        (open.count, false)
+                    }
+                }
+            };
+            if !closing && count >= cfg.ticks {
+                exhausted.insert(id);
+            }
+        }
+        TrackingLook {
+            errors,
+            exhausted,
+            longest: self.longest(),
+        }
+    }
 }
 
 /// One control step.
@@ -1360,104 +1513,41 @@ pub fn motion_tick(
     };
     out.report.misses = state.miss_count;
     out.report.pose_failures = state.pose_failures;
-    out.report.tracking_count = longest_streak(&state.tracking);
+    out.report.tracking_count = state.tracking.longest();
 
     // Tracking, on live reads only: a stale reading compared against a fresh
     // goal is a difference nobody measured, so a stale tick freezes every
     // joint's run where it stands rather than growing or clearing it.
     if let Some(present) = fresh {
-        let mut errors = [0.0; JointId::COUNT];
-        // The rows whose window ran out on this tick, by how far out they are,
-        // kept per group because the two groups are answered differently. Every
-        // other row holds a value no measurement can beat, so the same worst-of
-        // sweep names the joint among them.
+        let look = state
+            .tracking
+            .look(&cfg.tracking, state.masked, present, &state.last_goal);
+        out.report.tracking_errors = Some(look.errors);
+        // Recorded before the fault check: the tick that runs a window out is
+        // the one whose figure matters most, and a report that shipped zero
+        // there would read as a single-tick trip rather than a sustained one.
+        out.report.tracking_count = look.longest;
+
+        // The rows whose window ran out, by how far out they are, kept per
+        // group because the two groups are answered differently. Every other
+        // row holds a value no measurement can beat, so the same worst-of sweep
+        // names the joint among them.
         let mut head_out = [f64::NEG_INFINITY; JointId::COUNT];
         let mut antennas_out = [f64::NEG_INFINITY; JointId::COUNT];
         let mut head_exhausted = false;
         let mut antennas_exhausted = false;
-        for (row, ((id, angle), (_, goal))) in present
-            .joints()
-            .into_iter()
-            .zip(state.last_goal.joints())
-            .enumerate()
-        {
-            errors[row] = (angle - goal).abs();
-            // A masked joint is commanded nothing, so the distance between
-            // where it stands and the last goal it was written measures the
-            // machine's own drift and says nothing about tracking.
-            if state.masked.contains(id) {
-                state.tracking[row] = None;
+        for (row, id) in JointId::ALL.into_iter().enumerate() {
+            if !look.exhausted.contains(id) {
                 continue;
             }
-            let streak = &mut state.tracking[row];
-            if !outside_limit(errors[row], cfg.tracking.threshold_rad) {
-                // Within the threshold is healthy, whatever came before it.
-                *streak = None;
-                continue;
-            }
-            let (count, closing) = match streak {
-                // Progress is measured from where the joint stands now.
-                None => {
-                    *streak = Some(TrackingStreak {
-                        anchor: angle,
-                        side: Side::of(goal, angle),
-                        count: 1,
-                    });
-                    (1, false)
-                }
-                Some(open) => {
-                    // Ground covered since the anchor, signed toward the goal:
-                    // positive is closing, negative is running away, and a goal
-                    // that has arrived at the anchor leaves no direction to
-                    // close in. An unplaceable number closes nothing.
-                    let side = Side::of(goal, open.anchor);
-                    let advance = side.advance(angle - open.anchor);
-                    if side.crossed_from(open.side) {
-                        // The goal has moved to the far side of the anchor, so
-                        // the distance this run was measuring no longer exists
-                        // and every step the joint takes toward the new goal
-                        // reads as a step away from the old one. The run
-                        // restarts where the joint stands: a stalled joint
-                        // under a goal that keeps going faults one window
-                        // later, and a following joint is never blamed for the
-                        // goal turning round under it.
-                        open.anchor = angle;
-                        open.side = Side::of(goal, angle);
-                        open.count = 1;
-                        (1, true)
-                    } else if advance >= cfg.tracking.progress_min_rad {
-                        // Sitting behind a moving goal is what a proportional
-                        // loop does, not what this fault is for.
-                        open.anchor = angle;
-                        open.side = Side::of(goal, angle);
-                        open.count = 1;
-                        (1, true)
-                    } else {
-                        // A goal that started on the anchor takes its side from
-                        // wherever it first lands off it.
-                        if open.side == Side::Unplaced {
-                            open.side = side;
-                        }
-                        open.count += 1;
-                        (open.count, false)
-                    }
-                }
-            };
-            if !closing && count >= cfg.tracking.ticks {
-                if id.group() == JointGroup::Antennas {
-                    antennas_out[row] = errors[row];
-                    antennas_exhausted = true;
-                } else {
-                    head_out[row] = errors[row];
-                    head_exhausted = true;
-                }
+            if id.group() == JointGroup::Antennas {
+                antennas_out[row] = look.errors[row];
+                antennas_exhausted = true;
+            } else {
+                head_out[row] = look.errors[row];
+                head_exhausted = true;
             }
         }
-        out.report.tracking_errors = Some(errors);
-        // Recorded before the fault check: the tick that runs a window out is
-        // the one whose figure matters most, and a report that shipped zero
-        // there would read as a single-tick trip rather than a sustained one.
-        out.report.tracking_count = longest_streak(&state.tracking);
         // The head decides the tick when both groups run out together: its
         // answer winds the whole machine down, which subsumes taking the
         // antennas out of service.
@@ -1788,8 +1878,34 @@ const STRETCH_PASSES: usize = 4;
 /// this is one there is nothing left to measure about.
 const MAX_DRY_SAMPLES: u32 = 100_000;
 
-/// A move's clock as it was asked for and as it will run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The most a de-phasing stretch may lengthen one antenna's clock, as a
+/// multiple of what was asked for.
+///
+/// A side held four times as long as it was commanded is not a stagger any
+/// more, and the geometry that asks for it is one no clock separates: a leader
+/// creeping through the crossing leaves the follower nothing to be late for.
+/// The move runs on the last clocks and says the separation is unmet, which is
+/// the one thing this must never turn into a refusal — the maneuvers that
+/// recover this machine go down the same path.
+const MAX_PHASE_STRETCH: f64 = 4.0;
+
+/// How far past the separation a de-phasing stretch aims, as a fraction of it.
+///
+/// Each pass estimates the delay the pair still needs from the rate the leader
+/// is travelling at, and the leader is shaped, so it is slowing: the pass
+/// closes most of the remaining gap and the sequence approaches the separation
+/// from below without arriving at it — four passes over a floored pair landed
+/// four parts in ten million short. Aiming a twentieth past it is what makes a
+/// pass land, and a twentieth of the separation is a few hundredths of a second
+/// on the clock it comes out of.
+const PHASE_TARGET_OVERSHOOT: f64 = 1.05;
+
+/// A move's clock as it was asked for and as it will run, and what the antenna
+/// pair's phase came to.
+///
+/// Reported whenever there is something to say: a clock this pass lengthened, a
+/// pair it de-phased, or a pair whose separation it could not reach.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClockStretch {
     /// The durations the caller commanded.
     pub requested: MoveDurations,
@@ -1798,6 +1914,17 @@ pub struct ClockStretch {
     /// step bounds. Nothing sits between the two — a clock at its floor is a
     /// clock that runs.
     pub effective: MoveDurations,
+    /// How far from mirrored the antennas stand when the second of them reaches
+    /// the contact band, on the effective clocks. `None` for a move that does
+    /// not carry both tips across the band's edge.
+    pub separation: Option<PhaseSeparation>,
+    /// How far apart the pass was holding that pair to, radians — the
+    /// configured [`AntennaPhaseConfig::separation_rad`]. Carried here so a
+    /// report of the measurement carries what it was judged against.
+    pub separation_required: f64,
+    /// Whether an antenna clock here was lengthened to de-phase the pair, as
+    /// against to fit its own span inside the step bounds.
+    pub dephased: bool,
 }
 
 /// The worst per-tick step one dry pass saw, per clock, as a fraction of the
@@ -1828,8 +1955,9 @@ impl StepRatios {
     }
 }
 
-/// `command` on a clock long enough to carry the span it actually covers within
-/// the per-tick step bounds, and what the stretch was when there was one.
+/// `command` on clocks long enough to carry the span it actually covers within
+/// the per-tick step bounds and to part the antennas at their crossing, and
+/// what the pass did when it did anything.
 ///
 /// A duration is configuration, sized for the spans an ordinary command covers.
 /// Where the machine physically *stands* is not configuration: a hand or a crash
@@ -1841,13 +1969,22 @@ impl StepRatios {
 /// runs, over the same trajectory [`take_command`] will build — and hands back a
 /// clock that fits.
 ///
+/// The second thing a clock has to carry is the pair's phase. Two antennas
+/// sweeping inboard on clocks near enough alike reach the point their arcs
+/// cross together and their tips meet there — the one collision on record. So
+/// the sampled pair is measured at the contact band on the clocks the move will
+/// run on, floors included, and a pair that arrives too near mirrored has the
+/// later side delayed until they clear each other. A separation no delay
+/// reaches is reported and run anyway.
+///
 /// Only ever longer, and only where a fixed clock was never sized: a feasible
 /// move comes back untouched with `None`, so the configured durations remain
 /// the policy for every move they are feasible for. A command this cannot
 /// measure — a move that cannot be shaped, a path some sample has no inverse
 /// kinematics for, a step bound of zero — also comes back untouched. Nothing
-/// here refuses anything; [`take_command`] still judges the command it is
-/// handed.
+/// here refuses anything, phase geometry included: the maneuvers that recover
+/// this machine come down this path, and a stow must always be commandable.
+/// [`take_command`] still judges the command it is handed.
 ///
 /// `start` is what the accepted trajectory will chain from — the state's last
 /// commanded targets — so a retarget mid-recovery is right-sized for the span
@@ -1873,11 +2010,17 @@ pub fn floor_move_clock(
 
     let requested = *durations;
     let mut effective = requested;
+    // The spans first. A clock that cannot carry its own path is not a clock
+    // whose phase means anything, and the fit reached here survives what comes
+    // next: the worst step shrinks monotonically as a clock lengthens, and
+    // de-phasing only ever lengthens one.
+    let mut measured = false;
     for _ in 0..STRETCH_PASSES {
         let Some(ratios) = worst_step_ratios(cfg, start, &resolved, effective, *warp, tick_hz)
         else {
             break;
         };
+        measured = true;
         if ratios.fit(effective, tick_hz) {
             break;
         }
@@ -1886,8 +2029,39 @@ pub fn floor_move_clock(
         };
         effective = stretched;
     }
+    if !measured {
+        // Nothing about this command could be measured on the clocks it came
+        // with, so nothing about it is this pass's to change. The phase walk
+        // would still have an answer — it solves no legs, so a path nobody can
+        // place does not stop it — and a clock lengthened on that answer would
+        // be a stretch reported for a move the tick is about to refuse for a
+        // reason no clock addresses.
+        return (*command, None);
+    }
 
-    if effective == requested {
+    // Then the pair's phase, on the clocks the move will run on — measured
+    // again after every adjustment, so what is reported is what runs.
+    let sized = effective;
+    let mut separation;
+    let mut dephased = false;
+    let mut adjustments = 0;
+    loop {
+        separation = phase_of(cfg, start, &resolved, effective, *warp, tick_hz);
+        let Some(pair) = separation.filter(|pair| !pair.met(cfg.phase.separation_rad)) else {
+            break;
+        };
+        if adjustments == STRETCH_PASSES {
+            break;
+        }
+        let Some(next) = de_phased(cfg, sized, effective, &pair) else {
+            break;
+        };
+        effective = next;
+        adjustments += 1;
+        dephased = true;
+    }
+
+    if effective == requested && separation.is_none_or(|pair| pair.met(cfg.phase.separation_rad)) {
         return (*command, None);
     }
     (
@@ -1902,8 +2076,61 @@ pub fn floor_move_clock(
         Some(ClockStretch {
             requested,
             effective,
+            separation,
+            separation_required: cfg.phase.separation_rad,
+            dephased,
         }),
     )
+}
+
+/// `effective` with the later-arriving antenna's clock lengthened enough to
+/// carry the pair to the configured separation, or `None` when no clock gets
+/// there.
+///
+/// Delaying the side that reaches the crossing second is the whole mechanism:
+/// the other one is still travelling away from the crossing, so every extra
+/// second of delay is `leader_rate` more radians between the tips, and the
+/// estimate is that division. It is first-order — the leader is shaped and its
+/// rate is falling — and the re-measuring passes above are what close the rest,
+/// exactly as they do for a step-bound stretch.
+///
+/// `None` for the three cases no delay answers: a leader that has stopped, a
+/// crossing at the very start of the path, and a side already lengthened to
+/// [`MAX_PHASE_STRETCH`]. Each of them leaves the move on the clocks it has,
+/// saying the separation is unmet.
+///
+/// The cap is a multiple of `sized` — the clock the side runs on with its own
+/// span carried, before any de-phasing — and not of whatever was asked for. A
+/// caller who asks for a clock far under the floor has already had it replaced;
+/// capping against the number they typed would cap a side below the span it has
+/// to cover.
+fn de_phased(
+    cfg: &MotionConfig,
+    sized: MoveDurations,
+    effective: MoveDurations,
+    pair: &PhaseSeparation,
+) -> Option<MoveDurations> {
+    let side = match pair.later {
+        JointId::AntennaRight => 0,
+        JointId::AntennaLeft => 1,
+        JointId::BodyYaw | JointId::Leg(_) => return None,
+    };
+    let arrival = pair.at.as_secs_f64();
+    if !(pair.leader_rate > 0.0 && arrival > 0.0) {
+        return None;
+    }
+    // Scaling a clock scales every time along its path, the crossing included,
+    // so the delay is asked for as a factor rather than added on.
+    let target = cfg.phase.separation_rad * PHASE_TARGET_OVERSHOOT;
+    let delay = (target - pair.offset) / pair.leader_rate;
+    let scaled = effective.antennas[side].as_secs_f64() * (arrival + delay) / arrival;
+    let capped = scaled.min(sized.antennas[side].as_secs_f64() * MAX_PHASE_STRETCH);
+    let longer = Duration::try_from_secs_f64(capped).ok()?;
+    (longer > effective.antennas[side]).then(|| {
+        let mut durations = effective;
+        durations.antennas[side] = longer;
+        durations
+    })
 }
 
 /// `durations` with each clock that overran its bound scaled past it, and the
@@ -1958,49 +2185,196 @@ fn worst_step_ratios(
     warp: Warp,
     tick_hz: f64,
 ) -> Option<StepRatios> {
+    let peaks = peaks_of(cfg, start, target, durations, warp, tick_hz)?;
+    // Per joint and not per group: the legs and the body yaw ride one clock and
+    // are judged against bounds of their own, so the clock's ratio is the worse
+    // of the two.
+    let ratio = |step: f64, bound: f64| {
+        let ratio = step / bound;
+        ratio.is_finite().then_some(ratio)
+    };
+    Some(StepRatios {
+        head: ratio(peaks.legs, cfg.max_step.legs)?
+            .max(ratio(peaks.body_yaw, cfg.max_step.body_yaw)?),
+        antennas: [
+            ratio(peaks.antennas[0], cfg.max_step.antennas)?,
+            ratio(peaks.antennas[1], cfg.max_step.antennas)?,
+        ],
+    })
+}
+
+/// The worst per-tick step a move plans, per joint group, radians.
+///
+/// What a step bound is sized against: the largest distance one period of the
+/// plan asks a joint to cover, which is the peak of the shaped path and nothing
+/// to do with how the loop is paced.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DryPassPeaks {
+    /// The worst step any of the six cranks takes.
+    pub legs: f64,
+    /// The body yaw's worst step.
+    pub body_yaw: f64,
+    /// Each antenna's worst step: right, then left.
+    pub antennas: [f64; 2],
+}
+
+/// The largest per-tick step `command` would plan from `start`, sampled at
+/// `tick_hz` through the same envelope and inverse kinematics the live tick
+/// runs.
+///
+/// The measurement [`floor_move_clock`] decides on, handed back in radians
+/// rather than as a fraction of a bound. What it is for is sizing the bounds
+/// themselves: a recorded run says what the machine did, and this says what the
+/// planner asked of it, which is the series `max_step` has to admit. `None`
+/// for a command with no clock, and for every path the dry pass cannot measure.
+#[must_use]
+pub fn dry_pass_peaks(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    command: &MotionCommand,
+    tick_hz: f64,
+) -> Option<DryPassPeaks> {
+    let MotionCommand::MoveTo {
+        target,
+        durations,
+        warp,
+    } = command
+    else {
+        return None;
+    };
+    let resolved = resolve_antennas(start, target).ok()?;
+    peaks_of(cfg, start, &resolved, *durations, *warp, tick_hz)
+}
+
+/// How far from mirrored `command` plans to leave the antennas when the second
+/// of them reaches the contact band, sampled at `tick_hz`.
+///
+/// The measurement [`floor_move_clock`] holds a pair to, handed back on its own
+/// so a caller can ask what a command's phase comes to without commanding it —
+/// which is how the recorded runs and the shipped configuration are compared
+/// against the same figure. `None` for a command with no clock, for a path that
+/// cannot be shaped or walked, and for one that does not carry both tips across
+/// the band's edge.
+#[must_use]
+pub fn dry_pass_separation(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    command: &MotionCommand,
+    tick_hz: f64,
+) -> Option<PhaseSeparation> {
+    let MotionCommand::MoveTo {
+        target,
+        durations,
+        warp,
+    } = command
+    else {
+        return None;
+    };
+    let resolved = resolve_antennas(start, target).ok()?;
+    phase_of(cfg, start, &resolved, *durations, *warp, tick_hz)
+}
+
+/// One walk of the antennas' planned path from `start` to an already-resolved
+/// `target`, for the pair's phase at the contact band.
+///
+/// The legs are not solved for. This walk runs once per de-phasing pass on the
+/// period that accepts a command, and what it needs is two scalars per sample;
+/// putting the inverse kinematics through that many more passes to reach them
+/// would cost the accepting period a great deal for nothing.
+///
+/// Two things keep it to the question it asks. A side that is not going
+/// anywhere cannot cross the band's edge, so a command that moves neither
+/// antenna or only one of them is answered without a walk at all. And the walk
+/// spans the antenna clocks rather than the move's — a pair settled by period
+/// fifteen says nothing further over the remaining eighty-five of a calm stow.
+fn phase_of(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    target: &JointTargets,
+    durations: MoveDurations,
+    warp: Warp,
+    tick_hz: f64,
+) -> Option<PhaseSeparation> {
+    if start.antennas[0] == target.antennas[0] || start.antennas[1] == target.antennas[1] {
+        return None;
+    }
+    let span = durations.antennas[0].max(durations.antennas[1]);
+    let samples = dry_samples(span, tick_hz)?;
+    let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
+    let mut sampled = JointTargets::default();
+    // Seeded with the pose the machine already holds, so a pair that starts
+    // inside the contact band is read as standing there rather than as arriving.
+    let mut watch = PhaseWatch::new(cfg.phase.contact_band_rad);
+    watch.look(Duration::ZERO, start.antennas);
+    for step in 1..=samples {
+        let t = Duration::try_from_secs_f64(f64::from(step) / tick_hz).ok()?;
+        trajectory.sample(t, &mut sampled);
+        watch.look(t, sampled.antennas);
+    }
+    watch.separation()
+}
+
+/// How many periods a dry walk over `span` takes, or `None` for a tick rate or
+/// a clock there is nothing to measure about.
+///
+/// The grid the live loop samples on, from the first period that commands
+/// anything through the one that lands the endpoint. The move's own start is
+/// the pose already held and is the baseline rather than a step. `span` is
+/// whichever of the move's clocks the walk has a question about: every one of
+/// them for the step bounds, the two antennas for the pair's phase.
+fn dry_samples(span: Duration, tick_hz: f64) -> Option<u32> {
     if !(tick_hz.is_finite() && tick_hz > 0.0) {
         return None;
     }
-    let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
-
-    let samples = (durations.longest().as_secs_f64() * tick_hz).ceil();
+    let samples = (span.as_secs_f64() * tick_hz).ceil();
     if !samples.is_finite() || samples > f64::from(MAX_DRY_SAMPLES) {
         return None;
     }
-    // The grid the live loop samples on, from the first period that commands
-    // anything through the one that lands the endpoint. The move's own start is
-    // the pose already held and is the baseline rather than a step.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "bounded above by MAX_DRY_SAMPLES and below by the ceil of a non-negative span"
     )]
-    let samples = samples as u32;
+    Some(samples as u32)
+}
+
+/// [`dry_pass_peaks`] over an already-resolved target.
+fn peaks_of(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    target: &JointTargets,
+    durations: MoveDurations,
+    warp: Warp,
+    tick_hz: f64,
+) -> Option<DryPassPeaks> {
+    let samples = dry_samples(durations.longest(), tick_hz)?;
+    let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
 
     let mut previous = joints_of(cfg, start)?;
     let mut sampled = JointTargets::default();
-    let mut ratios = StepRatios::default();
+    let mut peaks = DryPassPeaks::default();
     for step in 1..=samples {
         let t = Duration::try_from_secs_f64(f64::from(step) / tick_hz).ok()?;
         trajectory.sample(t, &mut sampled);
         let candidate = joints_of(cfg, &sampled)?;
         for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(previous.joints()) {
-            let ratio = (angle - last).abs() / cfg.max_step.for_joint(id);
-            if !ratio.is_finite() {
+            let step = (angle - last).abs();
+            if !step.is_finite() {
                 return None;
             }
-            // Which clock this joint rides, not which group it belongs to: the
-            // two antennas share a bound and a group and nothing else here.
-            let clock = match id {
-                JointId::AntennaRight => &mut ratios.antennas[0],
-                JointId::AntennaLeft => &mut ratios.antennas[1],
-                JointId::BodyYaw | JointId::Leg(_) => &mut ratios.head,
+            // The six cranks are one figure and the yaw another, because they
+            // are bounded separately even though one clock drives them both.
+            let peak = match id {
+                JointId::AntennaRight => &mut peaks.antennas[0],
+                JointId::AntennaLeft => &mut peaks.antennas[1],
+                JointId::BodyYaw => &mut peaks.body_yaw,
+                JointId::Leg(_) => &mut peaks.legs,
             };
-            *clock = clock.max(ratio);
+            *peak = peak.max(step);
         }
         previous = candidate;
     }
-    Some(ratios)
+    Some(peaks)
 }
 
 /// The nine joint angles that hold `targets`, or `None` when some leg has no
@@ -2124,14 +2498,32 @@ mod tests {
     /// exact threshold lies within one step below.
     const FLOOR_SEARCH_STEP_S: f64 = 0.01;
 
-    /// How far from a closed-form floor an exactly stretched clock may land.
+    /// How far from the clock its span calls for an exactly stretched clock may
+    /// land.
     ///
-    /// The stretch carries no slack, so what separates it from the continuum
-    /// arithmetic is only the grid: the dry pass measures the largest step
-    /// between two sample points, and a min-jerk peak that falls between them
-    /// reads a fraction of a percent low. A clock landing a whole percent off
-    /// is something other than sampling.
+    /// The slack a stretch carries is the grid headroom, which is arithmetic
+    /// and is accounted for by [`floored_clock`] rather than tolerated here.
+    /// What is left is the sampling itself: the dry pass measures the largest
+    /// step between two sample points, and a min-jerk peak that falls between
+    /// them reads a fraction of a percent low. A clock landing a whole percent
+    /// off is something other than sampling.
     const GRID_TOLERANCE: f64 = 0.01;
+
+    /// Whether an effective clock landed on `wanted` — the larger of what was
+    /// asked for and the closed form its span needs — with no band between the
+    /// two.
+    ///
+    /// Never shortened, and over by no more than the grid headroom that clock
+    /// carries. The headroom is the ceiling because it is also the size of the
+    /// dry pass's own underestimate of the peak: a stretch starting from a very
+    /// short clock measures a ratio a little low, so it converges to within one
+    /// headroom of the floor rather than onto it. Both terms fall off as the
+    /// square of the periods the clock spans, so a long clock is held to the
+    /// sampling tolerance alone.
+    fn lands_on(effective: f64, wanted: f64, tick_hz: f64) -> bool {
+        let allowance = 2.0 * grid_headroom(wanted * tick_hz) + GRID_TOLERANCE;
+        effective >= wanted * (1.0 - GRID_TOLERANCE) && effective <= wanted * (1.0 + allowance)
+    }
 
     /// The period the tests grid on is the rate the floors are derived at, so
     /// what they measure is what a shipped configuration runs.
@@ -2478,7 +2870,7 @@ mod tests {
             head_pose_body: reachy_kin::stow_head_pose(),
             ..JointTargets::default()
         };
-        let requested = secs(0.5);
+        let requested = secs(0.2);
         let command = MotionCommand::MoveTo {
             target: JointTargets::default(),
             durations: MoveDurations::uniform(requested),
@@ -2488,7 +2880,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &stow);
         let (floored, stretch) =
             floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("half a second cannot carry the fold");
+        let stretch = stretch.expect("a fifth of a second cannot carry the fold");
         assert_eq!(stretch.requested, MoveDurations::uniform(requested));
         assert_eq!(stretch.effective, durations_of(&floored));
         assert!(
@@ -2525,8 +2917,8 @@ mod tests {
         let cfg = MotionConfig::default();
         let (state, _) = armed_at(&cfg, &JointTargets::default());
         let requested = MoveDurations {
-            head: secs(0.5),
-            antennas: [secs(0.3), secs(0.35)],
+            head: secs(0.2),
+            antennas: [secs(0.1), secs(0.15)],
         };
 
         let yaw_span = 1.0;
@@ -2582,7 +2974,7 @@ mod tests {
                 Some(side) => (stretch.effective.antennas[side], requested.antennas[side]),
             };
             assert!(
-                (moved.as_secs_f64() - floor).abs() <= floor * GRID_TOLERANCE,
+                lands_on(moved.as_secs_f64(), floor, FLOOR_TICK_HZ),
                 "{name}: stretched to {moved:?}, not the {floor:.4} s its span needs"
             );
             assert!(
@@ -2619,7 +3011,7 @@ mod tests {
         // shorter one and still fits.
         let requested = MoveDurations {
             head: secs(2.0),
-            antennas: [secs(0.3), secs(0.2)],
+            antennas: [secs(0.1), secs(0.05)],
         };
         let command = MotionCommand::MoveTo {
             target: JointTargets {
@@ -2656,11 +3048,14 @@ mod tests {
 
     /// The recovery this exists for: a body a hand spun to the half turn while
     /// the machine lay limp folds to stow on a clock sized for the half turn,
-    /// instead of faulting partway and dropping the head.
+    /// instead of faulting partway and dropping the head. It is the
+    /// unattended-at-boot case: nobody is there to catch the head or to restart
+    /// the daemon.
     ///
-    /// Half a turn exceeds the ~153° a two-second clock covers at this step
-    /// bound, and it is the unattended-at-boot case: nobody is there to catch
-    /// the head or to restart the daemon.
+    /// Half a turn needs 0.79 s at the measured yaw bound, which a calm
+    /// two-second stow carries outright — asserted here, because it is why the
+    /// fold below is driven at a quick gesture's clock instead: that is the
+    /// clock a half turn does not fit inside.
     #[test]
     fn a_body_spun_to_the_half_turn_folds_on_a_stretched_clock() {
         let cfg = MotionConfig::default();
@@ -2672,14 +3067,26 @@ mod tests {
             head_pose_body: reachy_kin::stow_head_pose(),
             ..JointTargets::default()
         };
-        let shipped = secs(2.0);
+        let calm = MotionCommand::MoveTo {
+            target: stow,
+            durations: MoveDurations::uniform(secs(2.0)),
+            warp: Warp::MinJerk,
+        };
+        let (state, _) = armed_at(&cfg, &crooked);
+        assert_eq!(
+            floor_move_clock(&cfg, state.last_targets(), &calm, FLOOR_TICK_HZ).1,
+            None,
+            "a calm stow carries the half turn as asked"
+        );
+
+        let quick = secs(0.5);
         let command = MotionCommand::MoveTo {
             target: stow,
-            durations: MoveDurations::uniform(shipped),
+            durations: MoveDurations::uniform(quick),
             warp: Warp::MinJerk,
         };
 
-        // Unfloored, the shipped fold is the regression: it steps past the
+        // Unfloored, the quick fold is the regression: it steps past the
         // bound partway round and the move is abandoned wherever that was.
         let (mut state, pinned) = armed_at(&cfg, &crooked);
         let (_, out) = run_command(&cfg, &mut state, &pinned, &command, 1.0 / FLOOR_TICK_HZ);
@@ -2698,7 +3105,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &crooked);
         let (floored, stretch) =
             floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("a half turn does not fit a two second clock");
+        let stretch = stretch.expect("a half turn does not fit a half second clock");
         let floor = duration_floor_s(core::f64::consts::PI, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
         assert!(
             stretch.effective.head.as_secs_f64() >= floor,
@@ -2845,7 +3252,7 @@ mod tests {
         };
         let command = MotionCommand::MoveTo {
             target: stow,
-            durations: MoveDurations::uniform(secs(2.0)),
+            durations: MoveDurations::uniform(secs(0.5)),
             warp: Warp::MinJerk,
         };
         let (state, _) = armed_at(&cfg, &crooked);
@@ -2951,9 +3358,14 @@ mod tests {
     ///
     /// Walked across the boundary a hundredth of a second at a time: every
     /// clock lands on the larger of what was asked and what the span needs,
-    /// none is ever shortened, and the sequence never steps backwards. A margin
-    /// on top of the floor would show up here as a jump at the crossing, and a
-    /// stretch that undershot would show up as a clock under the floor.
+    /// none is ever shortened, and the sequence never steps backwards by more
+    /// than the convergence residual. A margin on top of the floor would show
+    /// up here as a jump at the crossing, and a stretch that undershot would
+    /// show up as a clock under the floor.
+    ///
+    /// The residual is why the backwards check is not exact: two requests below
+    /// the floor land on it from different starting grids, and the shorter
+    /// start measures its ratio a shade lower, so it arrives a shade higher.
     #[test]
     fn the_effective_clock_is_the_requested_one_or_the_floor_and_nothing_between() {
         let cfg = MotionConfig::default();
@@ -2962,7 +3374,10 @@ mod tests {
         let floor = duration_floor_s(span, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
 
         let mut previous = 0.0;
-        for hundredths in 40..=120 {
+        // Straddling the floor, which the yaw's measured bound puts at a
+        // quarter of a second: a band that sat entirely above it would pass
+        // without ever crossing the thing under test.
+        for hundredths in 10..=60 {
             let requested = f64::from(hundredths) / 100.0;
             let command = MotionCommand::MoveTo {
                 target: JointTargets {
@@ -2979,15 +3394,16 @@ mod tests {
 
             let wanted = requested.max(floor);
             assert!(
-                (effective - wanted).abs() <= wanted * GRID_TOLERANCE,
+                lands_on(effective, wanted, FLOOR_TICK_HZ),
                 "{requested:.2} s ran on {effective:.4} s, not the {wanted:.4} s it should"
             );
             assert!(
                 effective >= requested,
                 "{requested:.2} s was shortened to {effective:.4} s"
             );
+            let residual = 2.0 * grid_headroom(previous * FLOOR_TICK_HZ) + GRID_TOLERANCE;
             assert!(
-                effective >= previous * (1.0 - GRID_TOLERANCE),
+                effective >= previous * (1.0 - residual),
                 "{requested:.2} s ran on {effective:.4} s, shorter than the clock before it"
             );
             previous = effective;
@@ -3000,7 +3416,7 @@ mod tests {
     #[test]
     fn a_stretch_follows_the_span_still_ahead() {
         let cfg = MotionConfig::default();
-        let requested = MoveDurations::uniform(secs(0.5));
+        let requested = MoveDurations::uniform(secs(0.3));
         let stow = JointTargets {
             head_pose_body: reachy_kin::stow_head_pose(),
             ..JointTargets::default()
@@ -3021,7 +3437,7 @@ mod tests {
             };
             floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
                 .1
-                .expect("half a second carries neither span")
+                .expect("three tenths of a second carries neither span")
                 .effective
                 .head
                 .as_secs_f64()
@@ -3126,19 +3542,19 @@ mod tests {
                 antennas: [short_arc, 0.0],
                 ..JointTargets::default()
             },
-            durations: MoveDurations::uniform(secs(0.5)),
+            durations: MoveDurations::uniform(secs(0.15)),
             warp: Warp::MinJerk,
         };
 
         let (floored, stretch) =
             floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("half a second cannot carry a turn of antenna");
+        let stretch = stretch.expect("a seventh of a second cannot carry a turn of antenna");
 
         let long_floor = duration_floor_s(long_arc, cfg.max_step.antennas, FLOOR_TICK_HZ);
         let short_floor = duration_floor_s(short_arc.abs(), cfg.max_step.antennas, FLOOR_TICK_HZ);
         let moved = stretch.effective.antennas[0].as_secs_f64();
         assert!(
-            (moved - long_floor).abs() <= long_floor * GRID_TOLERANCE,
+            lands_on(moved, long_floor, FLOOR_TICK_HZ),
             "stretched to {moved:.4} s, not the {long_floor:.4} s the long way round needs"
         );
         assert!(
@@ -3153,6 +3569,395 @@ mod tests {
             target.antennas,
             [short_arc, 0.0],
             "the target came back resolved, and the tick resolves it again"
+        );
+    }
+
+    /// Where the machine stands with its antennas at `antennas` and the head
+    /// stowed: the pose every recorded antenna sweep started from.
+    fn stowed_with(antennas: [f64; 2]) -> JointTargets {
+        JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            antennas,
+            ..JointTargets::default()
+        }
+    }
+
+    /// The stow representative the recordings hold the pair at, a hair over half
+    /// a turn from straight up on each side.
+    const SWEPT_FROM: [f64; 2] = [3.2336, -3.2336];
+
+    /// The gesture the pair is judged on: both antennas inboard to straight up,
+    /// on `antennas` and a head clock of `head`.
+    fn inboard_sweep(head: f64, antennas: [f64; 2]) -> MotionCommand {
+        MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations {
+                head: secs(head),
+                antennas: [secs(antennas[0]), secs(antennas[1])],
+            },
+            warp: Warp::MinJerk,
+        }
+    }
+
+    /// The validated pair — one side quick, the other slow — is what the
+    /// separation was sized to admit, and it comes back untouched.
+    #[test]
+    fn the_staggered_pair_sweeps_as_it_was_asked_to() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        let command = inboard_sweep(0.8, [0.7, 0.3]);
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        assert_eq!(stretch, None, "{stretch:?}");
+        assert_eq!(floored, command);
+
+        let pair = dry_pass_separation(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
+            .expect("both antennas cross the band");
+        assert!(pair.met(cfg.phase.separation_rad), "{pair:?}");
+    }
+
+    /// Both numbers are configuration, and a configuration that moves them
+    /// moves what the resolver makes of the same command.
+    ///
+    /// The validated pair clears the shipped separation and comes back with
+    /// nothing said; a configuration asking for more says the pair falls short
+    /// and names the figure it fell short of. And the band is where the pair is
+    /// measured: narrow it and the arrival the verdict is taken at moves later
+    /// into the sweep, on tips nearer the crossing.
+    #[test]
+    fn the_pair_is_judged_against_the_configured_geometry() {
+        let shipped = MotionConfig::default();
+        let (state, _) = armed_at(&shipped, &stowed_with(SWEPT_FROM));
+        let command = inboard_sweep(0.8, [0.7, 0.3]);
+
+        let mut demanding = shipped.clone();
+        demanding.phase.separation_rad = 1.2;
+        let (_, stretch) =
+            floor_move_clock(&demanding, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("the pair no longer clears the separation asked for");
+        assert!(
+            (stretch.separation_required - 1.2).abs() < 1e-12,
+            "the report carries what it judged against: {stretch:?}"
+        );
+        assert!(
+            !stretch
+                .separation
+                .expect("the pair was measured")
+                .met(demanding.phase.separation_rad),
+            "{stretch:?}"
+        );
+        // The quick side has arrived and stopped by the time the slow one
+        // reaches the edge, so no delay parts them further and the pass says so
+        // rather than stretching for nothing.
+        assert!(!stretch.dephased, "{stretch:?}");
+
+        // And the de-phasing aims at the configured figure rather than at a
+        // number of its own: a pair in step is parted to a little past what
+        // was asked for, whatever was asked for.
+        let in_step = inboard_sweep(0.8, [0.8, 0.8]);
+        let mut lax = shipped.clone();
+        lax.phase.separation_rad = 0.3;
+        let parted = |cfg: &MotionConfig| {
+            let (floored, stretch) =
+                floor_move_clock(cfg, state.last_targets(), &in_step, FLOOR_TICK_HZ);
+            let stretch = stretch.expect("a pair in step is de-phased");
+            assert!(stretch.dephased, "{stretch:?}");
+            let pair = dry_pass_separation(cfg, state.last_targets(), &floored, FLOOR_TICK_HZ)
+                .expect("the de-phased pair still crosses the band");
+            (stretch.effective.antennas[0], pair.offset)
+        };
+        let (lax_clock, lax_offset) = parted(&lax);
+        let (shipped_clock, shipped_offset) = parted(&shipped);
+        assert!(
+            lax_clock < shipped_clock,
+            "a laxer separation asked for the same delay: {lax_clock:?} against {shipped_clock:?}"
+        );
+        assert!(
+            (0.30..0.45).contains(&lax_offset),
+            "the laxer pass parted the pair to {lax_offset:.4} rad, not to a little past 0.30"
+        );
+        assert!(
+            (0.60..0.75).contains(&shipped_offset),
+            "the shipped pass parted the pair to {shipped_offset:.4} rad"
+        );
+
+        let mut narrow = shipped.clone();
+        narrow.phase.contact_band_rad = 0.4;
+        let wide_band =
+            dry_pass_separation(&shipped, state.last_targets(), &command, FLOOR_TICK_HZ)
+                .expect("both antennas cross the band");
+        let narrow_band =
+            dry_pass_separation(&narrow, state.last_targets(), &command, FLOOR_TICK_HZ)
+                .expect("both antennas cross the narrower band too");
+        assert!(
+            narrow_band.at > wide_band.at,
+            "the narrower band is reached later: {narrow_band:?} against {wide_band:?}"
+        );
+    }
+
+    /// A pair needs two sides going somewhere. A command that leaves one
+    /// antenna where it stands has no second arrival to be late for, so there
+    /// is nothing to measure and no walk taken to find that out.
+    #[test]
+    fn a_command_that_moves_one_antenna_is_not_a_pair() {
+        let cfg = MotionConfig::default();
+        let held = stowed_with(SWEPT_FROM);
+        let (state, _) = armed_at(&cfg, &held);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [0.0, held.antennas[1]],
+                ..JointTargets::default()
+            },
+            durations: MoveDurations {
+                head: secs(0.8),
+                antennas: [secs(0.7), secs(0.7)],
+            },
+            warp: Warp::MinJerk,
+        };
+
+        assert_eq!(
+            dry_pass_separation(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ),
+            None
+        );
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        assert_eq!(stretch, None, "{stretch:?}");
+        assert_eq!(floored, command);
+    }
+
+    /// The phase question spans the antennas' own clocks. A head clock ten
+    /// times longer is ten times the walk to reach the same verdict: the pair
+    /// has arrived, and where it crossed is where it crossed.
+    #[test]
+    fn the_pair_is_measured_over_its_own_clocks_and_not_the_moves() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+
+        let quick = dry_pass_separation(
+            &cfg,
+            state.last_targets(),
+            &inboard_sweep(0.8, [0.7, 0.3]),
+            FLOOR_TICK_HZ,
+        )
+        .expect("both antennas cross the band");
+        let calm = dry_pass_separation(
+            &cfg,
+            state.last_targets(),
+            &inboard_sweep(8.0, [0.7, 0.3]),
+            FLOOR_TICK_HZ,
+        )
+        .expect("both antennas cross the band");
+        assert_eq!(quick, calm);
+    }
+
+    /// A pair on one clock reaches the crossing mirror-symmetric, which is the
+    /// configuration the tips meet in. The pass delays the side that gets there
+    /// second until they clear each other, lengthening nothing else and
+    /// shortening nothing at all.
+    #[test]
+    fn a_pair_sweeping_in_step_is_de_phased() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        let command = inboard_sweep(0.8, [0.8, 0.8]);
+
+        let in_step = dry_pass_separation(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
+            .expect("both antennas cross the band");
+        assert!(
+            in_step.offset < 1e-6,
+            "one clock leaves the pair {:.4} rad apart",
+            in_step.offset
+        );
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("a pair in step is de-phased");
+        assert!(stretch.dephased, "{stretch:?}");
+        assert_eq!(stretch.effective.head, stretch.requested.head);
+        assert_eq!(stretch.effective.antennas[1], stretch.requested.antennas[1]);
+        assert!(
+            stretch.effective.antennas[0] > stretch.requested.antennas[0],
+            "{stretch:?}"
+        );
+
+        let separated = dry_pass_separation(&cfg, state.last_targets(), &floored, FLOOR_TICK_HZ)
+            .expect("both antennas still cross the band");
+        assert!(
+            separated.met(cfg.phase.separation_rad),
+            "de-phased to {:.4} rad, which is still under the bound",
+            separated.offset
+        );
+    }
+
+    /// A stagger a floor collapses is caught by the same check, because the
+    /// check runs on the clocks the move will actually run on.
+    ///
+    /// The quick side here is quicker than its own span allows, so it is
+    /// right-sized up towards the slow side's clock — and a stagger that
+    /// survives only as long as nothing else moves the clocks is folklore.
+    #[test]
+    fn a_floor_that_collapses_the_stagger_is_caught_on_the_effective_clocks() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        let asked = inboard_sweep(0.8, [0.05, 0.06]);
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &asked, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("neither side carries its sweep in a twentieth of a second");
+        assert!(stretch.dephased, "{stretch:?}");
+        let floor = duration_floor_s(SWEPT_FROM[0], cfg.max_step.antennas, FLOOR_TICK_HZ);
+        for side in 0..2 {
+            assert!(
+                stretch.effective.antennas[side].as_secs_f64() >= floor,
+                "side {side} runs on {:?}, under the {floor:.4} s its sweep needs",
+                stretch.effective.antennas[side]
+            );
+        }
+        let separated = dry_pass_separation(&cfg, state.last_targets(), &floored, FLOOR_TICK_HZ)
+            .expect("both antennas cross the band");
+        assert!(separated.met(cfg.phase.separation_rad), "{separated:?}");
+    }
+
+    /// A leader that has stopped is one no delay separates: the move runs on
+    /// the clocks it has and the report says the separation is unmet. Refusing
+    /// is not available — the maneuvers that recover this machine come down
+    /// this same path.
+    #[test]
+    fn a_pair_no_delay_parts_runs_and_says_so() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        // The left antenna stops just inside the band, early; the right arrives
+        // at the far edge long afterwards, mirroring it.
+        let command = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [0.0, -0.95],
+                ..JointTargets::default()
+            },
+            durations: MoveDurations {
+                head: secs(0.8),
+                antennas: [secs(1.0), secs(0.2)],
+            },
+            warp: Warp::MinJerk,
+        };
+
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("an unmet separation is reported");
+        assert!(!stretch.dephased, "{stretch:?}");
+        assert_eq!(stretch.effective, stretch.requested);
+        assert_eq!(durations_of(&floored), stretch.requested);
+        let pair = stretch.separation.expect("the pair was measured");
+        assert!(!pair.met(cfg.phase.separation_rad), "{pair:?}");
+        assert_eq!(pair.later, JointId::AntennaRight);
+        assert!(pair.leader_rate < 1e-6, "{pair:?}");
+    }
+
+    /// And a leader creeping through the crossing is the same answer arrived at
+    /// the long way: the delay the arithmetic asks for is past what a clock may
+    /// be stretched to, so the move runs on the last clocks with the separation
+    /// unmet.
+    #[test]
+    fn a_de_phasing_that_would_never_end_stops_at_the_cap() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with([SWEPT_FROM[0], -1.06]));
+        let command = MotionCommand::MoveTo {
+            target: JointTargets {
+                antennas: [0.0, -0.2],
+                ..JointTargets::default()
+            },
+            durations: MoveDurations {
+                head: secs(0.8),
+                antennas: [secs(2.0), secs(8.0)],
+            },
+            // Constant rate, so the left antenna is still crawling out of the
+            // band whenever the right one arrives at it.
+            warp: Warp::Linear,
+        };
+
+        let (_, stretch) = floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("the pair is measured and cannot be parted");
+        assert!(stretch.dephased, "{stretch:?}");
+        assert!(
+            !stretch
+                .separation
+                .expect("the pair was measured")
+                .met(cfg.phase.separation_rad)
+        );
+        assert_eq!(
+            stretch.effective.antennas[0],
+            secs(2.0 * MAX_PHASE_STRETCH),
+            "the right antenna was carried past its cap"
+        );
+    }
+
+    /// A pair already standing inside the band has no arrival to be late for,
+    /// and one side parked in there while the other sweeps through has only its
+    /// own. Both are left alone: a stationary tip is not somewhere a delay puts
+    /// the other one.
+    #[test]
+    fn a_pair_with_no_crossing_between_them_is_left_alone() {
+        let cfg = MotionConfig::default();
+        for (name, start, target) in [
+            ("both already inside", [0.5, -0.5], [0.2, -0.2]),
+            ("one parked inside", [SWEPT_FROM[0], -0.5], [0.0, -0.5]),
+        ] {
+            let (state, _) = armed_at(&cfg, &stowed_with(start));
+            let command = MotionCommand::MoveTo {
+                target: JointTargets {
+                    antennas: target,
+                    ..JointTargets::default()
+                },
+                durations: MoveDurations::uniform(secs(1.0)),
+                warp: Warp::MinJerk,
+            };
+            assert_eq!(
+                dry_pass_separation(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ),
+                None,
+                "{name}"
+            );
+            assert_eq!(
+                floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ).1,
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    /// A command whose spans the dry pass cannot measure comes back untouched,
+    /// pair included.
+    ///
+    /// The phase walk solves no legs, so it still has an answer for a path the
+    /// step walk gave up on — and acting on that answer would report a stretch
+    /// for a move the tick is about to refuse for a reason no clock addresses.
+    /// The pair here is the mirrored one the resolver de-phases whenever it can
+    /// measure anything at all.
+    #[test]
+    fn a_command_the_spans_cannot_be_measured_on_is_left_alone() {
+        let mut cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        let command = inboard_sweep(0.8, [0.8, 0.8]);
+
+        let measurable = floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
+            .1
+            .expect("the mirrored pair is de-phased while the spans can be measured");
+        assert!(measurable.dephased);
+
+        // A bound of zero: every ratio against it is a number the pass refuses
+        // to reason from, which is one of the three cases the contract names.
+        cfg.max_step.legs = 0.0;
+        let unmeasurable = floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        assert_eq!(
+            durations_of(&unmeasurable.0),
+            durations_of(&command),
+            "a command nothing could be measured about was re-clocked"
+        );
+        assert_eq!(unmeasurable.1, None);
+        // And the pair really is the one that would have been parted, so this
+        // case is about the early return and not about a pair with nothing to
+        // say.
+        assert!(
+            dry_pass_separation(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ)
+                .is_some_and(|pair| !pair.met(cfg.phase.separation_rad))
         );
     }
 
@@ -4313,17 +5118,17 @@ mod tests {
     ///
     /// The first is tuned by hand — a tight threshold and a slow move, which
     /// separates the arithmetic from the numbers the machine happens to ship
-    /// with. The second is what the bench ships and its resolver admits: every
-    /// per-tick goal step bounded by a step guard no wider than the threshold,
-    /// which is the relationship the reversal case below rests on. A joint
-    /// following at a distance has to survive both.
+    /// with. The second is the shipped configuration driven at the fastest
+    /// gesture it admits: a mirrored antenna sweep whose lag runs to several
+    /// times the threshold, which is the regime the shipped numbers have to
+    /// hold in. A joint following at a distance has to survive both.
     fn regimes() -> [(MotionConfig, JointTargets, Duration, usize); 2] {
         [
             (tracking_cfg(0.02, 0.002, 10), pose_at(0.19), secs(2.0), 8),
             (
                 MotionConfig::default(),
-                antennas_at([1.5, -1.5]),
-                secs(0.8),
+                antennas_at([3.0, -3.0]),
+                secs(0.5),
                 8,
             ),
         ]
