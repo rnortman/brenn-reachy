@@ -244,10 +244,7 @@ impl FaultTimeline {
     /// The most recent fault, which is the one an ending is reported under.
     #[must_use]
     pub fn last_fault(&self) -> Option<Fault> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            Entry::Fault { fault, .. } => Some(*fault),
-            Entry::Response { .. } => None,
-        })
+        last_fault(&self.entries)
     }
 
     /// The maneuver that is running, if one is.
@@ -295,7 +292,37 @@ impl FaultTimeline {
 /// verbatim.
 impl fmt::Display for FaultTimeline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, entry) in self.entries.iter().enumerate() {
+        Story(&self.entries).fmt(f)
+    }
+}
+
+/// The most recent fault in `entries`, which is the one an ending is reported
+/// under.
+///
+/// Over a slice rather than only over a whole [`FaultTimeline`], because a
+/// record outlives the session that made it: what a subscriber accumulated, or
+/// what a report carries, is entries and nothing else, and a second reverse scan
+/// written over those is a second answer to "what is this incident called".
+#[must_use]
+pub fn last_fault(entries: &[Entry]) -> Option<Fault> {
+    entries.iter().rev().find_map(|entry| match entry {
+        Entry::Fault { fault, .. } => Some(*fault),
+        Entry::Response { .. } => None,
+    })
+}
+
+/// Entries as the one line an operator quotes: each in order, arrow-separated.
+///
+/// The rendering of a record, wherever the record is held. One implementation of
+/// the separator and the ordering, because both surfaces of one machine — the
+/// line a session prints as it ends and the report a host attaches afterwards —
+/// have to be the same text for a grep or an alert rule to match both.
+#[derive(Debug, Clone, Copy)]
+pub struct Story<'a>(pub &'a [Entry]);
+
+impl fmt::Display for Story<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, entry) in self.0.iter().enumerate() {
             if index > 0 {
                 f.write_str(" → ")?;
             }

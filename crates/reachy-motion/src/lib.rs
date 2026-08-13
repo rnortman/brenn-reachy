@@ -82,11 +82,12 @@ pub use seq::{
     Sequencer, StepContext, ValueKind,
 };
 pub use tick::{
-    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, ClockStretch, CommandDisposition,
-    CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE,
-    Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Response, TickInputs, TickOutputs,
-    TickReport, TrackingFaultConfig, TrackingLook, TrackingMonitor, dry_pass_peaks,
-    dry_pass_separation, duration_floor_s, floor_move_clock, motion_tick,
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, BusFailureSource, ClockStretch,
+    CommandDisposition, CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S,
+    MIN_JERK_PEAK_RATE, Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Response,
+    TickInputs, TickOutputs, TickReport, TrackingFaultConfig, TrackingLook, TrackingMonitor,
+    WireFailure, dry_pass_peaks, dry_pass_separation, duration_floor_s, floor_move_clock,
+    motion_tick,
 };
-pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome};
+pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome, Story, last_fault};
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

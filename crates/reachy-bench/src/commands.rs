@@ -54,9 +54,9 @@ use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointTargets, Maneuver,
-    MotionCommand, MotionState, MoveDurations, Outcome, PollCadence, PollSequencer, Posture, RegId,
-    RegValue, ValueKind, Warp,
+    EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointSet, JointTargets,
+    Maneuver, MotionCommand, MotionState, MoveDurations, Outcome, PollCadence, PollSequencer,
+    Posture, RegId, RegValue, ValueKind, Warp,
 };
 
 use crate::config::Resolved;
@@ -794,14 +794,63 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         self.state.subscribe_timeline()
     }
 
+    /// The joints this session is no longer commanding.
+    ///
+    /// One set, whichever way a joint got into it: the engage-time health gate
+    /// seeds it with whatever was already flagging when torque went on, and a
+    /// condition raised mid-session inserts into the same set. So a caller
+    /// deciding whether to tell somebody the antennas are out of service asks
+    /// this and not the event it happened to see — a session engaged onto latched
+    /// bits raises no event at all, and a session that lost the pair mid-move
+    /// raises one and then keeps going.
+    ///
+    /// Membership by joint, not emptiness: a head servo on its way to a
+    /// park-class fault lands in this same set, and that is not the antennas
+    /// being degraded.
+    #[must_use]
+    pub fn out_of_service(&self) -> JointSet {
+        self.state.masked()
+    }
+
     /// Record a condition of the machine that only this layer could see.
-    fn record_fault(&mut self, fault: Fault, at: Duration) {
+    ///
+    /// The tick records what it raises, so what arrives here is what a layer
+    /// holding the wire found instead — a bus that stopped carrying, a
+    /// torque-off nobody acknowledged. [`PumpError::unrecorded_fault`] is the
+    /// question to ask before calling this: an ending whose fault the tick
+    /// already recorded owes the record nothing, and a second entry for one
+    /// condition reads as two.
+    pub fn record_fault(&mut self, fault: Fault, at: Duration) {
         self.state.record_fault(fault, at);
     }
 
     /// Record how far the maneuver answering a fault has got.
-    fn record_response(&mut self, maneuver: Maneuver, outcome: Outcome, at: Duration) {
+    ///
+    /// Public alongside [`Self::record_fault`] and for the same reason: a host
+    /// that commands part of a response itself is the only layer that knows how
+    /// far that part got, and a record carrying the condition with no maneuver
+    /// beside it is half of the one story an operator is sent to read. Which
+    /// maneuver it is comes from [`ErrorClass::maneuver`], never from the
+    /// caller's own opinion, and [`FaultTimeline::open_maneuver`] is the
+    /// question to ask before starting one: the ladder never begins a second
+    /// answer to a machine already being answered.
+    pub fn record_response(&mut self, maneuver: Maneuver, outcome: Outcome, at: Duration) {
         self.state.record_response(maneuver, outcome, at);
+    }
+
+    /// The whole of what one stow maneuver is allowed: the longest of the stow
+    /// clocks plus the window its arrival is measured in.
+    ///
+    /// What a caller adds to now to get the deadline [`wind_down`] takes: the
+    /// budget a host bounds its own controlled stow by is the one the maneuver
+    /// it escalates into will honour.
+    #[must_use]
+    pub fn stow_budget(&self) -> Duration {
+        self.machine
+            .resolved
+            .stow_durations()
+            .longest()
+            .saturating_add(self.machine.resolved.settle.timeout)
     }
 }
 
@@ -1032,7 +1081,13 @@ fn settle<T, P: BusPort>(
         }
         ErrorClass::SlowStowToRest | ErrorClass::MaskedSlowStowToPark => {
             line(&format!("fault: {error}"));
-            let (timeline, disposition) = wind_down(engaged, class, clock, line);
+            // Nothing has been spent on a maneuver yet: this ending arrived
+            // straight out of the move, so the whole of one stow is left.
+            let deadline = clock.now().saturating_add(engaged.stow_budget());
+            // Nothing here answers from a value: this command reports the run in
+            // prose, and the stow's events are printed with the rest of it.
+            let (timeline, disposition) =
+                wind_down(engaged, class, deadline, clock, line, &mut |_| {});
             report_disposition(disposition, line);
             report_incident(&timeline, line);
         }
@@ -1065,22 +1120,34 @@ fn settle<T, P: BusPort>(
 /// a wind-down the machine defeats, or one whose clock runs out, falls through
 /// to the immediate release. Every path through here ends with torque off.
 ///
+/// `deadline` is when that one clock is spent, on `clock`'s own scale. Taken
+/// rather than opened here, because a caller that has already commanded part of
+/// the maneuver itself — a host that stowed under control and had the stow
+/// defeated — is continuing the same maneuver and gets its remainder.
+/// [`Engaged::stow_budget`] is what a caller starting from nothing adds to now.
+///
 /// The disposition is the sticky maximum: a head servo dropping out latches,
 /// so a wind-down that started for a grabbed head and lost a servo on the way
 /// down ends parked rather than at rest.
-fn wind_down<P: BusPort>(
+///
+/// Public because the unattended daemon runs the same maneuver on the same
+/// state: which servos carry the head down, how long they have, and what the
+/// record says about it are facts of this machine, and a second implementation
+/// of them above this crate is a second answer that can come to disagree.
+///
+/// `event` gets the stow's own tick events as values beside the printed lines,
+/// as every other commanded move does: a condition raised on the way down — a
+/// pair leaving the moves — changes what the machine can do, and a caller whose
+/// surfaces answer from that cannot read it out of prose.
+pub fn wind_down<P: BusPort>(
     mut engaged: Engaged<'_, '_, P>,
     class: ErrorClass,
+    deadline: Duration,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
+    event: &mut dyn FnMut(TickEvent),
 ) -> (FaultTimeline, Disposition) {
     let stow = engaged.machine.resolved.stow_durations();
-    // The stow's own clock plus the window its arrival is measured in: the
-    // whole of what one stow is allowed, spent once across every expansion.
-    let deadline = clock
-        .now()
-        .saturating_add(stow.longest())
-        .saturating_add(engaged.machine.resolved.settle.timeout);
     // Start the maneuver only if the mask entry didn't already open one; a
     // grabbed head masked nothing, so the stow it takes starts here. Which
     // maneuver that is belongs to the class, not to this caller.
@@ -1108,7 +1175,14 @@ fn wind_down<P: BusPort>(
             break Outcome::FellThrough;
         }
         line("  stowing under control on what still commands");
-        match engaged.move_to(stow_pose_targets(), within(stow, left), clock, line) {
+        match engaged.move_retargeting_events(
+            stow_pose_targets(),
+            within(stow, left),
+            clock,
+            line,
+            event,
+            &mut || None,
+        ) {
             Ok(_) => {
                 line("  stowed; releasing torque");
                 break Outcome::Completed;
@@ -1355,6 +1429,16 @@ pub fn provision<P: BusPort>(
 /// indeterminate, and an indeterminate restart fails the command rather than
 /// riding out on the closing line — an operator scripting a recovery around the
 /// exit code is owed the difference.
+///
+/// And the byte an operator came here to clear is judged: a servo that answers
+/// still reporting hardware-error bits fails the command, whichever bits they
+/// are. This machine clears them to zero on a restart — the observation is in
+/// `docs/bench-runbook.md`, under the open observations, including for the
+/// chronic input-voltage bit every servo latches while running. So a byte that
+/// survives means the restart did not happen or the condition is live at this
+/// instant, and neither of those is a recovery. There is no per-bit tolerance
+/// here: the input-voltage latch is unexplained, and writing "probably fine"
+/// into a recovery command would settle it by assertion.
 pub fn reboot<P: BusPort>(
     map: &ServoMap,
     timing: BusTiming,
@@ -1424,6 +1508,19 @@ pub fn reboot<P: BusPort>(
                          nothing here says it restarted"
                     ));
                     trouble.get_or_insert(PumpError::RestartUnconfirmed { id, source });
+                } else if read.bits != 0 {
+                    // Last of the three, because the two above explain a byte
+                    // that stayed: a servo that never restarted was never going
+                    // to clear anything. This is the servo that did restart and
+                    // is reporting bits anyway.
+                    line(&format!(
+                        "  servo {id}: the bits are still set after a restart that took, so either \
+                         the reboot did not reach the latch or the condition is live now"
+                    ));
+                    trouble.get_or_insert(PumpError::StillLatched {
+                        id,
+                        bits: read.bits,
+                    });
                 }
             }
             Err(error) => {
@@ -1438,7 +1535,10 @@ pub fn reboot<P: BusPort>(
     match trouble {
         Some(error) => Err(error),
         None => {
-            line("rebooted; every servo that came back is limp. `selftest` reads the machine.");
+            line(
+                "rebooted; every servo that came back is limp and reporting no hardware error. \
+                 `selftest` reads the machine.",
+            );
             Ok(())
         }
     }
@@ -1500,6 +1600,8 @@ struct Reading {
     /// Whether it is still holding torque, which a restart clears — so a servo
     /// that answers holding it did not restart.
     holding: bool,
+    /// Its hardware-error byte, which a restart clears too.
+    bits: u8,
 }
 
 /// What a servo holds now: the hardware-error byte, its torque, and where it is
@@ -1510,10 +1612,11 @@ struct Reading {
 /// observable: a servo comes back with it cleared, so reading it is how
 /// answering is told from restarting. The position is reported as the servo's
 /// own count and the angle that count is, unshifted by anything the host knows.
-/// Neither the byte nor the position is compared against an expectation: what a
-/// restart does to a latched byte or to a position is not something this
-/// project has established on its own hardware, so both are reported as they
-/// read.
+/// The byte is reported as it reads *and* handed back for the caller to judge:
+/// this machine clears it to zero on a restart, recorded in the runbook's open
+/// observations, so a surviving byte is a reading with an expectation to fail
+/// against. The position has no such expectation established, so it is reported
+/// and nothing more.
 fn reading<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
@@ -1543,6 +1646,7 @@ fn reading<P: BusPort>(
             counts_to_rad(counts).to_degrees()
         ),
         holding,
+        bits,
     })
 }
 
@@ -3437,11 +3541,25 @@ mod tests {
             assert!(reading.contains("counts"), "{reading}");
             assert!(reading.contains("deg"), "{reading}");
         }
-        assert!(
-            run.printed
+        // The latch the operator came for is gone, and that is read back rather
+        // than assumed: nothing here writes the byte, so a servo reporting zero
+        // is a servo that restarted.
+        for id in cfg.map.ids() {
+            let reading = run
+                .printed
                 .iter()
-                .any(|line| line.contains("0x20") && line.contains("still latched")),
-            "a byte that survived the restart is reported as it read: {:?}",
+                .find(|line| line.contains(&format!("servo {id}: hardware error")))
+                .unwrap_or_else(|| panic!("servo {id} was not reported: {:?}", run.printed));
+            assert!(
+                reading.contains("0x00") && reading.contains("clear"),
+                "{reading}"
+            );
+        }
+        assert!(
+            !run.printed
+                .iter()
+                .any(|line| line.contains("still latched")),
+            "{:?}",
             run.printed
         );
         // The torque is measured, not assumed: the closing line claims every
@@ -3575,17 +3693,20 @@ mod tests {
         }
     }
 
-    /// A servo whose only latched bit is input voltage is reported as that and
-    /// not as a fault, and one that answers its ping but fails a register read
-    /// is named without stopping the other eight being read.
+    /// A servo whose only surviving bit is input voltage is reported as that,
+    /// and one that answers its ping but fails a register read is named without
+    /// stopping the other eight being read.
     ///
-    /// The voltage rendering is what tells an operator the reboot cleared what
-    /// they rebooted for; the read-error arm is the path a bus failure takes in
-    /// the middle of a report.
+    /// The voltage rendering is what tells an operator which bit they are
+    /// looking at; the read-error arm is the path a bus failure takes in the
+    /// middle of a report. The surviving byte is trouble of its own — the test
+    /// below pins that — and here it is a servo further down the bus than the
+    /// one that would not read, so what comes back is the first verdict in bus
+    /// order and not the last.
     #[test]
     fn a_reboot_reports_a_voltage_only_byte_and_a_servo_that_will_not_read() {
         let cfg = resolved();
-        let voltage = cfg.map.ids()[1];
+        let voltage = cfg.map.ids()[7];
         let unreadable = cfg.map.ids()[5];
         let mut machine = overloaded(&cfg);
         machine.set(
@@ -3593,6 +3714,7 @@ mod tests {
             reg_for(RegId::HardwareErrorStatus),
             &[dxl_proto::conv::HW_INPUT_VOLTAGE],
         );
+        machine.keeps_latch.push(voltage);
         // Answers its ping, answers nothing about where it is standing.
         machine
             .mute
@@ -3631,6 +3753,68 @@ mod tests {
                 "servo {id} went unreported: {:?}",
                 run.printed
             );
+        }
+    }
+
+    /// A hardware-error byte that survives its reboot fails the command, and
+    /// the chronic input-voltage bit is no exception.
+    ///
+    /// The one thing this command exists to do. A restart clears the byte on
+    /// this machine, so a servo answering with bits still set either never
+    /// restarted or is reporting a condition live at this instant — and an
+    /// operator scripting a recovery around the exit code must not be told a
+    /// reboot that cleared nothing succeeded. The voltage bit gets no carve-out:
+    /// it is an unexplained reading on a machine whose other readings are
+    /// trusted, and coding "probably fine" into the recovery path would settle
+    /// that question by assertion rather than by measuring the rail.
+    #[test]
+    fn a_latch_that_survives_its_reboot_fails_the_command() {
+        let cfg = resolved();
+        for bits in [0x20, dxl_proto::conv::HW_INPUT_VOLTAGE] {
+            let stuck = cfg.map.ids()[4];
+            let mut machine = overloaded(&cfg);
+            machine.set(stuck, reg_for(RegId::HardwareErrorStatus), &[bits]);
+            machine.keeps_latch.push(stuck);
+            let run = run(machine, |port, clock, line| {
+                reboot(&cfg.map, cfg.timing, port, None, clock, line)
+            });
+
+            let error = run.err("a reboot that cleared nothing did not recover");
+            let PumpError::StillLatched { id, bits: held } = error else {
+                panic!("expected a surviving latch, got {error}");
+            };
+            assert_eq!((*id, *held), (stuck, bits));
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|line| line.contains(&format!("servo {stuck}"))
+                        && line.contains("still set after a restart that took")),
+                "{:?}",
+                run.printed
+            );
+            assert!(
+                !run.printed.iter().any(|line| line.contains("rebooted;")),
+                "{:?}",
+                run.printed
+            );
+            // It restarted, so the torque did come off — the byte is the whole
+            // of the complaint, and the other eight still pass.
+            assert_eq!(
+                torque(&cfg, &run),
+                vec![0; JointId::COUNT],
+                "{:?}",
+                run.printed
+            );
+            for id in cfg.map.ids().iter().filter(|id| **id != stuck) {
+                assert!(
+                    run.printed
+                        .iter()
+                        .any(|line| line.contains(&format!("servo {id}: hardware error"))
+                            && line.contains("clear")),
+                    "servo {id} went unreported: {:?}",
+                    run.printed
+                );
+            }
         }
     }
 
@@ -4411,6 +4595,58 @@ mod tests {
         );
     }
 
+    /// The joints out of service are one set, whichever way they got there.
+    ///
+    /// A caller that has to tell somebody the antennas are limp has two
+    /// situations and must not need two ways of noticing them: a session engaged
+    /// onto bits already latched, where the gate simply never enables that servo
+    /// and nothing is ever raised; and a session that lost the pair mid-move,
+    /// which raises a condition and carries on. Reading the set covers both.
+    #[test]
+    fn the_joints_out_of_service_are_one_set_whichever_way_they_got_there() {
+        let cfg = resolved();
+        let antenna = cfg.map.ids()[7];
+
+        // Engaged onto a latch: nothing to hear, and the joint is out all the
+        // same.
+        let mut already = machine_at(&datumed_config(), &stow_legs());
+        already.set(antenna, reg_for(RegId::HardwareErrorStatus), &[0x20]);
+        let seeded = engaged_run(&cfg, already, |mut engaged, _registers, clock, line| {
+            let out = engaged.out_of_service();
+            assert!(out.contains(JointId::AntennaRight), "{out:?}");
+            assert!(!out.covers(JointGroup::Legs), "{out:?}");
+            assert!(
+                engaged.timeline().entries().is_empty(),
+                "the gate raised nothing: {:?}",
+                engaged.timeline().entries()
+            );
+            engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+            Ok(())
+        });
+        seeded
+            .outcome
+            .expect("a pair the gate left out does not stop the head");
+
+        // Degraded mid-session: the same set, reached by the other source.
+        let mid = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, registers, clock, line| {
+                assert!(engaged.out_of_service().is_empty());
+                registers
+                    .borrow_mut()
+                    .set(antenna, reg_for(RegId::HardwareErrorStatus), &[0x20]);
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                let out = engaged.out_of_service();
+                assert!(out.covers(JointGroup::Antennas), "{out:?}");
+                assert!(!out.covers(JointGroup::Legs), "{out:?}");
+                Ok(())
+            },
+        );
+        mid.outcome
+            .expect("a degraded pair does not end the head's move");
+    }
+
     /// The orderly release ends the session, so it ends with the session's
     /// record.
     ///
@@ -4776,6 +5012,158 @@ mod tests {
         );
     }
 
+    /// A re-commanded stow clamped to the last nanosecond of its deadline runs on
+    /// the clock the span still ahead of it needs, not on the nanosecond.
+    ///
+    /// The wind-down breaks out only when nothing at all is left, so the shortest
+    /// clock it can hand on is one tick of the deadline's own resolution — a move
+    /// that would finish between two control periods, stepping its whole
+    /// remaining span at once. What turns that into a clock the guard admits is
+    /// the right-sizing pass every command goes through, and this is the one
+    /// caller that reaches it from below a period.
+    #[test]
+    fn a_stow_clamped_to_the_last_nanosecond_is_re_floored_to_what_the_remainder_needs() {
+        let cfg = resolved();
+        let clamped = within(cfg.stow_durations(), Duration::from_nanos(1));
+        assert_eq!(clamped.head, Duration::from_nanos(1));
+
+        // A fold interrupted near its end: the head is down and a third of a
+        // radian of yaw is what remains.
+        let remaining = 0.3;
+        let start = JointTargets {
+            body_yaw: remaining,
+            ..stow_pose_targets()
+        };
+        let command = MotionCommand::MoveTo {
+            target: stow_pose_targets(),
+            durations: clamped,
+            warp: WARP,
+        };
+
+        let (floored, stretch) =
+            reachy_motion::floor_move_clock(&cfg.motion, &start, &command, f64::from(cfg.tick_hz));
+        let stretch = stretch.expect("a nanosecond carries nothing");
+        let floor = reachy_motion::duration_floor_s(
+            remaining,
+            cfg.motion.max_step.body_yaw,
+            f64::from(cfg.tick_hz),
+        );
+        // Within a percent of the closed form for the remaining sweep: the pass
+        // measures a whole period's travel, which runs a shade under the peak
+        // rate the form is written from.
+        let effective = stretch.effective.head.as_secs_f64();
+        assert!(
+            effective > floor * 0.99 && effective < floor * 1.01,
+            "the remainder runs on {effective:.4} s, not the {floor:.4} s its sweep needs"
+        );
+        assert_ne!(floored, command);
+    }
+
+    /// The maneuver runs on the deadline it is handed, not on one of its own.
+    ///
+    /// What a host above this crate depends on: a caller that commanded the
+    /// controlled stow itself and had it defeated is continuing one maneuver, so
+    /// what it passes in is the remainder of the clock that stow started on. A
+    /// wind-down that opened a fresh budget there would drive the head for a
+    /// second whole stow window against whatever defeated the first — twice the
+    /// window the doctrine sizes for a person holding the head.
+    #[test]
+    fn a_wind_down_runs_on_the_deadline_it_is_handed() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |engaged, _registers, clock, line| {
+                // The whole of one stow, so the difference below is the
+                // parameter and not the configuration.
+                assert_eq!(
+                    engaged.stow_budget(),
+                    cfg.stow_durations()
+                        .longest()
+                        .saturating_add(cfg.settle.timeout)
+                );
+                let spent = clock.now();
+                let (_, disposition) = wind_down(
+                    engaged,
+                    ErrorClass::MaskedSlowStowToPark,
+                    spent,
+                    clock,
+                    line,
+                    &mut |_| {},
+                );
+                assert_eq!(disposition, Disposition::Park);
+                Ok(())
+            },
+        );
+
+        let said = |text: &str| {
+            ended
+                .printed
+                .iter()
+                .filter(|line| line.contains(text))
+                .count()
+        };
+        assert_eq!(
+            said("stowing under control"),
+            0,
+            "a stow was commanded on a clock the caller had already spent: {:?}",
+            ended.printed
+        );
+        assert_eq!(said("the stow clock is spent"), 1, "{:?}", ended.printed);
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![0; JointId::COUNT],
+            "the release still happened"
+        );
+    }
+
+    /// The stow this maneuver commands reports itself to the caller as values,
+    /// the way every other commanded move does.
+    ///
+    /// What a host above this crate answers from: a pair leaving the moves on the
+    /// way down changes what the machine can do, and a caller whose own surfaces
+    /// state that cannot read it back out of a printed line. The lines stay
+    /// beside it — this hook observes, it does not replace the narration.
+    #[test]
+    fn a_wind_down_hands_the_stows_events_to_the_caller() {
+        let cfg = resolved();
+        let seen: Rc<RefCell<Vec<TickEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events = Rc::clone(&seen);
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |engaged, _registers, clock, line| {
+                let deadline = clock.now().saturating_add(engaged.stow_budget());
+                let (_, disposition) = wind_down(
+                    engaged,
+                    ErrorClass::SlowStowToRest,
+                    deadline,
+                    clock,
+                    line,
+                    &mut |event| events.borrow_mut().push(event),
+                );
+                assert_eq!(disposition, Disposition::Rest);
+                Ok(())
+            },
+        );
+
+        let reported = seen.borrow();
+        assert!(
+            reported
+                .iter()
+                .any(|event| matches!(event, TickEvent::Completed)),
+            "the stow ran and said nothing about itself: {reported:?}"
+        );
+        assert!(
+            ended
+                .printed
+                .iter()
+                .any(|line| line.contains("stowing under control")),
+            "the narration is still printed beside the events: {:?}",
+            ended.printed
+        );
+    }
+
     /// A wind-down whose clock runs out releases torque rather than starting
     /// another stow.
     ///
@@ -5035,14 +5423,17 @@ mod tests {
         );
     }
 
-    /// A condition only the wire-holding layer can see reaches the record
-    /// through the ending that names it.
+    /// A sequencer's verdict about the wire reaches the record through the
+    /// ending that names it.
     ///
     /// The tick never raised this one, so nothing appended it where it
     /// happened; the ending is the whole of the evidence, and the layer that
-    /// consumes the ending is the record's only chance of hearing about it.
+    /// consumes the ending is the record's only chance of hearing about it. The
+    /// ending here is a synthesized *sequencer* failure — the driver's own
+    /// transaction failing is the same condition by another route, and has its
+    /// own test below.
     #[test]
-    fn a_condition_found_on_the_wire_reaches_the_record_through_the_ending() {
+    fn a_sequencer_verdict_about_the_wire_reaches_the_record_through_the_ending() {
         let cfg = resolved();
         let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
         let ended = engaged_run(
@@ -5080,6 +5471,72 @@ mod tests {
             1,
             "recorded once, by the one layer that saw it: {}",
             ended.incident()
+        );
+    }
+
+    /// A transaction failing inside a move under torque reaches the record as
+    /// the same condition, naming the servo.
+    ///
+    /// No sequencer is involved, only the loop's own read or write coming back
+    /// with nothing. It is the wire not carrying commands
+    /// however it was noticed, so it is one word in the record and one maneuver
+    /// on the machine — and the servo it names is where an operator puts their
+    /// hands.
+    #[test]
+    fn a_transaction_that_fails_under_torque_reaches_the_record_naming_the_servo() {
+        let cfg = resolved();
+        let silent = cfg.map.ids()[3];
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |engaged, _registers, clock, line| {
+                let outcome: Result<(), PumpError> = Err(PumpError::Bus {
+                    id: silent,
+                    source: XactError::Timeout {
+                        id: silent,
+                        waited: Duration::from_millis(5),
+                    },
+                });
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        let error = ended
+            .outcome
+            .as_ref()
+            .expect_err("the run's own error comes back");
+        assert_eq!(
+            error.class(Phase::UnderTorque),
+            ErrorClass::ImmediateAllTorqueOffToPark
+        );
+        assert!(
+            ended.incident().starts_with("bus_failure: "),
+            "{}",
+            ended.incident()
+        );
+        assert!(
+            ended.incident().contains(&format!("servo {silent}")),
+            "the record points at a servo: {}",
+            ended.incident()
+        );
+        assert!(
+            ended
+                .incident()
+                .ends_with("immediate_all_torque_off completed"),
+            "{}",
+            ended.incident()
+        );
+        assert_eq!(
+            ended.recorded("bus_failure"),
+            1,
+            "recorded once, by the one layer that saw it: {}",
+            ended.incident()
+        );
+        // The driver's own error is not lost to the summary the record carries:
+        // it is on the ending, which is what the operator's line renders.
+        assert!(
+            error.to_string().contains("did not answer within"),
+            "{error}"
         );
     }
 

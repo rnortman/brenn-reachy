@@ -1516,6 +1516,154 @@ provenance = \"test fixture\"
         }
     }
 
+    /// The slice of `text` from `from` up to the next `to`.
+    fn between<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
+        let start = text
+            .find(from)
+            .unwrap_or_else(|| panic!("the example no longer carries `{from}`"));
+        let rest = &text[start..];
+        let end = rest
+            .find(to)
+            .unwrap_or_else(|| panic!("the example no longer carries `{to}` after `{from}`"));
+        &rest[..end]
+    }
+
+    /// One quoted figure, in the passage that owns it.
+    fn quotes(text: &str, expected: &str, doc: &str) {
+        assert!(
+            text.contains(expected),
+            "{doc} no longer says `{expected}`, so a figure it prints is not the one the library \
+             derives from the shipped bounds"
+        );
+    }
+
+    /// The floors argument's one home says the numbers the library derives.
+    ///
+    /// This block is where the duration-floor argument lives — the closed form,
+    /// the per-joint seconds, the sampling allowance, and what a sub-floor
+    /// duration costs. Every other document that needs it points here. Prose is
+    /// what no other test defends, and these figures have gone stale on three
+    /// separate occasions, so each one is quoted back out of the block and
+    /// compared against the value the library derives from this file's own
+    /// bounds. A bound, the tick rate or the yaw cap moving fails here rather
+    /// than leaving an operator reading a number the machine stopped honouring.
+    #[test]
+    fn the_floors_block_quotes_the_figures_the_library_derives() {
+        use reachy_motion::MIN_JERK_PEAK_RATE;
+
+        let resolved = example_resolved().resolve().expect("the example resolves");
+        let motion = &resolved.motion;
+        let tick_hz = f64::from(resolved.tick_hz);
+        let cap = motion.env.body_yaw_limit;
+
+        // The head group's floor is a searched constant rather than a closed
+        // form, and it was searched at one rate against one leg bound.
+        assert_eq!(f64::from(resolved.tick_hz), FLOOR_TICK_HZ);
+        let head = HEAD_GROUP_FLOOR_S;
+        // The three yaw sweeps the prose names: the cap this file sets, cap to
+        // cap, and the half turn a hand can leave a limp body at.
+        let yaw = [cap, 2.0 * cap, std::f64::consts::PI]
+            .map(|span| duration_floor_s(span, motion.max_step.body_yaw, tick_hz));
+
+        let doc = "the floors block";
+        // Anchored on the label the block is pointed at by name from the pod's
+        // example and runbook, so the anchor and the cross-repo pointer are the
+        // same string.
+        let block = between(EXAMPLE, "# FLOORS.", "\nstow_duration_s = ");
+
+        quotes(block, &format!("is {head:.2} s: below that"), doc);
+        quotes(block, &format!("one {} Hz", resolved.tick_hz), doc);
+        quotes(
+            block,
+            &format!("is {MIN_JERK_PEAK_RATE} × the sweep in radians"),
+            doc,
+        );
+        quotes(
+            block,
+            &format!("(`max_step_body_yaw_rad` × {})", resolved.tick_hz),
+            doc,
+        );
+        quotes(block, &format!("the {:.0}° cap", cap.to_degrees()), doc);
+        quotes(
+            block,
+            &format!("needs {:.2} s, and the widest sweep", yaw[0]),
+            doc,
+        );
+        quotes(
+            block,
+            &format!("needs {:.2} s, which the configuration", yaw[1]),
+            doc,
+        );
+        quotes(block, &format!("{:.2} s. The calm stow below", yaw[2]), doc);
+
+        let antennas = between(
+            EXAMPLE,
+            "# What the antennas take on any move.",
+            "\n# antenna_duration_s = ",
+        );
+        let widest = duration_floor_s(std::f64::consts::TAU, motion.max_step.antennas, tick_hz);
+        quotes(
+            antennas,
+            &format!("wants at least {widest:.2} s"),
+            "the antenna clock's own paragraph",
+        );
+
+        // The three arcs and the three seconds the bound's own comment states.
+        // Derived the way the pod derives them for its copy of the same triple:
+        // an antenna sweeps the way round that misses its outboard sideways
+        // point, so stow to neutral is a full turn less the stow angle, a
+        // re-stow from just inboard of sideways adds the sideways angle, and a
+        // full turn bounds the widest a command can ask for. The two repos
+        // derive identically or one of them is printing a number the machine
+        // stopped honouring.
+        let stow_angle = reachy_motion::disarm::STOW_ANTENNAS[1].abs();
+        let sideways = reachy_motion::ANTENNA_OUTBOARD[1].abs();
+        let to_neutral = std::f64::consts::TAU - stow_angle;
+        let arcs = [to_neutral, to_neutral + sideways, std::f64::consts::TAU];
+        let antenna_floors =
+            arcs.map(|arc| duration_floor_s(arc, motion.max_step.antennas, tick_hz));
+        let bound = between(
+            EXAMPLE,
+            "# The fastest sweep on record",
+            "\nmax_step_antennas_rad = ",
+        );
+        let bound_doc = "the antenna step bound's own comment";
+        quotes(
+            bound,
+            &format!(
+                "turn — {:.2} rad, which needs {:.2} s",
+                arcs[2], antenna_floors[2]
+            ),
+            bound_doc,
+        );
+        quotes(
+            bound,
+            &format!(
+                "presence arc is {:.2} rad ({:.2} s)",
+                arcs[0], antenna_floors[0]
+            ),
+            bound_doc,
+        );
+        quotes(
+            bound,
+            &format!(
+                "sideways is {:.2} rad ({:.2} s)",
+                arcs[1], antenna_floors[1]
+            ),
+            bound_doc,
+        );
+
+        // The one claim the block makes about a shipped value, checked as a
+        // claim: the fold this file ships carries the half turn outright.
+        let stow = resolved.stow_durations().head.as_secs_f64();
+        assert!(
+            stow >= yaw[2],
+            "the {stow:.2} s fold no longer carries the {:.2} s half turn the block says it \
+             carries outright",
+            yaw[2],
+        );
+    }
+
     /// The bench night, replayed against the guards it sized.
     ///
     /// Every value in `[motion]` is a measurement, and these are the

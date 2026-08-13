@@ -157,6 +157,15 @@ servo to answer again and refuses to call the restart done on a servo that
 comes back still holding torque, or one that never acknowledged and came back
 limp — either is an unconfirmed restart, not a success.
 
+It also judges the byte it went in for. A servo that answers its restart still
+carrying any hardware-error bit fails the command: this machine clears the byte
+to `0x00` on a restart, so a bit that survives means either the restart did not
+take or the condition is live at that instant, and a recovery command that did
+not recover says so in its exit code. No bit is carved out, the chronic
+input-voltage `0x01` included — the closing line names the servo and its byte,
+and the exit is non-zero. Every servo's byte is printed either way, so a run that
+passes is still the reading of record.
+
 What a restart does, and how it compares with cutting power:
 
 | | `reboot` | power cycle |
@@ -164,7 +173,7 @@ What a restart does, and how it compares with cutting power:
 | latched hardware error | cleared | cleared |
 | torque | dropped | dropped |
 | multi-turn count on the antennas | folds into one turn | folds into one turn |
-| health byte immediately after | `0x00` observed | the chronic `0x01` observed |
+| health byte immediately after | `0x00` observed, and asserted: a bit that survives fails the command | the chronic `0x01` observed |
 | how long | seconds, from the workstation | a walk to the switch |
 
 Arming writes the gains and the motion profile at every arm, so neither path
@@ -280,4 +289,8 @@ that the next person to see one knows it is not new.
   servos draw taking up the head's weight. The bit is deliberately excluded
   from the health predicate — the engage-time supply gate is what owns supply
   — so this does not stop anything today; it is an unexplained reading on a
-  machine whose other readings are trusted.
+  machine whose other readings are trusted. `reboot` is the tripwire on the
+  clearing half of it: the command fails on any byte a servo still holds after
+  its restart, this bit included, so a `0x01` that ever survives a reboot is a
+  non-zero exit naming the servo rather than a line printed past. That is this
+  observation recurring — take it to a person and do not carve the bit out.

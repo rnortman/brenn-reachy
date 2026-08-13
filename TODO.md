@@ -111,6 +111,31 @@ one that will brown out mid-motion, and a brown-out under load drops the head.
 The reading needs the machine and a scope or a logging meter on the rail. Marked
 at `DEFAULT_MIN_ARM_VOLTAGE` in `crates/reachy-motion/src/arm.rs`.
 
+## `unsendable-frame-condition`
+
+Decide which condition of the machine a frame this host could not send names,
+when it happens with torque on — and whether that is `bus_failure`, a condition
+of its own, or none at all.
+
+Deferral context: `wire_failure` collapses the six transaction failures where
+nothing went out (an EEPROM write refused under torque, a width that disagrees
+with the register table, an encode the driver refused, too many IDs for one
+frame) to `WireFailure::Unsendable`, and `PumpError::fault` then names the whole
+of `PumpError::Bus` under torque `bus_failure`. So a defect of our own encoding
+is published under the one word an operator greps for a wire fault, while
+`PumpError::Map` — the same species of defect, caught one layer up — is
+deliberately given no condition at all, on the argument that naming it
+`bus_failure` would send somebody to the cabling over our arithmetic. The
+response is not in question: nothing can be commanded, so torque comes off and
+the machine parks either way. What is in question is the word, and the word is
+the fault vocabulary's, so the answer belongs with the fault doctrine rather
+than in this function: it decides whether an eighth condition gains a
+qualification, a ninth condition is named, or a park-class ending is sanctioned
+to carry no slug. None of the six is reachable from the move loop's own
+transactions today — each would take a register-table or encoder defect to
+produce — which is why it waits. Marked at the `Unsendable` arm of
+`wire_failure` in `crates/reachy-bench/src/pump.rs`.
+
 ## `reachy-pod-motion-integration`
 
 Host these crates from the pod payload rather than from the bench binary, and

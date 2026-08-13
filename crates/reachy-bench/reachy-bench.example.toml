@@ -144,25 +144,36 @@ antenna_phase_separation_rad = 0.6
 # Consecutive ticks with no position read before the read-loss fault. Omit for
 # one second at the tick rate.
 read_loss_ticks = 50
-# The three durations below govern the head group — the head pose and the body
-# yaw, which the six legs follow. They are a nominal policy rather than a
-# promise: a move whose span will not fit inside the per-tick step bounds at the
-# duration named here runs on a clock stretched to fit, and says so on the way
-# in. The path is unchanged; it is traversed more slowly. So a duration set too
-# low costs a slower move and a line of output, never a fault mid-travel.
+# FLOORS. The three durations below govern the head group — the head pose and
+# the body yaw, which the six legs follow. They are a nominal policy rather
+# than a promise: a move whose span will not fit inside the per-tick step
+# bounds at the duration named here runs on a clock stretched to fit, and says
+# so on the way in. The path is unchanged; it is traversed more slowly. So a
+# duration set too low costs a slower move and a line of output, never a fault
+# mid-travel.
 #
 # The clock a move actually runs on is whichever is longer of the one asked for
 # here and the floor for the span it covers. There is no band between the two
-# where a move is quietly slowed, and nothing is added on top of the floor to
-# cover the loop's own timing: a period that starts late advances the move by
-# one period like any other, so lateness delays the arrival and cannot enlarge
-# a step. A run's summary line reports the slip that cost.
+# where a move is quietly slowed, and nothing at all is added for how late the
+# loop runs: a period that starts late advances the move by one period like any
+# other, so lateness delays the arrival and cannot enlarge a step. A run's
+# summary line reports the slip that cost.
+#
+# What the effective clock does carry is a small sampling allowance. A floor is
+# found by walking the planned path finer than the control rate and taking the
+# worst travel of any one period at any phase the loop could wake on — the walk
+# carrying on a period past the move's end, where the machine holds the target,
+# so the step that lands the move is measured like any other. What is left over
+# is the phase falling between two of those fine samples, which is second order
+# in their spacing and under a percent of the clock at any length an ordinary
+# command produces. So the phases the walk did not visit cannot trip the guard
+# either, and the allowance is derived from the sampling grid rather than chosen.
 #
 # What the floors are still for is knowing when that happens. The head group's
 # is 0.36 s: below that a stow-to-neutral move steps a leg further in one 50 Hz
-# period than `max_step_legs_rad` allows. Derived by sampling the move through
-# the IK at tick rate, and pinned by a reachy-motion unit test, so it moves only
-# when the geometry, the tick rate or that bound does. A configuration test
+# period than `max_step_legs_rad` allows. Derived by walking the move through
+# the IK on that fine grid, and pinned by a reachy-motion unit test, so it moves
+# only when the geometry, the tick rate or that bound does. A configuration test
 # checks the three values here against it, so the shipped durations are the ones
 # no ordinary command has to be stretched out of.
 #

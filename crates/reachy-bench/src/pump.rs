@@ -92,11 +92,11 @@ use reachy_bus::{
 };
 use reachy_bus::{reg_for, with_retry};
 use reachy_motion::{
-    ArmConfig, ArmRecord, BusRequest, BusResult, ClockStretch, CommandDisposition,
-    CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup, JointId, JointSet,
-    JointVector, Maneuver, Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Outcome,
-    RegId, RegValue, Response, SeqAction, SeqError, SeqStep, Sequencer, ServoHealth, TickInputs,
-    TickOutputs, TickReport, floor_move_clock, motion_tick,
+    ArmConfig, ArmRecord, BusFailureSource, BusRequest, BusResult, ClockStretch,
+    CommandDisposition, CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup,
+    JointId, JointSet, JointVector, Maneuver, Mode, MotionCommand, MotionConfig, MotionState,
+    MoveAbort, Outcome, RegId, RegValue, Response, SeqAction, SeqError, SeqStep, Sequencer,
+    ServoHealth, TickInputs, TickOutputs, TickReport, WireFailure, floor_move_clock, motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -342,6 +342,21 @@ pub enum PumpError {
         source: XactError,
     },
 
+    /// A rebooted servo answered still carrying a hardware-error byte. A restart
+    /// clears that byte, so one that survives means either the restart did not
+    /// happen or the condition behind the bits is live at this instant — and a
+    /// recovery command that recovered nothing must not exit as though it had.
+    #[error(
+        "servo {id} answered after its reboot still reporting hardware error bits {bits:#04x}, \
+         which a restart clears"
+    )]
+    StillLatched {
+        /// The servo still carrying bits.
+        id: u8,
+        /// The byte it came back with.
+        bits: u8,
+    },
+
     /// The sequence neither finished nor failed within its action budget — the
     /// supply gate's configured polling, plus the fixed phases.
     #[error("the sequence took more than {budget} actions without finishing")]
@@ -482,6 +497,37 @@ impl ErrorClass {
         }
     }
 
+    /// Which of two endings the machine is judged by: the one that asks more of
+    /// whoever finds it.
+    ///
+    /// What answers a compound ending — a stow defeated by a servo dropping
+    /// out, a torque-off nobody acknowledged on the way out of another fault.
+    /// Beside [`Self::disposition`] and [`Self::maneuver`] for the same reason:
+    /// every question about what a class asks of the machine is the doctrine's,
+    /// and a ranking written a crate away is a second answer to the one that
+    /// decides which maneuver a compound ending runs.
+    ///
+    /// Ranked rather than compared field by field, because the order is a
+    /// judgement and not an arithmetic: a park outranks any rest, and within the
+    /// parks the controlled descent outranks going limp on the spot.
+    /// Wildcard-free, so a class added to the doctrine is ranked here or does
+    /// not compile.
+    #[must_use]
+    pub fn worse(self, other: Self) -> Self {
+        let rank = |class| match class {
+            Self::Refuse => 0,
+            Self::SlowStowToRest => 1,
+            Self::ImmediateAllTorqueOffToRest => 2,
+            Self::MaskedSlowStowToPark => 3,
+            Self::ImmediateAllTorqueOffToPark => 4,
+        };
+        if rank(other) > rank(self) {
+            other
+        } else {
+            self
+        }
+    }
+
     /// Whether the machine this response leaves behind may be engaged again by
     /// whatever asks next, or has to wait for a person.
     ///
@@ -558,9 +604,9 @@ fn sequence_verdict(error: &SeqError) -> SeqVerdict {
         | SeqError::WireCorrupt { .. }
         | SeqError::VerifyMismatch { .. }
         | SeqError::AbsentServos { .. }
-        | SeqError::UnplaceableAngle { .. } => {
-            SeqVerdict::Fault(Fault::BusFailure { source: *error })
-        }
+        | SeqError::UnplaceableAngle { .. } => SeqVerdict::Fault(Fault::BusFailure {
+            source: BusFailureSource::Sequence(*error),
+        }),
         // The mechanism: angles that place no pose. One verdict, from one
         // measurement, which is what the sequencer took.
         SeqError::RestPoseImplausible { cause, .. }
@@ -580,6 +626,42 @@ fn sequence_verdict(error: &SeqError) -> SeqVerdict {
         // The step and the register table disagree about what a register is:
         // our defect, with a machine that is answering perfectly.
         SeqError::WrongAnswer { .. } | SeqError::WrongValue { .. } => SeqVerdict::Defect,
+    }
+}
+
+/// The shape a failed transaction has, as a condition can carry it.
+///
+/// The driver's error is richer than this and is not discarded: it stays on the
+/// ending, which is what an operator line and a refusal render. What this is for
+/// is the fault — a `Copy` value in a timeline entry — and the distinctions kept
+/// are the ones that send somebody to a different part of the machine.
+/// Wildcard-free, so a transaction failure added to the driver is a decision
+/// made here at compile time.
+fn wire_failure(error: &XactError) -> WireFailure {
+    match error {
+        XactError::Timeout { .. } => WireFailure::Silent,
+        // Bytes that arrived and did not hold together, or held the wrong
+        // exchange: the line, the adapter, or a frame from somebody else's read.
+        XactError::Corrupt { .. } | XactError::ShortReply { .. } | XactError::LongReply { .. } => {
+            WireFailure::Corrupt
+        }
+        XactError::ServoError { .. } => WireFailure::Refused,
+        XactError::VerifyMismatch { .. } => WireFailure::NotWritten,
+        XactError::Io { .. } => WireFailure::Port,
+        // Our own frame: a register this layer will not write, a width that
+        // disagrees with the table, a request the encoder refused. Nothing went
+        // out, and the wire is still whatever it was.
+        //
+        // TODO(unsendable-frame-condition): under torque these still reach
+        // `Fault::BusFailure` through `PumpError::fault`, so a defect of our own
+        // encoding is reported under the wire's name — the opposite of the
+        // answer `PumpError::Map` is deliberately given.
+        XactError::EepromRefused { .. }
+        | XactError::TorqueHeld { .. }
+        | XactError::ValueWidth { .. }
+        | XactError::RegisterTooWide { .. }
+        | XactError::Encode { .. }
+        | XactError::TooManyIds { .. } => WireFailure::Unsendable,
     }
 }
 
@@ -658,7 +740,8 @@ impl PumpError {
             | Self::OffRoster { .. }
             | Self::NotBack { .. }
             | Self::NotRestarted { .. }
-            | Self::RestartUnconfirmed { .. } => ErrorClass::Refuse,
+            | Self::RestartUnconfirmed { .. }
+            | Self::StillLatched { .. } => ErrorClass::Refuse,
             Self::Fault(fault) => ErrorClass::answering(fault.response()),
             // The plan was wrong and the platform is fine: the move dies and
             // the machine stows.
@@ -675,6 +758,17 @@ impl PumpError {
     /// a refusal, a planner defect and an exhausted budget are all statements
     /// about our own asks. The ones that do are the tick's faults, which arrive
     /// already named, and the transactions that failed with servos holding.
+    ///
+    /// A transaction failing under torque is the wire no longer carrying
+    /// commands, whichever layer ran it, so it names that condition and carries
+    /// the servo and the shape of the failure. Before torque the same failure is
+    /// a refusal, and a refusal names no condition of the machine: nothing was
+    /// energized, and asking again later is the whole answer.
+    ///
+    /// A defect of our own encoding names none either, deliberately. Its class
+    /// is the stow a healthy, still-commanding machine can run, and no
+    /// abort-class ending anywhere in the doctrine carries a slug — the response
+    /// tells that story, as it does for a step the planner sized wrong.
     #[must_use]
     pub fn fault(&self, phase: Phase) -> Option<Fault> {
         match self {
@@ -684,11 +778,16 @@ impl PumpError {
             },
             Self::TorqueOffUnacked { id } => Some(Fault::TorqueOffUnconfirmed { id: *id }),
             Self::Fault(fault) => Some(*fault),
-            // A verdict about the port, not about the machine, and one with no
-            // sequencer context to carry: it is its own detail, and its class
-            // says what the wire failing under torque means.
-            Self::Bus { .. }
-            | Self::Map { .. }
+            Self::Bus { id, source } => match phase {
+                Phase::PreTorque => None,
+                Phase::UnderTorque => Some(Fault::BusFailure {
+                    source: BusFailureSource::Transaction {
+                        id: *id,
+                        kind: wire_failure(source),
+                    },
+                }),
+            },
+            Self::Map { .. }
             | Self::WrongPart { .. }
             | Self::TorqueHeld { .. }
             | Self::UnknownServo { .. }
@@ -696,6 +795,7 @@ impl PumpError {
             | Self::NotBack { .. }
             | Self::NotRestarted { .. }
             | Self::RestartUnconfirmed { .. }
+            | Self::StillLatched { .. }
             | Self::Runaway { .. }
             | Self::Aborted(_)
             | Self::Rejected(_)
@@ -2874,8 +2974,24 @@ mod tests {
         assert!(matches!(
             PumpError::Sequence(SeqError::NoAnswer { context })
                 .unrecorded_fault(Phase::UnderTorque),
-            Some(Fault::BusFailure { .. })
+            Some(Fault::BusFailure {
+                source: BusFailureSource::Sequence(_)
+            })
         ));
+        assert_eq!(
+            PumpError::Bus {
+                id: 13,
+                source: XactError::Timeout { id: 13, waited },
+            }
+            .unrecorded_fault(Phase::UnderTorque),
+            Some(Fault::BusFailure {
+                source: BusFailureSource::Transaction {
+                    id: 13,
+                    kind: WireFailure::Silent,
+                },
+            }),
+            "the wire arm names the servo the record has to point at"
+        );
         assert_eq!(
             PumpError::TorqueOffUnacked { id: 13 }.unrecorded_fault(Phase::UnderTorque),
             Some(Fault::TorqueOffUnconfirmed { id: 13 })
@@ -6298,6 +6414,7 @@ mod tests {
                 No,
                 No,
             ),
+            (PumpError::StillLatched { id: 13, bits: 0x20 }, No, No),
             // The tick's own answers, which the classification takes verbatim.
             //
             // The two antenna conditions are the only ones whose response is
@@ -6477,6 +6594,47 @@ mod tests {
         );
     }
 
+    /// A compound ending is judged by the one that asks more of whoever finds
+    /// it, whichever order the two arrived in.
+    ///
+    /// The order is the doctrine's: any park outranks any rest, and within each
+    /// pair the maneuver that carries the head down outranks going limp where it
+    /// stands. Pinned as the whole 25-pair table, so a re-ranking — which
+    /// compiles, unlike an added class — has to be re-justified here.
+    #[test]
+    fn the_worse_of_two_endings_is_the_one_that_asks_more() {
+        // Weakest first: this order *is* the ranking, and the assertions below
+        // read it off the position rather than restating the arithmetic.
+        let ranked = [
+            ErrorClass::Refuse,
+            ErrorClass::SlowStowToRest,
+            ErrorClass::ImmediateAllTorqueOffToRest,
+            ErrorClass::MaskedSlowStowToPark,
+            ErrorClass::ImmediateAllTorqueOffToPark,
+        ];
+        for (i, left) in ranked.into_iter().enumerate() {
+            for (j, right) in ranked.into_iter().enumerate() {
+                let expected = ranked[i.max(j)];
+                assert_eq!(left.worse(right), expected, "{left:?} against {right:?}");
+                assert_eq!(right.worse(left), expected, "{right:?} against {left:?}");
+            }
+        }
+        // The rank is not the disposition: a rest can outrank another rest, and
+        // every park outranks every rest.
+        for rest in [
+            ErrorClass::Refuse,
+            ErrorClass::SlowStowToRest,
+            ErrorClass::ImmediateAllTorqueOffToRest,
+        ] {
+            for park in [
+                ErrorClass::MaskedSlowStowToPark,
+                ErrorClass::ImmediateAllTorqueOffToPark,
+            ] {
+                assert_eq!(rest.worse(park).disposition(), Disposition::Park);
+            }
+        }
+    }
+
     /// Which answer this is, as a slot in the coverage above.
     ///
     /// Wildcard-free, so a response added to the doctrine cannot be left out of
@@ -6541,6 +6699,185 @@ mod tests {
             assert_eq!(error.fault(Phase::PreTorque), None, "{error}");
             assert_eq!(error.class(Phase::PreTorque), ErrorClass::Refuse, "{error}");
         }
+    }
+
+    /// A transaction failing under torque names the bus, the servo and the
+    /// shape, whichever way it failed.
+    ///
+    /// The condition is the wire, not the layer that ran the transaction: a
+    /// sequencer's verdict and a read inside a move are the same thing to the
+    /// operator standing next to a head that cannot be commanded, and an alert
+    /// rule keys on one word. What the fault does *not* carry is the driver's own
+    /// error — that stays on the ending, which is what every line and every
+    /// refusal renders.
+    #[test]
+    fn a_transaction_failing_under_torque_names_the_bus_and_what_it_saw() {
+        let waited = Duration::from_millis(5);
+        let value = RawValue::new(&[0]).expect("one byte");
+        let table = [
+            (
+                XactError::Timeout { id: 11, waited },
+                WireFailure::Silent,
+                "servo 11: silence",
+            ),
+            (
+                XactError::Corrupt {
+                    id: 12,
+                    cause: dxl_proto::FrameError::BadCrc,
+                },
+                WireFailure::Corrupt,
+                "servo 12: a corrupt reply",
+            ),
+            (
+                XactError::ShortReply {
+                    id: 13,
+                    expected: 4,
+                    actual: 2,
+                },
+                WireFailure::Corrupt,
+                "servo 13: a corrupt reply",
+            ),
+            (
+                XactError::LongReply {
+                    id: 14,
+                    expected: 1,
+                    actual: 4,
+                },
+                WireFailure::Corrupt,
+                "servo 14: a corrupt reply",
+            ),
+            (
+                XactError::ServoError {
+                    id: 15,
+                    error: dxl_proto::StatusError(0x04),
+                },
+                WireFailure::Refused,
+                "servo 15: a refusal",
+            ),
+            (
+                XactError::VerifyMismatch {
+                    id: 16,
+                    addr: 64,
+                    wrote: value,
+                    read_back: value,
+                },
+                WireFailure::NotWritten,
+                "servo 16: a write that did not read back",
+            ),
+            (
+                XactError::Io {
+                    id: 17,
+                    source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+                },
+                WireFailure::Port,
+                "servo 17: the port itself",
+            ),
+            (
+                XactError::EepromRefused { id: 18, addr: 20 },
+                WireFailure::Unsendable,
+                "servo 18: a request that could not be sent",
+            ),
+            (
+                XactError::TorqueHeld { id: 10, addr: 11 },
+                WireFailure::Unsendable,
+                "servo 10: a request that could not be sent",
+            ),
+            (
+                XactError::ValueWidth {
+                    id: 11,
+                    addr: 64,
+                    expected: 1,
+                    actual: 2,
+                },
+                WireFailure::Unsendable,
+                "servo 11: a request that could not be sent",
+            ),
+            (
+                XactError::RegisterTooWide {
+                    id: 12,
+                    addr: 200,
+                    len: 7,
+                    max: RawValue::MAX_LEN,
+                },
+                WireFailure::Unsendable,
+                "servo 12: a request that could not be sent",
+            ),
+            (
+                XactError::Encode {
+                    id: 13,
+                    source: dxl_proto::EncodeError::BroadcastNotAllowed,
+                },
+                WireFailure::Unsendable,
+                "servo 13: a request that could not be sent",
+            ),
+            (
+                XactError::TooManyIds { count: 10, max: 9 },
+                WireFailure::Unsendable,
+                "servo 254: a request that could not be sent",
+            ),
+        ];
+
+        for (failure, kind, rendered) in table {
+            let id = failure.id();
+            let ending = bus_failure(failure);
+            let named = ending
+                .fault(Phase::UnderTorque)
+                .expect("a transaction failing under torque names the wire");
+            assert_eq!(
+                named,
+                Fault::BusFailure {
+                    source: BusFailureSource::Transaction { id, kind },
+                },
+                "{ending}"
+            );
+            assert_eq!(named.slug(), "bus_failure", "{ending}");
+            assert_eq!(
+                named.to_string(),
+                format!("the bus is not carrying commands: {rendered}")
+            );
+            assert_eq!(
+                ending.class(Phase::UnderTorque),
+                ErrorClass::answering(named.response()),
+                "{ending}"
+            );
+            assert_eq!(
+                ending.class(Phase::UnderTorque),
+                ErrorClass::ImmediateAllTorqueOffToPark,
+                "{ending}"
+            );
+            // Before torque the same failure is a refusal, and a refusal names
+            // no condition of the machine: nothing was energized, nothing was
+            // undone, and asking again later is the answer.
+            assert_eq!(ending.fault(Phase::PreTorque), None, "{ending}");
+            assert_eq!(
+                ending.class(Phase::PreTorque),
+                ErrorClass::Refuse,
+                "{ending}"
+            );
+        }
+    }
+
+    /// A register our own map could not encode or read back names no condition,
+    /// in either phase.
+    ///
+    /// Its class is the stow of a healthy, still-commanding machine, and no
+    /// abort-class ending in the doctrine carries a slug: an operator is told
+    /// what was done and reads the defect in the message, exactly as for a step
+    /// the planner sized wrong. Naming it `bus_failure` would send somebody to
+    /// the cabling over our arithmetic.
+    #[test]
+    fn a_defect_of_our_own_encoding_names_no_condition_of_the_machine() {
+        let ending = PumpError::Map {
+            id: 13,
+            reg: RegId::GoalPosition,
+            source: MapError::UnknownJoint { joint: 11 },
+        };
+        for phase in [Phase::PreTorque, Phase::UnderTorque] {
+            assert_eq!(ending.fault(phase), None, "{ending}");
+            assert_eq!(ending.unrecorded_fault(phase), None, "{ending}");
+        }
+        assert_eq!(ending.class(Phase::PreTorque), ErrorClass::Refuse);
+        assert_eq!(ending.class(Phase::UnderTorque), ErrorClass::SlowStowToRest);
     }
 
     /// The engage drive is pre-torque until its first enable goes out.

@@ -118,6 +118,7 @@
 //! length of the outage the machine may keep moving blind through, and sizing it
 //! is sizing exactly that.
 
+use core::fmt;
 use core::time::Duration;
 use std::sync::mpsc::Receiver;
 
@@ -442,6 +443,72 @@ impl Response {
     }
 }
 
+/// The shape of a failed transaction, coarse enough to name a condition with.
+///
+/// A driver's own error type is not what travels here. A [`Fault`] is `Copy` and
+/// rides in a timeline entry, and the whole detail of the failure is on the
+/// ending the same transaction returned — which every operator line and every
+/// refusal renders. What a condition needs is the distinction that sends an
+/// operator to a different part of the machine: silence is a connector or a dead
+/// servo, a mangled reply is the line or the adapter, a refusal is the servo
+/// answering that it will not, and a request this layer would not send at all is
+/// ours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireFailure {
+    /// Nothing came back before the deadline, and the retries are spent.
+    Silent,
+    /// Bytes came back that disagreed with themselves, or that were not an
+    /// answer of the shape the request asked for.
+    Corrupt,
+    /// The servo answered with its error field set.
+    Refused,
+    /// A verified write read back as something other than what was written.
+    NotWritten,
+    /// The port itself failed.
+    Port,
+    /// The request never went out, because this layer would not put it on the
+    /// wire.
+    Unsendable,
+}
+
+impl fmt::Display for WireFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Silent => "silence",
+            Self::Corrupt => "a corrupt reply",
+            Self::Refused => "a refusal",
+            Self::NotWritten => "a write that did not read back",
+            Self::Port => "the port itself",
+            Self::Unsendable => "a request that could not be sent",
+        };
+        f.write_str(name)
+    }
+}
+
+/// What found the bus not carrying, and what it saw.
+///
+/// One condition reached from two layers. A sequencer judges its own transaction
+/// and has the whole step context to say so; the loop driving a move sees one
+/// transaction fail and has the servo and the shape of the failure. "The wire
+/// stopped carrying commands under torque" is the same condition either way, it
+/// takes the same maneuver, and an alert rule keys on one word for it — so both
+/// are [`Fault::BusFailure`], and which layer noticed is a detail of the
+/// payload rather than a second name.
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+pub enum BusFailureSource {
+    /// A sequencer's verdict, whole.
+    #[error("{0}")]
+    Sequence(SeqError),
+    /// One of the move loop's own transactions, summarised.
+    #[error("servo {id}: {kind}")]
+    Transaction {
+        /// The servo the failed transaction addressed.
+        id: u8,
+        /// What the failure was.
+        kind: WireFailure,
+    },
+}
+
 /// A condition of the machine that a maneuver has to answer.
 ///
 /// One variant per named condition, and the name is the vocabulary the whole
@@ -532,8 +599,9 @@ pub enum Fault {
     /// manoeuvred.
     #[error("the bus is not carrying commands: {source}")]
     BusFailure {
-        /// What the failing transaction reported.
-        source: SeqError,
+        /// What the failing transaction reported, as the layer that judged it
+        /// can carry.
+        source: BusFailureSource,
     },
     /// A torque-off write went unacknowledged after every attempt, so the
     /// minimum risk condition is believed rather than known.
@@ -1804,40 +1872,74 @@ fn take_command(
     }
 }
 
-/// The headroom a clock carries past the ratio its dry pass measured, as a
-/// multiple of one over the square of the periods the clock spans.
+/// How many samples the dry pass takes per nominal control period.
 ///
-/// What the dry pass measures is the largest step between two points of *one*
-/// sampling grid, and that is a little under the largest step of one period's
-/// width the path holds anywhere: the peak of a min-jerk rate falls between two
-/// samples, and the grid reads it low by the curvature there. The deficit is
-/// second order in the grid spacing — `f'` loses fifteen times the square of
-/// the distance from its peak, which is at most half a period — so it is
-/// fifteen quarters over 1.875 of one over the periods squared, and this
-/// numerator is that with a factor of two over it.
+/// The live loop steps a move one period at a time from whatever phase it woke
+/// on, so the step that has to stay inside the bound is the largest over *every*
+/// window of one period's width the path holds — not the largest between two
+/// points of the one grid that starts where the move does. Sampling this much
+/// finer and maximising over every period-wide window of the fine series
+/// measures that directly, at every phase the fine grid can express, the
+/// inverse kinematics included: the fine samples go through the same solve the
+/// coarse ones did.
+///
+/// Eight puts the residual — the phases *between* two fine samples — at a
+/// sixteenth of a period, and what that residual is worth is
+/// [`grid_headroom`]. The cost is eight times the solves per pass, off the
+/// control loop and inside [`MAX_DRY_SAMPLES`].
+///
+/// The same factor at every clock length, deliberately, and not only where the
+/// second-order term is loosest. Two reasons, one of them measured. The
+/// allowance is derived from the grid that was actually walked, so a factor that
+/// varied with the clock would step the allowance by its square at the length it
+/// changed at — granting a *longer* clock sixty-four times more slack than the
+/// one just below it, which makes the predicate non-monotone in duration exactly
+/// where the stretch iteration is walking. And the saving is not worth buying
+/// that with: one pass over the shipped 0.8 s gesture at 50 Hz — 320 fine
+/// samples, each through the leg solve — measures 86 µs on the bench host, so
+/// the four passes a stretch may take are under a fiftieth of one control
+/// period, on a path that runs between periods rather than inside one.
+const DRY_OVERSAMPLE: u32 = 8;
+
+/// The fine samples one nominal period is worth, as a walk's extension past the
+/// sample that lands the endpoint.
+const ONE_PERIOD_BEYOND: u32 = DRY_OVERSAMPLE;
+
+/// No samples past the sample that lands the endpoint.
+///
+/// What a walk measuring a crossing offset takes: the pair's phase is a time the
+/// tips pass each other on the way, and nothing about the pose held afterwards
+/// says anything further about it.
+const NO_EXTENSION: u32 = 0;
+
+/// The headroom a clock carries past the step its dry pass measured, as a
+/// multiple of one over the square of the fine samples the clock spans.
+///
+/// What is left for a headroom to cover, once the pass maximises over every
+/// window the fine grid expresses, is the wake phases that fall between two
+/// fine samples — at most half a fine step from the window the pass measured.
+/// The deficit there is second order in that distance: `f'` loses fifteen times
+/// the square of the distance from its peak, so it is fifteen quarters over
+/// 1.875 of one over the fine samples squared, and this numerator is that with a
+/// factor of two over it.
 ///
 /// Two things need exactly that headroom. A loop running late resumes its
 /// periods at a shifted phase, and a shifted grid can land nearer the peak than
-/// the measured one did — so a clock accepted at the measured maximum alone,
+/// any fine sample did — so a clock accepted at the measured maximum alone,
 /// whether it was stretched to there or asked for there, leaves the guard to
-/// fault on a healthy move at an unlucky wake phase. And the
-/// stretch iteration itself does not otherwise finish: scaling a clock by the
-/// measured ratio refines its grid in the same motion, so each pass removes
-/// about fifteen sixteenths of the excess and the sequence approaches the bound
-/// from above without reaching it — four exact passes over the antenna sweep
-/// still leave a step five parts in ten million over.
+/// fault on a healthy move at an unlucky wake phase. And the stretch iteration
+/// needs somewhere to terminate: scaling a clock by the measured ratio refines
+/// its grid in the same motion, so the sequence approaches the bound from above,
+/// and a target exactly at the bound is one it reaches only in the limit.
 ///
 /// A term of this shape is the opposite of a jitter allowance: it does not grow
 /// with how late a loop runs, it grows with how coarsely the path is sampled,
-/// and it vanishes as the clock lengthens. On the fold's floor it is three
-/// parts in a thousand — a few milliseconds nobody can see.
+/// and it vanishes as the clock lengthens. It is derived at every clock length
+/// — nothing caps it, so no clock is accepted on an allowance that was asserted
+/// rather than measured. On the fold's floor it is two parts in ten thousand,
+/// and over a clock spanning as little as two periods it is under two parts in
+/// a hundred.
 const STRETCH_GRID_HEADROOM: f64 = 4.0;
-
-/// The most of it any one clock may take, for a clock spanning so few periods
-/// that the second-order argument above says nothing useful. A move of under
-/// four periods is not something a longer clock is going to characterise; the
-/// re-measuring passes and the guard are what stand behind it.
-const MAX_GRID_HEADROOM: f64 = 0.25;
 
 /// The headroom a clock spanning `periods` periods needs over the step its dry
 /// pass measured.
@@ -1846,11 +1948,17 @@ const MAX_GRID_HEADROOM: f64 = 0.25;
 /// what a stretch lands on are the same number: a clock accepted with less
 /// headroom than a stretch would have given it is a clock the live grid's own
 /// phase can walk past the guard.
+///
+/// Infinite for a clock spanning no periods at all: nothing about such a clock
+/// was sampled, so nothing about it is acceptable. No caller reaches it — a
+/// non-positive duration has no trajectory to measure and is answered long
+/// before this.
 fn grid_headroom(periods: f64) -> f64 {
-    if periods > 0.0 {
-        (STRETCH_GRID_HEADROOM / (periods * periods)).min(MAX_GRID_HEADROOM)
+    let samples = periods * f64::from(DRY_OVERSAMPLE);
+    if samples > 0.0 {
+        STRETCH_GRID_HEADROOM / (samples * samples)
     } else {
-        MAX_GRID_HEADROOM
+        f64::INFINITY
     }
 }
 
@@ -1873,9 +1981,10 @@ const STRETCH_PASSES: usize = 4;
 
 /// The most samples one dry pass takes.
 ///
-/// Two thousand seconds at fifty hertz. Any span this machine can travel fits
-/// inside the step bounds on a clock far shorter than that, so a duration past
-/// this is one there is nothing left to measure about.
+/// Two hundred and fifty seconds of move at fifty hertz, [`DRY_OVERSAMPLE`]
+/// samples to the period. Any span this machine can travel fits inside the step
+/// bounds on a clock far shorter than that, so a duration past this is one there
+/// is nothing left to measure about.
 const MAX_DRY_SAMPLES: u32 = 100_000;
 
 /// The most a de-phasing stretch may lengthen one antenna's clock, as a
@@ -1944,10 +2053,10 @@ struct StepRatios {
 impl StepRatios {
     /// Whether every clock carries its span, headroom included.
     ///
-    /// The same test a stretch is sized to satisfy. The dry pass walks one
-    /// phase of the sampling grid and the live loop walks whichever phase it
-    /// wakes on, so a clock is accepted only with the room its own length says
-    /// the other phases need.
+    /// The same test a stretch is sized to satisfy. The dry pass walks every
+    /// wake phase its fine grid expresses and the live loop wakes wherever it
+    /// wakes, so a clock is accepted only with the room its own length says the
+    /// phases between two fine samples need.
     fn fit(self, durations: MoveDurations, tick_hz: f64) -> bool {
         carries(self.head, durations.head, tick_hz)
             && carries(self.antennas[0], durations.antennas[0], tick_hz)
@@ -1964,10 +2073,11 @@ impl StepRatios {
 /// can leave the body most of a turn from where a stow expects to find it, and
 /// a fixed clock over that span steps past the guard partway through and
 /// faults, which de-torques the machine at the exact moment it was recovering.
-/// This measures the candidate path before it is commanded — dry-sampling it at
-/// `tick_hz` through the same envelope and inverse kinematics the live tick
-/// runs, over the same trajectory [`take_command`] will build — and hands back a
-/// clock that fits.
+/// This measures the candidate path before it is commanded — dry-sampling it
+/// through the same envelope and inverse kinematics the live tick runs, over the
+/// same trajectory [`take_command`] will build, for the worst step of one
+/// `tick_hz` period at any phase the loop could wake on — and hands back a clock
+/// that fits.
 ///
 /// The second thing a clock has to carry is the pair's phase. Two antennas
 /// sweeping inboard on clocks near enough alike reach the point their arcs
@@ -2157,14 +2267,27 @@ fn stretched(durations: MoveDurations, ratios: StepRatios, tick_hz: f64) -> Opti
 /// allowance is made for how the live loop is paced, because the loop advances
 /// a move by one period of its clock however late it wakes.
 ///
+/// A clock spanning fewer than [`MIN_JERK_PEAK_RATE`] periods is scaled from
+/// that many instead of from itself, because the proportionality it is scaled by
+/// is not true down there: a move that finishes inside one period is one step of
+/// its whole span whatever clock it was asked for, so its ratio says nothing
+/// about how much longer the clock must be. What that ratio says instead is the
+/// closed form — [`duration_floor_s`] of the span it measured is exactly
+/// `MIN_JERK_PEAK_RATE` periods times the ratio — so scaling from there lands on
+/// the span's own floor in one pass rather than creeping up on it over many. A
+/// wind-down re-commanding a stow with a nanosecond of deadline left is the case
+/// that reaches this.
+///
 /// A clock inside the bound on the grid the dry pass walked but short of the
 /// headroom is stretched by the headroom alone: its ratio is already one or
-/// under, and what it lacks is the room the other phases of the grid need.
+/// under, and what it lacks is the room the phases between two fine samples
+/// need.
 fn scale_past(duration: Duration, ratio: f64, tick_hz: f64) -> Option<Duration> {
     if carries(ratio, duration, tick_hz) {
         return Some(duration);
     }
-    let scaled = duration.as_secs_f64() * ratio.max(1.0);
+    let from = duration.as_secs_f64().max(MIN_JERK_PEAK_RATE / tick_hz);
+    let scaled = from * ratio.max(1.0);
     let periods = scaled * tick_hz;
     Duration::try_from_secs_f64(scaled * (1.0 + grid_headroom(periods))).ok()
 }
@@ -2206,8 +2329,8 @@ fn worst_step_ratios(
 /// The worst per-tick step a move plans, per joint group, radians.
 ///
 /// What a step bound is sized against: the largest distance one period of the
-/// plan asks a joint to cover, which is the peak of the shaped path and nothing
-/// to do with how the loop is paced.
+/// plan asks a joint to cover at the worst phase a loop could wake on, which is
+/// the peak of the shaped path and nothing to do with how the loop is paced.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DryPassPeaks {
     /// The worst step any of the six cranks takes.
@@ -2218,9 +2341,38 @@ pub struct DryPassPeaks {
     pub antennas: [f64; 2],
 }
 
-/// The largest per-tick step `command` would plan from `start`, sampled at
-/// `tick_hz` through the same envelope and inverse kinematics the live tick
-/// runs.
+impl DryPassPeaks {
+    /// The figure a joint's steps belong to.
+    ///
+    /// The six cranks are one figure and the yaw another, because they are
+    /// bounded separately even though one clock drives them both.
+    fn slot(&mut self, id: JointId) -> &mut f64 {
+        match id {
+            JointId::AntennaRight => &mut self.antennas[0],
+            JointId::AntennaLeft => &mut self.antennas[1],
+            JointId::BodyYaw => &mut self.body_yaw,
+            JointId::Leg(_) => &mut self.legs,
+        }
+    }
+
+    /// Take each joint's change from `from` to `to` into these peaks, or `None`
+    /// when some joint's change is not a number.
+    fn fold(&mut self, from: &JointVector, to: &JointVector) -> Option<()> {
+        for ((id, angle), (_, last)) in to.joints().into_iter().zip(from.joints()) {
+            let step = (angle - last).abs();
+            if !step.is_finite() {
+                return None;
+            }
+            let peak = self.slot(id);
+            *peak = peak.max(step);
+        }
+        Some(())
+    }
+}
+
+/// The largest step of one `tick_hz` period `command` would plan from `start` at
+/// any phase a loop could wake on, sampled through the same envelope and inverse
+/// kinematics the live tick runs.
 ///
 /// The measurement [`floor_move_clock`] decides on, handed back in radians
 /// rather than as a fraction of a bound. What it is for is sizing the bounds
@@ -2299,7 +2451,7 @@ fn phase_of(
         return None;
     }
     let span = durations.antennas[0].max(durations.antennas[1]);
-    let samples = dry_samples(span, tick_hz)?;
+    let samples = dry_samples(span, tick_hz, NO_EXTENSION)?;
     let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
     let mut sampled = JointTargets::default();
     // Seeded with the pose the machine already holds, so a pair that starts
@@ -2314,19 +2466,24 @@ fn phase_of(
     watch.separation()
 }
 
-/// How many periods a dry walk over `span` takes, or `None` for a tick rate or
-/// a clock there is nothing to measure about.
+/// How many samples a dry walk over `span` takes at `sample_hz`, `beyond`
+/// samples past the endpoint included, or `None` for a rate or a clock there is
+/// nothing to measure about.
 ///
-/// The grid the live loop samples on, from the first period that commands
-/// anything through the one that lands the endpoint. The move's own start is
-/// the pose already held and is the baseline rather than a step. `span` is
-/// whichever of the move's clocks the walk has a question about: every one of
-/// them for the step bounds, the two antennas for the pair's phase.
-fn dry_samples(span: Duration, tick_hz: f64) -> Option<u32> {
-    if !(tick_hz.is_finite() && tick_hz > 0.0) {
+/// From the first sample that moves anything through the one that lands the
+/// endpoint, and then `beyond` further. The move's own start is the pose already
+/// held and is the baseline rather than a step. `span` is whichever of the
+/// move's clocks the walk has a question about: every one of them for the step
+/// bounds, the two antennas for the pair's phase. `sample_hz` is the walk's own
+/// rate — the control rate for a walk that measures a crossing offset, and
+/// [`DRY_OVERSAMPLE`] times it for one that measures a step, which is why the
+/// budget below counts samples and not periods. The extension counts against
+/// that budget too: it is samples the pass walks and solves like any other.
+fn dry_samples(span: Duration, sample_hz: f64, beyond: u32) -> Option<u32> {
+    if !(sample_hz.is_finite() && sample_hz > 0.0) {
         return None;
     }
-    let samples = (span.as_secs_f64() * tick_hz).ceil();
+    let samples = (span.as_secs_f64() * sample_hz).ceil() + f64::from(beyond);
     if !samples.is_finite() || samples > f64::from(MAX_DRY_SAMPLES) {
         return None;
     }
@@ -2338,7 +2495,39 @@ fn dry_samples(span: Duration, tick_hz: f64) -> Option<u32> {
     Some(samples as u32)
 }
 
+/// The fine samples [`peaks_of`] walks for a move on `durations`, at `fine_hz`.
+///
+/// The step walk's whole extent in one named place: the move's longest clock,
+/// and then the nominal period past its endpoint where the trajectory holds the
+/// target. Named rather than written at the call site because how far the walk
+/// runs is what decides whether the landing step is measured at all, and on the
+/// geometry this machine has the landing windows sit under the interior peak —
+/// so an extension dropped here changes no measured figure and no assertion
+/// about one. What can hold it is a test of this function.
+fn walk_samples(durations: MoveDurations, fine_hz: f64) -> Option<u32> {
+    dry_samples(durations.longest(), fine_hz, ONE_PERIOD_BEYOND)
+}
+
 /// [`dry_pass_peaks`] over an already-resolved target.
+///
+/// Walked at [`DRY_OVERSAMPLE`] samples per nominal period, taking each joint's
+/// largest change across a window a whole period wide — every such window the
+/// fine grid holds, not only the ones a grid starting at the move's own zero
+/// would have visited. That is the step the live loop emits at whichever phase
+/// it wakes on, to within the half fine step [`grid_headroom`] covers.
+///
+/// The windows that reach back before the move's start read the pose the machine
+/// is already holding, which is what a first period shortened by a late wake
+/// actually steps from.
+///
+/// The walk runs one nominal period *past* the sample that lands the endpoint,
+/// for the same reason at the other end: past a clock's duration the trajectory
+/// holds that clock's joints on the target's own bits, so the windows reaching
+/// beyond the end read the pose the machine holds after landing — and the step
+/// the loop's last period emits is exactly one of them, from wherever inside the
+/// final period it woke to the target. Without the extension those windows go
+/// unmeasured, and a path whose joint angle is not monotone along its last
+/// period can hold a landing step larger than any window the walk did visit.
 fn peaks_of(
     cfg: &MotionConfig,
     start: &JointTargets,
@@ -2347,32 +2536,23 @@ fn peaks_of(
     warp: Warp,
     tick_hz: f64,
 ) -> Option<DryPassPeaks> {
-    let samples = dry_samples(durations.longest(), tick_hz)?;
+    let fine_hz = tick_hz * f64::from(DRY_OVERSAMPLE);
+    let samples = walk_samples(durations, fine_hz)?;
     let trajectory = Trajectory::new(start, target, durations, warp).ok()?;
 
-    let mut previous = joints_of(cfg, start)?;
+    // One nominal period of fine samples, as a ring: the slot a new sample lands
+    // in holds the sample from a whole period earlier, which is exactly what it
+    // has to be compared against.
+    let mut window = [joints_of(cfg, start)?; DRY_OVERSAMPLE as usize];
     let mut sampled = JointTargets::default();
     let mut peaks = DryPassPeaks::default();
     for step in 1..=samples {
-        let t = Duration::try_from_secs_f64(f64::from(step) / tick_hz).ok()?;
+        let t = Duration::try_from_secs_f64(f64::from(step) / fine_hz).ok()?;
         trajectory.sample(t, &mut sampled);
         let candidate = joints_of(cfg, &sampled)?;
-        for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(previous.joints()) {
-            let step = (angle - last).abs();
-            if !step.is_finite() {
-                return None;
-            }
-            // The six cranks are one figure and the yaw another, because they
-            // are bounded separately even though one clock drives them both.
-            let peak = match id {
-                JointId::AntennaRight => &mut peaks.antennas[0],
-                JointId::AntennaLeft => &mut peaks.antennas[1],
-                JointId::BodyYaw => &mut peaks.body_yaw,
-                JointId::Leg(_) => &mut peaks.legs,
-            };
-            *peak = peak.max(step);
-        }
-        previous = candidate;
+        let slot = (step % DRY_OVERSAMPLE) as usize;
+        peaks.fold(&window[slot], &candidate)?;
+        window[slot] = candidate;
     }
     Some(peaks)
 }
@@ -2501,28 +2681,45 @@ mod tests {
     /// How far from the clock its span calls for an exactly stretched clock may
     /// land.
     ///
-    /// The slack a stretch carries is the grid headroom, which is arithmetic
-    /// and is accounted for by [`floored_clock`] rather than tolerated here.
-    /// What is left is the sampling itself: the dry pass measures the largest
-    /// step between two sample points, and a min-jerk peak that falls between
-    /// them reads a fraction of a percent low. A clock landing a whole percent
-    /// off is something other than sampling.
+    /// The two terms a stretch lands within — the grid headroom it aims past
+    /// the bound by, and the closed form's own overestimate of a period's
+    /// travel — are arithmetic, and [`lands_on`] accounts for each rather than
+    /// tolerating either here. What is left is the fine grid's residual: the
+    /// phase between two fine samples, worth a fraction of a percent. A clock
+    /// landing a whole percent off is something other than sampling.
     const GRID_TOLERANCE: f64 = 0.01;
+
+    /// How far a one-period step falls short of the instantaneous peak rate the
+    /// closed form is written from, as a fraction, over a clock spanning
+    /// `periods` periods.
+    ///
+    /// [`duration_floor_s`] sizes a clock from `f'` at its peak, and what the
+    /// guard measures is a whole period's travel — the mean of `f'` across a
+    /// window centred there, which the curvature reads under the peak. The mean
+    /// over a window of half-width `h` is `f'` plus a sixth of `h²` times
+    /// `f'''`, and min-jerk's `f'''` at the peak is minus sixteen times its
+    /// `f'` there, so the shortfall is two thirds of one over the periods
+    /// squared. A clock the pass measures honestly therefore lands a shade
+    /// *under* the closed form, and that shade is arithmetic rather than
+    /// tolerance.
+    fn window_shortfall(periods: f64) -> f64 {
+        2.0 / (3.0 * periods * periods)
+    }
 
     /// Whether an effective clock landed on `wanted` — the larger of what was
     /// asked for and the closed form its span needs — with no band between the
     /// two.
     ///
-    /// Never shortened, and over by no more than the grid headroom that clock
-    /// carries. The headroom is the ceiling because it is also the size of the
-    /// dry pass's own underestimate of the peak: a stretch starting from a very
-    /// short clock measures a ratio a little low, so it converges to within one
-    /// headroom of the floor rather than onto it. Both terms fall off as the
-    /// square of the periods the clock spans, so a long clock is held to the
-    /// sampling tolerance alone.
+    /// Over by no more than the grid headroom that clock carries, which is what
+    /// a stretch aims past the bound by. Under by no more than
+    /// [`window_shortfall`], which is the closed form's own overestimate of a
+    /// period's travel. Both terms fall off as the square of the periods the
+    /// clock spans, so a long clock is held to the sampling tolerance alone.
     fn lands_on(effective: f64, wanted: f64, tick_hz: f64) -> bool {
-        let allowance = 2.0 * grid_headroom(wanted * tick_hz) + GRID_TOLERANCE;
-        effective >= wanted * (1.0 - GRID_TOLERANCE) && effective <= wanted * (1.0 + allowance)
+        let periods = wanted * tick_hz;
+        let over = grid_headroom(periods) + GRID_TOLERANCE;
+        let under = window_shortfall(periods) + GRID_TOLERANCE;
+        effective >= wanted * (1.0 - under) && effective <= wanted * (1.0 + over)
     }
 
     /// The period the tests grid on is the rate the floors are derived at, so
@@ -3107,9 +3304,14 @@ mod tests {
             floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
         let stretch = stretch.expect("a half turn does not fit a half second clock");
         let floor = duration_floor_s(core::f64::consts::PI, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
+        // The closed form is written from the peak rate, and a whole period's
+        // travel is the mean across a window centred there, so a clock measured
+        // honestly lands [`window_shortfall`] under it — four parts in ten
+        // thousand over a clock this long.
+        let carried = floor * (1.0 - window_shortfall(floor * FLOOR_TICK_HZ));
         assert!(
-            stretch.effective.head.as_secs_f64() >= floor,
-            "stretched to {:?}, under the {floor:.4} s the half turn needs",
+            stretch.effective.head.as_secs_f64() >= carried,
+            "stretched to {:?}, under the {carried:.4} s the half turn needs",
             stretch.effective.head,
         );
 
@@ -3145,6 +3347,12 @@ mod tests {
             let out = tick_with(cfg, &mut state, at(n), &present, command);
             assert_eq!(out.report.fault, None, "tick {n}");
             assert_eq!(out.report.aborted, None, "tick {n}");
+            // A refused command is not a shorter goal sequence, it is none at
+            // all — and a caller comparing sequences would otherwise wait out
+            // the loop below for a move that never started.
+            if n == 0 {
+                assert_eq!(out.report.command, CommandDisposition::Started, "tick {n}");
+            }
             if let Some(goal) = out.goal {
                 present = goal;
                 goals.push(goal);
@@ -3156,17 +3364,27 @@ mod tests {
         panic!("the move never completed");
     }
 
-    /// The largest single-period step in a goal sequence, over all nine joints.
-    fn worst_step_of(start: &JointVector, goals: &[JointVector]) -> f64 {
-        let mut worst: f64 = 0.0;
+    /// The largest single-period step in a goal sequence, per joint group.
+    fn peaks_of_goals(start: &JointVector, goals: &[JointVector]) -> DryPassPeaks {
+        let mut peaks = DryPassPeaks::default();
         let mut previous = *start;
         for goal in goals {
-            for ((_, angle), (_, last)) in goal.joints().into_iter().zip(previous.joints()) {
-                worst = worst.max((angle - last).abs());
-            }
+            peaks
+                .fold(&previous, goal)
+                .expect("a goal the loop emitted is a number");
             previous = *goal;
         }
-        worst
+        peaks
+    }
+
+    /// The largest single-period step in a goal sequence, over all nine joints.
+    fn worst_step_of(start: &JointVector, goals: &[JointVector]) -> f64 {
+        let peaks = peaks_of_goals(start, goals);
+        peaks
+            .legs
+            .max(peaks.body_yaw)
+            .max(peaks.antennas[0])
+            .max(peaks.antennas[1])
     }
 
     /// A loop running late emits the steps of a loop running on time; it takes
@@ -3329,6 +3547,634 @@ mod tests {
         }
     }
 
+    /// A move over a span whose clock is a couple of periods long carries at
+    /// every wake phase, whether the clock was stretched to there or asked for
+    /// there, and the dry pass's own number bounds what the loop emits.
+    ///
+    /// This is the band where one grid phase says least. Two periods is the worst
+    /// of it: that grid's middle sample lands on the peak of the min-jerk rate and
+    /// splits it, so it reads five eighths of the step a grid a quarter of a
+    /// period over emits. A clock accepted on that reading alone steps a quarter
+    /// past the bound at an unlucky wake phase and abandons a healthy move — and
+    /// clocks this short are reachable twice over: a wind-down re-commands the
+    /// remainder of a stow, and floors are proportional to the span, so a small
+    /// span never forces a long clock.
+    ///
+    /// Walked over spans whose closed-form floors run from a period and a half to
+    /// four, each asked for on clocks from a quarter of that floor to a tenth
+    /// past it, each driven at seven wake phases. Of every one: the loop never
+    /// steps past the bound, and never further than the dry pass measured with
+    /// its headroom. And a clock asked for at the closed form is accepted as
+    /// asked — the form is written from the peak rate, which a clock this short
+    /// never sustains for a whole period, so it forbids nothing the physics does.
+    #[test]
+    fn a_clock_of_a_couple_of_periods_carries_its_move_at_every_phase() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (state, _) = armed_at(&cfg, &start);
+
+        for tenths in [15, 20, 25, 30, 40] {
+            let periods = f64::from(tenths) / 10.0;
+            let floor = periods / FLOOR_TICK_HZ;
+            // The yaw sweep whose closed-form floor is exactly that clock.
+            let span = periods * cfg.max_step.body_yaw / MIN_JERK_PEAK_RATE;
+            for tenths_of_floor in [2.5, 5.0, 7.5, 9.0, 10.0, 11.0] {
+                let requested = floor * tenths_of_floor / 10.0;
+                let command = MotionCommand::MoveTo {
+                    target: JointTargets {
+                        body_yaw: span,
+                        ..JointTargets::default()
+                    },
+                    durations: MoveDurations::uniform(secs(requested)),
+                    warp: Warp::MinJerk,
+                };
+                let (floored, stretch) =
+                    floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+                if tenths_of_floor >= 10.0 {
+                    assert_eq!(
+                        stretch, None,
+                        "{periods} periods over {span:.4} rad was right-sized at {requested:.4} s, \
+                         and it does not need to be"
+                    );
+                }
+                let planned = dry_pass_peaks(&cfg, state.last_targets(), &floored, FLOOR_TICK_HZ)
+                    .expect("the sweep is measurable");
+                let effective = durations_of(&floored).head.as_secs_f64();
+                let admitted = planned.body_yaw * (1.0 + grid_headroom(effective * FLOOR_TICK_HZ));
+
+                for eighths in 1..8 {
+                    let shift = PERIOD.mul_f64(f64::from(eighths) / 8.0);
+                    let (pinned, goals) = goals_driven_at(&cfg, &start, &floored, &|n| {
+                        if n == 0 {
+                            Duration::ZERO
+                        } else {
+                            PERIOD * n - shift
+                        }
+                    });
+                    let worst = worst_step_of(&pinned, &goals);
+                    assert!(
+                        worst <= cfg.max_step.body_yaw,
+                        "{span:.4} rad asked for in {requested:.4} s ran on {effective:.4} s and \
+                         stepped {worst:.7} rad {eighths} eighths out of phase, past the guard's \
+                         bound"
+                    );
+                    assert!(
+                        worst <= admitted,
+                        "{span:.4} rad on {effective:.4} s stepped {worst:.7} rad {eighths} eighths \
+                         out of phase, past the {:.7} rad the dry pass measured",
+                        planned.body_yaw
+                    );
+                }
+            }
+        }
+    }
+
+    /// A stow re-commanded with a nanosecond of deadline left is re-floored to a
+    /// clock that carries the span still ahead of it, and the pass converges
+    /// there rather than exhausting its passes.
+    ///
+    /// The wind-down clamps the stow it re-commands to the deadline's remainder,
+    /// which is a clock as short as a nanosecond — a move that finishes between
+    /// two ticks, and whose measured step is its whole span whatever clock it was
+    /// asked for. Nothing about the clock's length can be read off that ratio;
+    /// what can be read off it is the closed form, and the pass lands there.
+    #[test]
+    fn a_stow_re_commanded_with_a_nanosecond_left_is_floored_to_a_clock_that_carries_it() {
+        let cfg = MotionConfig::default();
+        // A fold interrupted near its end: the head is already stowed and a
+        // third of a radian of yaw is what remains.
+        let remaining = 0.3;
+        let stowed = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            ..JointTargets::default()
+        };
+        let part_way = JointTargets {
+            body_yaw: remaining,
+            ..stowed
+        };
+        let command = MotionCommand::MoveTo {
+            target: stowed,
+            durations: MoveDurations::uniform(Duration::from_nanos(1)),
+            warp: Warp::MinJerk,
+        };
+
+        let (mut state, pinned) = armed_at(&cfg, &part_way);
+        let (floored, stretch) =
+            floor_move_clock(&cfg, state.last_targets(), &command, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("a nanosecond carries nothing");
+
+        // Converged, and not exhausted: the clock the last pass produced is one
+        // the acceptance predicate takes, measured again from scratch.
+        let ratios = worst_step_ratios(
+            &cfg,
+            state.last_targets(),
+            &stowed,
+            stretch.effective,
+            Warp::MinJerk,
+            FLOOR_TICK_HZ,
+        )
+        .expect("the remainder is measurable");
+        assert!(
+            ratios.fit(stretch.effective, FLOOR_TICK_HZ),
+            "the pass handed back {:?}, which its own measurement does not accept: {ratios:?}",
+            stretch.effective
+        );
+
+        // And that clock is the remaining span's own floor, less the shortfall a
+        // whole period's travel has against the peak rate the form is written
+        // from.
+        let floor = duration_floor_s(remaining, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
+        assert!(
+            lands_on(stretch.effective.head.as_secs_f64(), floor, FLOOR_TICK_HZ),
+            "re-floored to {:?}, not the {floor:.4} s the remainder needs",
+            stretch.effective.head
+        );
+
+        // It runs, in bounds, at every phase the loop could wake on.
+        for eighths in 1..8 {
+            let shift = PERIOD.mul_f64(f64::from(eighths) / 8.0);
+            let (start, goals) = goals_driven_at(&cfg, &part_way, &floored, &|n| {
+                if n == 0 {
+                    Duration::ZERO
+                } else {
+                    PERIOD * n - shift
+                }
+            });
+            let worst = worst_step_of(&start, &goals);
+            assert!(
+                worst <= cfg.max_step.body_yaw,
+                "the re-floored remainder stepped {worst:.7} rad {eighths} eighths out of phase"
+            );
+        }
+
+        let (_, out) = run_command(&cfg, &mut state, &pinned, &floored, 1.0 / FLOOR_TICK_HZ);
+        assert_eq!(out.report.fault, None, "{:?}", out.report);
+        assert!(out.report.completed, "{:?}", out.report);
+        assert!(
+            state.last_targets().body_yaw.abs() < 1e-12,
+            "left at {} rad",
+            state.last_targets().body_yaw
+        );
+    }
+
+    /// Every goal a move emits at each of `phases` wake phases across one
+    /// period, with the goals of each run kept in order.
+    ///
+    /// Driven through the real tick by [`goals_driven_at`], so the sequences are
+    /// what the loop emits — the antenna resolution the accept does, the
+    /// envelope, the step guard and the completion rule included — rather than a
+    /// second model of them built from the same two primitives the dry pass
+    /// uses. Each run's last goal is the one that lands the move, so the landing
+    /// step is in the sweep by construction.
+    ///
+    /// The phase moves on a *short* gap, as everywhere else in this module: a
+    /// late wake is credited at most one period, so what shifts the grid is the
+    /// period that recovers the lateness.
+    fn goals_at_every_phase(
+        cfg: &MotionConfig,
+        start: &JointTargets,
+        command: &MotionCommand,
+        phases: u32,
+    ) -> Vec<(JointVector, Vec<JointVector>)> {
+        (0..phases)
+            .map(|phase| {
+                let shift = PERIOD.mul_f64(f64::from(phase) / f64::from(phases));
+                goals_driven_at(cfg, start, command, &|n| {
+                    if n == 0 {
+                        Duration::ZERO
+                    } else {
+                        PERIOD * n - shift
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Every step a wake phase can make the loop emit over a whole move, the
+    /// step that lands it included, per joint group.
+    fn peaks_emitted(
+        cfg: &MotionConfig,
+        start: &JointTargets,
+        command: &MotionCommand,
+        phases: u32,
+    ) -> DryPassPeaks {
+        let mut peaks = DryPassPeaks::default();
+        for (pinned, goals) in goals_at_every_phase(cfg, start, command, phases) {
+            let mut previous = pinned;
+            for goal in &goals {
+                peaks
+                    .fold(&previous, goal)
+                    .expect("a goal the loop emitted is a number");
+                previous = *goal;
+            }
+        }
+        peaks
+    }
+
+    /// The largest step the loop emits *into* the pose a move lands on, per
+    /// joint group.
+    ///
+    /// The step the walk's extension exists for: one end wherever inside the
+    /// final period the loop last woke, the other on the target itself. Taken
+    /// per joint as the last step of the run that moved that joint at all — its
+    /// own clock's landing, which on a move whose groups run on different clocks
+    /// is not the run's last goal — so what this reports is the landing step the
+    /// loop actually emitted at that phase and not a reconstruction of one.
+    fn peaks_landing(
+        cfg: &MotionConfig,
+        start: &JointTargets,
+        command: &MotionCommand,
+        phases: u32,
+    ) -> DryPassPeaks {
+        let mut peaks = DryPassPeaks::default();
+        for (pinned, goals) in goals_at_every_phase(cfg, start, command, phases) {
+            let mut previous = pinned;
+            let mut landing = [0.0; JointId::COUNT];
+            for goal in &goals {
+                for (slot, ((_, angle), (_, last))) in
+                    goal.joints().into_iter().zip(previous.joints()).enumerate()
+                {
+                    let step = (angle - last).abs();
+                    if step > 0.0 {
+                        landing[slot] = step;
+                    }
+                }
+                previous = *goal;
+            }
+            for (slot, (id, _)) in previous.joints().into_iter().enumerate() {
+                let peak = peaks.slot(id);
+                *peak = peak.max(landing[slot]);
+            }
+        }
+        peaks
+    }
+
+    /// The windows the planned path holds into the pose a move lands on, per
+    /// joint group.
+    ///
+    /// The landing step the trajectory itself explains: one end on the target
+    /// the clock holds from its duration onward, the other at each fine sample
+    /// of the final period, which is where a loop's last wake before the clock
+    /// runs out can fall. Built from [`Trajectory`] and [`joints_of`] — the two
+    /// primitives the dry pass walks with — so what it says is what the plan
+    /// holds, independent of anything the tick does with it. Per group on that
+    /// group's own clock: a move whose antennas outlast its head group lands
+    /// each of them at its own moment.
+    fn landing_windows(
+        cfg: &MotionConfig,
+        start: &JointTargets,
+        command: &MotionCommand,
+        tick_hz: f64,
+    ) -> DryPassPeaks {
+        let MotionCommand::MoveTo {
+            target,
+            durations,
+            warp,
+        } = command
+        else {
+            panic!("a landing window is a question about a move");
+        };
+        let resolved = resolve_antennas(start, target).expect("the target resolves");
+        let trajectory =
+            Trajectory::new(start, &resolved, *durations, *warp).expect("the move is plannable");
+        let held = joints_of(cfg, &resolved).expect("the target solves");
+        let fine_hz = tick_hz * f64::from(DRY_OVERSAMPLE);
+
+        let final_period = |clock: Duration| {
+            let mut peaks = DryPassPeaks::default();
+            let mut sampled = JointTargets::default();
+            for back in 1..=DRY_OVERSAMPLE {
+                let t = clock.saturating_sub(secs(f64::from(back) / fine_hz));
+                trajectory.sample(t, &mut sampled);
+                let at = joints_of(cfg, &sampled).expect("the path solves");
+                peaks.fold(&at, &held).expect("a window is a number");
+            }
+            peaks
+        };
+
+        let head = final_period(durations.head);
+        let right = final_period(durations.antennas[0]);
+        let left = final_period(durations.antennas[1]);
+        DryPassPeaks {
+            legs: head.legs,
+            body_yaw: head.body_yaw,
+            antennas: [right.antennas[0], left.antennas[1]],
+        }
+    }
+
+    /// The fixtures the landing walk is asserted over: the gestures this
+    /// machine actually runs, each named with the clock it runs on.
+    ///
+    /// The stow pose carries the antennas the machine actually folds them to,
+    /// which is the one fixture arc where the accept's antenna resolution bites:
+    /// the short way round from neutral crosses the outboard sideways point, so
+    /// the loop sweeps the long way instead.
+    fn landing_fixtures() -> [(&'static str, JointTargets, JointTargets, f64); 4] {
+        let rest = JointTargets {
+            head_pose_body: rest_head_pose(),
+            ..JointTargets::default()
+        };
+        let stow = JointTargets {
+            head_pose_body: reachy_kin::stow_head_pose(),
+            antennas: crate::disarm::STOW_ANTENNAS,
+            ..JointTargets::default()
+        };
+        let raised = JointTargets {
+            antennas: [1.0, -1.0],
+            ..pose_at(0.19)
+        };
+        let spun = JointTargets {
+            body_yaw: core::f64::consts::PI,
+            ..rest
+        };
+        [
+            ("the presence gesture", rest, raised, 0.8),
+            ("the fold to stow", raised, stow, HEAD_GROUP_FLOOR_S),
+            // To neutral and not back to the rest pose: the rest a machine is
+            // armed from sits outside the legs' travel window and arming pins
+            // it, so it is a pose to start from and not one to command.
+            ("the lift to neutral", stow, JointTargets::default(), 0.5),
+            ("the fold from a half turn", spun, stow, 2.0),
+        ]
+    }
+
+    /// The binding rule holds through the step that lands a move, and that step
+    /// is one the plan holds.
+    ///
+    /// What the loop emits are period-spaced differences of the *clamped*
+    /// trajectory, so every step but the last is a full period of path and is
+    /// measured by a window the walk visits whatever the path does in between.
+    /// The last one is not: it runs from wherever the loop woke inside the final
+    /// period to the target being held, which is a *sub*-period difference — and
+    /// a crank whose angle is not monotone over that stretch can carry it
+    /// further than any window ending on the endpoint. The walk therefore runs
+    /// one period past the endpoint, where the trajectory holds the target.
+    ///
+    /// Three claims, per joint group and at the clock as asked, over this
+    /// machine's own gestures. The binding rule: what the pass measured, with
+    /// the headroom that clock carries, covers every step a sweep of wake phases
+    /// through the real tick can make the loop emit. The landing step is real
+    /// and is the one the plan holds: wherever a group moved at all it lands
+    /// somewhere, and what it lands from is a fine sample of the final period,
+    /// so a landing step the trajectory does not explain fails here. And the
+    /// pass covers those windows — the extension's own claim, and the one bound
+    /// of the three this machine's geometry leaves slack, because the landing
+    /// windows sit a hundredth to two of the interior peak. That the walk runs
+    /// far enough to have measured them is pinned at the seam instead, by
+    /// [`the_step_walk_runs_a_period_past_the_endpoint`].
+    #[test]
+    fn the_binding_rule_holds_through_the_step_that_lands_the_move() {
+        let cfg = MotionConfig::default();
+
+        for (name, start, target, duration) in landing_fixtures() {
+            let command = MotionCommand::MoveTo {
+                target,
+                durations: MoveDurations::uniform(secs(duration)),
+                warp: Warp::MinJerk,
+            };
+            let (state, _) = armed_at(&cfg, &start);
+            let pinned = *state.last_targets();
+            // The clock the command would run on, which is the one the pass is
+            // asked about: a gesture's own duration where that carries it, and
+            // the floor for its span where it does not.
+            let (floored, _) = floor_move_clock(&cfg, &pinned, &command, FLOOR_TICK_HZ);
+            let measured = dry_pass_peaks(&cfg, &pinned, &floored, FLOOR_TICK_HZ)
+                .expect("the path is walkable");
+            let emitted = peaks_emitted(&cfg, &start, &floored, 64);
+            let landing = peaks_landing(&cfg, &start, &floored, 64);
+            let windows = landing_windows(&cfg, &pinned, &floored, FLOOR_TICK_HZ);
+            // Per group and not per move: each group's headroom is the residual
+            // of the grid *its own* clock was walked on.
+            let clocks = durations_of(&floored);
+            for (group, clock, measured, emitted, landing, windows) in [
+                (
+                    "the legs",
+                    clocks.head,
+                    measured.legs,
+                    emitted.legs,
+                    landing.legs,
+                    windows.legs,
+                ),
+                (
+                    "the body yaw",
+                    clocks.head,
+                    measured.body_yaw,
+                    emitted.body_yaw,
+                    landing.body_yaw,
+                    windows.body_yaw,
+                ),
+                (
+                    "the right antenna",
+                    clocks.antennas[0],
+                    measured.antennas[0],
+                    emitted.antennas[0],
+                    landing.antennas[0],
+                    windows.antennas[0],
+                ),
+                (
+                    "the left antenna",
+                    clocks.antennas[1],
+                    measured.antennas[1],
+                    emitted.antennas[1],
+                    landing.antennas[1],
+                    windows.antennas[1],
+                ),
+            ] {
+                let admitted = 1.0 + grid_headroom(clock.as_secs_f64() * FLOOR_TICK_HZ);
+                assert!(
+                    emitted <= measured * admitted,
+                    "{name}: {group} step {emitted:.6} rad at some wake phase, past the \
+                     {measured:.6} rad the dry pass measured with its headroom"
+                );
+                // A group the move does not carry anywhere has no landing step
+                // to speak of; one it does carry must have measured a real one,
+                // or the comparison below is satisfied by nothing.
+                assert!(
+                    measured == 0.0 || landing > 0.0,
+                    "{name}: {group} moved {measured:.6} rad per period and yet lands nowhere, so \
+                     its landing step measures nothing"
+                );
+                // The landing step the loop emits is one the plan holds: its far
+                // end is the target, and its near end is a fine sample of the
+                // final period the walk's extension covers.
+                assert!(
+                    landing <= windows * admitted,
+                    "{name}: {group} lands {landing:.6} rad, past the {windows:.6} rad the \
+                     planned path holds into the target over its final period"
+                );
+                // And the pass measured those windows: this is the extension's
+                // own claim, and the only one of the three that a walk stopping
+                // at the endpoint could fail.
+                assert!(
+                    windows <= measured * admitted,
+                    "{name}: {group} holds {windows:.6} rad into the target over its final \
+                     period, past the {measured:.6} rad the dry pass measured with its headroom"
+                );
+            }
+        }
+    }
+
+    /// A clock the pass hands back carries its move at every wake phase, the
+    /// step that lands it included.
+    ///
+    /// The same gestures asked for on a quarter of the clock they need, so every
+    /// one of them is stretched, and then swept at sixty-four wake phases
+    /// through the landing. The sweep starts from the pose arming leaves the
+    /// machine holding, which is the pose the floored clock was measured from.
+    #[test]
+    fn a_floored_clock_carries_its_landing_step_too() {
+        let cfg = MotionConfig::default();
+
+        for (name, start, target, duration) in landing_fixtures() {
+            let command = MotionCommand::MoveTo {
+                target,
+                durations: MoveDurations::uniform(secs(duration / 4.0)),
+                warp: Warp::MinJerk,
+            };
+            let (state, _) = armed_at(&cfg, &start);
+            let pinned = *state.last_targets();
+            let (floored, stretch) = floor_move_clock(&cfg, &pinned, &command, FLOOR_TICK_HZ);
+            assert!(
+                stretch.is_some(),
+                "{name}: a quarter of its clock is not enough for it"
+            );
+
+            let emitted = peaks_emitted(&cfg, &start, &floored, 64);
+            for (group, emitted, bound) in [
+                ("a crank", emitted.legs, cfg.max_step.legs),
+                ("the yaw", emitted.body_yaw, cfg.max_step.body_yaw),
+                (
+                    "the right antenna",
+                    emitted.antennas[0],
+                    cfg.max_step.antennas,
+                ),
+                (
+                    "the left antenna",
+                    emitted.antennas[1],
+                    cfg.max_step.antennas,
+                ),
+            ] {
+                assert!(
+                    emitted <= bound,
+                    "{name}: {group} stepped {emitted:.6} rad at some wake phase, past the \
+                     {bound:.6} rad bound"
+                );
+            }
+        }
+    }
+
+    /// The step walk runs one nominal period past the sample that lands the
+    /// move.
+    ///
+    /// Pinned at the seam rather than through a measured figure, because on this
+    /// machine's geometry there is no reachable move whose landing windows
+    /// exceed the windows inside it: the extension is coverage of windows that
+    /// happen to sit under the interior peak, so dropping it moves nothing any
+    /// other assertion in this module reads. What it would move is the guarantee
+    /// — a path not monotone over its last period can put its landing step above
+    /// every window a walk stopping at the endpoint visits — so what holds the
+    /// extension in place is this.
+    #[test]
+    fn the_step_walk_runs_a_period_past_the_endpoint() {
+        let fine_hz = FLOOR_TICK_HZ * f64::from(DRY_OVERSAMPLE);
+        for periods in [1.0, 2.5, 40.0] {
+            let durations = MoveDurations::uniform(secs(periods / FLOOR_TICK_HZ));
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a handful of periods at the fine rate, far under MAX_DRY_SAMPLES"
+            )]
+            let lands = (periods * f64::from(DRY_OVERSAMPLE)).ceil() as u32;
+            assert_eq!(
+                walk_samples(durations, fine_hz),
+                Some(lands + DRY_OVERSAMPLE),
+                "a {periods}-period clock is walked to its endpoint and no further"
+            );
+        }
+    }
+
+    /// The samples the walk takes past the endpoint are samples, and the budget
+    /// counts them.
+    ///
+    /// Each is a solve like any other, so a span that fits inside
+    /// [`MAX_DRY_SAMPLES`] only without its extension is a span the pass hands
+    /// back rather than one it walks short. The crossing walk takes no
+    /// extension and reaches the budget on its own.
+    #[test]
+    fn the_walks_budget_counts_what_it_takes_past_the_endpoint() {
+        let fine_hz = FLOOR_TICK_HZ * f64::from(DRY_OVERSAMPLE);
+        let whole = f64::from(MAX_DRY_SAMPLES - ONE_PERIOD_BEYOND) / fine_hz;
+
+        assert_eq!(
+            dry_samples(secs(whole), fine_hz, ONE_PERIOD_BEYOND),
+            Some(MAX_DRY_SAMPLES)
+        );
+        assert_eq!(
+            dry_samples(secs(whole + 1.0 / fine_hz), fine_hz, ONE_PERIOD_BEYOND),
+            None
+        );
+        assert_eq!(
+            dry_samples(
+                secs(f64::from(MAX_DRY_SAMPLES) / FLOOR_TICK_HZ),
+                FLOOR_TICK_HZ,
+                NO_EXTENSION
+            ),
+            Some(MAX_DRY_SAMPLES)
+        );
+    }
+
+    /// The headroom is derived at every clock length, and nothing caps it.
+    ///
+    /// Four over the square of the fine samples the clock spans, which is the
+    /// second-order deficit of a wake phase falling between two of them. A clock
+    /// spanning no periods at all was not measured, and no headroom makes it
+    /// acceptable.
+    ///
+    /// Pinned as the numbers themselves rather than as the expression, because
+    /// what an operator is promised is a *width*: the sentences in
+    /// [`STRETCH_GRID_HEADROOM`]'s own documentation and in the bench example
+    /// quote these figures, and a tuning of either constant that left them stale
+    /// would pass a test written as the implementation's own arithmetic.
+    #[test]
+    fn the_grid_headroom_is_the_fine_grids_own_residual() {
+        // The three lengths the prose quotes: a one-period clock, the two
+        // periods the adversarial case is written at, and the fold's own floor.
+        let fold_floor_periods = HEAD_GROUP_FLOOR_S * FLOOR_TICK_HZ;
+        assert!(
+            (fold_floor_periods - 18.0).abs() < 1e-9,
+            "the fold's floor spans {fold_floor_periods} periods, not the 18 the figures below \
+             were read off"
+        );
+        for (periods, expected) in [
+            // 4 / 8², the whole of a one-period clock's own span.
+            (1.0, 0.062_5),
+            // 4 / 16²: under two parts in a hundred.
+            (2.0, 0.015_625),
+            // 4 / 144²: under two parts in ten thousand.
+            (fold_floor_periods, 0.000_192_901_234_567_901_2),
+            // 4 / 320²: four parts in a hundred thousand at the shipped gesture.
+            (40.0, 0.000_039_062_5),
+        ] {
+            let headroom = grid_headroom(periods);
+            assert!(
+                (headroom - expected).abs() < 1e-15,
+                "at {periods} periods: {headroom} against {expected}"
+            );
+        }
+        // Falling off monotonically is what makes a longer clock never harder to
+        // accept than a shorter one, which is what the stretch walks on.
+        let mut previous = f64::INFINITY;
+        for periods in [0.5, 1.0, 1.875, 2.0, 4.0, 18.0, 40.0, 1000.0] {
+            let headroom = grid_headroom(periods);
+            assert!(
+                headroom < previous,
+                "at {periods} periods the term rose to {headroom} from {previous}"
+            );
+            previous = headroom;
+        }
+        assert_eq!(grid_headroom(0.0), f64::INFINITY);
+    }
+
     /// A loop that is late by the same amount every period emits exactly the
     /// goals an on-time loop does.
     ///
@@ -3373,7 +4219,9 @@ mod tests {
         let span = 1.0;
         let floor = duration_floor_s(span, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
 
-        let mut previous = 0.0;
+        // `None` until there is a clock before this one to compare against;
+        // nothing is monotone about the first entry of a sequence.
+        let mut previous: Option<f64> = None;
         // Straddling the floor, which the yaw's measured bound puts at a
         // quarter of a second: a band that sat entirely above it would pass
         // without ever crossing the thing under test.
@@ -3401,12 +4249,14 @@ mod tests {
                 effective >= requested,
                 "{requested:.2} s was shortened to {effective:.4} s"
             );
-            let residual = 2.0 * grid_headroom(previous * FLOOR_TICK_HZ) + GRID_TOLERANCE;
-            assert!(
-                effective >= previous * (1.0 - residual),
-                "{requested:.2} s ran on {effective:.4} s, shorter than the clock before it"
-            );
-            previous = effective;
+            if let Some(previous) = previous {
+                let residual = grid_headroom(previous * FLOOR_TICK_HZ) + GRID_TOLERANCE;
+                assert!(
+                    effective >= previous * (1.0 - residual),
+                    "{requested:.2} s ran on {effective:.4} s, shorter than the clock before it"
+                );
+            }
+            previous = Some(effective);
         }
     }
 
@@ -3806,10 +4656,13 @@ mod tests {
         let stretch = stretch.expect("neither side carries its sweep in a twentieth of a second");
         assert!(stretch.dephased, "{stretch:?}");
         let floor = duration_floor_s(SWEPT_FROM[0], cfg.max_step.antennas, FLOOR_TICK_HZ);
+        // Under the closed form by the shortfall a period's travel has against
+        // the peak rate it is written from, and no further.
+        let carried = floor * (1.0 - window_shortfall(floor * FLOOR_TICK_HZ));
         for side in 0..2 {
             assert!(
-                stretch.effective.antennas[side].as_secs_f64() >= floor,
-                "side {side} runs on {:?}, under the {floor:.4} s its sweep needs",
+                stretch.effective.antennas[side].as_secs_f64() >= carried,
+                "side {side} runs on {:?}, under the {carried:.4} s its sweep needs",
                 stretch.effective.antennas[side]
             );
         }
@@ -4213,7 +5066,7 @@ mod tests {
     #[test]
     fn every_fault_names_the_maneuver_that_answers_it() {
         let bits = 0x20;
-        let table: [(Fault, Response, bool); 8] = [
+        let table: [(Fault, Response, bool); 9] = [
             (
                 Fault::AntennaObstructed {
                     joint: JointId::AntennaRight,
@@ -4266,8 +5119,20 @@ mod tests {
             ),
             (
                 Fault::BusFailure {
-                    source: SeqError::NoAnswer {
+                    source: BusFailureSource::Sequence(SeqError::NoAnswer {
                         context: StepContext::reg(SeqStep::PinAndEnable, 13, RegId::GoalPosition),
+                    }),
+                },
+                Response::ImmediateAllTorqueOffToPark,
+                true,
+            ),
+            // The same condition, found by the loop driving a move rather than
+            // by a sequencer. One response, whichever layer noticed.
+            (
+                Fault::BusFailure {
+                    source: BusFailureSource::Transaction {
+                        id: 13,
+                        kind: WireFailure::Silent,
                     },
                 },
                 Response::ImmediateAllTorqueOffToPark,
@@ -4345,9 +5210,9 @@ mod tests {
             ),
             (
                 Fault::BusFailure {
-                    source: SeqError::NoAnswer {
+                    source: BusFailureSource::Sequence(SeqError::NoAnswer {
                         context: StepContext::reg(SeqStep::PinAndEnable, 13, RegId::GoalPosition),
-                    },
+                    }),
                 },
                 "bus_failure",
             ),
@@ -4369,6 +5234,20 @@ mod tests {
         let distinct = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), distinct, "two faults share a slug: {slugs:?}");
+
+        // A wire failure the move loop found says the same word as one a
+        // sequencer found. One condition, one name, so one alert rule covers
+        // the machine however the trouble was noticed.
+        assert_eq!(
+            Fault::BusFailure {
+                source: BusFailureSource::Transaction {
+                    id: 13,
+                    kind: WireFailure::Silent,
+                },
+            }
+            .slug(),
+            "bus_failure"
+        );
     }
 
     /// Which condition this is, as a slot in the table above.
@@ -6977,7 +7856,7 @@ mod tests {
         violations.unreachable[0] = true;
         violations.margin = true;
 
-        let faults: [(Fault, &str); 8] = [
+        let faults: [(Fault, &str); 9] = [
             (
                 Fault::PositionFeedbackLost { misses: 50 },
                 "no position read for 50 consecutive ticks",
@@ -7014,12 +7893,21 @@ mod tests {
             ),
             (
                 Fault::BusFailure {
-                    source: SeqError::NoAnswer {
+                    source: BusFailureSource::Sequence(SeqError::NoAnswer {
                         context: StepContext::reg(SeqStep::PinAndEnable, 13, RegId::GoalPosition),
-                    },
+                    }),
                 },
                 "the bus is not carrying commands: pin and enable of servo 13, goal position: no \
                  answer",
+            ),
+            (
+                Fault::BusFailure {
+                    source: BusFailureSource::Transaction {
+                        id: 13,
+                        kind: WireFailure::Corrupt,
+                    },
+                },
+                "the bus is not carrying commands: servo 13: a corrupt reply",
             ),
             (
                 Fault::TorqueOffUnconfirmed { id: 14 },

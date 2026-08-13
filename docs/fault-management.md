@@ -151,6 +151,18 @@ about anything a control step can see.
 | `bus_failure` | transactions failing under torque; a write nothing acknowledges after every attempt | `immediate_all_torque_off_to_park` |
 | `torque_off_unconfirmed` | a torque-off write unacknowledged after all nine attempts and their retries | `immediate_all_torque_off_to_park`, degenerate: the torque-off already ran, so what remains is the park and the alert. An unconfirmed MRC is never reported as Resting |
 
+**One crank seized is not a grabbed head.** A single leg servo that stops while
+the other five keep tracking presents as `measured_pose_invalid`: five cranks on
+the plan and one off it is a pose no rigid head can hold, so the forward
+kinematics has no answer for the measurements and they have stopped meaning
+anything. A hand or a snag on the head itself holds all six cranks together,
+each of them still commandable and each drifting past the tracking threshold for
+a whole window, and that presents as `head_obstructed`. So the two conditions
+answer differently — the seized crank parks and goes limp, the obstruction stows
+under control — and the reason driving five legs against a seized sixth is not
+answered with a stow is the parallel-linkage argument in the escalation ladder
+below.
+
 Classification happens exactly once, at the point the condition becomes one of
 these values, and travels as that value. No layer re-derives a class from a
 message, and no layer invents a response outside the table.

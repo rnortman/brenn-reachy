@@ -122,6 +122,11 @@ pub(crate) struct FakeMachine {
     /// on the wire. They answer nothing to it and go on holding what they were
     /// holding, which is exactly how a servo that restarted answers a ping.
     pub(crate) deaf_to_reboot: Vec<u8>,
+    /// Servos that acknowledge a reboot, restart, and come back still carrying
+    /// their hardware-error byte: a condition live at this instant, or a restart
+    /// that took the torque and not the latch. Not what the machine on the bench
+    /// does — which is what makes it worth modelling separately.
+    pub(crate) keeps_latch: Vec<u8>,
     out: VecDeque<u8>,
 }
 
@@ -142,6 +147,7 @@ impl FakeMachine {
             stalled: Vec::new(),
             gone_on_reboot: Vec::new(),
             deaf_to_reboot: Vec::new(),
+            keeps_latch: Vec::new(),
             out: VecDeque::new(),
         }
     }
@@ -363,17 +369,20 @@ impl BusPort for FakeMachine {
                     return Ok(());
                 }
                 // Acknowledged with no parameters, then the servo restarts: it
-                // comes back with Torque Enable cleared, holding nothing. The
-                // position register and the latched hardware-error byte are
-                // left exactly as they were — what a restart does to either is
-                // not something this project has established on its own
-                // hardware, so the fixture claims nothing about it.
+                // comes back with Torque Enable cleared, holding nothing, and
+                // with its hardware-error byte at zero — which is what this
+                // machine does on the bench, recorded in the runbook's open
+                // observations. The position register is left as it was; that
+                // one is not established, so the fixture claims nothing.
                 self.reply(id, 0, &[]);
                 if self.gone_on_reboot.contains(&id) {
                     self.silent.push(id);
                     return Ok(());
                 }
                 self.set(id, reg_for(RegId::TorqueEnable), &[0]);
+                if !self.keeps_latch.contains(&id) {
+                    self.set(id, reg_for(RegId::HardwareErrorStatus), &[0]);
+                }
             }
             INST_SYNC_READ => {
                 // Broadcast: address, width, then the servos asked. Each answers
