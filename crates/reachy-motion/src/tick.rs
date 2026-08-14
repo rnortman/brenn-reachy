@@ -854,6 +854,21 @@ pub enum MotionCommand {
     },
     /// Abandon any active move and hold where the last goal put things.
     Hold,
+    /// Command exactly this target on this tick, and nothing beyond it.
+    ///
+    /// One setpoint, checked and emitted on the period it arrives on: the
+    /// caller owns the shaping, and what it hands over each period is the pose
+    /// it wants held until the next one. The checks are the ones a sampled path
+    /// pose gets — the envelope, and the per-tick step against the last goal —
+    /// so a caller that shapes badly is refused rather than obeyed, and a
+    /// refusal changes nothing at all. The antennas are taken as they are
+    /// given: an absolute angle in the frame the last command left them in, not
+    /// a direction to resolve, because a per-tick setpoint names a position
+    /// rather than an arc to sweep.
+    ///
+    /// Abandons an active move, for the same reason [`MotionCommand::Hold`]
+    /// does: two things cannot be commanding the same servos.
+    Track(JointTargets),
 }
 
 /// Why a command was refused. A refusal changes nothing: the machine stays in
@@ -874,6 +889,18 @@ pub enum CommandRejection {
         /// The goal that has no count, radians.
         angle: f64,
     },
+    /// A tracked setpoint stood further from the last goal than one tick's step
+    /// bound allows. The same bound [`MoveAbort::StepTooLarge`] guards a
+    /// sampled path with, answered to the caller instead of abandoning a move,
+    /// because a tracked setpoint *is* the caller's plan and there is no
+    /// trajectory to abandon.
+    #[error("{joint} would step {delta:.4} rad in one tick")]
+    StepTooLarge {
+        /// The joint whose step was too large.
+        joint: JointId,
+        /// How far it would have moved, radians.
+        delta: f64,
+    },
 }
 
 /// What became of this tick's command.
@@ -890,6 +917,10 @@ pub enum CommandDisposition {
     Retargeted,
     /// A hold was taken.
     Held,
+    /// A tracked setpoint was accepted, checked and commanded on this tick.
+    /// Whether it put goals on the wire is `emitted`, exactly as for a sampled
+    /// path pose: a setpoint identical to the last goal writes nothing.
+    Tracked,
     /// A command was refused, and nothing changed.
     Rejected(CommandRejection),
 }
@@ -1684,7 +1715,8 @@ pub fn motion_tick(
 
     // At most one command. Refusals report and change nothing.
     if let Some(command) = inp.command {
-        out.report.command = take_command(cfg, state, command);
+        let disposition = take_command(cfg, state, command, out);
+        out.report.command = disposition;
     }
     out.report.mode = state.mode;
 
@@ -1722,12 +1754,78 @@ pub fn motion_tick(
         return;
     }
 
+    match stage_target(cfg, state, &sampled, Judged::AgainstTheStart, out) {
+        Staged::Envelope(violations) => {
+            state.abort(MoveAbort::EnvelopePath(violations), out);
+            return;
+        }
+        Staged::Step { joint, delta } => {
+            state.abort(MoveAbort::StepTooLarge { joint, delta }, out);
+            return;
+        }
+        Staged::Emitted => {}
+    }
+
+    if done {
+        // The endpoint's own bits, so the next move chains from exactly what
+        // was commanded rather than from a sample near it.
+        state.last_targets = endpoint;
+        state.trajectory = None;
+        state.mode = Mode::Holding;
+        out.report.completed = true;
+    }
+    out.report.mode = state.mode;
+}
+
+/// How a pose the envelope refuses is judged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Judged {
+    /// On the bounds alone: a refused pose is refused.
+    OnTheBounds,
+    /// Against the excursion the machine started this move from, which is how a
+    /// machine standing outside the envelope travels back inside.
+    AgainstTheStart,
+}
+
+/// What became of one candidate pose.
+enum Staged {
+    /// It passed both gates; the goal and the last-commanded targets are it.
+    Emitted,
+    /// The envelope refused it.
+    Envelope(EnvelopeViolations),
+    /// One joint would have had to move further in a period than it may.
+    Step {
+        /// Which joint.
+        joint: JointId,
+        /// How far it was asked to travel, radians.
+        delta: f64,
+    },
+}
+
+/// Check one pose the machine is about to be commanded to, and stage it as this
+/// period's goal if it passes.
+///
+/// The two gates every commanded pose is held to — a pose the envelope will
+/// have, and a step no servo may take in one period — are one piece of code
+/// because they are one rule: a sampled move and a tracked setpoint ask the same
+/// two questions of the same machine, and a per-tick bound that meant one thing
+/// on one path and another on the other is the divergence the single gate exists
+/// to prevent. What differs is the answer to a failure, which is the caller's: a
+/// sample aborts the move it came from, a setpoint is refused to whoever sent
+/// it.
+fn stage_target(
+    cfg: &MotionConfig,
+    state: &mut MotionState,
+    target: &JointTargets,
+    judged: Judged,
+    out: &mut TickOutputs,
+) -> Staged {
     let mut envelope = EnvelopeReport::default();
     let verdict = check_envelope(
         &cfg.geom,
         &cfg.env,
-        &sampled.head_pose_body,
-        sampled.body_yaw,
+        &target.head_pose_body,
+        target.body_yaw,
         Some(state.present_min_margin),
         &mut envelope,
     );
@@ -1741,40 +1839,44 @@ pub fn motion_tick(
     // target it travels to passed the bounds outright when the command was
     // taken. Anything further out is the fault it always was.
     //
+    // A tracked setpoint gets no such allowance: it is a fresh ask every period
+    // with no start of its own to be judged against, and a machine standing
+    // outside the envelope is recovered by commanding a move.
+    //
     // The second arm is a verdict that passed without producing the angles it
     // passed on, and a pose with no angles is nothing this can command.
     let recovering = verdict.is_err();
     let admitted = match verdict {
         Ok(()) => true,
         Err(error) => {
-            !error.violations.margin
-                && Excursion::of(&cfg.env, &envelope, sampled.body_yaw)
+            judged == Judged::AgainstTheStart
+                && !error.violations.margin
+                && Excursion::of(&cfg.env, &envelope, target.body_yaw)
                     .no_further_out_than(&state.start_excursion)
         }
     };
     let (true, Some(angles)) = (admitted, envelope.leg_angles) else {
-        state.abort(MoveAbort::EnvelopePath(envelope.violations), out);
-        return;
+        return Staged::Envelope(envelope.violations);
     };
     out.report.recovering = recovering;
     let candidate = JointVector {
-        body_yaw: sampled.body_yaw,
+        body_yaw: target.body_yaw,
         legs: angles.0,
-        antennas: sampled.antennas,
+        antennas: target.antennas,
     };
 
     // Step guard. An oversized step is a slam, and the bug that produced it is
     // the thing worth reporting; it is never trimmed and sent. A move whose
     // clock is too short for its span does not reach here:
     // `floor_move_clock` right-sizes it before it is commanded, so what
-    // remains for this guard to catch is an interpolator or a seed that is
-    // wrong. What the bound bounds is therefore the plan, which is why passing
-    // it kills the move and not the machine.
+    // remains for this guard to catch on that path is an interpolator or a seed
+    // that is wrong. What the bound bounds is therefore the plan, which is why
+    // passing it kills the plan and not the machine.
     //
-    // A masked joint is skipped: nothing of what the planner produced for it
-    // goes anywhere, so there is no step to bound. The plan itself is left
-    // whole — the mask decides what reaches the wire, not what the trajectory
-    // says.
+    // A masked joint is skipped: nothing of what the plan or the setpoint says
+    // about it goes anywhere, so there is no step to bound. The plan itself is
+    // left whole — the mask decides what reaches the wire, not what the
+    // trajectory says.
     let mut changed = false;
     for ((id, angle), (_, last)) in candidate.joints().into_iter().zip(state.last_goal.joints()) {
         if state.masked.contains(id) {
@@ -1782,8 +1884,7 @@ pub fn motion_tick(
         }
         let delta = (angle - last).abs();
         if outside_limit(delta, cfg.max_step.for_joint(id)) {
-            state.abort(MoveAbort::StepTooLarge { joint: id, delta }, out);
-            return;
+            return Staged::Step { joint: id, delta };
         }
         changed |= angle != last;
     }
@@ -1791,64 +1892,53 @@ pub fn motion_tick(
     // Emit, but only what changed: holding writes nothing and the servos hold.
     // A period whose only movement is on a masked joint has nothing to say.
     out.report.emitted = changed;
-    if out.report.emitted {
+    if changed {
         out.goal = Some(candidate);
     }
     state.last_goal = candidate;
-    state.last_targets = sampled;
-
-    if done {
-        // The endpoint's own bits, so the next move chains from exactly what
-        // was commanded rather than from a sample near it.
-        state.last_targets = endpoint;
-        state.trajectory = None;
-        state.mode = Mode::Holding;
-        out.report.completed = true;
-    }
-    out.report.mode = state.mode;
+    state.last_targets = *target;
+    Staged::Emitted
 }
 
 /// Take at most one command, returning what became of it. Mutates the state
 /// only when the command is accepted.
+///
+/// `out` is written by the tracked-setpoint arm alone, which is the one command
+/// that both decides and emits within the period it arrives on; every other arm
+/// leaves the goal to the sampling below.
 fn take_command(
     cfg: &MotionConfig,
     state: &mut MotionState,
     command: &MotionCommand,
+    out: &mut TickOutputs,
 ) -> CommandDisposition {
-    let MotionCommand::MoveTo {
-        target,
-        durations,
-        warp,
-    } = command
-    else {
-        state.trajectory = None;
-        state.mode = Mode::Holding;
-        return CommandDisposition::Held;
+    let (target, durations, warp) = match command {
+        MotionCommand::MoveTo {
+            target,
+            durations,
+            warp,
+        } => (target, *durations, *warp),
+        MotionCommand::Track(target) => return take_track(cfg, state, target, out),
+        MotionCommand::Hold => {
+            state.trajectory = None;
+            state.mode = Mode::Holding;
+            return CommandDisposition::Held;
+        }
     };
-
-    let target = match resolve_antennas(&state.last_targets, target) {
-        Ok(target) => target,
-        Err(rejection) => return CommandDisposition::Rejected(rejection),
-    };
-
-    let mut report = EnvelopeReport::default();
-    if let Err(error) = check_envelope(
-        &cfg.geom,
-        &cfg.env,
-        &target.head_pose_body,
-        target.body_yaw,
-        Some(state.present_min_margin),
-        &mut report,
-    ) {
-        return CommandDisposition::Rejected(CommandRejection::Envelope(error.violations));
-    }
 
     // Start from the last commanded targets rather than the measured pose, so
     // consecutive moves chain without a step and a tracking lag is not written
     // into the path. Mid-move that is the setpoint the previous tick commanded,
     // which is what makes a retarget a splice rather than a jump.
     let retarget = matches!(state.mode, Mode::Moving { .. });
-    match Trajectory::new(&state.last_targets, &target, *durations, *warp) {
+    match shape_move(
+        cfg,
+        &state.last_targets,
+        target,
+        durations,
+        warp,
+        Some(state.present_min_margin),
+    ) {
         Ok(trajectory) => {
             // How far outside the envelope this move begins, which is the
             // allowance every sample of it is judged against. Recomputed per
@@ -1868,7 +1958,147 @@ fn take_command(
                 CommandDisposition::Started
             }
         }
-        Err(error) => CommandDisposition::Rejected(CommandRejection::Trajectory(error)),
+        Err(rejection) => CommandDisposition::Rejected(rejection),
+    }
+}
+
+/// The trajectory a move from `start` to `target` runs, or why it is refused.
+///
+/// The construction order the whole stack shapes a move through, in one place:
+/// resolve the antenna directions against where the last command left them,
+/// judge the *resolved* target against the envelope, and shape the path to it.
+/// Nothing here touches state, so a caller planning a move it will drive
+/// itself gets exactly the path [`take_command`] would have built.
+///
+/// `margin_baseline` is the toggle margin of the pose the machine presently
+/// holds, which is what admits a lift off a rest tighter than the clearance
+/// floor. A caller with no live read passes `None` and is held to the floor
+/// itself.
+fn shape_move(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    target: &JointTargets,
+    durations: MoveDurations,
+    warp: Warp,
+    margin_baseline: Option<f64>,
+) -> Result<Trajectory, CommandRejection> {
+    let target = resolve_antennas(start, target)?;
+
+    let mut report = EnvelopeReport::default();
+    check_envelope(
+        &cfg.geom,
+        &cfg.env,
+        &target.head_pose_body,
+        target.body_yaw,
+        margin_baseline,
+        &mut report,
+    )
+    .map_err(|error| CommandRejection::Envelope(error.violations))?;
+
+    Trajectory::new(start, &target, durations, warp).map_err(CommandRejection::Trajectory)
+}
+
+/// The path a move from `start` would run, on a clock long enough to carry it,
+/// without commanding anything.
+///
+/// What a caller driving its own tick-by-tick composition needs and cannot
+/// assemble itself: the antenna resolution that routes each side away from its
+/// outboard direction is private to this module, and a trajectory built from
+/// [`floor_move_clock`]'s deliberately *unresolved* target would sweep the
+/// short arc straight through the point that resolution exists to miss. So the
+/// whole construction lives here — resolve, floor the clock, shape the path to
+/// the resolved target — and a caller that samples the result and hands each
+/// sample back as [`MotionCommand::Track`] moves exactly as the same command
+/// through [`take_command`] would have.
+///
+/// The returned [`ClockStretch`] is the caller's to report, as it is for a
+/// commanded move. A refusal is a plan this machine will not run — an antenna
+/// direction no servo count reaches, a target outside the envelope, a move
+/// nothing can shape — and, per the fault doctrine, a refused plan is not a
+/// fault: nothing here parks, latches, or touches torque.
+///
+/// `margin_baseline` is [`MotionState::present_min_margin`] for a caller with a
+/// live read of the machine it is planning for.
+pub fn plan_move(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    target: &JointTargets,
+    durations: MoveDurations,
+    warp: Warp,
+    tick_hz: f64,
+    margin_baseline: Option<f64>,
+) -> Result<(Trajectory, Option<ClockStretch>), CommandRejection> {
+    let asked = MotionCommand::MoveTo {
+        target: *target,
+        durations,
+        warp,
+    };
+    let (floored, stretch) = floor_move_clock(cfg, start, &asked, tick_hz);
+    let MotionCommand::MoveTo {
+        durations: effective,
+        ..
+    } = floored
+    else {
+        unreachable!("flooring a move returns a move")
+    };
+    let trajectory = shape_move(cfg, start, target, effective, warp, margin_baseline)?;
+    Ok((trajectory, stretch))
+}
+
+/// Take one tracked setpoint: check it as a sampled path pose is checked, and
+/// command it on this tick.
+///
+/// The refusals are the same two facts a planned move is held to, answered to
+/// the caller rather than written into the machine's mode: a pose the envelope
+/// will not have, and a step no servo may take in one period. Neither is a
+/// fault and neither changes anything — the mask, the mode and the last goal
+/// are exactly what they were, so a caller whose composition went out of bounds
+/// drops it and carries on from a machine that never moved.
+fn take_track(
+    cfg: &MotionConfig,
+    state: &mut MotionState,
+    target: &JointTargets,
+    out: &mut TickOutputs,
+) -> CommandDisposition {
+    // The antennas are absolute here rather than directions to resolve, so what
+    // is left to check is that each angle is one the goal register can hold.
+    //
+    // A masked antenna is skipped, on the same rule the step guard keeps: what
+    // is masked never reaches the wire, so no register has to hold it. Checking
+    // one anyway would let a degraded antenna refuse every composed target a
+    // clip produces — and a refused composition drops every overlay — over a
+    // count nothing was ever going to write.
+    for (side, joint) in [JointId::AntennaRight, JointId::AntennaLeft]
+        .into_iter()
+        .enumerate()
+    {
+        if state.masked.contains(joint) {
+            continue;
+        }
+        let angle = target.antennas[side];
+        if outside_limit(angle, ANTENNA_GOAL_MAX_RAD) || below_limit(angle, ANTENNA_GOAL_MIN_RAD) {
+            return CommandDisposition::Rejected(CommandRejection::AntennaUnreachable {
+                joint,
+                angle,
+            });
+        }
+    }
+
+    match stage_target(cfg, state, target, Judged::OnTheBounds, out) {
+        Staged::Envelope(violations) => {
+            CommandDisposition::Rejected(CommandRejection::Envelope(violations))
+        }
+        Staged::Step { joint, delta } => {
+            CommandDisposition::Rejected(CommandRejection::StepTooLarge { joint, delta })
+        }
+        // Accepted. Any move in flight is over — its samples and this setpoint
+        // cannot both be what the servos are holding — and the machine is
+        // holding wherever this period puts it.
+        Staged::Emitted => {
+            state.trajectory = None;
+            state.mode = Mode::Holding;
+            CommandDisposition::Tracked
+        }
     }
 }
 
@@ -4814,11 +5044,12 @@ mod tests {
         );
     }
 
-    /// The durations a command carries, or the zero clock a hold has.
+    /// The durations a command carries, or the zero clock the commands that
+    /// travel no path have.
     fn durations_of(command: &MotionCommand) -> MoveDurations {
         match command {
             MotionCommand::MoveTo { durations, .. } => *durations,
-            MotionCommand::Hold => MoveDurations::uniform(Duration::ZERO),
+            MotionCommand::Hold | MotionCommand::Track(_) => MoveDurations::uniform(Duration::ZERO),
         }
     }
 
@@ -8348,5 +8579,490 @@ mod tests {
             let b = tick_with(&cfg, &mut second, now, &pinned, command);
             assert_eq!(a, b, "tick {n}");
         }
+    }
+
+    /// The neutral pose raised by `dz` metres: a setpoint a period away from
+    /// where an armed machine stands.
+    fn lifted(dz: f64) -> JointTargets {
+        let mut targets = JointTargets::default();
+        targets.head_pose_body.translation.z += dz;
+        targets
+    }
+
+    /// A tracked setpoint is decided and commanded within the period it
+    /// arrives on: no trajectory, no mode to leave, and the goals out on the
+    /// same tick.
+    #[test]
+    fn a_tracked_setpoint_is_commanded_on_its_own_tick() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let setpoint = lifted(0.002);
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.0),
+            &pinned,
+            Some(&MotionCommand::Track(setpoint)),
+        );
+
+        assert_eq!(out.report.command, CommandDisposition::Tracked);
+        assert_eq!(out.report.mode, Mode::Holding, "nothing is left running");
+        assert!(out.report.emitted, "the setpoint went out");
+        let goal = out.goal.expect("a setpoint that moves a joint emits");
+        assert_ne!(goal.legs, pinned.legs, "the legs hold the new pose");
+        assert_eq!(state.last_goal(), &goal);
+        assert_eq!(
+            state.last_targets(),
+            &setpoint,
+            "the next move chains from what was tracked, not from a solve of it"
+        );
+        assert_eq!(out.report.fault, None);
+        assert!(out.report.envelope.is_some(), "the pose was checked");
+    }
+
+    /// A setpoint identical to the goal the servos already hold is accepted and
+    /// writes nothing — the same rule a sampled path pose is emitted under.
+    #[test]
+    fn a_tracked_setpoint_that_moves_nothing_writes_nothing() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let held = MotionCommand::Track(*state.last_targets());
+        let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&held));
+
+        assert_eq!(out.report.command, CommandDisposition::Tracked);
+        assert!(!out.report.emitted);
+        assert!(out.goal.is_none());
+        assert_eq!(state.last_goal(), &pinned);
+    }
+
+    /// A setpoint outside the envelope is refused, and a refusal is nothing
+    /// happening: no goal, no fault, no mask, and the machine holding exactly
+    /// where it was.
+    #[test]
+    fn a_tracked_setpoint_outside_the_envelope_is_refused() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let past_the_cap = JointTargets {
+            body_yaw: cfg.env.body_yaw_limit + 0.1,
+            ..JointTargets::default()
+        };
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.0),
+            &pinned,
+            Some(&MotionCommand::Track(past_the_cap)),
+        );
+
+        let CommandDisposition::Rejected(CommandRejection::Envelope(violations)) =
+            out.report.command
+        else {
+            panic!("expected an envelope refusal, got {:?}", out.report.command);
+        };
+        assert!(violations.body_yaw);
+        assert!(out.goal.is_none());
+        assert!(!out.report.emitted);
+        assert_eq!(out.report.fault, None, "a bad plan is not a fault");
+        assert!(out.report.masked.is_empty(), "nothing was taken out");
+        assert_eq!(out.report.mode, Mode::Holding);
+        assert_eq!(state.last_goal(), &pinned, "the machine did not move");
+    }
+
+    /// The recovery allowance is a sampled move's alone.
+    ///
+    /// The pair is the assertion, and neither half proves anything by itself: a
+    /// machine standing outside the envelope has a move's samples admitted no
+    /// further out than where it started — that is how it travels back inside —
+    /// and the *same* pose handed in as a setpoint is refused. Every other
+    /// tracked test arms at neutral, where the excursion is zero and the two
+    /// verdicts are identical, so this is the only place the parameter means
+    /// anything. Without it a composed overlay would inherit the allowance and
+    /// the daemon would command out-of-envelope poses every tick, for as long
+    /// as the machine started out there, with nothing refused and nothing said.
+    #[test]
+    fn a_tracked_setpoint_gets_no_share_of_a_moves_recovery_allowance() {
+        let cfg = MotionConfig::default();
+        let turned = cfg.env.body_yaw_limit + 0.05;
+        let crooked = JointTargets {
+            body_yaw: turned,
+            ..JointTargets::default()
+        };
+        let (mut state, pinned) = armed_at(&cfg, &crooked);
+        let command = MotionCommand::MoveTo {
+            target: JointTargets::default(),
+            durations: MoveDurations::uniform(secs(4.0)),
+            warp: Warp::MinJerk,
+        };
+        let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
+        assert_eq!(out.report.command, CommandDisposition::Started);
+        let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, None);
+        assert!(
+            out.report.recovering,
+            "the move's samples are admitted under the allowance"
+        );
+        assert!(
+            out.report
+                .envelope
+                .expect("a checked sample")
+                .violations
+                .body_yaw,
+            "and they are still outside the cap"
+        );
+
+        // The pose that sample just commanded, handed straight back in as a
+        // setpoint: identical to something the move was allowed to command, and
+        // no further out than where the move began, so the allowance is the
+        // only thing that could admit it.
+        let admitted_as_a_sample = *state.last_targets();
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.04),
+            &pinned,
+            Some(&MotionCommand::Track(admitted_as_a_sample)),
+        );
+        let CommandDisposition::Rejected(CommandRejection::Envelope(violations)) =
+            out.report.command
+        else {
+            panic!(
+                "a setpoint is judged on the bounds alone, got {:?}",
+                out.report.command
+            );
+        };
+        assert!(violations.body_yaw);
+        assert_eq!(out.report.fault, None, "a bad plan is not a fault");
+        // The refusal changed nothing: the move it landed on is still the thing
+        // driving the machine, which is why its samples keep the allowance and
+        // the setpoint does not.
+        assert!(matches!(out.report.mode, Mode::Moving { .. }));
+    }
+
+    /// A setpoint further from the last goal than one tick's bound allows is
+    /// refused to the caller — where a sampled path pose would abandon a move,
+    /// there is no move to abandon and the caller is the planner.
+    #[test]
+    fn a_tracked_setpoint_past_the_step_bound_is_refused() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        // A pose the envelope has no objection to — it is a target moves are
+        // commanded to elsewhere here — reached in one period.
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.0),
+            &pinned,
+            Some(&MotionCommand::Track(pose_at(0.19))),
+        );
+
+        let CommandDisposition::Rejected(CommandRejection::StepTooLarge { joint, delta }) =
+            out.report.command
+        else {
+            panic!("expected a step refusal, got {:?}", out.report.command);
+        };
+        assert_eq!(joint.group(), JointGroup::Legs);
+        assert!(delta > cfg.max_step.legs, "{delta} rad in one tick");
+        assert!(out.goal.is_none());
+        assert_eq!(out.report.aborted, None, "there was no move to abandon");
+        assert_eq!(out.report.fault, None);
+        assert_eq!(state.last_goal(), &pinned);
+
+        // And the machine still takes a setpoint it can reach, so a refusal
+        // left nothing behind.
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.02),
+            &pinned,
+            Some(&MotionCommand::Track(lifted(0.002))),
+        );
+        assert_eq!(out.report.command, CommandDisposition::Tracked);
+    }
+
+    /// An antenna angle no goal register can hold is refused, on the same
+    /// reachability rule a commanded move is refused by.
+    #[test]
+    fn a_tracked_antenna_angle_with_no_count_is_refused() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.0),
+            &pinned,
+            Some(&MotionCommand::Track(antennas_at([
+                ANTENNA_GOAL_MAX_RAD + 1.0,
+                0.0,
+            ]))),
+        );
+
+        let CommandDisposition::Rejected(CommandRejection::AntennaUnreachable { joint, angle }) =
+            out.report.command
+        else {
+            panic!(
+                "expected a reachability refusal, got {:?}",
+                out.report.command
+            );
+        };
+        assert_eq!(joint, JointId::AntennaRight);
+        assert!(angle > ANTENNA_GOAL_MAX_RAD);
+        assert!(out.goal.is_none());
+    }
+
+    /// A degraded antenna is never commanded and never bounded: the pair is out
+    /// of service, so what a setpoint says about it neither reaches the wire nor
+    /// refuses the setpoint the rest of the machine is asked for.
+    #[test]
+    fn a_tracked_setpoint_honours_the_antenna_mask() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let mut health = healthy_servos();
+        health[8].bits = 0x04;
+        let out = tick_with_health(&cfg, &mut state, secs(0.0), &pinned, &health, None);
+        assert!(out.report.newly_masked.covers(JointGroup::Antennas));
+
+        // An antenna step no bound would pass, beside a head step that fits.
+        let wild = JointTargets {
+            antennas: [pinned.antennas[0] + 3.0, pinned.antennas[1]],
+            ..lifted(0.002)
+        };
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.02),
+            &pinned,
+            Some(&MotionCommand::Track(wild)),
+        );
+
+        assert_eq!(
+            out.report.command,
+            CommandDisposition::Tracked,
+            "a masked joint has no step to bound"
+        );
+        let goal = out.goal.expect("the head still moves");
+        assert!(
+            (goal.antennas[0] - wild.antennas[0]).abs() < 1e-12,
+            "the plan is left whole; the mask decides what reaches the wire"
+        );
+        assert!(out.report.masked.covers(JointGroup::Antennas));
+
+        // Past the goal register's range, not merely past a step: the same skip
+        // has to hold there, or a degraded antenna would refuse every composed
+        // target a clip produces — and a refused composition drops every
+        // overlay on the machine — over a count nothing writes.
+        let unreachable = JointTargets {
+            antennas: [ANTENNA_GOAL_MAX_RAD + 1.0, pinned.antennas[1]],
+            ..lifted(0.004)
+        };
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.04),
+            &pinned,
+            Some(&MotionCommand::Track(unreachable)),
+        );
+        assert_eq!(
+            out.report.command,
+            CommandDisposition::Tracked,
+            "a masked antenna has no register to reach"
+        );
+        assert!(out.goal.is_some(), "the head still moves");
+    }
+
+    /// A setpoint ends a move in flight. Two things cannot be commanding the
+    /// same servos, and the caller handing over setpoints is the one that is.
+    #[test]
+    fn a_tracked_setpoint_ends_the_move_it_lands_on() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (mut state, pinned) = armed_at(&cfg, &start);
+
+        let command = move_to(pose_at(0.19), secs(2.0));
+        let out = tick_with(&cfg, &mut state, secs(0.0), &pinned, Some(&command));
+        assert_eq!(out.report.command, CommandDisposition::Started);
+        let out = tick_with(&cfg, &mut state, secs(0.02), &pinned, None);
+        assert!(matches!(out.report.mode, Mode::Moving { .. }));
+
+        let held = *state.last_targets();
+        let out = tick_with(
+            &cfg,
+            &mut state,
+            secs(0.04),
+            &pinned,
+            Some(&MotionCommand::Track(held)),
+        );
+        assert_eq!(out.report.command, CommandDisposition::Tracked);
+        assert_eq!(out.report.mode, Mode::Holding);
+
+        // And the move really is gone: the ticks after it emit nothing.
+        let out = tick_with(&cfg, &mut state, secs(0.06), &pinned, None);
+        assert!(out.goal.is_none());
+        assert_eq!(out.report.mode, Mode::Holding);
+    }
+
+    /// A planned move driven setpoint by setpoint is the same motion as the
+    /// same move commanded: the plan resolves the antenna directions, floors
+    /// the clock, and shapes the path exactly as the tick would have, so the
+    /// goals that go on the wire are goal-for-goal identical.
+    ///
+    /// The antenna target is deliberately one whose short arc crosses its
+    /// outboard direction, which is the whole reason a caller cannot assemble
+    /// this trajectory itself: the resolution that routes it the long way round
+    /// is private to the tick.
+    #[test]
+    fn a_planned_move_driven_as_setpoints_is_the_move_it_planned() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let target = JointTargets {
+            body_yaw: 0.2,
+            antennas: [-1.7, 0.3],
+            ..lifted(0.005)
+        };
+        // Short enough that the pass has to lengthen it, so the equivalence
+        // covers the flooring too.
+        let asked = MoveDurations::uniform(secs(0.2));
+
+        let (mut commanded, pinned) = armed_at(&cfg, &start);
+        let (floored, stretch) = floor_move_clock(
+            &cfg,
+            commanded.last_targets(),
+            &MotionCommand::MoveTo {
+                target,
+                durations: asked,
+                warp: Warp::MinJerk,
+            },
+            FLOOR_TICK_HZ,
+        );
+        assert!(stretch.is_some(), "the asked-for clock is under its floor");
+
+        let mut wired = Vec::new();
+        let mut present = pinned;
+        for n in 0..2000 {
+            let command = (n == 0).then_some(&floored);
+            let out = tick_with(
+                &cfg,
+                &mut commanded,
+                secs(f64::from(n) * 0.02),
+                &present,
+                command,
+            );
+            assert_eq!(out.report.fault, None, "tick {n}");
+            assert_eq!(out.report.aborted, None, "tick {n}");
+            if let Some(goal) = out.goal {
+                wired.push(goal);
+                present = goal;
+            }
+            if out.report.completed {
+                break;
+            }
+        }
+        assert!(!wired.is_empty(), "the commanded move went out");
+
+        let (mut driven, pinned) = armed_at(&cfg, &start);
+        let (trajectory, planned_stretch) = plan_move(
+            &cfg,
+            driven.last_targets(),
+            &target,
+            asked,
+            Warp::MinJerk,
+            FLOOR_TICK_HZ,
+            Some(driven.present_min_margin()),
+        )
+        .expect("the move is one this machine runs");
+        assert_eq!(
+            planned_stretch, stretch,
+            "the same clock, reported the same"
+        );
+        assert!(
+            trajectory.target().antennas[0] > 0.0,
+            "the right antenna goes the long way round, not through its outboard \
+             direction: {}",
+            trajectory.target().antennas[0]
+        );
+
+        let mut streamed = Vec::new();
+        let mut present = pinned;
+        for n in 1..2000 {
+            let at = secs(f64::from(n) * 0.02);
+            let mut setpoint = JointTargets::default();
+            trajectory.sample(at, &mut setpoint);
+            let out = tick_with(
+                &cfg,
+                &mut driven,
+                at,
+                &present,
+                Some(&MotionCommand::Track(setpoint)),
+            );
+            assert_eq!(
+                out.report.command,
+                CommandDisposition::Tracked,
+                "tick {n}: a planned path is one the tick takes"
+            );
+            if let Some(goal) = out.goal {
+                streamed.push(goal);
+                present = goal;
+            }
+            if trajectory.done(at) {
+                break;
+            }
+        }
+
+        assert_eq!(streamed, wired, "the same goals, in the same order");
+    }
+
+    /// A plan is refused for the reasons a command is, and a refused plan is a
+    /// plan: nothing was touched, so there is nothing to wind down.
+    #[test]
+    fn a_plan_is_refused_for_what_a_command_is_refused_for() {
+        let cfg = MotionConfig::default();
+        let start = JointTargets::default();
+        let (state, _) = armed_at(&cfg, &start);
+        let baseline = Some(state.present_min_margin());
+
+        let past_the_cap = JointTargets {
+            body_yaw: cfg.env.body_yaw_limit + 0.1,
+            ..JointTargets::default()
+        };
+        let refused = plan_move(
+            &cfg,
+            state.last_targets(),
+            &past_the_cap,
+            MoveDurations::uniform(secs(2.0)),
+            Warp::MinJerk,
+            FLOOR_TICK_HZ,
+            baseline,
+        );
+        let Err(CommandRejection::Envelope(violations)) = refused else {
+            panic!("expected an envelope refusal, got {refused:?}");
+        };
+        assert!(violations.body_yaw);
+
+        let unreachable = plan_move(
+            &cfg,
+            state.last_targets(),
+            &antennas_at([f64::NAN, 0.0]),
+            MoveDurations::uniform(secs(2.0)),
+            Warp::MinJerk,
+            FLOOR_TICK_HZ,
+            baseline,
+        );
+        assert!(matches!(
+            unreachable,
+            Err(CommandRejection::AntennaUnreachable {
+                joint: JointId::AntennaRight,
+                ..
+            })
+        ));
     }
 }

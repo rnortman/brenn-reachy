@@ -1,0 +1,15 @@
+[package]
+name = "reachy-clips"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Masked delta-encoded motion clips for the Reachy Mini: asset format, validation, playback sampling, and layered composition"
+
+[dependencies]
+anyhow = { workspace = true }
+reachy-kin = { path = "../reachy-kin" }
+reachy-motion = { path = "../reachy-motion" }
+nalgebra = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

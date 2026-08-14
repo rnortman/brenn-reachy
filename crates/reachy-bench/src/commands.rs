@@ -44,19 +44,21 @@
 //! reason.
 
 use core::time::Duration;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use dxl_proto::{HardwareError, counts_to_rad};
 use reachy_bus::{
     Bus, BusPort, BusTiming, MapError, ServoMap, XactError, reg_for, value_kind, with_retry,
 };
+use reachy_clips::{ClipPlayer, Motion, OverlaySample, compose};
 use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
     EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointSet, JointTargets,
     Maneuver, MotionCommand, MotionState, MoveDurations, Outcome, PollCadence, PollSequencer,
-    Posture, RegId, RegValue, ValueKind, Warp,
+    Posture, RegId, RegValue, Trajectory, ValueKind, Warp, plan_move,
 };
 
 use crate::config::Resolved;
@@ -73,6 +75,19 @@ use crate::trace;
 /// this milestone wants the linear warp; it exists for tests that need a
 /// constant rate.
 const WARP: Warp = Warp::MinJerk;
+
+/// What a move already in flight should become.
+///
+/// A caller steering a move decides between these two outcomes each period.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Steer {
+    /// Turn around toward this endpoint, over these clocks, from wherever the
+    /// move has got to.
+    To(JointTargets, MoveDurations),
+    /// Stop here: abandon the move and hold the setpoint the last period
+    /// commanded.
+    HoldHere,
+}
 
 /// How far the demo sweeps the body, degrees either side of square.
 ///
@@ -496,6 +511,16 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         *self.state.last_targets()
     }
 
+    /// The control period this machine's loop runs at.
+    ///
+    /// What a caller composing its own setpoints advances its own clocks by:
+    /// the rate is the machine's, resolved once at startup, and a caller
+    /// deriving one of its own would be a second answer that can disagree.
+    #[must_use]
+    pub fn period(&self) -> Duration {
+        self.machine.resolved.period()
+    }
+
     /// Whether every joint that carries the head has been taken out of service.
     ///
     /// The end of the mask's growth: with the cranks and the body yaw all
@@ -556,6 +581,61 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         event: &mut dyn FnMut(TickEvent),
         retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
     ) -> Result<MoveSummary, PumpError> {
+        self.move_steering(target, durations, clock, line, event, &mut || {
+            retarget().map(|(target, durations)| Steer::To(target, durations))
+        })
+    }
+
+    /// The same move, whose retarget may also stop it where it has got to.
+    ///
+    /// When `retarget` returns [`Steer::HoldHere`], the trajectory is abandoned
+    /// on that period and the run ends as any arrival does.
+    ///
+    /// Warp shaping is applied here; the caller chooses destination or stop,
+    /// never the trajectory shape.
+    pub fn move_steering(
+        &mut self,
+        target: JointTargets,
+        durations: MoveDurations,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        retarget: &mut dyn FnMut() -> Option<Steer>,
+    ) -> Result<MoveSummary, PumpError> {
+        self.move_retargeting_commands(target, durations, clock, line, event, &mut || {
+            Some(match retarget()? {
+                Steer::To(target, durations) => MotionCommand::MoveTo {
+                    target,
+                    durations,
+                    warp: WARP,
+                },
+                Steer::HoldHere => MotionCommand::Hold,
+            })
+        })
+    }
+
+    /// The same move, whose retarget answers with a whole command rather than
+    /// another endpoint.
+    ///
+    /// What this admits that [`Engaged::move_retargeting_events`] does not is
+    /// [`MotionCommand::Hold`]: a caller that wants the head to stop where the
+    /// move has got to, rather than to turn around toward somewhere else,
+    /// answers with the hold and the tick abandons the trajectory on that very
+    /// period. Stopping is not expressible as an endpoint — the setpoint the
+    /// last period commanded is the tick's to know and not the caller's — so it
+    /// has to be a command.
+    ///
+    /// The run then ends as any other arrival does: the machine is holding, and
+    /// what it holds is where it was stopped.
+    pub fn move_retargeting_commands(
+        &mut self,
+        target: JointTargets,
+        durations: MoveDurations,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
+    ) -> Result<MoveSummary, PumpError> {
         let command = MotionCommand::MoveTo {
             target,
             durations,
@@ -570,16 +650,113 @@ impl<P: BusPort> Engaged<'_, '_, P> {
                 line(&format!("  {reported}"));
                 event(reported);
             },
-            &mut || {
-                retarget().map(|(target, durations)| MotionCommand::MoveTo {
-                    target,
-                    durations,
-                    warp: WARP,
-                })
-            },
+            retarget,
         );
         self.report(line);
         outcome
+    }
+
+    /// Drive the machine one composed setpoint per period, for as long as
+    /// `next` supplies them.
+    ///
+    /// What a caller playing a motion of its own needs: the path is the
+    /// caller's, period by period, and every setpoint still goes through the
+    /// tick's envelope check, per-tick step bound and antenna mask. The run
+    /// ends on the first period `next` declines, with the machine holding the
+    /// last setpoint it accepted.
+    ///
+    /// A setpoint the tick will not have ends the run as
+    /// [`PumpError::Rejected`] — a plan of ours the machine refused, which per
+    /// the doctrine is not a fault: nothing parks, nothing latches, and the
+    /// head is where the last accepted period put it.
+    pub fn stream_setpoints(
+        &mut self,
+        first: JointTargets,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        next: &mut dyn FnMut() -> Option<JointTargets>,
+    ) -> Result<MoveSummary, PumpError> {
+        let outcome = self.pump.stream(
+            &mut self.machine.bus,
+            &mut self.state,
+            first,
+            clock,
+            &mut |reported| {
+                line(&format!("  {reported}"));
+                event(reported);
+            },
+            next,
+        );
+        self.report(line);
+        outcome
+    }
+
+    /// Drive the machine one composed setpoint per period over a base this
+    /// crate samples.
+    ///
+    /// The layering entry point: the caller owns the overlays and the
+    /// composition, and this owns the reference they ride on — a held
+    /// configuration, or a transition shaped by [`plan_move`] and by nothing
+    /// else, so the antenna directions are resolved, the clock is floored and
+    /// the envelope is judged exactly as commanding the move outright would
+    /// have judged them.
+    ///
+    /// `compose` is asked once per period with where the base is and whether it
+    /// has anything further to command, and answers the setpoint to send or
+    /// `None` to end the run. A base that arrives before the caller stops
+    /// answering holds its final configuration; a caller that stops first
+    /// leaves the transition unfinished, with the machine holding the last
+    /// setpoint it accepted.
+    ///
+    /// A base the tick will not plan is [`PumpError::Rejected`] before anything
+    /// is commanded, which is a refused base move and not a fault.
+    pub fn stream_layered(
+        &mut self,
+        base: StreamBase,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        compose: &mut dyn FnMut(&JointTargets, bool) -> Option<JointTargets>,
+    ) -> Result<(), PumpError> {
+        let start = self.targets();
+        let period = self.period();
+        let resolved = self.machine.resolved;
+        let tick_hz = f64::from(resolved.tick_hz);
+        let base = match base {
+            StreamBase::Held => Base::Held(start),
+            StreamBase::Toward(target, durations) => {
+                let (trajectory, stretch) = plan_move(
+                    &resolved.motion,
+                    &start,
+                    &target,
+                    durations,
+                    WARP,
+                    tick_hz,
+                    // The margin the machine is presently standing in, which is
+                    // what admits a lift off a pose already tight against the
+                    // toggle limit.
+                    Some(self.state.present_min_margin()),
+                )
+                .map_err(PumpError::Rejected)?;
+                if let Some(stretch) = stretch {
+                    event(TickEvent::Stretched(stretch));
+                }
+                Base::Moving(trajectory)
+            }
+        };
+        let mut elapsed = Duration::ZERO;
+        let mut next = || {
+            let (targets, arrived) = base.step(&mut elapsed, period);
+            compose(&targets, arrived)
+        };
+        // A caller that declines the very first period asked for nothing at
+        // all: no setpoint goes out and the machine holds what it held.
+        let Some(first) = next() else {
+            return Ok(());
+        };
+        self.stream_setpoints(first, clock, line, event, &mut next)?;
+        Ok(())
     }
 
     /// What the run measured, printed whether or not it got where it was going.
@@ -1802,6 +1979,274 @@ fn demo_moves<P: BusPort>(
     Ok(())
 }
 
+/// Where a playback run's base goes while the motion plays over it.
+///
+/// The bench's two named configurations, as a word an operator types. Not a
+/// pose the caller hands in: what `up` and `stow` mean is this crate's, and a
+/// command line that could name an arbitrary configuration would be a way to
+/// drive the head somewhere nothing checked before the tick sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseMove {
+    /// The neutral configuration: head square and level, body square, antennas
+    /// upright.
+    Up,
+    /// The stow configuration the machine rests in.
+    Stow,
+}
+
+impl BaseMove {
+    /// The move `word` names, or nothing.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "up" => Some(Self::Up),
+            "stow" => Some(Self::Stow),
+            _ => None,
+        }
+    }
+
+    /// The word an operator types for this move.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Stow => "stow",
+        }
+    }
+
+    /// The configuration this move ends at, and the clocks it runs over.
+    fn goal(self, resolved: &Resolved) -> (JointTargets, MoveDurations) {
+        match self {
+            Self::Up => (neutral_targets(), resolved.up_durations()),
+            Self::Stow => (stow_pose_targets(), resolved.stow_durations()),
+        }
+    }
+}
+
+/// What the base layer of a streamed run does, as its caller states it.
+///
+/// The public half of [`Base`]: a caller says hold or says where to go, and
+/// the trajectory — its shaping, its floor, its resolved antenna directions —
+/// is this crate's to build. Handing one in would let a caller compose over a
+/// reference nothing had judged.
+pub enum StreamBase {
+    /// Hold the configuration the machine is already commanding.
+    Held,
+    /// Carry the base toward `target` over these durations, sampled per period.
+    Toward(JointTargets, MoveDurations),
+}
+
+/// The layer a playing motion rides on, and where that layer is.
+///
+/// Both forms are sampled by this command rather than commanded to the tick:
+/// what reaches the machine is one composed setpoint per period, and the base
+/// is one of the two things composed. A transition sampled here is shaped by
+/// [`plan_move`] and by nothing else, so it is the same path — antenna
+/// directions resolved, clock floored, envelope judged — that commanding the
+/// move outright would have run.
+enum Base {
+    /// One configuration, held for the whole run.
+    Held(JointTargets),
+    /// A transition in flight, stepped one period at a time.
+    Moving(Trajectory),
+}
+
+impl Base {
+    /// Where the base is `elapsed` into the run.
+    fn sample(&self, elapsed: Duration) -> JointTargets {
+        match self {
+            Self::Held(targets) => *targets,
+            Self::Moving(trajectory) => {
+                let mut out = *trajectory.target();
+                trajectory.sample(elapsed, &mut out);
+                out
+            }
+        }
+    }
+
+    /// Whether the base has nothing further to command.
+    fn done(&self, elapsed: Duration) -> bool {
+        match self {
+            Self::Held(_) => true,
+            Self::Moving(trajectory) => trajectory.done(elapsed),
+        }
+    }
+
+    /// Where the base is now, with the run then a period older.
+    ///
+    /// The pair every period of a streamed run asks for: the configuration to
+    /// compose over, and whether the base has anything further to command.
+    fn step(&self, elapsed: &mut Duration, period: Duration) -> (JointTargets, bool) {
+        let targets = self.sample(*elapsed);
+        let arrived = self.done(*elapsed);
+        *elapsed = elapsed.saturating_add(period);
+        (targets, arrived)
+    }
+}
+
+/// One motion playing over a base somebody else samples, as a setpoint per
+/// period.
+///
+/// Pure composition with no machine and no base in it: where the base is comes
+/// from [`Engaged::stream_layered`], which owns the trajectory and its shaping,
+/// and what the machine does with the result — accept it, or refuse it as a
+/// step or an envelope violation — is the tick's, and this never sees it.
+struct Layered {
+    motion: Arc<Motion>,
+    speed: f64,
+    /// When the overlay joins, on the run's own clock.
+    starts_at: Duration,
+    period: Duration,
+    elapsed: Duration,
+    player: Option<ClipPlayer>,
+    /// Whether the overlay has played out and faded to nothing.
+    spent: bool,
+}
+
+impl Layered {
+    fn new(motion: Arc<Motion>, speed: f64, starts_at: Duration, period: Duration) -> Self {
+        Self {
+            motion,
+            speed,
+            starts_at,
+            period,
+            elapsed: Duration::ZERO,
+            player: None,
+            spent: false,
+        }
+    }
+
+    /// The setpoint for the period the run is on, with the run then a period
+    /// older.
+    ///
+    /// `None` once the base has arrived and the overlay has faded out: neither
+    /// layer has anything left to say, and the machine holds what the last
+    /// period gave it.
+    fn next(&mut self, base: &JointTargets, arrived: bool) -> Option<JointTargets> {
+        let overlay = self.overlay();
+        if overlay.is_none() && self.spent && arrived {
+            return None;
+        }
+        self.elapsed = self.elapsed.saturating_add(self.period);
+        Some(compose(*base, overlay.as_slice()))
+    }
+
+    /// This period's overlay contribution, if the motion is playing.
+    ///
+    /// The player is built on the period it first plays, so a motion joining a
+    /// transition halfway through starts at its own first frame rather than at
+    /// the offset the run has reached.
+    fn overlay(&mut self) -> Option<OverlaySample> {
+        if self.spent || self.elapsed < self.starts_at {
+            return None;
+        }
+        let motion = Arc::clone(&self.motion);
+        let speed = self.speed;
+        let player = self
+            .player
+            .get_or_insert_with(|| ClipPlayer::new(motion, speed));
+        let sample = player.advance(self.period);
+        if sample.is_none() {
+            self.spent = true;
+        }
+        sample
+    }
+}
+
+/// Play `motion` over the neutral configuration, or over a transition toward
+/// `during`.
+///
+/// The attended run behind every imported clip: it raises the head to the pose
+/// the recording was made against, plays the motion as one composed setpoint
+/// per period, and leaves the machine holding. Nothing here is a self-test —
+/// this moves the machine, so it is a thing an operator watches.
+///
+/// `during` layers the motion over a base that is itself moving, which is the
+/// case a held base cannot show: the clip joins halfway through a commanded
+/// transition and both motions run at once.
+pub fn play<P: BusPort>(
+    resolved: &Resolved,
+    port: P,
+    motion: &Arc<Motion>,
+    speed: f64,
+    during: Option<BaseMove>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
+    let mut machine = commission(resolved, port, clock, line)?;
+    let mut engaged = machine.engage(clock, line)?;
+    line(&format!(
+        "play: {} at {speed:.2}x, {:.2} s of motion",
+        motion.name(),
+        motion.duration_s_at(speed),
+    ));
+    line("play 1/2: up, the configuration the recording is a delta against");
+    if let Err(error) = engaged.move_to(neutral_targets(), resolved.up_durations(), clock, line) {
+        return settle(engaged, Err::<(), _>(error), clock, line);
+    }
+    let outcome = play_over(&mut engaged, resolved, motion, speed, during, clock, line);
+    settle(engaged, outcome, clock, line)
+}
+
+/// The playback itself, from an engaged machine already at neutral.
+///
+/// Split out so the whole command has one ending: a refused setpoint, a fault
+/// or a lost wire all leave through [`settle`], which is what decides between
+/// holding, winding down, and releasing on the spot.
+fn play_over<P: BusPort>(
+    engaged: &mut Engaged<'_, '_, P>,
+    resolved: &Resolved,
+    motion: &Arc<Motion>,
+    speed: f64,
+    during: Option<BaseMove>,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), PumpError> {
+    let period = engaged.period();
+    let (base, starts_at) = match during {
+        None => {
+            line("play 2/2: over the pose the machine is holding");
+            (StreamBase::Held, Duration::ZERO)
+        }
+        Some(base_move) => {
+            let (target, durations) = base_move.goal(resolved);
+            line(&format!(
+                "play 2/2: over a base transition to {}, joined halfway through it",
+                base_move.name(),
+            ));
+            // Half the transition as it was asked for, which is what this side
+            // knows: a clock the plan floors runs a little longer, so the join
+            // is at or before the midpoint of what actually runs. What the join
+            // is for is watching the motion compose with a reference that is
+            // itself moving, and either side of the midpoint shows that.
+            (
+                StreamBase::Toward(target, durations),
+                durations.longest() / 2,
+            )
+        }
+    };
+    let mut layered = Layered::new(Arc::clone(motion), speed, starts_at, period);
+    // The base's own clock stretch, said after the run rather than before it:
+    // the run holds the line sink for as long as it lasts, and a stretch is a
+    // number to read afterwards rather than an instruction to act on.
+    let mut stretched: Vec<TickEvent> = Vec::new();
+    let outcome = engaged.stream_layered(
+        base,
+        clock,
+        line,
+        &mut |event| {
+            if matches!(event, TickEvent::Stretched(_)) {
+                stretched.push(event);
+            }
+        },
+        &mut |targets, arrived| layered.next(targets, arrived),
+    );
+    for event in stretched {
+        line(&format!("  {event}"));
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1814,6 +2259,8 @@ mod tests {
         JointVector, Rail, RegId, RegValue, ReleaseForm, SeqError, SeqStep, ServoHealth,
         StepContext, engage_gates,
     };
+
+    use reachy_clips::{ClipLimits, Library, STEP_MARGIN};
 
     use super::*;
     use crate::testutil::{
@@ -1862,20 +2309,7 @@ mod tests {
         /// The registers only hold where a run *ended*; a sweep is what it
         /// passed through on the way, and this is the only record of that.
         fn goal_series(&self, cfg: &Resolved, joint: JointId) -> Vec<f64> {
-            let row = joint.index().expect("a named joint has a bus row");
-            let id = cfg.map.ids()[row];
-            let goal = reg_for(RegId::GoalPosition).addr;
-            self.commanded
-                .borrow()
-                .iter()
-                .filter(|write| write.addr == goal)
-                .filter_map(|write| {
-                    let (_, bytes) = write.entries.iter().find(|(servo, _)| *servo == id)?;
-                    let counts =
-                        i32::from_le_bytes(bytes.as_slice().try_into().expect("a goal is four"));
-                    Some(cfg.map.present_rad(row, counts).expect("a goal places"))
-                })
-                .collect()
+            goal_series(cfg, &self.commanded, joint)
         }
 
         /// Whether this run ever commanded `joint` to `angle`, to within the
@@ -1911,6 +2345,32 @@ mod tests {
                 self.printed,
             );
         }
+    }
+
+    /// Every goal `joint` was commanded across a run, in the order they went
+    /// out.
+    ///
+    /// The registers only hold where a run *ended*; a sweep is what it passed
+    /// through on the way, and the grouped writes are the only record of that.
+    fn goal_series(
+        cfg: &Resolved,
+        commanded: &Rc<RefCell<Vec<GroupedWrite>>>,
+        joint: JointId,
+    ) -> Vec<f64> {
+        let row = joint.index().expect("a named joint has a bus row");
+        let id = cfg.map.ids()[row];
+        let goal = reg_for(RegId::GoalPosition).addr;
+        commanded
+            .borrow()
+            .iter()
+            .filter(|write| write.addr == goal)
+            .filter_map(|write| {
+                let (_, bytes) = write.entries.iter().find(|(servo, _)| *servo == id)?;
+                let counts =
+                    i32::from_le_bytes(bytes.as_slice().try_into().expect("a goal is four"));
+                Some(cfg.map.present_rad(row, counts).expect("a goal places"))
+            })
+            .collect()
     }
 
     /// Run one command against `machine`.
@@ -3107,6 +3567,104 @@ mod tests {
             "the splice is narrated: {:?}",
             run.printed
         );
+    }
+
+    /// `move_retargeting_commands` admits a hold as the replacement, and the
+    /// head stops where the move had got to.
+    ///
+    /// The freeze a caller executing somebody else's timeline needs: the goal
+    /// the run ends holding is neither endpoint but a pose between them, and
+    /// the run returns rather than carrying on to the target it was given.
+    #[test]
+    fn a_move_the_caller_stops_holds_where_it_had_got_to() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let asked = Rc::new(RefCell::new(0usize));
+        let asks = asked.clone();
+        let run = run(machine, move |port, clock, line| {
+            let mut machine = commission(&cfg, port, clock, line)?;
+            let mut engaged = machine.engage(clock, line)?;
+            engaged.move_retargeting_commands(
+                neutral_targets(),
+                cfg.up_durations(),
+                clock,
+                line,
+                &mut |_| {},
+                &mut || {
+                    let mut asked = asks.borrow_mut();
+                    *asked += 1;
+                    (*asked == 20).then_some(MotionCommand::Hold)
+                },
+            )?;
+            Ok(())
+        });
+        run.ok("a move stopped partway is an arrival, not a refusal");
+
+        let held = goals(&resolved(), &run);
+        for (legs, what) in [
+            (neutral_legs(), "the raise's endpoint"),
+            (stow_legs(), "the fold it left"),
+        ] {
+            assert!(
+                held.legs
+                    .iter()
+                    .zip(legs.iter())
+                    .any(|(held, end)| (held - end).abs() > 1e-3),
+                "the head is between the two poses, not at {what}: {:?} against {legs:?}",
+                held.legs
+            );
+        }
+    }
+
+    /// `move_steering` says the same two things without the caller holding a
+    /// command: an endpoint turns the move around, and a hold stops it here.
+    ///
+    /// The pair in one run, because what the type is for is choosing between
+    /// them per period.
+    #[test]
+    fn a_steered_move_turns_around_and_then_stops_where_it_is() {
+        let cfg = resolved();
+        let machine = machine_at(&datumed_config(), &stow_legs());
+        let asked = Rc::new(RefCell::new(0usize));
+        let asks = asked.clone();
+        let folds = cfg.stow_durations();
+        let run = run(machine, move |port, clock, line| {
+            let mut machine = commission(&cfg, port, clock, line)?;
+            let mut engaged = machine.engage(clock, line)?;
+            engaged.move_steering(
+                neutral_targets(),
+                cfg.up_durations(),
+                clock,
+                line,
+                &mut |_| {},
+                &mut || {
+                    let mut asked = asks.borrow_mut();
+                    *asked += 1;
+                    match *asked {
+                        10 => Some(Steer::To(stow_pose_targets(), folds)),
+                        30 => Some(Steer::HoldHere),
+                        _ => None,
+                    }
+                },
+            )?;
+            Ok(())
+        });
+        run.ok("a steered move ends where it was stopped");
+
+        let held = goals(&resolved(), &run);
+        for (legs, what) in [
+            (neutral_legs(), "the raise it was given"),
+            (stow_legs(), "the fold it was turned toward"),
+        ] {
+            assert!(
+                held.legs
+                    .iter()
+                    .zip(legs.iter())
+                    .any(|(held, end)| (held - end).abs() > 1e-3),
+                "the head stopped at {what} rather than between the poses: {:?} against {legs:?}",
+                held.legs
+            );
+        }
     }
 
     /// `move_retargeting_events` hands the caller the run's events as values
@@ -5770,6 +6328,406 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("NO ACKNOWLEDGEMENT of torque off")),
             "{printed:?}"
+        );
+    }
+
+    /// A motion whose antennas alternate between upright and one usable step
+    /// out, as the library loads it.
+    ///
+    /// The amplitude is derived rather than chosen: a track whose frames are a
+    /// step apart is the fastest one the loader will admit at 1.0x, which is
+    /// what makes it a fixture about composition rather than about bounds.
+    fn antennas_motion(cfg: &Resolved, frames: usize) -> Arc<Motion> {
+        let limits = ClipLimits::from_motion_config(&cfg.motion);
+        let step = limits.max_step.antennas * STEP_MARGIN;
+        let track: Vec<String> = (0..frames)
+            .map(|index| format!("{{\"antennas\": [{}, 0.0]}}", (index % 2) as f64 * step))
+            .collect();
+        let json = format!(
+            r#"{{"version": 1, "kind": "clip", "name": "bench/wiggle",
+                 "channels": ["antennas"], "frame_hz": 50.0, "max_speed": 1.0,
+                 "frames": [{}]}}"#,
+            track.join(",")
+        );
+        let (library, skips) = Library::load([("bench/wiggle.json", json.as_str())], &limits);
+        assert!(skips.is_empty(), "the fixture loads: {skips:?}");
+        Arc::clone(library.motion("bench/wiggle").expect("loaded"))
+    }
+
+    /// Every setpoint a layered run produces, in order.
+    ///
+    /// Drives `layered` over `base` exactly as [`Engaged::stream_layered`]
+    /// drives it on a machine — one period at a time, off the same
+    /// [`Base::step`] — with the machine and its tick left out.
+    fn played(base: &Base, mut layered: Layered, period: Duration) -> Vec<JointTargets> {
+        let mut setpoints = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        loop {
+            let (targets, arrived) = base.step(&mut elapsed, period);
+            let Some(target) = layered.next(&targets, arrived) else {
+                break;
+            };
+            setpoints.push(target);
+            assert!(
+                setpoints.len() < 10_000,
+                "a layered run that does not end is a player whose clock is not advancing"
+            );
+        }
+        setpoints
+    }
+
+    /// A motion masking only the antennas says nothing at all about the rest of
+    /// the configuration.
+    ///
+    /// The composition property the whole masked-delta format exists for:
+    /// wiggling the antennas must not pin the head or the body, so the channels
+    /// the motion does not drive come through bit-identical to the base rather
+    /// than approximately equal to it.
+    #[test]
+    fn an_antennas_motion_leaves_the_rest_of_the_base_untouched() {
+        let cfg = resolved();
+        let base = JointTargets {
+            body_yaw: 0.3,
+            ..neutral_targets()
+        };
+        let motion = antennas_motion(&cfg, 20);
+        let period = cfg.period();
+        let setpoints = played(
+            &Base::Held(base),
+            Layered::new(motion, 1.0, Duration::ZERO, period),
+            period,
+        );
+
+        assert!(!setpoints.is_empty());
+        for target in &setpoints {
+            assert_eq!(target.head_pose_body, base.head_pose_body);
+            assert_eq!(target.body_yaw, base.body_yaw);
+        }
+        assert!(
+            setpoints
+                .iter()
+                .any(|target| target.antennas[0] != base.antennas[0]),
+            "the motion drove the antennas somewhere"
+        );
+        assert!(
+            setpoints
+                .iter()
+                .all(|target| target.antennas[1] == base.antennas[1]),
+            "the left antenna's track is zero throughout"
+        );
+    }
+
+    /// A motion layered over a base that is itself moving composes both.
+    ///
+    /// The case a held base cannot show, and the one a face tracker will reach
+    /// through the same path: the channels the motion does not drive follow the
+    /// transition exactly, and the ones it does carry the transition plus the
+    /// motion's own delta.
+    #[test]
+    fn a_motion_over_a_moving_base_composes_both() {
+        let cfg = resolved();
+        let start = neutral_targets();
+        let (trajectory, _) = plan_move(
+            &cfg.motion,
+            &start,
+            &stow_pose_targets(),
+            cfg.stow_durations(),
+            WARP,
+            f64::from(cfg.tick_hz),
+            None,
+        )
+        .expect("a stow from neutral is a plan this machine will run");
+        let joins_at = trajectory.durations().longest() / 2;
+        let motion = antennas_motion(&cfg, 20);
+        let period = cfg.period();
+        let setpoints = played(
+            &Base::Moving(trajectory.clone()),
+            Layered::new(motion, 1.0, joins_at, period),
+            period,
+        );
+
+        let mut moved = false;
+        for (index, target) in setpoints.iter().enumerate() {
+            let at = period * u32::try_from(index).expect("a run of periods");
+            let mut base = *trajectory.target();
+            trajectory.sample(at, &mut base);
+            assert_eq!(
+                target.head_pose_body, base.head_pose_body,
+                "the head follows the transition alone, at period {index}"
+            );
+            assert_eq!(target.body_yaw, base.body_yaw);
+            if at < joins_at {
+                assert_eq!(
+                    target.antennas, base.antennas,
+                    "nothing is layered before the motion joins, at period {index}"
+                );
+            } else if target.antennas[0] != base.antennas[0] {
+                moved = true;
+            }
+        }
+        assert!(moved, "the motion drove the antennas over the moving base");
+    }
+
+    /// A layered run ends once the base has arrived and the motion has faded.
+    ///
+    /// Both layers, not either: a motion shorter than the transition it joins
+    /// must not cut the transition off, and a transition that arrives first
+    /// must not end the run with the motion still ramping out.
+    #[test]
+    fn a_layered_run_outlasts_both_of_its_layers() {
+        let cfg = resolved();
+        let motion = antennas_motion(&cfg, 20);
+        let period = cfg.period();
+        let (trajectory, _) = plan_move(
+            &cfg.motion,
+            &neutral_targets(),
+            &stow_pose_targets(),
+            cfg.stow_durations(),
+            WARP,
+            f64::from(cfg.tick_hz),
+            None,
+        )
+        .expect("a stow from neutral is a plan this machine will run");
+        let base_s = trajectory.durations().longest();
+        let periods = played(
+            &Base::Moving(trajectory),
+            Layered::new(Arc::clone(&motion), 1.0, base_s / 2, period),
+            period,
+        )
+        .len();
+        let ran_for = period * u32::try_from(periods).expect("a run of periods");
+
+        assert!(
+            ran_for >= base_s,
+            "the transition ran to its end: {ran_for:?} against {base_s:?}"
+        );
+        let joined_at = base_s / 2;
+        let played_for = Duration::from_secs_f64(motion.duration_s());
+        assert!(
+            ran_for >= joined_at + played_for,
+            "the motion played out: {ran_for:?} against {:?}",
+            joined_at + played_for
+        );
+    }
+
+    /// A streamed run commands exactly the setpoints it was handed, one per
+    /// period, and ends when the caller stops handing them over.
+    #[test]
+    fn a_streamed_run_commands_one_setpoint_per_period() {
+        let cfg = resolved();
+        let step = cfg.motion.max_step.antennas / 4.0;
+        let wanted: Vec<f64> = (1..=5).map(|index| f64::from(index) * step).collect();
+        let asked = wanted.clone();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                let held = engaged.targets();
+                let mut left = asked.into_iter();
+                let first = JointTargets {
+                    antennas: [0.0, 0.0],
+                    ..held
+                };
+                engaged.stream_setpoints(first, clock, line, &mut |_| {}, &mut || {
+                    Some(JointTargets {
+                        antennas: [left.next()?, 0.0],
+                        ..held
+                    })
+                })?;
+                Ok(())
+            },
+        );
+
+        ended.outcome.as_ref().expect("the stream runs");
+        let commanded = goal_series(&cfg, &ended.commanded, JointId::AntennaRight);
+        let tail = &commanded[commanded.len() - wanted.len()..];
+        for (commanded, wanted) in tail.iter().zip(&wanted) {
+            assert!(
+                (commanded - wanted).abs() <= core::f64::consts::PI / 4096.0,
+                "{commanded} against {wanted}: {commanded:?}"
+            );
+        }
+    }
+
+    /// The `play` command layers through [`Engaged::stream_layered`].
+    ///
+    /// A run here exercises the shared composition path — base built and
+    /// sampled by `stream_layered` — rather than a second copy of it.
+    #[test]
+    fn the_play_command_layers_over_a_base_this_crate_builds() {
+        let cfg = resolved();
+        let motion = antennas_motion(&cfg, 20);
+        let played = Arc::clone(&motion);
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                play_over(&mut engaged, &cfg, &played, 1.0, None, clock, line)
+            },
+        );
+
+        ended.outcome.as_ref().expect("the playback runs");
+        let right = goal_series(&cfg, &ended.commanded, JointId::AntennaRight);
+        let left = goal_series(&cfg, &ended.commanded, JointId::AntennaLeft);
+        let rested = neutral_targets().antennas[0];
+        assert!(
+            right.iter().any(|angle| (angle - rested).abs() > 1e-3),
+            "the motion drove the right antenna: {right:?}"
+        );
+        assert!(
+            left.iter()
+                .all(|angle| (angle - neutral_targets().antennas[1]).abs() <= 1e-3),
+            "the motion says nothing about the left antenna: {left:?}"
+        );
+    }
+
+    /// The `play` command over a base transition drives both layers on a
+    /// machine.
+    ///
+    /// The composition tests exercise each layer in isolation; without a run
+    /// through the machine, a drift between the two loops would pass green.
+    #[test]
+    fn the_play_command_layers_over_a_moving_base_on_a_machine() {
+        let cfg = resolved();
+        let motion = antennas_motion(&cfg, 40);
+        let played = Arc::clone(&motion);
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                play_over(
+                    &mut engaged,
+                    &cfg,
+                    &played,
+                    1.0,
+                    Some(BaseMove::Stow),
+                    clock,
+                    line,
+                )
+            },
+        );
+
+        ended
+            .outcome
+            .as_ref()
+            .expect("the playback over a transition runs");
+        let right = goal_series(&cfg, &ended.commanded, JointId::AntennaRight);
+        let left = goal_series(&cfg, &ended.commanded, JointId::AntennaLeft);
+        let stow = stow_pose_targets().antennas;
+
+        // The base carried both antennas the whole way, so the transition ran
+        // to its end under the motion rather than being cut off by it. Compared
+        // on the circle: the plan resolves each antenna's arc, which can be the
+        // one a whole turn away from the angle the pose is written as.
+        for (angle, wanted) in [(right.last(), stow[0]), (left.last(), stow[1])] {
+            let angle = *angle.expect("the antennas were commanded");
+            assert!(
+                wrap_to_pi(angle - wanted).abs() <= 1e-2,
+                "the base did not arrive: {angle} against {wanted}"
+            );
+        }
+        // A transition walks its arc one way; a motion's excursion alternates on
+        // and off. So the channel the motion drives doubles back and the one it
+        // does not never does, whichever way the resolved arc runs.
+        let doubles_back = |series: &[f64]| {
+            let up = series.windows(2).any(|pair| pair[1] > pair[0] + 1e-3);
+            let down = series.windows(2).any(|pair| pair[1] < pair[0] - 1e-3);
+            up && down
+        };
+        assert!(
+            !doubles_back(&left),
+            "something drove the left antenna off the transition: {left:?}"
+        );
+        assert!(
+            doubles_back(&right),
+            "the motion contributed nothing over the moving base: {right:?}"
+        );
+    }
+
+    /// A base the tick will not plan refuses the layered run before anything is
+    /// commanded.
+    #[test]
+    fn a_base_outside_the_envelope_refuses_a_layered_run_before_it_commands() {
+        let cfg = resolved();
+        let idle = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |_engaged, _registers, _clock, _line| Ok(()),
+        );
+        let refused = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                // Well past the body yaw limit, which is an envelope refusal
+                // and not a reachability one.
+                let target = JointTargets {
+                    body_yaw: 10.0,
+                    ..neutral_targets()
+                };
+                engaged.stream_layered(
+                    StreamBase::Toward(target, cfg.up_durations()),
+                    clock,
+                    line,
+                    &mut |_| {},
+                    &mut |base, _| Some(*base),
+                )
+            },
+        );
+
+        let error = refused
+            .outcome
+            .expect_err("the base is outside the envelope");
+        assert!(
+            matches!(error, PumpError::Rejected(_)),
+            "a base the tick would not plan was answered as something else: {error}"
+        );
+        assert_eq!(
+            refused.commanded.borrow().len(),
+            idle.commanded.borrow().len(),
+            "a refused base still commanded the machine"
+        );
+    }
+
+    /// A setpoint the tick will not have ends the stream and leaves the machine
+    /// holding.
+    ///
+    /// A plan of ours the machine refused: nothing faults, nothing latches, and
+    /// the head is where the last accepted period put it. A caller that wants
+    /// to carry on starts a fresh run from there.
+    #[test]
+    fn a_refused_setpoint_ends_a_stream_without_faulting() {
+        let cfg = resolved();
+        let ended = engaged_run(
+            &cfg,
+            machine_at(&datumed_config(), &stow_legs()),
+            |mut engaged, _registers, clock, line| {
+                engaged.move_to(neutral_targets(), cfg.up_durations(), clock, line)?;
+                let held = engaged.targets();
+                let mut periods = 0;
+                let outcome = engaged.stream_setpoints(held, clock, line, &mut |_| {}, &mut || {
+                    periods += 1;
+                    // Ninety degrees of yaw in one period: past the cap and
+                    // past every step bound.
+                    (periods < 3).then_some(JointTargets {
+                        body_yaw: 90.0_f64.to_radians(),
+                        ..held
+                    })
+                });
+                settle(engaged, outcome, clock, line)
+            },
+        );
+
+        let error = ended.outcome.as_ref().expect_err("the setpoint is refused");
+        assert!(matches!(error, PumpError::Rejected(_)), "{error}");
+        assert_eq!(error.class(Phase::UnderTorque), ErrorClass::Refuse);
+        assert_eq!(
+            torque_bits(&cfg, &ended.registers),
+            vec![1; 9],
+            "a refusal changes nothing: {:?}",
+            ended.printed
         );
     }
 }

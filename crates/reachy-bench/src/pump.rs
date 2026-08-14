@@ -94,9 +94,10 @@ use reachy_bus::{reg_for, with_retry};
 use reachy_motion::{
     ArmConfig, ArmRecord, BusFailureSource, BusRequest, BusResult, ClockStretch,
     CommandDisposition, CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup,
-    JointId, JointSet, JointVector, Maneuver, Mode, MotionCommand, MotionConfig, MotionState,
-    MoveAbort, Outcome, RegId, RegValue, Response, SeqAction, SeqError, SeqStep, Sequencer,
-    ServoHealth, TickInputs, TickOutputs, TickReport, WireFailure, floor_move_clock, motion_tick,
+    JointId, JointSet, JointTargets, JointVector, Maneuver, Mode, MotionCommand, MotionConfig,
+    MotionState, MoveAbort, Outcome, RegId, RegValue, Response, SeqAction, SeqError, SeqStep,
+    Sequencer, ServoHealth, TickInputs, TickOutputs, TickReport, WireFailure, floor_move_clock,
+    motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -1346,6 +1347,7 @@ impl fmt::Display for TickEvent {
                 f.write_str("moving, replacing the move that was running")
             }
             Self::Command(CommandDisposition::Held) => f.write_str("holding"),
+            Self::Command(CommandDisposition::Tracked) => f.write_str("tracking a setpoint"),
             Self::Command(CommandDisposition::Rejected(why)) => write!(f, "refused: {why}"),
             Self::ReadLost { failed } => write!(f, "position read lost: {failed}"),
             Self::ReadRestored { after } => {
@@ -1583,6 +1585,16 @@ enum Until<'r> {
     Holding {
         retarget: &'r mut dyn FnMut() -> Option<MotionCommand>,
     },
+    /// The caller has no more setpoints. `next` is asked at every period for
+    /// the one to command, and the run ends on the first period it declines.
+    ///
+    /// Nothing about the machine ends this run — a streamed setpoint is
+    /// holding by the period after it lands, so a settle test would end the
+    /// stream on its first period. The clock the motion runs on is the
+    /// caller's, and so is its ending.
+    Streaming {
+        next: &'r mut dyn FnMut() -> Option<JointTargets>,
+    },
     /// The dwell has elapsed. A hold is holding from its first period, so
     /// there is nothing else for it to wait for.
     Elapsed(Duration),
@@ -1734,7 +1746,9 @@ impl<'a> MotionPump<'a> {
         match command {
             MotionCommand::MoveTo { durations, .. } => self.budget_for(durations.longest()),
             // A hold commands no travel: it takes the period it is asked in.
-            MotionCommand::Hold => self.budget_for(Duration::ZERO),
+            // A tracked setpoint is one period's worth by construction — the
+            // caller's own clock is what spans the motion.
+            MotionCommand::Hold | MotionCommand::Track(_) => self.budget_for(Duration::ZERO),
         }
     }
 
@@ -1958,6 +1972,41 @@ impl<'a> MotionPump<'a> {
         )
     }
 
+    /// Command one setpoint per period, for as long as `next` supplies them.
+    ///
+    /// The caller composes each period's target and hands it over; the tick
+    /// checks it exactly as it checks a sample of a plan it shaped itself — the
+    /// envelope, the per-tick step bound, the antenna mask — so a streamed
+    /// motion gets no bypass and needs no safety code of its own. What a
+    /// refused setpoint costs is the run: it comes back as
+    /// [`PumpError::Rejected`] with the machine holding the last target it
+    /// accepted, nothing faulted and nothing latched, and a caller that wants
+    /// to carry on starts a fresh run from there.
+    ///
+    /// The run ends on the first period `next` declines, with the machine
+    /// holding what it was last given. No settle window: the caller's clock
+    /// says when the motion is over, and a settle test would end the stream on
+    /// its first period, since a tracked setpoint leaves the machine holding
+    /// immediately.
+    pub fn stream<P: BusPort>(
+        &mut self,
+        bus: &mut Bus<P>,
+        state: &mut MotionState,
+        first: JointTargets,
+        clock: &mut dyn Clock,
+        event: &mut dyn FnMut(TickEvent),
+        next: &mut dyn FnMut() -> Option<JointTargets>,
+    ) -> Result<MoveSummary, PumpError> {
+        self.carry(
+            bus,
+            state,
+            MotionCommand::Track(first),
+            Until::Streaming { next },
+            clock,
+            event,
+        )
+    }
+
     /// The fixed-rate loop itself, run until `until` says the run is over.
     fn carry<P: BusPort>(
         &mut self,
@@ -1973,7 +2022,7 @@ impl<'a> MotionPump<'a> {
             event(TickEvent::Stretched(stretch));
         }
         let mut budget = match until {
-            Until::Holding { .. } => self.stall_budget(&command),
+            Until::Holding { .. } | Until::Streaming { .. } => self.stall_budget(&command),
             Until::Elapsed(dwell) => self.budget_for(dwell),
         };
         let epoch = clock.now();
@@ -2041,6 +2090,30 @@ impl<'a> MotionPump<'a> {
                 summary.commanded = None;
                 summary.settled = None;
                 summary.unsettled = None;
+            }
+            // The streamed run's own ask, on the same period and for the same
+            // reason: the setpoint reaches this period's tick. A period the
+            // caller declines ends the run before any of it is read, so nothing
+            // is commanded and nothing is measured for it.
+            if pending.is_none()
+                && let Until::Streaming { next } = &mut until
+            {
+                match next() {
+                    Some(targets) => {
+                        let command = MotionCommand::Track(targets);
+                        // Kept one setpoint ahead, so the stall test — which
+                        // exists for a plan that stopped arriving — never fires
+                        // on a stream whose ending is the caller's to give.
+                        budget = tick.saturating_add(self.stall_budget(&command));
+                        pending = Some(command);
+                        // Every period of a stream is a commanding period.
+                        commanded_at = None;
+                    }
+                    None => {
+                        ending = Some(Ok(()));
+                        break;
+                    }
+                }
             }
             let now = clock.now();
             // A period that starts materially after it was due is one the loop
@@ -2289,7 +2362,7 @@ impl<'a> MotionPump<'a> {
                         _ => waited >= self.settle.timeout,
                     }
                 }
-                Until::Holding { .. } => false,
+                Until::Holding { .. } | Until::Streaming { .. } => false,
                 Until::Elapsed(dwell) => elapsed >= dwell,
             };
             self.record(tick, elapsed, present.as_ref(), held, settling, event);
@@ -4482,6 +4555,42 @@ mod tests {
         assert_eq!(summary.elapsed, dwell, "{summary:?}");
     }
 
+    /// A stream longer than the fixed stall margin ends when its caller
+    /// declines, not as a stall.
+    ///
+    /// The stall budget must be refreshed each period; without the refresh, a
+    /// stream longer than the margin aborts mid-travel on a machine doing
+    /// exactly what it was told.
+    #[test]
+    fn a_long_stream_ends_with_its_caller_and_not_as_a_stall() {
+        let cfg = resolved();
+        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
+        let mut pump = pump(&cfg, bench.held);
+        let mut clock = TestClock::default();
+        let periods = u64::from(cfg.tick_hz) * STALL_MARGIN_SECS + 10;
+        // The configuration the machine is already holding, every period: it is
+        // genuinely not moving, which is the state the stall test exists to
+        // catch, so nothing but the refresh keeps this run alive.
+        let held = *bench.state.last_targets();
+        let mut left = periods;
+
+        let mut events = Vec::new();
+        let outcome = pump.stream(
+            &mut bench.bus,
+            &mut bench.state,
+            held,
+            &mut clock,
+            &mut |event| events.push(event),
+            &mut || {
+                left = left.checked_sub(1)?;
+                Some(held)
+            },
+        );
+
+        let summary = outcome.expect("a stream past the margin is the caller's to end");
+        assert_eq!(summary.ticks, periods + 1, "{summary:?}");
+    }
+
     /// A hold's stall budget follows the dwell it was asked for.
     ///
     /// The dwell is an operator-facing knob with no ceiling, and the obvious
@@ -6001,9 +6110,13 @@ mod tests {
     #[test]
     fn every_event_says_what_happened() {
         let servos = [ServoHealth { id: 10, bits: 1 }; JointId::COUNT];
-        let mut said = [false; 19];
+        let mut said = [false; 20];
         for (event, expected) in [
             (TickEvent::Command(CommandDisposition::None), "no command"),
+            (
+                TickEvent::Command(CommandDisposition::Tracked),
+                "tracking a setpoint",
+            ),
             (TickEvent::Command(CommandDisposition::Started), "moving"),
             (
                 TickEvent::Command(CommandDisposition::Retargeted),
@@ -6218,6 +6331,7 @@ mod tests {
             TickEvent::Faulted(_) => 16,
             TickEvent::AntennasDegraded(_) => 17,
             TickEvent::Aborted(_) => 18,
+            TickEvent::Command(CommandDisposition::Tracked) => 19,
         }
     }
 

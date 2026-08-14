@@ -284,6 +284,7 @@ dependencies = [
  "anyhow",
  "dxl-proto",
  "reachy-bus",
+ "reachy-clips",
  "reachy-kin",
  "reachy-motion",
  "serde",
@@ -299,6 +300,19 @@ dependencies = [
  "libc",
  "reachy-motion",
  "serialport",
+ "thiserror",
+]
+
+[[package]]
+name = "reachy-clips"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nalgebra",
+ "reachy-kin",
+ "reachy-motion",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

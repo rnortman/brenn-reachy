@@ -151,3 +151,21 @@ answer: what carries an intent, what happens to a fault when there is no operato
 watching, and who owns the port when two things want it. None of it changes the
 libraries; it is a second host beside this one. Marked at the driver in
 `crates/reachy-bench/src/pump.rs`.
+
+## `clip-blend-ceiling`
+
+Decide what a blend ramp longer than the clip it ramps should do, and do it.
+
+Deferral context: a clip's ramps are floored at load — derived from its own
+largest frame delta and the per-tick step bounds, stretched and reported — but
+nothing bounds one from above. A ramp far longer than the clip plays the whole
+track at a weight near zero, so a typo of a factor of a hundred yields an emote
+that is commanded, reported as playing, and physically does nothing, with no
+load refusal and nothing for an operator to look at. Unlike the floor, whose
+answer the design fixes (stretch and report, never refuse), the ceiling has no
+stated policy: refusing the document is the loud answer, clamping to some
+multiple of the clip's own duration is the forgiving one, and which of those the
+format wants is a design call rather than something to settle in passing. The
+current accept-and-do-nothing behaviour is pinned by a player test so the choice
+is visible rather than accidental. Marked in `Clip::from_doc` in
+`crates/reachy-clips/src/format.rs`.

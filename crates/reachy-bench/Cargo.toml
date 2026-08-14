@@ -12,6 +12,10 @@ description = "Bench binary for Reachy Mini bring-up: read-only self-test regist
 reachy-bus = { path = "../reachy-bus" }
 # The tick, the trajectories, and the arm/disarm sequencers this binary drives.
 reachy-motion = { path = "../reachy-motion" }
+# The motion library: the clip and sequence assets `play` reads, the player that
+# clocks one, and the compositor that lays it over a base. The same code the
+# daemon loads its library with, so a clip that plays here plays there.
+reachy-clips = { path = "../reachy-clips" }
 # Poses, geometry and envelope configuration for the self-test cases that compute
 # resting-pose kinematics and clearance margins without commanding anything.
 reachy-kin = { path = "../reachy-kin" }

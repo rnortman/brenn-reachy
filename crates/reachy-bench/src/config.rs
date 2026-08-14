@@ -762,6 +762,16 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The control period this machine's loop runs at.
+    ///
+    /// The one place the tick rate becomes a duration: a caller composing its
+    /// own setpoints advances its clocks by this, and a second derivation of it
+    /// is a second answer that can disagree.
+    #[must_use]
+    pub fn period(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(self.tick_hz))
+    }
+
     /// The stow move's per-group durations.
     #[must_use]
     pub fn stow_durations(&self) -> MoveDurations {

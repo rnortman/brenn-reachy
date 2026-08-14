@@ -11,15 +11,19 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 
 use reachy_bench::commands;
+use reachy_bench::commands::BaseMove;
 use reachy_bench::config::{self, RECORD_NAME, Resolved, resolve_for_commanding};
 use reachy_bench::pump::{MonotonicClock, PumpError};
 use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
+use reachy_clips::{ClipLimits, Library, MAX_SPEED, MIN_SPEED, Motion, document_name, documents};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
@@ -31,6 +35,10 @@ struct Args {
     record: Option<PathBuf>,
     /// Where every run of this invocation appends its per-period trace.
     trace: Option<PathBuf>,
+    /// How fast a played motion runs, as a multiple of its recorded speed.
+    speed: Option<f64>,
+    /// The base transition a played motion runs over, for the layered run.
+    during: Option<BaseMove>,
     /// The words that were not flags: a yaw in degrees, or two antenna angles.
     operands: Vec<String>,
 }
@@ -54,6 +62,15 @@ fn usage() -> String {
          \x20 yaw <deg>             rotate the body\n\
          \x20 antennas <right> <left>   move the antennas, radians\n\
          \x20 demo                  up, hold, antennas, yaw, stow, off\n\
+         \x20 play <file>           play a motion document over the neutral configuration\n\
+         \n\
+         `play` raises the head to neutral — the configuration a recording's frames are\n\
+         deltas against — and then commands one composed setpoint per control period.\n\
+         `--speed X` runs the motion faster or slower within the bounds the document\n\
+         itself allows; `--during up|stow` starts a base transition first and joins the\n\
+         motion halfway through it, which is the layered case a held base cannot show.\n\
+         The whole directory the file sits in is read, because a sequence names other\n\
+         documents; what is played is the name the named file declares.\n\
          \n\
          Every command but `selftest`, `provision`, `reboot` and `off` commissions the\n\
          machine, polls it and takes hold of it first: nothing is remembered between\n\
@@ -104,12 +121,13 @@ enum Command {
     Yaw,
     Antennas,
     Demo,
+    Play,
 }
 
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 11] = [
+    const ALL: [Command; 12] = [
         Self::Selftest,
         Self::Provision,
         Self::Reboot,
@@ -121,6 +139,7 @@ impl Command {
         Self::Yaw,
         Self::Antennas,
         Self::Demo,
+        Self::Play,
     ];
 
     /// The command `word` names, or nothing.
@@ -137,6 +156,7 @@ impl Command {
             "yaw" => Self::Yaw,
             "antennas" => Self::Antennas,
             "demo" => Self::Demo,
+            "play" => Self::Play,
             _ => return None,
         })
     }
@@ -155,6 +175,7 @@ impl Command {
             Self::Yaw => "yaw",
             Self::Antennas => "antennas",
             Self::Demo => "demo",
+            Self::Play => "play",
         }
     }
 
@@ -173,7 +194,7 @@ impl Command {
             | Self::Stow
             | Self::Off
             | Self::Demo => 0,
-            Self::Reboot | Self::Yaw => 1,
+            Self::Reboot | Self::Yaw | Self::Play => 1,
             Self::Antennas => 2,
         }
     }
@@ -225,6 +246,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Command::Demo => moving(&args, name, |resolved, port, clock, line| {
             commands::demo(resolved, port, clock, line)
         }),
+        Command::Play => play(&args),
     }
 }
 
@@ -234,6 +256,8 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
         trace: None,
+        speed: None,
+        during: None,
         operands: Vec::new(),
     };
     let mut argv = argv;
@@ -251,6 +275,15 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
             "--config" => args.config = PathBuf::from(value),
             "--record" => args.record = Some(PathBuf::from(value)),
             "--trace" => args.trace = Some(PathBuf::from(value)),
+            "--speed" => args.speed = Some(number(&value)?),
+            "--during" => {
+                args.during = Some(BaseMove::parse(&value).with_context(|| {
+                    format!(
+                        "`--during` takes `up` or `stow`, not `{value}`\n\n{}",
+                        usage()
+                    )
+                })?);
+            }
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
@@ -457,10 +490,9 @@ fn preamble(command: &str, device: &str, baud: u32) -> String {
 /// Run a command that writes to a servo: resolve the configuration, open the
 /// port, and hand both to the command.
 ///
-/// The configuration is resolved before the port is opened, so a refusal costs
-/// the machine nothing. That is where the recorded crank datum is required —
-/// without it every converted angle is a guess, so there is nothing to command
-/// with.
+/// The two halves are split apart for the one command with work between them:
+/// `play` reads its motion against the resolved configuration, and does it
+/// before any port is opened.
 fn moving<F>(args: &Args, command: &str, run: F) -> anyhow::Result<()>
 where
     F: FnOnce(
@@ -470,12 +502,35 @@ where
         &mut dyn FnMut(&str),
     ) -> Result<(), PumpError>,
 {
+    let resolved = commanding_config(args)?;
+    commanding(&resolved, command, run)
+}
+
+/// The configuration a commanding run resolves against, with the command
+/// line's own say folded in.
+///
+/// Resolved before any port is opened, so a refusal costs the machine nothing.
+/// That is where the recorded crank datum is required — without it every
+/// converted angle is a guess, so there is nothing to command with.
+fn commanding_config(args: &Args) -> anyhow::Result<Resolved> {
     let cfg = config::load(&args.config)?;
     let mut resolved = resolve_for_commanding(&cfg)?;
     // The one thing about a commanding run that comes from the command line
     // rather than the file: which run an operator wants the periods of.
     resolved.trace = args.trace.clone();
+    Ok(resolved)
+}
 
+/// Open the port and hand the machine to `run`.
+fn commanding<F>(resolved: &Resolved, command: &str, run: F) -> anyhow::Result<()>
+where
+    F: FnOnce(
+        &Resolved,
+        SerialBusPort,
+        &mut MonotonicClock,
+        &mut dyn FnMut(&str),
+    ) -> Result<(), PumpError>,
+{
     println!(
         "{}",
         preamble(command, &resolved.device, resolved.timing.baud)
@@ -485,13 +540,104 @@ where
         .with_context(|| format!("opening {}", resolved.device))?;
     let mut clock = MonotonicClock::new();
 
-    run(&resolved, port, &mut clock, &mut |line| println!("{line}")).map_err(|error| match error {
+    run(resolved, port, &mut clock, &mut |line| println!("{line}")).map_err(|error| match error {
         // A sequence that refused has already said which phase, which servo,
         // which register and both values. Wrapping that in "the command failed"
         // would bury the only part worth reading.
         PumpError::Sequence(refusal) => anyhow::anyhow!("`{command}` stopped at {refusal}"),
         other => anyhow::Error::new(other).context(format!("`{command}`")),
     })
+}
+
+/// Play the motion a path names, over the neutral configuration or over a base
+/// transition.
+///
+/// The document is read and the library resolved before the port is opened: a
+/// motion that will not load is an operator's typo, and paying for it with an
+/// engaged machine would raise the head to say so.
+///
+/// The speed is judged in the same order and for the same reason, and against
+/// the global bounds first: a player's clock must be finite and positive, and a
+/// value that is neither reaches the machine as a panic with torque already on
+/// the head, since the player is built on the period the motion first plays.
+fn play(args: &Args) -> anyhow::Result<()> {
+    let [path] = args.operands.as_slice() else {
+        bail!("reachy-bench: play <file> takes one path\n\n{}", usage());
+    };
+    let speed = args.speed.unwrap_or(1.0);
+    if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+        bail!(
+            "reachy-bench: --speed is played between {MIN_SPEED:.2}x and {MAX_SPEED:.2}x, not \
+             {speed}\n\n{}",
+            usage()
+        );
+    }
+    let resolved = commanding_config(args)?;
+    let motion = load_motion(&resolved, Path::new(path))?;
+    let during = args.during;
+    if speed > motion.max_speed() {
+        bail!(
+            "reachy-bench: {} plays at up to {:.2}x, not {speed:.2}x",
+            motion.name(),
+            motion.max_speed(),
+        );
+    }
+    commanding(&resolved, "play", move |resolved, port, clock, line| {
+        commands::play(resolved, port, &motion, speed, during, clock, line)
+    })
+}
+
+/// The motion a path names, resolved against the library its directory holds.
+///
+/// The whole directory is read rather than the one file, because a sequence
+/// names other documents and a name resolves only against a library holding
+/// them. What is played is the name the named document declares: a path is how
+/// an operator points at a file, and a name is how the rest of the stack —
+/// the wire above all — addresses a motion.
+///
+/// The bounds come off the resolved configuration, so a speed ceiling and a
+/// blend floor are what *this* machine's step bounds and envelope imply. A
+/// document derived against defaults could otherwise be admitted here and
+/// refused every period by the tick.
+fn load_motion(resolved: &Resolved, path: &Path) -> anyhow::Result<Arc<Motion>> {
+    let asked = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let name =
+        document_name(&asked).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+
+    // Which files count as documents, and in what order two of them claiming
+    // one name are decided, is `reachy-clips`' rule and not this command's: the
+    // daemon reads its library directory by the same one, so a motion that
+    // plays here is a motion the machine under a script holds.
+    let read = documents(dir).with_context(|| format!("reading {}", dir.display()))?;
+    let mut assets = Vec::new();
+    for (source, text) in read {
+        match text {
+            Ok(text) => assets.push((source, text)),
+            Err(error) => println!("skipping {source}: {error}"),
+        }
+    }
+
+    let limits = ClipLimits::from_motion_config(&resolved.motion);
+    let (library, skips) = Library::load(
+        assets.iter().map(|(source, text)| (source.clone(), text)),
+        &limits,
+    );
+    for skip in &skips {
+        println!("skipped {}: {}", skip.source, skip.error);
+    }
+    for note in library.notes() {
+        println!("note: {note}");
+    }
+    let motion = library.motion(&name).with_context(|| {
+        format!(
+            "{} names {name}, which is not in the library {} loaded",
+            path.display(),
+            dir.display(),
+        )
+    })?;
+    Ok(Arc::clone(motion))
 }
 
 #[cfg(test)]
@@ -741,6 +887,208 @@ mod tests {
             let printed = refused.to_string();
             assert!(printed.contains(expected), "{words:?}: {printed}");
             assert!(printed.contains("usage:"), "{words:?}: {printed}");
+        }
+    }
+
+    /// `play`'s own flags are read off the command line, and a base transition
+    /// it cannot name is refused there.
+    #[test]
+    fn a_play_invocation_carries_its_speed_and_its_base_transition() {
+        let args = parse_args(argv(&[
+            "clips/nod.json",
+            "--speed",
+            "1.5",
+            "--during",
+            "stow",
+        ]))
+        .expect("a play invocation");
+        assert_eq!(args.operands, vec!["clips/nod.json".to_string()]);
+        assert_eq!(args.speed, Some(1.5));
+        assert_eq!(args.during, Some(BaseMove::Stow));
+
+        let refused = parse_args(argv(&["clips/nod.json", "--during", "sideways"]))
+            .expect_err("there is no such transition");
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("`up` or `stow`"), "{printed}");
+
+        let refused = dispatch(argv(&["play"])).expect_err("play needs a file");
+        assert!(
+            format!("{refused:#}").contains("takes one path"),
+            "{refused:#}"
+        );
+    }
+
+    /// The configuration resolves before anything else about a `play` does.
+    #[test]
+    fn a_play_resolves_its_configuration_before_opening_the_port() {
+        let refused = dispatch(argv(&[
+            "play",
+            "/nonexistent/nod.json",
+            "--config",
+            "/nonexistent/reachy-bench.toml",
+        ]))
+        .expect_err("neither file is there");
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("configuration"), "{printed}");
+    }
+
+    /// A configuration file a commanding run resolves against: the shipped
+    /// example with a datum recorded, which is the only shape that resolves.
+    fn playable_config() -> PathBuf {
+        let path = scratch_dir("play-config").join("reachy-bench.toml");
+        let text = format!(
+            "{}\n[datum]\ncrank_datum = \"direct\"\nprovenance = \"a test, not a unit\"\n",
+            include_str!("../reachy-bench.example.toml")
+        );
+        fs::write(&path, text).expect("the configuration writes");
+        path
+    }
+
+    /// A directory of its own for a test's files, swept by [`swept`] on the
+    /// passing path as the suite's scratch files are.
+    fn scratch_dir(name: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "reachy-bench-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("a scratch directory");
+        path
+    }
+
+    /// Remove the scratch directory a file sits in, on the passing path only:
+    /// a failing test keeps its files, so what it was looking at is still
+    /// there to look at.
+    fn swept(file: &Path) {
+        let dir = file.parent().expect("a scratch file has a directory");
+        fs::remove_dir_all(dir).expect("the scratch directory goes away");
+    }
+
+    /// An antennas-only clip document written into a directory of its own, and
+    /// the path of the document.
+    ///
+    /// The frames swing further than one period's step bound admits, so the
+    /// ceiling the loader derives is below 1x and a speed above it is a refusal
+    /// this can ask for.
+    fn playable_clip(name: &str, max_speed: f64) -> PathBuf {
+        let dir = scratch_dir("play-clips");
+        let path = dir.join("wiggle.json");
+        let track: Vec<String> = (0..8)
+            .map(|index| format!("{{\"antennas\": [{}, 0.0]}}", f64::from(index % 2) * 0.6))
+            .collect();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version": 1, "kind": "clip", "name": "{name}",
+                     "channels": ["antennas"], "frame_hz": 50.0,
+                     "max_speed": {max_speed}, "frames": [{}]}}"#,
+                track.join(",")
+            ),
+        )
+        .expect("the document writes");
+        path
+    }
+
+    /// A motion file that is not there is refused, and the refusal names it.
+    ///
+    /// An operator's typo must not cost an engage: raising the head to announce
+    /// that a file is not there is the failure this ordering rules out, and the
+    /// operator has to be told which file it was.
+    #[test]
+    fn a_play_of_a_missing_motion_file_never_reaches_the_machine() {
+        let config = playable_config();
+        let refused = dispatch(argv(&[
+            "play",
+            "/nonexistent/nod.json",
+            "--config",
+            &config.display().to_string(),
+        ]))
+        .expect_err("the motion file is not there");
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("/nonexistent/nod.json"), "{printed}");
+        swept(&config);
+    }
+
+    /// A document the directory's library does not hold is refused by name.
+    ///
+    /// A different operator error from a missing file: the file is there but
+    /// the library will not accept it.
+    #[test]
+    fn a_play_of_a_document_the_library_will_not_hold_is_refused_by_name() {
+        let config = playable_config();
+        let path = playable_clip("bench/wiggle", 1.0);
+        // A frame rate below the loader's floor: the document is named but
+        // the library will not hold it.
+        let text = fs::read_to_string(&path)
+            .expect("the document reads")
+            .replace("\"frame_hz\": 50.0", "\"frame_hz\": 40.0");
+        fs::write(&path, text).expect("the document writes");
+
+        let refused = dispatch(argv(&[
+            "play",
+            &path.display().to_string(),
+            "--config",
+            &config.display().to_string(),
+        ]))
+        .expect_err("the library refused the document");
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("not in the library"), "{printed}");
+        assert!(printed.contains("bench/wiggle"), "{printed}");
+        swept(&config);
+        swept(&path);
+    }
+
+    /// A speed above the document's own ceiling is refused before the port is
+    /// opened, and the refusal names the motion and the ceiling.
+    #[test]
+    fn a_play_above_the_documents_ceiling_is_refused_with_the_ceiling() {
+        let config = playable_config();
+        let path = playable_clip("bench/wiggle", 1.0);
+
+        let refused = dispatch(argv(&[
+            "play",
+            &path.display().to_string(),
+            "--speed",
+            "2.0",
+            "--config",
+            &config.display().to_string(),
+        ]))
+        .expect_err("the document does not play that fast");
+        let printed = format!("{refused:#}");
+        assert!(printed.contains("bench/wiggle"), "{printed}");
+        assert!(printed.contains("plays at up to"), "{printed}");
+        swept(&config);
+        swept(&path);
+    }
+
+    /// A speed outside the global bounds is refused ahead of the
+    /// configuration, and so ahead of everything else.
+    ///
+    /// The ceiling check alone admits zero and every negative — neither is
+    /// above any ceiling — and a player's clock must be finite and positive. The
+    /// player is built on the period the motion first plays, by which time the
+    /// head has been raised to neutral, so this refusal is the difference
+    /// between a usage error and a process that dies with torque on. Asked here
+    /// with a configuration that is not there: a speed judged second would be
+    /// answered with the configuration's refusal instead of its own.
+    #[test]
+    fn a_play_outside_the_global_speed_bounds_is_refused_ahead_of_everything() {
+        for speed in ["0", "-1", "0.01", "2.5"] {
+            let refused = dispatch(argv(&[
+                "play",
+                "/nonexistent/nod.json",
+                "--speed",
+                speed,
+                "--config",
+                "/nonexistent/reachy-bench.toml",
+            ]))
+            .expect_err("that is not a speed this plays at");
+            let printed = format!("{refused:#}");
+            assert!(
+                printed.contains("--speed is played between"),
+                "{speed}: {printed}"
+            );
         }
     }
 

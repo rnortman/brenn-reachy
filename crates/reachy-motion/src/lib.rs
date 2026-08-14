@@ -87,7 +87,7 @@ pub use tick::{
     MIN_JERK_PEAK_RATE, Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Response,
     TickInputs, TickOutputs, TickReport, TrackingFaultConfig, TrackingLook, TrackingMonitor,
     WireFailure, dry_pass_peaks, dry_pass_separation, duration_floor_s, floor_move_clock,
-    motion_tick,
+    motion_tick, plan_move,
 };
 pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome, Story, last_fault};
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
