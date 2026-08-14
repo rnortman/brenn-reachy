@@ -52,13 +52,11 @@
 //! [`PumpError::class`] is what that caller acts on, and it names one of the
 //! doctrine's responses rather than a yes-or-no about faulting.
 //!
-//! A run is not a commitment to the command that started it:
-//! [`MotionPump::run_retargeting`] asks its caller at every period whether the
-//! move in flight is still the one wanted, and a replacement is spliced in from
-//! the setpoint the last period commanded. A caller executing a timeline off a
-//! wire needs that — waiting out a raise before starting the fold makes the
-//! head late by a whole move — and the stall budget follows the replacement, so
-//! being steered is never mistaken for hanging.
+//! A commanded run is a commitment to its endpoint: [`MotionPump::run`] carries
+//! the move it was given and ends there. A caller whose instruction can change
+//! mid-travel — one executing a timeline off a wire — drives the machine
+//! through [`MotionPump::stream`] instead, where each period's setpoint is the
+//! caller's own and a change of mind costs one period.
 //!
 //! A run does not end when the trajectory does. The last goal going out says
 //! only that commanding is over; the machine is still on its way there, and on
@@ -1574,17 +1572,12 @@ struct Held {
 
 /// What ends a run of the fixed-rate loop.
 ///
-/// The caller's say over a run in flight lives on the endpoint arm and nowhere
-/// else, because that is the only run whose ending is a place rather than a
-/// time: a hold ends when its dwell is up and there is nothing about it to
-/// change.
+/// The caller's say over a run in flight lives on the streaming arm and nowhere
+/// else: a commanded move ends at the endpoint it was given, and a hold ends
+/// when its dwell is up.
 enum Until<'r> {
-    /// The machine is holding again: the move reached its endpoint. `retarget`
-    /// is asked at every period that has no command pending whether that
-    /// endpoint is still the right one.
-    Holding {
-        retarget: &'r mut dyn FnMut() -> Option<MotionCommand>,
-    },
+    /// The machine is holding again: the move reached its endpoint.
+    Holding,
     /// The caller has no more setpoints. `next` is asked at every period for
     /// the one to command, and the run ends on the first period it declines.
     ///
@@ -1894,54 +1887,7 @@ impl<'a> MotionPump<'a> {
         clock: &mut dyn Clock,
         event: &mut dyn FnMut(TickEvent),
     ) -> Result<MoveSummary, PumpError> {
-        self.carry(
-            bus,
-            state,
-            command,
-            Until::Holding {
-                retarget: &mut || None,
-            },
-            clock,
-            event,
-        )
-    }
-
-    /// Run `command` to completion, asking `retarget` at every control period
-    /// whether it has become the wrong command.
-    ///
-    /// `retarget` is consulted at the top of each period that has no command
-    /// pending, and answering `Some` replaces the move in flight: the tick
-    /// shapes the new path from the setpoint the previous period commanded, so
-    /// nothing jumps and the machine never stops on the way. The run then ends
-    /// when the *replacement* has been carried and arrived at, and the stall
-    /// budget is re-sized to the replacement's own travel — a caller changing
-    /// its mind is not a loop that hung.
-    ///
-    /// `retarget` is asked during the settle too, so a caller is never made to
-    /// wait out an arrival it has already changed its mind about; a replacement
-    /// taken there puts the run back to commanding.
-    ///
-    /// [`MotionPump::run`] is this with nothing to say. Two entry points for the
-    /// same reason [`MotionPump::hold`] has two: a bench move is commanded once
-    /// and watched to its end, while a program taking instructions off a wire
-    /// has a schedule that can move under it mid-travel.
-    pub fn run_retargeting<P: BusPort>(
-        &mut self,
-        bus: &mut Bus<P>,
-        state: &mut MotionState,
-        command: MotionCommand,
-        clock: &mut dyn Clock,
-        event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
-    ) -> Result<MoveSummary, PumpError> {
-        self.carry(
-            bus,
-            state,
-            command,
-            Until::Holding { retarget },
-            clock,
-            event,
-        )
+        self.carry(bus, state, command, Until::Holding, clock, event)
     }
 
     /// Watch the machine hold for `dwell`, commanding nothing.
@@ -2022,7 +1968,7 @@ impl<'a> MotionPump<'a> {
             event(TickEvent::Stretched(stretch));
         }
         let mut budget = match until {
-            Until::Holding { .. } | Until::Streaming { .. } => self.stall_budget(&command),
+            Until::Holding | Until::Streaming { .. } => self.stall_budget(&command),
             Until::Elapsed(dwell) => self.budget_for(dwell),
         };
         let epoch = clock.now();
@@ -2061,38 +2007,8 @@ impl<'a> MotionPump<'a> {
 
         let mut tick: u64 = 0;
         while tick < budget {
-            // Asked before the period's read, so a replacement command reaches
-            // the same period's tick and the machine turns on the very next
-            // setpoint. Skipped while a command is already pending — the
-            // accepting period, and the one that accepts a replacement, have
-            // nothing to ask about yet.
-            if pending.is_none()
-                && let Until::Holding { retarget } = &mut until
-                && let Some(replacement) = retarget()
-            {
-                // Right-sized against where the machine has got to, so a
-                // replacement issued mid-recovery gets a clock for the span
-                // still ahead of it rather than for the one the original
-                // command had.
-                let (replacement, stretch) = self.right_sized(state, replacement);
-                if let Some(stretch) = stretch {
-                    event(TickEvent::Stretched(stretch));
-                }
-                // Re-sized from here, not extended: what bounds the run is the
-                // travel still ahead of it, and a caller that keeps changing
-                // its mind is doing exactly what this entry point is for.
-                budget = tick.saturating_add(self.stall_budget(&replacement));
-                pending = Some(replacement);
-                // A run in its settle phase is commanding again, so what it had
-                // measured about arriving is about a goal that is no longer the
-                // one it is heading for.
-                commanded_at = None;
-                summary.commanded = None;
-                summary.settled = None;
-                summary.unsettled = None;
-            }
-            // The streamed run's own ask, on the same period and for the same
-            // reason: the setpoint reaches this period's tick. A period the
+            // The streamed run's ask, before the period's read, so the setpoint
+            // reaches this period's tick. A period the
             // caller declines ends the run before any of it is read, so nothing
             // is commanded and nothing is measured for it.
             if pending.is_none()
@@ -2326,7 +2242,7 @@ impl<'a> MotionPump<'a> {
                 event(TickEvent::Completed);
             }
             let over = match until {
-                Until::Holding { .. } if matches!(state.mode(), Mode::Holding) => {
+                Until::Holding if matches!(state.mode(), Mode::Holding) => {
                     // The first such period is where commanding ended; the ones
                     // after it are the settle, and they command nothing.
                     let since = *commanded_at.get_or_insert_with(|| {
@@ -2362,7 +2278,7 @@ impl<'a> MotionPump<'a> {
                         _ => waited >= self.settle.timeout,
                     }
                 }
-                Until::Holding { .. } | Until::Streaming { .. } => false,
+                Until::Holding | Until::Streaming { .. } => false,
                 Until::Elapsed(dwell) => elapsed >= dwell,
             };
             self.record(tick, elapsed, present.as_ref(), held, settling, event);
@@ -2587,7 +2503,7 @@ fn bus_failure(source: XactError) -> PumpError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE};
@@ -3701,26 +3617,6 @@ mod tests {
         (outcome, events)
     }
 
-    /// Run `command` on `bench`, letting `retarget` replace it mid-travel.
-    fn run_retargeting(
-        bench: &mut Bench,
-        pump: &mut MotionPump<'_>,
-        command: MotionCommand,
-        clock: &mut dyn Clock,
-        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
-    ) -> (Result<MoveSummary, PumpError>, Vec<TickEvent>) {
-        let mut events = Vec::new();
-        let outcome = pump.run_retargeting(
-            &mut bench.bus,
-            &mut bench.state,
-            command,
-            clock,
-            &mut |event| events.push(event),
-            retarget,
-        );
-        (outcome, events)
-    }
-
     /// How many control periods a span of travel occupies at `tick_hz`.
     fn periods_for(span: Duration, tick_hz: u32) -> u64 {
         let period = Duration::from_secs(1) / tick_hz;
@@ -4105,88 +4001,6 @@ mod tests {
             full,
             vec![&TickEvent::TraceFull { samples: ceiling }],
             "announced once, on the period that reached it: {events:?}"
-        );
-    }
-
-    /// A caller that steers the run after the machine has arrived gets a
-    /// summary about the goal it steered to, not the one it abandoned.
-    ///
-    /// `retarget` is asked during the settle as well as during travel, and a
-    /// replacement taken there puts the run back to commanding. What the run
-    /// had measured about arriving belongs to a goal it is no longer heading
-    /// for, and a caller reading `commanded`/`settled` off that summary would
-    /// be reading instants from a move that was abandoned.
-    #[test]
-    fn a_move_replaced_during_its_settle_reports_the_replacement() {
-        let cfg = resolved();
-        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        // A count a period: the machine is still closing on its goal when
-        // commanding ends, so the settle spans periods a replacement can
-        // arrive in.
-        bench
-            .registers
-            .borrow_mut()
-            .creep
-            .insert(servo_for(&cfg, JointId::BodyYaw), 1);
-        let mut pump = pump(&cfg, bench.held);
-        let mut clock = TestClock::default();
-
-        let span = Duration::from_millis(500);
-        let first = yaw_by(&bench.state, 6.0, span);
-        let second = yaw_by(&bench.state, 3.0, span);
-        let arrived = Cell::new(false);
-        let mut events = Vec::new();
-        let mut steered = false;
-        let outcome = pump.run_retargeting(
-            &mut bench.bus,
-            &mut bench.state,
-            first,
-            &mut clock,
-            &mut |event| {
-                if event == TickEvent::Completed {
-                    arrived.set(true);
-                }
-                events.push(event);
-            },
-            &mut || {
-                // Only once the first move has finished commanding, which is
-                // what puts the replacement inside the settle.
-                (arrived.get() && !std::mem::replace(&mut steered, true)).then_some(second)
-            },
-        );
-        let summary = outcome.expect("the replacement carries to its own endpoint");
-
-        // Two commands and two completions: the replacement was taken after the
-        // first move had finished commanding, which is the settle phase and not
-        // travel — so the tick starts it rather than splicing it.
-        let started: Vec<usize> = events
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| **event == TickEvent::Command(CommandDisposition::Started))
-            .map(|(at, _)| at)
-            .collect();
-        let completed: Vec<usize> = events
-            .iter()
-            .enumerate()
-            .filter(|(_, event)| **event == TickEvent::Completed)
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(started.len(), 2, "{events:?}");
-        assert_eq!(completed.len(), 2, "{events:?}");
-        assert!(started[1] > completed[0], "{events:?}");
-
-        let commanded = summary.commanded.expect("the replacement finished too");
-        assert!(
-            commanded > span,
-            "the instants are the replacement's, not the abandoned move's: {summary:?}"
-        );
-        let settled = summary.settled.expect("and the machine got there");
-        assert!(settled >= commanded, "{summary:?}");
-        assert_eq!(summary.unsettled, None, "{summary:?}");
-        assert!(
-            (bench.state.last_targets().body_yaw - 3f64.to_radians()).abs() < 1e-9,
-            "the run ended on the replacement's endpoint: {:?}",
-            bench.state.last_targets().body_yaw
         );
     }
 
@@ -4724,124 +4538,6 @@ mod tests {
             budget > pump.stall_budget(&command),
             "the budget is the asked-for clock's, not the stretched one's"
         );
-    }
-
-    /// A replacement issued mid-travel goes through the same right-sizing, from
-    /// the setpoint the previous period commanded.
-    ///
-    /// The retarget site sizes its own budget, so a replacement that skipped
-    /// the pass would be the one move a stretch could not save.
-    #[test]
-    fn a_replacement_is_right_sized_before_its_budget_is() {
-        let cfg = resolved();
-        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let mut pump = pump(&cfg, bench.held);
-        let mut clock = TestClock::default();
-
-        // A quarter of the way in: far enough that the replacement lands well
-        // inside the first move, which itself needs no stretch.
-        let replacement = Duration::from_millis(100);
-        let mut periods = 0;
-        let (outcome, events) = run_retargeting(
-            &mut bench,
-            &mut pump,
-            to_neutral(&cfg),
-            &mut clock,
-            &mut || {
-                periods += 1;
-                (periods == 10).then(|| MotionCommand::MoveTo {
-                    target: crate::commands::stow_pose_targets(),
-                    durations: MoveDurations::uniform(replacement),
-                    warp: Warp::MinJerk,
-                })
-            },
-        );
-        outcome.expect("the replacement reaches its own endpoint");
-
-        let stretches: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                TickEvent::Stretched(stretch) => Some(*stretch),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(stretches.len(), 1, "{events:?}");
-        assert_eq!(stretches[0].requested, MoveDurations::uniform(replacement));
-        let ClockStretch {
-            requested,
-            effective,
-            ..
-        } = stretches[0];
-        assert!(effective.longest() > requested.longest(), "{stretches:?}");
-        assert!(
-            effective.head >= requested.head && effective.antennas >= requested.antennas,
-            "a clock was shortened: {stretches:?}"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
-            "{events:?}"
-        );
-    }
-
-    /// A replacement issued while the loop is running late lands like any
-    /// other: right-sized, spliced from the setpoint the last period commanded,
-    /// and carried to its own endpoint.
-    ///
-    /// The lateness cannot reach the new path either — the replacement's clock
-    /// starts at zero and advances a period at a time, so the splice is the
-    /// same one an on-time loop makes, arriving later.
-    #[test]
-    fn a_replacement_under_lateness_reaches_its_endpoint() {
-        let cfg = resolved();
-        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let mut pump = pump(&cfg, bench.held);
-        // Three quarters of a period late, every period: an overrun each time,
-        // and never enough to rebase the grid.
-        let mut clock = LateClock {
-            now: Duration::ZERO,
-            late: pump.period() * 3 / 4,
-        };
-
-        let mut periods = 0;
-        let (outcome, events) = run_retargeting(
-            &mut bench,
-            &mut pump,
-            to_neutral(&cfg),
-            &mut clock,
-            &mut || {
-                periods += 1;
-                (periods == 10).then(|| to_stow(&cfg))
-            },
-        );
-        let summary = outcome.expect("the replacement reaches its own endpoint");
-
-        assert!(
-            events.contains(&TickEvent::Command(CommandDisposition::Retargeted)),
-            "{events:?}"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(e, TickEvent::Faulted(_))),
-            "{events:?}"
-        );
-        assert!(events.contains(&TickEvent::Completed));
-        assert!(matches!(bench.state.mode(), Mode::Holding));
-        assert!(summary.slip > Duration::ZERO, "{summary:?}");
-        // Its *own* endpoint, which is the whole claim: a replacement dropped
-        // on the floor leaves the raise to finish, and everything above is
-        // true of that run too. The antennas are the discriminator — by the
-        // turn they are away from both poses — and the fold's sweep takes the
-        // inboard arc, so the goal that arrives a turn below stow is stow.
-        let ended = bench.state.last_targets().antennas;
-        for (ended, stow) in ended
-            .into_iter()
-            .zip(crate::commands::stow_pose_targets().antennas)
-        {
-            let apart = (ended - stow).rem_euclid(core::f64::consts::TAU);
-            assert!(
-                apart < 1e-9 || core::f64::consts::TAU - apart < 1e-9,
-                "the run ended at {ended} rad, not the {stow} rad it was turned to"
-            );
-        }
     }
 
     /// A target the envelope refuses stops the run without commanding
@@ -5772,115 +5468,6 @@ mod tests {
             undisturbed.elapsed + stall,
             "{summary:?} against {undisturbed:?}"
         );
-    }
-
-    /// A caller that changes its mind mid-travel gets the head turned around
-    /// where it is, and the run ends at the replacement.
-    ///
-    /// Without mid-travel replacement the head must finish going up before it
-    /// can come down — an instruction arriving mid-raise is late by a whole
-    /// move. One run, one endpoint — the replacement's.
-    #[test]
-    fn a_move_replaced_part_way_ends_at_the_replacement() {
-        let cfg = resolved();
-        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let mut pump = pump(&cfg, bench.held);
-        let mut clock = TestClock::default();
-        // Well into the raise and nowhere near its end: the antennas are the
-        // discriminator below, and by here they are away from both poses.
-        let turn_at = 40;
-        let mut periods = 0;
-
-        let (outcome, events) = run_retargeting(
-            &mut bench,
-            &mut pump,
-            to_neutral(&cfg),
-            &mut clock,
-            &mut || {
-                periods += 1;
-                (periods == turn_at).then(|| to_stow(&cfg))
-            },
-        );
-        let summary = outcome.expect("the replacement carries to its own endpoint");
-
-        let retargets = events
-            .iter()
-            .filter(|event| **event == TickEvent::Command(CommandDisposition::Retargeted))
-            .count();
-        assert_eq!(retargets, 1, "{events:?}");
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| **event == TickEvent::Completed)
-                .count(),
-            1,
-            "the first move never completed: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .position(|event| *event == TickEvent::Completed)
-                > events
-                    .iter()
-                    .position(|event| *event == TickEvent::Command(CommandDisposition::Retargeted)),
-            "the completion is the replacement's: {events:?}"
-        );
-        // Compared as directions: the fold's antenna sweep takes the inboard
-        // arc, so the goal that arrives at −3.05 rad is the one a turn above it.
-        let ended = bench.state.last_targets().antennas;
-        for (ended, stow) in ended
-            .into_iter()
-            .zip(crate::commands::stow_pose_targets().antennas)
-        {
-            let apart = (ended - stow).rem_euclid(core::f64::consts::TAU);
-            assert!(
-                apart < 1e-9 || core::f64::consts::TAU - apart < 1e-9,
-                "the run ended commanding the pose it was turned to: {ended} against {stow}"
-            );
-        }
-        // And it ran on the *replacement's* clock. Both halves of a replacement
-        // are the caller's — targets and durations — and the fixture's calm
-        // fold takes more than twice the quick raise, so a run that kept the
-        // raise's clock for the fold lands sixty periods short of this.
-        let turn_at = u64::try_from(turn_at).expect("a small count");
-        let fold = periods_for(cfg.stow_duration, cfg.tick_hz);
-        let raise = periods_for(cfg.up_duration, cfg.tick_hz);
-        assert!(
-            summary.ticks >= turn_at + fold && summary.ticks < turn_at + 2 * fold,
-            "the fold's own clock is what ran: {} periods, turned at {turn_at}, fold {fold}, \
-             raise {raise}",
-            summary.ticks,
-        );
-    }
-
-    /// Replacing the move for longer than the original command's own stall
-    /// budget is a caller changing its mind, not a loop that hung.
-    ///
-    /// The budget follows the travel still ahead, so it is re-sized by every
-    /// replacement. A fixed one sized off the first command would abort a run
-    /// that was being steered, and report it as a stall — the one failure that
-    /// says the loop stopped advancing.
-    #[test]
-    fn a_move_replaced_over_and_over_is_not_a_stall() {
-        let cfg = resolved();
-        let mut bench = armed(&cfg, machine_at(&datumed_config(), &stow_legs()));
-        let mut pump = pump(&cfg, bench.held);
-        let mut clock = TestClock::default();
-        let first = to_neutral(&cfg);
-        let budget = pump.stall_budget(&first);
-        let mut periods: u64 = 0;
-
-        let (outcome, _) = run_retargeting(&mut bench, &mut pump, first, &mut clock, &mut || {
-            periods += 1;
-            (periods <= budget + 10).then(|| to_neutral(&cfg))
-        });
-        let summary = outcome.expect("a steered move is not a stalled one");
-
-        assert!(
-            periods > budget,
-            "the fixture outlasted the first command's budget: {periods} against {budget}"
-        );
-        assert!(summary.ticks > budget, "{summary:?}");
     }
 
     /// The tick is fed what the servos report, not what they were last told.

@@ -1511,8 +1511,10 @@ mod tests {
 
     #[test]
     fn a_motions_blend_out_is_its_last_clips() {
+        // Fifty frames is a second of clip, so each authored ramp fits inside
+        // the clip it belongs to and is carried rather than refused.
         let blending = |name: &str, blend_out_ms: u32| {
-            clip_json(name, 4, 2.0).replace(
+            clip_json(name, 50, 2.0).replace(
                 "\"max_speed\": 2",
                 &format!("\"blend_out_ms\": {blend_out_ms}, \"max_speed\": 2"),
             )

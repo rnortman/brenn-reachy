@@ -76,19 +76,6 @@ use crate::trace;
 /// constant rate.
 const WARP: Warp = Warp::MinJerk;
 
-/// What a move already in flight should become.
-///
-/// A caller steering a move decides between these two outcomes each period.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Steer {
-    /// Turn around toward this endpoint, over these clocks, from wherever the
-    /// move has got to.
-    To(JointTargets, MoveDurations),
-    /// Stop here: abandon the move and hold the setpoint the last period
-    /// commanded.
-    HoldHere,
-}
-
 /// How far the demo sweeps the body, degrees either side of square.
 ///
 /// Well inside the bench's own yaw cap, because the demo is a thing to watch
@@ -539,31 +526,7 @@ impl<P: BusPort> Engaged<'_, '_, P> {
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
     ) -> Result<MoveSummary, PumpError> {
-        self.move_retargeting(target, durations, clock, line, &mut || None)
-    }
-
-    /// Carry one move, asking `retarget` at every control period whether it is
-    /// still the move the caller wants.
-    ///
-    /// Answering `Some((target, durations))` replaces the move in flight: the
-    /// new path is shaped from the setpoint the last period commanded, so the
-    /// head turns around where it is rather than finishing the old move first.
-    /// The call returns when whichever move was last accepted reaches its
-    /// endpoint.
-    ///
-    /// This is what a caller executing a timeline it does not control needs:
-    /// the instruction can change while the head is halfway up, and waiting out
-    /// the raise before starting the fold is the head being late by a whole
-    /// move. [`Engaged::move_to`] is this with nothing to say.
-    pub fn move_retargeting(
-        &mut self,
-        target: JointTargets,
-        durations: MoveDurations,
-        clock: &mut dyn Clock,
-        line: &mut dyn FnMut(&str),
-        retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
-    ) -> Result<MoveSummary, PumpError> {
-        self.move_retargeting_events(target, durations, clock, line, &mut |_| {}, retarget)
+        self.move_events(target, durations, clock, line, &mut |_| {})
     }
 
     /// The same move, with the run's tick events handed to `event` as values
@@ -572,76 +535,26 @@ impl<P: BusPort> Engaged<'_, '_, P> {
     /// Unlike [`Engaged::hold_events`], the bench's printed report stays —
     /// `event` observes beside it. A rendered line is not a fact downstream
     /// can key on; this gives a caller its own machine-readable record.
-    pub fn move_retargeting_events(
+    ///
+    /// The move is fixed once it starts: it runs to the endpoint it was given.
+    /// A caller whose instruction can change mid-travel drives the machine
+    /// through [`Engaged::stream_setpoints`] instead, where every period is the
+    /// caller's own. Warp shaping is chosen here; a caller chooses the
+    /// destination, never the trajectory shape.
+    pub fn move_events(
         &mut self,
         target: JointTargets,
         durations: MoveDurations,
         clock: &mut dyn Clock,
         line: &mut dyn FnMut(&str),
         event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<(JointTargets, MoveDurations)>,
-    ) -> Result<MoveSummary, PumpError> {
-        self.move_steering(target, durations, clock, line, event, &mut || {
-            retarget().map(|(target, durations)| Steer::To(target, durations))
-        })
-    }
-
-    /// The same move, whose retarget may also stop it where it has got to.
-    ///
-    /// When `retarget` returns [`Steer::HoldHere`], the trajectory is abandoned
-    /// on that period and the run ends as any arrival does.
-    ///
-    /// Warp shaping is applied here; the caller chooses destination or stop,
-    /// never the trajectory shape.
-    pub fn move_steering(
-        &mut self,
-        target: JointTargets,
-        durations: MoveDurations,
-        clock: &mut dyn Clock,
-        line: &mut dyn FnMut(&str),
-        event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<Steer>,
-    ) -> Result<MoveSummary, PumpError> {
-        self.move_retargeting_commands(target, durations, clock, line, event, &mut || {
-            Some(match retarget()? {
-                Steer::To(target, durations) => MotionCommand::MoveTo {
-                    target,
-                    durations,
-                    warp: WARP,
-                },
-                Steer::HoldHere => MotionCommand::Hold,
-            })
-        })
-    }
-
-    /// The same move, whose retarget answers with a whole command rather than
-    /// another endpoint.
-    ///
-    /// What this admits that [`Engaged::move_retargeting_events`] does not is
-    /// [`MotionCommand::Hold`]: a caller that wants the head to stop where the
-    /// move has got to, rather than to turn around toward somewhere else,
-    /// answers with the hold and the tick abandons the trajectory on that very
-    /// period. Stopping is not expressible as an endpoint — the setpoint the
-    /// last period commanded is the tick's to know and not the caller's — so it
-    /// has to be a command.
-    ///
-    /// The run then ends as any other arrival does: the machine is holding, and
-    /// what it holds is where it was stopped.
-    pub fn move_retargeting_commands(
-        &mut self,
-        target: JointTargets,
-        durations: MoveDurations,
-        clock: &mut dyn Clock,
-        line: &mut dyn FnMut(&str),
-        event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<MotionCommand>,
     ) -> Result<MoveSummary, PumpError> {
         let command = MotionCommand::MoveTo {
             target,
             durations,
             warp: WARP,
         };
-        let outcome = self.pump.run_retargeting(
+        let outcome = self.pump.run(
             &mut self.machine.bus,
             &mut self.state,
             command,
@@ -650,7 +563,6 @@ impl<P: BusPort> Engaged<'_, '_, P> {
                 line(&format!("  {reported}"));
                 event(reported);
             },
-            retarget,
         );
         self.report(line);
         outcome
@@ -1352,14 +1264,7 @@ pub fn wind_down<P: BusPort>(
             break Outcome::FellThrough;
         }
         line("  stowing under control on what still commands");
-        match engaged.move_retargeting_events(
-            stow_pose_targets(),
-            within(stow, left),
-            clock,
-            line,
-            event,
-            &mut || None,
-        ) {
+        match engaged.move_events(stow_pose_targets(), within(stow, left), clock, line, event) {
             Ok(_) => {
                 line("  stowed; releasing torque");
                 break Outcome::Completed;
@@ -3492,183 +3397,8 @@ mod tests {
         );
     }
 
-    /// `move_retargeting` hands the caller the move in flight: answering with
-    /// another target turns the head around and the call returns at that one.
-    ///
-    /// The entry point a program executing a timeline it does not own needs.
-    /// The pump's own tests pin the periods; what this pins is the wrapper —
-    /// that the pair the caller answers with really becomes the command, both
-    /// halves of it, and that nothing about the reply is dropped on the way.
-    #[test]
-    fn a_move_the_caller_replaces_returns_at_the_replacement() {
-        let cfg = resolved();
-        let machine = machine_at(&datumed_config(), &stow_legs());
-        let asked = Rc::new(RefCell::new(0usize));
-        let asks = asked.clone();
-        let ran = Rc::new(RefCell::new(0u64));
-        let counted = ran.clone();
-        let run = run(machine, move |port, clock, line| {
-            let mut machine = commission(&cfg, port, clock, line)?;
-            let mut engaged = machine.engage(clock, line)?;
-            let summary = engaged.move_retargeting(
-                neutral_targets(),
-                cfg.up_durations(),
-                clock,
-                line,
-                &mut || {
-                    let mut asked = asks.borrow_mut();
-                    *asked += 1;
-                    (*asked == 20).then(|| (stow_pose_targets(), cfg.stow_durations()))
-                },
-            )?;
-            *counted.borrow_mut() = summary.ticks;
-            Ok(())
-        });
-        run.ok("the replacement carries the head back down");
-
-        assert!(
-            *asked.borrow() > 20,
-            "the caller is asked every period, not once: {}",
-            asked.borrow()
-        );
-        // The durations half of the caller's answer is what the replacement ran
-        // on. Dropping it — keeping the `durations` still in scope from the
-        // parameter list — reaches the same pose and completes after the same
-        // splice, so nothing else in this test would notice; what it changes is
-        // the fold's pace, and a fold carried faster than the clock its step
-        // bounds were sized against faults partway and drops the head.
-        let cfg = resolved();
-        let periods = |span: Duration| {
-            let period = Duration::from_secs(1) / cfg.tick_hz;
-            u64::try_from(span.as_nanos() / period.as_nanos()).expect("a small count")
-        };
-        let (turn_at, ticks) = (20, *ran.borrow());
-        assert!(
-            ticks >= turn_at + periods(cfg.stow_duration)
-                && ticks < turn_at + 2 * periods(cfg.stow_duration),
-            "the fold ran on the fold's clock: {ticks} periods, turned at {turn_at}, fold {}, \
-             raise {}",
-            periods(cfg.stow_duration),
-            periods(cfg.up_duration),
-        );
-        within_a_count(
-            &goals(&resolved(), &run),
-            &JointVector {
-                body_yaw: 0.0,
-                legs: stow_legs(),
-                antennas: STOW_ANTENNAS,
-            },
-            "the machine came back to its fold",
-        );
-        assert!(
-            run.printed
-                .iter()
-                .any(|line| line.contains("replacing the move that was running")),
-            "the splice is narrated: {:?}",
-            run.printed
-        );
-    }
-
-    /// `move_retargeting_commands` admits a hold as the replacement, and the
-    /// head stops where the move had got to.
-    ///
-    /// The freeze a caller executing somebody else's timeline needs: the goal
-    /// the run ends holding is neither endpoint but a pose between them, and
-    /// the run returns rather than carrying on to the target it was given.
-    #[test]
-    fn a_move_the_caller_stops_holds_where_it_had_got_to() {
-        let cfg = resolved();
-        let machine = machine_at(&datumed_config(), &stow_legs());
-        let asked = Rc::new(RefCell::new(0usize));
-        let asks = asked.clone();
-        let run = run(machine, move |port, clock, line| {
-            let mut machine = commission(&cfg, port, clock, line)?;
-            let mut engaged = machine.engage(clock, line)?;
-            engaged.move_retargeting_commands(
-                neutral_targets(),
-                cfg.up_durations(),
-                clock,
-                line,
-                &mut |_| {},
-                &mut || {
-                    let mut asked = asks.borrow_mut();
-                    *asked += 1;
-                    (*asked == 20).then_some(MotionCommand::Hold)
-                },
-            )?;
-            Ok(())
-        });
-        run.ok("a move stopped partway is an arrival, not a refusal");
-
-        let held = goals(&resolved(), &run);
-        for (legs, what) in [
-            (neutral_legs(), "the raise's endpoint"),
-            (stow_legs(), "the fold it left"),
-        ] {
-            assert!(
-                held.legs
-                    .iter()
-                    .zip(legs.iter())
-                    .any(|(held, end)| (held - end).abs() > 1e-3),
-                "the head is between the two poses, not at {what}: {:?} against {legs:?}",
-                held.legs
-            );
-        }
-    }
-
-    /// `move_steering` says the same two things without the caller holding a
-    /// command: an endpoint turns the move around, and a hold stops it here.
-    ///
-    /// The pair in one run, because what the type is for is choosing between
-    /// them per period.
-    #[test]
-    fn a_steered_move_turns_around_and_then_stops_where_it_is() {
-        let cfg = resolved();
-        let machine = machine_at(&datumed_config(), &stow_legs());
-        let asked = Rc::new(RefCell::new(0usize));
-        let asks = asked.clone();
-        let folds = cfg.stow_durations();
-        let run = run(machine, move |port, clock, line| {
-            let mut machine = commission(&cfg, port, clock, line)?;
-            let mut engaged = machine.engage(clock, line)?;
-            engaged.move_steering(
-                neutral_targets(),
-                cfg.up_durations(),
-                clock,
-                line,
-                &mut |_| {},
-                &mut || {
-                    let mut asked = asks.borrow_mut();
-                    *asked += 1;
-                    match *asked {
-                        10 => Some(Steer::To(stow_pose_targets(), folds)),
-                        30 => Some(Steer::HoldHere),
-                        _ => None,
-                    }
-                },
-            )?;
-            Ok(())
-        });
-        run.ok("a steered move ends where it was stopped");
-
-        let held = goals(&resolved(), &run);
-        for (legs, what) in [
-            (neutral_legs(), "the raise it was given"),
-            (stow_legs(), "the fold it was turned toward"),
-        ] {
-            assert!(
-                held.legs
-                    .iter()
-                    .zip(legs.iter())
-                    .any(|(held, end)| (held - end).abs() > 1e-3),
-                "the head stopped at {what} rather than between the poses: {:?} against {legs:?}",
-                held.legs
-            );
-        }
-    }
-
-    /// `move_retargeting_events` hands the caller the run's events as values
-    /// and still prints the run.
+    /// `move_events` hands the caller the run's events as values and still
+    /// prints the run.
     #[test]
     fn a_move_hands_out_its_events_and_still_prints_them() {
         let cfg = resolved();
@@ -3681,14 +3411,9 @@ mod tests {
         let run = run(machine, move |port, clock, line| {
             let mut machine = commission(&cfg, port, clock, line)?;
             let mut engaged = machine.engage(clock, line)?;
-            engaged.move_retargeting_events(
-                neutral_targets(),
-                hurried,
-                clock,
-                line,
-                &mut |event| seen.borrow_mut().push(event),
-                &mut || None,
-            )?;
+            engaged.move_events(neutral_targets(), hurried, clock, line, &mut |event| {
+                seen.borrow_mut().push(event);
+            })?;
             Ok(())
         });
         run.ok("a hurried raise runs on the clock it was right-sized to");

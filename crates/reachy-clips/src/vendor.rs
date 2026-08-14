@@ -29,8 +29,8 @@ use thiserror::Error;
 
 use crate::compose::{interpolate_pose, lerp};
 use crate::format::{
-    Channel, ChannelMask, Clip, ClipDoc, ClipError, DEFAULT_BLEND_MS, DeltaFrame, FORMAT_VERSION,
-    FrameDoc, MAX_SPEED, validate_name,
+    Channel, ChannelMask, Clip, ClipDoc, ClipError, DeltaFrame, FORMAT_VERSION, FrameDoc,
+    MAX_SPEED, validate_name,
 };
 use crate::speed::ClipLimits;
 
@@ -286,7 +286,10 @@ pub fn convert(
 
     // Placeholders: the loader re-derives ceiling and ramps from the frames
     // alone, so computing them here would double the cost for numbers it
-    // recomputes anyway. The written document comes from the loaded clip.
+    // recomputes anyway. The written document comes from the loaded clip. The
+    // ramps are left unsaid rather than set to the default, because a recording
+    // states no blend intent and a stated ramp longer than the clip is refused;
+    // omitted, the default is capped at the clip's own length instead.
     let asked = ClipDoc {
         version: FORMAT_VERSION,
         kind: "clip".to_owned(),
@@ -298,8 +301,8 @@ pub fn convert(
             .collect(),
         frame_hz: FLOOR_TICK_HZ,
         max_speed: MAX_SPEED,
-        blend_in_ms: Some(DEFAULT_BLEND_MS),
-        blend_out_ms: Some(DEFAULT_BLEND_MS),
+        blend_in_ms: None,
+        blend_out_ms: None,
         frames: frames.iter().map(frame_doc).collect(),
     };
     let mut clip =
@@ -652,6 +655,8 @@ mod tests {
 
     use nalgebra::Vector3;
     use serde_json::json;
+
+    use crate::format::ClipNote;
 
     /// A 4x4 identity, which is the vendor's spelling of the neutral head pose.
     fn identity() -> Vec<Vec<f64>> {
@@ -1205,13 +1210,15 @@ mod tests {
         );
     }
 
-    /// The written document is the one the loader reads back: the max speed and
-    /// the blend ramps in the file are the derived ones, not the placeholders.
+    /// The written document is the one the loader reads back: the max speed in
+    /// the file is the derived one rather than the placeholder, and a reload
+    /// lands on the same clip.
     #[test]
     fn the_written_document_carries_what_the_loader_derived() {
         // Fast enough that the derivation lands under the global ceiling and
-        // above the default ramps: a track the placeholders happened to fit
-        // would prove nothing about which numbers were written.
+        // stretches the ramps past the clip's own length: a track the
+        // placeholder happened to fit would prove nothing about what was
+        // written.
         let json = recording(
             0.04,
             vec![
@@ -1231,16 +1238,27 @@ mod tests {
             "the fixture derives a ceiling below the placeholder, or this proves nothing",
         );
         assert_eq!(import.doc().max_speed, import.clip.max_speed());
-        assert_eq!(import.doc().blend_in_ms, Some(import.clip.blend_in_ms()));
+        // The entry ramp these frames derive is longer than the clip, which is
+        // a length no document may state, so the file leaves it unsaid and the
+        // reload derives it again from the same frames. The exit ramp fits, so
+        // it is written as it stands.
+        assert!(f64::from(import.clip.blend_in_ms()) > import.clip.duration_s() * 1000.0);
+        assert_eq!(import.doc().blend_in_ms, None);
         assert_eq!(import.doc().blend_out_ms, Some(import.clip.blend_out_ms()));
 
         let text = serde_json::to_string(&import.doc()).expect("renders");
-        let reloaded = Clip::from_json(&text, &ClipLimits::default()).expect("loads back");
-        assert_eq!(reloaded, import.clip);
+        let mut reloaded = Clip::from_json(&text, &ClipLimits::default()).expect("loads back");
+        assert_eq!(reloaded.blend_in_ms(), import.clip.blend_in_ms());
+        assert_eq!(reloaded.blend_out_ms(), import.clip.blend_out_ms());
         assert!(
-            reloaded.notes().is_empty(),
-            "the file needs no correction on the way back in: {:?}",
+            reloaded
+                .notes()
+                .iter()
+                .all(|note| matches!(note, ClipNote::BlendStretched { .. })),
+            "the only correction on the way back in is the ramp derivation: {:?}",
             reloaded.notes(),
         );
+        reloaded.forget_notes();
+        assert_eq!(reloaded, import.clip);
     }
 }

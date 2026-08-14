@@ -533,8 +533,13 @@ mod tests {
 
     /// A one-segment motion over `clip`, blend ramps as authored.
     fn motion_of(clip: Arc<Clip>) -> Arc<Motion> {
+        motion_of_under(clip, &limits())
+    }
+
+    /// The same, under the bounds the clip was derived against.
+    fn motion_of_under(clip: Arc<Clip>, limits: &ClipLimits) -> Arc<Motion> {
         let json = serde_json::to_string(&clip.to_doc()).expect("clip serialises");
-        let library = Library::load([("test".to_owned(), json)], &limits()).0;
+        let library = Library::load([("test".to_owned(), json)], limits).0;
         library.motion(clip.name()).expect("clip loaded").clone()
     }
 
@@ -696,7 +701,9 @@ mod tests {
 
     #[test]
     fn a_fading_channel_holds_the_last_delta_it_was_given() {
-        let motion = motion_of(antenna_clip("walk", &[0.0, 0.1, 0.7], 100));
+        // Five frames — 100 ms — so the ramps fit inside the clip; the last
+        // three hold the delta the fade runs against.
+        let motion = motion_of(antenna_clip("walk", &[0.0, 0.1, 0.7, 0.7, 0.7], 100));
         let mut player = ClipPlayer::new(motion, 1.0);
         let samples = run(&mut player, 40);
         for sample in &samples[3..] {
@@ -839,20 +846,21 @@ mod tests {
 
     #[test]
     fn a_join_inside_a_gap_holds_the_clip_it_follows() {
-        // Clip `a` is two frames — 40 ms — and the hold after it runs to
-        // 240 ms, so a join at 100 ms lands inside that hold. Every player that
-        // played `a` from the top is holding its final 0.4 there; the joiner
-        // holds the same delta rather than the zero one nobody recorded.
+        // Clip `a` is five frames — 100 ms, long enough to carry its own ramps
+        // — and the hold after it runs to 300 ms, so a join at 160 ms lands
+        // inside that hold. Every player that played `a` from the top is
+        // holding its final 0.4 there; the joiner holds the same delta rather
+        // than the zero one nobody recorded.
         let clips = [
-            antenna_clip("a", &[0.0, 0.4], 100),
-            antenna_clip("b", &[0.9, 0.9], 100),
+            antenna_clip("a", &[0.0, 0.4, 0.4, 0.4, 0.4], 100),
+            antenna_clip("b", &[0.9; 10], 100),
         ];
         let sequence = r#"{
             "version": 1, "kind": "sequence", "name": "seq",
             "entries": [{"ref": "a"}, {"gap_ms": 200}, {"ref": "b"}]
         }"#;
         let motion = sequence_motion(&clips, sequence, "seq");
-        let mut player = ClipPlayer::joining_at(motion, 1.0, Duration::from_millis(100));
+        let mut player = ClipPlayer::joining_at(motion, 1.0, Duration::from_millis(160));
 
         let first = player.advance(TICK).expect("holding");
         assert!((first.frame.antennas.expect("antennas held")[0] - 0.4).abs() < 1e-12);
@@ -868,7 +876,7 @@ mod tests {
     #[test]
     fn a_join_inside_a_gap_lands_where_a_player_from_the_top_already_is() {
         let clips = [
-            antenna_clip("a", &[0.0, 0.4], 100),
+            antenna_clip("a", &[0.0, 0.4, 0.4, 0.4, 0.4], 100),
             antenna_clip("b", &[0.9; 10], 100),
         ];
         let sequence = r#"{
@@ -876,12 +884,12 @@ mod tests {
             "entries": [{"ref": "a"}, {"gap_ms": 200}, {"ref": "b"}]
         }"#;
         let motion = sequence_motion(&clips, sequence, "seq");
-        let mut joined = ClipPlayer::joining_at(motion.clone(), 1.0, Duration::from_millis(100));
+        let mut joined = ClipPlayer::joining_at(motion.clone(), 1.0, Duration::from_millis(160));
         let mut from_top = ClipPlayer::new(motion, 1.0);
 
-        // The join is five ticks into the motion, so the joiner's first sample
-        // is the sixth of a player that started at the top.
-        const SKIP: usize = 5;
+        // The join is eight ticks into the motion, so the joiner's first sample
+        // is the ninth of a player that started at the top.
+        const SKIP: usize = 8;
         let joined = run(&mut joined, 60);
         let top = run(&mut from_top, 60);
         assert_eq!(joined.len() + SKIP, top.len());
@@ -906,13 +914,13 @@ mod tests {
 
     #[test]
     fn a_join_inside_the_trailing_gap_still_fades_out_on_the_clips_ramp() {
-        let clips = [antenna_clip("a", &[0.0, 0.4], 100)];
+        let clips = [antenna_clip("a", &[0.0, 0.4, 0.4, 0.4, 0.4], 100)];
         let sequence = r#"{
             "version": 1, "kind": "sequence", "name": "seq",
             "entries": [{"ref": "a"}, {"gap_ms": 200}]
         }"#;
         let motion = sequence_motion(&clips, sequence, "seq");
-        let mut player = ClipPlayer::joining_at(motion, 1.0, Duration::from_millis(100));
+        let mut player = ClipPlayer::joining_at(motion, 1.0, Duration::from_millis(160));
         let samples = run(&mut player, 40);
 
         // The last five samples fade over the clip's own 100 ms ramp; without
@@ -980,11 +988,44 @@ mod tests {
     }
 
     #[test]
-    fn a_blend_longer_than_the_clip_plays_the_whole_track_at_no_weight() {
-        // Pins today's behaviour rather than blessing it: nothing bounds a
-        // configured ramp from above, so a ramp far longer than the clip is a
-        // motion that is commanded and never appears. TODO(clip-blend-ceiling)
-        let motion = motion_of(antenna_clip("walk", &[0.5; 10], 60_000));
+    fn a_derived_ramp_longer_than_the_clip_plays_the_whole_track_at_no_weight() {
+        // An authored ramp longer than its clip is refused at load, so the only
+        // way to reach this state is the floor: against a tight antenna step
+        // bound the derivation stretches a zero ramp to many times the clip's
+        // length, which is stretch-and-report rather than refusal. The
+        // accepting load below is that exemption; the weights are what the
+        // player does with the result.
+        let tight = ClipLimits {
+            max_step: JointStep {
+                antennas: 0.001,
+                ..limits().max_step
+            },
+            ..limits()
+        };
+        let doc = ClipDoc {
+            version: 1,
+            kind: "clip".to_owned(),
+            name: "walk".to_owned(),
+            description: None,
+            channels: vec![Channel::Antennas],
+            frame_hz: FLOOR_TICK_HZ,
+            max_speed: 2.0,
+            blend_in_ms: Some(0),
+            blend_out_ms: Some(0),
+            frames: (0..10)
+                .map(|_| FrameDoc {
+                    antennas: Some([0.5, -0.5]),
+                    ..FrameDoc::default()
+                })
+                .collect(),
+        };
+        let clip = Clip::from_doc(doc, &tight).expect("a floored ramp is not a refusal");
+        // Ten frames at 50 Hz is 200 ms of clip; the floor is orders longer.
+        assert!(clip.blend_in_ms() > 10_000, "{}", clip.blend_in_ms());
+
+        // Through the library under the same bounds, so the ramp the reload
+        // re-derives is the one the direct load found.
+        let motion = motion_of_under(Arc::new(clip), &tight);
         let mut player = ClipPlayer::new(motion, 1.0);
         let samples = run(&mut player, 200);
         for sample in &samples[..10] {

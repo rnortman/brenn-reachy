@@ -465,6 +465,26 @@ pub enum ClipError {
         /// The speed ceiling the frames themselves impose.
         derived: f64,
     },
+
+    /// An authored blend ramp longer than the clip it ramps.
+    ///
+    /// A blend-in longer than the clip never reaches full weight, so the motion
+    /// is structurally attenuated and, at the factor-of-a-hundred typo this
+    /// guards, invisible. A blend-out longer than the clip parks a finished
+    /// overlay's final delta on the machine for as long as the fade runs. Both
+    /// are content faults in the document, answered the way the format answers
+    /// content faults. Only numbers the author wrote are judged: an omitted
+    /// blend is capped at the clip's duration instead, and a ramp stretched to
+    /// its derived floor is exempt.
+    #[error("clip is {clip_ms} ms long; its authored {end} ramp of {blend_ms} ms is longer")]
+    BlendExceedsClip {
+        /// Which ramp.
+        end: BlendEnd,
+        /// What the document asked for.
+        blend_ms: u32,
+        /// The clip's own duration at 1.0x, milliseconds.
+        clip_ms: f64,
+    },
 }
 
 impl From<DeriveError> for ClipError {
@@ -726,18 +746,15 @@ impl Clip {
                 derived: derived.max_speed,
             });
         }
-        // Nothing bounds a ramp from above yet: a blend of a minute over a
-        // one-second emote loads clean and plays the whole track at a weight
-        // near zero, which reads as a motion that simply did not happen.
-        // TODO(clip-blend-ceiling)
+        let clip_ms = clip_duration_ms(frames.len());
         let blend_in_ms = floor_blend(
-            doc.blend_in_ms.unwrap_or(DEFAULT_BLEND_MS),
+            authored_blend(doc.blend_in_ms, BlendEnd::In, clip_ms)?,
             derived.blend_in_floor_ms,
             BlendEnd::In,
             &mut notes,
         );
         let blend_out_ms = floor_blend(
-            doc.blend_out_ms.unwrap_or(DEFAULT_BLEND_MS),
+            authored_blend(doc.blend_out_ms, BlendEnd::Out, clip_ms)?,
             derived.blend_out_floor_ms,
             BlendEnd::Out,
             &mut notes,
@@ -807,9 +824,9 @@ impl Clip {
     ///
     /// A note says the load disagreed with something a document claimed, which
     /// is a fact about a file somebody wrote. The importer's document is not
-    /// one: it names the global ceiling and the default ramps as placeholders
-    /// precisely so the derivation runs once — here, in the loader — and the
-    /// numbers it settles on are the numbers that get written. Carrying the
+    /// one: it names the global ceiling as a placeholder and states no ramps at
+    /// all, precisely so the derivation runs once — here, in the loader — and
+    /// the numbers it settles on are the numbers that get written. Carrying the
     /// loader's corrections of those placeholders into a report would be the
     /// importer disagreeing with itself in front of an operator.
     pub(crate) fn forget_notes(&mut self) {
@@ -841,12 +858,34 @@ impl Clip {
     /// one-tick pose rather than an instant of nothing.
     #[must_use]
     pub fn duration_s(&self) -> f64 {
-        self.frames.len() as f64 / FLOOR_TICK_HZ
+        self.duration_ms() / 1000.0
+    }
+
+    /// How long the clip runs at 1.0×, milliseconds.
+    ///
+    /// The same number the blend ceiling is judged against, from the same
+    /// expression: a clip's length is one fact, and a second way of computing
+    /// it is a second answer waiting to disagree with the first.
+    #[must_use]
+    pub fn duration_ms(&self) -> f64 {
+        clip_duration_ms(self.frames.len())
     }
 
     /// The document form of this clip, for a writer.
+    ///
+    /// A ramp the load derived rather than read — a floor stretch, or a default
+    /// capped at the clip — can be longer than the clip itself, which is a
+    /// number no author may write. Written as authored it would produce a
+    /// document this same loader refuses, so such a ramp is left unsaid and
+    /// re-derived from the frames on the way back in. Everything within the
+    /// clip's own length is written as it stands.
+    ///
+    /// TODO(clip-doc-faithful-blends): the omission makes the writer keep the
+    /// reader's rule, and the document stops stating what plays.
     #[must_use]
     pub fn to_doc(&self) -> ClipDoc {
+        let clip_ms = self.duration_ms();
+        let writable = |ms: u32| (f64::from(ms) <= clip_ms).then_some(ms);
         ClipDoc {
             version: FORMAT_VERSION,
             kind: "clip".to_owned(),
@@ -855,11 +894,53 @@ impl Clip {
             channels: self.mask.iter().collect(),
             frame_hz: FLOOR_TICK_HZ,
             max_speed: self.max_speed,
-            blend_in_ms: Some(self.blend_in_ms),
-            blend_out_ms: Some(self.blend_out_ms),
+            blend_in_ms: writable(self.blend_in_ms),
+            blend_out_ms: writable(self.blend_out_ms),
             frames: self.frames.iter().map(|frame| frame.to_doc()).collect(),
         }
     }
+}
+
+/// A clip's own duration at 1.0x, milliseconds: one frame is one tick.
+fn clip_duration_ms(frames: usize) -> f64 {
+    frames as f64 * 1000.0 / FLOOR_TICK_HZ
+}
+
+/// The ramp a document asks for, refused when the author wrote one longer than
+/// the clip and capped at the clip's length when the author wrote nothing.
+///
+/// The two cases differ because the numbers have different authors. An
+/// over-long ramp in the file is a content fault — the motion it describes
+/// either never reaches full weight or fades for longer than it played — and
+/// rewriting it silently would hand back a materially different motion with no
+/// error, which is exactly how a factor-of-a-hundred typo stays invisible. The
+/// default is the format's own number, not anyone's intent, so capping it is
+/// the format correcting itself; refusing a short clip over a value its author
+/// never wrote would leave no way to say "no blend" short of writing `0`.
+///
+/// Equality passes: a ramp exactly as long as the clip touches full weight at
+/// the final frame.
+fn authored_blend(
+    configured_ms: Option<u32>,
+    end: BlendEnd,
+    clip_ms: f64,
+) -> Result<u32, ClipError> {
+    let Some(blend_ms) = configured_ms else {
+        let cap = if clip_ms >= f64::from(DEFAULT_BLEND_MS) {
+            DEFAULT_BLEND_MS
+        } else {
+            clip_ms as u32
+        };
+        return Ok(cap);
+    };
+    if f64::from(blend_ms) > clip_ms {
+        return Err(ClipError::BlendExceedsClip {
+            end,
+            blend_ms,
+            clip_ms,
+        });
+    }
+    Ok(blend_ms)
 }
 
 /// Take the longer of a configured ramp and its floor, noting a stretch.
@@ -1083,8 +1164,10 @@ mod tests {
         assert_eq!(clip.description(), Some("a test"));
         assert!(Channel::ALL.iter().all(|c| clip.mask().contains(*c)));
         assert_eq!(clip.frames().len(), 1);
-        assert_eq!(clip.blend_in_ms(), DEFAULT_BLEND_MS);
-        assert_eq!(clip.blend_out_ms(), DEFAULT_BLEND_MS);
+        // One frame is 20 ms of clip, so the omitted default is capped there
+        // and then stretched to the floor its own delta derives.
+        assert_eq!(clip.blend_in_ms(), 180);
+        assert_eq!(clip.blend_out_ms(), 60);
     }
 
     #[test]
@@ -1484,16 +1567,17 @@ mod tests {
         let doc = ClipDoc {
             blend_in_ms: Some(0),
             blend_out_ms: Some(600),
-            frames: vec![
-                FrameDoc {
-                    antennas: Some([0.0, 0.0]),
-                    ..FrameDoc::default()
-                },
-                FrameDoc {
-                    antennas: Some([big, 0.0]),
-                    ..FrameDoc::default()
-                },
-            ],
+            // Long enough that the authored exit ramp fits inside the clip:
+            // holding the same delta leaves both derived floors where they are.
+            frames: std::iter::once(FrameDoc {
+                antennas: Some([0.0, 0.0]),
+                ..FrameDoc::default()
+            })
+            .chain((0..30).map(|_| FrameDoc {
+                antennas: Some([big, 0.0]),
+                ..FrameDoc::default()
+            }))
+            .collect(),
             ..antennas_doc()
         };
         let clip = Clip::from_doc(doc, &limits).expect("in range");
@@ -1520,6 +1604,160 @@ mod tests {
             )),
             "the exit ramp was long enough and is not reported"
         );
+    }
+
+    /// The write and the read are one invariant across two functions: a clip
+    /// whose derived ramps outrun its own length must survive a round trip
+    /// through the document, or the writer emits files this loader refuses.
+    #[test]
+    fn a_clip_whose_derived_ramps_outrun_it_survives_a_round_trip() {
+        let limits = limits();
+        let big = limits.max_step.antennas * crate::speed::STEP_MARGIN * 4.0;
+        let doc = ClipDoc {
+            blend_in_ms: Some(0),
+            blend_out_ms: Some(0),
+            frames: vec![
+                FrameDoc {
+                    antennas: Some([0.0, 0.0]),
+                    ..FrameDoc::default()
+                },
+                FrameDoc {
+                    antennas: Some([big, 0.0]),
+                    ..FrameDoc::default()
+                },
+            ],
+            ..antennas_doc()
+        };
+        let clip = Clip::from_doc(doc, &limits).expect("in range");
+        assert!(
+            f64::from(clip.blend_in_ms()) > clip.duration_ms()
+                && f64::from(clip.blend_out_ms()) > clip.duration_ms(),
+            "both floors outrun the clip, or this proves nothing: {} / {} over {}",
+            clip.blend_in_ms(),
+            clip.blend_out_ms(),
+            clip.duration_ms(),
+        );
+
+        let mut reloaded = Clip::from_doc(clip.to_doc(), &limits).expect("loads back");
+        assert_eq!(reloaded.blend_in_ms(), clip.blend_in_ms());
+        assert_eq!(reloaded.blend_out_ms(), clip.blend_out_ms());
+        reloaded.forget_notes();
+        let mut written = clip;
+        written.forget_notes();
+        assert_eq!(reloaded, written);
+    }
+
+    /// A track of `frames` frames the antennas hold still through: whatever the
+    /// ceiling tests do to the blends, the derivation has nothing to say.
+    fn still_doc(frames: usize) -> ClipDoc {
+        ClipDoc {
+            frames: (0..frames)
+                .map(|_| FrameDoc {
+                    antennas: Some([0.1, -0.1]),
+                    ..FrameDoc::default()
+                })
+                .collect(),
+            ..antennas_doc()
+        }
+    }
+
+    #[test]
+    fn an_authored_blend_in_longer_than_the_clip_is_refused() {
+        // Fifty frames is a second of clip; the ramp is the hundredfold typo.
+        let doc = ClipDoc {
+            blend_in_ms: Some(100_000),
+            blend_out_ms: Some(0),
+            ..still_doc(50)
+        };
+        let err = Clip::from_doc(doc, &limits()).expect_err("longer than the clip");
+        assert_eq!(
+            err,
+            ClipError::BlendExceedsClip {
+                end: BlendEnd::In,
+                blend_ms: 100_000,
+                clip_ms: 1000.0,
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("blend-in"), "{message}");
+        assert!(message.contains("100000"), "{message}");
+        assert!(message.contains("1000"), "{message}");
+
+        // The boundary itself. Equality is lawful and one frame past it is not,
+        // so this is the pair that says where the comparison sits — a typo a
+        // hundredfold away says only that something rejects it.
+        let doc = ClipDoc {
+            blend_in_ms: Some(1020),
+            blend_out_ms: Some(0),
+            ..still_doc(50)
+        };
+        assert_eq!(
+            Clip::from_doc(doc, &limits()).expect_err("one frame past the clip"),
+            ClipError::BlendExceedsClip {
+                end: BlendEnd::In,
+                blend_ms: 1020,
+                clip_ms: 1000.0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_authored_blend_out_longer_than_the_clip_is_refused() {
+        let doc = ClipDoc {
+            blend_in_ms: Some(0),
+            blend_out_ms: Some(100_000),
+            ..still_doc(50)
+        };
+        assert_eq!(
+            Clip::from_doc(doc, &limits()).expect_err("longer than the clip"),
+            ClipError::BlendExceedsClip {
+                end: BlendEnd::Out,
+                blend_ms: 100_000,
+                clip_ms: 1000.0,
+            }
+        );
+    }
+
+    #[test]
+    fn authored_blends_as_long_as_the_clip_are_accepted() {
+        let doc = ClipDoc {
+            blend_in_ms: Some(1000),
+            blend_out_ms: Some(1000),
+            ..still_doc(50)
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("equality is inside the ceiling");
+        assert_eq!(clip.blend_in_ms(), 1000);
+        assert_eq!(clip.blend_out_ms(), 1000);
+
+        let doc = ClipDoc {
+            blend_in_ms: Some(500),
+            blend_out_ms: Some(500),
+            ..still_doc(50)
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("below the ceiling");
+        assert_eq!(clip.blend_in_ms(), 500);
+        assert_eq!(clip.blend_out_ms(), 500);
+    }
+
+    /// A clip shorter than the default ramp, saying nothing about its blends:
+    /// the default is the format's own number, so it is capped at the clip
+    /// rather than held against an author who wrote nothing.
+    #[test]
+    fn omitted_blends_are_capped_at_the_clip_duration() {
+        let doc = ClipDoc {
+            blend_in_ms: None,
+            blend_out_ms: None,
+            ..still_doc(5)
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("a short clip still loads");
+        assert!(clip.duration_ms() < f64::from(DEFAULT_BLEND_MS));
+        // The clip's own length, not the number that happens to be its length
+        // at this frame rate: the cap is a truncating cast, and a rate whose
+        // frame is not a whole millisecond would silently cap short of the
+        // clip while a literal went on passing.
+        assert_eq!(f64::from(clip.blend_in_ms()), clip.duration_ms());
+        assert_eq!(f64::from(clip.blend_out_ms()), clip.duration_ms());
+        assert_eq!(clip.blend_in_ms(), 100);
     }
 
     /// A ceiling the author wrote *below* what the frames derive: the loader
