@@ -386,3 +386,28 @@ introduces, or a drop upgrade that stops registering the aarch64 clang
 toolchain — all of them discovered at `make bench-build` in front of a
 powered-up unit. Marked at the `reachy-device` platform in
 `bazel/platform/BUILD.bazel`.
+
+## `ci-cache-refresh`
+
+Decide whether CI's Bazel cache archive should refresh on every green run
+instead of being written once per key, and if so what bounds its size.
+
+Deferral context: the cache step keys on an exact dependency-graph fingerprint
+with no `restore-keys` fallback, and `actions/cache` skips the save on an exact
+hit. The archive under a key is therefore whatever the first cold run after a
+dependency change produced, forever: third-party and toolchain actions are
+served from it, but nothing this repo's own targets build — eight crates, the
+clippy and rustfmt aspects over `//...`, the `.clk` compiles, the scenario
+runners — is ever persisted, so every source-only push rebuilds and re-lints all
+of it. The same freeze means a cache degraded by something outside the key, a
+runner image bump changing local action environments, stays degraded until a
+dependency bump happens to rotate the key, with nothing surfacing it. The
+canonical fix is a rotating key plus `restore-keys` prefixes, which was
+rejected because each save would then tar the prior key's stale entries
+alongside the new ones and Bazel's own disk-cache GC runs at server idle, which
+a CI job never reaches. That trade is what needs deciding rather than coding:
+whether a prune before save (age- or size-capped) is a bound anyone wants to
+own, against a per-run save of a multi-gigabyte archive and the 10 GB per-repo
+budget it competes for. Nothing about it is a correctness question — both stores
+are content-addressed, so any cache state produces the same build. Marked at
+the cache step in `.github/workflows/ci.yml`.

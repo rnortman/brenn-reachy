@@ -19,8 +19,60 @@ jobs:
   check:
     name: check (shellcheck, fmt, clippy, test)
     runs-on: ubuntu-latest
+
+    # One statement of each cache path and of the gate's flags for the whole job:
+    # the cache step's `path:` list, the bazelisk install step, the gate
+    # invocation, and the assertion after it all read these, so those copies
+    # cannot drift apart. .bazelrc states the two store paths again because Bazel
+    # cannot read them from here, and the assertion compares that copy against
+    # these.
+    env:
+      BAZEL_DISK_CACHE: ~/.cache/bazel-disk
+      BAZEL_REPO_CACHE: ~/.cache/bazel-repo
+      # bazelisk's download directory. The install step pins bazelisk to this
+      # path via BAZELISK_HOME, so the directory is this job's choice rather
+      # than a runner default; the assertion checks that the exported pin is
+      # absolute and equal to this value, which covers the export going wrong
+      # but not bazelisk ceasing to read the variable.
+      BAZEL_LAUNCHER_CACHE: ~/.cache/bazelisk
+      GATE_BAZEL_FLAGS: --config=ci --lockfile_mode=error
+
     steps:
       - uses: actions/checkout@v7
+
+      # Paths set by --config=ci in .bazelrc, plus bazelisk's downloaded binary.
+      # No restore-keys fallback: an exact hit makes actions/cache skip the save,
+      # so each dependency set's cache is written once by the first green run and
+      # cannot accrete stale entries from earlier keys. A dependency change costs
+      # one cold build, which then saves a fresh minimal archive.
+      #
+      # One combined step, not restore + save with `if: always()`: saving only on
+      # success is load-bearing, since a partial cache frozen under a key no
+      # later run can overwrite is worse than no cache.
+      #
+      # The key covers everything that decides what the stores should hold: the
+      # module graph and its lock, the flags, the Bazel release, and this file —
+      # which names the paths and the flags, so an edit here lands on a cold run
+      # whose stores are empty unless this job's own Bazel filled them. The lock
+      # alone would not do: it records resolution outputs, not MODULE.bazel's
+      # bytes, so a module edit that leaves those outputs alone would keep
+      # restoring an archive that predates it.
+      #
+      # TODO(ci-cache-refresh): an exact hit skips the save, so nothing this run
+      # built is ever added to the archive under its key.
+      #
+      # Pinned by commit for the reason the downloads below are: this action
+      # writes the store Bazel then takes action results from, so it decides
+      # part of what the rest of the job builds.
+      - name: Restore Bazel caches
+        id: bazel-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BAZEL_DISK_CACHE }}
+            ${{ env.BAZEL_REPO_CACHE }}
+            ${{ env.BAZEL_LAUNCHER_CACHE }}
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion', '.github/workflows/ci.yml') }}
 
       # The gate's first step needs it. Installed explicitly rather than
       # inherited from whatever the runner image happens to ship, so a step that
@@ -44,22 +96,49 @@ jobs:
           echo "${BAZELISK_SHA256}  $RUNNER_TEMP/bazel" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/bazel"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          # Point bazelisk's downloads at the archived store, for the steps
+          # after this one — the gate below is the first to run bazelisk. The
+          # path is expanded here rather than stated expanded: a job-level
+          # `env:` cannot expand $HOME, and bazelisk, being Go, would take a
+          # leading tilde literally and write to a directory named `~` in the
+          # workspace. tools/lib.sh owns the expansion so this and the
+          # assertion below cannot disagree about what a tilde means.
+          . tools/lib.sh
+          echo "BAZELISK_HOME=$(expand_home "$BAZEL_LAUNCHER_CACHE")" >> "$GITHUB_ENV"
 
       # The gate's contents live in the root `check` target, not here, so the
       # whole thing is reproducible locally on a fresh clone. shellcheck above is
       # the only apt prerequisite: the Rust toolchain, the C++ sysroot and every
       # third-party crate come out of the Bazel module graph.
       #
-      # The one added flag is the gate's whole reason for existing here:
-      # --lockfile_mode=error refuses a MODULE.bazel.lock that module resolution
+      # Of the added flags, --lockfile_mode=error is the gate's whole reason for
+      # existing here: it refuses a MODULE.bazel.lock that module resolution
       # would rewrite, so a graph resolving at versions nobody chose is a red
       # build here instead of an untracked diff on somebody's machine.
+      # --config=ci points Bazel at the cached stores above.
+      - run: make check BAZEL_FLAGS="$GATE_BAZEL_FLAGS"
+
+      # Whether the caches are doing anything is otherwise invisible: a job that
+      # restores nothing and writes nowhere is green and looks like any other,
+      # just slower. The script compares .bazelrc's store paths against the ones
+      # archived above, checks the gate asked for the config that carries them,
+      # checks the exported bazelisk pin is an absolute path naming one of them,
+      # and refuses an empty store; the hit flag and the sizes go in the log, so a
+      # run that stopped hitting, or an archive growing towards the budget, is a
+      # log diff away rather than a suspicion about wall time.
       #
-      # Left uncached deliberately: a Bazel output base does not fit in the
-      # per-repository cache budget, and a partially restored one is a build
-      # nobody can reproduce. Every run is a cold cache — the pinned Clockwork
-      # drop's whole graph, a hermetic clang sysroot among it.
-      - run: make check BAZEL_FLAGS=--lockfile_mode=error
+      # After the gate, so the stores hold this run's writes, and before the
+      # cache action's post step, which does not save on a failed job — a store
+      # this refuses is never frozen under its key.
+      - name: Assert and report the Bazel caches
+        run: |
+          echo "cache-hit=${{ steps.bazel-cache.outputs.cache-hit }}"
+          tools/ci-assert-bazel-caches.sh \
+            --gate-flags "$GATE_BAZEL_FLAGS" \
+            --disk-cache "$BAZEL_DISK_CACHE" \
+            --repository-cache "$BAZEL_REPO_CACHE" \
+            --launcher-home "${BAZELISK_HOME:-}" \
+            --store "$BAZEL_LAUNCHER_CACHE"
 
   scrub:
     name: scrub

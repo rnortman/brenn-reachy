@@ -23,9 +23,9 @@
 # Mirrored from the pinned drop
 # ---------------------------------------------------------------------------
 
-# Local default is to refresh the lockfile. CI's check job runs
-# `make check BAZEL_FLAGS=--lockfile_mode=error`, and that command line overrides
-# this, so resolution drift is a red build there rather than a quiet diff here.
+# Local default is to refresh the lockfile. CI's check job overrides this from
+# the command line with --lockfile_mode=error, so resolution drift is a red
+# build there rather than a quiet diff here.
 common --lockfile_mode=update
 
 build --@curl//:ssl_lib="openssl"
@@ -87,6 +87,14 @@ common --test_env=RUST_BACKTRACE=1
 build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
 build:lint --output_groups=+clippy_checks,+rustfmt_checks
 build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+
+# CI's caches, behind a config so a local build neither reads nor writes them.
+# Both stores are content-addressed — a missing entry is a cache miss and an
+# extraneous one is dead weight, so restoring them from a CI cache archive
+# cannot change what a build produces. Fixed paths under ~/.cache so the
+# workflow's cache step and this file agree without quoting runner internals.
+common:ci --disk_cache=~/.cache/bazel-disk
+common:ci --repository_cache=~/.cache/bazel-repo
 
 # Per-developer flags, gitignored. Last so it can override anything above.
 try-import %workspace%/.bazelrc.user

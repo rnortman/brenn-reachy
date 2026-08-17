@@ -34,6 +34,35 @@ app_home=/var/lib/brenn-app
 # executable at all.
 store_mount=/run/brenn-app
 
+# A leading `~` replaced with $HOME, any other path unchanged. Bazel's path
+# converter expands a leading `~` and so does the cache action in its path list;
+# a shell passing an environment variable through does not, and neither does a
+# Go or Rust binary reading one. One implementation, so a path handed to a
+# tilde-ignorant tool and a path compared against another copy of itself agree.
+#
+# The tilde is assembled into a variable rather than written as a literal: the
+# linter reads a quoted literal one as a tilde that failed to expand, and it
+# would be right about every other use of one.
+#
+# An unset or empty HOME is a refusal rather than a silent expansion to `/`: the
+# callers write the result into an environment variable or compare it against
+# another path, and a plausible-looking `/.cache/...` is worse in both places
+# than a stop.
+expand_home() {
+	local tilde='~'
+	case $1 in
+	"$tilde" | "${tilde}/"*)
+		[ -n "${HOME:-}" ] ||
+			die "cannot expand a leading tilde in ${1}: HOME is unset or empty"
+		;;
+	esac
+	case $1 in
+	"$tilde") printf '%s\n' "$HOME" ;;
+	"${tilde}/"*) printf '%s\n' "${HOME}/${1#"${tilde}/"}" ;;
+	*) printf '%s\n' "$1" ;;
+	esac
+}
+
 # Fail with a headline and any number of indented detail lines.
 die() {
 	echo "${prog}: $1" >&2
