@@ -53,10 +53,14 @@ service=brenn-app.service
 # bench run at the wrong moment meets a held port rather than a free one.
 motiond_service=reachy-motiond.service
 
-# What the device binary is built out of. The container definition is in it:
-# the builder image is named for that file's content, so editing it produces a
-# different toolchain and a different binary.
-workspace_paths=(crates containers Cargo.toml Cargo.lock rust-toolchain.toml)
+# What the device binary is built out of: the sources, and everything that
+# decides how they are compiled — the build files, the module and its lockfile,
+# the flags, the Bazel release, and the build script that names the platform and
+# the compilation mode. cogs/ is not an input to the bench and stays out.
+workspace_paths=(
+	crates bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion
+	tools/build-bench.sh
+)
 
 usage() {
 	die "usage: ${prog} <host> --config <file>|--run [--stale-ok] [args...]|--fetch <dir>"
@@ -72,9 +76,10 @@ usage() {
 # bench-run` builds first and is the entry point to prefer.
 #
 # The rebuild this prescribes is what clears it, always: build-bench.sh stamps
-# the artifact once it has verified it, because cargo leaves an output it did
-# not have to relink untouched and a commit that changes no linked code would
-# otherwise leave a current binary refused with no way through but --stale-ok.
+# the artifact once it has verified it, because a build system hands back an
+# output it did not have to relink untouched and a commit that changes no linked
+# code would otherwise leave a current binary refused with no way through but
+# --stale-ok.
 #
 # A tree with no history for those paths (a tarball, a shallow clone that
 # excluded them) is not evidence of staleness, so it says what it could not

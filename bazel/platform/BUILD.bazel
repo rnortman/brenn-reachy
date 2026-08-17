@@ -6,3 +6,25 @@ platform(
     constraint_values = ["@bazel_tools//tools/cpp:clang"],
     parents = ["@platforms//host"],
 )
+
+# The Reachy Mini itself: 64-bit ARM Linux. Named by `--platforms` when the
+# bench is built for the device, which is the only cross-compile here.
+#
+# Deliberately without host-clang's `@bazel_tools//tools/cpp:clang` constraint:
+# nothing in the fetched Clockwork drop selects on it, and the drop's own
+# toolchains declare os and cpu only, so on a target platform it would be dead
+# weight.
+#
+# No gate builds anything in this configuration. `make check` and CI are the host
+# configuration only, so a break here — a dependency without aarch64 in its
+# `target_compatible_with`, a drop upgrade that stops registering the aarch64
+# clang toolchain — surfaces at `make bench-build` in front of a powered-up unit.
+# TODO(bazel-device-config-gate)
+platform(
+    name = "reachy-device",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)

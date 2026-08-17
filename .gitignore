@@ -1,7 +1,8 @@
 # Globs here are deliberately wide. An uncovered artifact is one `git add .`
 # away from becoming tracked content that has to be scrubbed back out again.
 
-# Rust build trees.
+# Scratch build output. The device build installs its artifact here because the
+# deploy path's freshness contract is about a file it can stamp.
 target/
 **/*.rs.bk
 

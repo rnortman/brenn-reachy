@@ -1,10 +1,7 @@
-# Cargo remains the dev loop for the libraries under crates/: `make check` is
-# still cargo fmt, clippy and test over the workspace, and nothing here changes
-# that. Bazel exists beside it because the Clockwork cog system cannot be built
-# any other way -- the compiler that turns a `.clk` module into C++ and Rust is
-# a Bazel rule, and the drop it comes from arrives as a module dependency. The
-# libraries are therefore dual-built: Cargo owns their tests, Bazel builds them
-# so a cog body can depend on them.
+# Bazel is the only build system here: every crate under crates/, every cog, and
+# the cross-compiled device binary come out of this module. There are no Cargo
+# manifests, no rustup, and no second lane -- one pinned compiler, one dependency
+# resolution, one gate.
 #
 # Everything derived from the pinned Clockwork drop -- its whole dependency
 # table, its toolchain registration -- is quarantined in the included segment,
@@ -80,20 +77,23 @@ python.toolchain(
     python_version = PYTHON_VERSION,
 )
 
-# Rust under Bazel. The version is pinned exactly. It has to be compatible with
-# the versions the drop's override table forces on the whole graph, which is why
-# it is here and not in that segment.
+# Rust. The version has to be compatible with the versions the drop's override
+# table forces on the whole graph, which is why it is here and not in that
+# segment.
 #
-# This is deliberately *not* the version rust-toolchain.toml names. That file
-# says `stable`, for the Cargo lane and for rustup; this pin is what Bazel
-# fetches, and a floating channel under Bazel would be a build nobody can
-# reproduce. The two lanes compile the same sources with different compilers on
-# purpose -- the Cargo lane is where a new stable's lints are met first.
+# An exact version, never a channel: this is the one compiler every crate here is
+# built and linted with, on a workstation and on CI alike, and a floating channel
+# would be a build nobody can reproduce. New lints therefore arrive when this pin
+# is bumped, deliberately, and the churn they cause is absorbed in that commit.
 bazel_dep(name = "rules_rust", version = "0.73.0")
 
 RUST_VERSION = "1.97.1"
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# The edition must agree with the rustfmt edition flag in
+# .claude/hooks/format.sh, or the editor hook formats against a different
+# language version than the gate checks. This line is the edition's single
+# statement.
 rust.toolchain(
     edition = "2024",
     rustfmt_version = RUST_VERSION,
@@ -103,15 +103,11 @@ use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
 
-# The third-party Rust crates the motion libraries need, resolved by
-# crate_universe. `from_specs` rather than `from_cargo`: the Cargo workspace's
-# manifests carry members Bazel never builds (the bench binary, the serial bus
-# layer) and their dependency trees would be resolved for nothing. The set here
-# is exactly what the Bazel-built libraries name, and it is small enough to
-# state.
-#
-# Versions match the workspace's `[workspace.dependencies]` so the two lanes
-# compile the same crates; MODULE.bazel.lock pins the resolution that comes out.
+# The third-party Rust crates this repo needs, resolved by crate_universe.
+# `from_specs` rather than `from_cargo` because there are no Cargo manifests to
+# read: the specs below are this repo's single statement of what third-party code
+# it depends on and at what version, and each carries a comment saying what it is
+# for. MODULE.bazel.lock pins the resolution that comes out of them.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
 # f64 linear algebra for the head kinematics. reachy-kin and reachy-motion.
@@ -133,6 +129,51 @@ crate.spec(
 crate.spec(
     features = ["float_roundtrip"],
     package = "serde_json",
+    version = "1",
+)
+
+# Serial port access for the servo bus, and the only I/O dependency here.
+# Default features off drops the udev-backed enumeration support: the port is
+# named in configuration, never discovered, so the extra native dependency would
+# buy nothing and cost a build prerequisite. The floor is 4.9 because the bus
+# layer's one-speaker guarantee rests on what an exclusive open does there:
+# `TIOCEXCL` and a non-blocking exclusive `flock`, both held for the lifetime of
+# the port. reachy-bus.
+crate.spec(
+    default_features = False,
+    package = "serialport",
+    version = "4.9",
+)
+
+# Error reporting at the binary edge only, where a chain of context is what an
+# operator at a bench actually wants. Libraries use thiserror. reachy-bench,
+# reachy-clips.
+crate.spec(
+    package = "anyhow",
+    version = "1",
+)
+
+# Platform constants -- the two open(2) flags and the one errno the bus layer's
+# contention probe reads. reachy-bus only, and constants only: every crate here
+# forbids unsafe code, so nothing calls into it.
+crate.spec(
+    package = "libc",
+    version = "0.2",
+)
+
+# Deserialization for the bench's configuration file and for the clip assets.
+# `derive` because every one of those types is a plain struct with a `#[derive]`
+# on it. reachy-bench, reachy-clips.
+crate.spec(
+    features = ["derive"],
+    package = "serde",
+    version = "1",
+)
+
+# The bench binary's configuration file format: bus device, envelope caps,
+# motion parameters, arm thresholds, and the resolved crank datum.
+crate.spec(
+    package = "toml",
     version = "1",
 )
 

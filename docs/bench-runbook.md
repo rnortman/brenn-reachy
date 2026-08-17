@@ -15,9 +15,12 @@ Before anything that arms, moves or de-torques, the binding rules are in
 
 ## What you need
 
-- **podman**, and on a non-arm64 workstation an `aarch64` `binfmt_misc`
-  registration carrying the `F` flag. `tools/build-bench.sh` preflights both
-  and says how to fix either.
+- **bazel** (bazelisk; `.bazelversion` pins the release it fetches).
+  `tools/build-bench.sh` preflights it and says how to get it. The device binary
+  is a cross-compile against the hermetic sysroot the pinned Clockwork drop
+  brings — no container, no emulation. It needs an x86_64 workstation: the drop's
+  toolchains only run there, so an arm64 development host cannot build the device
+  binary today.
 - **ssh as root to the unit**, key-based: every script runs with
   `BatchMode=yes` and will not prompt.
 - **The unit's hostname**, named once in the gitignored `.local/reachy.conf`:
@@ -80,7 +83,7 @@ how a rebooted unit is brought back afterwards, not how a session begins.
 
 ## The loop
 
-    make bench-build                     # the aarch64 binary, in the pinned container
+    make bench-build                     # the aarch64 binary, cross-compiled by bazel
     make bench-config                    # push .local/reachy-bench.toml into the unit's RAM
     make bench-run ARGS="selftest"       # read-only: pings and register reads, no torque
     make bench-run ARGS="up"             # and the rest of the commands
@@ -117,15 +120,18 @@ line.
 ## Binary freshness
 
 `deploy-bench.sh --run` refuses a binary older than the newest commit touching
-`crates`, `containers`, `Cargo.toml`, `Cargo.lock` or `rust-toolchain.toml`.
-The refusal prints both times and names `make bench-build`, and that build
-always clears it: `build-bench.sh` stamps the artifact once it has verified it,
-so a commit cargo had nothing to relink for — a checked-in trace fixture, a
-test-only change — does not leave a current binary looking stale.
+`crates`, `bazel`, `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
+`.bazelversion` or `tools/build-bench.sh` — the last of those because the
+platform and compilation mode the device build uses live only there. The refusal
+prints both times and names `make bench-build`, and
+that build always clears it: `build-bench.sh` installs the verified output at the
+contract path, which stamps it, so a commit the binary did not have to relink for
+— a checked-in trace fixture, a test-only change — does not leave a current
+binary looking stale.
 
 This exists because a day-old binary once resurrected a config gate that had
-been deleted from the source, and cost an evening. Two things it does not
-catch, both deliberate:
+been deleted from the source, and cost an evening. Three things it does not
+catch, all deliberate:
 
 - **Uncommitted edits.** Commit time against file time cannot see them.
   `make bench-run` builds first, which is the answer to that half, and is the
@@ -133,6 +139,9 @@ catch, both deliberate:
 - **A tree with no history for those paths** (a tarball, a clone that excluded
   them). It says the age is unknown and runs. Absence of history is not
   evidence of staleness.
+- **`.bazelrc.user`.** It is untracked by design and can override any build
+  flag, so no commit time describes it. A per-developer flag that changes what
+  the device binary is has to be followed by a rebuild by hand.
 
 To run an old binary deliberately — bisecting a behaviour, reproducing a past
 session — `--stale-ok` is the first token after `--run`:

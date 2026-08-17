@@ -1,0 +1,59 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+# Masked delta-encoded motion clips for the Reachy Mini: asset format,
+# validation, playback sampling, and layered composition. Nothing here is a
+# safety gate — an asset it accepts still meets the envelope check on the way
+# out.
+#
+# `src/bin/` is excluded: a binary's root is its own crate, built by the
+# `rust_binary` below rather than as part of this library.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-clips` is not a Rust identifier.
+rust_library(
+    name = "reachy_clips",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**/*.rs"],
+    ),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:thiserror",
+    ],
+)
+
+# The validation and sampling suite: pure arithmetic over in-memory documents,
+# plus a few round-trips through temporary directories.
+rust_test(
+    name = "reachy_clips_test",
+    size = "small",
+    crate = ":reachy_clips",
+)
+
+# The offline vendor-recording converter, run as
+# `bazel run //crates/reachy-clips:reachy_clip_import -- <args>`. It reaches no
+# network: the operator fetches the dataset and points this at the directory.
+rust_binary(
+    name = "reachy_clip_import",
+    srcs = ["src/bin/reachy-clip-import.rs"],
+    deps = [
+        ":reachy_clips",
+        "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# A binary's root is its own crate, so the library's test target never sees the
+# argument parsing and the channel-mask spelling this file owns. Its tests use
+# temporary directories only.
+rust_test(
+    name = "reachy_clip_import_test",
+    size = "small",
+    crate = ":reachy_clip_import",
+)

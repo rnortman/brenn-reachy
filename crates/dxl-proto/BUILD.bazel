@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Sans-I/O Dynamixel Protocol 2.0 codec, X-series register table, and unit
+# conversions. It touches no port: frames in, frames out, and every malformed
+# input is a named error, which is what lets the bus layer above it and the
+# scripted machine in the bench's tests share one definition of the wire.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `dxl-proto` is not a Rust identifier.
+rust_library(
+    name = "dxl_proto",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = ["@brenn_reachy_crates//:thiserror"],
+)
+
+# Pure arithmetic over byte arrays and register addresses: no I/O, no clock.
+rust_test(
+    name = "dxl_proto_test",
+    size = "small",
+    crate = ":dxl_proto",
+)

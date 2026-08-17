@@ -45,9 +45,9 @@ If a gate blocks a write or a commit, **surface it** — never route around it. 
 gate being wrong happens and is worth reporting; a bypassed gate is not
 recoverable once it has been pushed.
 
-Every manifest carries `license.workspace = true` against the workspace's
-`license = "Apache-2.0"`. Without it the published code is technically
-all-rights-reserved.
+The whole tree is Apache-2.0, stated once in `LICENSE` and `NOTICE`. There are
+no per-crate manifests to restate it in: a crate says what it is in the `//!`
+header of its `lib.rs` and in the header comment of its `BUILD.bazel`.
 
 ## Bring-up discipline
 
@@ -97,8 +97,9 @@ Comments say what the code currently does and why, tersely. Two standing bans:
 - **No changelog comments.** What the code used to do, or how it changed, is
   what `git log` and `CHANGELOG.md` are for.
 
-Dependency lines in every manifest carry a comment saying what the dependency is
-for. A `//!` header on every module states what it is and why it exists.
+Every `crate.spec` in `MODULE.bazel` carries a comment saying what the dependency
+is for and which crates use it. A `//!` header on every module states what it is
+and why it exists.
 
 ## TODO system
 

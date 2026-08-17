@@ -1,0 +1,75 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+# Bench binary for Reachy Mini bring-up: read-only self-test registry and
+# supervised motion commands. The deployable — cross-compiled for the device
+# with `--platforms=//bazel/platform:reachy-device`.
+#
+# `crate_name` rather than the derived name: `src/main.rs` says
+# `reachy_bench::`, and the target name is taken by the binary below.
+#
+# `src/main.rs` is excluded from the library's sources for the same reason it is
+# the binary's root — it is a separate crate.
+rust_library(
+    name = "reachy_bench_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "reachy_bench",
+    deps = [
+        "//crates/dxl-proto:dxl_proto",
+        "//crates/reachy-bus:reachy_bus",
+        "//crates/reachy-clips:reachy_clips",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:thiserror",
+        "@brenn_reachy_crates//:toml",
+    ],
+)
+
+# Two kinds of test input, and they reach the test by different routes.
+#
+# The example configuration comes in through `include_str!`, which is resolved
+# by the compiler against its declared inputs and never through the source glob,
+# so it is `compile_data`.
+#
+# The hardware trace recordings are read at run time by
+# `trace::metrics::Trace::read`, so they are `data` and arrive as runfiles.
+# Where they land is stated here rather than in the source that opens them —
+# beside the glob that supplies them, so moving this package moves one fact.
+# The path is relative to the runfiles root, which is a test's working
+# directory.
+rust_test(
+    name = "reachy_bench_lib_test",
+    size = "medium",
+    compile_data = ["reachy-bench.example.toml"],
+    crate = ":reachy_bench_lib",
+    data = glob(["fixtures/**"]),
+    env = {"REACHY_BENCH_TRACE_FIXTURES": "crates/reachy-bench/fixtures/traces"},
+)
+
+# The entry point: argument parsing, the configuration file it reads off disk,
+# and the dispatch into the library's commands and registry.
+rust_binary(
+    name = "reachy_bench",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":reachy_bench_lib",
+        "//crates/reachy-bus:reachy_bus",
+        "//crates/reachy-clips:reachy_clips",
+        "@brenn_reachy_crates//:anyhow",
+    ],
+)
+
+# A binary's root is its own crate, so the library's test target never sees the
+# argument grammar this file owns. Its tests read the example configuration
+# through `include_str!` and touch no file at run time, so this target needs
+# `compile_data` and no runfiles.
+rust_test(
+    name = "reachy_bench_test",
+    size = "small",
+    compile_data = ["reachy-bench.example.toml"],
+    crate = ":reachy_bench",
+)

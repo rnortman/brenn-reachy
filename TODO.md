@@ -367,3 +367,22 @@ decision is which shape the session slice takes — a second channel into the
 driver, or a multi-publisher channel if the framework grows one — and it is that
 slice's to make, with the aux path's requirements in hand. Marked at the
 `DriverCmd` declaration in `cogs/motion.clk`.
+
+## `bazel-device-config-gate`
+
+Cover the device configuration in a gate. The deployable is
+`//crates/reachy-bench:reachy_bench` built with
+`--platforms=//bazel/platform:reachy-device`, and nothing in `make check` or in
+CI builds it: a `platform_transition_filegroup` (or a transitioned alias) beside
+the platform definition would put it inside `bazel build //...`.
+
+Deferral context: the shape is cheap; the cost is not. CI runs on an uncached
+runner by design, so a second full aarch64 Rust build roughly doubles the
+job — the decision is whether that goes into CI, into the local gate only, or
+into a separate scheduled job, and it is a cost decision rather than a coding
+one. What breaks silently until then: a dependency whose
+`target_compatible_with` lacks aarch64, a `select()` a future dependency
+introduces, or a drop upgrade that stops registering the aarch64 clang
+toolchain — all of them discovered at `make bench-build` in front of a
+powered-up unit. Marked at the `reachy-device` platform in
+`bazel/platform/BUILD.bazel`.

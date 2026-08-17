@@ -12,12 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  # A CI panic is read from the log or not at all — there is no rerunning it under
-  # a debugger.
-  RUST_BACKTRACE: 1
-
 jobs:
   # Named for its role rather than its contents: the required-status-check rule on
   # the branch embeds this string, so renaming it later silently makes that rule
@@ -36,41 +30,10 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      # rust-toolchain.toml names the channel and the components, so this resolves
-      # and installs exactly what a developer's machine uses. Doing it as an
-      # explicit step makes a failed install a failed step instead of a confusing
-      # failure inside the gate.
-      - name: Install Rust
-        run: rustup component add rustfmt clippy
-
-      # The workspace is at the repo root, so the default cache scope is correct
-      # and no explicit workspaces list is needed.
-      - uses: Swatinem/rust-cache@v2
-
-      # The gate's contents live in the root `check` target, not here, so the whole
-      # thing is reproducible locally on a fresh clone. shellcheck above is the only
-      # apt prerequisite: the serial port dependency is built without its udev-backed
-      # enumeration support, which is the only native library this workspace would
-      # otherwise need.
-      - run: make check
-
-  # The Clockwork lane. Separate from `check` for the same reason `make
-  # check-bazel` is separate from `make check`: it fetches and builds the pinned
-  # drop's whole graph, including a hermetic clang sysroot, which is minutes on
-  # a cold cache — and every run here is a cold cache, since nothing is carried
-  # between them. Left uncached deliberately: a Bazel output base does not fit
-  # in the per-repository cache budget, and a partially restored one is a build
-  # nobody can reproduce.
-  bazel:
-    name: bazel (Clockwork lane)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
       # The runner image ships no Bazel, and .bazelversion is only honoured by a
       # launcher that reads it. Pinned by version and checksum for the reason
-      # the gitleaks download below is: a release asset is mutable, and this
-      # binary decides what the rest of the job builds.
+      # the gitleaks download in the scrub job is: a release asset is mutable,
+      # and this binary decides what the rest of the job builds.
       - name: Install bazelisk
         env:
           BAZELISK_VERSION: 1.29.0
@@ -82,12 +45,21 @@ jobs:
           chmod +x "$RUNNER_TEMP/bazel"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
-      # The lane's contents live in the Makefile target, so this runs what a
-      # developer runs. The one added flag is the gate's whole reason for
-      # existing: --lockfile_mode=error refuses a MODULE.bazel.lock that module
-      # resolution would rewrite, so a graph resolving at versions nobody chose
-      # is a red build here instead of an untracked diff on somebody's machine.
-      - run: make check-bazel BAZEL_FLAGS=--lockfile_mode=error
+      # The gate's contents live in the root `check` target, not here, so the
+      # whole thing is reproducible locally on a fresh clone. shellcheck above is
+      # the only apt prerequisite: the Rust toolchain, the C++ sysroot and every
+      # third-party crate come out of the Bazel module graph.
+      #
+      # The one added flag is the gate's whole reason for existing here:
+      # --lockfile_mode=error refuses a MODULE.bazel.lock that module resolution
+      # would rewrite, so a graph resolving at versions nobody chose is a red
+      # build here instead of an untracked diff on somebody's machine.
+      #
+      # Left uncached deliberately: a Bazel output base does not fit in the
+      # per-repository cache budget, and a partially restored one is a build
+      # nobody can reproduce. Every run is a cold cache — the pinned Clockwork
+      # drop's whole graph, a hermetic clang sysroot among it.
+      - run: make check BAZEL_FLAGS=--lockfile_mode=error
 
   scrub:
     name: scrub

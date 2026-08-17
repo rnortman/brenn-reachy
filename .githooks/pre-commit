@@ -15,12 +15,10 @@ brenn-scrub staged
 # garbage and abort the commit under `set -e`.
 for var in $(compgen -v GIT_ || true); do unset "$var"; done
 
-# check-commit is both lanes; check is the Cargo lane alone, which cannot see a
-# .clk schema compile. The fallback is for historical checkouts: core.hooksPath
-# hooks run at whatever revision is checked out, and revisions from before
-# check-commit existed have no such target.
-if [ -f Makefile ] && grep -q '^check-commit:' Makefile; then
-    make check-commit
-elif [ -f Makefile ] && grep -q '^check:' Makefile; then
+# `check` is the whole gate: the shell scripts' self-checks and every Bazel
+# target, the .clk schema compiles among them. Guarded by a grep because
+# core.hooksPath hooks run at whatever revision is checked out, and a tree
+# without a Makefile is not one this hook invents a gate for.
+if [ -f Makefile ] && grep -q '^check:' Makefile; then
     make check
 fi

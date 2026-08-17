@@ -2,11 +2,10 @@
 #
 # The targets hold the contents of the gate, so both the pre-commit hook and CI
 # invoke one definition rather than two copies that drift, and the whole gate is
-# reproducible on a fresh clone. `check-commit` is what a commit must pass and
-# is the two lanes together; `check` and `check-bazel` are those lanes, kept
-# separate because CI runs them as two jobs and a developer's inner loop wants
-# them one at a time. The secret sweep is a separate target, and separate in CI
-# too: it scans content, not correctness, and answers a different question.
+# reproducible on a fresh clone. `check` is what a commit must pass and what CI
+# runs, one lane over the whole tree. The secret sweep is a separate target, and
+# separate in CI too: it scans content, not correctness, and answers a different
+# question.
 
 # Recipes run under bash with -e and pipefail, so a failing command anywhere in a
 # chain or a pipeline fails the target. Without this a broken step degrades into a
@@ -19,16 +18,14 @@ SHELL := /bin/bash
 .PHONY: help
 help:
 	@echo "Repo-root targets:"
-	@echo "  make check-commit  what a commit must pass: both lanes, the total of CI's two jobs"
-	@echo "  make check         the Cargo lane (shellcheck, fmt, clippy, tests) — as CI runs it"
-	@echo "  make check-bazel   the Bazel lane (Clockwork) — as CI runs it"
-	@echo "  make fix           auto-fix what the gate can fix (fmt + clippy --fix)"
+	@echo "  make check         what a commit must pass: shellcheck, script tests, bazel test"
+	@echo "  make fix           auto-fix what the gate can fix (rustfmt)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
 	@echo ""
-	@echo "Device targets — real hardware, no part of any gate. Need podman, and a"
+	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
 	@echo "REACHY_HOST naming a reachable unit:"
-	@echo "  make bench-build     the aarch64 binary, built in the pinned container"
+	@echo "  make bench-build     the aarch64 binary, cross-compiled by bazel"
 	@echo "  make bench-config    push the bench's configuration into the unit's RAM"
 	@echo "  make bench-run       build, push, run the bench on the unit (ARGS=...)"
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
@@ -84,70 +81,61 @@ test-scripts:
 	    "./$$script"; \
 	done < <(git ls-files -z '*.test.sh')
 
-# The whole gate. One workspace at the repo root, every crate a default member,
-# so --workspace and a bare invocation cover the same set.
-#
-# -D warnings on clippy and --check on fmt: this repo's style rules are not
-# advisory, and a warning that CI tolerates is a warning nobody reads.
+# The whole gate, one lane: the shell scripts' own checks, then every Bazel
+# target in the tree — the eight Rust crates with their tests, the `.clk` schema
+# compiles, the generated cog wrappers, and the deterministic-runner scenarios.
 #
 # The scripts go first: they are seconds of work, and a broken deploy script is
-# not something to discover after a full test run.
-.PHONY: check
-check: check-scripts test-scripts
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
-
-# The Bazel lane: everything Clockwork. Not a prerequisite of `check` — they
-# are two lanes over disjoint code, not two build systems racing — but part of
-# `check-commit` below, and so part of the commit gate.
+# not something to discover after a full test run. Sequential sub-makes rather
+# than prerequisites, because prerequisites are unordered and `make -j check`
+# would interleave the three — and the bazel refusal would land after the work it
+# is there to save.
 #
-# The Cargo lane still covers every library in crates/ on its own. What only
-# this lane covers is the Bazel build of those libraries and the cog system:
-# the `.clk` compiles, the generated wrappers, and the deterministic-runner
-# scenarios. A commit gate that cannot see those cannot see this repo's
-# schemas at all, which is how a non-building cogs/ tree got committed twice in
-# one round. The cold-cache cost — the pinned Clockwork drop's whole dependency
-# graph, a hermetic clang sysroot among it, minutes and gigabytes — is paid
-# once per machine; on a warm cache the lane is seconds.
-#
-# --config=lint adds the clippy and rustfmt aspects over the Bazel-built Rust,
-# which is the same denial of warnings the Cargo lane makes.
+# --config=lint adds the clippy and rustfmt aspects over every Rust target, with
+# warnings denied. A warning the gate tolerates is a warning nobody reads.
 #
 # BAZEL_FLAGS is how CI adds --lockfile_mode=error to the same invocation
 # developers run: locally the lockfile refreshes as a side effect of a build,
 # and the gate is the place that has to refuse the refreshed bytes rather than
 # absorb them. One target, two flag sets, no second copy of the command.
+#
+# The cold-cache cost — the pinned Clockwork drop's whole dependency graph, a
+# hermetic clang sysroot among it, minutes and gigabytes — is paid once per
+# machine; on a warm cache the lane is seconds.
 BAZEL_FLAGS ?=
 
-.PHONY: check-bazel
-check-bazel:
+
+# The refusal every Bazel-backed target here shares, in one place: a target that
+# needs bazel asks for this first and gets the same explanation, rather than each
+# one carrying its own copy.
+#
+# tools/build-bench.sh carries the one deliberate second copy: it is a script
+# run outside make, and its REACHY_BAZEL knob gives it a third line to say.
+.PHONY: require-bazel
+require-bazel:
 	@command -v bazel >/dev/null 2>&1 || { \
-	    echo "bazel not found on PATH — the Clockwork lane cannot run." >&2; \
+	    echo "bazel not found on PATH." >&2; \
 	    echo "Install bazelisk; .bazelversion pins the Bazel release it fetches." >&2; \
 	    exit 1; \
 	}
+
+.PHONY: check
+check:
+	@$(MAKE) require-bazel
+	@$(MAKE) check-scripts
+	@$(MAKE) test-scripts
 	bazel test --config=lint $(BAZEL_FLAGS) //...
 
-# What a commit must pass: both lanes. `check` is the Cargo lane, `check-bazel`
-# is everything Clockwork — including the .clk schema compiles that `check`
-# cannot see, which is how a non-building cogs/ tree got committed twice.
+# Auto-fix, which means formatting: rules_rust's rustfmt runner formats every
+# Rust target in the tree with the pinned toolchain's rustfmt, which is the same
+# formatter the gate's rustfmt aspect checks with. Review the diff before
+# committing.
 #
-# Sequential sub-makes rather than prerequisites so the cheap lane refuses first
-# even under -j. CI still invokes the two lanes as two jobs; the definitions are
-# shared.
-.PHONY: check-commit
-check-commit:
-	$(MAKE) check
-	$(MAKE) check-bazel
-
-# Auto-fix, scoped to exactly what `check` enforces, so `make fix && make check`
-# is always a clean cycle. --allow-dirty/--allow-staged so it is usable mid-edit;
-# review the diff before committing.
+# Clippy findings are fixed by hand from the gate's output. There is no Bazel
+# equivalent of `clippy --fix`, and the gate never depended on one.
 .PHONY: fix
-fix:
-	cargo fmt --all
-	cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets
+fix: require-bazel
+	bazel run @rules_rust//tools/rustfmt:target_aware_rustfmt
 
 # Wire git at the tracked hooks directory and report any missing tooling.
 # Idempotent; run once per clone.
@@ -169,7 +157,7 @@ setup-hooks:
 	    echo "Install the release brenn-scrub pins; it refuses to run against any other."; \
 	}
 	@command -v bazel >/dev/null 2>&1 || { \
-	    echo "bazel not found on PATH — the Clockwork half of the commit gate will not run."; \
+	    echo "bazel not found on PATH — the commit gate will not run."; \
 	    echo "Install bazelisk; .bazelversion pins the Bazel release it fetches."; \
 	}
 	@echo "setup-hooks: done."
@@ -181,7 +169,7 @@ scrub-tree:
 # ---------------------------------------------------------------------------
 # The device path: building the bench for the Reachy Mini and running it there.
 #
-# None of this is part of the gate. It needs podman to build and a reachable
+# None of this is part of the gate. It needs bazel to build and a reachable
 # unit to run, and it exists because the device cannot build anything itself —
 # brenn-os carries no compiler, and its flash is not somewhere a toolchain gets
 # installed.
@@ -207,7 +195,7 @@ BENCH_RECORDS ?= .local/records
 
 # Refuse before doing anything rather than ssh to nowhere. A prerequisite of
 # every target that talks to a device, listed first so the refusal comes before
-# a container build.
+# a build.
 .PHONY: bench-host
 bench-host:
 	@[ -n "$(REACHY_HOST)" ] || { \
@@ -219,8 +207,8 @@ bench-host:
 	    exit 1; \
 	}
 
-# The aarch64 binary, built in the pinned container. Needs podman; needs no
-# device.
+# The aarch64 binary, cross-compiled for the device platform. Needs bazel; needs
+# no device.
 .PHONY: bench-build
 bench-build:
 	tools/build-bench.sh

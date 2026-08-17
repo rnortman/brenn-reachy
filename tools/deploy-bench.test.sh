@@ -166,7 +166,7 @@ assert_status "a binary newer than the newest commit runs" 0 "$(status_of "$resu
 assert_contains "the run reaches the device" "$(calls)" "reachy-bench"
 
 assert_contains "the freshness question is asked of the workspace paths" "$(calls)" \
-	"git -C ${repo} log -1 --format=%ct -- crates containers Cargo.toml Cargo.lock rust-toolchain.toml"
+	"git -C ${repo} log -1 --format=%ct -- crates bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion tools/build-bench.sh"
 
 build_binary_at "$before"
 result=$(deploy unit --run selftest)

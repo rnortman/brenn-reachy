@@ -62,19 +62,15 @@ assert_lacks() {
 	fi
 }
 
-# Whole-line matching, for the cases that must tell `make check` from `make
-# check-commit`: one is a prefix of the other, so a substring search cannot say
-# which of them ran.
-lacks_line() {
-	! printf '%s\n' "$1" | grep -qxF -- "$2"
-}
-
-assert_lacks_line() {
-	local label=$1 haystack=$2 line=$3
-	if lacks_line "$haystack" "$line"; then
+# A whole line, not a substring: `check` is a prefix of every other target name
+# the Makefile could grow, so `make check-commit` or `make check foo` must not
+# satisfy the assertion that the hook asks for the gate.
+assert_records_line() {
+	local label=$1 needle=$2
+	if grep -qxF -- "$needle" "$CALLS"; then
 		pass "$label"
 	else
-		fail "$label" "expected NOT to find the line: ${line}" "in:" "$haystack"
+		fail "$label" "expected a line reading exactly: ${needle}" "in:" "$(calls)"
 	fi
 }
 
@@ -157,19 +153,17 @@ calls() { cat -- "$CALLS"; }
 # The gate the hook asks for
 # ---------------------------------------------------------------------------
 
-write_makefile check check-bazel check-commit
-status=$(run_hook)
-assert_status "a tree that can run both lanes commits" 0 "$status"
-assert_contains "the commit gate is both lanes" "$(calls)" "make check-commit"
-assert_lacks_line "and not the Cargo lane alone" "$(calls)" "make check"
-
-# A checkout from before check-commit existed: core.hooksPath hooks run at
-# whatever revision is checked out, so the older target is still reachable.
 write_makefile check
 status=$(run_hook)
-assert_status "a historical checkout still commits" 0 "$status"
-assert_contains "and falls back to the lane it has" "$(calls)" "make check"
-assert_lacks_line "without asking for a target that is not there" "$(calls)" "make check-commit"
+assert_status "a tree that can run the gate commits" 0 "$status"
+assert_records_line "the commit gate is the check target and nothing else" "make check"
+
+# A tree whose Makefile has no check target: the hook asks for nothing rather
+# than failing on a target that is not there.
+write_makefile scrub-tree
+status=$(run_hook)
+assert_status "a Makefile without the gate still commits" 0 "$status"
+assert_lacks "and no gate was asked for" "$(calls)" "make"
 
 # No Makefile at all: the scrub still runs, and nothing else is invented.
 rm -f -- "${repo}/Makefile"
@@ -182,7 +176,7 @@ assert_lacks "and no gate was invented" "$(calls)" "make"
 # The refusals
 # ---------------------------------------------------------------------------
 
-write_makefile check check-commit
+write_makefile check
 MAKE_STATUS=1
 status=$(run_hook)
 assert_status "a failing gate fails the commit" 1 "$status"

@@ -1,0 +1,28 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The serial bus layer for the Reachy Mini servo chain: transactions, retry
+# policy, and error taxonomy. The one crate here that owns a file descriptor,
+# and the seam every layer above it reaches the machine through.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-bus` is not a Rust identifier.
+rust_library(
+    name = "reachy_bus",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crates/dxl-proto:dxl_proto",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:libc",
+        "@brenn_reachy_crates//:serialport",
+        "@brenn_reachy_crates//:thiserror",
+    ],
+)
+
+# The suite runs against the port seam's in-memory implementation, so it opens
+# no device node and needs no machine.
+rust_test(
+    name = "reachy_bus_test",
+    size = "small",
+    crate = ":reachy_bus",
+)

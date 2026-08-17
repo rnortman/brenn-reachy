@@ -31,6 +31,10 @@ use crate::pump::Clock;
 /// A rail comfortably over the arm floor, in the register's tenths of a volt.
 const HEALTHY_RAIL: u16 = 118;
 
+/// The variable naming the directory the hardware trace recordings arrive in.
+/// The test target sets it; nothing else reads it.
+const TRACE_FIXTURES_ENV: &str = "REACHY_BENCH_TRACE_FIXTURES";
+
 /// A path in the system temporary directory that nothing else in this run is
 /// using, ending in `name`.
 ///
@@ -50,18 +54,26 @@ pub(crate) fn scratch_path(name: &str) -> PathBuf {
 /// A run recorded on real hardware, read back from the fixture of that name.
 ///
 /// The recordings are checked in beside the crate, one file per bench session
-/// and one or more runs per file; `crates/reachy-bench/fixtures/traces` says
-/// what each holds. They are the measurements this machine's guards are sized
-/// against, so replaying them is how a change that would false-trip a validated
-/// gesture — or miss the one collision on record — fails here rather than on
-/// the machine.
+/// and one or more runs per file; their own `README.md` says what each holds.
+/// They are the measurements this machine's guards are sized against, so
+/// replaying them is how a change that would false-trip a validated gesture —
+/// or miss the one collision on record — fails here rather than on the machine.
 ///
-/// Panics rather than answers: a fixture that will not read is a broken
-/// checkout, not a test case.
+/// The directory is not spelled here: `TRACE_FIXTURES_ENV` carries it, set by
+/// the test target beside the `data` attribute that puts the files in runfiles,
+/// so the two halves stay in one place. Its value is relative to the runfiles
+/// root, which is a test's working directory.
+///
+/// Panics rather than answers: neither a missing fixture nor a missing
+/// environment is a test case.
 pub(crate) fn trace_fixture(name: &str) -> crate::trace::metrics::Trace {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/traces")
-        .join(format!("{name}.csv"));
+    let dir = std::env::var(TRACE_FIXTURES_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{TRACE_FIXTURES_ENV} is unset: the test target has to name the trace fixture \
+             directory beside the data attribute that supplies it"
+        )
+    });
+    let path = PathBuf::from(dir).join(format!("{name}.csv"));
     match crate::trace::metrics::Trace::read(&path) {
         Ok(trace) => trace,
         Err(error) => panic!("the {name} trace fixture reads: {error}"),

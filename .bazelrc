@@ -23,9 +23,9 @@
 # Mirrored from the pinned drop
 # ---------------------------------------------------------------------------
 
-# Local default is to refresh the lockfile. The CI Bazel job passes
-# --lockfile_mode=error on the command line, which overrides this, so resolution
-# drift is a red build there rather than a quiet diff here.
+# Local default is to refresh the lockfile. CI's check job runs
+# `make check BAZEL_FLAGS=--lockfile_mode=error`, and that command line overrides
+# this, so resolution drift is a red build there rather than a quiet diff here.
 common --lockfile_mode=update
 
 build --@curl//:ssl_lib="openssl"
@@ -71,10 +71,17 @@ common --incompatible_disable_autoloads_in_main_repo
 # Ours
 # ---------------------------------------------------------------------------
 
-# The Rust lint lanes, as aspects over whatever targets are asked for. Behind a
+# A panicking test says where from. Test actions get a controlled environment —
+# --incompatible_strict_action_env above, and only what --test_env names crosses
+# over — so a backtrace has to be asked for here or the log carries the "run
+# with RUST_BACKTRACE=1" note and nothing else. On CI that note is all there is:
+# there is no rerunning it under a debugger.
+common --test_env=RUST_BACKTRACE=1
+
+# The Rust lint checks, as aspects over whatever targets are asked for. Behind a
 # config rather than on by default: an aspect that reruns clippy and rustfmt on
-# every `bazel build` taxes the edit-compile loop, and the Cargo lane's
-# `make check` is where a library author meets a lint first.
+# every `bazel build` taxes the edit-compile loop, so `make check` turns them on
+# and an inner-loop build does not. They are the only lint opinion in the tree.
 #
 # Warnings are denied. A warning the gate tolerates is a warning nobody reads.
 build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect

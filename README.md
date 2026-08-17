@@ -11,6 +11,21 @@ bus. This repository is the control stack for that mechanism: the wire protocol,
 the kinematics, the motion shaping, the bus layer, and a bench binary that drives
 a real unit.
 
+## Building it
+
+Bazel, and only Bazel. `make check` is the whole gate — the shell scripts' own
+self-checks, then `bazel test --config=lint //...` over every crate, every cog
+and every lint aspect. There are no Cargo manifests and nothing here uses
+`cargo` or `rustup`: the compiler, the third-party crates and the C++ sysroot all
+come out of the module graph, so a fresh clone needs bazelisk and shellcheck and
+nothing else. The device binary is a cross-compile of the same targets
+(`make bench-build`; `docs/bench-runbook.md`).
+
+An editor wanting a project model gets one from
+`bazel run @rules_rust//tools/rust_analyzer:gen_rust_project`, which writes the
+`rust-project.json` rust-analyzer reads instead of cargo metadata. No gate uses
+it.
+
 ## The shape of the code
 
 One constraint decides the whole design: **this code does not own the execution

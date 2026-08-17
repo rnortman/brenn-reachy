@@ -1,12 +1,12 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# The wire codec, built for Bazel because every cog body that touches a driver
-# channel parses bytes with it. Same sources Cargo builds from the manifest
-# next door.
+# The wire codec: the byte layout of a driver channel's frames. Every cog body
+# that touches one parses bytes with it, and a Python checker asserts the same
+# layout from the other side.
 #
 # `golden.json` is compile data rather than a runtime file: the crate pulls it
-# in with `include_str!`, so both build lanes read one copy and neither needs a
-# manifest directory or a runfiles path to find it. The Python checker takes the
+# in with `include_str!`, so neither the Rust crate nor the Python checker needs
+# a runfiles path to find it. The Python checker takes the
 # same file as a data dependency, which is what makes it a cross-language gate
 # rather than two fixtures.
 #
@@ -19,13 +19,11 @@ rust_library(
     visibility = ["//visibility:public"],
 )
 
-# The layout this crate states is spoken by a driver process, a cog body and a
-# Python checker, so it is checked in the lane that builds the cog too, not only
-# in Cargo. Pure arithmetic over byte arrays: no I/O, no clock.
+# Pure arithmetic over byte arrays: no I/O, no clock.
 #
-# `reachy_motion` is a dependency of the test and not of the library, mirroring
-# the Cargo dev-dependency: one assertion compares the row count and mask bits
-# stated here against the crate that owns `JointId`.
+# `reachy_motion` is a dependency of the test and not of the library: one
+# assertion compares the row count and mask bits stated here against the crate
+# that owns `JointId`.
 rust_test(
     name = "reachy_wire_test",
     size = "small",

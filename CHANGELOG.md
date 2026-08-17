@@ -22,3 +22,25 @@ Nothing has been released, and nothing here has driven a motor.
   one I/O layer), and `reachy-bench` (bench binary and self-test registry). Each
   is a skeleton at this point — the module headers state the contract each will
   hold to.
+
+### Changed
+
+- **Bazel is the only build system.** Every crate is a `rust_library` with its
+  tests, `make check` is one lane (`bazel test --config=lint //...`) and CI one
+  job, and the device binary is a cross-compile against the hermetic aarch64
+  sysroot the pinned Clockwork drop brings — `--platforms=//bazel/platform:reachy-device`
+  in place of cargo inside an emulated arm64 container. Nothing in the dev loop
+  or on a runner invokes `cargo` or `rustup`, and the pinned `RUST_VERSION` in
+  `MODULE.bazel` is the single compiler and the single statement of the edition.
+
+### Removed
+
+- **The Cargo lane.** The workspace manifest, every crate manifest,
+  `Cargo.lock`, `rust-toolchain.toml`, the `containers/bench-builder` image
+  definition, and the `check-bazel`/`check-commit` split. Third-party versions
+  are now stated once as `crate.spec` entries in `MODULE.bazel` and pinned by
+  `MODULE.bazel.lock`. `make fix` formats only: `clippy --fix` has no Bazel
+  equivalent, and clippy findings are fixed by hand from the gate's output.
+  With the manifests go the ways cargo consumes these crates: there is nothing
+  for a `git = "..."` dependency or a `cargo publish` to resolve. A consumer
+  builds them with Bazel, or pins a revision from before this change.
