@@ -1051,5 +1051,14 @@ schema MoverState
         // restarts the wire sequence at zero; this counter is what tells that
         // apart from a commander that restarted.
         #11 refused_readback: UInt64;
+
+        // How many times an epoch this cog had not answered yet was answered by
+        // a posture step, all run. An epoch stands until a posture step covers
+        // an instant, and one execution sees only the latest schedule, so two
+        // bumps published inside one gap are one answer here: the total counts
+        // epoch changes this cog observed, not epochs a session published, and
+        // subtracting it from a publish count says nothing. Whether the epoch
+        // published now is outstanding is `schedule_epoch_seen` against it.
+        #12 epochs_answered: UInt64;
     }
 }

@@ -307,15 +307,25 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         }
         let state = state.as_mut().expect("armed a moment ago if not before");
 
-        let asked = schedule.and_then(|schedule| desired.at(schedule, nominal));
-        let retarget = schedule.is_some_and(|schedule| schedule.epoch() != epoch_seen);
-        let command = asked
-            .filter(|asked| retarget || *asked != desired)
-            .map(|asked| {
-                desired = asked;
-                asked.command(&settings)
-            });
-        epoch_seen = schedule.map_or(epoch_seen, SessionSchedule::epoch);
+        // A retarget is spent by the step that answers it, not by the schedule
+        // arriving, so it cannot be lost to the gap it happens to land in: a
+        // bumped epoch stands, sample over sample and across the slot, until a
+        // posture step covers an instant and the machine is sent somewhere. One
+        // site, so the dispatch and the consumption cannot come apart.
+        let command = schedule.and_then(|schedule| {
+            let retarget = schedule.epoch() != epoch_seen;
+            desired
+                .at(schedule, nominal)
+                .filter(|asked| retarget || *asked != desired)
+                .map(|asked| {
+                    desired = asked;
+                    epoch_seen = schedule.epoch();
+                    if retarget {
+                        counters.epochs_answered += 1;
+                    }
+                    asked.command(&settings)
+                })
+        });
 
         let before_mode = state.mode();
         let mut out = TickOutputs::default();
@@ -971,7 +981,7 @@ mod tests {
 
 counters! {
     /// The run's totals, as the pose estimator keeps them.
-    PoseCounters of PoseState, PoseSignals<'_> {
+    PoseCounters of PoseState, PoseSignals<'_>, crossing the_pose_totals_cross_their_slot {
         /// Solves that found no pose.
         fk_failures / set_fk_failures,
         /// Datagrams the codec refused.
@@ -983,7 +993,7 @@ counters! {
 
 counters! {
     /// The run's totals, as the decision tick keeps them.
-    MoverCounters of MoverState, MoverSignals<'_> {
+    MoverCounters of MoverState, MoverSignals<'_>, crossing the_mover_totals_cross_their_slot {
         /// Goal datagrams published.
         goals_published / set_goals_published,
         /// Reports raised.
@@ -1000,5 +1010,10 @@ counters! {
         /// Times this cog's own last goal datagram would not decode, so the
         /// stream restarted its sequence.
         refused_readback / set_refused_readback,
+        /// Times an epoch this cog had not answered yet was answered by a
+        /// posture step. One execution sees only the latest schedule, so bumps
+        /// coalesced by a gap count once: this counts epoch changes observed,
+        /// not epochs the session published.
+        epochs_answered / set_epochs_answered,
     }
 }

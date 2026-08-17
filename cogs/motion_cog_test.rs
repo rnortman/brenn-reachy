@@ -31,6 +31,7 @@ use reachy_motion::joints::{JointId, JointSet};
 use reachy_motion::snap::PoseSnapshotError;
 use reachy_motion::tick::Mode;
 use reachy_wire::{GoalSetpoint, JOINT_COUNT, PoseSample};
+use std::time::Duration;
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -745,6 +746,14 @@ impl Mover {
         (0..cycles).map(|_| self.step()).collect()
     }
 
+    /// Which cycle from `T0` the last sample published was.
+    ///
+    /// The spans a schedule carries are counted from `T0`, so this is what a
+    /// case saying "the next few samples" has to say it in.
+    fn cycles_from_start(&self) -> i64 {
+        (self.now - T0) / PERIOD
+    }
+
     /// The angles the machine is at.
     fn at(&self, joint: JointId) -> f64 {
         self.present[joint.index().expect("a bus row")]
@@ -946,6 +955,12 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
         !mover.cog.state_ctrl().armed(),
         "the state dies with the engagement",
     );
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        1,
+        "a disengaged sample answers nothing, so it spends no epoch either",
+    );
+    assert_eq!(mover.cog.state_ctrl().epochs_answered(), 1);
 
     // Engaging again builds a fresh state from where the machine now stands,
     // rather than resuming the one that ended.
@@ -957,6 +972,16 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
     assert!(
         matches!(snap.mode, Mode::Moving { .. }),
         "a fresh engagement dispatches the posture its schedule names",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        3,
+        "and that dispatch is what consumes the epoch it came under",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        2,
+        "the engagement's epoch, answered once and not again by the re-arm",
     );
 }
 
@@ -1242,6 +1267,261 @@ fn a_repeated_schedule_dispatches_nothing_new() {
     }
     let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
     assert_eq!(snap.mode, Mode::Holding, "no move was started");
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        1,
+        "only the schedule that engaged the machine; a sample that is not a \
+         retarget counts nothing",
+    );
+}
+
+/// Two posture steps under one epoch are two dispatches and one epoch answered:
+/// the step boundary sends the machine somewhere with the epoch unchanged, which
+/// is what says the total counts epochs rather than dispatches.
+#[test]
+fn two_posture_steps_under_one_epoch_answer_it_once() {
+    // The first step ends at the cycle from `T0` that the second one starts on,
+    // a step's end being exclusive, and it is longer than the up move so the
+    // machine is holding when the boundary arrives.
+    const BOUNDARY: i64 = 45;
+    let mut mover = Mover::new();
+    mover.schedule(
+        true,
+        1,
+        &[(BOUNDARY, Some(Posture::UP)), (1000, Some(Posture::STOW))],
+    );
+
+    let up = mover.run(usize::try_from(BOUNDARY - 1).expect("cycles inside the first step"));
+    assert!(reports(&up).is_empty(), "a plain stand-up refuses nothing");
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert_eq!(snap.mode, Mode::Holding, "the up move is over");
+    assert_eq!(mover.cog.state_ctrl().epochs_answered(), 1);
+    assert_eq!(mover.cog.state_ctrl().schedule_epoch_seen(), 1);
+
+    // Across the boundary, on the same epoch: the posture differs, so the step
+    // is dispatched by the posture rather than by a retarget.
+    let stowing = mover.run(3);
+    assert!(
+        stowing.iter().all(|cycle| cycle.goal.is_some()),
+        "a step boundary is a new path, not a gap in the stream",
+    );
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert!(
+        matches!(snap.mode, Mode::Moving { .. }),
+        "the second step was dispatched",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        1,
+        "a second dispatch under an epoch already answered counts nothing",
+    );
+    assert_eq!(mover.cog.state_ctrl().schedule_epoch_seen(), 1);
+}
+
+/// Two bumps that both land inside one gap are one answer: an execution sees
+/// only the latest schedule, so the first epoch is never observed at all. What
+/// the total says is which epoch changes this cog saw answered -- not how many a
+/// session published, which is why subtracting it from a publish count is not a
+/// count of outstanding retargets.
+#[test]
+fn two_bumps_in_one_gap_are_answered_once() {
+    let mut mover = standing_up();
+    mover.run(60);
+    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+
+    // A keep span over the samples that follow, then the posture the machine is
+    // already on -- the shape of the surviving-bump case, with a second bump
+    // published inside the same span.
+    const KEEP: usize = 6;
+    let keep_until = mover.cycles_from_start() + i64::try_from(KEEP).expect("six cycles") + 1;
+    let spans = [(keep_until, None), (1000, Some(Posture::UP))];
+    mover.schedule(true, 2, &spans);
+    mover.run(3);
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        1,
+        "the first bump is outstanding",
+    );
+
+    mover.schedule(true, 3, &spans);
+    let keeping = mover.run(KEEP - 3);
+    for cycle in &keeping {
+        assert_eq!(
+            cycle.goal.expect("still commanded").setpoint.targets,
+            arrived,
+            "a keep span dispatches nothing, whatever the epoch says",
+        );
+    }
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        1,
+        "two bumps published, neither answered yet",
+    );
+
+    let moving = mover.run(2);
+    assert!(
+        moving.iter().all(|cycle| cycle.goal.is_some()),
+        "the stream never broke",
+    );
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert!(
+        matches!(snap.mode, Mode::Moving { .. }),
+        "the surviving bump was answered",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        3,
+        "the epoch the step answered is the latest one, the only one it saw",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        2,
+        "one answer for the two bumps: the superseded one was never observed",
+    );
+}
+
+/// A schedule republished under a bumped epoch is the session saying "go again",
+/// and it is dispatched even when it names the posture the machine is already
+/// on: the epoch is the only thing that differs, so nothing else could carry it.
+#[test]
+fn an_epoch_bump_alone_dispatches_a_fresh_move() {
+    let mut mover = standing_up();
+    mover.run(60);
+    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert_eq!(snap.mode, Mode::Holding, "the move is over before the bump");
+    assert_eq!(mover.cog.state_ctrl().schedule_epoch_seen(), 1);
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        1,
+        "the schedule that engaged the machine is the first epoch answered",
+    );
+
+    // The same step and the same posture at one epoch higher, covering the
+    // instants the samples that follow name.
+    mover.schedule(true, 2, &[(1000, Some(Posture::UP))]);
+    let again = mover.run(3);
+    assert!(reports(&again).is_empty(), "a retarget refuses nothing");
+
+    // The setpoints a same-posture retarget plans are the ones the machine was
+    // already holding, so what these cycles say is that the stream carried them
+    // without a break: a retarget that dropped a cycle would trip the driver's
+    // dead-man mid-session.
+    for cycle in &again {
+        assert_eq!(
+            cycle
+                .goal
+                .expect("a retarget is a new path, not a gap")
+                .setpoint
+                .targets,
+            arrived,
+            "the machine is asked for where it already is, every cycle",
+        );
+    }
+
+    // A fresh path, not the finished move's remains: the first sample after the
+    // bump started one, so the elapsed time is the samples since. The machine is
+    // already at UP, so the setpoints a same-posture retarget produces are the
+    // ones it was already holding -- the move's own clock is what says a path
+    // exists at all.
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert_eq!(
+        snap.mode,
+        Mode::Moving {
+            elapsed: Duration::from_nanos(u64::try_from(2 * PERIOD).expect("two cycles")),
+        },
+        "the bumped epoch is the whole reason a move was started",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        2,
+        "and the dispatch consumed it",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        2,
+        "and the epoch a step answered is counted",
+    );
+
+    // And the path is the configured length, so a session watching the mode
+    // sees a whole move rather than a mode word that clears on the next tick.
+    let length = usize::try_from(UP_NS / PERIOD).expect("a move of whole cycles");
+    mover.run(length - 3);
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert!(
+        matches!(snap.mode, Mode::Moving { .. }),
+        "one cycle short of the move's length is still moving",
+    );
+    mover.step();
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert_eq!(
+        snap.mode,
+        Mode::Holding,
+        "and the move is over on its length"
+    );
+}
+
+/// A bumped epoch that arrives during a gap is not spent there: the schedule
+/// arriving is not the schedule answering, so the retarget stands until a
+/// posture step covers an instant. Otherwise whether a session's "go again" took
+/// effect would turn on how its publication happened to line up with a step
+/// boundary.
+#[test]
+fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
+    let mut mover = standing_up();
+    mover.run(60);
+    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+
+    // A keep span over the samples that follow, then the posture the machine is
+    // already on. The bump is published under the keep span, which asks for
+    // nothing. The span is stated from where the machine now stands rather than
+    // hand-counted from `T0`, and it ends one cycle past the last sample it is
+    // to cover, a step's end being exclusive.
+    const KEEP: usize = 4;
+    let keep_cycles = i64::try_from(KEEP).expect("four cycles");
+    let keep_until = mover.cycles_from_start() + keep_cycles + 1;
+    mover.schedule(true, 2, &[(keep_until, None), (1000, Some(Posture::UP))]);
+    let keeping = mover.run(KEEP);
+    for cycle in &keeping {
+        assert_eq!(
+            cycle.goal.expect("still commanded").setpoint.targets,
+            arrived,
+            "a keep span dispatches nothing, whatever the epoch says",
+        );
+    }
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        1,
+        "the bump is outstanding, not consumed by the gap",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        1,
+        "one epoch answered so far, which is what says the bump is outstanding",
+    );
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert_eq!(snap.mode, Mode::Holding, "nothing was dispatched");
+
+    let moving = mover.run(2);
+    assert!(
+        moving.iter().all(|cycle| cycle.goal.is_some()),
+        "the stream never broke",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().schedule_epoch_seen(),
+        2,
+        "the step that answered is what consumed it",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        2,
+        "and the answer is what counted it",
+    );
+    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    assert!(
+        matches!(snap.mode, Mode::Moving { .. }),
+        "the retarget outlived the gap it landed in",
+    );
 }
 
 /// A step that keeps the base holds whatever posture is already commanded, and

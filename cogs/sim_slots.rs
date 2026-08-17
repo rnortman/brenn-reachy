@@ -71,7 +71,7 @@ counters! {
     /// crate which depends, through the cog bodies, on this one. So the totals
     /// cross the slot here and the change-guarded report is written in the cog
     /// body, where the type is reachable.
-    Counters of SimState {
+    Counters of SimState, crossing the_run_totals_cross_the_slot {
         /// Goals written to the modelled servos.
         goals_executed / set_goals_executed,
         /// Goals refused because the queue was full.

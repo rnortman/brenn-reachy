@@ -716,11 +716,19 @@ impl PoseRead for SeedRef<'_> {
 /// crate the generated cog crate depends on, which therefore cannot name it: the
 /// totals cross the slot here and the report is written where the type is
 /// reachable.
+///
+/// The `crossing` clause names the round-trip case this emits into the calling
+/// crate's test build, and is required so that a totals type cannot be declared
+/// without one. The case is generated rather than written because the field list
+/// is here: a pair declared with each other's setters compiles, and only a
+/// distinct value in every field shows what it corrupts -- so the values are
+/// counted out over the same repetition that declares the fields, and no caller
+/// can hand two fields the same one.
 #[macro_export]
 macro_rules! counters {
     (
         $(#[$totals_doc:meta])*
-        $name:ident of $slot:ty {
+        $name:ident of $slot:ty, crossing $crossing:ident {
             $($(#[$field_doc:meta])* $field:ident / $set:ident),+ $(,)?
         }
     ) => {
@@ -742,17 +750,33 @@ macro_rules! counters {
                 $(state.$set(self.$field);)+
             }
         }
+
+        /// Every total crosses the slot as itself: a distinct value in each
+        /// field, stored, and read back field for field.
+        #[cfg(test)]
+        #[test]
+        fn $crossing() {
+            let mut totals = $name::default();
+            let mut nth = 0u64;
+            $(
+                nth += 1;
+                totals.$field = nth;
+            )+
+            let mut state = <$slot>::new();
+            totals.store(&mut state);
+            assert_eq!($name::read(&state), totals);
+        }
     };
 
     (
         $(#[$totals_doc:meta])*
-        $name:ident of $slot:ty, $signals:ty {
+        $name:ident of $slot:ty, $signals:ty, crossing $crossing:ident {
             $($(#[$field_doc:meta])* $field:ident / $set:ident),+ $(,)?
         }
     ) => {
         $crate::counters! {
             $(#[$totals_doc])*
-            $name of $slot {
+            $name of $slot, crossing $crossing {
                 $($(#[$field_doc])* $field / $set),+
             }
         }

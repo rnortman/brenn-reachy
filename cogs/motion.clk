@@ -327,6 +327,18 @@ cog Mover
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
+
+        // How many times an epoch this cog had not answered yet was answered by
+        // a posture step. Counted per epoch value the cog saw, and the schedule
+        // channel is latest-wins, so bumps superseded before an execution are
+        // never seen and never counted -- this is a run total, not a subtraction
+        // against how many epochs a session published. Whether the epoch
+        // published now has been answered is `schedule_epoch_seen` against it.
+        epochs_answered: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
     }
 
     inputs

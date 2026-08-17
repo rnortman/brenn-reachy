@@ -207,7 +207,9 @@ rust_library(
 # execution publishes. In-crate rather than beside the wrapper cases next door,
 # because a machine driven through the wrapper cannot reach every outcome the
 # tick reports -- three of the four ways a command is refused, one of the two
-# ways a move is abandoned, and any two outcomes arriving on the same tick.
+# ways a move is abandoned, and any two outcomes arriving on the same tick. The
+# `counters!` round-trip cases land here too: the macro emits them beside the
+# totals it declares, which is this crate.
 rust_test(
     name = "motion_cogs_test",
     size = "small",
@@ -574,6 +576,15 @@ rust_library(
         "//crates/reachy-motion:reachy_motion",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
+)
+
+# The crate's own cases: the `counters!` round-trip the macro emits beside the
+# totals it declares, which only exists in a test build of the crate the totals
+# are declared in.
+rust_test(
+    name = "sim_slots_test",
+    size = "small",
+    crate = ":sim_slots",
 )
 
 clk(

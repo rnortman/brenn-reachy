@@ -338,8 +338,10 @@ the output log as channels -- carrying, at this drop, no messages at all over a
 five-second S1 run. So neither half of the surface is covered: not that a total
 reaches the group, and not that each total reaches the signal named for it
 (`counters!` and `sim_cogs::signal` reuse the state slot's setter identifier, so
-two totals declared with each other's setter names compile and round-trip
-through the state slot, which is what every existing assertion reads). Reading
+two totals declared with each other's setter names compile; the slot crossing is
+now pinned field for field by the round-trip case `counters!` emits, which leaves
+unproven that a group setter reaches the signal named for it in the `.clk`, that
+any value reaches the output log, and the hand pairing in `sim_cogs::signal`). Reading
 one takes a Rust type bound to a group's generated schema, which
 `rust_clk_module` is not established to emit; whether the emptiness is the
 policy's reporting window, the run's length, or a drop limitation is the first
