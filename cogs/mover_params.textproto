@@ -1,0 +1,23 @@
+# The decision tick's configuration, loaded once at process setup.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.MoverParams`, which the
+# compiler generates from the `MoverParams` schema in `config.clk`. Read as it
+# is: the box binds it by path, and the casing converts it to the message the
+# dial hands the cog.
+
+# Date each goal two cycles ahead of the sample that decided it. That is the
+# slack the whole loop gets between a pose being read and the answer having to
+# be on the bus, and it is comfortably inside the driver's queue.
+lag_k: 2
+
+# The bus cycle: 20 ms, which is the grid the simulated driver's samples sit on
+# and the unit `lag_k` counts in. The two have to agree -- a goal dated in
+# cycles of a length the driver does not run on lands at the wrong instant.
+period_ns: 20000000
+
+# 0.8 s to stand up.
+up_duration_ns: 800000000
+
+# 2.0 s to stow. Longer than the way up: stowing is how every session ends and
+# it is done gently.
+stow_duration_ns: 2000000000

@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The motion library, built for Bazel so a Clockwork cog body can host its
+# per-tick control step. Same sources Cargo builds from the manifest next door.
+#
+# The unit tests run in both lanes. This crate reads no files and takes no
+# clock, so the suite is portable between them, and it is the crate a cog body
+# hosts the per-tick control step out of -- the Bazel lane compiling it and not
+# running it would leave the hosted library untested on the side that hosts it.
+# reachy-kin's suite is Cargo-only for a reason given in its own BUILD file.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-motion` is not a Rust identifier.
+rust_library(
+    name = "reachy_motion",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crates/reachy-kin:reachy_kin",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:thiserror",
+    ],
+)
+
+rust_test(
+    name = "reachy_motion_test",
+    # Hundreds of pure-arithmetic cases over the trajectory shaper and the tick;
+    # no I/O, no clock, no sleep anywhere in the crate.
+    size = "small",
+    crate = ":reachy_motion",
+)

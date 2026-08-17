@@ -1,10 +1,12 @@
 # Repo-root Makefile — the check gate, the tree sweep, and hook wiring.
 #
-# `check` holds the contents of the gate, so both the pre-commit hook and CI
+# The targets hold the contents of the gate, so both the pre-commit hook and CI
 # invoke one definition rather than two copies that drift, and the whole gate is
-# reproducible on a fresh clone. The secret sweep is a separate target, and
-# separate in CI too: it scans content, not correctness, and answers a different
-# question.
+# reproducible on a fresh clone. `check-commit` is what a commit must pass and
+# is the two lanes together; `check` and `check-bazel` are those lanes, kept
+# separate because CI runs them as two jobs and a developer's inner loop wants
+# them one at a time. The secret sweep is a separate target, and separate in CI
+# too: it scans content, not correctness, and answers a different question.
 
 # Recipes run under bash with -e and pipefail, so a failing command anywhere in a
 # chain or a pipeline fails the target. Without this a broken step degrades into a
@@ -17,7 +19,9 @@ SHELL := /bin/bash
 .PHONY: help
 help:
 	@echo "Repo-root targets:"
-	@echo "  make check         the gate (shellcheck, fmt, clippy, tests) — same contents CI runs"
+	@echo "  make check-commit  what a commit must pass: both lanes, the total of CI's two jobs"
+	@echo "  make check         the Cargo lane (shellcheck, fmt, clippy, tests) — as CI runs it"
+	@echo "  make check-bazel   the Bazel lane (Clockwork) — as CI runs it"
 	@echo "  make fix           auto-fix what the gate can fix (fmt + clippy --fix)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
@@ -94,6 +98,49 @@ check: check-scripts test-scripts
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
 
+# The Bazel lane: everything Clockwork. Not a prerequisite of `check` — they
+# are two lanes over disjoint code, not two build systems racing — but part of
+# `check-commit` below, and so part of the commit gate.
+#
+# The Cargo lane still covers every library in crates/ on its own. What only
+# this lane covers is the Bazel build of those libraries and the cog system:
+# the `.clk` compiles, the generated wrappers, and the deterministic-runner
+# scenarios. A commit gate that cannot see those cannot see this repo's
+# schemas at all, which is how a non-building cogs/ tree got committed twice in
+# one round. The cold-cache cost — the pinned Clockwork drop's whole dependency
+# graph, a hermetic clang sysroot among it, minutes and gigabytes — is paid
+# once per machine; on a warm cache the lane is seconds.
+#
+# --config=lint adds the clippy and rustfmt aspects over the Bazel-built Rust,
+# which is the same denial of warnings the Cargo lane makes.
+#
+# BAZEL_FLAGS is how CI adds --lockfile_mode=error to the same invocation
+# developers run: locally the lockfile refreshes as a side effect of a build,
+# and the gate is the place that has to refuse the refreshed bytes rather than
+# absorb them. One target, two flag sets, no second copy of the command.
+BAZEL_FLAGS ?=
+
+.PHONY: check-bazel
+check-bazel:
+	@command -v bazel >/dev/null 2>&1 || { \
+	    echo "bazel not found on PATH — the Clockwork lane cannot run." >&2; \
+	    echo "Install bazelisk; .bazelversion pins the Bazel release it fetches." >&2; \
+	    exit 1; \
+	}
+	bazel test --config=lint $(BAZEL_FLAGS) //...
+
+# What a commit must pass: both lanes. `check` is the Cargo lane, `check-bazel`
+# is everything Clockwork — including the .clk schema compiles that `check`
+# cannot see, which is how a non-building cogs/ tree got committed twice.
+#
+# Sequential sub-makes rather than prerequisites so the cheap lane refuses first
+# even under -j. CI still invokes the two lanes as two jobs; the definitions are
+# shared.
+.PHONY: check-commit
+check-commit:
+	$(MAKE) check
+	$(MAKE) check-bazel
+
 # Auto-fix, scoped to exactly what `check` enforces, so `make fix && make check`
 # is always a clean cycle. --allow-dirty/--allow-staged so it is usable mid-edit;
 # review the diff before committing.
@@ -120,6 +167,10 @@ setup-hooks:
 	@command -v gitleaks >/dev/null 2>&1 || { \
 	    echo "gitleaks not found on PATH — brenn-scrub cannot scan without it."; \
 	    echo "Install the release brenn-scrub pins; it refuses to run against any other."; \
+	}
+	@command -v bazel >/dev/null 2>&1 || { \
+	    echo "bazel not found on PATH — the Clockwork half of the commit gate will not run."; \
+	    echo "Install bazelisk; .bazelversion pins the Bazel release it fetches."; \
 	}
 	@echo "setup-hooks: done."
 

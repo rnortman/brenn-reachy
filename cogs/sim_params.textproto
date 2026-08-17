@@ -1,0 +1,27 @@
+# The simulated driver's configuration, loaded once at process setup.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.SimParams`, which the
+# compiler generates from the `SimParams` schema in `config.clk`. Read as it is:
+# the box binds it by path, and the casing converts it to the message the dial
+# hands the cog.
+
+# The bus cycle: 20 ms, the same number the cog's execution condition states and
+# the same grid the decision tick dates its goals on.
+period_ns: 20000000
+
+# The dead-man: 200 ms of silence on the goal stream and the gate de-torques the
+# machine. Ten cycles, so a commander that has merely missed one is not treated
+# as one that has stopped.
+hold_timeout_ns: 200000000
+
+# The machine starts cold. Every scenario that wants it energised says so with
+# an injection, which is what an arming sequencer will do on the real machine.
+start_torqued: false
+
+# How far a modelled servo moves in one cycle. These are the motion library's
+# own per-cycle step bounds, so a well-formed goal stream is tracked within one
+# cycle and anything that is not -- a jammed servo, a step nobody should have
+# commanded -- shows up as the growing tracking error the library classifies.
+slew_legs_rad: 0.15
+slew_body_yaw_rad: 0.15
+slew_antennas_rad: 0.65

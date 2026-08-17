@@ -1,0 +1,24 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The goal gate, built for Bazel because the simulated driver cog hosts exactly
+# this logic -- the point of the crate is that the simulation and the real
+# driver cannot disagree about when a machine de-torques. Same sources Cargo
+# builds from the manifest next door.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-driver` is not a Rust identifier.
+rust_library(
+    name = "reachy_driver",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = ["//crates/reachy-wire:reachy_wire"],
+)
+
+# Run in both lanes. The dead-man timer is the last thing between a stalled
+# commander and a machine holding torque indefinitely, and it is hosted out of
+# the Bazel side; the lane that hosts it runs its tests.
+rust_test(
+    name = "reachy_driver_test",
+    size = "small",
+    crate = ":reachy_driver",
+)

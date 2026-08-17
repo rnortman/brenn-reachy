@@ -1,0 +1,6 @@
+# The root package. Nothing is built here.
+#
+# It exists because Bazel requires the repository root to be a package before
+# anything can name a label in it, and crate_universe does exactly that: it
+# resolves `@@//:MODULE.bazel` to find the workspace root. Without this file the
+# extension fails during module evaluation, a long way from any target.

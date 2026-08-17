@@ -52,8 +52,6 @@ use reachy_bus::{
     Bus, BusPort, BusTiming, MapError, ServoMap, XactError, reg_for, value_kind, with_retry,
 };
 use reachy_clips::{ClipPlayer, Motion, OverlaySample, compose};
-use reachy_kin::{neutral_head_pose, stow_head_pose};
-use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
     EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointSet, JointTargets,
@@ -102,37 +100,13 @@ const BOOT_POLLS: u32 = 100;
 /// swing would read as a spin rather than as a gesture.
 const DEMO_ANTENNA_RAD: f64 = 1.0;
 
-/// The neutral configuration: head square and level at nominal height, body
-/// square, antennas upright.
+/// The two base postures, from the motion library.
 ///
-/// This is what `up` commands. It is the whole configuration and not just the
-/// head pose, because the pose the machine is lifted *from* is stow, which
-/// folds the antennas back — a lift that left them folded would raise a head
-/// that is not up.
-#[must_use]
-pub fn neutral_targets() -> JointTargets {
-    JointTargets {
-        head_pose_body: neutral_head_pose(),
-        body_yaw: 0.0,
-        antennas: [0.0, 0.0],
-    }
-}
-
-/// The stow configuration: the head lowered and pitched forward, the body
-/// square, the antennas folded back.
-///
-/// The same pose the disarm sequence measures against, expressed as the
-/// Cartesian command the tick path takes. Disarming compares joint angles and
-/// this commands a head pose; both are derived from the one stow pose, so the
-/// motion and the check cannot describe different places.
-#[must_use]
-pub fn stow_pose_targets() -> JointTargets {
-    JointTargets {
-        head_pose_body: stow_head_pose(),
-        body_yaw: 0.0,
-        antennas: STOW_ANTENNAS,
-    }
-}
+/// `up` and `stow` are commanded by more than one host — this bench and the
+/// control-rate cog — and stow is the posture the minimum risk condition names,
+/// so where they are is stated once, beside the stow angles disarming measures
+/// against, rather than composed again here.
+pub use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 
 /// A commissioned machine: the bus, and the last thing the poll saw.
 ///
@@ -2158,7 +2132,7 @@ mod tests {
     use std::rc::Rc;
 
     use dxl_proto::frame::{INST_PING, INST_REBOOT, INST_WRITE};
-    use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, wrap_to_pi};
+    use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, neutral_head_pose, wrap_to_pi};
     use reachy_motion::{
         ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, CommandDisposition, JointGroup, JointSet,
         JointVector, Rail, RegId, RegValue, ReleaseForm, SeqError, SeqStep, ServoHealth,

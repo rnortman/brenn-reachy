@@ -1,0 +1,388 @@
+// The control-rate cogs: what runs on every sample the driver publishes.
+//
+// The driver publishes one pose sample per cycle, and that stream is the clock
+// everything in this file runs on. Nothing here is time-triggered: a cog woken
+// by a timer would drift against the bus cycle it is supposed to answer, and a
+// cog woken by the sample cannot. The cogs are sized to see every sample rather
+// than the latest one, because a pose series with a hole in it is not a series.
+//
+// Every signal below is `multi_instance`, here and in `sim.clk`. That marker
+// says an offboard consumer should expect more than one reporter of the
+// quantity, and here it is a fact about the build rather than about the
+// machine: the compiler builds a casing for every box a generating module
+// declares *and* one for the system target over it, and each casing registers
+// an instance of every signal its cogs carry. A single-instance signal in that
+// arrangement refuses to compile. There is one of each cog in this system
+// whatever the marker says, so a consumer aggregating one of these counters
+// across "instances" is asking a question with a wrong answer available.
+// TODO(clockwork-single-instance-signal)
+//
+// The sample channel carries `reachy-wire` datagrams as opaque bytes, which is
+// what makes this file identical in the simulation and on the machine: a cog
+// cannot tell a socket-fed channel from a simulator-fed one, and the parse path
+// in the body is the same code either way. The carrier size is chosen off
+// `var_packet.clk`'s own menu of instantiations rather than declared here.
+// TODO(foreign-generic-instantiation-crate)
+
+#![generate(cpp, cpp_cog, cpp_test_cog)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use cogs::config;
+use cogs::msgs;
+use @clockwork::clockwork::io::var_packet;
+use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
+    ReportGroupLogType};
+
+// The driver's sample stream: one datagram per bus cycle, always, whether or
+// not the read succeeded. One publisher -- the driver -- as every channel in
+// this repo's systems has.
+//
+// Sixteen messages deep against the deepest view on it, which is eight: a
+// subscriber that fell far enough behind to be lapped would have been stalled
+// for 320 ms at the control rate, and the driver's own dead-man de-torques the
+// machine long before that.
+channel DriverPose
+{
+    message_type: Tachyon<var_packet::VarPacket288>;
+    max_num_messages: 16;
+}
+
+// Where the head is, one message per sample.
+channel Estimates
+{
+    message_type: Tachyon<msgs::PoseEstimate>;
+    max_num_messages: 16;
+}
+
+// The goal stream: what the machine is being asked to hold next, one datagram
+// per sample while a session is under way. One publisher -- the decision tick.
+//
+// Sixteen deep against the deepest view on it, which is eight, for the same
+// reason the sample channel is: a subscriber lapped on this channel has been
+// stalled long past the driver's own dead-man.
+//
+// The stream is a keep-alive as well as a command. A holding machine
+// re-publishes the setpoint it is already on rather than falling silent,
+// because silence on this channel is what the driver's dead-man measures.
+//
+// One publisher is not a preference: an input fed by a channel two cogs publish
+// to needs a dial the composer will not load a system holding, so the session
+// cog's own traffic to the driver cannot come down this channel.
+// TODO(cogs-session-channel)
+channel DriverCmd
+{
+    message_type: Tachyon<var_packet::VarPacket128>;
+    max_num_messages: 16;
+}
+
+// What the session has asked for, republished whole on every change. One
+// publisher: in this system the log reader, standing in for the session cog
+// that does not exist yet.
+//
+// Four deep against a view of one. A schedule is state rather than an event --
+// the newest message is the whole of what a consumer needs -- so a subscriber
+// lapped here has lost nothing it would have acted on.
+channel ScheduleChan
+{
+    message_type: Tachyon<msgs::SessionSchedule>;
+    max_num_messages: 4;
+}
+
+// What the tick had to say about a cycle: one message per raise, never a
+// repetition of a standing condition. One publisher -- the decision tick.
+//
+// Eight deep against no view at all: nothing subscribes, the log does. Reports
+// are events rather than cycles, so the depth is slack for a burst of them and
+// not a rate.
+channel TickFaults
+{
+    message_type: Tachyon<msgs::TickFault>;
+    max_num_messages: 8;
+}
+
+// Forward kinematics, once per sample.
+//
+// The estimator holds no opinion about what the machine should do and issues no
+// command; it says where the head is and how well it knows. Its one piece of
+// memory is the seed the solver starts from, which is what selects the branch
+// of the mechanism the answer lies on -- the mechanism closes in more than one
+// configuration and only one of them is the machine.
+//
+// Each of the three counters below is the run's total. They are held in the
+// state slot and reported on the signal group only on the executions where one
+// of them moves. Kept in the group's own fold instead they would restart every
+// time the group reported, and it would report soonest during an outage that
+// moves one of them on every execution -- so the number a reader trusted least
+// would be the one it got during the failure it was watching for.
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take. Under the deterministic runner an output is published at the
+// execution's start time plus that duration, so an estimate lands in the log
+// one millisecond after the sample that produced it, and a checker reading
+// timestamps has to know that its `time_of_validity` and its log time are two
+// different clocks. It is stated rather than left to the generator's default,
+// which happens to be the same millisecond: an assertion about a number needs
+// somewhere to read the number from.
+cog Pose
+{
+    states
+    {
+        // The solver's seed, and the run's totals for the three signals below.
+        est: Tappy<msgs::PoseState>
+        {
+            mutable: true;
+        }
+    }
+
+    signals stats
+    {
+        // How many solves failed to find a pose. Rises only on a complete
+        // sample the solver could not answer -- an incomplete sample is not a
+        // failure of the solver, and is visible as an invalid estimate.
+        fk_failures: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many datagrams the codec refused. Distinct from a solve failure:
+        // the bytes were not a sample at all, so they name no instant and no
+        // positions. An execution that refused every datagram in its window
+        // still publishes an invalid estimate, at its own instant; this counter
+        // is what says why, and separates a driver speaking a version this
+        // build does not from a machine that stopped answering.
+        undecodable_samples: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times the seed slot held numbers that were not a pose. This
+        // cog is the only thing that writes that slot, so a rise means memory
+        // nobody wrote was read back as a rotation -- refused, and the solve
+        // started from the neutral pose as it does before any answer at all.
+        refused_seeds: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+    }
+
+    inputs
+    {
+        // The sample stream, sized to see every message rather than the latest
+        // one.
+        sample: Tappy<var_packet::VarPacket288>
+        {
+            max_msgs: 8;
+        }
+    }
+
+    outputs
+    {
+        estimate: Tappy<msgs::PoseEstimate>;
+    }
+
+    execution
+    {
+        // Every sample, no skips: the bound equals the view's size, so the
+        // count is the window's length and never a clamp of it.
+        condition got: new_message(sample, max=8);
+
+        execute when: got;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}
+
+// The window a post-aggregated group folds over before it reports. It bounds
+// observations, not time: these counters are written only when one of them
+// moves. A standing condition can move one of them on every execution -- a
+// driver whose datagrams this build refuses does exactly that -- so the window
+// can roll at the sample rate, and the size below is what makes that survivable
+// rather than what prevents it: every observation is an absolute total, so the
+// first report of a fresh window carries the run's count and not the window's.
+policy ReportGroupPolicy for Pose.stats
+{
+    reporting_strategy = ReportingStrategy::post_aggregated;
+    log_type = ReportGroupLogType::event;
+    max_observations = 1000;
+}
+
+// The decision tick: what the machine is asked to do next, once per sample.
+//
+// This cog is the motion library hosted, not re-implemented. Which goal a
+// posture change produces, what counts as an obstruction, when a move has left
+// the envelope -- all of that is `reachy-motion`'s tick, called once per sample
+// with the state it left last time. What is written here is the hosting: arming
+// off a measured pose, reading a session's schedule, turning what the tick
+// reported into messages, and keeping the goal stream alive.
+//
+// The goal stream is a keep-alive. A machine that has arrived and is holding
+// re-publishes the setpoint it is on with every sample, because the driver's
+// dead-man measures silence on that channel and a holding session is not a
+// stopped one. The stream stops on exactly one thing: a fault the tick latches
+// on, after which the tick commands nothing and the dead-man de-torques the
+// machine -- which is the minimum risk condition arriving by the shortest path
+// this system has, not a failure of it.
+//
+// A report goes out only when something was raised, never on the cycles a
+// standing condition is merely still true: a channel carrying a fault at the
+// sample rate is a channel nobody can read. One output slot carries one message
+// per execution, so a cycle raising two reports publishes the first and counts
+// the rest.
+//
+// The counters below are the run's totals, held in the state slot and reported
+// on the signal group only on the executions where one of them moves. Kept in
+// the group's own fold instead they would restart every time the group
+// reported.
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take: a goal datagram is logged that long after the sample that decided it,
+// while the instant the goal names is arithmetic off the sample's own nominal.
+// A checker reading timestamps must not conflate the two. (Neither a block
+// header nor a field inside one may carry a comment of its own, which is why
+// this is here.)
+cog Mover
+{
+    configs
+    {
+        // The grid goals are dated on, and how long a posture change takes.
+        params: Tappy<config::MoverParams>;
+    }
+
+    states
+    {
+        // The tick's own state, and what this cog knows about the schedule it
+        // is following.
+        ctrl: Tappy<msgs::MoverState>
+        {
+            mutable: true;
+        }
+    }
+
+    signals stats
+    {
+        // How many goal datagrams went out. One per execution at most, so under
+        // the deterministic runner this is one per sample of an engaged
+        // session.
+        goals_published: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many reports the tick raised: faults, degrades, abandoned moves
+        // and refused commands. Raises, not standing conditions.
+        faults_raised: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many samples were decoded and ticked on.
+        samples_seen: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many datagrams the codec refused. A driver speaking a version
+        // this build does not is a machine that looks stopped from here; this
+        // counter is what tells the two apart.
+        undecodable_samples: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many raises lost the one report slot an execution has.
+        reports_dropped: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times the tick state in this cog's own slot could not be
+        // read back as a machine, or would not go back into it. This cog is the
+        // only writer of that slot, so a rise means memory nobody wrote was
+        // read as a machine, or a machine would not fit the slot it came out
+        // of; either way the engagement ended and the next sample starts a new
+        // one, which is a session nobody asked to restart.
+        refused_state: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times this cog's own last goal datagram would not decode.
+        // The stream's sequence numbers restart at zero when it happens, and a
+        // consumer watching them cannot otherwise tell that from a commander
+        // that restarted.
+        refused_readback: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+    }
+
+    inputs
+    {
+        // The driver's sample stream, sized to see every message rather than
+        // the latest one: a sample missed is a control cycle that never
+        // happened, and this cog's whole clock is that stream.
+        sample: Tappy<var_packet::VarPacket288>
+        {
+            max_msgs: 8;
+        }
+
+        // The session's schedule, at the default view of 1. Latest wins: the
+        // message is the whole schedule every time, so the newest one is all
+        // there is to know. Deliberately not a condition -- a schedule arriving
+        // between samples changes what the next sample decides, not when this
+        // cog runs.
+        sched: Tappy<msgs::SessionSchedule>;
+
+        // This cog's own goal channel, at the default view of 1: the last
+        // datagram it published, or an empty view before it ever has. The wire
+        // sequence number of the next one, and the instant the last one named,
+        // are read back from it rather than kept in state fields. Deliberately
+        // not a condition -- a cog woken by its own publication would never
+        // stop.
+        own_cmd: Tappy<var_packet::VarPacket128>;
+    }
+
+    outputs
+    {
+        goal: Tappy<var_packet::VarPacket128>;
+        fault: Tappy<msgs::TickFault>;
+    }
+
+    execution
+    {
+        // Every sample, no skips: the bound equals the view's size, so the
+        // count is the window's length and never a clamp of it.
+        condition got: new_message(sample, max=8);
+
+        execute when: got;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}
+
+// The window a post-aggregated group folds over before it reports. It bounds
+// observations, not time: these counters are written only when one of them
+// moves, and every observation is an absolute total, so the first report of a
+// fresh window carries the run's count and not the window's.
+policy ReportGroupPolicy for Mover.stats
+{
+    reporting_strategy = ReportingStrategy::post_aggregated;
+    log_type = ReportGroupLogType::event;
+    max_observations = 1000;
+}

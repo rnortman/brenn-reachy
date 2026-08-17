@@ -54,7 +54,10 @@ pub mod arm;
 pub mod disarm;
 pub mod joints;
 pub mod phase;
+pub mod postures;
 pub mod seq;
+mod slot_enum;
+pub mod snap;
 #[cfg(test)]
 mod testutil;
 pub mod tick;
@@ -65,7 +68,7 @@ pub use arm::{
     ArmConfig, ArmRecord, CommissionSequencer, CommissionSummary, EXPECTED_MODELS,
     EXPECTED_OPERATING_MODES, EngageSequencer, EngageSummary, Gains, GroupGains, PinOutcome,
     PollCadence, PollSequencer, Posture, ProfileConfig, ProvisionExpect, ProvisionReadings,
-    ProvisionTable, Rail, VENDOR_HOMING_OFFSETS, engage_gates, pin_goals,
+    ProvisionTable, Rail, VENDOR_HOMING_OFFSETS, engage_gates, pin_goals, rest_pose_seeds,
 };
 pub use disarm::{
     DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow, stow_targets,
@@ -77,17 +80,24 @@ pub use phase::{
     ANTENNA_CONTACT_BAND_RAD, ANTENNA_PHASE_SEPARATION_RAD, AntennaPhaseConfig, PhaseSeparation,
     PhaseWatch, mirror_offset,
 };
+pub use postures::{neutral_targets, stow_pose_targets};
 pub use seq::{
-    AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep,
-    Sequencer, StepContext, ValueKind,
+    AbsentSet, AnswerKind, BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError,
+    SeqErrorKind, SeqStep, Sequencer, StepContext, ValueKind,
+};
+pub use snap::{
+    BusSourceCode, DurationError, DurationsSnapshot, ExcursionSnapshot, FaultCode, FaultSnapshot,
+    FaultSnapshotError, FkFailureCode, JointsSnapshot, ModeCode, MotionSnapshot, PoseSnapshot,
+    PoseSnapshotError, SnapshotError, TargetsSnapshot, TrackingSide, TrackingStreakSnapshot,
+    TrajectorySeed, duration_from_nanos, duration_nanos,
 };
 pub use tick::{
     ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, BusFailureSource, ClockStretch,
     CommandDisposition, CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S,
     MIN_JERK_PEAK_RATE, Mode, MotionCommand, MotionConfig, MotionState, MoveAbort, Response,
     TickInputs, TickOutputs, TickReport, TrackingFaultConfig, TrackingLook, TrackingMonitor,
-    WireFailure, dry_pass_peaks, dry_pass_separation, duration_floor_s, floor_move_clock,
-    motion_tick, plan_move,
+    WireFailure, default_motion_config, dry_pass_peaks, dry_pass_separation, duration_floor_s,
+    floor_move_clock, motion_tick, plan_move,
 };
 pub use timeline::{Entry, FaultTimeline, Maneuver, Outcome, Story, last_fault};
 pub use traj::{MoveDurations, Trajectory, TrajectoryError, Warp};

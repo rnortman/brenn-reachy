@@ -80,6 +80,24 @@ impl Default for HeadGeometry {
     }
 }
 
+/// The vendor's nominal linkage, built once.
+///
+/// [`HeadGeometry::default`] is not a struct literal: it converts six rotation
+/// matrices into quaternions and checks each is a proper rotation. Those inputs
+/// are baked constants, so every call produces the same bits, and a host that
+/// solves at the control rate would spend that work per period. This is the
+/// same value, built on first use and shared by everything that solves against
+/// the nominal model.
+///
+/// It is not a configuration seam and does not become one: a unit whose
+/// dimensions have been measured is a [`HeadGeometry`] of its own, passed to the
+/// solver by whoever owns the measurement.
+#[must_use]
+pub fn default_geometry() -> &'static HeadGeometry {
+    static NOMINAL: std::sync::OnceLock<HeadGeometry> = std::sync::OnceLock::new();
+    NOMINAL.get_or_init(HeadGeometry::default)
+}
+
 /// The top three rows of a 4×4 homogeneous transform as an isometry.
 ///
 /// The rotation block is taken as-is. It has to be a *proper* rotation —
@@ -166,6 +184,28 @@ pub fn cone_angle(rotation: &UnitQuaternion<f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared nominal linkage is the same linkage, bit for bit: a host that
+    /// takes the reference and one that builds its own solve against the same
+    /// machine.
+    #[test]
+    fn the_shared_nominal_linkage_is_the_built_one() {
+        let built = HeadGeometry::default();
+        let shared = default_geometry();
+        assert_eq!(shared.crank_len.to_bits(), built.crank_len.to_bits());
+        assert_eq!(shared.rod_len.to_bits(), built.rod_len.to_bits());
+        for (leg, (shared_leg, built_leg)) in shared.legs.iter().zip(&built.legs).enumerate() {
+            assert_eq!(
+                format!("{shared_leg:?}"),
+                format!("{built_leg:?}"),
+                "leg {leg}"
+            );
+        }
+        assert!(
+            core::ptr::eq(default_geometry(), shared),
+            "the reference is built once and shared"
+        );
+    }
 
     #[test]
     fn branch_sign_multipliers() {

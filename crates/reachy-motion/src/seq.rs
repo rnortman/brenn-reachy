@@ -41,6 +41,7 @@ use reachy_kin::FkError;
 use thiserror::Error;
 
 use crate::joints::JointId;
+use crate::slot_enum::slot_enum;
 
 /// A register, named the way this crate thinks of them.
 ///
@@ -904,6 +905,106 @@ impl SeqError {
             | Self::RestPoseImplausible { context, .. }
             | Self::PinnedPoseUnsolvable { context, .. } => *context,
         }
+    }
+
+    /// Which failure this is, without any of what it saw.
+    ///
+    /// What survives a trip through a fixed-layout slot, where the context and
+    /// the readings have nowhere to go. See [`SeqErrorKind`].
+    #[must_use]
+    pub fn kind(&self) -> SeqErrorKind {
+        match self {
+            Self::NoAnswer { .. } => SeqErrorKind::NoAnswer,
+            Self::Refused { .. } => SeqErrorKind::Refused,
+            Self::WireCorrupt { .. } => SeqErrorKind::WireCorrupt,
+            Self::VerifyMismatch { .. } => SeqErrorKind::VerifyMismatch,
+            Self::WrongAnswer { .. } => SeqErrorKind::WrongAnswer,
+            Self::WrongValue { .. } => SeqErrorKind::WrongValue,
+            Self::UnplaceableAngle { .. } => SeqErrorKind::UnplaceableAngle,
+            Self::AbsentServos { .. } => SeqErrorKind::AbsentServos,
+            Self::IdentityMismatch { .. } => SeqErrorKind::IdentityMismatch,
+            Self::ProvisionMismatch { .. } => SeqErrorKind::ProvisionMismatch,
+            Self::VoltageLow { .. } => SeqErrorKind::VoltageLow,
+            Self::SupplyBelowFloor { .. } => SeqErrorKind::SupplyBelowFloor,
+            Self::UnhealthyServo { .. } => SeqErrorKind::UnhealthyServo,
+            Self::RestPoseImplausible { .. } => SeqErrorKind::RestPoseImplausible,
+            Self::PinnedPoseUnsolvable { .. } => SeqErrorKind::PinnedPoseUnsolvable,
+        }
+    }
+}
+
+slot_enum! {
+/// Which [`SeqError`] a failure was, with none of its payload.
+///
+/// [`SeqError`] carries a [`StepContext`] and, variant by variant, registers,
+/// readings and solver causes — none of which fit a fixed-layout slot, and all
+/// of which have already been reported by the time anything reads a slot back.
+/// The name of the failure does fit, and the name is what still tells an
+/// operator which half of the machine to look at.
+///
+/// Public data with a stated integer numbering, for a host writing the name
+/// into a slot with an integer field.
+    pub enum SeqErrorKind: u8 {
+        encode: as_u8;
+        decode: from_u8;
+        refusal: "A number outside the fifteen was written by something that \
+                  does not agree with this type about what the failures are, \
+                  and guessing one would put a name on a failure nobody \
+                  reported.";
+
+    /// [`SeqError::NoAnswer`].
+    NoAnswer = 1,
+    /// [`SeqError::Refused`].
+    Refused = 2,
+    /// [`SeqError::WireCorrupt`].
+    WireCorrupt = 3,
+    /// [`SeqError::VerifyMismatch`].
+    VerifyMismatch = 4,
+    /// [`SeqError::WrongAnswer`].
+    WrongAnswer = 5,
+    /// [`SeqError::WrongValue`].
+    WrongValue = 6,
+    /// [`SeqError::UnplaceableAngle`].
+    UnplaceableAngle = 7,
+    /// [`SeqError::AbsentServos`].
+    AbsentServos = 8,
+    /// [`SeqError::IdentityMismatch`].
+    IdentityMismatch = 9,
+    /// [`SeqError::ProvisionMismatch`].
+    ProvisionMismatch = 10,
+    /// [`SeqError::VoltageLow`].
+    VoltageLow = 11,
+    /// [`SeqError::SupplyBelowFloor`].
+    SupplyBelowFloor = 12,
+    /// [`SeqError::UnhealthyServo`].
+    UnhealthyServo = 13,
+    /// [`SeqError::RestPoseImplausible`].
+    RestPoseImplausible = 14,
+    /// [`SeqError::PinnedPoseUnsolvable`].
+    PinnedPoseUnsolvable = 15,
+    }
+}
+
+impl fmt::Display for SeqErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::NoAnswer => "no answer",
+            Self::Refused => "a refusal",
+            Self::WireCorrupt => "a corrupt reply",
+            Self::VerifyMismatch => "a write that did not read back",
+            Self::WrongAnswer => "an answer of the wrong shape",
+            Self::WrongValue => "a value of the wrong shape",
+            Self::UnplaceableAngle => "an angle that is not a number",
+            Self::AbsentServos => "servos that did not answer a ping",
+            Self::IdentityMismatch => "a servo of another model",
+            Self::ProvisionMismatch => "a register provisioned otherwise",
+            Self::VoltageLow => "a supply that never reached the arming floor",
+            Self::SupplyBelowFloor => "a supply below the arming floor",
+            Self::UnhealthyServo => "latched hardware error bits",
+            Self::RestPoseImplausible => "resting angles that place no pose",
+            Self::PinnedPoseUnsolvable => "pinned angles that place no pose",
+        };
+        f.write_str(text)
     }
 }
 

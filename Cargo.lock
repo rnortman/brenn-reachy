@@ -317,6 +317,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reachy-driver"
+version = "0.1.0"
+dependencies = [
+ "reachy-wire",
+]
+
+[[package]]
 name = "reachy-kin"
 version = "0.1.0"
 dependencies = [
@@ -332,6 +339,13 @@ dependencies = [
  "nalgebra",
  "reachy-kin",
  "thiserror",
+]
+
+[[package]]
+name = "reachy-wire"
+version = "0.1.0"
+dependencies = [
+ "reachy-motion",
 ]
 
 [[package]]

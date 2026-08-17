@@ -1,0 +1,10 @@
+# Verbatim copies of the patch files the pinned Clockwork drop applies to its
+# own dependencies. Ours only because Bazel refuses a patch label from another
+# repository in a `*_override` -- the patches themselves are the drop's, are
+# never edited here, and are re-copied wholesale on a drop upgrade.
+#
+# They sit here rather than under third_party/ because the tracked .gitignore
+# ignores that directory wholesale: a copy placed there would silently go
+# untracked and break every fresh clone.
+
+exports_files(glob(["*.patch"]))

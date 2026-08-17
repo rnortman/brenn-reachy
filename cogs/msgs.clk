@@ -1,0 +1,1055 @@
+// The vocabulary the motion cogs speak: the messages that cross channels and
+// the slots the cogs keep.
+//
+// Messages sit in a module of their own, apart from the cogs that carry them.
+// That is forced rather than stylistic: a cog member's type is an interface
+// instantiation, and the compiler resolves one only against a module the cog's
+// module imports. A state's message is declared the same way, so the slots are
+// here too even though nothing puts one on a channel.
+//
+// Two conventions hold throughout, and both are worth stating because a reader
+// coming from the wire format will expect otherwise:
+//
+//   * Time is `SyncTime` and `Duration`, never a bare nanosecond count. The
+//     wire format carries `i64` nanoseconds because a datagram has no type
+//     system; a Clockwork message does, and a raw count here would throw that
+//     away at the one boundary where it is free to keep.
+//   * Joints are named fields, never a positional array, and the names run in
+//     the bus order the datagrams use -- body yaw, the six legs, right antenna,
+//     left antenna. A row misplaced in an array is a silent swap of two servos;
+//     a row misplaced across named fields does not compile.
+//
+// Angles are radians about the model datum, positions metres in the body
+// frame -- the same units `reachy-kin` and `reachy-motion` use, so nothing here
+// converts.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+// A point in three dimensions, metres.
+schema Vec3
+{
+    uuid: aa3bfd75-bc00-4a5e-819d-23ed7b0608b7;
+    fields
+    {
+        // Forward.
+        #0 x: Float64;
+        // Left.
+        #1 y: Float64;
+        // Up.
+        #2 z: Float64;
+    }
+}
+
+// A rotation as a unit quaternion, scalar first.
+//
+// Scalar first because that is the order `nalgebra`'s `UnitQuaternion` names
+// its parts in and the order every conversion in this repo writes; the storage
+// order it uses internally is its own business.
+schema Quat
+{
+    uuid: 47c30364-235c-49b9-b463-47c2fb76e3c7;
+    fields
+    {
+        // The scalar part.
+        #0 w: Float64;
+        // The vector part, about the forward axis.
+        #1 x: Float64;
+        // The vector part, about the left axis.
+        #2 y: Float64;
+        // The vector part, about the up axis.
+        #3 z: Float64;
+    }
+}
+
+// One number per servo, in bus order. Positions, targets or errors, radians --
+// what the numbers mean is the field that carries this, not this.
+schema Joints
+{
+    uuid: 8ac1ca43-1e41-42c0-9806-ef41ba165023;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: Float64;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: Float64;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: Float64;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: Float64;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: Float64;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: Float64;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: Float64;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: Float64;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: Float64;
+    }
+}
+
+// Where the machine is asked to hold itself: the head's pose in the body frame,
+// the body's own yaw, and the two antennas.
+//
+// This is task space, not joint space -- the legs do not appear, because a head
+// pose is what the motion library plans in and the six crank angles are what
+// inverse kinematics makes of it.
+schema Targets
+{
+    uuid: 98528aeb-06d1-4176-b85e-78e959b97e2a;
+    fields
+    {
+        // Head position in the body frame, metres.
+        #0 head_pos: Vec3;
+
+        // Head orientation in the body frame.
+        #1 head_quat: Quat;
+
+        // Body yaw about the vertical, radians.
+        #2 body_yaw: Float64;
+
+        // Right antenna angle, absolute, radians.
+        #3 antenna_right: Float64;
+
+        // Left antenna angle, absolute, radians.
+        #4 antenna_left: Float64;
+    }
+}
+
+// What a scheduled step asks for.
+//
+// `base_keep` is not "do nothing": it is "hold whatever the base posture
+// already is", which is what a step that exists to occupy time says. A step
+// naming a posture is the only thing that retargets the base.
+enum StepKind
+{
+    uuid: 186ddcf8-bbcd-423c-8544-a4e692c94a5d;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Hold the posture already commanded.
+        #0 base_keep default { underlying_value: 0; }
+        // Move the base to the posture this step names.
+        #1 base_posture { underlying_value: 1; }
+    }
+}
+
+// The base postures a step may name.
+//
+// Two, deliberately: stowed is the posture the machine rests in and the one
+// every de-torqued position is safe from, and up is the working posture. A
+// third arrives when something needs one, not before.
+enum Posture
+{
+    uuid: 9ce82955-0620-4580-9d3a-2670d6350059;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Low, off-centre, pitched up: where the machine rests.
+        #0 stow default { underlying_value: 0; }
+        // The neutral working posture.
+        #1 up { underlying_value: 1; }
+    }
+}
+
+// One servo, or none.
+//
+// The vocabulary a field naming a single joint takes, so that "which joint" is a
+// name the compiler knows rather than a number a comment explains. `none` is a
+// value of the vocabulary and not a sentinel outside it: a report about the
+// machine as a whole names no joint, and a slot nothing wrote decodes to that
+// rather than to the body yaw.
+//
+// The numbers are one past the bus row: a Clockwork default carries the value
+// zero, `none` is the default, and the nine rows follow it in bus order. The
+// motion library numbers the same nine from zero and spells "no joint" 255, so
+// the two vocabularies are one offset apart; the offset is applied in exactly
+// one place, `cogs/motion_slots.rs`, and pinned in both directions by
+// `cogs/motion_slot_test.rs`.
+enum JointRef
+{
+    uuid: a2bc4328-a051-422d-898d-3ed306ede2af;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No single servo: what a report about the whole machine names, and
+        // what a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Bus row 0: the body's yaw servo.
+        #1 body_yaw { underlying_value: 1; }
+        // Bus row 1: the first crank servo.
+        #2 leg_0 { underlying_value: 2; }
+        // Bus row 2: the second crank servo.
+        #3 leg_1 { underlying_value: 3; }
+        // Bus row 3: the third crank servo.
+        #4 leg_2 { underlying_value: 4; }
+        // Bus row 4: the fourth crank servo.
+        #5 leg_3 { underlying_value: 5; }
+        // Bus row 5: the fifth crank servo.
+        #6 leg_4 { underlying_value: 6; }
+        // Bus row 6: the sixth crank servo.
+        #7 leg_5 { underlying_value: 7; }
+        // Bus row 7: the right antenna.
+        #8 antenna_right { underlying_value: 8; }
+        // Bus row 8: the left antenna.
+        #9 antenna_left { underlying_value: 9; }
+    }
+}
+
+// A set of servos, one bit per bus row.
+//
+// Bit `n` is bus row `n`, which is the numbering the motion library's joint sets
+// and the wire format's masks both use, so a set crosses between them as the
+// number it already is. Values combine: two legs is a value of this type, not a
+// value outside it, which is why the generated membership predicate is no use
+// here -- it answers for the declared bits only. What refuses a bit above the
+// ninth is the motion library's own decoder, at the one boundary
+// `cogs/motion_slots.rs` draws.
+enum JointFlags
+{
+    uuid: 274718d8-c081-410b-9849-5757dd628c9a;
+    options
+    {
+        underlying_type: UInt16;
+        bit_flags;
+    }
+    values
+    {
+        // No servo at all: the empty set, and what a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Bus row 0: the body's yaw servo.
+        #1 body_yaw { underlying_value: 1; }
+        // Bus row 1: the first crank servo.
+        #2 leg_0 { underlying_value: 2; }
+        // Bus row 2: the second crank servo.
+        #3 leg_1 { underlying_value: 4; }
+        // Bus row 3: the third crank servo.
+        #4 leg_2 { underlying_value: 8; }
+        // Bus row 4: the fourth crank servo.
+        #5 leg_3 { underlying_value: 16; }
+        // Bus row 5: the fifth crank servo.
+        #6 leg_4 { underlying_value: 32; }
+        // Bus row 6: the sixth crank servo.
+        #7 leg_5 { underlying_value: 64; }
+        // Bus row 7: the right antenna.
+        #8 antenna_right { underlying_value: 128; }
+        // Bus row 8: the left antenna.
+        #9 antenna_left { underlying_value: 256; }
+    }
+}
+
+// One step of a session's schedule: a half-open interval and what to do in it.
+schema ScheduledStep
+{
+    uuid: f55ded2c-98ad-46da-a3d3-0ea2f62f8131;
+    fields
+    {
+        // When the step begins, inclusive.
+        #0 start: SyncTime;
+
+        // When the step ends, exclusive. A sample at exactly this instant
+        // belongs to the next step, so consecutive steps may share an edge
+        // without either owning it twice.
+        #1 end: SyncTime;
+
+        // What the step asks for.
+        #2 kind: StepKind;
+
+        // Which posture, meaningful only when `kind` is `base_posture`.
+        #3 posture: Posture;
+    }
+}
+
+// The whole schedule, republished in full on every change.
+//
+// State-shaped rather than incremental: a lost publish heals on the next one,
+// and a subscriber that has only ever seen the latest message has seen
+// everything. `epoch` is what makes a change observable when the steps happen
+// to look the same, and what a consumer keys its retargeting on.
+schema SessionSchedule
+{
+    uuid: dd2ae37e-338e-4c53-b059-babcff64dcbc;
+    fields
+    {
+        // The gate: nothing is commanded while this is false. Not a step and
+        // not a posture -- engagement is whether the machine is under command
+        // at all.
+        #0 engaged: Bool;
+
+        // Bumped on every change. A consumer that has acted on this number and
+        // sees it again has nothing to do.
+        #1 epoch: UInt32;
+
+        // The steps, in time order.
+        #2 steps: VarArray<ScheduledStep, 16>;
+    }
+}
+
+// Where the head is, as the estimator reads it off one sample.
+//
+// Published for every sample, valid or not. A consumer of a pose series needs
+// staleness to be a value it can see rather than a gap it has to infer from
+// timestamps, so an incomplete sample or a solve that did not converge produces
+// a message saying so at the instant it happened.
+schema PoseEstimate
+{
+    uuid: cd21ea37-ddf3-4088-a5c1-583e005f57cc;
+    fields
+    {
+        // When the reading this estimate came from was taken -- the sample's
+        // own sample time, not the instant this message was published.
+        #0 time_of_validity: SyncTime;
+
+        // The measured joint positions the estimate was made from, radians.
+        // Carried even when invalid, because what was read is evidence.
+        #1 joints: Joints;
+
+        // Head position in the body frame, metres. Meaningless when `valid` is
+        // false -- the solver writes no pose it could not find.
+        #2 head_pos: Vec3;
+
+        // Head orientation in the body frame. Meaningless when `valid` is
+        // false, as above.
+        #3 head_quat: Quat;
+
+        // Whether the sample was complete and the solve converged.
+        #4 valid: Bool;
+
+        // Newton iterations the solve took. Zero when the seed already
+        // satisfied the tolerance, and zero when there was no solve.
+        #5 fk_iters: UInt32;
+
+        // The worst per-leg loop-closure residual at the answer, metres.
+        #6 fk_residual: Float64;
+    }
+}
+
+// What a tick reported, as a value on a channel.
+//
+// The fault slugs are the doctrine's, and the three non-fault outcomes share
+// this enum rather than a second one: they are all "what the tick had to say
+// about this cycle", they are all one-shot events, and a consumer that must not
+// miss a fault must not miss an aborted move either.
+//
+// The eight faults carry the same numbers as `reachy_motion::FaultCode`, which
+// is the same vocabulary as integers on the state-slot side; the two are held
+// together by a test rather than by this comment. Every value states its own
+// number as `underlying_value`, so the numbering does not depend on declaration
+// order and a value inserted among the others renumbers nothing.
+enum FaultKind
+{
+    uuid: e907b868-2680-42d1-869f-4648bdf5b9f5;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No report. The default a never-written slot decodes to, and not
+        // something any message carries.
+        #0 none default { underlying_value: 0; }
+
+        // An antenna is not tracking its setpoint and something is holding it.
+        #1 antenna_obstructed { underlying_value: 1; }
+        // An antenna servo reported a hardware error.
+        #2 antenna_servo_fault { underlying_value: 2; }
+        // The head is not tracking its setpoint and something is holding it.
+        #3 head_obstructed { underlying_value: 3; }
+        // A head servo reported a hardware error.
+        #4 head_servo_fault { underlying_value: 4; }
+        // Positions stopped coming back for long enough to stop believing them.
+        #5 position_feedback_lost { underlying_value: 5; }
+        // The measured crank angles do not close the linkage: a pose the
+        // machine cannot be in, so the reading is not one.
+        #6 measured_pose_invalid { underlying_value: 6; }
+        // The servo bus itself failed.
+        #7 bus_failure { underlying_value: 7; }
+        // A commanded torque-off was not confirmed by the servos.
+        #8 torque_off_unconfirmed { underlying_value: 8; }
+
+        // A move gave up because it would have left the envelope.
+        #9 move_aborted_envelope { underlying_value: 9; }
+        // A move gave up because a step was larger than the servo may take.
+        #10 move_aborted_step { underlying_value: 10; }
+        // A command was refused.
+        #11 command_rejected { underlying_value: 11; }
+    }
+}
+
+// One raise, at the instant it was raised.
+//
+// One message per raise, never a repetition of a standing condition: a fault
+// that is still true next cycle is not news, and a channel that carries it at
+// poll rate is a channel nobody can read. The evidence fields are the numbers
+// that made the classification, so a reader need not go back to the sample
+// stream to know why.
+//
+// This message carries the classification and the numbers it was made from, but
+// not the servo's own id or its hardware-error byte -- those travel only in the
+// host-side snapshot the restore path consults. The row below names the servo
+// for every fault that is about one; the rest of the diagnostic chain travels
+// once, at raise time, in the value the host holds.
+schema TickFault
+{
+    uuid: 01137aa8-3ca7-42fe-aefa-ef2b9399cfcb;
+    fields
+    {
+        // The nominal instant of the sample that raised it.
+        #0 time: SyncTime;
+
+        // What was raised.
+        #1 kind: FaultKind;
+
+        // The servo concerned, or `none` where the report is about no single
+        // one.
+        #2 joint: JointRef;
+
+        // The magnitude that carried the classification -- a tracking error or
+        // a residual, in the units of whatever `kind` measures.
+        #3 detail: Float64;
+
+        // The count that carried it -- misses, failures, or a streak length.
+        #4 count: UInt32;
+    }
+}
+
+// What a scenario does to the simulated machine.
+//
+// These stand in for the physical world and for the arming sequencer, neither
+// of which exists in this system: a scenario torques the servos, teleports
+// them, jams them, and cuts their replies, and the plant answers as it would.
+// Nothing outside the simulator publishes one, and no cog on the real machine
+// ever sees one.
+enum SimOp
+{
+    uuid: 5e31bb5c-1905-49d9-93c0-9ff8e91da146;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Nothing. The default a never-written slot decodes to.
+        #0 nop default { underlying_value: 0; }
+        // Energise the masked rows, as an arming sequence would.
+        #1 torque_on { underlying_value: 1; }
+        // De-energise the masked rows.
+        #2 torque_off { underlying_value: 2; }
+        // Teleport the masked rows to `positions`.
+        #3 set_positions { underlying_value: 3; }
+        // Jam the masked rows where they stand.
+        #4 obstruct { underlying_value: 4; }
+        // Release the masked rows.
+        #5 release_obstruction { underlying_value: 5; }
+        // Lose the next `count` cycles of position replies.
+        #6 drop_replies { underlying_value: 6; }
+    }
+}
+
+// One injection.
+schema SimCmd
+{
+    uuid: a740edb8-b229-4ad3-9a5c-7fbf7e34281d;
+    fields
+    {
+        // What to do.
+        #0 op: SimOp;
+
+        // Which servos it applies to.
+        #1 mask: JointFlags;
+
+        // The positions `set_positions` teleports to, radians.
+        #2 positions: Joints;
+
+        // How many cycles of replies `drop_replies` loses.
+        #3 count: UInt32;
+    }
+}
+
+// What the pose estimator keeps between samples.
+//
+// The seed, and the three totals it reports. The seed is the last pose the
+// solver actually found, which is not the last pose it published: an invalid
+// estimate carries no pose, and seeding the next solve from a pose nobody found
+// would pick the branch of the mechanism by accident. It is a slot rather than a
+// read-back of the output channel for the same reason -- a bounded view cannot
+// promise that a valid estimate is still in it after a long run of invalid ones.
+//
+// The totals are here rather than read back out of the signal group's own fold
+// for a related reason: a post-aggregated group folds over a bounded window and
+// starts a new one when it reports, so a total kept only in the fold restarts at
+// zero mid-run -- and it restarts soonest in exactly the outages these counters
+// exist to make visible, where one of them moves on every execution. Kept in the
+// slot they are the run's totals; the signals are written from them, so what a
+// report carries is an absolute count and never a window's share of one.
+schema PoseState
+{
+    uuid: 7af3ec68-943c-4bf4-9a4b-480b421a7555;
+    fields
+    {
+        // Whether a solve has ever succeeded. False on the first execution,
+        // when the seed below is whatever a default-constructed slot holds.
+        #0 have_seed: Bool;
+
+        // Position of the last pose found, metres in the body frame.
+        #1 seed_pos: Vec3;
+
+        // Orientation of the last pose found.
+        #2 seed_quat: Quat;
+
+        // How many complete samples the solver could not answer, all run.
+        #3 fk_failures: UInt64;
+
+        // How many datagrams the codec refused, all run.
+        #4 undecodable_samples: UInt64;
+
+        // How many times the seed slot held numbers that were not a pose, all
+        // run.
+        #5 refused_seeds: UInt64;
+    }
+}
+
+// One setpoint waiting for the instant it is to be written at.
+//
+// The slot-side form of a goal the gate holds: the same three values a goal
+// datagram carries, in the fields a state schema can hold them in.
+schema QueuedGoal
+{
+    uuid: ff8999a1-06ed-4072-a1ea-410b81fe53f3;
+    fields
+    {
+        // The grid instant this setpoint is to be written at.
+        #0 execute_at: SyncTime;
+
+        // The rows it writes. A row outside this set keeps whatever it was
+        // already holding, and the angle carried for it below is not written
+        // anywhere.
+        #1 mask: JointFlags;
+
+        // The commanded angles, radians. Only the rows in `mask` mean
+        // anything.
+        #2 targets: Joints;
+    }
+}
+
+// Everything the simulated driver carries from one cycle to the next: the goal
+// gate's own state, and the plant it drives.
+//
+// The gate half mirrors `reachy_driver::GoalGate` field for field, which is
+// what that crate's public `Copy` data exists for -- the same decision runs in
+// the real driver, in this simulator and in the gate's own tests, and a second
+// copy of it here would be a second set of conditions under which a machine
+// does not de-torque. The queue's length is the array's own, so a length past
+// the end of the queue is not a state this slot can hold.
+//
+// The plant half is the modelled world: where the servos are, what they are
+// being asked for, which of them are energised, which are jammed, and how many
+// cycles of replies are still being swallowed. `positions` is ground truth and
+// stays a slot rather than a read-back of the published samples, because during
+// a reply-drop window the published sample deliberately misreports and the
+// machine underneath it keeps moving.
+//
+// The counters are the run's totals, kept here for the same reason the
+// estimator's are: a post-aggregated signal group folds over a bounded window
+// and restarts when it reports, so a total kept only in the fold restarts
+// mid-run.
+schema SimState
+{
+    uuid: 1ee7c510-5ae4-468e-8d08-59e7915b3b6d;
+    fields
+    {
+        // Whether the first execution has run. Until it has, every field below
+        // is whatever a default-constructed slot holds and none of it describes
+        // a machine.
+        #0 initialized: Bool;
+
+        // Where the servos actually are, radians. Ground truth, whatever the
+        // published sample says.
+        #1 positions: Joints;
+
+        // Which servos are energised. An angle written to a row outside this
+        // set moves nothing, as on a de-torqued Dynamixel.
+        #2 torqued: JointFlags;
+
+        // What each servo is being asked to hold, radians. Written from the
+        // held setpoint, one row at a time, and only for the rows its mask
+        // names.
+        #3 targets: Joints;
+
+        // Which rows of `targets` have ever been written. A row outside this
+        // set has never been commanded and holds where it stands.
+        #4 has_target: JointFlags;
+
+        // Whether anything has ever been commanded.
+        #5 has_held: Bool;
+
+        // The setpoint the gate is holding, rewritten every cycle no new goal
+        // is due for. Meaningful only when `has_held`.
+        #6 held: QueuedGoal;
+
+        // Goals accepted and not yet executed, oldest first. One executes per
+        // cycle, so a burst drains at the cycle rate rather than becoming a
+        // jump.
+        #7 queue: VarArray<QueuedGoal, 5>;
+
+        // Whether the gate has latched torque off. Only a fresh arming ends a
+        // latch.
+        #8 latched: Bool;
+
+        // Whether liveness has ever been observed. Until it has, the dead-man
+        // does not run: a driver nobody has spoken to yet is not a driver that
+        // has gone quiet.
+        #9 has_accepted: Bool;
+
+        // When liveness was last observed -- an accepted goal, or an arming.
+        // Meaningful only when `has_accepted`.
+        #10 last_accept: SyncTime;
+
+        // Which servos are jammed. A jammed servo holds where it stands
+        // whatever it is asked for, which is what an obstruction looks like to
+        // a position loop.
+        #11 obstructed: JointFlags;
+
+        // How many more cycles of position replies are swallowed. While this is
+        // non-zero the published sample carries no reading at all.
+        #12 drop_replies_left: UInt32;
+
+        // How many goals have been written to the modelled servos, all run.
+        #13 goals_executed: UInt64;
+
+        // How many goals were refused because the queue was full, all run.
+        #14 goals_dropped: UInt64;
+
+        // How many times the dead-man latched torque off, all run.
+        #15 hold_timeouts: UInt64;
+
+        // How many datagrams on the goal channel the codec refused, all run.
+        #16 undecodable_goals: UInt64;
+
+        // How many events were raised on a cycle that had already reported one,
+        // all run. An output carries one message per execution, so a cycle that
+        // raises two events publishes one of them; this is how many were lost.
+        #17 events_dropped: UInt64;
+
+        // How many times a field of this slot named servos this build does not
+        // know, all run. This cog is the only thing that writes it, so a rise
+        // means memory nobody wrote was read back as a set of servos -- refused,
+        // and read as no servos at all.
+        #18 refused_state_fields: UInt64;
+
+        // How many injections this build could not carry out, all run: an
+        // operation it does not know, or one naming servos it does not know.
+        // A scenario written against a newer vocabulary than the binary running
+        // it would otherwise have its hand on the machine discarded in silence.
+        #19 refused_injections: UInt64;
+    }
+}
+
+// What the motion tick is doing.
+//
+// Must carry the same numbers as `reachy_motion::ModeCode`; a test pins the
+// agreement. Zero names none of them, so a slot nothing wrote does not read as
+// the state the machine happens to be safe in.
+enum MotionMode
+{
+    uuid: a750bd1c-98da-4b75-a917-3d1e5f9e0596;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No mode. What a never-written slot decodes to, and no state the tick
+        // is ever in.
+        #0 none default { underlying_value: 0; }
+
+        // Holding the last commanded setpoint.
+        #1 holding { underlying_value: 1; }
+        // Running a move, whose elapsed time travels beside this.
+        #2 moving { underlying_value: 2; }
+        // Parked on a fault, which travels beside this.
+        #3 faulted { underlying_value: 3; }
+    }
+}
+
+// How a move's normalised time maps onto its normalised progress.
+//
+// Must carry the same numbers as `reachy_motion::Warp`. The default is the profile
+// the machine actually moves on, which is the one case in this file where the
+// zero value is a real choice rather than an absence: a move with no warp is
+// not a thing, and the tick's own default is the smooth one.
+enum WarpKind
+{
+    uuid: 9d955d91-c922-4cc5-add1-18f28e20ec63;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Smooth in and out, zero velocity at both ends.
+        #0 min_jerk default { underlying_value: 0; }
+        // Constant rate.
+        #1 linear { underlying_value: 1; }
+    }
+}
+
+// Which side of a tracking run's anchor its goal lies on.
+//
+// Must carry the same numbers as `reachy_motion::TrackingSide`: the value is
+// the direction, so the side below the anchor is the negative one.
+enum TrackingSideKind
+{
+    uuid: ecbd7614-630e-402f-9e79-3b24ec0d4852;
+    options
+    {
+        underlying_type: Int8;
+    }
+    values
+    {
+        // Neither side: the goal sits on the anchor, or is a number nobody can
+        // place.
+        #0 unplaced default { underlying_value: 0; }
+        // Above the anchor -- closing means rising.
+        #1 above { underlying_value: 1; }
+        // Below it -- closing means falling.
+        #2 below { underlying_value: -1; }
+    }
+}
+
+// Which way a pose solve failed, or that none did.
+//
+// Must carry the same numbers as `reachy_motion::FkFailureCode`. Keys the pair
+// of numbers a solver's failure carries.
+enum FkFailureKind
+{
+    uuid: eacad9fa-07aa-4713-9c15-61f96c8f8eda;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Not about a pose solve, and the two numbers beside it mean nothing.
+        #0 not_applicable default { underlying_value: 0; }
+        // The solve ran out of iterations: iterations, then the largest
+        // residual.
+        #1 no_convergence { underlying_value: 1; }
+        // The solve landed on a configuration the machine is not in: head tilt
+        // in degrees, then head height in metres.
+        #2 wrong_assembly_mode { underlying_value: 2; }
+    }
+}
+
+// Which layer judged the servo bus not to be carrying, or that none did.
+//
+// Must carry the same numbers as `reachy_motion::BusSourceCode`. Keys the failure-kind number
+// beside it: a wire failure when a transaction judged it, a sequencer failure
+// when a sequence did.
+enum BusSourceKind
+{
+    uuid: fe0f9e39-94f9-4100-8c2a-bbbb4eeadd61;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Not about the bus, and the failure-kind number means nothing.
+        #0 not_applicable default { underlying_value: 0; }
+        // The move loop's own transaction.
+        #1 transaction { underlying_value: 1; }
+        // A sequencer's verdict. What restores from it names the failure and
+        // the servo and drops the step context, which the slot never held.
+        #2 sequence { underlying_value: 2; }
+    }
+}
+
+// One joint's open run of live ticks past the tracking threshold.
+//
+// The evidence an obstruction is classified from: how far the joint has failed
+// to close on its goal, and for how long.
+schema TrackingStreakSnap
+{
+    uuid: f2d6d29a-87a7-44bf-933a-af86736b3f80;
+    fields
+    {
+        // Whether a run is open at all. Every field below means nothing when
+        // this is false.
+        #0 active: Bool;
+
+        // Where the joint was when this run last restarted, radians.
+        #1 anchor: Float64;
+
+        // Which side of `anchor` the goal lay on then.
+        #2 side: TrackingSideKind;
+
+        // Live ticks since, this one included.
+        #3 count: UInt32;
+    }
+}
+
+// The four values a running move is rebuilt from.
+//
+// A path is not stored sample by sample: these fully determine it, and a
+// trajectory built from them produces the same samples whenever it is built.
+// That is what lets a move survive a slot at all.
+schema TrajectorySeed
+{
+    uuid: 3cf50833-c1d3-41ef-a648-4e488dbe5341;
+    fields
+    {
+        // Whether a move is running. Every field below means nothing when this
+        // is false.
+        #0 present: Bool;
+
+        // The command set the path starts from.
+        #1 start: Targets;
+
+        // The command set it ends at.
+        #2 target: Targets;
+
+        // The head group's clock.
+        #3 dur_head: Duration;
+
+        // The right antenna's clock. The antennas are clocked apart from the
+        // head and from each other, so a move may finish one before another.
+        #4 dur_antenna_right: Duration;
+
+        // The left antenna's clock.
+        #5 dur_antenna_left: Duration;
+
+        // How normalised time maps onto normalised progress.
+        #6 warp: WarpKind;
+    }
+}
+
+// A standing fault as the numbers a slot holds it in.
+//
+// Must agree field for field with `reachy_motion::FaultSnapshot`. Carries
+// identity and actionable evidence; diagnostic error-chain structure is absent
+// because it travels once at raise time, in the `TickFault` message and the log.
+//
+// Every field is present for every fault, because a slot has no room for a
+// variant. Which of them the fault actually said is keyed by `code`, and the
+// rest carry zero -- which says "not part of this fault" and never a
+// measurement of zero.
+schema FaultSnap
+{
+    uuid: 3a3768e7-49c2-41e6-bc5d-eaa21f6e6db8;
+    fields
+    {
+        // Which fault this is. The three non-fault outcomes the tick reports on
+        // the fault channel cannot appear here: a machine does not stand parked
+        // on a refused command.
+        #0 code: FaultKind;
+
+        // The servo concerned, or `none` where the fault is about no single
+        // one.
+        #1 joint: JointRef;
+
+        // The servo's bus id, or zero where the fault names no servo.
+        #2 servo_id: UInt8;
+
+        // The servo's hardware-error byte as read, or zero.
+        #3 error_bits: UInt8;
+
+        // How many consecutive periods the evidence ran for -- missed reads, or
+        // failed solves -- or zero.
+        #4 count: UInt32;
+
+        // How far the joint stood from its goal, radians, or zero.
+        #5 error: Float64;
+
+        // Which way a pose solve failed, or that none did.
+        #6 fk_code: FkFailureKind;
+
+        // The solve failure's first number, keyed by `fk_code`.
+        #7 fk_a: Float64;
+
+        // The solve failure's second number, keyed by `fk_code`.
+        #8 fk_b: Float64;
+
+        // Which layer judged the bus not carrying, or that none did.
+        #9 bus_source: BusSourceKind;
+
+        // What that layer called the failure, as the number its own type
+        // states. Keyed by `bus_source`, so it is never a number without an
+        // owner; zero where no layer is named.
+        #10 bus_failure_kind: UInt8;
+    }
+}
+
+// Everything the motion tick carries from one sample to the next.
+//
+// A cog keeps no memory of its own between executions: what survives is what a
+// declared slot holds, and the tick's state is private data with a running
+// move, a fault timeline and a set of accumulators inside it. Fields must agree
+// with `reachy_motion::MotionSnapshot`; the crate's own flat forms fill them.
+//
+// What is deliberately absent is the session's fault timeline. It is neither
+// copyable nor bounded, and it does not need to be: a classification happens
+// once and travels as a value, which for this cog means a `TickFault` message
+// the moment it is raised. A restored state starts with an empty timeline and
+// loses nothing, because nothing was keeping the record there.
+//
+// The accumulators are the point of the whole thing. The tracking runs, the
+// miss count and the failed-solve count are not bookkeeping -- they are the
+// fault detectors themselves, and a cog that rebuilt its state from each
+// sample would be a machine that can never notice anything that takes more than
+// one period to become true.
+schema MotionSnap
+{
+    uuid: ae11eebd-b410-434d-812b-36ac7cfab0b0;
+    fields
+    {
+        // What the machine is doing. `none` is what an unwritten slot holds and
+        // is refused rather than read as a state.
+        #0 mode: MotionMode;
+
+        // How far into the running move, meaningful only while `mode` is
+        // `moving`.
+        #1 moving_elapsed: Duration;
+
+        // The standing fault, meaningful only while `mode` is `faulted`.
+        #2 fault: FaultSnap;
+
+        // The running move. Present while `mode` is `moving`, and also while
+        // `mode` is `faulted` -- a latching fault stops commanding without
+        // clearing the path it was on.
+        #3 trajectory: TrajectorySeed;
+
+        // Whether a tick has run at all. False before the first one, when the
+        // time below means nothing.
+        #4 prev_now_valid: Bool;
+
+        // The previous tick's clock reading.
+        #5 prev_now: Duration;
+
+        // The goals last emitted, radians -- or the ones arming pinned, if none
+        // have been. This is the baseline a step bound is measured against, so
+        // a slot that lost it is a machine that would accept any step at all.
+        #6 last_goal: Joints;
+
+        // The Cartesian mirror of `last_goal`: where the head was last asked to
+        // be, which is where the next move starts from.
+        #7 last_targets: Targets;
+
+        // Position the next present-pose solve is seeded from, metres.
+        #8 fk_seed_pos: Vec3;
+
+        // Orientation the next present-pose solve is seeded from.
+        #9 fk_seed_quat: Quat;
+
+        // The present pose's smallest toggle margin as of the last live read.
+        #10 present_min_margin: Float64;
+
+        // Per crank, how far the running move's start pose stood outside its
+        // travel window, radians, zero where it was inside. A move that began
+        // outside the envelope is excused back to this baseline, which is what
+        // lets a machine that woke up out of bounds travel home.
+        #11 excursion_cranks: FixedArray<Float64, 6>;
+
+        // How far that start pose's body yaw reached past its cap, radians.
+        #12 excursion_body_yaw: Float64;
+
+        // How far its head-relative yaw reached past its cap, radians.
+        #13 excursion_relative_yaw: Float64;
+
+        // How far its head attitude reached past the cone bound, radians.
+        #14 excursion_cone: Float64;
+
+        // Consecutive periods without a live read.
+        #15 miss_count: UInt32;
+
+        // Consecutive live reads whose pose would not solve.
+        #16 pose_failures: UInt32;
+
+        // Each joint's open tracking run, in bus order. An entry whose `active`
+        // is false is a joint with no run open.
+        #17 tracking: FixedArray<TrackingStreakSnap, 9>;
+
+        // The joints out of service. Nothing is commanded for these and nothing
+        // is judged about them.
+        #18 masked: JointFlags;
+    }
+}
+
+// What the decision tick carries between samples: the tick's own state, and
+// what the cog knows about the schedule it is following.
+//
+// The tick's state is the whole of `snap`, and everything beside it is this
+// cog's: whether a state exists at all, and enough about the last schedule it
+// acted on to tell a change from a repetition. Publish bookkeeping is absent:
+// the cog reads sequence numbers and timestamps back from its own view of the
+// channel it publishes on.
+schema MoverState
+{
+    uuid: f4cb808c-2637-48ba-a16d-1041319208dd;
+    fields
+    {
+        // Whether a motion state exists: the session is engaged and a solve
+        // from a measured pose produced one. Until it does, `snap` is whatever
+        // a default-constructed slot holds and describes no machine.
+        #0 armed: Bool;
+
+        // The tick's state.
+        #1 snap: MotionSnap;
+
+        // The `epoch` of the last schedule acted on. A schedule arriving with
+        // this number again asks for nothing new, whatever its steps say.
+        #2 schedule_epoch_seen: UInt32;
+
+        // The kind of the last step dispatched as a move.
+        #3 desired_kind: StepKind;
+
+        // The posture of that step. Together with `desired_kind` this is what a
+        // fresh schedule is compared against to decide whether the machine has
+        // somewhere new to be.
+        #4 desired_posture: Posture;
+
+        // How many goal datagrams have been published, all run.
+        #5 goals_published: UInt64;
+
+        // How many reports the tick raised, all run.
+        #6 faults_raised: UInt64;
+
+        // How many samples have been seen, all run.
+        #7 samples_seen: UInt64;
+
+        // How many datagrams on the sample channel the codec refused, all run.
+        // Distinct from a sample that carried no reading: those bytes were not
+        // a sample at all, so they named no instant and no positions and no
+        // tick ran on them.
+        #8 undecodable_samples: UInt64;
+
+        // How many reports were raised on an execution that had already
+        // reported one, all run. What a reader compares against the reports in
+        // the log to know whether it is reading all of them.
+        #9 reports_dropped: UInt64;
+
+        // How many times the tick state in this slot could not be read back as
+        // a machine, or would not go back into it, all run. Either way the cog
+        // is left unarmed and arms again off the next sample, so a rise says an
+        // engagement ended without anything having asked for it.
+        #10 refused_state: UInt64;
+
+        // How many times this cog's own last goal datagram would not decode,
+        // all run. That read-back is where the next sequence number and the
+        // instant the next publish is checked against come from, so a refusal
+        // restarts the wire sequence at zero; this counter is what tells that
+        // apart from a commander that restarted.
+        #11 refused_readback: UInt64;
+    }
+}

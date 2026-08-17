@@ -1,0 +1,601 @@
+load("@clockwork//clockwork:rules.bzl", "clk")
+load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:rust_clk.bzl", "rust_clk_module")
+load("//bazel:scenario_suite.bzl", "scenario_suite")
+
+# The motion cog system: the schemas everything here speaks, the cogs that run
+# on the driver's sample stream, the simulated driver that produces it, and the
+# process that hosts all three.
+#
+# Framework integration (compiling `.clk`, VarPacket round-trips, driving the
+# deterministic runner from a Rust-authored log) is proved by `proof/`; not
+# re-proved here. What this package adds is the composition: one box, one
+# process, and scenarios that run it end to end.
+#
+# The rules below are in the order and the shape the drop's own BUILD updater
+# renders, because a `clk()` over a system module brings a gate test that holds
+# this file to exactly that. So they are alphabetical by target name rather than
+# in dependency order, and the two rules the tool writes -- `system_sim_clk` and
+# the `motioncpu.textproto` launcher config it derives -- carry no comments,
+# because it strips them. That launcher config is used by nothing here: it
+# redirects a child's console into files, which is not what a deterministic run
+# wants. It earns its place when a system spans processes. Until then a wildcard
+# build builds it and the TCP bridge it names for nothing, and the updater
+# refuses the `tags = ["manual"]` that would stop that as surely as it refuses a
+# comment. TODO(clockwork-build-updater-strips-annotations)
+
+# The one system every scenario below runs on, and the generated artifacts the
+# harness script needs on disk to run it. Named once so that a rename in the
+# system module is one edit rather than five.
+SIM_EXE = ":sim_clk_exe"
+
+SIM_PROCESS = ":brenn_reachy.cogs.system_sim.motion_sim.proc.tachyon"
+
+SIM_PUBLISHER_CONFIG = ":system_sim.motion_sim.MotionCpu_channel_publisher_config.tachyon"
+
+SIM_LOGGER_CONFIG = ":system_sim.motion_sim.MotionCpu_event_logger_config.tachyon"
+
+SIM_CONFIGS = [
+    "mover_params.textproto",
+    "sim_params.textproto",
+]
+
+exports_files([
+    "config.clk",
+    "motion.clk",
+    "msgs.clk",
+    # The three-phase driver every scenario's `sh_test` runs, including the
+    # harness proof's next door: one invocation of the deterministic runner for
+    # the whole repo.
+    "scenario_test.sh",
+    "sim.clk",
+    "system_sim.clk",
+])
+
+# The configs, in a module of their own because they are the only schemas that
+# cross the Protobuf backend -- which is what lets a box bind one to a file of
+# text -- and generation is declared per module. `msgs.clk` cannot cross it: the
+# emitter refuses a negative enumerator, and the tracking-side enum mirroring
+# the library's own has one.
+clk(
+    name = "config_clk",
+    srcs = ["config.clk"],
+    outs = [
+        "config_clk_cc.cc",
+        "config_clk_cc.hh",
+        "config_clk_cc.inl",
+        "config_clk_proto.proto",
+        "config_clk_proto_conv.cc",
+        "config_clk_proto_conv.hh",
+        "config_clk_proto_conv.inl",
+    ],
+    generate = [
+        "cpp",
+        "proto",
+        "proto_conv",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "config_clk_rs",
+    src = "config.clk",
+)
+
+# Taking an output log apart, for whatever system wrote it: the binding check, a
+# message to an owned value, a carrier to a datagram. Its own crate rather than a
+# module of `scenario`, because the harness proof next door reads its logs the
+# same way and must not depend on this system's schemas to do it.
+rust_library(
+    name = "log_read",
+    srcs = ["log_read.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# `cpp_cog` makes the generated `_cc` library depend on `:motion_clk_cc_impl`.
+# No `cpp_exe`: the system module that declares the process is not in this
+# package.
+clk(
+    name = "motion_clk",
+    srcs = ["motion.clk"],
+    outs = [
+        "motion_clk_cc.cc",
+        "motion_clk_cc.hh",
+        "motion_clk_cc.inl",
+        "motion_clk_cc_dial.cc",
+        "motion_clk_cc_dial.hh",
+        "motion_clk_cc_dial.inl",
+        "motion_clk_cc_test.cc",
+        "motion_clk_cc_test.hh",
+        "motion_clk_cc_test.inl",
+    ],
+    cpp_deps = [
+        ":config_clk_cc",
+        ":msgs_clk_cc",
+        "@clockwork//clockwork/io:var_packet_clk_cc",
+    ],
+    generate = [
+        "cpp",
+        "cpp_cog",
+        "cpp_test_cog",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config_clk",
+        ":msgs_clk",
+        "@clockwork//clockwork/io:var_packet_clk",
+    ],
+)
+
+# Must be named `motion_clk_cc_impl`: the generated `_cc` library depends on
+# `:<clk target>_cc_impl`.
+cc_library(
+    name = "motion_clk_cc_impl",
+    srcs = ["motion_clk_cc_impl.cc"],
+    deps = [
+        ":motion_clk_cc_dial",
+        ":motion_clk_rs_entry",
+        "@clockwork//clockwork/dial:msg_input",
+        "@clockwork//clockwork/pinion:publishable",
+        "@clockwork//jewels/container:circular_buffer",
+    ],
+)
+
+rust_clk_module(
+    name = "motion_clk_rs",
+    src = "motion.clk",
+    cog_impl = ":motion_cogs",
+    imports = [
+        "config.clk",
+        "msgs.clk",
+        "@clockwork//clockwork/io:var_packet.clk",
+    ],
+    test_wrappers = True,
+    deps = [
+        ":config_clk_rs",
+        ":msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+    ],
+)
+
+rust_test(
+    name = "motion_cog_test",
+    size = "small",
+    srcs = ["motion_cog_test.rs"],
+    edition = "2024",
+    deps = [
+        ":config_clk_rs",
+        ":motion_clk_rs_test",
+        ":motion_slots",
+        ":msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+        "@brenn_reachy_crates//:nalgebra",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+rust_library(
+    name = "motion_cogs",
+    srcs = ["motion_cogs.rs"],
+    edition = "2024",
+    deps = [
+        ":motion_clk_rs",
+        ":motion_slots",
+        ":msgs_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+        "@brenn_reachy_crates//:nalgebra",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The cog bodies' own cases: what one tick said, as the one message an
+# execution publishes. In-crate rather than beside the wrapper cases next door,
+# because a machine driven through the wrapper cannot reach every outcome the
+# tick reports -- three of the four ways a command is refused, one of the two
+# ways a move is abandoned, and any two outcomes arriving on the same tick.
+rust_test(
+    name = "motion_cogs_test",
+    size = "small",
+    crate = ":motion_cogs",
+)
+
+rust_test(
+    name = "motion_slot_test",
+    size = "small",
+    srcs = ["motion_slot_test.rs"],
+    edition = "2024",
+    deps = [
+        ":motion_slots",
+        ":msgs_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:nalgebra",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The one place a motion value meets a schema field. Its own crate rather than a
+# module of the cog bodies, because the cogs' tests and the scenario checkers
+# read the same fields and must read them the same way.
+rust_library(
+    name = "motion_slots",
+    srcs = ["motion_slots.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:thiserror",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+merge_simplelaunch_config(
+    name = "motioncpu.textproto",
+    srcs = [
+        "system_sim.motion_sim.MotionCpu_simplelaunch_config.textproto",
+        "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
+    ],
+    data = [
+        "brenn_reachy.cogs.system_sim.motion_sim.proc.tachyon",
+        "system_sim.motion_sim.MotionCpu_channel_allocations.csv",
+        "system_sim.motion_sim.MotionCpu_channel_publisher_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_channel_spy_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_event_logger_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_metrics_channel_metadata_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_signal_metadata_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_telemetry_logger_config.tachyon",
+        "system_sim.motion_sim.diagnostics_database_config.tachyon",
+        ":sim_clk_exe",
+        "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+)
+
+# A module of its own because a cog member's type is an interface instantiation
+# and the compiler resolves one only against a module the cog's module imports.
+clk(
+    name = "msgs_clk",
+    srcs = ["msgs.clk"],
+    outs = [
+        "msgs_clk_cc.cc",
+        "msgs_clk_cc.hh",
+        "msgs_clk_cc.inl",
+    ],
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "msgs_clk_rs",
+    src = "msgs.clk",
+)
+
+# S1, raise-hold-stow, over the real system: three cogs, seven channels, two
+# configs read from text. What is under test is the loop, not the harness -- the
+# harness's own proof points live in `proof/` and are not re-proved here.
+# Simulated time throughout, so the run is a fraction of a second of this
+# machine's clock whatever its load.
+scenario_suite(
+    name = "s1",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        "//crates/reachy-motion:reachy_motion",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":msgs_clk_rs",
+    ],
+)
+
+# S2, obstruction: the same three cogs S1 runs on, with a hand held against the
+# head cranks part way through the raise.
+scenario_suite(
+    name = "s2",
+    author_deps = [
+        ":msgs_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+    ],
+)
+
+# S3, dead-man: energised, and then left alone.
+scenario_suite(
+    name = "s3",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        "//crates/reachy-wire:reachy_wire",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [],
+)
+
+# S4, feedback loss: the same three cogs S1 runs on, with the bus made to stop
+# answering once the machine is upright and holding.
+scenario_suite(
+    name = "s4",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+    ],
+)
+
+# S5, retarget: the same three cogs S1 runs on, with the session changing the
+# posture it asks for while the machine is still on its way to the one it asked
+# for first.
+scenario_suite(
+    name = "s5",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:nalgebra",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":msgs_clk_rs",
+    ],
+)
+
+# What every scenario of this system is made of: the epoch and the grid, the
+# channel names, an input-log author, an output-log reader, and the assertions
+# every scenario shares. Bazel-only, like everything that links the log crate --
+# and no cog links this, so it may.
+rust_library(
+    name = "scenario",
+    srcs = [
+        "scenario.rs",
+        "scenario/author.rs",
+        "scenario/check.rs",
+        "scenario/read.rs",
+    ],
+    crate_root = "scenario.rs",
+    edition = "2024",
+    deps = [
+        ":log_read",
+        ":motion_slots",
+        ":msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+        "@brenn_reachy_crates//:nalgebra",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The simulated driver, the box that closes the loop around it, and the process
+# that hosts the box. `cpp_cog` makes the generated `_cc` library depend on
+# `:sim_clk_cc_impl`; `cpp_exe` synthesizes the process executable, whose name is
+# derived from the file stem and is therefore the name `sim.clk`'s
+# `Process(executable=...)` spells.
+#
+# `offline_main` rather than the online main: it carries the deterministic
+# runner, which is what a scenario drives this process under.
+clk(
+    name = "sim_clk",
+    srcs = ["sim.clk"],
+    outs = [
+        "sim_clk_cc.cc",
+        "sim_clk_cc.hh",
+        "sim_clk_cc.inl",
+        "sim_clk_cc_dial.cc",
+        "sim_clk_cc_dial.hh",
+        "sim_clk_cc_dial.inl",
+        "sim_clk_cc_test.cc",
+        "sim_clk_cc_test.hh",
+        "sim_clk_cc_test.inl",
+        "sim_clk_exe.cc",
+        "sim_clk_exe.hh",
+        "sim_clk_exe.inl",
+    ],
+    cpp_deps = [
+        ":config_clk_cc",
+        ":motion_clk_cc",
+        ":msgs_clk_cc",
+        "@clockwork//clockwork/io:var_packet_clk_cc",
+    ],
+    cpp_exe_deps = [
+        # The two configs arrive as protobuf text, so the executable carries the
+        # generated protobuf messages and the conversions into the messages the
+        # dials hand the cogs.
+        ":config_clk_proto_cc_library",
+        ":config_clk_proto_conv",
+        "@clockwork//clockwork/scaffolding:offline_main",
+    ],
+    # Read by path at process setup, relative to the runfiles of whatever runs
+    # the executable.
+    data = [
+        "mover_params.textproto",
+        "sim_params.textproto",
+    ],
+    generate = [
+        "cpp",
+        "cpp_cog",
+        "cpp_exe",
+        "cpp_test_cog",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config_clk",
+        ":motion_clk",
+        ":msgs_clk",
+        "@clockwork//clockwork/io:var_packet_clk",
+    ],
+)
+
+# Must be named `sim_clk_cc_impl`: the generated `_cc` library depends on
+# `:<clk target>_cc_impl`.
+cc_library(
+    name = "sim_clk_cc_impl",
+    srcs = ["sim_clk_cc_impl.cc"],
+    deps = [
+        ":sim_clk_cc_dial",
+        ":sim_clk_rs_entry",
+        "@clockwork//clockwork/dial:msg_input",
+        "@clockwork//clockwork/pinion:publishable",
+        "@clockwork//jewels/container:circular_buffer",
+    ],
+)
+
+rust_clk_module(
+    name = "sim_clk_rs",
+    src = "sim.clk",
+    cog_impl = ":sim_cogs",
+    imports = [
+        "config.clk",
+        "motion.clk",
+        "msgs.clk",
+        "@clockwork//clockwork/io:var_packet.clk",
+    ],
+    test_wrappers = True,
+    deps = [
+        ":config_clk_rs",
+        ":motion_clk_rs",
+        ":msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+    ],
+)
+
+rust_test(
+    name = "sim_cog_test",
+    size = "small",
+    srcs = ["sim_cog_test.rs"],
+    edition = "2024",
+    deps = [
+        ":config_clk_rs",
+        ":motion_slots",
+        ":msgs_clk_rs",
+        ":sim_clk_rs_test",
+        ":sim_slots",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+rust_library(
+    name = "sim_cogs",
+    srcs = ["sim_cogs.rs"],
+    edition = "2024",
+    deps = [
+        ":motion_slots",
+        ":msgs_clk_rs",
+        ":sim_clk_rs",
+        ":sim_slots",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+rust_test(
+    name = "sim_slot_test",
+    size = "small",
+    srcs = ["sim_slot_test.rs"],
+    edition = "2024",
+    deps = [
+        ":motion_slots",
+        ":msgs_clk_rs",
+        ":sim_slots",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-motion:reachy_motion",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# Its own crate for the same reason `motion_slots` is: the cog, its tests and a
+# scenario checker all read the slot and must read it the same way.
+rust_library(
+    name = "sim_slots",
+    srcs = ["sim_slots.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":motion_slots",
+        ":msgs_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-motion:reachy_motion",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+clk(
+    name = "system_sim_clk",
+    srcs = ["system_sim.clk"],
+    outs = [
+        "brenn_reachy.cogs.system_sim.motion_sim.proc.tachyon",
+        "system_sim.motion_sim.MotionCpu_channel_allocations.csv",
+        "system_sim.motion_sim.MotionCpu_channel_publisher_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_channel_spy_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_event_logger_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_metrics_channel_metadata_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_signal_metadata_config.tachyon",
+        "system_sim.motion_sim.MotionCpu_simplelaunch_config.textproto",
+        "system_sim.motion_sim.MotionCpu_telemetry_logger_config.tachyon",
+        "system_sim.motion_sim.diagnostics_database_config.tachyon",
+        "system_sim.motion_sim.logged_channel_metadata.pbbin",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":motion_clk",
+        ":sim_clk",
+        "@clockwork//clockwork/logging:channel_policy_clk",
+    ],
+)

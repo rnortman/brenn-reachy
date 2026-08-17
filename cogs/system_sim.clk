@@ -1,0 +1,86 @@
+// The simulated system: the target a scenario runs, and the channel policies
+// that decide what the runner feeds and what it logs.
+//
+// No `generate` attribute, and that is forced rather than stylistic: the
+// grammar admits a `system_target` only in a module that generates nothing. So
+// the process, the machine it runs on and the box they host are declared in
+// `sim.clk`, and this file names the target over them and emits only the
+// process description and per-domain configs the runner reads.
+//
+// What a scenario needs from this file is the two per-domain configs: the
+// channel publisher config that makes the schedule and injection channels come
+// out of an input log, and the event logger config that puts every channel
+// worth asserting on into the output log.
+//
+// The policies live here rather than beside the channels they bind because
+// `channel_policy` generates nothing, and a module that generates C++ may not
+// import one that generates no targets.
+//
+// Everything a scenario checker reads is below. `DriverPose` is the machine's
+// heartbeat, `DriverCmd` what it was asked for, `DriverEvt` what the gate did
+// about it, `TickFaults` what the decision tick had to say and `Estimates`
+// where the head was. The two log-fed channels are logged as well, so a run's
+// inputs and its outputs are in one file and a failure can be read without the
+// scenario's source in hand.
+
+use cogs::sim;
+use cogs::motion;
+use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy,
+    LogReaderPolicy, LogType};
+
+// What makes the runner publish these two channels from the input log. Neither
+// policy carries a `source_name`, so the source is the channel's own name,
+// which is what the scenario author writes.
+policy LogReaderPolicy for motion::ScheduleChan
+{
+}
+
+policy LogReaderPolicy for sim::SimCmdChan
+{
+}
+
+// What the run is asked to do, kept beside what it did.
+policy ChannelLoggingPolicy for motion::ScheduleChan
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for sim::SimCmdChan
+{
+    log_type = LogType::event;
+}
+
+// The machine's heartbeat: one sample per cycle, always.
+policy ChannelLoggingPolicy for motion::DriverPose
+{
+    log_type = LogType::event;
+}
+
+// What it was asked to hold next.
+policy ChannelLoggingPolicy for motion::DriverCmd
+{
+    log_type = LogType::event;
+}
+
+// What the gate did that the sample stream does not show.
+policy ChannelLoggingPolicy for sim::DriverEvt
+{
+    log_type = LogType::event;
+}
+
+// What the decision tick raised.
+policy ChannelLoggingPolicy for motion::TickFaults
+{
+    log_type = LogType::event;
+}
+
+// Where the head was, once per sample.
+policy ChannelLoggingPolicy for motion::Estimates
+{
+    log_type = LogType::event;
+}
+
+system_target motion_sim
+{
+    box: sim::System;
+}

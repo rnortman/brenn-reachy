@@ -1,0 +1,57 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+# Rust crates for Clockwork's own `.clk` modules.
+#
+# `rust_clk_module` generates the Rust for a module *of this repo*: it derives
+# the crate name from the package the module sits in and compiles it under this
+# repository's name. A module that belongs to the Clockwork drop needs neither,
+# and needs both to come out exactly as the generator spells them elsewhere --
+# a dial that carries an upstream message writes that message's type as
+# `<upstream module's crate>::<type>`, and the crate has to exist under that
+# name or nothing links.
+#
+# So this package calls the generator longhand for the upstream modules our cogs
+# carry messages from. There is one today, and every one added after it is
+# another hand-written invocation tracking the generator's flags by itself --
+# which is what a `repo`/`root`/`crate_name` override on the macro would end.
+# TODO(rusty-cogs-macro-parameters)
+
+# The variable-size byte packet, which is how every wire-format channel in this
+# repo's cog systems carries its datagrams. Its module instantiates a fixed menu
+# of sizes; a channel may only name one of those, and the generator emits an
+# instantiation into the crate of the module whose `instantiate` created it --
+# so the sizes our channels use are chosen off that menu rather than declared
+# here, and the crate below is where their Rust types come from.
+# TODO(foreign-generic-instantiation-crate)
+#
+# `--root` is derived from the source's own path rather than written down: the
+# generator names a module by its path relative to the root it is given, and
+# the drop arrives under a canonical repository directory whose spelling Bazel
+# owns. Stripping the known suffix is what gets the two to agree without this
+# file knowing that spelling.
+genrule(
+    name = "var_packet_clk_rs_gen",
+    srcs = ["@clockwork//clockwork/io:var_packet.clk"],
+    outs = ["var_packet_clk_rs.rs"],
+    cmd = "src=$(location @clockwork//clockwork/io:var_packet.clk); " +
+          "$(location @rusty_cogs//generator:rusty_cogs_gen) generate " +
+          "--input $$src " +
+          "--output $@ " +
+          "--repo clockwork " +
+          "--crate-name clockwork__clockwork__io__var_packet_clk_rs " +
+          "--root $${src%/clockwork/io/var_packet.clk} " +
+          "--rustfmt $(location @rules_rust//rust/toolchain:current_rustfmt_toolchain)",
+    tools = [
+        "@rules_rust//rust/toolchain:current_rustfmt_toolchain",
+        "@rusty_cogs//generator:rusty_cogs_gen",
+    ],
+)
+
+rust_library(
+    name = "var_packet_clk_rs",
+    srcs = [":var_packet_clk_rs_gen"],
+    crate_name = "clockwork__clockwork__io__var_packet_clk_rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = ["@rusty_cogs//crates/clockwork-rs:clockwork_rs"],
+)

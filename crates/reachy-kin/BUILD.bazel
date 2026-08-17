@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The kinematics library, built for Bazel so a Clockwork cog body can depend on
+# it. Same sources Cargo builds from the manifest next door -- this is a second
+# build of one crate, not a second copy of it.
+#
+# No `edition` attribute: the Rust toolchain registered in MODULE.bazel carries
+# the workspace's edition, and restating it per target is drift waiting to
+# happen.
+rust_library(
+    name = "reachy_kin",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:thiserror",
+    ],
+)
+
+# The same suite Cargo runs, in the lane that builds the flight code. The
+# vendored geometry file the transcription test checks against reaches it
+# through `include_str!`, whose path is relative to the source file rather than
+# to a manifest directory, so the file is `compile_data` here and needs no
+# runfiles.
+rust_test(
+    name = "reachy_kin_test",
+    size = "small",
+    compile_data = ["tests/fixtures/kinematics_data.json"],
+    crate = ":reachy_kin",
+    deps = ["@brenn_reachy_crates//:serde_json"],
+)

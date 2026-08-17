@@ -1,0 +1,52 @@
+// The messages the bring-up probe passes, and the slot it keeps.
+//
+// Messages sit in a module of their own, apart from the cog that carries them:
+// a cog member's type is an interface instantiation, and the compiler resolves
+// one only against a module the cog's module imports.
+//
+// The field types are chosen rather than convenient. `SyncTime` and `Duration`
+// are here because every schema the motion cogs will carry uses them and
+// nothing in this repo had yet compiled one, in either the generated Rust or
+// the log reader's typed decode; a primitives-only probe would have proven the
+// path for messages we do not send.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::proof)]
+
+// One instruction to the probe, injected from the input log.
+schema ProbeCmd
+{
+    uuid: 3dacdb38-e475-4158-aac1-9cdda9a9bcb7;
+    fields
+    {
+        // When the scenario meant this command to take effect. Carried through
+        // to the datagram the probe emits, so a checker reading the output log
+        // can join a packet back to the command that caused it.
+        #0 at: SyncTime;
+
+        // How long the commanded position is meant to be held. Nothing acts on
+        // it; it is here because a `Duration` field has to cross the same three
+        // boundaries the `SyncTime` above does.
+        #1 hold: Duration;
+
+        // The commanded position, in the joint the probe writes.
+        #2 position: Float64;
+    }
+}
+
+// What the probe remembers between executions.
+schema ProbeState
+{
+    uuid: 53a2aaae-a96d-4b30-98c0-9c0310e07906;
+    fields
+    {
+        // How many commands have been acted on since the process started.
+        #0 commands_seen: UInt32;
+
+        // The sequence number the probe read back out of its own output
+        // channel on this execution, and 0 before it has ever published. Kept
+        // so a unit test can observe the read-back rather than infer it from
+        // what was published.
+        #1 echoed_seq: UInt32;
+    }
+}

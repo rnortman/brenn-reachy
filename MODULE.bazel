@@ -1,0 +1,140 @@
+# Cargo remains the dev loop for the libraries under crates/: `make check` is
+# still cargo fmt, clippy and test over the workspace, and nothing here changes
+# that. Bazel exists beside it because the Clockwork cog system cannot be built
+# any other way -- the compiler that turns a `.clk` module into C++ and Rust is
+# a Bazel rule, and the drop it comes from arrives as a module dependency. The
+# libraries are therefore dual-built: Cargo owns their tests, Bazel builds them
+# so a cog body can depend on them.
+#
+# Everything derived from the pinned Clockwork drop -- its whole dependency
+# table, its toolchain registration -- is quarantined in the included segment,
+# so that a drop upgrade touches one file and this one stays about us.
+
+module(name = "brenn_reachy")
+
+include("//bazel:clockwork_overrides.MODULE.bazel")
+
+# The cog generator: the tool that turns a `.clk` module's cogs into Rust, and
+# the crate the generated code rests on. It brings the Clockwork drop with it as
+# its own dependency, which is why the override table above is a copy of theirs
+# -- Bazel honours overrides only in the root module, so a dependency's table
+# reaches nothing.
+#
+# Pinned by revision against the GitHub remote rather than by version: rusty-cogs
+# publishes no releases and the module graph has to be fetchable by CI and by any
+# other machine.
+#
+# TODO(rusty-cogs-pin-bump-merge-order)
+bazel_dep(name = "rusty_cogs", version = "")
+#
+# Two patches, each the upstream fix written in the wrong repository, and each
+# with its own header explaining itself. Both are context diffs and fail loudly
+# on a pin bump that moves the lines they name.
+#
+# The first removes one line of their MODULE.bazel: an `include()` of their copy
+# of the Clockwork override table. `include()` is legal only in the root module,
+# so without this nothing in the graph resolves at all -- and the table it pulls
+# in is the same table this repo already includes from its own root, so the graph
+# is unchanged by dropping it.
+# TODO(rusty-cogs-root-only-include)
+#
+# The second gives the generated signal trampolines internal linkage. Without it
+# two cog modules' C++ shims define the same unmangled symbols and no process
+# holding cogs from more than one module links at all.
+# TODO(rusty-cogs-signal-trampoline-linkage)
+git_override(
+    module_name = "rusty_cogs",
+    commit = "4e8f8e893412020c1a00a57ce8e61ab20aade09e",
+    patch_strip = 1,
+    patches = [
+        "//bazel/rusty-cogs-patches:module-drop-root-only-include.patch",
+        "//bazel/rusty-cogs-patches:shim-trampolines-internal-linkage.patch",
+    ],
+    remote = "https://github.com/rnortman/rusty-cogs.git",
+)
+
+# Uncomment to build against a working tree instead of the pin. Both must not be
+# active at once; the pin above is what CI and every other machine resolve.
+# local_path_override(
+#     module_name = "rusty_cogs",
+#     path = "../rusty-cogs",
+# )
+
+# The interpreter the drop pins for its own Python code and both of its pip
+# hubs. Those hubs are version-keyed and the Clockwork compiler's dependency
+# closure comes out of them, so anything of ours that imports the compiler runs
+# on this version too. A fact supplied by the drop, revisited per drop, not a
+# choice of ours.
+PYTHON_VERSION = "3.10"
+
+# The Clockwork compiler needs to know the name of the root module, and the
+# extension that tells it can only see modules that use it -- so the root has to
+# use it even though nothing here references the repo directly.
+root_repo = use_extension("@clockwork//tools/repo:root_repo.bzl", "root_repo")
+use_repo(root_repo, "root_repo")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    configure_coverage_tool = True,
+    is_default = True,
+    python_version = PYTHON_VERSION,
+)
+
+# Rust under Bazel. The version is pinned exactly. It has to be compatible with
+# the versions the drop's override table forces on the whole graph, which is why
+# it is here and not in that segment.
+#
+# This is deliberately *not* the version rust-toolchain.toml names. That file
+# says `stable`, for the Cargo lane and for rustup; this pin is what Bazel
+# fetches, and a floating channel under Bazel would be a build nobody can
+# reproduce. The two lanes compile the same sources with different compilers on
+# purpose -- the Cargo lane is where a new stable's lints are met first.
+bazel_dep(name = "rules_rust", version = "0.73.0")
+
+RUST_VERSION = "1.97.1"
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    rustfmt_version = RUST_VERSION,
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# The third-party Rust crates the motion libraries need, resolved by
+# crate_universe. `from_specs` rather than `from_cargo`: the Cargo workspace's
+# manifests carry members Bazel never builds (the bench binary, the serial bus
+# layer) and their dependency trees would be resolved for nothing. The set here
+# is exactly what the Bazel-built libraries name, and it is small enough to
+# state.
+#
+# Versions match the workspace's `[workspace.dependencies]` so the two lanes
+# compile the same crates; MODULE.bazel.lock pins the resolution that comes out.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# f64 linear algebra for the head kinematics. reachy-kin and reachy-motion.
+crate.spec(
+    package = "nalgebra",
+    version = "0.35",
+)
+
+# Derived `Display`/`Error` for the libraries' typed error enums.
+crate.spec(
+    package = "thiserror",
+    version = "2",
+)
+
+# Tests only: reachy-kin's baked linkage constants are asserted against the
+# vendored copy of the vendor file they were transcribed from, and that file is
+# JSON. `float_roundtrip` because the comparison is exact equality against
+# transcribed decimals.
+crate.spec(
+    features = ["float_roundtrip"],
+    package = "serde_json",
+    version = "1",
+)
+
+crate.from_specs(name = "brenn_reachy_crates")
+use_repo(crate, "brenn_reachy_crates")

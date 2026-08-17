@@ -15,6 +15,12 @@ brenn-scrub staged
 # garbage and abort the commit under `set -e`.
 for var in $(compgen -v GIT_ || true); do unset "$var"; done
 
-if [ -f Makefile ] && grep -q '^check:' Makefile; then
+# check-commit is both lanes; check is the Cargo lane alone, which cannot see a
+# .clk schema compile. The fallback is for historical checkouts: core.hooksPath
+# hooks run at whatever revision is checked out, and revisions from before
+# check-commit existed have no such target.
+if [ -f Makefile ] && grep -q '^check-commit:' Makefile; then
+    make check-commit
+elif [ -f Makefile ] && grep -q '^check:' Makefile; then
     make check
 fi

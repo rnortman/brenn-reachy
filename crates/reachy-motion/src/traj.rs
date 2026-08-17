@@ -46,17 +46,30 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use thiserror::Error;
 
 use crate::joints::JointTargets;
+use crate::slot_enum::slot_enum;
 
-/// How normalised time maps onto normalised progress.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Warp {
-    /// Minimum-jerk: starts and ends at zero velocity *and* zero acceleration.
-    /// The default for anything the head does, because the linkage's own
-    /// compliance rings on a velocity step.
-    MinJerk,
-    /// Constant rate. For test paths and for motion whose endpoints are
-    /// already at rest by construction.
-    Linear,
+slot_enum! {
+    /// How normalised time maps onto normalised progress.
+    ///
+    /// Zero is the shape a move gets when nobody said otherwise, which is why
+    /// this one numbering starts there rather than at one.
+    pub enum Warp: u8 {
+        encode: as_u8;
+        decode: from_u8;
+        refusal: "A number outside the two is not read as the default: a slot \
+                  holding one was written by something that does not agree with \
+                  this type about what shapes exist, and reading it as \
+                  minimum-jerk would restore a path that moves differently from \
+                  the one that was running.";
+
+        /// Minimum-jerk: starts and ends at zero velocity *and* zero
+        /// acceleration. The default for anything the head does, because the
+        /// linkage's own compliance rings on a velocity step.
+        MinJerk = 0,
+        /// Constant rate. For test paths and for motion whose endpoints are
+        /// already at rest by construction.
+        Linear = 1,
+    }
 }
 
 impl Warp {
@@ -305,6 +318,30 @@ mod tests {
 
     fn neutral() -> JointTargets {
         JointTargets::default()
+    }
+
+    /// The numbering over the whole `u8` domain. That `ALL` names both shapes
+    /// comes from `slot_enum!`, which emits the enum and the list together.
+    #[test]
+    fn the_warp_numbering_is_the_one_written_down() {
+        for warp in Warp::ALL {
+            let number = match warp {
+                Warp::MinJerk => 0,
+                Warp::Linear => 1,
+            };
+            assert_eq!(warp.as_u8(), number, "{warp:?}");
+        }
+        // The decoder against the literal numbers rather than against `ALL`:
+        // asserting it against the list it is defined over restates the
+        // definition and cannot fail.
+        for value in 0..=u8::MAX {
+            let named = match value {
+                0 => Some(Warp::MinJerk),
+                1 => Some(Warp::Linear),
+                _ => None,
+            };
+            assert_eq!(Warp::from_u8(value), named, "the number {value}");
+        }
     }
 
     fn stow() -> JointTargets {

@@ -1,0 +1,240 @@
+diff --git python/private/attributes.bzl python/private/attributes.bzl
+index c3b1cad..8d961a8 100644
+--- python/private/attributes.bzl
++++ python/private/attributes.bzl
+@@ -443,6 +443,30 @@ be avoided if possible.
+ """,
+             default = -1,
+         ),
++        "infer_ld_library_path": attr.bool(
++            default = False,
++            doc = """
++Whether to automatically set the `LD_LIBRARY_PATH` environment variable based on
++shared libraries (`.so` files) found in the target's runfiles. This is useful for
++C++ binaries that link against shared libraries, such as CUDA. If `True`,
++`LD_LIBRARY_PATH` will include the directories containing the relevant shared libraries.
++"""),
++        "shared_object_include_substrings": attr.string_list(
++            doc = """
++A list of substrings. Only shared objects whose paths contain any of these substrings
++will be considered for LD_LIBRARY_PATH inference. If empty, all .so files are included.
++Has an effect only if `infer_ld_library_path` is enabled.
++""",
++            default = [],
++        ),
++        "shared_object_exclude_substrings": attr.string_list(
++            doc = """
++A list of substrings. Shared objects whose paths contain any of these substrings
++will be excluded from LD_LIBRARY_PATH inference. Has an effect only if `infer_ld_library_path`
++is enabled.
++""",
++            default = [],
++        )
+     },
+ )
+ 
+diff --git python/private/interpreter_tmpl.sh python/private/interpreter_tmpl.sh
+index cfe85ec..31aceb6 100644
+--- python/private/interpreter_tmpl.sh
++++ python/private/interpreter_tmpl.sh
+@@ -16,6 +16,10 @@ set +e # allow us to check for errors more easily
+ readonly TARGET_FILE="%target_file%"
+ MAIN_BIN=$(rlocation "$TARGET_FILE")
+ 
++# Prevent Python packages installed in user site-packages outside of Bazel from being used;
++# e.g. this ensures the Pylance VS Code extension won't show IntelliSense for Python packages installed outside of Bazel
++export PYTHONNOUSERSITE=1
++
+ if [[ -z "$MAIN_BIN" || ! -e "$MAIN_BIN" ]]; then
+   echo "ERROR: interpreter executable not found: $MAIN_BIN (from $TARGET_FILE)"
+   exit 1
+diff --git python/private/normalize_name.bzl python/private/normalize_name.bzl
+index 7898222..66d3205 100644
+--- python/private/normalize_name.bzl
++++ python/private/normalize_name.bzl
+@@ -47,7 +47,7 @@ def normalize_name(name):
+     Returns:
+         a normalized name as a string.
+     """
+-    name = name.replace("-", "_").replace(".", "_").lower()
++    name = name.replace("-", "_").replace(".", "_").replace("%", "_").lower()
+     if "__" not in name:
+         return name
+ 
+diff --git python/private/py_executable.bzl python/private/py_executable.bzl
+index 9927975..8d51694 100644
+--- python/private/py_executable.bzl
++++ python/private/py_executable.bzl
+@@ -1795,7 +1795,7 @@ def _create_providers(
+             ),
+         ),
+         create_instrumented_files_info(ctx),
+-        _create_run_environment_info(ctx, inherited_environment),
++        _create_run_environment_info(ctx, inherited_environment, runfiles_details),
+         PyExecutableInfo(
+             main = main_py,
+             runfiles_without_exe = runfiles_details.runfiles_without_exe,
+@@ -1868,7 +1868,7 @@ def _create_providers(
+     providers.extend(extra_providers)
+     return providers
+ 
+-def _create_run_environment_info(ctx, inherited_environment):
++def _create_run_environment_info(ctx, inherited_environment, runfiles_details):
+     expanded_env = {}
+     for key, value in ctx.attr.env.items():
+         expanded_env[key] = _py_builtins.expand_location_and_make_variables(
+@@ -1877,6 +1877,32 @@ def _create_run_environment_info(ctx, inherited_environment):
+             expression = value,
+             targets = ctx.attr.data,
+         )
++
++    # Infers the `LD_LIBRARY_PATH` environment variable if enabled based on the presence of
++    # shared library files (.so) in the runfiles of the target. The existing `LD_LIBRARY_PATH`
++    # value is preserved if present.
++    if ctx.attr.infer_ld_library_path:
++        ld_library_path = {}
++        for file in runfiles_details.runfiles_without_exe.files.to_list():
++            if ".so" in file.basename:
++                include = (
++                    not ctx.attr.shared_object_include_substrings or
++                    any([s in file.short_path for s in ctx.attr.shared_object_include_substrings])
++                )
++                exclude = (
++                    ctx.attr.shared_object_exclude_substrings and
++                    any([s in file.short_path for s in ctx.attr.shared_object_exclude_substrings])
++                )
++                if include and not exclude:
++                    lib_path = file.short_path.removesuffix(file.basename).rstrip("/")
++                    ld_library_path[lib_path] = True
++
++        if ld_library_path:
++            paths = []
++            paths += expanded_env["LD_LIBRARY_PATH"].split(":") if "LD_LIBRARY_PATH" in expanded_env else []
++            paths += ld_library_path.keys()
++            expanded_env["LD_LIBRARY_PATH"] = ":".join(paths)
++
+     return RunEnvironmentInfo(
+         environment = expanded_env,
+         inherited_environment = inherited_environment,
+diff --git python/private/pypi/pkg_aliases.bzl python/private/pypi/pkg_aliases.bzl
+index d71c37c..2d21abf 100644
+--- python/private/pypi/pkg_aliases.bzl
++++ python/private/pypi/pkg_aliases.bzl
+@@ -157,26 +157,6 @@ def pkg_aliases(
+     }
+ 
+     actual = multiplatform_whl_aliases(aliases = actual, **kwargs)
+-    if type(actual) == type({}) and "//conditions:default" not in actual:
+-        alias(
+-            name = _INCOMPATIBLE,
+-            actual = select(
+-                {_LABEL_CURRENT_CONFIG_NO_MATCH: _LABEL_NONE},
+-                no_match_error = _NO_MATCH_ERROR_TEMPLATE.format(
+-                    config_settings = render.indent(
+-                        "\n".join(sorted([
+-                            value
+-                            for key in actual
+-                            for value in (key if type(key) == "tuple" else [key])
+-                        ])),
+-                    ).lstrip(),
+-                    current_flags = str(_LABEL_CURRENT_CONFIG),
+-                ),
+-            ),
+-            visibility = ["//visibility:private"],
+-            tags = ["manual"],
+-        )
+-        actual["//conditions:default"] = _INCOMPATIBLE
+ 
+     for name, target_name in target_names.items():
+         if type(actual) == type(""):
+@@ -193,6 +173,16 @@ def pkg_aliases(
+                     ) if repo != _INCOMPATIBLE else repo
+                     for v, repo in actual.items()
+                 },
++                no_match_error = _NO_MATCH_ERROR_TEMPLATE.format(
++                    config_settings = render.indent(
++                        "\n".join(sorted([
++                            value
++                            for key in actual
++                            for value in (key if type(key) == "tuple" else [key])
++                        ])),
++                    ).lstrip(),
++                    current_flags = str(_LABEL_CURRENT_CONFIG),
++                ),
+             )
+         else:
+             fail("The `actual` arg must be a dictionary or a string")
+diff --git python/private/pypi/simpleapi_download.bzl python/private/pypi/simpleapi_download.bzl
+index a3ba969..069dfc1 100644
+--- python/private/pypi/simpleapi_download.bzl
++++ python/private/pypi/simpleapi_download.bzl
+@@ -102,6 +102,7 @@ def simpleapi_download(
+                 attr = attr,
+                 cache = cache,
+                 get_auth = get_auth,
++                allow_fail = (attr.extra_index_urls != []),
+                 **download_kwargs
+             )
+             if hasattr(result, "wait"):
+@@ -156,7 +157,7 @@ def simpleapi_download(
+ 
+     return contents
+ 
+-def _read_simpleapi(ctx, url, attr, cache, get_auth = None, **download_kwargs):
++def _read_simpleapi(ctx, url, attr, cache, get_auth = None, allow_fail = True, **download_kwargs):
+     """Read SimpleAPI.
+ 
+     Args:
+@@ -170,6 +171,7 @@ def _read_simpleapi(ctx, url, attr, cache, get_auth = None, **download_kwargs):
+                http_file for docs.
+         cache: A dict for storing the results.
+         get_auth: A function to get auth information. Used in tests.
++        allow_fail: A boolean to indicate whether to allow the download to fail.
+         **download_kwargs: Any extra params to ctx.download.
+             Note that output and auth will be passed for you.
+ 
+@@ -214,7 +216,7 @@ def _read_simpleapi(ctx, url, attr, cache, get_auth = None, **download_kwargs):
+         url = [real_url],
+         output = output,
+         auth = get_auth(ctx, [real_url], ctx_attr = attr),
+-        allow_fail = True,
++        allow_fail = allow_fail,
+         **download_kwargs
+     )
+ 
+diff --git python/private/pypi/whl_repo_name.bzl python/private/pypi/whl_repo_name.bzl
+index 2b3b541..66f6ace 100644
+--- python/private/pypi/whl_repo_name.bzl
++++ python/private/pypi/whl_repo_name.bzl
+@@ -58,8 +58,7 @@ def whl_repo_name(filename, sha256):
+         parts.append(sha256[:8])
+     elif version:
+         parts.insert(1, version)
+-
+-    return "_".join(parts)
++    return normalize_name("_".join(parts))
+ 
+ def pypi_repo_name(whl_name, *target_platforms):
+     """Return a valid whl_library given a requirement line.
+diff --git python/private/python_bootstrap_template.txt python/private/python_bootstrap_template.txt
+index a979fd4..27614dc 100644
+--- python/private/python_bootstrap_template.txt
++++ python/private/python_bootstrap_template.txt
+@@ -440,6 +440,17 @@ def _RunForCoverage(python_program, main_filename, args, env,
+ relative_files = True
+ source =
+ \t{source}
++omit = config-3.py
++[report]
++exclude_also =
++    # Exclude empty list checks (e.g., "if []:")
++    if\s+\[\s*\]\s*:
++    # Exclude empty dict checks (e.g., "if {{}}:")
++    if\s+\{{\s*\}}\s*:
++    # Exclude main module checks (e.g., "if __name__ == '__main__':")
++    if\s+__name__\s*==\s*.__main__.\s*:
++    # Exclude type checking blocks (e.g., "if TYPE_CHECKING:" or "if typing.TYPE_CHECKING:")
++    if\s+(typing\.)?TYPE_CHECKING\s*:
+ ''')
+   PrintVerboseCoverage('Coverage entrypoint:', coverage_entrypoint)
+   # First run the target Python file via coveragepy to create a .coverage

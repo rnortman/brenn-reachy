@@ -285,12 +285,11 @@ mod tests {
     /// Exact equality: these are transcriptions, not derivations.
     #[test]
     fn baked_constants_match_the_vendored_source() {
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/kinematics_data.json"
-        ))
-        .expect("vendored kinematics_data.json is readable");
-        let json: Value = serde_json::from_str(&text).expect("fixture parses");
+        // Compiled in rather than read at run time. The path is relative to
+        // this source file, so both build lanes reach the same bytes without a
+        // manifest directory or a runfiles tree in either of them.
+        let text = include_str!("../tests/fixtures/kinematics_data.json");
+        let json: Value = serde_json::from_str(text).expect("fixture parses");
 
         assert_eq!(json["motor_arm_length"].as_f64().unwrap(), CRANK_LEN);
         assert_eq!(json["rod_length"].as_f64().unwrap(), ROD_LEN);

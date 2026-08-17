@@ -1,0 +1,683 @@
+diff --git BUILD.bazel BUILD.bazel
+index 5547de2f..fd4224d3 100644
+--- BUILD.bazel
++++ BUILD.bazel
+@@ -1,4 +1,4 @@
+-load("@//rules:proto_gazelle.bzl", "proto_gazelle")
++load("@build_stack_rules_proto//rules:proto_gazelle.bzl", "proto_gazelle")
+ load("@bazel_gazelle//:def.bzl", "gazelle_binary")
+ load("@npm_ts_proto//:defs.bzl", "npm_link_all_packages")
+ 
+@@ -23,6 +23,7 @@ gazelle_binary(
+         "@bazel_gazelle//language/go",
+         "@bazel_gazelle//language/proto",
+         "//language/protobuf",
++        "@bazel_skylib_gazelle_plugin//bzl",
+     ],
+     visibility = ["//visibility:public"],
+ )
+diff --git MODULE.bazel MODULE.bazel
+index 62c165b9..fde48d1a 100644
+--- MODULE.bazel
++++ MODULE.bazel
+@@ -30,6 +30,7 @@ bazel_dep(name = "grpc", version = "1.74.1", repo_name = "com_github_grpc_grpc")
+ bazel_dep(name = "grpc-java", version = "1.71.0", repo_name = "io_grpc_grpc_java")
+ bazel_dep(name = "gazelle", version = "0.45.0", repo_name = "bazel_gazelle")
+ bazel_dep(name = "bazel_skylib", version = "1.8.1")
++bazel_dep(name = "bazel_skylib_gazelle_plugin", version = "1.8.2")
+ bazel_dep(name = "bazel_features", version = "1.35.0")
+ bazel_dep(name = "aspect_rules_ts", version = "3.7.0")
+ bazel_dep(name = "aspect_rules_js", version = "2.5.0")
+@@ -155,6 +156,7 @@ use_repo(
+     "com_github_emicklei_proto",
+     "com_github_gogo_protobuf",
+     "com_github_google_go_cmp",
++    "com_github_grpc_ecosystem_grpc_gateway_v2",
+     "com_github_pmezard_go_difflib",
+     "com_github_stretchr_testify",
+     "in_gopkg_yaml_v3",
+@@ -233,7 +235,7 @@ use_repo(npm, "npm_ts_proto")
+ 
+ maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+ maven.install(
+-    name = "maven",
++    name = "maven_rules_proto",
+     # these artifacts are specified only to disambiguate versions between
+     # multiple contributing modules (bazel mod warnings)
+     artifacts = [
+@@ -284,10 +286,10 @@ use_repo(
+     maven,
+     "com_google_protobuf_protobuf_java_3_19_6",
+     "com_thesamet_scalapb_compilerplugin_2_12_0_11_13",
+-    "maven",
+     "maven_akka",
+     "maven_scala",
+     "maven_zio",
++    maven = "maven_rules_proto",
+ )
+ 
+ # -------------------------------------------------------------------
+diff --git go.mod go.mod
+index e99a7a75..37236d27 100644
+--- go.mod
++++ go.mod
+@@ -22,6 +22,7 @@ require (
+ require (
+ 	github.com/bmatcuk/doublestar/v4 v4.7.1 // indirect
+ 	github.com/davecgh/go-spew v1.1.1 // indirect
++	github.com/grpc-ecosystem/grpc-gateway/v2 v2.16.0
+ 	golang.org/x/mod v0.27.0 // indirect
+ 	golang.org/x/net v0.41.0 // indirect
+ 	golang.org/x/sync v0.15.0 // indirect
+diff --git go.sum go.sum
+index e5b625e9..7d48b061 100644
+--- go.sum
++++ go.sum
+@@ -18,6 +18,8 @@ github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
+ github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
+ github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+ github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.16.0 h1:YBftPWNWd4WwGqtY2yeZL2ef8rHAxPBD8KFhJpmcqms=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.16.0/go.mod h1:YN5jB8ie0yfIUg6VvR9Kz84aCaG7AsGZnLjhHbUqwPg=
+ github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
+ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
+ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+diff --git pkg/language/protobuf/config.go pkg/language/protobuf/config.go
+index 4b65f556..e1644bbf 100644
+--- pkg/language/protobuf/config.go
++++ pkg/language/protobuf/config.go
+@@ -130,18 +130,18 @@ func (pl *protobufLang) getOrCreatePackageConfig(config *config.Config) *protoc.
+ 
+ func registerWellKnownProtos(resolver protoc.ImportResolver) {
+ 	for k, v := range map[string]label.Label{
+-		"google/protobuf/any.proto":             label.New("com_google_protobuf", "", "any_proto"),
+-		"google/protobuf/api.proto":             label.New("com_google_protobuf", "", "api_proto"),
+-		"google/protobuf/compiler/plugin.proto": label.New("com_google_protobuf", "", "compiler_plugin_proto"),
+-		"google/protobuf/descriptor.proto":      label.New("com_google_protobuf", "", "descriptor_proto"),
+-		"google/protobuf/duration.proto":        label.New("com_google_protobuf", "", "duration_proto"),
+-		"google/protobuf/empty.proto":           label.New("com_google_protobuf", "", "empty_proto"),
+-		"google/protobuf/field_mask.proto":      label.New("com_google_protobuf", "", "field_mask_proto"),
+-		"google/protobuf/source_context.proto":  label.New("com_google_protobuf", "", "source_context_proto"),
+-		"google/protobuf/struct.proto":          label.New("com_google_protobuf", "", "struct_proto"),
+-		"google/protobuf/timestamp.proto":       label.New("com_google_protobuf", "", "timestamp_proto"),
+-		"google/protobuf/type.proto":            label.New("com_google_protobuf", "", "type_proto"),
+-		"google/protobuf/wrappers.proto":        label.New("com_google_protobuf", "", "wrappers_proto"),
++		"google/protobuf/any.proto":             label.New("protobuf", "", "any_proto"),
++		"google/protobuf/api.proto":             label.New("protobuf", "", "api_proto"),
++		"google/protobuf/compiler/plugin.proto": label.New("protobuf", "", "compiler_plugin_proto"),
++		"google/protobuf/descriptor.proto":      label.New("protobuf", "", "descriptor_proto"),
++		"google/protobuf/duration.proto":        label.New("protobuf", "", "duration_proto"),
++		"google/protobuf/empty.proto":           label.New("protobuf", "", "empty_proto"),
++		"google/protobuf/field_mask.proto":      label.New("protobuf", "", "field_mask_proto"),
++		"google/protobuf/source_context.proto":  label.New("protobuf", "", "source_context_proto"),
++		"google/protobuf/struct.proto":          label.New("protobuf", "", "struct_proto"),
++		"google/protobuf/timestamp.proto":       label.New("protobuf", "", "timestamp_proto"),
++		"google/protobuf/type.proto":            label.New("protobuf", "", "type_proto"),
++		"google/protobuf/wrappers.proto":        label.New("protobuf", "", "wrappers_proto"),
+ 	} {
+ 		resolver.Provide("proto", "proto", k, v)
+ 	}
+diff --git pkg/plugin/grpcecosystem/grpcgateway/BUILD.bazel pkg/plugin/grpcecosystem/grpcgateway/BUILD.bazel
+index 72fa9c4f..227b20e0 100644
+--- pkg/plugin/grpcecosystem/grpcgateway/BUILD.bazel
++++ pkg/plugin/grpcecosystem/grpcgateway/BUILD.bazel
+@@ -2,7 +2,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+ 
+ go_library(
+     name = "grpcgateway",
+-    srcs = ["protoc-gen-grpc-gateway.go"],
++    srcs = [
++        "protoc-gen-grpc-gateway.go",
++        "protoc-gen-grpc-openapiv2.go",
++    ],
+     importpath = "github.com/stackb/rules_proto/pkg/plugin/grpcecosystem/grpcgateway",
+     visibility = ["//visibility:public"],
+     deps = [
+diff --git pkg/plugin/grpcecosystem/grpcgateway/protoc-gen-grpc-openapiv2.go pkg/plugin/grpcecosystem/grpcgateway/protoc-gen-grpc-openapiv2.go
+new file mode 100644
+index 00000000..4a8524e2
+--- /dev/null
++++ pkg/plugin/grpcecosystem/grpcgateway/protoc-gen-grpc-openapiv2.go
+@@ -0,0 +1,51 @@
++package grpcgateway
++
++import (
++	"path"
++
++	"github.com/bazelbuild/bazel-gazelle/label"
++	"github.com/stackb/rules_proto/pkg/protoc"
++)
++
++func init() {
++	protoc.Plugins().MustRegisterPlugin(&protocGenGrpcOpenapiv2Plugin{})
++}
++
++// protocGenGrpcOpenapiv2Plugin implements Plugin for protoc-gen-grpc-openapiv2.
++type protocGenGrpcOpenapiv2Plugin struct{}
++
++// Name implements part of the Plugin interface.
++func (p *protocGenGrpcOpenapiv2Plugin) Name() string {
++	return "grpc-ecosystem:grpc-gateway:protoc-gen-grpc-openapiv2"
++}
++
++// Configure implements part of the Plugin interface.
++func (p *protocGenGrpcOpenapiv2Plugin) Configure(ctx *protoc.PluginContext) *protoc.PluginConfiguration {
++	if !p.shouldApply(ctx.ProtoLibrary) {
++		return nil
++	}
++	return &protoc.PluginConfiguration{
++		Label:   label.New("build_stack_rules_proto", "plugin/grpc-ecosystem/grpc-gateway", "protoc-gen-grpc-openapiv2"),
++		Outputs: p.outputs(ctx.Rel, ctx.ProtoLibrary),
++		Options: ctx.PluginConfig.GetOptions(),
++	}
++}
++
++func (p *protocGenGrpcOpenapiv2Plugin) shouldApply(lib protoc.ProtoLibrary) bool {
++	return protoc.HasServices(lib.Files()...)
++}
++
++func (p *protocGenGrpcOpenapiv2Plugin) outputs(rel string, lib protoc.ProtoLibrary) []string {
++	srcs := make([]string, 0)
++	for _, f := range lib.Files() {
++		if !f.HasServices() {
++			continue
++		}
++		base := f.Name
++		if rel != "" {
++			base = path.Join(rel, base)
++		}
++		srcs = append(srcs, base+".swagger.json")
++	}
++	return srcs
++}
+diff --git pkg/protoc/language_config.go pkg/protoc/language_config.go
+index c016089e..997e11da 100644
+--- pkg/protoc/language_config.go
++++ pkg/protoc/language_config.go
+@@ -2,6 +2,7 @@ package protoc
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"sort"
+ 	"strconv"
+ )
+@@ -9,21 +10,23 @@ import (
+ // LanguageConfig carries a set of configured Plugins and Rules that will
+ // contribute to a protoc invocation.
+ type LanguageConfig struct {
+-	Name    string
+-	Protoc  string
+-	Enabled bool
+-	Plugins map[string]bool
+-	Rules   map[string]bool
++	Name         string
++	Protoc       string
++	Enabled      bool
++	Plugins      map[string]bool
++	PluginsOrder []string
++	Rules        map[string]bool
+ }
+ 
+ // newLanguageConfig constructs a new language configuration having the
+ // given name and list of default rule configurations.
+ func newLanguageConfig(name string, rules ...*LanguageRuleConfig) *LanguageConfig {
+ 	c := &LanguageConfig{
+-		Name:    name,
+-		Rules:   make(map[string]bool),
+-		Plugins: make(map[string]bool),
+-		Enabled: true,
++		Name:         name,
++		Rules:        make(map[string]bool),
++		Plugins:      make(map[string]bool),
++		PluginsOrder: make([]string, 0),
++		Enabled:      true,
+ 	}
+ 	for _, rule := range rules {
+ 		c.Rules[rule.Name] = true
+@@ -51,6 +54,9 @@ func (c *LanguageConfig) clone() *LanguageConfig {
+ 	for k, v := range c.Plugins {
+ 		clone.Plugins[k] = v
+ 	}
++	for _, plugin := range c.PluginsOrder {
++		clone.PluginsOrder = append(clone.PluginsOrder, plugin)
++	}
+ 	for k, v := range c.Rules {
+ 		clone.Rules[k] = v
+ 	}
+@@ -69,6 +75,9 @@ func (c *LanguageConfig) parseDirective(cfg *PackageConfig, d, param, value stri
+ 		c.Enabled = enabled
+ 	case "plugin":
+ 		c.Plugins[value] = intent.Want
++		if !slices.Contains(c.PluginsOrder, value) {
++			c.PluginsOrder = append(c.PluginsOrder, value)
++		}
+ 	case "protoc":
+ 		c.Protoc = value
+ 	case "rule":
+@@ -80,13 +89,16 @@ func (c *LanguageConfig) parseDirective(cfg *PackageConfig, d, param, value stri
+ 	return nil
+ }
+ 
+-// fromYAML loads configuration from the yaml rule confug.
++// fromYAML loads configuration from the yaml rule config.
+ func (c *LanguageConfig) fromYAML(y *YLanguage) error {
+ 	if c.Name != y.Name {
+ 		return fmt.Errorf("yaml language mismatch: want %q got %q", c.Name, y.Name)
+ 	}
+ 	for _, plugin := range y.Plugin {
+ 		c.Plugins[plugin] = true
++		if !slices.Contains(c.PluginsOrder, plugin) {
++			c.PluginsOrder = append(c.PluginsOrder, plugin)
++		}
+ 	}
+ 	for _, rule := range y.Rule {
+ 		c.Rules[rule] = true
+diff --git pkg/protoc/package.go pkg/protoc/package.go
+index 8465db82..2b64f09e 100644
+--- pkg/protoc/package.go
++++ pkg/protoc/package.go
+@@ -62,56 +62,56 @@ func (s *Package) libraryRules(p *LanguageConfig, lib ProtoLibrary) []RuleProvid
+ 	// list of plugin configurations that apply to this proto_library
+ 	configs := make([]*PluginConfiguration, 0)
+ 
+-	for name, want := range p.Plugins {
+-		if !want {
+-			continue
+-		}
+-		plugin, ok := s.cfg.plugins[name]
+-		if !ok {
+-			log.Fatalf("plugin not configured: %q", name)
+-		}
+-		if !plugin.Enabled {
+-			continue
+-		}
++	for _, name := range p.PluginsOrder {
++		want := p.Plugins[name]
++		if want {
++			plugin, ok := s.cfg.plugins[name]
++			if !ok {
++				log.Fatalf("plugin not configured: %q", name)
++			}
++			if !plugin.Enabled {
++				continue
++			}
+ 
+-		ctx := &PluginContext{
+-			Rel:           s.rel,
+-			ProtoLibrary:  lib,
+-			PackageConfig: *s.cfg,
+-			PluginConfig:  *plugin,
+-		}
++			ctx := &PluginContext{
++				Rel:           s.rel,
++				ProtoLibrary:  lib,
++				PackageConfig: *s.cfg,
++				PluginConfig:  *plugin,
++			}
+ 
+-		if plugin.Implementation == "" {
+-			plugin.Implementation = plugin.Name
+-		}
+-		impl, err := globalRegistry.LookupPlugin(plugin.Implementation)
++			if plugin.Implementation == "" {
++				plugin.Implementation = plugin.Name
++			}
++			impl, err := globalRegistry.LookupPlugin(plugin.Implementation)
+ 
+-		if err == ErrUnknownPlugin {
+-			log.Fatalf(
+-				"%s: plugin not registered: %q (available: %v) [%+v]",
+-				s.rel,
+-				plugin.Implementation,
+-				globalRegistry.PluginNames(),
+-				plugin,
+-			)
+-		}
+-		ctx.Plugin = impl
++			if err == ErrUnknownPlugin {
++				log.Fatalf(
++					"%s: plugin not registered: %q (available: %v) [%+v]",
++					s.rel,
++					plugin.Implementation,
++					globalRegistry.PluginNames(),
++					plugin,
++				)
++			}
++			ctx.Plugin = impl
+ 
+-		// Delegate to the implementation for configuration
+-		config := impl.Configure(ctx)
+-		if config == nil {
+-			continue
+-		}
+-		config.Plugin = impl
+-		config.Config = plugin.clone()
+-		config.Options = DeduplicateAndSort(config.Options)
++			// Delegate to the implementation for configuration
++			config := impl.Configure(ctx)
++			if config == nil {
++				continue
++			}
++			config.Plugin = impl
++			config.Config = plugin.clone()
++			config.Options = DeduplicateAndSort(config.Options)
+ 
+-		// plugin.Label overrides the default value from the implementation
+-		if plugin.Label.Name != "" {
+-			config.Label = plugin.Label
+-		}
++			// plugin.Label overrides the default value from the implementation
++			if plugin.Label.Name != "" {
++				config.Label = plugin.Label
++			}
+ 
+-		configs = append(configs, config)
++			configs = append(configs, config)
++		}
+ 	}
+ 
+ 	if len(configs) == 0 {
+diff --git pkg/protoc/plugin_configuration.go pkg/protoc/plugin_configuration.go
+index 8c3d7d29..03365de4 100644
+--- pkg/protoc/plugin_configuration.go
++++ pkg/protoc/plugin_configuration.go
+@@ -35,7 +35,6 @@ func GetPluginLabels(plugins []*PluginConfiguration) []string {
+ 	for i, plugin := range plugins {
+ 		labels[i] = plugin.Label.String()
+ 	}
+-	sort.Strings(labels)
+ 	return labels
+ }
+ 
+diff --git pkg/rule/rules_python/py_library.go pkg/rule/rules_python/py_library.go
+index f189258d..8892a7bb 100644
+--- pkg/rule/rules_python/py_library.go
++++ pkg/rule/rules_python/py_library.go
+@@ -15,6 +15,7 @@ import (
+ var pyLibraryKindInfo = rule.KindInfo{
+ 	MergeableAttrs: map[string]bool{
+ 		"srcs":       true,
++		"data":       true,
+ 		"deps":       true,
+ 		"visibility": true,
+ 		"imports":    true,
+@@ -102,6 +103,15 @@ func (s *PyLibrary) Rule(otherGen ...*rule.Rule) *rule.Rule {
+ 	newRule := rule.NewRule(s.Kind(), s.Name())
+ 
+ 	newRule.SetAttr("srcs", s.Srcs())
++	var pyi_files []string
++	for _, src := range s.Srcs() {
++		if !strings.HasSuffix(src, "grpc.py") {
++			pyi_files = append(pyi_files, src+"i")
++		}
++	}
++	if len(pyi_files) > 0 {
++		newRule.SetAttr("data", pyi_files)
++	}
+ 
+ 	deps := s.Deps()
+ 	if len(deps) > 0 {
+diff --git plugin/grpc-ecosystem/grpc-gateway/BUILD.bazel plugin/grpc-ecosystem/grpc-gateway/BUILD.bazel
+new file mode 100644
+index 00000000..24709fa9
+--- /dev/null
++++ plugin/grpc-ecosystem/grpc-gateway/BUILD.bazel
+@@ -0,0 +1,21 @@
++load("@build_stack_rules_proto//rules:proto_plugin.bzl", "proto_plugin")
++
++proto_plugin(
++    name = "protoc-gen-grpc-gateway",
++    options = ["paths=source_relative"],
++    tool = "@com_github_grpc_ecosystem_grpc_gateway_v2//protoc-gen-grpc-gateway",
++    visibility = ["//visibility:public"],
++)
++
++proto_plugin(
++    name = "protoc-gen-grpc-openapiv2",
++    tool = "@com_github_grpc_ecosystem_grpc_gateway_v2//protoc-gen-openapiv2",
++    visibility = ["//visibility:public"],
++)
++
++filegroup(
++    name = "all_files",
++    testonly = True,
++    srcs = ["BUILD.bazel"],
++    visibility = ["//plugin:__pkg__"],
++)
+diff --git rules/BUILD.bazel rules/BUILD.bazel
+index f0139417..96d665a9 100644
+--- rules/BUILD.bazel
++++ rules/BUILD.bazel
+@@ -1,3 +1,5 @@
++load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
++
+ filegroup(
+     name = "all_files",
+     testonly = True,
+@@ -13,3 +15,104 @@ filegroup(
+     ],
+     visibility = ["//:__pkg__"],
+ )
++
++bzl_library(
++    name = "example",
++    srcs = ["example.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@io_bazel_rules_go//go/tools/bazel_testing:def"],
++)
++
++bzl_library(
++    name = "golden_filegroup",
++    srcs = ["golden_filegroup.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        "@build_stack_rules_proto//rules:proto_compile_gencopy",
++        "@build_stack_rules_proto//rules:providers",
++    ],
++)
++
++bzl_library(
++    name = "proto_compile",
++    srcs = ["proto_compile.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        ":providers",
++        "@rules_proto//proto:defs",
++    ],
++)
++
++bzl_library(
++    name = "proto_compile_assets",
++    srcs = ["proto_compile_assets.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [":proto_compile_gencopy"],
++)
++
++bzl_library(
++    name = "proto_compile_gencopy",
++    srcs = ["proto_compile_gencopy.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [":providers"],
++)
++
++bzl_library(
++    name = "proto_compiled_source_update",
++    srcs = ["proto_compiled_source_update.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [":proto_compile_gencopy"],
++)
++
++bzl_library(
++    name = "proto_compiled_sources",
++    srcs = ["proto_compiled_sources.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        ":proto_compile",
++        ":proto_compile_gencopy",
++    ],
++)
++
++bzl_library(
++    name = "proto_descriptor_set",
++    srcs = ["proto_descriptor_set.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@rules_proto//proto:defs"],
++)
++
++bzl_library(
++    name = "proto_gazelle",
++    srcs = ["proto_gazelle.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        "@bazel_skylib//lib:shell",
++        "@rules_shell//shell:sh_binary",
++    ],
++)
++
++bzl_library(
++    name = "proto_plugin",
++    srcs = ["proto_plugin.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        "@build_stack_rules_proto//rules:providers",
++        "@rules_proto//proto:defs",
++    ],
++)
++
++bzl_library(
++    name = "protogenrule",
++    srcs = ["protogenrule.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        "@build_stack_rules_proto//rules:proto_compile_gencopy",
++        "@build_stack_rules_proto//rules:providers",
++    ],
++)
++
++bzl_library(
++    name = "providers",
++    srcs = ["providers.bzl"],
++    visibility = ["//visibility:public"],
++)
+diff --git rules/cc/BUILD.bazel rules/cc/BUILD.bazel
+index 59fe9aef..ed1122e1 100644
+--- rules/cc/BUILD.bazel
++++ rules/cc/BUILD.bazel
+@@ -1,3 +1,5 @@
++load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
++
+ filegroup(
+     name = "all_files",
+     testonly = True,
+@@ -8,3 +10,17 @@ filegroup(
+     ],
+     visibility = ["//rules:__pkg__"],
+ )
++
++bzl_library(
++    name = "grpc_cc_library",
++    srcs = ["grpc_cc_library.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@rules_cc//cc:defs_bzl"],
++)
++
++bzl_library(
++    name = "proto_cc_library",
++    srcs = ["proto_cc_library.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@rules_cc//cc:defs_bzl"],
++)
+diff --git rules/go/BUILD.bazel rules/go/BUILD.bazel
+index bd52ee34..1f1da7ee 100644
+--- rules/go/BUILD.bazel
++++ rules/go/BUILD.bazel
+@@ -1,3 +1,5 @@
++load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
++
+ filegroup(
+     name = "all_files",
+     testonly = True,
+@@ -8,3 +10,20 @@ filegroup(
+     ],
+     visibility = ["//rules:__pkg__"],
+ )
++
++bzl_library(
++    name = "proto_go_library",
++    srcs = ["proto_go_library.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@io_bazel_rules_go//go:def"],
++)
++
++bzl_library(
++    name = "proto_go_modules",
++    srcs = ["proto_go_modules.bzl"],
++    visibility = ["//visibility:public"],
++    deps = [
++        "@io_bazel_rules_go//go:def",
++        "@io_bazel_rules_go//go/private:common",
++    ],
++)
+diff --git rules/private/proto_repository_tools_srcs.bzl rules/private/proto_repository_tools_srcs.bzl
+index 9810725a..4cab9f29 100644
+--- rules/private/proto_repository_tools_srcs.bzl
++++ rules/private/proto_repository_tools_srcs.bzl
+@@ -91,6 +91,7 @@ PROTO_REPOSITORY_TOOLS_SRCS = [
+     "@build_stack_rules_proto//pkg/plugin/grpc/grpcweb:protoc-gen-grpc-web.go",
+     "@build_stack_rules_proto//pkg/plugin/grpcecosystem/grpcgateway:BUILD.bazel",
+     "@build_stack_rules_proto//pkg/plugin/grpcecosystem/grpcgateway:protoc-gen-grpc-gateway.go",
++    "@build_stack_rules_proto//pkg/plugin/grpcecosystem/grpcgateway:protoc-gen-grpc-openapiv2.go",
+     "@build_stack_rules_proto//pkg/plugin/scalapb/scalapb:BUILD.bazel",
+     "@build_stack_rules_proto//pkg/plugin/scalapb/scalapb:protoc_gen_scala.go",
+     "@build_stack_rules_proto//pkg/plugin/scalapb/zio_grpc:BUILD.bazel",
+@@ -173,6 +174,7 @@ PROTO_REPOSITORY_TOOLS_SRCS = [
+     "@build_stack_rules_proto//plugin/grpc/grpc-java:BUILD.bazel",
+     "@build_stack_rules_proto//plugin/grpc/grpc-node:BUILD.bazel",
+     "@build_stack_rules_proto//plugin/grpc/grpc-web:BUILD.bazel",
++    "@build_stack_rules_proto//plugin/grpc-ecosystem/grpc-gateway:BUILD.bazel",
+     "@build_stack_rules_proto//plugin/scalapb/scalapb:BUILD.bazel",
+     "@build_stack_rules_proto//plugin/scalapb/zio-grpc:BUILD.bazel",
+     "@build_stack_rules_proto//plugin/stackb/grpc_js:BUILD.bazel",
+diff --git rules/py/BUILD.bazel rules/py/BUILD.bazel
+index 3dc9072c..798e4f93 100644
+--- rules/py/BUILD.bazel
++++ rules/py/BUILD.bazel
+@@ -1,3 +1,5 @@
++load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
++
+ filegroup(
+     name = "all_files",
+     testonly = True,
+@@ -8,3 +10,17 @@ filegroup(
+     ],
+     visibility = ["//rules:__pkg__"],
+ )
++
++bzl_library(
++    name = "grpc_py_library",
++    srcs = ["grpc_py_library.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@rules_python//python:defs_bzl"],
++)
++
++bzl_library(
++    name = "proto_py_library",
++    srcs = ["proto_py_library.bzl"],
++    visibility = ["//visibility:public"],
++    deps = ["@rules_python//python:defs_bzl"],
++)
+diff --git rules/ts/proto_ts_library.bzl rules/ts/proto_ts_library.bzl
+index f2b49604..49bfa5dd 100644
+--- rules/ts/proto_ts_library.bzl
++++ rules/ts/proto_ts_library.bzl
+@@ -16,6 +16,9 @@ def proto_ts_library(
+         transpiler = "tsc",
+         tsconfig = tsconfig or {
+             "compilerOptions": {
++                "moduleResolution": "node",
++                "module": "esnext",
++                "target": "ESNext",
+                 "declaration": declaration,
+                 "esModuleInterop": True,
+             },

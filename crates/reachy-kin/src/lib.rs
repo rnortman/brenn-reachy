@@ -47,8 +47,8 @@ pub use envelope::{
 };
 pub use fk::{FkError, FkOptions, FkStats, forward_kinematics};
 pub use geometry::{
-    BranchSign, HeadGeometry, LegGeometry, cone_angle, neutral_head_pose, rest_head_pose,
-    stow_head_pose,
+    BranchSign, HeadGeometry, LegGeometry, cone_angle, default_geometry, neutral_head_pose,
+    rest_head_pose, stow_head_pose,
 };
 pub use ik::{
     IkError, LegAngles, inverse_kinematics, min_margin, min_pose_margin, pose_margins, wrap_to_pi,

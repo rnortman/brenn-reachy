@@ -5,6 +5,12 @@
 target/
 **/*.rs.bk
 
+# Bazel's convenience symlinks into the output base, and the per-developer flag
+# file .bazelrc imports last. MODULE.bazel.lock is deliberately *not* here: it
+# is the pinned resolution of the module graph and is tracked content.
+/bazel-*
+.bazelrc.user
+
 # Bench and bring-up output. Every run of the bench binary against real hardware
 # produces transcripts, register dumps and bus traces; none of it is source.
 *.log

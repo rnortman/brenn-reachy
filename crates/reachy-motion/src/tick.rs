@@ -135,7 +135,12 @@ use crate::joints::{
     JointGroup, JointId, JointSet, JointStep, JointTargets, JointVector, ServoHealth, worst_joint,
 };
 use crate::phase::{AntennaPhaseConfig, PhaseSeparation, PhaseWatch};
-use crate::seq::SeqError;
+use crate::seq::{SeqError, SeqErrorKind};
+use crate::slot_enum::slot_enum;
+use crate::snap::{
+    ExcursionSnapshot, MotionSnapshot, SnapshotError, TrackingSide, TrackingStreakSnapshot,
+    TrajectorySeed,
+};
 use crate::timeline::{Entry, FaultTimeline, Maneuver, Outcome};
 use crate::traj::{MoveDurations, Trajectory, TrajectoryError, Warp};
 
@@ -335,6 +340,24 @@ impl Default for MotionConfig {
     }
 }
 
+/// The default configuration, built once.
+///
+/// [`MotionConfig::default`] is not a struct literal: its geometry converts six
+/// rotation matrices into quaternions and checks each is a proper rotation, and
+/// a host that ticks at the control rate would pay for that every period. This
+/// is the same value, built on first use and shared — the same arrangement
+/// `reachy_kin::default_geometry` makes for the geometry alone, for the same
+/// reason.
+///
+/// It is not a configuration seam and does not become one: a host with anything
+/// to say about the envelope, the step bounds or the tracking windows builds a
+/// [`MotionConfig`] of its own and passes it to the tick.
+#[must_use]
+pub fn default_motion_config() -> &'static MotionConfig {
+    static NOMINAL: std::sync::OnceLock<MotionConfig> = std::sync::OnceLock::new();
+    NOMINAL.get_or_init(MotionConfig::default)
+}
+
 /// The tick rate the duration floors below are derived at, hertz.
 ///
 /// The bench and the daemon both run the loop at fifty. A deployment that
@@ -443,32 +466,41 @@ impl Response {
     }
 }
 
-/// The shape of a failed transaction, coarse enough to name a condition with.
-///
-/// A driver's own error type is not what travels here. A [`Fault`] is `Copy` and
-/// rides in a timeline entry, and the whole detail of the failure is on the
-/// ending the same transaction returned — which every operator line and every
-/// refusal renders. What a condition needs is the distinction that sends an
-/// operator to a different part of the machine: silence is a connector or a dead
-/// servo, a mangled reply is the line or the adapter, a refusal is the servo
-/// answering that it will not, and a request this layer would not send at all is
-/// ours.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireFailure {
-    /// Nothing came back before the deadline, and the retries are spent.
-    Silent,
-    /// Bytes came back that disagreed with themselves, or that were not an
-    /// answer of the shape the request asked for.
-    Corrupt,
-    /// The servo answered with its error field set.
-    Refused,
-    /// A verified write read back as something other than what was written.
-    NotWritten,
-    /// The port itself failed.
-    Port,
-    /// The request never went out, because this layer would not put it on the
-    /// wire.
-    Unsendable,
+slot_enum! {
+    /// The shape of a failed transaction, coarse enough to name a condition
+    /// with.
+    ///
+    /// A driver's own error type is not what travels here. A [`Fault`] is
+    /// `Copy` and rides in a timeline entry, and the whole detail of the
+    /// failure is on the ending the same transaction returned — which every
+    /// operator line and every refusal renders. What a condition needs is the
+    /// distinction that sends an operator to a different part of the machine:
+    /// silence is a connector or a dead servo, a mangled reply is the line or
+    /// the adapter, a refusal is the servo answering that it will not, and a
+    /// request this layer would not send at all is ours.
+    pub enum WireFailure: u8 {
+        encode: as_u8;
+        decode: from_u8;
+        refusal: "A number outside the six was written by something that does \
+                  not agree with this type about what a wire failure is, and \
+                  reading it as any of them would send an operator at the wrong \
+                  part of the machine.";
+
+        /// Nothing came back before the deadline, and the retries are spent.
+        Silent = 1,
+        /// Bytes came back that disagreed with themselves, or that were not an
+        /// answer of the shape the request asked for.
+        Corrupt = 2,
+        /// The servo answered with its error field set.
+        Refused = 3,
+        /// A verified write read back as something other than what was written.
+        NotWritten = 4,
+        /// The port itself failed.
+        Port = 5,
+        /// The request never went out, because this layer would not put it on
+        /// the wire.
+        Unsendable = 6,
+    }
 }
 
 impl fmt::Display for WireFailure {
@@ -506,6 +538,23 @@ pub enum BusFailureSource {
         id: u8,
         /// What the failure was.
         kind: WireFailure,
+    },
+    /// A sequencer's verdict as it comes back out of a fixed-layout slot: the
+    /// name of the failure and the servo it happened at, and nothing else.
+    ///
+    /// [`Self::Sequence`] carries a whole [`SeqError`], which carries a
+    /// [`StepContext`](crate::seq::StepContext) and per-variant payloads that
+    /// no slot holds. Restoring
+    /// one as a fabricated `SeqError` would put a register and a reading in
+    /// front of an operator that nothing ever observed, so a restore says what
+    /// it knows and stops there. Nothing raises this: it exists only on the way
+    /// back in.
+    #[error("restored: {kind} at servo {id}")]
+    RestoredSequence {
+        /// The servo the sequence was addressing.
+        id: u8,
+        /// Which failure it was.
+        kind: SeqErrorKind,
     },
 }
 
@@ -1339,6 +1388,216 @@ impl MotionState {
         out.goal = None;
         out.report.mode = self.mode;
         out.report.aborted = Some(abort);
+    }
+
+    /// Everything this state carries between periods, as plain copyable data.
+    ///
+    /// For a host whose per-execution memory is a fixed-layout slot rather than
+    /// a local variable that outlives the call: it restores a state at the top
+    /// of the period, ticks it, and writes this back at the bottom. See
+    /// [`crate::snap`] for what the round trip does and does not preserve —
+    /// notably that the session timeline does not survive it, because a host of
+    /// that shape sends each classification on as a message instead of keeping
+    /// a growing record.
+    ///
+    /// Every field is destructured rather than projected, and the pattern
+    /// carries no rest: a field added to this state fails to compile here,
+    /// which is what makes "the snapshot is the whole of it" a property of the
+    /// language rather than of whoever last edited both.
+    #[must_use]
+    pub fn snapshot(&self) -> MotionSnapshot {
+        let Self {
+            mode,
+            trajectory,
+            prev_now,
+            last_goal,
+            last_targets,
+            fk_seed,
+            present_min_margin,
+            start_excursion,
+            miss_count,
+            pose_failures,
+            tracking,
+            masked,
+            // The one field deliberately left behind, for the reason `snap`
+            // gives: a growing record has nowhere to live in a fixed slot, and
+            // a host of that shape sends each classification on as a message.
+            timeline: _,
+        } = self;
+        MotionSnapshot {
+            mode: *mode,
+            trajectory: trajectory.as_ref().map(|path| TrajectorySeed {
+                start: *path.start(),
+                target: *path.target(),
+                durations: path.durations(),
+                warp: path.warp(),
+            }),
+            prev_now: *prev_now,
+            last_goal: *last_goal,
+            last_targets: *last_targets,
+            fk_seed: *fk_seed,
+            present_min_margin: *present_min_margin,
+            start_excursion: start_excursion.snapshot(),
+            miss_count: *miss_count,
+            pose_failures: *pose_failures,
+            tracking: tracking.snapshot(),
+            masked: *masked,
+        }
+    }
+
+    /// The state `snap` describes, with a fresh and empty timeline.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`], for a snapshot describing no state a tick could be
+    /// in. Unreachable from a snapshot [`Self::snapshot`] took; reachable from
+    /// a slot holding bytes that nothing wrote, which is exactly the case a
+    /// host has to be told about rather than handed a state that quietly
+    /// dropped the half of the contradiction it could not keep.
+    pub fn from_snapshot(snap: &MotionSnapshot) -> Result<Self, SnapshotError> {
+        // Destructured with no rest pattern, as [`Self::snapshot`] is: a field
+        // added to the snapshot and not read back here is a compile error
+        // rather than a detector that silently resets every period.
+        let MotionSnapshot {
+            mode,
+            trajectory: seed,
+            prev_now,
+            last_goal,
+            last_targets,
+            fk_seed,
+            present_min_margin,
+            start_excursion,
+            miss_count,
+            pose_failures,
+            tracking,
+            masked,
+        } = snap;
+        let trajectory = seed
+            .map(|seed| Trajectory::new(&seed.start, &seed.target, seed.durations, seed.warp))
+            .transpose()?;
+        // The mode and the path are set and cleared together, so the two ways
+        // they can disagree are both states no tick produced. Faulted with a
+        // path is the one pairing that is neither: a latching fault stops
+        // commanding without clearing the path it stopped on.
+        if trajectory.is_none() && matches!(mode, Mode::Moving { .. }) {
+            return Err(SnapshotError::MovingWithoutTrajectory);
+        }
+        if trajectory.is_some() && matches!(mode, Mode::Holding) {
+            return Err(SnapshotError::HoldingWithTrajectory);
+        }
+        Ok(Self {
+            mode: *mode,
+            trajectory,
+            prev_now: *prev_now,
+            last_goal: *last_goal,
+            last_targets: *last_targets,
+            fk_seed: *fk_seed,
+            present_min_margin: *present_min_margin,
+            start_excursion: Excursion::from_snapshot(start_excursion),
+            miss_count: *miss_count,
+            pose_failures: *pose_failures,
+            tracking: TrackingMonitor::from_snapshot(tracking),
+            masked: *masked,
+            timeline: FaultTimeline::new(),
+        })
+    }
+}
+
+impl Excursion {
+    /// These distances as plain data. Destructured with no rest pattern, so a
+    /// bound added here has to be added to the mirror too.
+    fn snapshot(&self) -> ExcursionSnapshot {
+        let Self {
+            window,
+            body_yaw,
+            relative_yaw,
+            cone,
+        } = self;
+        ExcursionSnapshot {
+            window: *window,
+            body_yaw: *body_yaw,
+            relative_yaw: *relative_yaw,
+            cone: *cone,
+        }
+    }
+
+    /// The distances `snap` records. Total: every combination of finite and
+    /// non-finite numbers is one some pose could stand at.
+    fn from_snapshot(snap: &ExcursionSnapshot) -> Self {
+        let ExcursionSnapshot {
+            window,
+            body_yaw,
+            relative_yaw,
+            cone,
+        } = snap;
+        Self {
+            window: *window,
+            body_yaw: *body_yaw,
+            relative_yaw: *relative_yaw,
+            cone: *cone,
+        }
+    }
+}
+
+impl Side {
+    /// This side as public data.
+    fn snapshot(self) -> TrackingSide {
+        match self {
+            Self::Above => TrackingSide::Above,
+            Self::Below => TrackingSide::Below,
+            Self::Unplaced => TrackingSide::Unplaced,
+        }
+    }
+
+    /// The side `snap` names.
+    fn from_snapshot(snap: TrackingSide) -> Self {
+        match snap {
+            TrackingSide::Above => Self::Above,
+            TrackingSide::Below => Self::Below,
+            TrackingSide::Unplaced => Self::Unplaced,
+        }
+    }
+}
+
+impl TrackingMonitor {
+    /// Every joint's open run, in bus order, as plain data.
+    fn snapshot(&self) -> [Option<TrackingStreakSnapshot>; JointId::COUNT] {
+        let Self { runs } = self;
+        runs.map(|run| {
+            run.map(|open| {
+                let TrackingStreak {
+                    anchor,
+                    side,
+                    count,
+                } = open;
+                TrackingStreakSnapshot {
+                    anchor,
+                    side: side.snapshot(),
+                    count,
+                }
+            })
+        })
+    }
+
+    /// The runs `snap` records. Total: a run is three independent numbers and
+    /// any of them is one a live read could have written.
+    fn from_snapshot(snap: &[Option<TrackingStreakSnapshot>; JointId::COUNT]) -> Self {
+        Self {
+            runs: snap.map(|run| {
+                run.map(|open| {
+                    let TrackingStreakSnapshot {
+                        anchor,
+                        side,
+                        count,
+                    } = open;
+                    TrackingStreak {
+                        anchor,
+                        side: Side::from_snapshot(side),
+                        count,
+                    }
+                })
+            }),
+        }
     }
 }
 
@@ -2897,6 +3156,23 @@ mod tests {
 
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
+    }
+
+    /// The shared default configuration is the built one: a host that takes the
+    /// reference and one that builds its own tick against the same numbers.
+    ///
+    /// Compared as text because [`MotionConfig`] carries a [`HeadGeometry`],
+    /// which has no equality — the same reason `reachy-kin`'s own shared-value
+    /// test compares its legs that way.
+    #[test]
+    fn the_shared_default_configuration_is_the_built_one() {
+        let built = MotionConfig::default();
+        let shared = default_motion_config();
+        assert_eq!(format!("{shared:?}"), format!("{built:?}"));
+        assert!(
+            core::ptr::eq(default_motion_config(), shared),
+            "the reference is built once and shared"
+        );
     }
 
     /// The control period every test here drives, and the one the floors are
@@ -9064,5 +9340,772 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The snapshot round-trip law: for any state the tick can reach and any
+    /// inputs, a state restored from a snapshot of it ticks identically.
+    ///
+    /// Asserted at *every* period of each replayed sequence rather than at a
+    /// chosen one, because the states worth doubting are the ones a sequence
+    /// passes through: a move part way along its clock, a tracking run part way
+    /// through its window, a mask half filled. Each sequence also says what it
+    /// exercised, so a scenario that stops reaching the state it was written
+    /// for fails rather than passing vacuously.
+    mod snapshot {
+        use super::*;
+        use crate::snap::{MotionSnapshot, SnapshotError, TrackingSide, TrajectorySeed};
+
+        /// What a scripted machine offers the tick on one period.
+        #[derive(Default)]
+        struct Offered {
+            present: Option<JointVector>,
+            health: Option<[ServoHealth; JointId::COUNT]>,
+            command: Option<MotionCommand>,
+        }
+
+        impl Offered {
+            /// A live read and nothing else.
+            fn read(present: JointVector) -> Self {
+                Self {
+                    present: Some(present),
+                    ..Self::default()
+                }
+            }
+
+            /// A live read, with a command on this period.
+            fn commanded(present: JointVector, command: MotionCommand) -> Self {
+                Self {
+                    present: Some(present),
+                    command: Some(command),
+                    ..Self::default()
+                }
+            }
+
+            /// A live read, with a health sweep on this period.
+            fn swept(present: JointVector, health: [ServoHealth; JointId::COUNT]) -> Self {
+                Self {
+                    present: Some(present),
+                    health: Some(health),
+                    ..Self::default()
+                }
+            }
+        }
+
+        /// What a replayed sequence turned out to reach.
+        ///
+        /// The guard against a vacuous law: every scenario below asserts on
+        /// this, so a fixture that quietly stops faulting, aborting or moving
+        /// fails instead of confirming the law over a state machine standing
+        /// still.
+        #[derive(Debug, Default)]
+        struct Seen {
+            moved: bool,
+            completed: bool,
+            faults: Vec<Fault>,
+            degraded: Vec<Fault>,
+            aborted: Vec<MoveAbort>,
+            rejected: u32,
+            longest_run: u32,
+            most_misses: u32,
+            most_pose_failures: u32,
+            /// The furthest any of the ten excursion distances stood outside
+            /// its bound, over the whole run. Zero says every scenario started
+            /// a move from inside the envelope, which is a mirror crossing the
+            /// round trip as ten zeroes.
+            furthest_out: f64,
+            masked: JointSet,
+        }
+
+        impl Seen {
+            fn record(&mut self, report: &TickReport) {
+                self.moved |= matches!(report.mode, Mode::Moving { .. });
+                self.completed |= report.completed;
+                if let Some(fault) = report.fault {
+                    self.faults.push(fault);
+                }
+                if let Some(fault) = report.degraded {
+                    self.degraded.push(fault);
+                }
+                if let Some(abort) = report.aborted {
+                    self.aborted.push(abort);
+                }
+                if matches!(report.command, CommandDisposition::Rejected(_)) {
+                    self.rejected += 1;
+                }
+                self.longest_run = self.longest_run.max(report.tracking_count);
+                self.most_misses = self.most_misses.max(report.misses);
+                self.most_pose_failures = self.most_pose_failures.max(report.pose_failures);
+                self.masked = report.masked;
+            }
+
+            /// Note how far outside the envelope the state's running move
+            /// began, so a fixture can prove the excursion mirror carried
+            /// something other than zeroes.
+            fn note_excursion(&mut self, excursion: &ExcursionSnapshot) {
+                let ExcursionSnapshot {
+                    window,
+                    body_yaw,
+                    relative_yaw,
+                    cone,
+                } = excursion;
+                for out in window
+                    .iter()
+                    .chain([body_yaw, relative_yaw, cone])
+                    .filter(|out| out.is_finite())
+                {
+                    self.furthest_out = self.furthest_out.max(*out);
+                }
+            }
+
+            /// The distinct fault slugs raised — a re-raise of the same
+            /// standing condition is one slug, not two.
+            fn fault_slugs(&self) -> Vec<&'static str> {
+                let mut slugs: Vec<&'static str> =
+                    self.faults.iter().map(|fault| fault.slug()).collect();
+                slugs.dedup();
+                slugs
+            }
+        }
+
+        /// Drive `state` through `periods` periods of `script`, asserting the
+        /// law at each one, and report what the run reached.
+        ///
+        /// `script` is handed the period index and where a perfectly following
+        /// machine would be standing — the previous period's goal — and answers
+        /// with what its own machine offers, which is how a fixture freezes a
+        /// joint or drops a read.
+        fn law_holds<F>(
+            cfg: &MotionConfig,
+            state: &mut MotionState,
+            periods: u32,
+            mut script: F,
+        ) -> Seen
+        where
+            F: FnMut(u32, &JointVector) -> Offered,
+        {
+            let mut tracking_machine = *state.last_goal();
+            let mut seen = Seen::default();
+            for n in 0..periods {
+                let offered = script(n, &tracking_machine);
+                let inputs = TickInputs {
+                    now: secs(f64::from(n) * PERIOD.as_secs_f64()),
+                    period: PERIOD,
+                    present: offered.present.as_ref(),
+                    command: offered.command.as_ref(),
+                    health: offered.health.as_ref(),
+                };
+
+                let snap = state.snapshot();
+                let mut restored = MotionState::from_snapshot(&snap)
+                    .expect("a state's own snapshot describes a state");
+                assert_eq!(
+                    restored.snapshot(),
+                    snap,
+                    "period {n}: a restored state does not snapshot back to what it was restored \
+                     from"
+                );
+
+                // The second boundary: every member through the numbers a
+                // fixed-layout slot holds it in, and back. Each of them
+                // flattens losslessly, so the whole snapshot comes back equal.
+                assert_eq!(
+                    crate::snap::crossed(&snap),
+                    snap,
+                    "period {n}: a snapshot does not survive the flat forms a slot holds it in"
+                );
+
+                let mut out = TickOutputs::default();
+                let mut shadow = TickOutputs::default();
+                motion_tick(cfg, state, &inputs, &mut out);
+                motion_tick(cfg, &mut restored, &inputs, &mut shadow);
+                assert_eq!(
+                    out, shadow,
+                    "period {n}: a restored state ticked differently"
+                );
+                assert_eq!(
+                    state.snapshot(),
+                    restored.snapshot(),
+                    "period {n}: a restored state landed in a different successor"
+                );
+
+                seen.record(&out.report);
+                seen.note_excursion(&state.snapshot().start_excursion);
+                if let Some(goal) = out.goal {
+                    tracking_machine = goal;
+                }
+            }
+            seen
+        }
+
+        /// A machine armed and holding at the recorded stow pose.
+        fn armed_at_stow(cfg: &MotionConfig) -> (MotionState, JointVector) {
+            armed_at(
+                cfg,
+                &JointTargets {
+                    head_pose_body: reachy_kin::stow_head_pose(),
+                    ..JointTargets::default()
+                },
+            )
+        }
+
+        /// A whole move, sampled every period by a machine that follows
+        /// perfectly, then held past its completion.
+        #[test]
+        fn a_move_survives_the_round_trip_at_every_period() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let command = move_to(JointTargets::default(), secs(1.0));
+
+            let seen = law_holds(&cfg, &mut state, 80, |n, tracked| {
+                if n == 0 {
+                    Offered::commanded(*tracked, command)
+                } else {
+                    Offered::read(*tracked)
+                }
+            });
+
+            assert!(seen.moved, "the fixture never moved");
+            assert!(seen.completed, "the move never finished: {seen:?}");
+            assert!(seen.faults.is_empty(), "{seen:?}");
+        }
+
+        /// A move retargeted part way along its own clock, which rebuilds the
+        /// trajectory from a start that is neither endpoint of the first one.
+        #[test]
+        fn a_retarget_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let up = move_to(JointTargets::default(), secs(1.0));
+            let back = move_to(
+                JointTargets {
+                    head_pose_body: reachy_kin::stow_head_pose(),
+                    ..JointTargets::default()
+                },
+                secs(1.0),
+            );
+
+            let seen = law_holds(&cfg, &mut state, 140, |n, tracked| match n {
+                0 => Offered::commanded(*tracked, up),
+                25 => Offered::commanded(*tracked, back),
+                _ => Offered::read(*tracked),
+            });
+
+            assert!(seen.completed, "the retargeted move never finished");
+            assert!(seen.faults.is_empty(), "{seen:?}");
+        }
+
+        /// A move abandoned part way by a hold, which clears the trajectory
+        /// without ending at either of its endpoints.
+        #[test]
+        fn a_hold_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let up = move_to(JointTargets::default(), secs(2.0));
+
+            let seen = law_holds(&cfg, &mut state, 40, |n, tracked| match n {
+                0 => Offered::commanded(*tracked, up),
+                20 => Offered::commanded(*tracked, MotionCommand::Hold),
+                _ => Offered::read(*tracked),
+            });
+
+            assert!(seen.moved, "the fixture never moved");
+            assert!(!seen.completed, "the hold should have abandoned the move");
+            assert!(seen.faults.is_empty(), "{seen:?}");
+        }
+
+        /// Single setpoints tracked one period at a time — the command that
+        /// never builds a trajectory, and whose state is nothing but the last
+        /// goal and its mirror.
+        #[test]
+        fn tracked_setpoints_survive_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let neutral = JointTargets::default();
+            let (mut state, _) = armed_at(&cfg, &neutral);
+
+            let seen = law_holds(&cfg, &mut state, 12, |n, tracked| {
+                // Creep the right antenna a hundredth of a radian a period,
+                // well inside the step bound, so each period asks the tick for
+                // one setpoint and nothing shapes it.
+                let mut target = neutral;
+                target.antennas[0] += 0.01 * f64::from(n + 1);
+                Offered::commanded(*tracked, MotionCommand::Track(target))
+            });
+
+            assert!(!seen.moved, "a tracked setpoint is not a move");
+            assert_eq!(seen.rejected, 0, "{seen:?}");
+            assert!(seen.faults.is_empty(), "{seen:?}");
+        }
+
+        /// A run of dropped reads long enough to raise the latching
+        /// position-feedback fault, and periods past it: the tick re-reports a
+        /// standing fault forever, and the restored state has to re-report the
+        /// same one.
+        #[test]
+        fn a_latching_fault_and_its_re_reports_survive_the_round_trip() {
+            let cfg = MotionConfig {
+                read_loss_ticks: 4,
+                ..MotionConfig::default()
+            };
+            let (mut state, _) = armed_at_stow(&cfg);
+
+            let seen = law_holds(&cfg, &mut state, 12, |n, tracked| {
+                if (2..8).contains(&n) {
+                    Offered::default()
+                } else {
+                    Offered::read(*tracked)
+                }
+            });
+
+            assert!(state.is_faulted(), "the fixture never latched");
+            assert_eq!(
+                seen.fault_slugs(),
+                vec!["position_feedback_lost"],
+                "{seen:?}"
+            );
+            assert!(seen.most_misses >= 4, "{seen:?}");
+        }
+
+        /// A joint held away from its goal long enough to run its tracking
+        /// window out, twice: the run's anchor, side and count all have to
+        /// cross the round trip, and the fault is non-latching so the machine
+        /// carries on and rebuilds one.
+        #[test]
+        fn a_tracking_run_and_its_fault_survive_the_round_trip() {
+            let cfg = tracking_cfg(0.1, 0.01, 3);
+            let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+            let mut stuck = pinned;
+            stuck.legs[3] += 0.2;
+            stuck.antennas[1] = 0.4;
+
+            let seen = law_holds(&cfg, &mut state, 20, |_, _| Offered::read(stuck));
+
+            assert!(seen.longest_run >= 3, "{seen:?}");
+            assert_eq!(seen.fault_slugs(), vec!["head_obstructed"], "{seen:?}");
+            assert!(
+                seen.faults.len() >= 2,
+                "a standing obstruction should rebuild its run and raise again: {seen:?}"
+            );
+            assert!(!state.is_faulted(), "the head's obstruction does not latch");
+        }
+
+        /// An antenna's latched error bits, which take it out of service: the
+        /// mask and the forgotten run both have to cross the round trip.
+        #[test]
+        fn a_degrade_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let mut flagged = healthy_servos();
+            flagged[7].bits = 0x20;
+
+            let seen = law_holds(&cfg, &mut state, 8, |n, tracked| {
+                if n >= 3 {
+                    Offered::swept(*tracked, flagged)
+                } else {
+                    Offered::swept(*tracked, healthy_servos())
+                }
+            });
+
+            assert!(
+                seen.degraded
+                    .iter()
+                    .any(|fault| matches!(fault, Fault::AntennaServoFault { .. })),
+                "{seen:?}"
+            );
+            assert!(
+                seen.masked.contains(JointId::AntennaRight),
+                "the flagged antenna was not taken out of service: {seen:?}"
+            );
+        }
+
+        /// A move whose sampled path steps further in a period than the bound
+        /// allows, which aborts it and drops the trajectory mid-flight.
+        #[test]
+        fn an_abort_survives_the_round_trip() {
+            let cfg = MotionConfig {
+                max_step: JointStep {
+                    legs: 0.001,
+                    body_yaw: 0.15,
+                    antennas: 0.65,
+                },
+                ..MotionConfig::default()
+            };
+            let (mut state, _) = armed_at_stow(&cfg);
+            let command = move_to(JointTargets::default(), secs(1.0));
+
+            let seen = law_holds(&cfg, &mut state, 20, |n, tracked| {
+                if n == 0 {
+                    Offered::commanded(*tracked, command)
+                } else {
+                    Offered::read(*tracked)
+                }
+            });
+
+            assert!(
+                seen.aborted
+                    .iter()
+                    .any(|abort| matches!(abort, MoveAbort::StepTooLarge { .. })),
+                "{seen:?}"
+            );
+            assert!(!seen.completed, "an aborted move does not complete");
+        }
+
+        /// A refused command, which changes nothing but is reported: the state
+        /// either side of it is the same one, and the report has to match.
+        #[test]
+        fn a_rejection_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let unreachable = move_to(pose_at(10.0), secs(1.0));
+
+            let seen = law_holds(&cfg, &mut state, 4, |n, tracked| {
+                if n == 1 {
+                    Offered::commanded(*tracked, unreachable)
+                } else {
+                    Offered::read(*tracked)
+                }
+            });
+
+            assert_eq!(seen.rejected, 1, "{seen:?}");
+            assert!(seen.faults.is_empty(), "a refusal is not a fault: {seen:?}");
+        }
+
+        /// The session record does not cross the round trip, and the crate says
+        /// so out loud: a restored state's timeline is empty however much the
+        /// state it came from had raised.
+        #[test]
+        fn the_timeline_does_not_survive_the_round_trip() {
+            let cfg = MotionConfig {
+                read_loss_ticks: 2,
+                ..MotionConfig::default()
+            };
+            let (mut state, pinned) = armed_at_stow(&cfg);
+            tick_with(&cfg, &mut state, secs(0.0), &pinned, None);
+            for n in 1..=3 {
+                let mut out = TickOutputs::default();
+                motion_tick(
+                    &cfg,
+                    &mut state,
+                    &TickInputs {
+                        now: secs(f64::from(n) * 0.02),
+                        period: PERIOD,
+                        present: None,
+                        command: None,
+                        health: None,
+                    },
+                    &mut out,
+                );
+            }
+            assert!(state.is_faulted(), "the fixture never latched");
+            assert!(
+                !state.timeline().entries().is_empty(),
+                "the fixture recorded nothing to lose"
+            );
+
+            let restored =
+                MotionState::from_snapshot(&state.snapshot()).expect("the snapshot restores");
+            assert!(
+                restored.timeline().entries().is_empty(),
+                "a restored state starts a fresh record"
+            );
+            assert_eq!(
+                restored.mode(),
+                state.mode(),
+                "the latched fault itself is not what was dropped"
+            );
+        }
+
+        /// A slot holding a mode with no path to sample is refused rather than
+        /// restored into a machine that would drop to holding on its next tick
+        /// without saying why.
+        #[test]
+        fn a_move_with_no_path_is_refused() {
+            let cfg = MotionConfig::default();
+            let (state, _) = armed_at_stow(&cfg);
+            let snap = MotionSnapshot {
+                mode: Mode::Moving { elapsed: secs(0.5) },
+                trajectory: None,
+                ..state.snapshot()
+            };
+            assert_eq!(
+                MotionState::from_snapshot(&snap).err(),
+                Some(SnapshotError::MovingWithoutTrajectory)
+            );
+        }
+
+        /// A path that cannot be built is refused with the constructor's own
+        /// reason.
+        #[test]
+        fn a_path_that_cannot_be_built_is_refused() {
+            let cfg = MotionConfig::default();
+            let (state, _) = armed_at_stow(&cfg);
+            let snap = MotionSnapshot {
+                mode: Mode::Holding,
+                trajectory: Some(TrajectorySeed {
+                    start: JointTargets::default(),
+                    target: JointTargets::default(),
+                    durations: MoveDurations::uniform(Duration::ZERO),
+                    warp: Warp::MinJerk,
+                }),
+                ..state.snapshot()
+            };
+            assert_eq!(
+                MotionState::from_snapshot(&snap).err(),
+                Some(SnapshotError::Trajectory(
+                    TrajectoryError::NonPositiveDuration
+                ))
+            );
+        }
+
+        /// A faulted state keeps the path it stopped on. Nothing samples it
+        /// again, but it is half of a pair the tick sets and clears together,
+        /// and a restore that refused it would refuse a state the tick reaches.
+        #[test]
+        fn a_path_left_by_a_latching_fault_restores() {
+            let cfg = MotionConfig {
+                read_loss_ticks: 2,
+                ..MotionConfig::default()
+            };
+            let (mut state, pinned) = armed_at_stow(&cfg);
+            tick_with(
+                &cfg,
+                &mut state,
+                secs(0.0),
+                &pinned,
+                Some(&move_to(JointTargets::default(), secs(2.0))),
+            );
+            for n in 1..=3 {
+                let mut out = TickOutputs::default();
+                motion_tick(
+                    &cfg,
+                    &mut state,
+                    &TickInputs {
+                        now: secs(f64::from(n) * 0.02),
+                        period: PERIOD,
+                        present: None,
+                        command: None,
+                        health: None,
+                    },
+                    &mut out,
+                );
+            }
+            let snap = state.snapshot();
+            assert!(matches!(snap.mode, Mode::Faulted(_)), "{:?}", snap.mode);
+            assert!(snap.trajectory.is_some(), "the path was cleared after all");
+            let restored = MotionState::from_snapshot(&snap).expect("the snapshot restores");
+            assert_eq!(restored.snapshot(), snap);
+        }
+
+        /// A machine standing outside the envelope, commanded back inside:
+        /// the only state in which the excursion mirror carries anything but
+        /// zeroes, and the allowance every sample of the recovery is judged
+        /// against.
+        #[test]
+        fn a_recovery_out_of_the_envelope_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let turned = cfg.env.body_yaw_limit + 0.05;
+            let crooked = JointTargets {
+                body_yaw: turned,
+                ..JointTargets::default()
+            };
+            let (mut state, _) = armed_at(&cfg, &crooked);
+            let square = move_to(JointTargets::default(), secs(4.0));
+
+            let seen = law_holds(&cfg, &mut state, 120, |n, tracked| {
+                if n == 0 {
+                    Offered::commanded(*tracked, square)
+                } else {
+                    Offered::read(*tracked)
+                }
+            });
+
+            assert!(seen.moved, "the recovery never started");
+            assert!(seen.faults.is_empty(), "{seen:?}");
+            assert!(
+                seen.furthest_out > 0.0,
+                "the excursion mirror crossed the round trip as zeroes: {seen:?}"
+            );
+        }
+
+        /// Live reads whose crank angles close no linkage, for longer than
+        /// their run is allowed: the pose-failure counter is the detector, and
+        /// it has to cross the round trip carrying a value.
+        #[test]
+        fn an_unsolvable_pose_and_its_fault_survive_the_round_trip() {
+            let cfg = MotionConfig {
+                read_loss_ticks: 3,
+                ..MotionConfig::default()
+            };
+            let (mut state, _) = armed_at(&cfg, &JointTargets::default());
+            let impossible = JointVector {
+                legs: [
+                    0.0,
+                    core::f64::consts::PI,
+                    0.0,
+                    core::f64::consts::PI,
+                    0.0,
+                    0.0,
+                ],
+                ..JointVector::default()
+            };
+
+            let seen = law_holds(&cfg, &mut state, 10, |n, tracked| {
+                if n < 2 {
+                    Offered::read(*tracked)
+                } else {
+                    Offered::read(impossible)
+                }
+            });
+
+            assert!(
+                seen.most_pose_failures >= 4,
+                "the pose-failure run never reached its bound: {seen:?}"
+            );
+            assert_eq!(
+                seen.fault_slugs(),
+                vec!["measured_pose_invalid"],
+                "{seen:?}"
+            );
+            assert!(state.is_faulted(), "an unsolvable pose latches");
+            assert_eq!(seen.most_misses, 0, "the reads did arrive: {seen:?}");
+        }
+
+        /// An antenna held away from its goal while the head follows: the
+        /// degrade path, which takes the antennas out of service instead of
+        /// winding the machine down, and leaves a mask and a cleared run to
+        /// carry across.
+        #[test]
+        fn an_antenna_obstruction_survives_the_round_trip() {
+            let cfg = tracking_cfg(0.1, 0.01, 3);
+            let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+            let mut stuck = pinned;
+            stuck.antennas[1] = 0.4;
+
+            let seen = law_holds(&cfg, &mut state, 12, |_, _| Offered::read(stuck));
+
+            assert!(
+                seen.degraded
+                    .iter()
+                    .any(|fault| matches!(fault, Fault::AntennaObstructed { .. })),
+                "{seen:?}"
+            );
+            assert!(seen.longest_run >= 3, "{seen:?}");
+            assert!(
+                seen.masked.contains(JointId::AntennaLeft),
+                "the obstructed antenna was not taken out of service: {seen:?}"
+            );
+            assert!(
+                !state.is_faulted(),
+                "an antenna does not wind the machine down"
+            );
+        }
+
+        /// A leg servo's own error bits: the fault that masks the joint it
+        /// names and hands the machine back holding, so both the mask and the
+        /// raise have to cross the round trip.
+        #[test]
+        fn a_head_servo_fault_survives_the_round_trip() {
+            let cfg = MotionConfig::default();
+            let (mut state, _) = armed_at_stow(&cfg);
+            let mut flagged = healthy_servos();
+            flagged[2].bits = 0x20;
+
+            let seen = law_holds(&cfg, &mut state, 8, |n, tracked| {
+                if n >= 2 {
+                    Offered::swept(*tracked, flagged)
+                } else {
+                    Offered::swept(*tracked, healthy_servos())
+                }
+            });
+
+            assert_eq!(seen.fault_slugs(), vec!["head_servo_fault"], "{seen:?}");
+            assert!(
+                seen.masked.contains(JointId::Leg(1)),
+                "the flagged leg was not taken out of service: {seen:?}"
+            );
+        }
+
+        /// The ten distances the excursion mirror carries, each a different
+        /// number: a swap of two of them, or an index shifted along the window,
+        /// is a different value coming back.
+        #[test]
+        fn an_excursion_crosses_as_ten_separate_numbers() {
+            let excursion = Excursion {
+                window: [0.11, 0.22, 0.33, 0.44, 0.55, 0.66],
+                body_yaw: 0.77,
+                relative_yaw: 0.88,
+                cone: 0.99,
+            };
+            let snap = excursion.snapshot();
+            assert_eq!(snap.window, excursion.window);
+            assert_eq!(snap.body_yaw, excursion.body_yaw);
+            assert_eq!(snap.relative_yaw, excursion.relative_yaw);
+            assert_eq!(snap.cone, excursion.cone);
+            assert_eq!(Excursion::from_snapshot(&snap), excursion);
+        }
+
+        /// Every side a run can be measuring in, across the mapping the
+        /// snapshot actually goes through. Written as a match over the private
+        /// type, so a fourth side is a compile error here rather than a run
+        /// restored measuring in a direction it was never in.
+        #[test]
+        fn every_side_survives_the_mapping_a_snapshot_goes_through() {
+            for side in [Side::Above, Side::Below, Side::Unplaced] {
+                assert_eq!(Side::from_snapshot(side.snapshot()), side);
+                let named = match side {
+                    Side::Above => TrackingSide::Above,
+                    Side::Below => TrackingSide::Below,
+                    Side::Unplaced => TrackingSide::Unplaced,
+                };
+                assert_eq!(side.snapshot(), named);
+            }
+        }
+
+        /// A slot holding a path in a mode that never keeps one is refused.
+        ///
+        /// Every way the tick reaches holding drops the path in the same
+        /// statement, so this pairing is not a state it produces — and a path
+        /// left standing in it reads to anything that looks as a move in
+        /// flight.
+        #[test]
+        fn a_hold_carrying_a_path_is_refused() {
+            let cfg = MotionConfig::default();
+            let (mut state, pinned) = armed_at_stow(&cfg);
+            tick_with(
+                &cfg,
+                &mut state,
+                secs(0.0),
+                &pinned,
+                Some(&move_to(JointTargets::default(), secs(2.0))),
+            );
+            let moving = state.snapshot();
+            assert!(moving.trajectory.is_some(), "the fixture never moved");
+
+            let snap = MotionSnapshot {
+                mode: Mode::Holding,
+                ..moving
+            };
+            assert_eq!(
+                MotionState::from_snapshot(&snap).err(),
+                Some(SnapshotError::HoldingWithTrajectory)
+            );
+        }
+
+        /// A side is written into a slot as an integer, and only the three that
+        /// name one read back.
+        #[test]
+        fn a_side_survives_its_integer() {
+            for side in [
+                TrackingSide::Above,
+                TrackingSide::Below,
+                TrackingSide::Unplaced,
+            ] {
+                assert_eq!(TrackingSide::from_i8(side.as_i8()), Some(side));
+            }
+            assert_eq!(TrackingSide::from_i8(2), None);
+            assert_eq!(TrackingSide::from_i8(-2), None);
+            assert_eq!(TrackingSide::from_i8(i8::MIN), None);
+        }
     }
 }

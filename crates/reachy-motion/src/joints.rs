@@ -377,6 +377,16 @@ impl JointSet {
     /// The set with nothing in it.
     pub const EMPTY: Self = Self(0);
 
+    /// Every servo on the bus.
+    ///
+    /// Spelled as the nine low bits rather than folded from [`JointId::ALL`],
+    /// because a constant cannot fold; that the two describe the same nine
+    /// servos is a test rather than a comment. What it is for is the caller
+    /// that has to say "all of them" — the mask on a goal that leaves nothing
+    /// out, a machine energised whole — without each such caller assembling its
+    /// own nine and getting to disagree.
+    pub const ALL: Self = Self((1u16 << JointId::COUNT) - 1);
+
     /// Add `joint`, reporting whether it was not already there.
     ///
     /// The return is what makes an entry an event: a fault that names a servo
@@ -405,6 +415,22 @@ impl JointSet {
         self.0 == 0
     }
 
+    /// The joints in either set.
+    ///
+    /// What a caller holding a set of servos does instead of reaching for the
+    /// bits: a union written as bit arithmetic is a place a servo's bit can
+    /// land on another servo's name.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The joints in this set and not in `other`.
+    #[must_use]
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// How many joints are in it.
     #[must_use]
     pub fn len(self) -> u32 {
@@ -418,6 +444,32 @@ impl JointSet {
             .into_iter()
             .filter(|joint| joint.group() == group)
             .all(|joint| self.contains(joint))
+    }
+
+    /// The set as the bit field a slot holds it in, one bit per bus row.
+    ///
+    /// Bit `n` is the joint at bus row `n`, which is the same convention the
+    /// wire's masks use, so a host mirroring this into an integer field writes
+    /// this number and nothing derived from it.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// The set `bits` names, or `None` if it names a row no joint has.
+    ///
+    /// The nine rows occupy the low nine bits; anything above them was written
+    /// by something that does not agree with this type about how many joints
+    /// there are, and masking it off would restore a set that leaves a servo
+    /// commanding which the state had taken out of service.
+    #[must_use]
+    pub fn from_bits(bits: u16) -> Option<Self> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "JointId::COUNT is 9, which fits a shift width"
+        )]
+        const OCCUPIED: u16 = (1 << JointId::COUNT as u16) - 1;
+        (bits & !OCCUPIED == 0).then_some(Self(bits))
     }
 
     /// Everything in the set, in bus order.
@@ -463,6 +515,62 @@ mod tests {
     use reachy_kin::{
         EnvelopeConfig, EnvelopeReport, EnvelopeViolations, HeadGeometry, check_envelope,
     };
+
+    /// The constant and the nine servos are one thing said twice, which is only
+    /// safe while they agree.
+    #[test]
+    fn the_whole_bus_is_every_joint_the_bus_has() {
+        let folded = JointId::ALL
+            .into_iter()
+            .fold(JointSet::EMPTY, |set, joint| {
+                let mut set = set;
+                assert!(set.insert(joint), "{joint} is on the bus once");
+                set
+            });
+        assert_eq!(JointSet::ALL, folded);
+        assert_eq!(
+            usize::try_from(JointSet::ALL.len()).expect("nine servos is a small number"),
+            JointId::COUNT,
+        );
+        for joint in JointId::ALL {
+            assert!(JointSet::ALL.contains(joint), "{joint} is on the bus");
+        }
+        assert_eq!(
+            JointSet::from_bits(JointSet::ALL.bits()),
+            Some(JointSet::ALL),
+            "the whole bus is a set of rows the bus has",
+        );
+    }
+
+    #[test]
+    fn a_set_restores_from_the_bits_a_slot_holds_it_in() {
+        let mut set = JointSet::EMPTY;
+        assert_eq!(set.bits(), 0);
+        for joint in [JointId::BodyYaw, JointId::Leg(4), JointId::AntennaLeft] {
+            set.insert(joint);
+        }
+        assert_eq!(set.bits(), 0b1_0010_0001, "rows 0, 5 and 8");
+        assert_eq!(JointSet::from_bits(set.bits()), Some(set));
+
+        // Every subset of the nine rows is a set something could have masked.
+        for bits in 0..=0b1_1111_1111u16 {
+            let restored = JointSet::from_bits(bits).expect("nine rows are nine rows");
+            assert_eq!(restored.bits(), bits);
+        }
+    }
+
+    #[test]
+    fn a_row_no_joint_has_is_refused_rather_than_masked_off() {
+        for bit in JointId::COUNT..16 {
+            let bits = 1 << bit;
+            assert_eq!(
+                JointSet::from_bits(bits),
+                None,
+                "bit {bit} names no joint and is no set"
+            );
+        }
+        assert_eq!(JointSet::from_bits(u16::MAX), None);
+    }
 
     /// The worst-deviation selection is an ordering, and a value nobody can
     /// place wins it. Reusing the bound test here would let the unplaceable
@@ -740,6 +848,29 @@ mod tests {
         assert!(!set.insert(JointId::Leg(9)));
         assert!(set.is_empty());
         assert!(!set.contains(JointId::Leg(9)));
+    }
+
+    /// Union and difference, which is how a caller holding a set adds servos to
+    /// it or takes them out without ever writing a shift.
+    #[test]
+    fn joints_go_into_a_set_and_come_out_of_it_by_name() {
+        let cranks = JointGroup::Legs.joints();
+        let antennas = JointGroup::Antennas.joints();
+
+        let both = cranks.union(antennas);
+        assert_eq!(both.len(), cranks.len() + antennas.len());
+        assert!(both.covers(JointGroup::Legs) && both.covers(JointGroup::Antennas));
+        assert!(!both.contains(JointId::BodyYaw));
+        assert_eq!(both.union(cranks), both, "a union with a subset is itself");
+
+        let left = both.without(antennas);
+        assert_eq!(left, cranks);
+        assert!(left.without(cranks).is_empty());
+        assert_eq!(
+            left.without(JointSet::EMPTY),
+            cranks,
+            "taking nothing out changes nothing"
+        );
     }
 
     /// Group coverage, which is what says a mask has taken a whole group out of

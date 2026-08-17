@@ -1,0 +1,89 @@
+// What the cogs are built with: the numbers a scenario chooses before the run
+// starts and nothing writes afterwards.
+//
+// A module of its own, apart from the messages and slots in `msgs.clk`, and
+// that is forced rather than stylistic. A config is bound to a file of
+// protobuf text, so its schema has to cross the Protobuf backend as well as the
+// C++ one -- and generation is declared per module, not per schema. `msgs.clk`
+// cannot cross that backend: it declares an enum with a negative member
+// (`TrackingSideKind::below`, mirroring the library's own `TrackingSide`), and
+// the Protobuf emitter refuses a negative enumerator outright. So the schemas
+// that must be authored as text live here, where every field is a plain
+// non-negative scalar.
+//
+// The nanosecond counts below are the one place in this system bare numbers
+// stand in for time. The Protobuf path carries integers rather than the
+// `SyncTime`/`Duration` types the messages use, and a config authored as text
+// is the reason that path is taken at all.
+
+#![generate(cpp, proto, proto_conv)]
+#![cpp(namespace=brenn_reachy::config)]
+
+// What the decision tick is built with: the grid it commands on and how long a
+// posture change takes.
+//
+// A config rather than constants in the body because a scenario chooses these:
+// a scenario asserting that a goal is due two cycles out, or that the machine
+// reached its posture in the time it was given, is asserting against a number
+// somebody wrote down.
+schema MoverParams
+{
+    uuid: 59f47201-9b76-42c1-a6ce-635686d21fce;
+    fields
+    {
+        // How many cycles ahead of the sample a goal is dated. The driver
+        // executes a goal at the instant it names, so this is the slack the
+        // whole loop gets between reading a pose and having to have decided
+        // what to do about it.
+        #0 lag_k: UInt32;
+
+        // The bus cycle, nanoseconds -- the spacing of the sample stream, and
+        // the unit `lag_k` counts in.
+        #1 period_ns: Int64;
+
+        // How long a move to the upright posture takes, nanoseconds.
+        #2 up_duration_ns: Int64;
+
+        // How long a move to stow takes, nanoseconds. Longer than the way up:
+        // stowing is the posture the machine ends every session in, and it is
+        // done gently.
+        #3 stow_duration_ns: Int64;
+    }
+}
+
+// What the simulated driver is built with: the cycle it runs on, the dead-man
+// it enforces, and how fast the modelled servos move.
+//
+// A config for the same reason: a dead-man scenario wants the timeout it
+// asserts against to be a number it stated, and a plant that slews at a rate
+// nobody wrote down is a plant whose settling time is an accident.
+schema SimParams
+{
+    uuid: a20e4386-2277-419a-bf82-77fe0f2572fe;
+    fields
+    {
+        // The bus cycle, nanoseconds. Every sample sits on this grid and the
+        // plant advances by one step per cycle.
+        #0 period_ns: Int64;
+
+        // How long the goal stream may be silent before the gate de-torques
+        // the machine, nanoseconds.
+        #1 hold_timeout_ns: Int64;
+
+        // Whether the machine starts energised. False in a scenario that arms
+        // the machine itself, which is what a session does.
+        #2 start_torqued: Bool;
+
+        // How far a crank servo moves in one cycle, radians. The plant is
+        // first-order: it closes this much of the gap to its target per cycle
+        // and no more, so a goal stream that steps further than this shows up
+        // as a tracking error rather than as a teleport.
+        #3 slew_legs_rad: Float64;
+
+        // How far the body yaw servo moves in one cycle, radians.
+        #4 slew_body_yaw_rad: Float64;
+
+        // How far an antenna servo moves in one cycle, radians.
+        #5 slew_antennas_rad: Float64;
+    }
+}

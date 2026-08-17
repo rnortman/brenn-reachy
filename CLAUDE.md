@@ -116,3 +116,8 @@ operational tasks; those are asks made to a human directly.
 `TODO.md` is part of a public repository. An entry is public writing: it may
 describe the work, but not internal topology, host names, or anything else that
 would not otherwise be published.
+
+## Comments in `.clk` files
+
+In `.clk` files, `//` is not a normal code comment but a *required documentation
+element*. They cannot be removed or relocated. They may be rewritten.

@@ -1,0 +1,140 @@
+// The bring-up probe: one Rust cog, two channels, and the wiring that makes the
+// four open Clockwork questions answerable by a test.
+//
+// The cog itself does almost nothing -- it turns each command into one
+// `reachy-wire` datagram carried as a `VarPacket` -- and that is the point.
+// Everything shaped here is a mechanism the motion cogs rest on:
+//
+//   * `ProbeCmds` carries a `LogReaderPolicy` -- declared next door in
+//     `probe_system.clk`, because the module it comes from generates nothing
+//     and a module that generates C++ may not import one that does not -- so
+//     the deterministic runner feeds this channel from an input log. That is
+//     how `session`'s schedules and the simulator's injections will arrive.
+//   * `ProbePackets` is a `VarPacket` channel, which is how every wire-format
+//     channel in the motion system carries its bytes, and it is logged, so the
+//     checker has to recover a datagram from a logged payload.
+//   * `probe.own_packet` is wired to the channel `probe.packet` publishes. A
+//     cog reading back its own last publication is the rule the motion cogs use
+//     in place of publish-bookkeeping state, and nothing upstream demonstrates
+//     the loop composing.
+//
+// The imports carry no explicit generation targets: this module generates C++
+// and both modules it imports do too, which is all either is asked for here.
+// (A comment may not sit directly above a `use`, which is why this one is
+// here.)
+
+#![generate(cpp, cpp_cog, cpp_exe, cpp_test_cog)]
+#![cpp(namespace=brenn_reachy::proof)]
+
+use cogs::proof::probe_msgs;
+use @clockwork::clockwork::io::var_packet;
+
+// The commands, injected from the input log. One publisher -- the log reader --
+// as every channel in this repo's systems has.
+channel ProbeCmds
+{
+    message_type: Tachyon<probe_msgs::ProbeCmd>;
+    max_num_messages: 8;
+}
+
+// The datagrams the probe emits, as opaque bytes.
+channel ProbePackets
+{
+    message_type: Tachyon<var_packet::VarPacket288>;
+    max_num_messages: 16;
+}
+
+// One command in, one datagram out, and the previous datagram read back.
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take. Under the deterministic runner an output is published at the
+// execution's start time plus that duration, so it is the offset between a
+// command's instant and its datagram's, and the scenario checker asserts that
+// offset. It is stated rather than left to the compiler's default, which
+// happens to be the same millisecond: an assertion about a number needs
+// somewhere to read the number from. (Neither a block header nor a field inside
+// that block may carry a comment of its own, which is why this one is here.)
+cog Probe
+{
+    states
+    {
+        // What survives between executions. Named for what it holds rather
+        // than for the cog: a state member whose name matches its cog's
+        // generates a C++ class nested inside one of the same name, which does
+        // not compile.
+        kept: Tappy<probe_msgs::ProbeState>
+        {
+            mutable: true;
+        }
+    }
+
+    inputs
+    {
+        // The commands. Sized to see every message rather than the latest one,
+        // and the only execution condition.
+        cmds: Tappy<probe_msgs::ProbeCmd>
+        {
+            max_msgs: 4;
+        }
+
+        // This cog's own output channel, at the default view of 1: the last
+        // datagram it published, or an empty view before it ever has.
+        // Deliberately not a condition -- a cog that woke itself on its own
+        // publication would never stop.
+        own_packet: Tappy<var_packet::VarPacket288>;
+    }
+
+    outputs
+    {
+        packet: Tappy<var_packet::VarPacket288>;
+    }
+
+    execution
+    {
+        // Every command, no skips: the bound equals the view's size, so the
+        // count is the window's length and never a clamp of it.
+        condition got: new_message(cmds, max=4);
+
+        execute when: got;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}
+
+// The machine this runs on.
+cpu_domain ProbeCpu;
+
+box ProbeBox
+{
+    new probe: Probe;
+
+    // The cog's own slot, written by nothing else. No `init=`, so it is
+    // default-constructed into a buffer the compiler synthesizes.
+    new probe_state: State(representation=Tachyon<probe_msgs::ProbeState>);
+    connect probe_state to probe.kept;
+
+    connect ProbeCmds to probe.cmds;
+    connect probe.packet to ProbePackets;
+
+    // The self-loop. A second subscriber on a channel this box already has one
+    // publisher for -- not a second publisher, so the single-publisher rule the
+    // motion system is built around is untouched.
+    connect ProbePackets to probe.own_packet;
+}
+
+// One box in one process: the topology the deterministic runner is documented
+// for, and the one a `LogReaderPolicy` is permitted in.
+box System
+{
+    new box: ProbeBox;
+
+    // `probe_clk_exe` is the executable the compiler synthesizes for this file
+    // under `cpp_exe`, named for the file stem.
+    new proc: Process(executable=probe_clk_exe);
+
+    apply HostProcess(process=proc) in box;
+    apply HostCpuDomain(cpu_domain=ProbeCpu) to proc;
+}

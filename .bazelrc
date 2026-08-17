@@ -1,0 +1,85 @@
+# Bazel flags for this repo.
+#
+# A dependency's .bazelrc never applies, so everything the pinned Clockwork drop
+# needs to build correctly has to be restated here. Derivation rule for the
+# "mirrored from the pinned drop" section below: it reproduces the drop's
+# .bazelrc line for line, and every line deliberately *not* carried is named
+# here with the reason. Silent divergence from the drop's build flags is the
+# failure this rule exists to prevent, so on a drop upgrade the two files get
+# diffed and this list gets re-derived. The immediate copy is rusty-cogs'
+# .bazelrc at rev 776a582, which already did that derivation.
+#
+# Not carried, and why:
+#   --noremote_upload_local_results   remote-cache hygiene; we have no remote cache.
+#   --ui_event_filters=-DEBUG         cosmetic only.
+#   try-import %workspace%/user.bazelrc  replaced below by our own
+#                                     .bazelrc.user, which .gitignore covers.
+#
+# Carried modified:
+#   --host_platform  points at our own platform copy rather than the drop's,
+#                    which is not visible outside their tree.
+
+# ---------------------------------------------------------------------------
+# Mirrored from the pinned drop
+# ---------------------------------------------------------------------------
+
+# Local default is to refresh the lockfile. The CI Bazel job passes
+# --lockfile_mode=error on the command line, which overrides this, so resolution
+# drift is a red build there rather than a quiet diff here.
+common --lockfile_mode=update
+
+build --@curl//:ssl_lib="openssl"
+build --@grpc//third_party:grpc_use_openssl=True
+
+# Use the hermetic clang toolchain the drop pins, never a host compiler.
+build --incompatible_enable_cc_toolchain_resolution
+build --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+build --host_platform=//bazel/platform:host-clang
+
+# Disable warnings on third-party code
+build --per_file_copt=^bazel-out/.*/bin/external/,^external/@-w
+build --host_per_file_copt=^bazel-out/.*/bin/external/,^external/@-w
+
+# Output test errors to stderr so a failure is readable without opening logs.
+common --test_output=errors
+
+# Only report the tests that failed.
+common --test_summary=terse
+
+# Use a static value for `PATH` and do not inherit `LD_LIBRARY_PATH`, so client
+# environment changes cannot cause mass cache misses.
+build --incompatible_strict_action_env
+
+# No network access for build actions in the sandbox. Targets that genuinely
+# need it must be tagged `requires-network`.
+build --sandbox_default_allow_network=false
+
+# Keep Python packages installed in user site-packages out of Bazel actions.
+# The scenario authoring and checking scripts run as Python actions, so a leaked
+# site-packages there is a non-hermetic test.
+common --host_action_env=PYTHONNOUSERSITE=1 --test_env=PYTHONNOUSERSITE=1
+
+# Keeps rules_proto working under Bazel 8. The drop's clk rules load
+# build_stack_rules_proto at load time, so this binds even for a build that
+# only compiles messages.
+common --noincompatible_disallow_ctx_resolve_tools
+
+# Don't load native rules; our BUILD files use explicit load() statements.
+common --incompatible_disable_autoloads_in_main_repo
+
+# ---------------------------------------------------------------------------
+# Ours
+# ---------------------------------------------------------------------------
+
+# The Rust lint lanes, as aspects over whatever targets are asked for. Behind a
+# config rather than on by default: an aspect that reruns clippy and rustfmt on
+# every `bazel build` taxes the edit-compile loop, and the Cargo lane's
+# `make check` is where a library author meets a lint first.
+#
+# Warnings are denied. A warning the gate tolerates is a warning nobody reads.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --output_groups=+clippy_checks,+rustfmt_checks
+build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+
+# Per-developer flags, gitignored. Last so it can override anything above.
+try-import %workspace%/.bazelrc.user

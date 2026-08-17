@@ -1,0 +1,8 @@
+# Our own copy of the pinned drop's host platform. Byte-equivalent to theirs,
+# but owned here: their target has package-default visibility and so cannot be
+# named from this repo, and `--host_platform` in .bazelrc must resolve.
+platform(
+    name = "host-clang",
+    constraint_values = ["@bazel_tools//tools/cpp:clang"],
+    parents = ["@platforms//host"],
+)

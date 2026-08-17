@@ -1,0 +1,2 @@
+# Exists only so that sysroot.bzl sits in a package; Bazel requires one for
+# every .bzl file. Nothing is built here.

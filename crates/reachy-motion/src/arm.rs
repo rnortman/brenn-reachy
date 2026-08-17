@@ -877,7 +877,13 @@ pub(crate) fn angle_at(joints: &JointVector, row: usize) -> f64 {
 /// Every pose a command targets is one of the three, or differs from neutral
 /// only in yaw and antennas, which do not move the head pose being solved for.
 /// Named here rather than written inline so the list is a thing a test can read.
-fn rest_pose_seeds() -> [Isometry3<f64>; 3] {
+///
+/// Public because it is the list *any* solve of a resting machine's measured
+/// angles wants, and a caller that arms from a pose sample rather than from the
+/// engage sequencer would otherwise write its own three and get to disagree
+/// with this one about the poses a session can start from.
+#[must_use]
+pub fn rest_pose_seeds() -> [Isometry3<f64>; 3] {
     [stow_head_pose(), rest_head_pose(), neutral_head_pose()]
 }
 

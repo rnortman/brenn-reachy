@@ -1,0 +1,341 @@
+// The simulated driver: the machine's other half, with no machine.
+//
+// One cog stands in for the motor driver process. It is time-triggered on the
+// bus cycle and publishes one pose sample per cycle whatever else happened,
+// because that stream is the clock the control-rate cogs run on and a cycle
+// with no sample is a cycle they never see. What it decides between those
+// samples -- which goal is due, what to rewrite, when silence has gone on long
+// enough to de-torque the machine -- is not written here: it is
+// `reachy-driver`, the same decision the real driver process will run, hosted
+// rather than re-implemented.
+//
+// What is written here is the plant: where the servos are, how fast they move,
+// what a jammed one does, and what a cycle whose replies were lost looks like
+// on the wire. It is a first-order model and nothing more -- no inertia, no
+// voltage, no temperature -- which is enough to raise every fault the motion
+// tick classifies from evidence and is not enough to answer a question about
+// servo fidelity. When the real driver exists, logs captured from it supersede
+// this model rather than argue with it.
+//
+// The scenario's hand reaches the plant through `SimCmdChan`, which is fed from
+// an input log. Those injections stand in for the physical world and for the
+// arming sequencer, neither of which exists in this system.
+//
+// The foot of this file is the composition: the box that closes the loop around
+// all three cogs, and the process that hosts it. They are here rather than in
+// the system module next door because the grammar admits a `system_target` only
+// in a module that generates nothing, and a process needs a module that
+// generates an executable.
+//
+// Every signal below is `multi_instance`, for the reason `motion.clk`'s header
+// states in full: the marker is a fact about how this system is built, not
+// about the machine, which carries one of each cog.
+// TODO(clockwork-single-instance-signal)
+// (A comment may not sit directly above a `use`, which is why this one is
+// here.)
+
+#![generate(cpp, cpp_cog, cpp_exe, cpp_test_cog)]
+#![cpp(namespace=brenn_reachy::sim)]
+
+use [cpp, proto, proto_conv] cogs::config;
+use cogs::motion;
+use cogs::msgs;
+use @clockwork::clockwork::io::var_packet;
+use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
+    ReportGroupLogType};
+
+// What the driver did that the sample stream does not show: the edges. One
+// publisher -- the driver -- as every channel in this repo's systems has.
+//
+// Sized sixteen deep against a view of one, which is more slack than the rate
+// needs: events mark boundaries, not cycles, and a driver emitting one per
+// cycle is a driver reporting a standing condition at poll rate.
+channel DriverEvt
+{
+    message_type: Tachyon<var_packet::VarPacket64>;
+    max_num_messages: 16;
+}
+
+// The scenario's injections, read from the input log. One publisher -- the log
+// reader.
+//
+// Sixteen deep against a view of eight: injections are sparse, and the depth is
+// what lets a scenario put a burst of them at one instant without the reader
+// lapping the cog that reads them. What actually bounds a burst is the view,
+// not the ring -- an injection the view does not reach is one the cog never
+// sees, and unlike every other loss this cog suffers there is no count of it --
+// so the view is sized for the largest burst a scenario has a hand for, an
+// operation per joint group per instant and room over.
+channel SimCmdChan
+{
+    message_type: Tachyon<msgs::SimCmd>;
+    max_num_messages: 16;
+}
+
+// The motor driver, with the motors modelled.
+//
+// Its cycle is the real one's: take in what arrived, decide what to write, write
+// it, report what happened. One pose sample goes out every cycle without
+// exception -- the heartbeat -- and an event goes out only when something
+// happened that the sample stream cannot show.
+//
+// A cycle can raise more than one event and an output carries one message per
+// execution, so the events are ranked: the dead-man's latch outranks the rest,
+// because it is the machine changing state rather than a remark about a
+// datagram, and the ones that lose the slot are counted. In the scenarios this
+// runs in the two do not coincide -- a live goal stream is what holds the
+// dead-man off.
+//
+// The counters below are the run's totals, held in the state slot and reported
+// on the signal group only on the executions where one of them moves. Kept in
+// the group's own fold instead they would restart every time the group
+// reported.
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take, which is the offset between a cycle's nominal instant and the log time
+// of the sample it publishes. A checker reading timestamps has to know that the
+// two are different clocks: `execute_at` arithmetic is off the nominal, and the
+// log time is off the publish. It is stated rather than left to the generator's
+// default, which happens to be the same millisecond: an assertion about a
+// number needs somewhere to read the number from. (Neither a block header nor a
+// field inside one may carry a comment of its own, which is why this is here.)
+cog MotorSim
+{
+    configs
+    {
+        // The cycle, the dead-man, and the modelled servos' speed. The cycle
+        // this cog is woken on is the execution condition's below; the period
+        // here is what one cycle is worth to the plant, and a scenario that
+        // sets the two apart is telling the plant that its cycle is longer or
+        // shorter than the one it is woken on.
+        params: Tappy<config::SimParams>;
+    }
+
+    states
+    {
+        // The gate and the plant, and the run's totals.
+        sim: Tappy<msgs::SimState>
+        {
+            mutable: true;
+        }
+    }
+
+    signals stats
+    {
+        // How many goals reached the modelled servos. A goal that arrived and
+        // was queued is not one of these until its instant comes round.
+        goals_executed: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many goals were refused because the queue was full. A sender
+        // overrunning the gate, which the deterministic scenarios cannot do at
+        // one goal per cycle and a stalled commander online can.
+        goals_dropped: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times the dead-man latched torque off. The one counter here
+        // about the machine rather than about the traffic.
+        hold_timeouts: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many datagrams on the goal channel the codec refused. Distinct
+        // from a dropped goal: those bytes were not a setpoint at all, so they
+        // name no instant and no rows.
+        undecodable_goals: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many events were raised on a cycle that had already reported one.
+        // What a reader compares against the events in the log to know whether
+        // it is reading all of them.
+        events_dropped: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times a field of this cog's own slot named servos this build
+        // does not know.
+        refused_state_fields: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many of the scenario's injections this build could not carry out:
+        // an operation it does not know, or one naming servos it does not know.
+        // A scenario authored against a newer vocabulary than this binary would
+        // otherwise read as a machine nobody ever touched.
+        refused_injections: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+    }
+
+    inputs
+    {
+        // The goal stream, sized to see every datagram rather than the latest
+        // one: a goal that went unseen is a goal the machine was never asked
+        // for, and the gate is what decides which of them is due.
+        goals: Tappy<var_packet::VarPacket128>
+        {
+            max_msgs: 8;
+        }
+
+        // The scenario's injections. Sized to see all of a same-instant burst:
+        // an injection outside this window is silently absent, where every
+        // other injection this cog cannot carry out is counted.
+        cmds: Tappy<msgs::SimCmd>
+        {
+            max_msgs: 8;
+        }
+
+        // This cog's own sample channel, at the default view of 1: the last
+        // sample it published, or an empty view before it ever has. The wire
+        // sequence number of the next one is read back from it rather than kept
+        // in a state field. Deliberately not a condition -- a cog woken by its
+        // own publication would never stop.
+        own_pose: Tappy<var_packet::VarPacket288>;
+
+        // This cog's own event channel, read back for the same reason. Events
+        // are sparse, so this view holds the last one however long ago it was
+        // sent, which is exactly what a sequence number needs.
+        own_evt: Tappy<var_packet::VarPacket64>;
+    }
+
+    outputs
+    {
+        pose: Tappy<var_packet::VarPacket288>;
+        evt: Tappy<var_packet::VarPacket64>;
+    }
+
+    execution
+    {
+        // The bus cycle. Under the deterministic runner this is exact: the
+        // runner advances simulated time to the timer rather than sampling a
+        // clock, so the samples sit on a perfect grid and every instant a
+        // checker asserts is arithmetic rather than measurement.
+        condition tick: time_since_last_exec(20ms);
+
+        execute when: tick;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}
+
+// The window a post-aggregated group folds over before it reports. It bounds
+// observations, not time: these counters are written only when one of them
+// moves, and every observation is an absolute total, so the first report of a
+// fresh window carries the run's count and not the window's.
+policy ReportGroupPolicy for MotorSim.stats
+{
+    reporting_strategy = ReportingStrategy::post_aggregated;
+    log_type = ReportGroupLogType::event;
+    max_observations = 1000;
+}
+
+// The control loop, closed: the simulated driver, the decision tick and the
+// estimator, with the driver's sample stream as the clock all three run on.
+//
+// The topology is the one the real system will have, with two of the three
+// publishers replaced. `motor_sim` stands in for the driver process, and the
+// input log stands in for the session cog on `ScheduleChan` and for the
+// physical world on `SimCmdChan`. Nothing the cogs do distinguishes those from
+// the real thing: a cog reads channels, and a channel does not say what filled
+// it.
+//
+// Every channel has exactly one publisher. The two self-loops -- the decision
+// tick reading its own goal channel, the driver reading its own sample and
+// event channels -- add subscribers and no publishers, which is what lets those
+// cogs read back what they last sent instead of remembering it in a slot.
+box SimBox
+{
+    new motor_sim: MotorSim;
+    new mover: motion::Mover;
+    new pose: motion::Pose;
+
+    // Each cog's own slot, written by nothing else. No `init=`, so each is
+    // default-constructed into a buffer the compiler synthesizes.
+    new sim_state: State(representation=Tachyon<msgs::SimState>);
+    connect sim_state to motor_sim.sim;
+
+    new mover_state: State(representation=Tachyon<msgs::MoverState>);
+    connect mover_state to mover.ctrl;
+
+    new pose_state: State(representation=Tachyon<msgs::PoseState>);
+    connect pose_state to pose.est;
+
+    // The two configs, read from checked-in protobuf text before the first
+    // execution. The paths resolve against the runfiles of whatever runs the
+    // process, which is why the files are data dependencies of the executable.
+    new sim_params: SerializedDataFile(
+        representation=Protobuf<config::SimParams>,
+        path="cogs/sim_params.textproto");
+    connect sim_params to motor_sim.params;
+
+    new mover_params: SerializedDataFile(
+        representation=Protobuf<config::MoverParams>,
+        path="cogs/mover_params.textproto");
+    connect mover_params to mover.params;
+
+    // The sample stream: the driver publishes it, both control-rate cogs run on
+    // it, and the driver reads its own last one back for the wire sequence
+    // number.
+    connect motor_sim.pose to motion::DriverPose;
+    connect motion::DriverPose to mover.sample;
+    connect motion::DriverPose to pose.sample;
+    connect motion::DriverPose to motor_sim.own_pose;
+
+    // The goal stream, and the loop it closes: the tick commands, the driver's
+    // gate decides what is due, and the tick reads back what it last sent.
+    connect mover.goal to motion::DriverCmd;
+    connect motion::DriverCmd to motor_sim.goals;
+    connect motion::DriverCmd to mover.own_cmd;
+
+    // The driver's edges, read back by their own publisher for the same reason.
+    connect motor_sim.evt to DriverEvt;
+    connect DriverEvt to motor_sim.own_evt;
+
+    // What the run is asked to do, and what the world does to it. Both come
+    // from the input log.
+    connect motion::ScheduleChan to mover.sched;
+    connect SimCmdChan to motor_sim.cmds;
+
+    // Logged only: nothing in this system consumes either.
+    connect mover.fault to motion::TickFaults;
+    connect pose.estimate to motion::Estimates;
+}
+
+// The machine the whole loop runs on. One domain: this system is one process by
+// construction, because the deterministic runner is a single-process runner and
+// every channel in it is in-process memory.
+cpu_domain MotionCpu;
+
+// One box in one process: the topology the deterministic runner is documented
+// for, and the one a `LogReaderPolicy` is permitted in.
+box System
+{
+    new box: SimBox;
+
+    // `sim_clk_exe` is the executable the compiler synthesizes for this file
+    // under `cpp_exe`, named for the file stem.
+    new proc: Process(executable=sim_clk_exe);
+
+    apply HostProcess(process=proc) in box;
+    apply HostCpuDomain(cpu_domain=MotionCpu) to proc;
+}

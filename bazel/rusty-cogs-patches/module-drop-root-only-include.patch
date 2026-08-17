@@ -1,0 +1,37 @@
+Replace rusty-cogs' `include()` of the Clockwork override segment with the
+bazel_dep declarations its own packages need.
+
+Bazel accepts `include()` only in the root module, and rusty-cogs is a
+dependency here, so its MODULE.bazel cannot be evaluated as written --
+resolution fails before any target is analyzed. The segment it includes is the
+Clockwork drop's dependency table: versionless `bazel_dep`s plus the overrides
+that satisfy them. This repo carries its own verbatim copy of that table and
+includes it from the root, where the directive is legal and where the overrides
+are the ones Bazel honours, so the only thing rusty-cogs still needs from it is
+*visibility*: a module can name `@clockwork` only if it declares a dep on it.
+The list below is exactly the table entries rusty-cogs' own `.bzl` and
+`BUILD.bazel` files reference by repo name; every one is versionless because the
+root's overrides pin it.
+
+diff --git a/MODULE.bazel b/MODULE.bazel
+index ac85550..511e2dc 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -7,7 +7,16 @@
+ 
+ module(name = "rusty_cogs")
+ 
+-include("//bazel:clockwork_overrides.MODULE.bazel")
++bazel_dep(name = "bazel_skylib")
++bazel_dep(name = "build_stack_rules_proto")
++bazel_dep(name = "clockwork")
++bazel_dep(name = "platforms")
++bazel_dep(name = "rules_cc")
++bazel_dep(name = "rules_proto")
++bazel_dep(name = "rules_python")
++bazel_dep(name = "rules_shell")
++bazel_dep(name = "xxhash")
++bazel_dep(name = "zstd")
+ 
+ # The interpreter the drop pins for its own Python code and both of its pip
+ # hubs. Those hubs are version-keyed, and the Clockwork compiler's dependency

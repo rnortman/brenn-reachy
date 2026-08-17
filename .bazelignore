@@ -1,0 +1,7 @@
+# Directories Bazel must not treat as packages. Bazel walks the whole working
+# tree regardless of what git ignores, so a build tree or a checked-out copy of
+# something upstream would otherwise inject packages into //... and break the
+# gate locally in a way it cannot break in CI.
+.claude
+.local
+target

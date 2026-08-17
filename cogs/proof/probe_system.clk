@@ -1,0 +1,40 @@
+// The system the probe composes: one target over the box that holds the cog,
+// and the channel policies that decide what the runner feeds and what it logs.
+//
+// No `generate` attribute -- a system module declares no types and emits no
+// code, only the process descriptions and per-domain configs the runner reads.
+// Two of those are what this slice is about: the channel publisher config that
+// makes `ProbeCmds` come out of an input log, and the event logger config that
+// puts both channels into the output log.
+//
+// The policies live here rather than beside the channels they bind because
+// `channel_policy` generates nothing, and a module that generates C++ may not
+// import one that generates no targets. Every future system module in this repo
+// carries its own policies for the same reason.
+
+use cogs::proof::probe;
+use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy,
+    LogReaderPolicy, LogType};
+
+// What makes the runner publish this channel from the input log. The source
+// name defaults to the channel name, which is what the scenario author writes.
+policy LogReaderPolicy for probe::ProbeCmds
+{
+}
+
+// Both channels reach the output log, so a checker sees what went in as well as
+// what came out.
+policy ChannelLoggingPolicy for probe::ProbeCmds
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for probe::ProbePackets
+{
+    log_type = LogType::event;
+}
+
+system_target probe_sim
+{
+    box: probe::System;
+}

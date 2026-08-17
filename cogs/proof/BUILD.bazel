@@ -1,0 +1,284 @@
+load("@clockwork//clockwork:rules.bzl", "clk")
+load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:rust_clk.bzl", "rust_clk_module")
+
+# The Clockwork bring-up probe: the smallest system that answers the questions
+# the motion cogs cannot be written without.
+#
+# It is not a motion cog and never becomes one. What it exists to establish, in
+# this repo's module graph rather than in a document, is:
+#
+#   * that a `.clk` module of ours compiles at all here, and that `SyncTime` and
+#     `Duration` fields survive into the generated Rust and back out of a log;
+#   * that a Rust cog body can read and write a `VarPacket` payload, which is
+#     how every wire-format channel in the motion system carries its bytes;
+#   * that a cog may subscribe to a channel it publishes -- the read-back rule
+#     the motion cogs use instead of publish-bookkeeping state;
+#   * that a log written by the Rust writer drives the deterministic runner, and
+#     that the output log it produces reads back through the Rust reader.
+#
+# Each of those is a proof point of the design, and each is pinned by a test in
+# this package so that a later drop or pin that breaks one says so here.
+#
+# The rules below are in the order and the shape the drop's own BUILD updater
+# renders, because a `clk()` over a system module brings a gate test that holds
+# this file to exactly that. So they are alphabetical by target name rather than
+# in dependency order, and the two rules the tool writes -- `probe_system_clk`
+# and the `probecpu.textproto` launcher config it derives -- carry no comments,
+# because it strips them. That launcher config is used by nothing here: it
+# redirects a child's console into files, which is not what a deterministic run
+# wants. It earns its place when a system spans processes.
+
+exports_files([
+    "probe.clk",
+    "probe_msgs.clk",
+])
+
+# The cog, through the stock upstream path. `cpp_cog` is what makes the
+# generated `_cc` library depend on a consumer-supplied `:probe_clk_cc_impl`
+# defining `execute_cog` for the dial; `cpp_exe` synthesizes the process
+# executable, whose name is derived from the file stem and is therefore the name
+# `probe.clk`'s `Process(executable=...)` spells.
+#
+# `offline_main` rather than the online main: it carries the deterministic
+# runner, which is what the scenario test drives the process under.
+clk(
+    name = "probe_clk",
+    srcs = ["probe.clk"],
+    outs = [
+        "probe_clk_cc.cc",
+        "probe_clk_cc.hh",
+        "probe_clk_cc.inl",
+        "probe_clk_cc_dial.cc",
+        "probe_clk_cc_dial.hh",
+        "probe_clk_cc_dial.inl",
+        "probe_clk_cc_test.cc",
+        "probe_clk_cc_test.hh",
+        "probe_clk_cc_test.inl",
+        "probe_clk_exe.cc",
+        "probe_clk_exe.hh",
+        "probe_clk_exe.inl",
+    ],
+    cpp_deps = [
+        ":probe_msgs_clk_cc",
+        "@clockwork//clockwork/io:var_packet_clk_cc",
+    ],
+    cpp_exe_deps = ["@clockwork//clockwork/scaffolding:offline_main"],
+    generate = [
+        "cpp",
+        "cpp_cog",
+        "cpp_exe",
+        "cpp_test_cog",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":probe_msgs_clk",
+        "@clockwork//clockwork/io:var_packet_clk",
+    ],
+)
+
+# The generated C++ shim. The name is not ours to pick: `cpp_cog` makes the
+# generated `_cc` library depend on `:<clk target>_cc_impl`.
+cc_library(
+    name = "probe_clk_cc_impl",
+    srcs = ["probe_clk_cc_impl.cc"],
+    deps = [
+        ":probe_clk_cc_dial",
+        ":probe_clk_rs_entry",
+        "@clockwork//clockwork/dial:msg_input",
+        "@clockwork//clockwork/pinion:publishable",
+        "@clockwork//jewels/container:circular_buffer",
+    ],
+)
+
+# The Rust side of the cog module: the dial crate, the entry-point archive, and
+# the C++ shim the `cc_library` above compiles. `test_wrappers` adds the testonly
+# crate the unit test drives.
+rust_clk_module(
+    name = "probe_clk_rs",
+    src = "probe.clk",
+    cog_impl = ":probe_cogs",
+    imports = [
+        "probe_msgs.clk",
+        "@clockwork//clockwork/io:var_packet.clk",
+    ],
+    test_wrappers = True,
+    deps = [
+        ":probe_msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+    ],
+)
+
+# The cog under upstream's own unit-test harness, driven from Rust.
+rust_test(
+    name = "probe_cog_test",
+    size = "small",
+    srcs = ["probe_cog_test.rs"],
+    edition = "2024",
+    deps = [
+        ":probe_clk_rs_test",
+        ":probe_msgs_clk_rs",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The cog body, hand-written. The only file in this package an author of a cog
+# writes.
+rust_library(
+    name = "probe_cogs",
+    srcs = ["probe_cogs.rs"],
+    edition = "2024",
+    deps = [
+        ":probe_clk_rs",
+        ":probe_msgs_clk_rs",
+        ":probe_scenario",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The messages, compiled for C++ by the stock upstream path.
+clk(
+    name = "probe_msgs_clk",
+    srcs = ["probe_msgs.clk"],
+    outs = [
+        "probe_msgs_clk_cc.cc",
+        "probe_msgs_clk_cc.hh",
+        "probe_msgs_clk_cc.inl",
+    ],
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+)
+
+# The same messages, for Rust. No `cog_impl`: the module declares no cogs, so
+# the generator writes only the message crate for it.
+rust_clk_module(
+    name = "probe_msgs_clk_rs",
+    src = "probe_msgs.clk",
+)
+
+# The scenario: what the probe, the author and the checker agree on. No log
+# crate here -- the cog body depends on this too, and no cog may link the log
+# crate.
+rust_library(
+    name = "probe_scenario",
+    srcs = ["probe_scenario.rs"],
+    edition = "2024",
+    deps = [
+        ":probe_msgs_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# Phase one: the input log. A plain binary linking generated schema types
+# outside a cog, which is how every scenario in the motion slice is authored.
+rust_binary(
+    name = "probe_scenario_author",
+    srcs = ["probe_scenario_author.rs"],
+    edition = "2024",
+    deps = [
+        ":probe_msgs_clk_rs",
+        ":probe_scenario",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# Phase three: the assertions, over the output log. It links the wire codec
+# rather than reimplementing it, so the datagrams are checked by the same code
+# that produced them -- what is under test here is the carrier and the log, not
+# the encoding, which `reachy-wire`'s own suite and its golden vectors own.
+rust_binary(
+    name = "probe_scenario_checker",
+    srcs = ["probe_scenario_checker.rs"],
+    edition = "2024",
+    deps = [
+        ":probe_msgs_clk_rs",
+        ":probe_scenario",
+        "//cogs:log_read",
+        "//cogs/upstream:var_packet_clk_rs",
+        "//crates/reachy-wire:reachy_wire",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The three phases in order, through the driver every scenario in this repo
+# runs -- so a break in that driver shows up here rather than in a motion
+# scenario, where it would look like a motion bug. Each phase is a design proof
+# point of its own: the input log is written by the Rust writer and consumed by
+# upstream's C++ log publisher, and the output log is written by upstream's C++
+# logger and read by the Rust reader, neither of which is demonstrated anywhere
+# upstream. Simulated time throughout, so the run is a fraction of a second of
+# this machine's clock whatever its load.
+sh_test(
+    name = "probe_scenario_test",
+    size = "small",
+    srcs = ["//cogs:scenario_test.sh"],
+    args = [
+        "probe_scenario",
+        "$(rootpath :probe_scenario_author)",
+        "$(rootpath :probe_clk_exe)",
+        "$(rootpath :brenn_reachy.cogs.proof.probe_system.probe_sim.proc.tachyon)",
+        "$(rootpath :probe_system.probe_sim.ProbeCpu_channel_publisher_config.tachyon)",
+        "$(rootpath :probe_system.probe_sim.ProbeCpu_event_logger_config.tachyon)",
+        "$(rootpath :probe_scenario_checker)",
+    ],
+    data = [
+        ":brenn_reachy.cogs.proof.probe_system.probe_sim.proc.tachyon",
+        ":probe_clk_exe",
+        ":probe_scenario_author",
+        ":probe_scenario_checker",
+        ":probe_system.probe_sim.ProbeCpu_channel_publisher_config.tachyon",
+        ":probe_system.probe_sim.ProbeCpu_event_logger_config.tachyon",
+    ],
+)
+
+clk(
+    name = "probe_system_clk",
+    srcs = ["probe_system.clk"],
+    outs = [
+        "brenn_reachy.cogs.proof.probe_system.probe_sim.proc.tachyon",
+        "probe_system.probe_sim.ProbeCpu_channel_allocations.csv",
+        "probe_system.probe_sim.ProbeCpu_channel_publisher_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_channel_spy_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_event_logger_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_metrics_channel_metadata_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_signal_metadata_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_simplelaunch_config.textproto",
+        "probe_system.probe_sim.ProbeCpu_telemetry_logger_config.tachyon",
+        "probe_system.probe_sim.diagnostics_database_config.tachyon",
+        "probe_system.probe_sim.logged_channel_metadata.pbbin",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":probe_clk",
+        "@clockwork//clockwork/logging:channel_policy_clk",
+    ],
+)
+
+merge_simplelaunch_config(
+    name = "probecpu.textproto",
+    srcs = [
+        "probe_system.probe_sim.ProbeCpu_simplelaunch_config.textproto",
+        "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
+    ],
+    data = [
+        "brenn_reachy.cogs.proof.probe_system.probe_sim.proc.tachyon",
+        "probe_system.probe_sim.ProbeCpu_channel_allocations.csv",
+        "probe_system.probe_sim.ProbeCpu_channel_publisher_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_channel_spy_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_event_logger_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_metrics_channel_metadata_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_signal_metadata_config.tachyon",
+        "probe_system.probe_sim.ProbeCpu_telemetry_logger_config.tachyon",
+        "probe_system.probe_sim.diagnostics_database_config.tachyon",
+        ":probe_clk_exe",
+        "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+)

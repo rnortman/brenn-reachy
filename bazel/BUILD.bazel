@@ -1,0 +1,26 @@
+# Bazel plumbing for this repo: the included module segment lives here, and
+# `include()` resolves it as a label, so this directory has to be a package.
+
+exports_files(["clockwork_overrides.MODULE.bazel"])
+
+# The framework's own `.clk` modules, for every compile the cog generator runs
+# over a cog-bearing module. The compiler injects imports of its telemetry
+# modules into any cog with metrics enabled, which is the default, so a compile
+# that cannot resolve them fails inside the upstream importer with a
+# module-not-found naming the file.
+#
+# Copied from rusty-cogs' filegroup of the same name at rev 4e8f8e8, for the
+# same reason `rust_clk.bzl` is copied: the macro names this label in the module
+# being compiled, so it has to be a target here. It ends when the macro takes
+# the label as a parameter.
+# TODO(rusty-cogs-macro-parameters)
+filegroup(
+    name = "framework_clk_imports",
+    srcs = [
+        "@clockwork//clockwork/dsl/cog:common_cog_event_metrics.clk",
+        "@clockwork//clockwork/dsl/cog:common_cog_telemetry_metrics.clk",
+        "@clockwork//clockwork/dsl/cog:ten_nanosecond.clk",
+        "@clockwork//std:signals.clk",
+    ],
+    visibility = ["//visibility:public"],
+)

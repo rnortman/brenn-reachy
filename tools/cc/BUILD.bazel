@@ -1,0 +1,17 @@
+# The one label the upstream drop asks the *root* module to supply.
+#
+# Every C++ binary the drop's rules build goes through its own `cc_binary`
+# wrapper, which appends a stack-trace handler to the link. That handler is named
+# with a root-module label rather than a repo-qualified one, so when the drop is
+# a dependency the label points here, at whatever repository is building. A
+# consumer that does not define it cannot link any binary the drop's rules
+# produce -- including the process executable a `cpp_exe` module generates.
+#
+# An alias rather than a copy: the implementation stays the drop's, pinned with
+# the drop, and this package exists only so the label resolves. Nothing else
+# belongs in it.
+alias(
+    name = "stacktrace",
+    actual = "@clockwork//tools/cc:stacktrace",
+    visibility = ["//visibility:public"],
+)
