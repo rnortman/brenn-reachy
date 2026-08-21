@@ -42,6 +42,21 @@
 //! whole surface is exercisable against a scripted machine with no device in
 //! sight. What a command prints goes out through a callback for the same
 //! reason.
+//!
+//! Not in the build: this file is part of the bench's retired motion layer, kept
+//! on disk as the record of how this machine was driven -- the call order, the
+//! settle policy, the fault responses. It no longer compiles, and it will not
+//! against any version of the crates it names: the types it imports have since
+//! been deleted. Read it as prose about what the bench did, never as code to
+//! revive.
+//! TODO(bench-motion-delete)
+//!
+//! Four items here have live twins in `bare.rs`: `provision`, `reboot`,
+//! `reboot_targets` and the register-reading helpers beneath them, plus the
+//! torque-off sweep that `off` became. The copies here may differ from the live
+//! ones; read `bare.rs` for what the machine does today. What exists only here
+//! is the commanding half -- the arm/up/hold/stow/yaw/antenna/demo/play bodies
+//! and the supervised `off` that drove the disarm sequence.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -51,12 +66,13 @@ use dxl_proto::{HardwareError, counts_to_rad};
 use reachy_bus::{
     Bus, BusPort, BusTiming, MapError, ServoMap, XactError, reg_for, value_kind, with_retry,
 };
-use reachy_clips::{ClipPlayer, Motion, OverlaySample, compose};
+use reachy_clips::{ClipPlayer, Motion, MotionPlayer, OverlaySample, compose};
 use reachy_motion::{
     CommissionSequencer, DisarmSequencer, DisarmSummary, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
-    EngageSequencer, Entry, Fault, FaultTimeline, JointGroup, JointId, JointSet, JointTargets,
-    Maneuver, MotionCommand, MotionState, MoveDurations, Outcome, PollCadence, PollSequencer,
-    Posture, RegId, RegValue, Trajectory, ValueKind, Warp, plan_move,
+    EngageSequencer, Entry, Evidence, Fault, FaultTimeline, JointGroup, JointId, JointSet,
+    JointTargets, Maneuver, MotionCommand, MotionState, MoveDurations, Outcome, PollCadence,
+    PollSequencer, Posture, RegId, RegValue, StowEnding, Trajectory, ValueKind, Warp, WindDown,
+    WindDownAction, WindDownOutcome, plan_move, within,
 };
 
 use crate::config::Resolved;
@@ -1146,11 +1162,10 @@ fn settle<T, P: BusPort>(
             line(&format!("fault: {error}"));
             // Nothing has been spent on a maneuver yet: this ending arrived
             // straight out of the move, so the whole of one stow is left.
-            let deadline = clock.now().saturating_add(engaged.stow_budget());
+            let maneuver = WindDown::begin(class, clock.now(), engaged.stow_budget());
             // Nothing here answers from a value: this command reports the run in
             // prose, and the stow's events are printed with the rest of it.
-            let (timeline, disposition) =
-                wind_down(engaged, class, deadline, clock, line, &mut |_| {});
+            let (timeline, disposition) = wind_down(engaged, maneuver, clock, line, &mut |_| {});
             report_disposition(disposition, line);
             report_incident(&timeline, line);
         }
@@ -1183,11 +1198,12 @@ fn settle<T, P: BusPort>(
 /// a wind-down the machine defeats, or one whose clock runs out, falls through
 /// to the immediate release. Every path through here ends with torque off.
 ///
-/// `deadline` is when that one clock is spent, on `clock`'s own scale. Taken
-/// rather than opened here, because a caller that has already commanded part of
-/// the maneuver itself — a host that stowed under control and had the stow
-/// defeated — is continuing the same maneuver and gets its remainder.
-/// [`Engaged::stow_budget`] is what a caller starting from nothing adds to now.
+/// `maneuver` carries the ending being answered and the one clock, opened by
+/// the caller rather than here: a caller that has already commanded part of the
+/// maneuver itself — a host that stowed under control and had the stow
+/// defeated — is continuing the same maneuver and resumes it on its remainder.
+/// [`WindDown::begin`] over [`Engaged::stow_budget`] is what a caller starting
+/// from nothing opens.
 ///
 /// The disposition is the sticky maximum: a head servo dropping out latches,
 /// so a wind-down that started for a grabbed head and lost a servo on the way
@@ -1204,8 +1220,7 @@ fn settle<T, P: BusPort>(
 /// surfaces answer from that cannot read it out of prose.
 pub fn wind_down<P: BusPort>(
     mut engaged: Engaged<'_, '_, P>,
-    class: ErrorClass,
-    deadline: Duration,
+    mut maneuver: WindDown,
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
     event: &mut dyn FnMut(TickEvent),
@@ -1215,53 +1230,72 @@ pub fn wind_down<P: BusPort>(
     // grabbed head masked nothing, so the stow it takes starts here. Which
     // maneuver that is belongs to the class, not to this caller.
     if engaged.timeline().open_maneuver().is_none()
-        && let Some(maneuver) = class.maneuver()
+        && let Some(opened) = maneuver.class().maneuver()
     {
-        engaged.record_response(maneuver, Outcome::Started, clock.now());
+        engaged.record_response(opened, Outcome::Started, clock.now());
     }
-    let mut disposition = class.disposition();
-    let closing = loop {
-        if engaged.head_released() {
-            // Not a stow: there is nothing left to drive one with. The
-            // maneuver is over all the same — the mask growing to cover the
-            // head is the torque-off it was walking towards — but nothing put
-            // the head down and nothing measured where it came to rest, so the
-            // record says as much. Saying the head came down under control
-            // when every joint that carries it has gone limp is the one claim
-            // this record must not make, in the printed line or in the entry.
-            line("  no head joint is still commanded; releasing torque now");
-            break Outcome::Unconfirmed;
-        }
-        let left = deadline.saturating_sub(clock.now());
-        if left.is_zero() {
-            line("  the stow clock is spent; releasing torque now");
-            break Outcome::FellThrough;
-        }
-        line("  stowing under control on what still commands");
-        match engaged.move_events(stow_pose_targets(), within(stow, left), clock, line, event) {
-            Ok(_) => {
-                line("  stowed; releasing torque");
-                break Outcome::Completed;
-            }
-            Err(error) => match error.fault(Phase::UnderTorque) {
-                // The mask grew. Nothing about the maneuver changes but which
-                // servos carry the head the rest of the way down.
-                Some(fault @ Fault::HeadServoFault { .. }) => {
-                    line(&format!("  {fault}; the stow carries on without it"));
-                    disposition = Disposition::Park;
-                }
-                _ => {
-                    line(&format!("  the stow did not finish: {error}"));
-                    // A condition the tick never raised reaches the record here
-                    // or nowhere: this ending is consumed inside the maneuver
-                    // rather than handed back to the caller that records the
-                    // others.
-                    if let Some(fault) = error.unrecorded_fault(Phase::UnderTorque) {
-                        engaged.record_fault(fault, clock.now());
+    // Every decision from here is the core's: the clock it was handed, what a
+    // servo dropping out does to the answer, and where the machine is left.
+    // What is left here is the doing and the telling.
+    let mut evidence = Evidence::nothing();
+    let (closing, disposition) = loop {
+        evidence.head_released = engaged.head_released();
+        let stow_ended = evidence.stow;
+        match maneuver.next(clock.now(), evidence) {
+            WindDownAction::Conclude {
+                outcome,
+                disposition,
+            } => {
+                match outcome {
+                    WindDownOutcome::Completed => line("  stowed; releasing torque"),
+                    // Saying the head came down under control when every joint
+                    // that carries it has gone limp is the one claim this record
+                    // must not make, in the printed line or in the entry.
+                    WindDownOutcome::Unconfirmed => {
+                        line("  no head joint is still commanded; releasing torque now");
                     }
-                    break Outcome::FellThrough;
+                    // A stow the machine defeated printed why as it ended, so
+                    // the only fall-through left to announce is the clock.
+                    WindDownOutcome::FellThrough => {
+                        if !matches!(stow_ended, Some(StowEnding::Defeated)) {
+                            line("  the stow clock is spent; releasing torque now");
+                        }
+                    }
                 }
-            },
+                break (outcome.recorded(), disposition);
+            }
+            WindDownAction::CommandStow { remaining } => {
+                line("  stowing under control on what still commands");
+                evidence.stow = Some(
+                    match engaged.move_events(
+                        stow_pose_targets(),
+                        within(stow, remaining),
+                        clock,
+                        line,
+                        event,
+                    ) {
+                        Ok(_) => StowEnding::Stowed,
+                        Err(error) => match error.fault(Phase::UnderTorque) {
+                            Some(fault @ Fault::HeadServoFault { .. }) => {
+                                line(&format!("  {fault}; the stow carries on without it"));
+                                StowEnding::MaskGrew(fault)
+                            }
+                            _ => {
+                                line(&format!("  the stow did not finish: {error}"));
+                                // A condition the tick never raised reaches the
+                                // record here or nowhere: this ending is
+                                // consumed inside the maneuver rather than
+                                // handed back to the caller that records the
+                                // others.
+                                if let Some(fault) = error.unrecorded_fault(Phase::UnderTorque) {
+                                    engaged.record_fault(fault, clock.now());
+                                }
+                                StowEnding::Defeated
+                            }
+                        },
+                    },
+                );
+            }
         }
     };
     // Only if the maneuver is still open; a closed one was already recorded
@@ -1272,20 +1306,6 @@ pub fn wind_down<P: BusPort>(
     let (timeline, released) = engaged.conclude(clock, line);
     report_release(&released, line);
     (timeline, disposition)
-}
-
-/// The same move clocks, with nothing over `left` on any of them.
-///
-/// What a re-commanded stow is asked for: the maneuver's clock is the one it
-/// started with, so an expansion gets the remainder of it rather than a fresh
-/// one. A remainder shorter than the move can be run in is floored by the
-/// guard, as any other under-clocked move is, and the deadline catches the
-/// overrun on the next pass.
-fn within(durations: MoveDurations, left: Duration) -> MoveDurations {
-    MoveDurations {
-        head: durations.head.min(left),
-        antennas: durations.antennas.map(|antenna| antenna.min(left)),
-    }
 }
 
 /// What the machine is left waiting for.
@@ -1977,7 +1997,7 @@ struct Layered {
     starts_at: Duration,
     period: Duration,
     elapsed: Duration,
-    player: Option<ClipPlayer>,
+    player: Option<MotionPlayer>,
     /// Whether the overlay has played out and faded to nothing.
     spent: bool,
 }
@@ -5339,15 +5359,10 @@ mod tests {
                         .longest()
                         .saturating_add(cfg.settle.timeout)
                 );
-                let spent = clock.now();
-                let (_, disposition) = wind_down(
-                    engaged,
-                    ErrorClass::MaskedSlowStowToPark,
-                    spent,
-                    clock,
-                    line,
-                    &mut |_| {},
-                );
+                // A clock the caller has already spent, resumed rather than
+                // opened: the remainder is nothing.
+                let spent = WindDown::resume(ErrorClass::MaskedSlowStowToPark, clock.now());
+                let (_, disposition) = wind_down(engaged, spent, clock, line, &mut |_| {});
                 assert_eq!(disposition, Disposition::Park);
                 Ok(())
             },
@@ -5390,15 +5405,14 @@ mod tests {
             &cfg,
             machine_at(&datumed_config(), &stow_legs()),
             |engaged, _registers, clock, line| {
-                let deadline = clock.now().saturating_add(engaged.stow_budget());
-                let (_, disposition) = wind_down(
-                    engaged,
+                let maneuver = WindDown::begin(
                     ErrorClass::SlowStowToRest,
-                    deadline,
-                    clock,
-                    line,
-                    &mut |event| events.borrow_mut().push(event),
+                    clock.now(),
+                    engaged.stow_budget(),
                 );
+                let (_, disposition) = wind_down(engaged, maneuver, clock, line, &mut |event| {
+                    events.borrow_mut().push(event)
+                });
                 assert_eq!(disposition, Disposition::Rest);
                 Ok(())
             },

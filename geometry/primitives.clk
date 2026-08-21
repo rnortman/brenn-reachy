@@ -1,0 +1,50 @@
+// The mathematical carriage types: a point in space and a rotation.
+//
+// The one package in this tree whose name is not a component's, because these
+// two have no single producer -- a head pose is written by the tick, read by the
+// mover, sampled by the driver half, and none of them owns the abstraction. The
+// package name says exactly what may live here: mathematics with no opinion
+// about the machine. Anything that names a servo, a register or a phase belongs
+// to whichever component writes it.
+//
+// Units are the ones `reachy-kin` and `reachy-motion` work in -- metres in the
+// body frame, radians about the model datum -- so nothing here converts.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::geometry)]
+
+// A point in three dimensions, metres.
+schema Vec3
+{
+    uuid: aa3bfd75-bc00-4a5e-819d-23ed7b0608b7;
+    fields
+    {
+        // Forward.
+        #0 x: Float64;
+        // Left.
+        #1 y: Float64;
+        // Up.
+        #2 z: Float64;
+    }
+}
+
+// A rotation as a unit quaternion, scalar first.
+//
+// Scalar first because that is the order `nalgebra`'s `UnitQuaternion` names
+// its parts in and the order every conversion in this repo writes; the storage
+// order it uses internally is its own business.
+schema Quat
+{
+    uuid: 47c30364-235c-49b9-b463-47c2fb76e3c7;
+    fields
+    {
+        // The scalar part.
+        #0 w: Float64;
+        // The vector part, about the forward axis.
+        #1 x: Float64;
+        // The vector part, about the left axis.
+        #2 y: Float64;
+        // The vector part, about the up axis.
+        #3 z: Float64;
+    }
+}

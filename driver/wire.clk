@@ -1,0 +1,47 @@
+// The datagram header: what sits in front of a schema's bytes on a socket.
+//
+// A datagram this machine sends is a schema's own blob bytes -- fixed size,
+// little-endian, laid out by the generator -- with this header in front. Only
+// the socket edge needs it: a Clockwork channel carries the schema itself and
+// names its type in the channel declaration, so nothing prefixes a header
+// there.
+//
+// What the payload is, is the socket's own business: one schema per socket, so
+// the header says nothing about which. What it does say is the three things a
+// receiver cannot work out from the bytes -- that this is one of ours, which
+// layout revision wrote it, and where it sits in the sender's stream.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+// The header in front of every datagram.
+schema DatagramHeader
+{
+    uuid: 6cf1d1cb-97fd-4c4a-96a9-6e2eee1e3e1d;
+    fields
+    {
+        // A fixed discriminator: `0x5257`, the ASCII of `RW`, which lands as
+        // the bytes `WR` and so is legible in a hex dump. What a datagram from
+        // something else on the same port fails on, before any field of it is
+        // read as a number.
+        //
+        // Not at the front of the datagram: the generator lays fields out by
+        // alignment rather than in declaration order, so `seq` takes the first
+        // four bytes and this sits at offset 4. A receiver reads the field
+        // where the layout puts it -- which the golden vectors pin -- and never
+        // the leading bytes of the buffer.
+        #0 magic: UInt16;
+
+        // The layout revision the sender wrote. A receiver that does not speak
+        // it drops the datagram whole rather than reading fields it may have
+        // moved: a version it can count, where a silently misread field is one
+        // it cannot.
+        #1 version: UInt8;
+
+        // Where this datagram sits in the sender's stream, counting up from the
+        // first one it sent. What a receiver measures loss and reordering with;
+        // it wraps, and a receiver compares wrapped differences rather than
+        // magnitudes.
+        #2 seq: UInt32;
+    }
+}

@@ -1,0 +1,25 @@
+# Apache-2.0. The schemas `reachy-clips` writes: one playing overlay's state,
+# and the carriage records it is written in.
+#
+# A `.clk` module lives in a package named for the component that writes or
+# publishes its types, and consumers import from there -- which is why this
+# package is `clips/` and not the cog that happens to carry the row. The
+# directory is not `crates/reachy-clips/` because a module's `use` path and
+# generated crate name are its path from the repo root verbatim, and a hyphen is
+# legal in neither.
+#
+# One module per subject, because visibility is recompilation. The player is one
+# subject: its state and the three records that state is spelled in change
+# together, and no consumer takes one without taking the player.
+#
+# Nothing here depends on anything but `clockwork_rs` and sibling schema
+# modules. No cogs, no runtime, no I/O.
+
+load("//bazel:clk_schema.bzl", "clk_schema_module")
+
+# The import lists are transitive and minimal: a module names every module
+# reachable from it, and no more.
+clk_schema_module(
+    name = "player",
+    imports = ["//geometry:primitives"],
+)

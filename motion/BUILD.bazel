@@ -1,0 +1,131 @@
+# Apache-2.0. The schemas `reachy-motion` writes: the servos it names, the task
+# space it plans in, and the transactions its sequencers ask the bus for.
+#
+# A `.clk` module lives in a package named for the component that writes or
+# publishes its types, and consumers import from there -- which is why this
+# package is `motion/` and not a central bucket. The directory is not
+# `crates/reachy-motion/` because a module's `use` path and generated crate name
+# are its path from the repo root verbatim, and a hyphen is legal in neither.
+#
+# One module per type or per tightly coupled set, because visibility is
+# recompilation: naming a servo must not be a reason to rebuild when a pose
+# changes. That is the only rule deciding where the knife cuts; a module growing
+# a second unrelated subject is split rather than extended.
+#
+# Nothing here depends on anything but `clockwork_rs` and sibling schema
+# modules. No cogs, no runtime, no I/O.
+
+load("//bazel:clk_schema.bzl", "clk_schema_module")
+
+# The import lists are transitive and minimal: a module names every module
+# reachable from it, and no more.
+clk_schema_module(name = "joints")
+
+clk_schema_module(name = "fk")
+
+clk_schema_module(
+    name = "faults",
+    imports = ["joints"],
+)
+
+clk_schema_module(name = "reports")
+
+clk_schema_module(
+    name = "timeline",
+    imports = [
+        "faults",
+        "joints",
+        "reports",
+    ],
+)
+
+clk_schema_module(
+    name = "targets",
+    imports = ["//geometry:primitives"],
+)
+
+clk_schema_module(
+    name = "bus_txn",
+    imports = ["//hardware/dynamixel:registers"],
+)
+
+clk_schema_module(
+    name = "servo_health",
+    imports = ["joints"],
+)
+
+clk_schema_module(
+    name = "arm_record",
+    imports = [
+        "joints",
+        "//geometry:primitives",
+    ],
+)
+
+clk_schema_module(
+    name = "seq",
+    imports = [
+        "joints",
+        "fk",
+        "//hardware/dynamixel:registers",
+    ],
+)
+
+clk_schema_module(
+    name = "commission",
+    imports = [
+        "bus_txn",
+        "joints",
+        "seq",
+        "servo_health",
+        "fk",
+        "//hardware/dynamixel:registers",
+    ],
+)
+
+clk_schema_module(
+    name = "poll",
+    imports = [
+        "bus_txn",
+        "joints",
+        "seq",
+        "servo_health",
+        "fk",
+        "//hardware/dynamixel:registers",
+    ],
+)
+
+clk_schema_module(
+    name = "engage",
+    imports = [
+        "arm_record",
+        "bus_txn",
+        "joints",
+        "seq",
+        "fk",
+        "//geometry:primitives",
+        "//hardware/dynamixel:registers",
+    ],
+)
+
+clk_schema_module(
+    name = "tick_state",
+    imports = [
+        "faults",
+        "fk",
+        "joints",
+        "targets",
+        "//geometry:primitives",
+    ],
+)
+
+clk_schema_module(
+    name = "disarm",
+    imports = [
+        "bus_txn",
+        "joints",
+        "seq",
+        "fk",
+        "//hardware/dynamixel:registers",
+    ],
+)

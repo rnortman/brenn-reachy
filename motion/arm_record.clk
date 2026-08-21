@@ -1,0 +1,99 @@
+// The record of an arming: where the platform was, and where pinning put it.
+//
+// Engage writes these and disarm reads them back, which is why they sit apart
+// from both sequencers' phase machines -- a release must not rebuild when an
+// engagement grows a phase. The pose fields are `geometry/primitives.clk`,
+// because a record of where the head was is mathematics the machine's
+// vocabulary has no opinion about.
+//
+// The per-leg collection below is named fields, never a positional array, for
+// the reason the joint vocabulary states: a crank misplaced in an array is a
+// silent swap of two legs.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use geometry::primitives;
+use motion::joints as joint_vocab;
+
+// One number per crank, in leg order. Margins or pull-ins, metres or radians --
+// what the numbers mean is the field that carries this, not this.
+//
+// Named fields rather than an array for the reason the head of this file
+// states. Only the six cranks appear: a leg is the only joint a pin moves and the
+// only one a toggle margin is measured at.
+schema Legs
+{
+    uuid: b5728088-6218-4600-a61f-b32ce41b160d;
+    fields
+    {
+        // The first crank.
+        #0 leg_0: Float64;
+        // The second crank.
+        #1 leg_1: Float64;
+        // The third crank.
+        #2 leg_2: Float64;
+        // The fourth crank.
+        #3 leg_3: Float64;
+        // The fifth crank.
+        #4 leg_4: Float64;
+        // The sixth crank.
+        #5 leg_5: Float64;
+    }
+}
+
+// A set of joint angles and the platform pose they hold, solved.
+//
+// The form a record lives in. `reachy_motion::ArmRecord` is the same numbers with
+// the pose as a solved isometry, which is what the kinematics speak. Two of these
+// bracket an engagement: where the poll found the platform resting, and where the
+// pins left it once torque was on. The margins are held rather than re-solved --
+// re-solving would be a second answer to a question already asked, and the seeds
+// it would need are not here.
+schema ArmRecordSnap
+{
+    uuid: 2ef88c89-9387-428d-9476-91411cee080c;
+    fields
+    {
+        // Whether this record exists at all. Every field below means nothing
+        // when this is false, which is what an engagement that has not finished
+        // holds in its armed record.
+        #0 present: Bool;
+
+        // The nine angles: measured, for the resting record; pinned, for the
+        // armed one. Radians.
+        #1 joints: joint_vocab::Joints;
+
+        // Where those crank angles put the head, in the body frame, metres.
+        #2 head_pos: primitives::Vec3;
+
+        // The head's orientation at that pose, in the body frame.
+        #3 head_quat: primitives::Quat;
+
+        // Per-leg toggle margins at that pose, metres.
+        #4 margins: Legs;
+
+        // The smallest of them, metres: the clearance a first move is measured
+        // against.
+        #5 min_margin: Float64;
+    }
+}
+
+// The goals an engagement pinned, and how far pinning moved each leg.
+//
+// The pull is recorded and never judged: a leg already inside its travel window
+// is pulled zero, which is the ordinary case on a machine somebody just let go
+// of.
+schema PinSnap
+{
+    uuid: 4920571f-0688-404c-9ab2-1651ba9b50cc;
+    fields
+    {
+        // The goals written: the measured angles, each leg brought inside its
+        // travel window. Radians.
+        #0 pinned: joint_vocab::Joints;
+
+        // Per leg, how far the pin moved it, radians.
+        #1 pull_in: Legs;
+    }
+}

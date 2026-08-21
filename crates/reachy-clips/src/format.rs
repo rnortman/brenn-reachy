@@ -215,7 +215,7 @@ impl ChannelMask {
 
     /// Add `channel`, reporting whether it was not already there.
     ///
-    /// The polarity is `JointSet::insert`'s, the workspace's other small set:
+    /// The polarity is that of the joint vocabulary's own set insertion:
     /// the return is what makes an entry an event, so a caller reading `if
     /// set.insert(x)` means the same thing whichever set it holds.
     pub fn insert(&mut self, channel: Channel) -> bool {
@@ -290,14 +290,14 @@ pub enum NameError {
 /// Check an asset name against the charset, the length bound, and the shape a
 /// relative path may take.
 ///
-/// Shared by clips and sequences: they live in one namespace, addressed by one
-/// wire field, so one rule. The path shape belongs to that rule rather than to
-/// each consumer, because a name *becomes* a path: the importer writes a clip
-/// and its audio sidecar under it, and a name a consumer joins onto a directory
-/// is the whole of what stops a downloaded, converted document from writing
-/// outside it. So a name is a relative path with no navigation in it — no
-/// leading slash, no empty segment, no `.` or `..` — and does not open with a
-/// `-`, which reads as an option wherever a name reaches a command line.
+/// Every asset lives in one namespace, addressed by one wire field, so one
+/// rule. The path shape belongs to that rule rather than to each consumer,
+/// because a name *becomes* a path: the importer writes a clip and its audio
+/// sidecar under it, and a name a consumer joins onto a directory is the whole
+/// of what stops a downloaded, converted document from writing outside it. So a
+/// name is a relative path with no navigation in it — no leading slash, no
+/// empty segment, no `.` or `..` — and does not open with a `-`, which reads as
+/// an option wherever a name reaches a command line.
 pub fn validate_name(name: &str) -> Result<(), NameError> {
     if name.is_empty() {
         return Err(NameError::Empty);
@@ -580,6 +580,55 @@ impl DeltaFrame {
         }
     }
 
+    /// The channels this frame drives.
+    ///
+    /// The inverse of [`DeltaFrame::zero`]'s argument: a frame carries a value
+    /// exactly where its mask names a channel.
+    #[must_use]
+    pub fn mask(&self) -> ChannelMask {
+        let mut mask = ChannelMask::empty();
+        if self.head.is_some() {
+            mask.insert(Channel::Head);
+        }
+        if self.antennas.is_some() {
+            mask.insert(Channel::Antennas);
+        }
+        if self.body_yaw.is_some() {
+            mask.insert(Channel::BodyYaw);
+        }
+        mask
+    }
+
+    /// Whether every number this frame carries is finite.
+    ///
+    /// Here beside the type rather than in a player, so a channel added to the
+    /// frame is added to the check with it.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        let head = self.head.is_none_or(|head| {
+            head.translation
+                .vector
+                .iter()
+                .all(|value| value.is_finite())
+                && head.rotation.coords.iter().all(|value| value.is_finite())
+        });
+        let antennas = self
+            .antennas
+            .is_none_or(|antennas| antennas.iter().all(|value| value.is_finite()));
+        head && antennas && self.body_yaw.is_none_or(f64::is_finite)
+    }
+
+    /// How far this frame's rotation is from unit length, or `None` where the
+    /// frame drives no head.
+    ///
+    /// A clip's frames are unit by construction; a frame from an unvalidated
+    /// source is checked against [`QUAT_NORM_TOL`] through this.
+    #[must_use]
+    pub fn rotation_norm_error(&self) -> Option<f64> {
+        self.head
+            .map(|head| (head.rotation.coords.norm() - 1.0).abs())
+    }
+
     /// The document form of this frame.
     fn to_doc(self) -> FrameDoc {
         let (dt, dq) = match self.head {
@@ -696,7 +745,7 @@ impl Clip {
                 version: doc.version,
             });
         }
-        if doc.kind != "clip" {
+        if doc.kind != CLIP_KIND {
             return Err(ClipError::WrongKind { kind: doc.kind });
         }
         validate_name(&doc.name).map_err(|source| ClipError::Name {
@@ -888,7 +937,7 @@ impl Clip {
         let writable = |ms: u32| (f64::from(ms) <= clip_ms).then_some(ms);
         ClipDoc {
             version: FORMAT_VERSION,
-            kind: "clip".to_owned(),
+            kind: CLIP_KIND.to_owned(),
             name: self.name.clone(),
             description: self.description.clone(),
             channels: self.mask.iter().collect(),
@@ -902,7 +951,8 @@ impl Clip {
 }
 
 /// A clip's own duration at 1.0x, milliseconds: one frame is one tick.
-fn clip_duration_ms(frames: usize) -> f64 {
+#[must_use]
+pub fn clip_duration_ms(frames: usize) -> f64 {
     frames as f64 * 1000.0 / FLOOR_TICK_HZ
 }
 
@@ -1075,15 +1125,22 @@ struct KindProbe {
     kind: String,
 }
 
+/// The `kind` a clip document declares.
+pub const CLIP_KIND: &str = "clip";
+
+/// The `kind` a sequence document declares.
+pub const SEQUENCE_KIND: &str = "sequence";
+
 /// Read a document's `kind` without committing to which asset it is.
 ///
-/// A library directory holds clips and sequences side by side, and the loader
-/// has to route a file to one reader or the other before either can parse it.
-/// Routing is the loader's own business, so this is crate-internal, and it
-/// carries the parser's account of an unreadable document rather than a
-/// [`ClipError`] — the document may not be a clip at all, and the reader it
-/// routes to is what refuses a malformed one.
-pub(crate) fn document_kind(json: &str) -> Result<String, String> {
+/// A library directory holds whatever files somebody put in it, and deciding
+/// which of them a clip reader is even offered happens before it can parse one.
+/// Every routing site must use this probe: a second opinion about which files
+/// are clips silently renumbers the library where ids are positions. Returns
+/// the parser's account of an unreadable document rather than a [`ClipError`]:
+/// the document may not be a clip at all, and the reader it routes to is what
+/// refuses a malformed one.
+pub fn document_kind(json: &str) -> Result<String, String> {
     serde_json::from_str::<KindProbe>(json)
         .map(|probe| probe.kind)
         .map_err(|err| err.to_string())
@@ -1098,7 +1155,7 @@ struct NameProbe {
 /// Read the name a document claims, without loading it.
 ///
 /// A name is how the whole stack addresses a motion — the wire carries names
-/// and a [`crate::Library`] is keyed by them — while a path is how an operator
+/// and a [`crate::library::Library`] is keyed by them — while a path is how an operator
 /// points at one file. This is the join between the two, for a caller holding a
 /// path and needing the name the library will have filed that document under.
 /// It validates nothing: what a name may be is the reader's business, and a
@@ -1168,6 +1225,85 @@ mod tests {
         // and then stretched to the floor its own delta derives.
         assert_eq!(clip.blend_in_ms(), 180);
         assert_eq!(clip.blend_out_ms(), 60);
+    }
+
+    /// The two whole-frame checks a consumer of an unvalidated source makes
+    /// before it hands frames to a player, over a frame that drives everything.
+    #[test]
+    fn a_frames_numbers_and_rotation_are_checked_whole() {
+        let mask = ChannelMask::of(Channel::Head)
+            .union(ChannelMask::of(Channel::Antennas))
+            .union(ChannelMask::of(Channel::BodyYaw));
+        let zero = DeltaFrame::zero(mask);
+        assert!(zero.is_finite());
+        assert_eq!(zero.rotation_norm_error(), Some(0.0));
+
+        for spoiled in [
+            DeltaFrame {
+                head: Some(Isometry3::from_parts(
+                    Translation3::new(0.0, f64::NAN, 0.0),
+                    UnitQuaternion::identity(),
+                )),
+                ..zero
+            },
+            DeltaFrame {
+                antennas: Some([0.0, f64::INFINITY]),
+                ..zero
+            },
+            DeltaFrame {
+                body_yaw: Some(f64::NAN),
+                ..zero
+            },
+            // A rotation coordinate, which is the one number here the norm check
+            // cannot catch: a NaN coordinate makes the norm NaN, and a NaN is not
+            // further from unit than the tolerance.
+            DeltaFrame {
+                head: Some(Isometry3::from_parts(
+                    Translation3::identity(),
+                    UnitQuaternion::new_unchecked(Quaternion::new(f64::NAN, 0.0, 0.0, 1.0)),
+                )),
+                ..zero
+            },
+            DeltaFrame {
+                head: Some(Isometry3::from_parts(
+                    Translation3::identity(),
+                    UnitQuaternion::new_unchecked(Quaternion::new(0.0, f64::INFINITY, 0.0, 1.0)),
+                )),
+                ..zero
+            },
+        ] {
+            assert!(!spoiled.is_finite(), "{spoiled:?}");
+        }
+
+        // Why the finiteness check has to run first: a non-finite coordinate
+        // leaves the norm error non-finite, so it is never *further* from unit
+        // than the tolerance and the rotation check lets it past.
+        let nan_rotation = DeltaFrame {
+            head: Some(Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::new_unchecked(Quaternion::new(f64::NAN, 0.0, 0.0, 1.0)),
+            )),
+            ..zero
+        };
+        let error = nan_rotation
+            .rotation_norm_error()
+            .expect("the frame drives the head");
+        assert!(error.is_nan());
+        assert_eq!(error.partial_cmp(&QUAT_NORM_TOL), None);
+
+        // A frame driving no head has no rotation to check.
+        assert_eq!(
+            DeltaFrame::zero(ChannelMask::of(Channel::BodyYaw)).rotation_norm_error(),
+            None
+        );
+        let scaled = DeltaFrame {
+            head: Some(Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::new_unchecked(Quaternion::new(1.5, 0.0, 0.0, 0.0)),
+            )),
+            ..zero
+        };
+        assert_eq!(scaled.rotation_norm_error(), Some(0.5));
     }
 
     #[test]

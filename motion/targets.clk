@@ -1,0 +1,38 @@
+// Task space: where the machine is asked to hold itself.
+//
+// Apart from the joint vocabulary on purpose. A pose is what the motion library
+// plans in and what the mover and the clip player compose; the six crank angles
+// are what inverse kinematics makes of it. Those are two consumer sets, so a
+// change to what a target is must not rebuild a fault consumer that only needed
+// to name a servo -- and nothing here names one.
+//
+// Positions are metres in the body frame, angles radians about the model datum.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use geometry::primitives;
+
+// Where the machine is asked to hold itself: the head's pose in the body frame,
+// the body's own yaw, and the two antennas.
+schema Targets
+{
+    uuid: 98528aeb-06d1-4176-b85e-78e959b97e2a;
+    fields
+    {
+        // Head position in the body frame, metres.
+        #0 head_pos: primitives::Vec3;
+
+        // Head orientation in the body frame.
+        #1 head_quat: primitives::Quat;
+
+        // Body yaw about the vertical, radians.
+        #2 body_yaw: Float64;
+
+        // Right antenna angle, absolute, radians.
+        #3 antenna_right: Float64;
+
+        // Left antenna angle, absolute, radians.
+        #4 antenna_left: Float64;
+    }
+}

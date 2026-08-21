@@ -31,6 +31,12 @@
 // states in full: the marker is a fact about how this system is built, not
 // about the machine, which carries one of each cog.
 // TODO(clockwork-single-instance-signal)
+//
+// Four modules are imported under aliases because the box or a cog carries a
+// member of the same name: the modelled driver's output slot is called `pose`,
+// the box's motion cog `mover`, and its two state slots `sim_state` and
+// `pose_state`. A member name shadows a module name in the enclosing scope,
+// which the compiler refuses as a redefinition.
 // (A comment may not sit directly above a `use`, which is why this one is
 // here.)
 
@@ -39,20 +45,25 @@
 
 use [cpp, proto, proto_conv] cogs::config;
 use cogs::motion;
-use cogs::msgs;
-use @clockwork::clockwork::io::var_packet;
+use cogs::mover as mover_vocab;
+use cogs::pose_state as pose_state_vocab;
+use cogs::sim_state as sim_state_vocab;
+use driver::goal;
+use driver::health;
+use driver::pose as pose_vocab;
 use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
     ReportGroupLogType};
 
 // What the driver did that the sample stream does not show: the edges. One
 // publisher -- the driver -- as every channel in this repo's systems has.
 //
-// Sized sixteen deep against a view of one, which is more slack than the rate
-// needs: events mark boundaries, not cycles, and a driver emitting one per
-// cycle is a driver reporting a standing condition at poll rate.
+// Nothing in this system reads it: an event is logged and a checker reads it
+// out of the log. Sized sixteen deep, which is more slack than the rate needs:
+// events mark boundaries, not cycles, and a driver emitting one per cycle is a
+// driver reporting a standing condition at poll rate.
 channel DriverEvt
 {
-    message_type: Tachyon<var_packet::VarPacket64>;
+    message_type: Tachyon<health::DriverEvent>;
     max_num_messages: 16;
 }
 
@@ -68,7 +79,7 @@ channel DriverEvt
 // operation per joint group per instant and room over.
 channel SimCmdChan
 {
-    message_type: Tachyon<msgs::SimCmd>;
+    message_type: Tachyon<sim_state_vocab::SimCmd>;
     max_num_messages: 16;
 }
 
@@ -114,7 +125,7 @@ cog MotorSim
     states
     {
         // The gate and the plant, and the run's totals.
-        sim: Tappy<msgs::SimState>
+        sim: Tappy<sim_state_vocab::SimState>
         {
             mutable: true;
         }
@@ -147,10 +158,10 @@ cog MotorSim
             multi_instance: true;
         }
 
-        // How many datagrams on the goal channel the codec refused. Distinct
-        // from a dropped goal: those bytes were not a setpoint at all, so they
-        // name no instant and no rows.
-        undecodable_goals: signal UInt64
+        // How many goals named a set of servos this build does not know.
+        // Distinct from a dropped goal: a setpoint whose rows cannot be read is
+        // not a setpoint at all, so nothing was queued for it.
+        refused_goals: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
@@ -165,8 +176,8 @@ cog MotorSim
             multi_instance: true;
         }
 
-        // How many times a field of this cog's own slot named servos this build
-        // does not know.
+        // How many times this cog's own state slot did not read back as a
+        // state.
         refused_state_fields: signal UInt64
         {
             post_aggregation: ["final_value"];
@@ -186,10 +197,10 @@ cog MotorSim
 
     inputs
     {
-        // The goal stream, sized to see every datagram rather than the latest
+        // The goal stream, sized to see every message rather than the latest
         // one: a goal that went unseen is a goal the machine was never asked
         // for, and the gate is what decides which of them is due.
-        goals: Tappy<var_packet::VarPacket128>
+        goals: Tappy<goal::GoalSetpoint>
         {
             max_msgs: 8;
         }
@@ -197,28 +208,22 @@ cog MotorSim
         // The scenario's injections. Sized to see all of a same-instant burst:
         // an injection outside this window is silently absent, where every
         // other injection this cog cannot carry out is counted.
-        cmds: Tappy<msgs::SimCmd>
+        cmds: Tappy<sim_state_vocab::SimCmd>
         {
             max_msgs: 8;
         }
 
         // This cog's own sample channel, at the default view of 1: the last
-        // sample it published, or an empty view before it ever has. The wire
-        // sequence number of the next one is read back from it rather than kept
-        // in a state field. Deliberately not a condition -- a cog woken by its
-        // own publication would never stop.
-        own_pose: Tappy<var_packet::VarPacket288>;
-
-        // This cog's own event channel, read back for the same reason. Events
-        // are sparse, so this view holds the last one however long ago it was
-        // sent, which is exactly what a sequence number needs.
-        own_evt: Tappy<var_packet::VarPacket64>;
+        // sample it published, or an empty view before it ever has. Read back
+        // rather than kept in a state field. Deliberately not a condition -- a
+        // cog woken by its own publication would never stop.
+        own_pose: Tappy<pose_vocab::PoseSample>;
     }
 
     outputs
     {
-        pose: Tappy<var_packet::VarPacket288>;
-        evt: Tappy<var_packet::VarPacket64>;
+        pose: Tappy<pose_vocab::PoseSample>;
+        evt: Tappy<health::DriverEvent>;
     }
 
     execution
@@ -271,13 +276,13 @@ box SimBox
 
     // Each cog's own slot, written by nothing else. No `init=`, so each is
     // default-constructed into a buffer the compiler synthesizes.
-    new sim_state: State(representation=Tachyon<msgs::SimState>);
+    new sim_state: State(representation=Tachyon<sim_state_vocab::SimState>);
     connect sim_state to motor_sim.sim;
 
-    new mover_state: State(representation=Tachyon<msgs::MoverState>);
+    new mover_state: State(representation=Tachyon<mover_vocab::MoverState>);
     connect mover_state to mover.ctrl;
 
-    new pose_state: State(representation=Tachyon<msgs::PoseState>);
+    new pose_state: State(representation=Tachyon<pose_state_vocab::PoseState>);
     connect pose_state to pose.est;
 
     // The two configs, read from checked-in protobuf text before the first
@@ -293,6 +298,14 @@ box SimBox
         path="cogs/mover_params.textproto");
     connect mover_params to mover.params;
 
+    // The clips an overlay can name. Emitted from the documents under
+    // `cogs/clips/` rather than authored, and read the same way the two
+    // parameter files are.
+    new clip_library: SerializedDataFile(
+        representation=Protobuf<config::ClipLibraryConfig>,
+        path="cogs/clip_library.textproto");
+    connect clip_library to mover.clips;
+
     // The sample stream: the driver publishes it, both control-rate cogs run on
     // it, and the driver reads its own last one back for the wire sequence
     // number.
@@ -307,16 +320,13 @@ box SimBox
     connect motion::DriverCmd to motor_sim.goals;
     connect motion::DriverCmd to mover.own_cmd;
 
-    // The driver's edges, read back by their own publisher for the same reason.
-    connect motor_sim.evt to DriverEvt;
-    connect DriverEvt to motor_sim.own_evt;
-
     // What the run is asked to do, and what the world does to it. Both come
     // from the input log.
     connect motion::ScheduleChan to mover.sched;
     connect SimCmdChan to motor_sim.cmds;
 
-    // Logged only: nothing in this system consumes either.
+    // Logged only: nothing in this system consumes any of the three.
+    connect motor_sim.evt to DriverEvt;
     connect mover.fault to motion::TickFaults;
     connect pose.estimate to motion::Estimates;
 }

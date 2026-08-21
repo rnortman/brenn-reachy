@@ -59,9 +59,18 @@ use reachy_kin::{
 };
 
 use crate::arm::{angle_at, confirm_write, placeable};
-use crate::joints::{JointId, JointVector, worst_joint};
+use crate::cells;
+use crate::joints::{self, JointRef, JointVector, ROW_COUNT, ROWS, flags, worst_joint};
+use crate::resume::{ResumeError, checked_cursor, no_phase, no_stray_field};
 use crate::seq::{
-    BusRequest, BusResult, RegId, RegValue, SeqAction, SeqError, SeqStep, Sequencer, StepContext,
+    BusResult, RegId, SeqAction, SeqError, SeqFailureKind, SeqStepKind, Sequencer, StepContext,
+};
+use crate::txn::{self, BusTxnWire};
+use crate::value;
+use crate::verdict;
+
+pub use brenn_reachy__motion__disarm_clk_rs::{
+    DisarmPhaseKind, DisarmSnap, DisarmSnapWire, ReleaseFormKind,
 };
 
 /// Where the antennas are stowed, right then left, radians.
@@ -106,7 +115,7 @@ pub fn stow_targets(geom: &HeadGeometry) -> Result<JointVector, IkError> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisarmConfig {
     /// The nine servo IDs, in bus order.
-    pub ids: [u8; JointId::COUNT],
+    pub ids: [u8; ROW_COUNT],
     /// The angles stow puts the machine at, which the measured joints are
     /// compared against.
     pub stow_targets: JointVector,
@@ -149,7 +158,7 @@ pub struct DisarmSummary {
     /// How far each joint was from its stow angle, in bus order, radians;
     /// circular on the antennas, linear elsewhere. Zero for a joint that was
     /// not measured.
-    pub deviation: [f64; JointId::COUNT],
+    pub deviation: [f64; ROW_COUNT],
     /// Why each joint's position read produced no angle, in bus order, and
     /// `None` where it produced one.
     ///
@@ -161,9 +170,9 @@ pub struct DisarmSummary {
     /// is what distinguishes that.
     ///
     /// [`form`]: DisarmSummary::form
-    pub unmeasured: [Option<SeqError>; JointId::COUNT],
+    pub unmeasured: [Option<SeqError>; ROW_COUNT],
     /// Whether each servo acknowledged its torque-off write.
-    pub released: [bool; JointId::COUNT],
+    pub released: [bool; ROW_COUNT],
     /// Whether every joint was measured and every one inside the tolerance.
     pub at_stow: bool,
 }
@@ -171,7 +180,7 @@ pub struct DisarmSummary {
 impl DisarmSummary {
     /// The joint furthest from its stow angle, and how far, radians.
     #[must_use]
-    pub fn worst_deviation(&self) -> (JointId, f64) {
+    pub fn worst_deviation(&self) -> (JointRef, f64) {
         worst_joint(&self.deviation)
     }
 
@@ -190,17 +199,17 @@ impl DisarmSummary {
     /// Whether every joint's position read landed.
     #[must_use]
     pub fn measured_all(&self) -> bool {
-        (0..JointId::COUNT).all(|row| self.measured(row))
+        (0..ROW_COUNT).all(|row| self.measured(row))
     }
 
     /// The joints a release looked at and could not read, each with why, in bus
     /// order. Empty for a release that did not look.
-    pub fn unreadable(&self) -> impl Iterator<Item = (JointId, SeqError)> + '_ {
+    pub fn unreadable(&self) -> impl Iterator<Item = (JointRef, SeqError)> + '_ {
         self.unmeasured
             .iter()
             .enumerate()
             .filter(move |_| self.looked())
-            .filter_map(|(row, cause)| cause.map(|cause| (JointId::ALL[row], cause)))
+            .filter_map(|(row, cause)| cause.map(|cause| (ROWS[row], cause)))
     }
 
     /// Whether all nine servos acknowledged their torque-off write.
@@ -213,12 +222,12 @@ impl DisarmSummary {
     ///
     /// These are the servos that may still be holding: the write was issued and
     /// retried by the bus, and nothing came back to say it landed.
-    pub fn unreleased(&self) -> impl Iterator<Item = JointId> + '_ {
+    pub fn unreleased(&self) -> impl Iterator<Item = JointRef> + '_ {
         self.released
             .iter()
             .enumerate()
             .filter(|(_, released)| !**released)
-            .map(|(row, _)| JointId::ALL[row])
+            .map(|(row, _)| ROWS[row])
     }
 }
 
@@ -236,10 +245,10 @@ impl DisarmSummary {
 /// an angle nobody can place is not evidence that the head is folded.
 #[must_use]
 pub fn at_stow(cfg: &DisarmConfig, present: &JointVector) -> bool {
-    (0..JointId::COUNT).all(|row| {
+    (0..ROW_COUNT).all(|row| {
         !outside_limit(
             deviation_from(
-                JointId::ALL[row],
+                ROWS[row],
                 angle_at(present, row),
                 angle_at(&cfg.stow_targets, row),
             ),
@@ -258,34 +267,58 @@ pub fn at_stow(cfg: &DisarmConfig, present: &JointVector) -> bool {
 /// body are bounded joints working far from the half turn, where the two agree
 /// and the linear form is the honest one: a leg reading a turn away from its
 /// target is a broken reading, not a joint at its target.
-fn deviation_from(joint: JointId, present: f64, target: f64) -> f64 {
+fn deviation_from(joint: JointRef, present: f64, target: f64) -> f64 {
     match joint {
-        JointId::AntennaRight | JointId::AntennaLeft => wrap_to_pi(present - target).abs(),
+        JointRef::AntennaRight | JointRef::AntennaLeft => wrap_to_pi(present - target).abs(),
         _ => (present - target).abs(),
     }
 }
 
-/// Which part of the sequence is running.
-///
-/// There is no failed phase: nothing in this sequence refuses, so the only way
-/// out is through the releases.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Phase {
-    Dwell { waiting: bool },
-    Verify { cursor: usize },
-    Release { cursor: usize },
-    Complete,
+/// How many servos a release phase's sweep walks, or `None` for the settle, the
+/// ending and the phase that names nothing, which have no cursor.
+fn disarm_sweep(phase: DisarmPhaseKind) -> Option<usize> {
+    match phase {
+        DisarmPhaseKind::Verify | DisarmPhaseKind::Release => Some(ROW_COUNT),
+        DisarmPhaseKind::None | DisarmPhaseKind::Dwell | DisarmPhaseKind::Complete => None,
+    }
 }
 
-impl Phase {
-    /// The phase name this part of the sequence is reported under.
-    fn step(self) -> SeqStep {
-        match self {
-            Self::Verify { .. } => SeqStep::VerifyAtStow,
-            Self::Dwell { .. } => SeqStep::Dwell,
-            Self::Release { .. } | Self::Complete => SeqStep::TorqueOff,
-        }
+/// The name a refusal about a release phase reads under.
+fn disarm_phase_name(phase: DisarmPhaseKind) -> &'static str {
+    match phase {
+        DisarmPhaseKind::None => "no",
+        DisarmPhaseKind::Dwell => "dwell",
+        DisarmPhaseKind::Verify => "verify",
+        DisarmPhaseKind::Release => "release",
+        DisarmPhaseKind::Complete => "complete",
     }
+}
+
+/// Which release the slot's form names.
+///
+/// Total, and the `none` a slot nothing wrote holds answers the immediate form:
+/// [`DisarmSequencer::resume`] refuses that slot, and of the two answers the one
+/// claiming nothing was looked at is the one that cannot overstate what a release
+/// measured.
+fn release_form(form: ReleaseFormKind) -> ReleaseForm {
+    match form {
+        ReleaseFormKind::Orderly => ReleaseForm::Orderly,
+        ReleaseFormKind::Immediate | ReleaseFormKind::None => ReleaseForm::Immediate,
+    }
+}
+
+/// Whether any joint carries a filed verdict for a position read that produced
+/// no angle.
+///
+/// The filed kinds only, and free of the sequencer, because both a running
+/// release and a restore of one ask it: a row is filed or it is not, and
+/// decoding the evidence to answer that would make the answer depend on whether
+/// this build can read the evidence.
+fn any_verdict_filed(unmeasured: &cells::SeqFailures) -> bool {
+    ROWS.iter().any(|joint| {
+        cells::failure_row(unmeasured, *joint)
+            .is_some_and(|filed| filed.kind != SeqFailureKind::None)
+    })
 }
 
 /// Disarming, as a state machine that touches no port.
@@ -295,23 +328,28 @@ impl Phase {
 /// each release read back. The order is what makes the measurement mean
 /// something — it describes where the head was at the moment torque left it —
 /// and it lives here, testable against scripted replies.
-pub struct DisarmSequencer {
-    cfg: DisarmConfig,
-    form: ReleaseForm,
-    phase: Phase,
-    pending: Option<BusRequest>,
-    present: JointVector,
-    deviation: [f64; JointId::COUNT],
-    unmeasured: [Option<SeqError>; JointId::COUNT],
-    released: [bool; JointId::COUNT],
-    at_stow: bool,
+///
+/// The state between two transactions is the slot the host hands over and
+/// nothing else: the phase, the cursor, the measurements and the nine verdicts
+/// are the schema's own fields, written through the validated view.
+pub struct DisarmSequencer<'a> {
+    cfg: &'a DisarmConfig,
+    state: &'a mut DisarmSnap,
 }
 
-impl DisarmSequencer {
-    /// A sequence ready to run against `cfg`: settle, measure, release.
-    #[must_use]
-    pub fn new(cfg: &DisarmConfig) -> Self {
-        Self::from(cfg, ReleaseForm::Orderly, Phase::Dwell { waiting: true })
+impl<'a> DisarmSequencer<'a> {
+    /// A sequence ready to run against `cfg`, in `slot`: settle, measure,
+    /// release.
+    ///
+    /// The slot is cleared to the schema's declared initial state, so a slot an
+    /// earlier release left its measurements in describes this one and nothing
+    /// else.
+    pub fn start(cfg: &'a DisarmConfig, slot: &'a mut DisarmSnapWire) -> Self {
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Dwell;
+        state.dwell_waiting = true.into();
+        Self { cfg, state }
     }
 
     /// A sequence that writes the nine releases and nothing else.
@@ -322,73 +360,200 @@ impl DisarmSequencer {
     /// still be believed. The summary reports every joint unmeasured and
     /// `at_stow` false — not a verdict about where the head is, a statement
     /// that nobody looked.
-    #[must_use]
-    pub fn immediate(cfg: &DisarmConfig) -> Self {
-        Self::from(cfg, ReleaseForm::Immediate, Phase::Release { cursor: 0 })
+    pub fn immediate(cfg: &'a DisarmConfig, slot: &'a mut DisarmSnapWire) -> Self {
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Immediate;
+        state.phase = DisarmPhaseKind::Release;
+        Self { cfg, state }
     }
 
-    fn from(cfg: &DisarmConfig, form: ReleaseForm, phase: Phase) -> Self {
-        Self {
-            cfg: *cfg,
-            form,
-            phase,
-            pending: None,
-            present: JointVector::default(),
-            deviation: [0.0; JointId::COUNT],
-            unmeasured: [None; JointId::COUNT],
-            released: [false; JointId::COUNT],
-            at_stow: false,
+    /// The release `state` holds, run against `cfg`.
+    ///
+    /// The configuration comes from the caller rather than the state: it is what
+    /// the host was configured with, not what the release found out.
+    ///
+    /// # Errors
+    ///
+    /// [`ResumeError`] for a state no release reaches — a phase-and-cursor
+    /// pairing, a form naming neither release, the settle's flag left behind in a
+    /// later phase, or measurement and release evidence standing in a phase that
+    /// cannot have produced it.
+    pub fn resume(cfg: &'a DisarmConfig, state: &'a mut DisarmSnap) -> Result<Self, ResumeError> {
+        let phase = state.phase;
+        let name = disarm_phase_name(phase);
+        no_phase(name, phase == DisarmPhaseKind::None)?;
+        if state.form == ReleaseFormKind::None {
+            return Err(ResumeError::NoReleaseForm);
+        }
+        checked_cursor(name, disarm_sweep(phase), state.cursor)?;
+        // The settle's flag is written by the settle and nowhere else, so a slot
+        // holding it in another phase is a slot nothing here wrote; accepting it
+        // would erase the evidence along with the value.
+        if phase != DisarmPhaseKind::Dwell {
+            no_stray_field(
+                "dwell_waiting",
+                disarm_phase_name(DisarmPhaseKind::Dwell),
+                name,
+                state.dwell_waiting.into(),
+            )?;
+        }
+        // What the release found and what it did are written by the phases that
+        // produce them, and by nothing else. A slot holding either before its
+        // phase can have run is refused on the same ground as the settle's flag,
+        // and for a sharper reason: the verify sweep blanks no row it succeeds
+        // on, so a verdict nobody filed survives the whole sequence and is
+        // reported as a servo somebody looked at and could not measure. The
+        // immediate release measures nothing at all, so those fields stay blank
+        // through every phase of it.
+        let verify = disarm_phase_name(DisarmPhaseKind::Verify);
+        if phase == DisarmPhaseKind::Dwell {
+            no_stray_field(
+                "released",
+                disarm_phase_name(DisarmPhaseKind::Release),
+                name,
+                !flags::is_empty(state.released),
+            )?;
+        }
+        if phase == DisarmPhaseKind::Dwell || state.form == ReleaseFormKind::Immediate {
+            no_stray_field("at_stow", verify, name, state.at_stow.into())?;
+            no_stray_field(
+                "unmeasured",
+                verify,
+                name,
+                any_verdict_filed(&state.unmeasured),
+            )?;
+        }
+        Ok(Self { cfg, state })
+    }
+
+    /// The fields a phase owns, blanked as it is left.
+    ///
+    /// The settle's flag belongs to the settle: it says whether the wait has
+    /// been taken, and it means nothing once the measurements are running.
+    fn blank_phase_fields(&mut self) {
+        self.state.dwell_waiting = false.into();
+    }
+
+    /// Which phase a reading or a write here is reported under.
+    fn phase_step(&self) -> SeqStepKind {
+        match self.state.phase {
+            DisarmPhaseKind::Dwell => SeqStepKind::Dwell,
+            DisarmPhaseKind::Verify => SeqStepKind::VerifyAtStow,
+            // A release that has not begun is reported under the writes it is
+            // there to make: the phase that names nothing is refused by
+            // [`Self::resume`] and never reached from either constructor.
+            DisarmPhaseKind::Release | DisarmPhaseKind::Complete | DisarmPhaseKind::None => {
+                SeqStepKind::TorqueOff
+            }
         }
     }
 
-    fn read(&self, row: usize, reg: RegId) -> BusRequest {
-        BusRequest::ReadReg {
-            id: self.cfg.ids[row],
-            reg,
+    /// What the release found, and what it did, as the slot holds it.
+    fn summary(&self) -> DisarmSummary {
+        DisarmSummary {
+            form: release_form(self.state.form),
+            present: joints::vector_of(&self.state.present),
+            deviation: joints::rows_of(&self.state.deviation),
+            unmeasured: self.unmeasured(),
+            released: flags::rows(self.state.released),
+            at_stow: self.state.at_stow.into(),
         }
     }
 
-    fn release(&self, row: usize) -> BusRequest {
-        BusRequest::WriteRegVerified {
-            id: self.cfg.ids[row],
-            reg: RegId::TorqueEnable,
-            value: RegValue::U8(0),
+    /// Why each joint's position read produced no angle, in bus order.
+    ///
+    /// A verdict the slot holds that this build cannot read is reported as
+    /// exactly that: the joint was not measured either way, which is the fact
+    /// the release reports, and the evidence is what a slot written by something
+    /// else lost.
+    fn unmeasured(&self) -> [Option<SeqError>; ROW_COUNT] {
+        let mut causes = [None; ROW_COUNT];
+        for (row, cause) in causes.iter_mut().enumerate() {
+            let Some(filed) = joints::joint_ref(row)
+                .and_then(|joint| cells::failure_row(&self.state.unmeasured, joint))
+            else {
+                continue;
+            };
+            if filed.kind == SeqFailureKind::None {
+                continue;
+            }
+            *cause = Some(verdict::read(filed).unwrap_or(SeqError::VerdictUnreadable {
+                context: StepContext::servo(filed.step, filed.servo_id),
+            }));
         }
+        causes
+    }
+
+    /// Whether any joint's position read produced no angle, over this
+    /// sequence's own grid.
+    fn any_unmeasured(&self) -> bool {
+        any_verdict_filed(&self.state.unmeasured)
+    }
+
+    /// File `cause` against the servo at bus row `row` as the reason it was not
+    /// measured.
+    ///
+    /// A cause whose own evidence will not cross is filed as unreadable rather
+    /// than dropped: what matters to whoever reads the release is that this
+    /// joint was not measured, and a blank row would say it was.
+    fn record_unmeasured(&mut self, row: usize, cause: SeqError) {
+        let context = cause.context();
+        let Some(filed) = joints::joint_ref(row)
+            .and_then(|joint| cells::failure_row_mut(&mut self.state.unmeasured, joint))
+        else {
+            return;
+        };
+        if verdict::write(filed, &cause).is_err() {
+            // Not discarded: a refused write blanks the row, and a blank row is
+            // the one claim this function exists to prevent. The unreadable
+            // verdict carries neither a register value nor a wait, which are the
+            // only two things a write refuses.
+            verdict::write(filed, &SeqError::VerdictUnreadable { context })
+                .expect("the unreadable verdict carries nothing a write can refuse");
+        }
+    }
+
+    fn read(&mut self, row: usize, reg: RegId) {
+        txn::set_read_reg(&mut self.state.pending, self.cfg.ids[row], reg);
+    }
+
+    fn release(&mut self, row: usize) {
+        txn::set_write_reg_verified(
+            &mut self.state.pending,
+            self.cfg.ids[row],
+            RegId::TorqueEnable,
+            value::u8(0),
+        );
     }
 
     /// The next action, the previous one having been absorbed.
     fn emit(&mut self, now: Duration) -> SeqAction<DisarmSummary> {
-        let request = match self.phase {
-            Phase::Dwell { waiting } => {
+        let cursor = self.cursor();
+        match self.state.phase {
+            DisarmPhaseKind::Dwell => {
                 // The settle is waited once, on entry. A configured dwell of
                 // zero is no dwell at all rather than a wait until now, which
                 // would hand the driver a deadline it has already passed.
+                let waiting: bool = self.state.dwell_waiting.into();
                 if waiting && !self.cfg.dwell.is_zero() {
-                    if let Phase::Dwell { waiting } = &mut self.phase {
-                        *waiting = false;
-                    }
+                    self.state.dwell_waiting = false.into();
                     return SeqAction::Wait {
                         until: now + self.cfg.dwell,
                     };
                 }
-                self.phase = Phase::Verify { cursor: 0 };
-                self.read(0, RegId::PresentPosition)
+                self.enter(DisarmPhaseKind::Verify);
+                self.read(0, RegId::PresentPosition);
             }
-            Phase::Verify { cursor } => self.read(cursor, RegId::PresentPosition),
-            Phase::Release { cursor } => self.release(cursor),
-            Phase::Complete => {
-                return SeqAction::Done(DisarmSummary {
-                    form: self.form,
-                    present: self.present,
-                    deviation: self.deviation,
-                    unmeasured: self.unmeasured,
-                    released: self.released,
-                    at_stow: self.at_stow,
-                });
+            DisarmPhaseKind::Verify => self.read(cursor, RegId::PresentPosition),
+            DisarmPhaseKind::Release => self.release(cursor),
+            // A release that has finished, and the phase a slot nothing wrote
+            // holds — which `resume` refuses, so nothing reaches this arm with
+            // work left to do.
+            DisarmPhaseKind::Complete | DisarmPhaseKind::None => {
+                return SeqAction::Done(self.summary());
             }
-        };
-        self.pending = Some(request);
-        SeqAction::Transact(request)
+        }
+        SeqAction::Transact
     }
 
     /// Take the previous transaction's result and move the cursor on.
@@ -401,47 +566,77 @@ impl DisarmSequencer {
     /// because it is the only thing distinguishing an unplugged servo from an
     /// overloaded one.
     fn absorb(&mut self, prior: Option<&BusResult>) {
-        let Some(request) = self.pending.take() else {
+        if !txn::held(&self.state.pending) {
             // Nothing was outstanding — the first call, or the call after the
             // dwell. A result handed back here answers no request.
             return;
+        }
+        let read = txn::fields(&self.state.pending, self.phase_step());
+        txn::set_none(&mut self.state.pending);
+        let (context, wrote) = match read {
+            Ok(read) => read,
+            // The transaction it was waiting on cannot be read, so what came
+            // back answers nothing describable. Recorded against the servo the
+            // cursor is on and the sweep carries on: torque coming off the rest
+            // is worth more than stopping here.
+            Err(cause) => return self.abandon(cause),
         };
-        let context = StepContext {
-            step: self.phase.step(),
-            id: request.id(),
-            reg: request.reg(),
-        };
-        match self.phase {
-            Phase::Verify { cursor } => self.absorb_verify(cursor, context, prior),
-            Phase::Release { cursor } => {
-                self.released[cursor] =
-                    prior.is_some_and(|result| confirm_write(result, &request, context).is_ok());
-                self.phase = if cursor + 1 < JointId::COUNT {
-                    Phase::Release { cursor: cursor + 1 }
-                } else {
-                    Phase::Complete
-                };
+        let cursor = self.cursor();
+        match self.state.phase {
+            DisarmPhaseKind::Verify => self.absorb_verify(cursor, context, prior),
+            DisarmPhaseKind::Release => {
+                if prior.is_some_and(|result| confirm_write(result, wrote, context).is_ok()) {
+                    flags::insert(&mut self.state.released, ROWS[cursor]);
+                }
+                self.advance_release(cursor);
             }
             // Terminal, or waiting: nothing is ever outstanding in these.
-            Phase::Dwell { .. } | Phase::Complete => {}
+            DisarmPhaseKind::Dwell | DisarmPhaseKind::Complete | DisarmPhaseKind::None => {}
+        }
+    }
+
+    /// Give up on the transaction the cursor is on, for `cause`, and carry on.
+    ///
+    /// The one thing disarming never does is stop: an outstanding transaction
+    /// that cannot be read leaves this joint undescribed — unmeasured while
+    /// measuring, unreleased while releasing — and the sweep moves to the next
+    /// servo, which is what gets torque off the other eight.
+    fn abandon(&mut self, cause: SeqError) {
+        let cursor = self.cursor();
+        match self.state.phase {
+            DisarmPhaseKind::Verify => {
+                self.record_unmeasured(cursor, cause);
+                self.advance_verify(cursor);
+            }
+            // The servo is left out of the released set, which is what says it
+            // may still be holding, and it is never written to.
+            DisarmPhaseKind::Release => self.advance_release(cursor),
+            DisarmPhaseKind::Dwell | DisarmPhaseKind::Complete | DisarmPhaseKind::None => {}
         }
     }
 
     fn absorb_verify(&mut self, cursor: usize, context: StepContext, prior: Option<&BusResult>) {
-        let joint = JointId::ALL[cursor];
+        let joint = ROWS[cursor];
         let angle = prior
             .ok_or(SeqError::NoAnswer { context })
             .and_then(|result| placeable(cursor, context, result));
         match angle {
             Ok(angle) => {
-                self.present.set(joint, angle);
-                self.deviation[cursor] =
-                    deviation_from(joint, angle, angle_at(&self.cfg.stow_targets, cursor));
+                joints::set_angle(&mut self.state.present, joint, angle);
+                joints::set_angle(
+                    &mut self.state.deviation,
+                    joint,
+                    deviation_from(joint, angle, angle_at(&self.cfg.stow_targets, cursor)),
+                );
             }
-            Err(cause) => self.unmeasured[cursor] = Some(cause),
+            Err(cause) => self.record_unmeasured(cursor, cause),
         }
-        if cursor + 1 < JointId::COUNT {
-            self.phase = Phase::Verify { cursor: cursor + 1 };
+        self.advance_verify(cursor);
+    }
+
+    fn advance_verify(&mut self, cursor: usize) {
+        if cursor + 1 < ROW_COUNT {
+            self.seek(cursor + 1);
             return;
         }
 
@@ -450,16 +645,30 @@ impl DisarmSequencer {
         // line. A joint nobody could read is not at stow as far as this says:
         // the claim is that the head was found where it can be left, and an
         // unread joint is no evidence of that.
-        self.at_stow = self.unmeasured.iter().all(|cause| cause.is_none())
-            && !self
-                .deviation
-                .iter()
-                .any(|deviation| outside_limit(*deviation, self.cfg.tolerance));
-        self.phase = Phase::Release { cursor: 0 };
+        let measured_all = !self.any_unmeasured();
+        let inside = !joints::rows_of(&self.state.deviation)
+            .iter()
+            .any(|deviation| outside_limit(*deviation, self.cfg.tolerance));
+        self.state.at_stow = (measured_all && inside).into();
+        self.enter(DisarmPhaseKind::Release);
+    }
+
+    fn advance_release(&mut self, cursor: usize) {
+        if cursor + 1 < ROW_COUNT {
+            self.seek(cursor + 1);
+        } else {
+            self.enter(DisarmPhaseKind::Complete);
+        }
     }
 }
 
-impl Sequencer for DisarmSequencer {
+phase_state!(DisarmSequencer, DisarmPhaseKind);
+
+impl Sequencer for DisarmSequencer<'_> {
+    fn pending(&self) -> &BusTxnWire {
+        clockwork_rs::as_raw(&self.state.pending)
+    }
+
     type Summary = DisarmSummary;
 
     fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<DisarmSummary> {
@@ -467,8 +676,8 @@ impl Sequencer for DisarmSequencer {
         self.emit(now)
     }
 
-    fn step(&self) -> SeqStep {
-        self.phase.step()
+    fn step(&self) -> SeqStepKind {
+        self.phase_step()
     }
 }
 
@@ -476,7 +685,10 @@ impl Sequencer for DisarmSequencer {
 mod tests {
     use super::*;
     use crate::arm::SERVO_IDS;
-    use crate::testutil::ScriptedBus;
+    use crate::joints::Name;
+    use crate::testutil::{Asked, ScriptedBus, asked};
+    use crate::txn::AuxOpKind;
+    use crate::value::Value;
     use reachy_kin::{EnvelopeConfig, EnvelopeReport, check_envelope, neutral_head_pose};
 
     fn config() -> DisarmConfig {
@@ -506,25 +718,33 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Machine {
         present: JointVector,
-        torque: [bool; JointId::COUNT],
-        silent: [bool; JointId::COUNT],
+        torque: [bool; ROW_COUNT],
+        silent: [bool; ROW_COUNT],
         /// One write to answer with something other than success.
         fail_write: Option<(u8, BusResult)>,
         /// One read to answer with something other than success.
         fail_read: Option<(u8, BusResult)>,
-        log: Vec<(SeqStep, BusRequest)>,
+        log: Vec<(SeqStepKind, Asked)>,
         waits: Vec<(Duration, Duration)>,
         /// How many transactions had run when each wait began, which is what
         /// places the settle in the order rather than merely counting it.
         waited_after: Vec<usize>,
     }
 
+    /// Two copies of one machine: the direct run and the crossed run.
+    ///
+    /// Built once and cloned rather than written twice, because the comparison
+    /// between the two runs means nothing unless both faced the same bus.
+    fn pair(machine: Machine) -> (Machine, Machine) {
+        (machine.clone(), machine)
+    }
+
     /// A platform holding itself at stow, torque on.
     fn bus() -> Machine {
         Machine {
             present: config().stow_targets,
-            torque: [true; JointId::COUNT],
-            silent: [false; JointId::COUNT],
+            torque: [true; ROW_COUNT],
+            silent: [false; ROW_COUNT],
             fail_write: None,
             fail_read: None,
             log: Vec::new(),
@@ -534,35 +754,44 @@ mod tests {
     }
 
     impl ScriptedBus for Machine {
-        fn answer(&mut self, step: SeqStep, request: BusRequest) -> BusResult {
-            self.log.push((step, request));
+        fn answer(&mut self, step: SeqStepKind, request: &BusTxnWire) -> BusResult {
+            let entry = asked(request, step);
+            let Asked {
+                op,
+                context,
+                value: written,
+            } = entry;
+            self.log.push((step, entry));
             let row = SERVO_IDS
                 .iter()
-                .position(|id| *id == request.id())
+                .position(|id| *id == context.id)
                 .expect("addressed to a servo on this bus");
             if self.silent[row] {
                 return BusResult::NoAnswer;
             }
-            let scripted = match request {
-                BusRequest::WriteRegVerified { .. } => self.fail_write,
+            let scripted = match op {
+                AuxOpKind::WriteRegVerified => self.fail_write,
                 _ => self.fail_read,
             };
             if let Some((id, result)) = scripted
-                && request.id() == id
+                && context.id == id
             {
                 return result;
             }
-            match request {
-                BusRequest::ReadReg { .. } => {
-                    BusResult::Value(RegValue::Radians(angle_at(&self.present, row)))
+            match op {
+                AuxOpKind::ReadReg => {
+                    BusResult::Value(value::radians(angle_at(&self.present, row)))
                 }
-                BusRequest::WriteRegVerified { value, .. } => {
-                    if value == RegValue::U8(0) {
+                AuxOpKind::Ping | AuxOpKind::None => {
+                    panic!("disarming pings nothing")
+                }
+                AuxOpKind::WriteRegVerified => {
+                    let value = written;
+                    if value == value::u8(0) {
                         self.torque[row] = false;
                     }
                     BusResult::Written
                 }
-                BusRequest::Ping { .. } => panic!("disarming pings nothing"),
             }
         }
 
@@ -573,24 +802,66 @@ mod tests {
     }
 
     impl Machine {
-        fn writes(&self) -> Vec<(u8, RegValue)> {
+        fn writes(&self) -> Vec<(u8, Value)> {
             self.log
                 .iter()
-                .filter_map(|(_, request)| match request {
-                    BusRequest::WriteRegVerified { id, value, .. } => Some((*id, *value)),
-                    _ => None,
-                })
+                .filter(|(_, request)| request.op == AuxOpKind::WriteRegVerified)
+                .map(|(_, request)| (request.id(), request.value))
                 .collect()
         }
     }
 
-    /// The shared driver, against this crate's disarming sequencer.
-    fn drive(
+    /// The shared driver, against this crate's disarming sequencer: the orderly
+    /// release, held across its own steps.
+    fn drive(cfg: &DisarmConfig, machine: &mut Machine) -> Result<DisarmSummary, SeqError> {
+        let mut slot = DisarmSnapWire::new();
+        let mut seq = DisarmSequencer::start(cfg, &mut slot);
+        crate::testutil::drive(&mut seq, machine)
+    }
+
+    /// The same, for the fault release.
+    fn drive_immediate(
         cfg: &DisarmConfig,
         machine: &mut Machine,
-    ) -> Result<DisarmSummary, crate::seq::SeqError> {
-        let mut seq = DisarmSequencer::new(cfg);
+    ) -> Result<DisarmSummary, SeqError> {
+        let mut slot = DisarmSnapWire::new();
+        let mut seq = DisarmSequencer::immediate(cfg, &mut slot);
         crate::testutil::drive(&mut seq, machine)
+    }
+
+    resumed! {
+        /// The release, resumed from its slot before every step: `cfg` is all
+        /// its `resume` needs.
+        struct Resuming { cfg: DisarmConfig }
+        slot = DisarmSnapWire, summary = DisarmSummary, seq = DisarmSequencer,
+        resume(host, state) = DisarmSequencer::resume(host.cfg, state);
+    }
+
+    /// Step the release `slot` holds to its end, resuming a sequencer from the
+    /// slot before every step.
+    fn release_from_slot(
+        cfg: &DisarmConfig,
+        slot: &mut DisarmSnapWire,
+        machine: &mut Machine,
+    ) -> Result<DisarmSummary, SeqError> {
+        crate::testutil::drive_from_slot(&Resuming { cfg }, slot, machine, Duration::ZERO)
+    }
+
+    /// The orderly release, crossed at every step.
+    fn drive_resumed(cfg: &DisarmConfig, machine: &mut Machine) -> Result<DisarmSummary, SeqError> {
+        let mut slot = DisarmSnapWire::new();
+        DisarmSequencer::start(cfg, &mut slot);
+        release_from_slot(cfg, &mut slot, machine)
+    }
+
+    /// The fault release, crossed at every step.
+    fn drive_immediate_resumed(
+        cfg: &DisarmConfig,
+        machine: &mut Machine,
+    ) -> Result<DisarmSummary, SeqError> {
+        let mut slot = DisarmSnapWire::new();
+        DisarmSequencer::immediate(cfg, &mut slot);
+        release_from_slot(cfg, &mut slot, machine)
     }
 
     /// The order is the whole safety property: the settle is waited out, every
@@ -602,12 +873,12 @@ mod tests {
         let mut machine = bus();
         let summary = drive(&cfg, &mut machine).expect("a machine at stow disarms");
 
-        let steps: Vec<SeqStep> = machine.log.iter().map(|(step, _)| *step).collect();
+        let steps: Vec<SeqStepKind> = machine.log.iter().map(|(step, _)| *step).collect();
         assert_eq!(
             steps,
             [
-                vec![SeqStep::VerifyAtStow; JointId::COUNT],
-                vec![SeqStep::TorqueOff; JointId::COUNT],
+                vec![SeqStepKind::VerifyAtStow; ROW_COUNT],
+                vec![SeqStepKind::TorqueOff; ROW_COUNT],
             ]
             .concat()
         );
@@ -615,10 +886,10 @@ mod tests {
             machine.writes(),
             SERVO_IDS
                 .iter()
-                .map(|id| (*id, RegValue::U8(0)))
+                .map(|id| (*id, value::u8(0)))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
         assert_eq!(machine.waits.len(), 1, "the settle is waited exactly once");
         assert_eq!(
             machine.waited_after,
@@ -630,13 +901,13 @@ mod tests {
         assert!(summary.at_stow);
         assert_eq!(summary.form, ReleaseForm::Orderly);
         assert_eq!(summary.present, cfg.stow_targets);
-        assert_eq!(summary.deviation, [0.0; JointId::COUNT]);
+        assert_eq!(summary.deviation, [0.0; ROW_COUNT]);
         assert!(summary.measured_all());
         assert_eq!(summary.unreadable().count(), 0);
-        assert_eq!(summary.released, [true; JointId::COUNT]);
+        assert_eq!(summary.released, [true; ROW_COUNT]);
         assert!(summary.all_released());
         assert_eq!(summary.unreleased().count(), 0);
-        assert_eq!(summary.worst_deviation(), (JointId::BodyYaw, 0.0));
+        assert_eq!(summary.worst_deviation(), (JointRef::BodyYaw, 0.0));
     }
 
     /// A joint away from stow is reported and torque comes off anyway. The head
@@ -651,17 +922,17 @@ mod tests {
         let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow, "five degrees is past the tolerance");
         assert!(summary.measured_all());
-        assert_eq!(summary.worst_deviation().0, JointId::Leg(2));
+        assert_eq!(summary.worst_deviation().0, JointRef::Leg2);
         assert!((summary.deviation[3].to_degrees() - 5.0).abs() < 1e-9);
 
         assert_eq!(
             machine.writes(),
             SERVO_IDS
                 .iter()
-                .map(|id| (*id, RegValue::U8(0)))
+                .map(|id| (*id, value::u8(0)))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
         assert!(summary.all_released());
     }
 
@@ -677,8 +948,8 @@ mod tests {
 
         let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow);
-        assert_eq!(summary.worst_deviation().0, JointId::AntennaLeft);
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(summary.worst_deviation().0, JointRef::AntennaLeft);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
     }
 
     /// Released from the neutral pose — the head up, as far from stow as this
@@ -692,10 +963,10 @@ mod tests {
         let summary = drive(&cfg, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow, "the machine was not at stow and says so");
         assert_eq!(summary.present, machine.present);
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
 
         let (joint, deviation) = summary.worst_deviation();
-        let row = JointId::ALL
+        let row = ROWS
             .iter()
             .position(|id| *id == joint)
             .expect("a joint of this bus");
@@ -726,21 +997,21 @@ mod tests {
         };
 
         let cases = [
-            (0usize, 7usize, 162.248_f64, JointId::AntennaRight),
-            (1, 8, -162.248, JointId::AntennaLeft),
+            (0usize, 7usize, 162.248_f64, JointRef::AntennaRight),
+            (1, 8, -162.248, JointRef::AntennaLeft),
         ];
         for (side, row, degrees, joint) in cases {
             let mut machine = bus();
             machine.present.antennas[side] = degrees.to_radians();
 
             let summary = drive(&wide, &mut machine).expect("23° is inside a 25° gate");
-            assert!(summary.at_stow, "{joint}");
+            assert!(summary.at_stow, "{}", Name(joint));
             assert!(
                 (summary.deviation[row].to_degrees() - 23.0).abs() < 1e-3,
                 "the distance around the circle is {}°",
                 summary.deviation[row].to_degrees()
             );
-            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert_eq!(machine.torque, [false; ROW_COUNT]);
 
             // The same reading against the 2° tolerance reads as away from
             // stow, and by the circular figure: nothing here waives the
@@ -755,7 +1026,7 @@ mod tests {
                 "the report carries the distance around the circle: {}°",
                 summary.deviation[row].to_degrees()
             );
-            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert_eq!(machine.torque, [false; ROW_COUNT]);
         }
 
         // A leg keeps the linear difference: it is a windowed joint working far
@@ -765,7 +1036,7 @@ mod tests {
         machine.present.legs[0] += core::f64::consts::TAU;
         let summary = drive(&wide, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow, "a turn is not zero on a leg");
-        assert_eq!(summary.worst_deviation().0, JointId::Leg(0));
+        assert_eq!(summary.worst_deviation().0, JointRef::Leg0);
         assert!((summary.present.legs[0] - stow.legs[0] - core::f64::consts::TAU).abs() < 1e-12);
     }
 
@@ -793,7 +1064,7 @@ mod tests {
                 matches!(
                     summary.unmeasured[7],
                     Some(SeqError::UnplaceableAngle {
-                        joint: JointId::AntennaRight,
+                        joint: JointRef::AntennaRight,
                         angle,
                         ..
                     }) if angle.to_bits() == value.to_bits()
@@ -806,9 +1077,9 @@ mod tests {
                     .unreadable()
                     .map(|(joint, _)| joint)
                     .collect::<Vec<_>>(),
-                vec![JointId::AntennaRight]
+                vec![JointRef::AntennaRight]
             );
-            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert_eq!(machine.torque, [false; ROW_COUNT]);
             assert!(summary.all_released());
         }
     }
@@ -834,8 +1105,8 @@ mod tests {
         let mut machine = bus();
         drive(&brisk, &mut machine).expect("a machine at stow disarms");
         assert!(machine.waits.is_empty());
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
-        assert_eq!(machine.log.len(), 2 * JointId::COUNT);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
+        assert_eq!(machine.log.len(), 2 * ROW_COUNT);
     }
 
     /// A release the servo refuses is recorded against that servo and the walk
@@ -855,7 +1126,7 @@ mod tests {
         assert!(!summary.all_released());
         assert_eq!(
             summary.unreleased().collect::<Vec<_>>(),
-            vec![JointId::Leg(3)]
+            vec![JointRef::Leg3]
         );
 
         // Nine writes went out, one per servo, in bus order.
@@ -863,7 +1134,7 @@ mod tests {
             machine.writes(),
             SERVO_IDS
                 .iter()
-                .map(|id| (*id, RegValue::U8(0)))
+                .map(|id| (*id, value::u8(0)))
                 .collect::<Vec<_>>()
         );
         assert_eq!(
@@ -889,13 +1160,13 @@ mod tests {
             summary.unmeasured[6]
         );
         assert!(!summary.at_stow);
-        assert_eq!(machine.writes().len(), JointId::COUNT);
+        assert_eq!(machine.writes().len(), ROW_COUNT);
         // The silent servo never acknowledges its release either; the other
         // eight are limp.
         assert!(!summary.released[6]);
         assert_eq!(
             summary.unreleased().collect::<Vec<_>>(),
-            vec![JointId::Leg(5)]
+            vec![JointRef::Leg5]
         );
         assert_eq!(
             machine.torque,
@@ -933,15 +1204,135 @@ mod tests {
                 "{answer:?} came back as {cause}"
             );
             assert_eq!(cause.context().id, SERVO_IDS[4], "named against its servo");
-            assert_eq!(cause.context().step, SeqStep::VerifyAtStow);
+            assert_eq!(cause.context().step, SeqStepKind::VerifyAtStow);
             assert!(!summary.at_stow);
             // And torque still came off all nine, which is the point of not
             // refusing over any of this.
-            assert_eq!(machine.torque, [false; JointId::COUNT]);
+            assert_eq!(machine.torque, [false; ROW_COUNT]);
             assert!(summary.all_released());
         }
     }
 
+    /// A release resumed with an outstanding record this build cannot read gives
+    /// up on that one servo and keeps sweeping. The record is damaged where a
+    /// slot's bytes are: the release phase's transaction is left naming no
+    /// register, which is what something that does not agree with this build
+    /// about a transaction writes.
+    #[test]
+    fn a_pending_record_that_cannot_be_read_abandons_one_servo_and_the_sweep_walks_on() {
+        let cfg = config();
+        let mut machine = bus();
+        let mut slot = DisarmSnapWire::new();
+        DisarmSequencer::start(&cfg, &mut slot);
+        let mut now = Duration::ZERO;
+        let mut prior = None;
+        let mut damaged_at = None;
+        let summary = loop {
+            let state = slot
+                .validate_mut()
+                .expect("a release writes its own schema");
+            let mut seq =
+                DisarmSequencer::resume(&cfg, state).expect("a release mid-sweep resumes");
+            match seq.next(now, prior.as_ref()) {
+                SeqAction::Transact => {
+                    let phase = seq.step();
+                    let addressed = asked(seq.pending(), phase).id();
+                    if phase == SeqStepKind::TorqueOff && addressed == SERVO_IDS[3] {
+                        // The record it is waiting on, left naming no register
+                        // where the operation needs one.
+                        let state = slot.validate_mut().expect("the state was written here");
+                        state.pending.reg = RegId::None;
+                        damaged_at = Some(3);
+                        prior = None;
+                        continue;
+                    }
+                    prior = Some(machine.answer(phase, seq.pending()));
+                }
+                SeqAction::Wait { until } => {
+                    machine.waited(now, until);
+                    now = until;
+                    prior = None;
+                }
+                SeqAction::Done(summary) => break summary,
+                SeqAction::Fail(error) => panic!("a release does not stop: {error}"),
+            }
+        };
+        assert_eq!(damaged_at, Some(3), "the release phase was reached");
+
+        // The abandoned servo is reported as unreleased and never written to;
+        // the other eight are limp, which is the whole point of walking on.
+        assert!(!summary.released[3]);
+        for row in 0..ROW_COUNT {
+            if row == 3 {
+                continue;
+            }
+            assert!(summary.released[row], "servo {row} released");
+            assert!(!machine.torque[row], "servo {row} is limp");
+        }
+        assert!(
+            machine.torque[3],
+            "the abandoned servo was never written to"
+        );
+        // Measurement happened before the damage, so the sweep's own look is
+        // unaffected.
+        assert!(summary.unmeasured.iter().all(Option::is_none));
+    }
+
+    /// The same in the measuring sweep: the joint whose record cannot be read is
+    /// filed as unmeasured, carrying the refusal that named it, and all nine
+    /// still let go.
+    #[test]
+    fn a_pending_record_that_cannot_be_read_leaves_one_joint_unmeasured() {
+        let cfg = config();
+        let mut machine = bus();
+        let mut slot = DisarmSnapWire::new();
+        DisarmSequencer::start(&cfg, &mut slot);
+        let mut now = Duration::ZERO;
+        let mut prior = None;
+        let mut damaged = false;
+        let summary = loop {
+            let state = slot
+                .validate_mut()
+                .expect("a release writes its own schema");
+            let mut seq =
+                DisarmSequencer::resume(&cfg, state).expect("a release mid-sweep resumes");
+            match seq.next(now, prior.as_ref()) {
+                SeqAction::Transact => {
+                    let phase = seq.step();
+                    let addressed = asked(seq.pending(), phase).id();
+                    if !damaged && phase == SeqStepKind::VerifyAtStow && addressed == SERVO_IDS[6] {
+                        let state = slot.validate_mut().expect("the state was written here");
+                        state.pending.reg = RegId::None;
+                        damaged = true;
+                        prior = None;
+                        continue;
+                    }
+                    prior = Some(machine.answer(phase, seq.pending()));
+                }
+                SeqAction::Wait { until } => {
+                    machine.waited(now, until);
+                    now = until;
+                    prior = None;
+                }
+                SeqAction::Done(summary) => break summary,
+                SeqAction::Fail(error) => panic!("a release does not stop: {error}"),
+            }
+        };
+        assert!(damaged, "the measuring sweep reached the sixth crank");
+
+        assert!(
+            matches!(
+                summary.unmeasured[6],
+                Some(SeqError::PendingUnreadable { .. })
+            ),
+            "{:?}",
+            summary.unmeasured[6]
+        );
+        assert_eq!(summary.unreadable().count(), 1);
+        assert!(!summary.at_stow, "an unread joint is no evidence of a fold");
+        assert!(summary.all_released(), "all nine still let go");
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
+    }
     /// A driver that runs a transaction and brings nothing back leaves that one
     /// joint undescribed and moves on. Silence on the wire is exactly the
     /// condition under which the head most needs to end up limp, so it cannot
@@ -949,12 +1340,13 @@ mod tests {
     #[test]
     fn a_driver_that_brings_nothing_back_does_not_stop_the_walk() {
         let cfg = config();
-        let mut seq = DisarmSequencer::new(&cfg);
+        let mut slot = DisarmSnapWire::new();
+        let mut seq = DisarmSequencer::start(&cfg, &mut slot);
         let SeqAction::Wait { until } = seq.next(Duration::ZERO, None) else {
             panic!("the settle comes first");
         };
         let first = seq.next(until, None);
-        assert!(matches!(first, SeqAction::Transact(_)));
+        assert!(matches!(first, SeqAction::Transact));
 
         // Every transaction unanswered, all the way through: the sequence still
         // reaches its end, having asked every servo to release.
@@ -962,25 +1354,25 @@ mod tests {
         let mut transactions = 1;
         let summary = loop {
             match action {
-                SeqAction::Transact(_) => {
+                SeqAction::Transact => {
                     transactions += 1;
-                    assert!(transactions <= 2 * JointId::COUNT, "the walk does not loop");
+                    assert!(transactions <= 2 * ROW_COUNT, "the walk does not loop");
                     action = seq.next(until, None);
                 }
                 SeqAction::Done(summary) => break summary,
                 other => panic!("nothing here waits or fails: {other:?}"),
             }
         };
-        assert_eq!(transactions, 2 * JointId::COUNT);
+        assert_eq!(transactions, 2 * ROW_COUNT);
         assert!(!summary.measured_all());
-        assert_eq!(summary.released, [false; JointId::COUNT]);
+        assert_eq!(summary.released, [false; ROW_COUNT]);
         assert!(!summary.at_stow);
 
         // Nine servos looked at and none of them readable — which the summary
         // states as nine silences under the orderly form, not as a release that
         // deliberately did not look.
         assert_eq!(summary.form, ReleaseForm::Orderly);
-        assert_eq!(summary.unreadable().count(), JointId::COUNT);
+        assert_eq!(summary.unreadable().count(), ROW_COUNT);
         assert!(
             summary
                 .unmeasured
@@ -998,20 +1390,19 @@ mod tests {
     fn the_immediate_release_is_nine_writes_and_nothing_else() {
         let cfg = config();
         let mut machine = bus();
-        let mut seq = DisarmSequencer::immediate(&cfg);
-        let summary = crate::testutil::drive(&mut seq, &mut machine).expect("nothing here refuses");
+        let summary = drive_immediate(&cfg, &mut machine).expect("nothing here refuses");
 
         assert!(machine.waits.is_empty(), "a fault waits for nothing");
-        let steps: Vec<SeqStep> = machine.log.iter().map(|(step, _)| *step).collect();
-        assert_eq!(steps, vec![SeqStep::TorqueOff; JointId::COUNT]);
+        let steps: Vec<SeqStepKind> = machine.log.iter().map(|(step, _)| *step).collect();
+        assert_eq!(steps, vec![SeqStepKind::TorqueOff; ROW_COUNT]);
         assert_eq!(
             machine.writes(),
             SERVO_IDS
                 .iter()
-                .map(|id| (*id, RegValue::U8(0)))
+                .map(|id| (*id, value::u8(0)))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(machine.torque, [false; JointId::COUNT]);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
 
         // The summary says what it looked at, which is nothing. A machine
         // physically at stow still reports `at_stow` false here: the claim
@@ -1020,10 +1411,10 @@ mod tests {
         // so no reader has to infer it from nine empty measurements.
         assert_eq!(summary.form, ReleaseForm::Immediate);
         assert!(!summary.measured_all());
-        assert_eq!(summary.unmeasured, [None; JointId::COUNT]);
+        assert_eq!(summary.unmeasured, [None; ROW_COUNT]);
         assert_eq!(summary.unreadable().count(), 0);
         assert!(!summary.at_stow);
-        assert_eq!(summary.released, [true; JointId::COUNT]);
+        assert_eq!(summary.released, [true; ROW_COUNT]);
         assert!(summary.all_released());
     }
 
@@ -1037,14 +1428,13 @@ mod tests {
         machine.fail_write = Some((SERVO_IDS[2], BusResult::ServoError { code: 0x04 }));
         machine.silent[5] = true;
 
-        let mut seq = DisarmSequencer::immediate(&cfg);
-        let summary = crate::testutil::drive(&mut seq, &mut machine).expect("nothing here refuses");
+        let summary = drive_immediate(&cfg, &mut machine).expect("nothing here refuses");
 
         assert_eq!(
             summary.unreleased().collect::<Vec<_>>(),
-            vec![JointId::Leg(1), JointId::Leg(4)]
+            vec![JointRef::Leg1, JointRef::Leg4]
         );
-        assert_eq!(machine.writes().len(), JointId::COUNT);
+        assert_eq!(machine.writes().len(), ROW_COUNT);
         assert_eq!(
             machine.torque,
             [false, false, true, false, false, true, false, false, false]
@@ -1140,5 +1530,361 @@ mod tests {
         machine.present = just_outside;
         let summary = drive(&cfg, &mut machine).expect("a release always finishes");
         assert_eq!(summary.at_stow, at_stow(&cfg, &just_outside));
+    }
+
+    // ---- The release resumed from its slot ----
+
+    /// The orderly release, resumed at every step: the settle, the nine
+    /// measurements and the nine releases all survive a slot crossing, and the
+    /// summary is the one a host holding the sequencer in a local variable gets.
+    #[test]
+    fn a_crossed_orderly_release_reaches_the_same_summary() {
+        let cfg = config();
+
+        let (mut direct, mut machine) = pair(bus());
+        let held = drive(&cfg, &mut direct).expect("a machine at stow disarms");
+        let crossed = drive_resumed(&cfg, &mut machine).expect("a machine at stow disarms");
+
+        assert_eq!(crossed, held);
+        assert_eq!(machine.log, direct.log);
+        assert_eq!(machine.waits, direct.waits);
+        assert_eq!(machine.waited_after, direct.waited_after);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
+    }
+
+    /// The immediate release, resumed: nine writes and nothing else. The form is
+    /// what says the measurement fields describe no look at all, and it is a
+    /// field the slot holds.
+    #[test]
+    fn a_crossed_immediate_release_still_looks_at_nothing() {
+        let cfg = config();
+
+        let (mut direct, mut machine) = pair(bus());
+        let held = drive_immediate(&cfg, &mut direct).expect("the immediate release cannot fail");
+        let crossed =
+            drive_immediate_resumed(&cfg, &mut machine).expect("the immediate release cannot fail");
+
+        assert_eq!(crossed, held);
+        assert_eq!(crossed.form, ReleaseForm::Immediate);
+        assert!(!crossed.looked());
+        assert_eq!(machine.log, direct.log);
+        assert!(machine.waits.is_empty());
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
+    }
+
+    /// A machine away from stow, one servo silent, and one release
+    /// unacknowledged: three things a release records rather than stops over,
+    /// each carried across every crossing between the step that recorded it and
+    /// the summary that reports it.
+    #[test]
+    fn a_crossed_release_carries_what_it_recorded_on_the_way() {
+        let cfg = config();
+
+        let mut standing = bus();
+        standing.present = joints_at(&neutral_head_pose());
+        let (mut direct, mut machine) = pair(standing);
+        let held = drive(&cfg, &mut direct).expect("torque comes off wherever the head is");
+        let crossed =
+            drive_resumed(&cfg, &mut machine).expect("torque comes off wherever the head is");
+        assert_eq!(crossed, held);
+        assert!(!crossed.at_stow);
+        assert_eq!(machine.torque, [false; ROW_COUNT]);
+
+        let mut silent = [false; ROW_COUNT];
+        silent[4] = true;
+        let (mut direct, mut machine) = pair(Machine { silent, ..bus() });
+        let held = drive(&cfg, &mut direct).expect("the other eight are released");
+        let crossed = drive_resumed(&cfg, &mut machine).expect("the other eight are released");
+        assert_eq!(crossed, held);
+        assert!(crossed.unmeasured[4].is_some());
+        assert!(!crossed.released[4]);
+        assert!(!crossed.at_stow);
+
+        let (mut direct, mut machine) = pair(Machine {
+            fail_write: Some((14, BusResult::NoAnswer)),
+            ..bus()
+        });
+        let held = drive(&cfg, &mut direct).expect("torque comes off regardless");
+        let crossed = drive_resumed(&cfg, &mut machine).expect("torque comes off regardless");
+        assert_eq!(crossed, held);
+        assert_eq!(crossed.unreleased().collect::<Vec<_>>(), [JointRef::Leg3]);
+    }
+
+    /// A configured dwell of zero is no wait at all, and the flag that says the
+    /// settle has been taken is state the slot holds: a release that lost it
+    /// would wait the dwell again on every execution and never let go.
+    #[test]
+    fn a_crossed_settle_is_taken_once() {
+        let cfg = config();
+        let mut slot = DisarmSnapWire::new();
+        DisarmSequencer::start(&cfg, &mut slot);
+        assert!(
+            bool::from(
+                slot.validate()
+                    .expect("a fresh release writes its own schema")
+                    .dwell_waiting
+            ),
+            "a fresh release opens waiting"
+        );
+
+        let mut machine = bus();
+        let summary =
+            release_from_slot(&cfg, &mut slot, &mut machine).expect("a machine at stow disarms");
+        assert!(summary.at_stow);
+        assert_eq!(machine.waits.len(), 1, "the settle is waited exactly once");
+
+        let prompt = DisarmConfig {
+            dwell: Duration::ZERO,
+            ..cfg
+        };
+        let mut machine = bus();
+        let summary = drive_resumed(&prompt, &mut machine).expect("a machine at stow disarms");
+        assert!(summary.at_stow);
+        assert!(machine.waits.is_empty(), "a dwell of zero is no dwell");
+    }
+
+    /// A state no release reaches is refused rather than run.
+    #[test]
+    fn a_state_no_release_reaches_is_refused() {
+        let cfg = config();
+        let mut slot = DisarmSnapWire::new();
+
+        // A slot nothing wrote names no phase, and reading it as the settle
+        // would wait a dwell nobody asked for — which delays a torque-off.
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, slot.clear_valid()).err(),
+            Some(ResumeError::NoPhase { phase: "no" })
+        );
+
+        // A form naming neither release, with a phase that does. The form is
+        // what says whether the measurements describe a failed look or no look
+        // at all, so it is not guessed.
+        let state = slot.clear_valid();
+        state.phase = DisarmPhaseKind::Dwell;
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::NoReleaseForm)
+        );
+
+        // A cursor past the sweep it indexes.
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Release;
+        state.cursor = 9;
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::CursorOutOfRange {
+                phase: "release",
+                cursor: 9,
+                bound: 9,
+            })
+        );
+
+        // The settle carries no cursor, so only zero is one it could have been
+        // left at.
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Dwell;
+        state.cursor = 1;
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::CursorInPhaseWithNoSweep {
+                phase: "dwell",
+                cursor: 1,
+            })
+        );
+
+        // The settle's flag outside the settle. A release that has moved on has
+        // taken its wait, so a slot claiming otherwise was written by something
+        // else — and accepting it would wait the dwell again.
+        for phase in [
+            DisarmPhaseKind::Verify,
+            DisarmPhaseKind::Release,
+            DisarmPhaseKind::Complete,
+        ] {
+            let state = slot.clear_valid();
+            state.form = ReleaseFormKind::Orderly;
+            state.phase = phase;
+            state.dwell_waiting = true.into();
+            assert_eq!(
+                DisarmSequencer::resume(&cfg, state).err(),
+                Some(ResumeError::StrayPhaseField {
+                    field: "dwell_waiting",
+                    owner: "dwell",
+                    phase: disarm_phase_name(phase),
+                }),
+                "{phase:?}"
+            );
+
+            let state = slot.clear_valid();
+            state.form = ReleaseFormKind::Orderly;
+            state.phase = phase;
+            assert!(
+                DisarmSequencer::resume(&cfg, state).is_ok(),
+                "{phase:?} is reachable with the flag down"
+            );
+        }
+    }
+
+    /// Evidence a phase cannot have produced is refused, not carried into the
+    /// summary.
+    ///
+    /// The verify sweep blanks no row it succeeds on, so a verdict pre-filed in
+    /// a slot survives the whole sequence and reads back as a servo somebody
+    /// looked at and could not measure — a refusal nobody observed, in the record
+    /// that says whether a park ending got an accurate story. The immediate form
+    /// looks at nothing at all, so those fields stay blank through every phase of
+    /// it.
+    #[test]
+    fn evidence_a_phase_cannot_have_produced_is_refused() {
+        let cfg = config();
+        let mut slot = DisarmSnapWire::new();
+        let verify = disarm_phase_name(DisarmPhaseKind::Verify);
+        let release = disarm_phase_name(DisarmPhaseKind::Release);
+
+        // The settle has looked at nothing and let go of nothing.
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Dwell;
+        state.at_stow = true.into();
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::StrayPhaseField {
+                field: "at_stow",
+                owner: verify,
+                phase: "dwell",
+            })
+        );
+
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Dwell;
+        file_verdict(state, JointRef::Leg1);
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::StrayPhaseField {
+                field: "unmeasured",
+                owner: verify,
+                phase: "dwell",
+            })
+        );
+
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Dwell;
+        flags::insert(&mut state.released, JointRef::Leg3);
+        assert_eq!(
+            DisarmSequencer::resume(&cfg, state).err(),
+            Some(ResumeError::StrayPhaseField {
+                field: "released",
+                owner: release,
+                phase: "dwell",
+            })
+        );
+
+        // The fault release measures nothing, so a measurement in one was
+        // written by something else — in the phase it does run, not only ahead
+        // of it.
+        for phase in [DisarmPhaseKind::Release, DisarmPhaseKind::Complete] {
+            let state = slot.clear_valid();
+            state.form = ReleaseFormKind::Immediate;
+            state.phase = phase;
+            state.at_stow = true.into();
+            assert_eq!(
+                DisarmSequencer::resume(&cfg, state).err(),
+                Some(ResumeError::StrayPhaseField {
+                    field: "at_stow",
+                    owner: verify,
+                    phase: disarm_phase_name(phase),
+                }),
+                "{phase:?}"
+            );
+
+            let state = slot.clear_valid();
+            state.form = ReleaseFormKind::Immediate;
+            state.phase = phase;
+            file_verdict(state, JointRef::AntennaLeft);
+            assert_eq!(
+                DisarmSequencer::resume(&cfg, state).err(),
+                Some(ResumeError::StrayPhaseField {
+                    field: "unmeasured",
+                    owner: verify,
+                    phase: disarm_phase_name(phase),
+                }),
+                "{phase:?}"
+            );
+
+            // What the release itself writes is not stray in the release.
+            let state = slot.clear_valid();
+            state.form = ReleaseFormKind::Immediate;
+            state.phase = phase;
+            flags::insert(&mut state.released, JointRef::Leg3);
+            assert!(
+                DisarmSequencer::resume(&cfg, state).is_ok(),
+                "{phase:?} is where torque comes off"
+            );
+        }
+
+        // And the orderly release carries its own measurements once the sweep
+        // that makes them has run.
+        let state = slot.clear_valid();
+        state.form = ReleaseFormKind::Orderly;
+        state.phase = DisarmPhaseKind::Release;
+        state.at_stow = true.into();
+        file_verdict(state, JointRef::Leg1);
+        flags::insert(&mut state.released, JointRef::Leg0);
+        assert!(DisarmSequencer::resume(&cfg, state).is_ok());
+    }
+
+    /// File a verdict against `joint`, as a measurement that produced no angle.
+    fn file_verdict(state: &mut DisarmSnap, joint: JointRef) {
+        let filed = cells::failure_row_mut(&mut state.unmeasured, joint)
+            .expect("a joint names a row of the grid");
+        filed.kind = SeqFailureKind::NoAnswer;
+    }
+
+    /// A release started in a slot an earlier release used describes this one
+    /// and nothing else.
+    ///
+    /// The clear on the way in is the whole of that guarantee: nothing else
+    /// re-blanks the slot, so without it the summary would report a head
+    /// measured at stow nobody looked at, and a servo that never answered as one
+    /// that let go.
+    #[test]
+    fn a_release_started_over_an_earlier_one_describes_this_one_only() {
+        let cfg = config();
+
+        // A first release that leaves something in every field the clear has to
+        // reach: a leg away from stow, and a servo that answered neither its
+        // measurement nor its release.
+        let mut messy = bus();
+        messy.present.legs[2] += 0.4;
+        messy.silent[1] = true;
+        let mut slot = DisarmSnapWire::new();
+        let mut seq = DisarmSequencer::start(&cfg, &mut slot);
+        let dirty =
+            crate::testutil::drive(&mut seq, &mut messy).expect("a release always finishes");
+        assert!(!dirty.at_stow, "the machine was away from stow");
+        assert!(
+            dirty.unmeasured[1].is_some(),
+            "a silent servo is not measured"
+        );
+        assert!(!dirty.released[1], "and acknowledges no release");
+        assert_ne!(dirty.deviation, [0.0; ROW_COUNT]);
+
+        // The same slot, run again against a machine at stow.
+        let mut clean = bus();
+        let mut seq = DisarmSequencer::start(&cfg, &mut slot);
+        let again =
+            crate::testutil::drive(&mut seq, &mut clean).expect("a release always finishes");
+
+        let mut fresh_slot = DisarmSnapWire::new();
+        let mut fresh_machine = bus();
+        let mut fresh_seq = DisarmSequencer::start(&cfg, &mut fresh_slot);
+        let fresh = crate::testutil::drive(&mut fresh_seq, &mut fresh_machine)
+            .expect("a release always finishes");
+
+        assert_eq!(again, fresh, "the reused slot reported the release it ran");
+        assert_eq!(slot, fresh_slot, "and holds nothing of the one before it");
     }
 }

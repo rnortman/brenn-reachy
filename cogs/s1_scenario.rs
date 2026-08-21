@@ -16,7 +16,7 @@
 use scenario::author::Step;
 use scenario::{STOW_DURATION_NS, UP_DURATION_NS, cycle_at, cycles_for};
 
-use brenn_reachy__cogs__msgs_clk_rs::Posture;
+use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 
 /// The cycle the session is engaged and the machine energised at.
 ///
@@ -68,12 +68,12 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(UP_START_CYCLE),
             end_ns: cycle_at(STOW_START_CYCLE),
-            posture: Some(Posture::UP),
+            posture: Some(PostureWire::UP),
         },
         Step {
             start_ns: cycle_at(STOW_START_CYCLE),
             end_ns: cycle_at(DISENGAGE_CYCLE),
-            posture: Some(Posture::STOW),
+            posture: Some(PostureWire::STOW),
         },
     ]
 }

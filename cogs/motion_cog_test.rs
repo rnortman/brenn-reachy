@@ -10,16 +10,17 @@
 //! carrier's, and the two are deliberately different numbers in these cases so
 //! that one standing in for the other fails.
 
-use brenn_reachy__cogs__config_clk_rs::MoverParams;
+use brenn_reachy__cogs__config_clk_rs::MoverParamsWire;
 use brenn_reachy__cogs__motion_clk_rs_test::{MoverTestWrapper, PoseTestWrapper};
-use brenn_reachy__cogs__msgs_clk_rs::{
-    FaultKind, JointRef, PoseEstimate, Posture, ScheduledStep, SessionSchedule, StepKind, TickFault,
+use brenn_reachy__cogs__schedule_clk_rs::{
+    PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
 };
-use clockwork__clockwork__io__var_packet_clk_rs::{VarPacket__128, VarPacket__288};
-use clockwork_rs::{Clear as _, SyncTime};
-use motion_slots::{
-    read_joints, read_motion_snap, read_pose, row_from_joint_ref, rows_from_joints,
-};
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
+use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, TickFaultWire};
+use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointRefWire, JointsWire};
+use brenn_reachy__motion__tick_state_clk_rs::{MotionMode, MotionSnap, MotionSnapWire};
+use clockwork_rs::{Clear as _, Duration as SlotDuration, SyncTime};
 use nalgebra::Isometry3;
 use reachy_kin::{
     HeadGeometry, LegAngles, default_geometry, inverse_kinematics, neutral_head_pose,
@@ -27,11 +28,17 @@ use reachy_kin::{
 };
 use reachy_motion::default_motion_config;
 use reachy_motion::disarm::{STOW_ANTENNAS, stow_targets};
-use reachy_motion::joints::{JointId, JointSet};
+use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
+use reachy_motion::joints::{
+    self, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
+};
+use reachy_motion::record;
 use reachy_motion::snap::PoseSnapshotError;
-use reachy_motion::tick::Mode;
-use reachy_wire::{GoalSetpoint, JOINT_COUNT, PoseSample};
-use std::time::Duration;
+
+/// The validated tick state, panicking if the slot's bytes are not one.
+fn state_of(slot: &MotionSnapWire) -> &MotionSnap {
+    slot.validate().expect("a state a tick produced")
+}
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -65,49 +72,101 @@ fn cranks(head: &Isometry3<f64>) -> [f64; 6] {
     angles.0
 }
 
+/// One sample as a case states it, before it is written into a message.
+///
+/// A plain struct rather than the schema type, so a case can build one and then
+/// damage a single field of it; [`Sample::message`] is where it becomes the
+/// message the channel carries.
+struct Sample {
+    /// The cycle's grid instant.
+    nominal_time_ns: i64,
+    /// When the read completed.
+    sample_time_ns: i64,
+    /// Whether the reading is a complete one.
+    present_valid: bool,
+    /// Whether a setpoint is being held.
+    commanded_valid: bool,
+    torque_off_latched: bool,
+    /// The rows that did not answer, as the bits the schema holds: a case that
+    /// wants a set this build does not know sets a bit above the ninth.
+    missing: u16,
+    /// Measured positions, radians in bus order.
+    present: [f64; JOINT_COUNT],
+    /// The setpoint held, radians in bus order.
+    commanded: [f64; JOINT_COUNT],
+}
+
+impl Sample {
+    fn message(&self) -> PoseSampleWire {
+        let mut msg = PoseSampleWire::new();
+        let view = msg.clear_valid();
+        view.nominal_time = SyncTime::from_nanos(self.nominal_time_ns);
+        view.sample_time = SyncTime::from_nanos(self.sample_time_ns);
+        view.present_valid = self.present_valid.into();
+        view.commanded_valid = self.commanded_valid.into();
+        view.torque_off_latched = self.torque_off_latched.into();
+        write_rows(&mut view.present, &self.present);
+        write_rows(&mut view.commanded, &self.commanded);
+        // Last, and through the open type: a case damages this field on purpose
+        // to drive the boundary refusal, so the set is written as bits rather
+        // than narrowed here.
+        msg.set_missing(JointFlagsWire(self.missing));
+        msg
+    }
+}
+
+/// The nine angles the machine rests at, in bus-row order.
+///
+/// Through the schema's own vector, which is where the library states the
+/// mapping between a servo's name and its bus row in both directions.
+fn stow_rows() -> [f64; JOINT_COUNT] {
+    let mut slot = JointsWire::new();
+    joints::write_vector(
+        slot.clear_valid(),
+        &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
+    );
+    rows_of(
+        slot.validate()
+            .expect("a cleared vector of angles reads back"),
+    )
+}
+
 /// A complete sample reading the crank angles that hold `head`.
-fn sample_at(head: &Isometry3<f64>, at_ns: i64) -> PoseSample {
+fn sample_at(head: &Isometry3<f64>, at_ns: i64) -> Sample {
     let mut present = [0.0; JOINT_COUNT];
     present[1..7].copy_from_slice(&cranks(head));
-    PoseSample {
+    Sample {
         nominal_time_ns: at_ns,
         sample_time_ns: at_ns,
         present_valid: true,
         commanded_valid: true,
         torque_off_latched: false,
-        miss_mask: 0,
+        missing: 0,
         present,
         commanded: [0.0; JOINT_COUNT],
     }
 }
 
 /// Hand a sample to the cog, as the driver's channel would.
-fn publish(cog: &mut PoseTestWrapper, sample: &PoseSample, seq: u32, at_ns: i64) {
-    let mut packet = VarPacket__288::new();
-    assert!(
-        packet.try_set_bytes(&sample.encode(seq)),
-        "the carrier holds a PoseSample datagram",
-    );
-    cog.publish_sample(&packet, SyncTime::from_nanos(at_ns));
+fn publish(cog: &mut PoseTestWrapper, sample: &Sample, at_ns: i64) {
+    cog.publish_sample(&sample.message(), SyncTime::from_nanos(at_ns));
 }
 
-/// Hand the cog a datagram the codec will refuse.
+/// Hand the cog a message validation will refuse.
 ///
-/// The bytes are a well-formed sample with the version byte bumped past what
-/// this build speaks, which is the failure a driver upgrade produces online:
-/// the header is intact, the payload is unreadable, and the receiver's only
-/// answer is to drop it.
-fn publish_undecodable(cog: &mut PoseTestWrapper, seq: u32, at_ns: i64) {
-    let mut bytes = sample_at(&neutral_head_pose(), at_ns).encode(seq);
-    bytes[2] = bytes[2].wrapping_add(1);
+/// A well-formed sample whose missing-rows field names a servo above the ninth
+/// bus row, which is the failure a driver from a build that knows more servos
+/// than this one produces: the bytes are the right size and every other field
+/// reads, and the receiver's only answer is to drop the message.
+fn publish_unreadable(cog: &mut PoseTestWrapper, at_ns: i64) {
+    let mut sample = sample_at(&neutral_head_pose(), at_ns);
+    sample.missing = 1 << 15;
+    let msg = sample.message();
     assert!(
-        PoseSample::decode(&bytes).is_err(),
-        "the case rests on these bytes not decoding",
+        msg.validate().is_err(),
+        "the case rests on this message not validating",
     );
-
-    let mut packet = VarPacket__288::new();
-    assert!(packet.try_set_bytes(&bytes), "the carrier holds a datagram");
-    cog.publish_sample(&packet, SyncTime::from_nanos(at_ns));
+    cog.publish_sample(&msg, SyncTime::from_nanos(at_ns));
 }
 
 /// One published estimate, copied out of the message.
@@ -142,19 +201,18 @@ impl Reading {
 }
 
 /// Copy an estimate out of the cog's memory.
-fn read(estimate: &PoseEstimate) -> Reading {
-    let joints = read_joints(estimate.joints());
-    let pos = estimate.head_pos();
-    let quat = estimate.head_quat();
+fn read(estimate: &PoseEstimateWire) -> Reading {
+    let estimate = estimate.validate().expect("the cog publishes an estimate");
+    let (pos, quat) = (&estimate.head_pos, &estimate.head_quat);
     Reading {
-        time_of_validity_ns: estimate.time_of_validity().as_nanos(),
-        joints: rows_from_joints(&joints),
-        head_pos: [pos.x(), pos.y(), pos.z()],
-        head_quat: [quat.w(), quat.x(), quat.y(), quat.z()],
-        pose: read_pose(estimate),
-        valid: estimate.valid(),
-        fk_iters: estimate.fk_iters(),
-        fk_residual: estimate.fk_residual(),
+        time_of_validity_ns: estimate.time_of_validity.as_nanos(),
+        joints: rows_of(&estimate.joints),
+        head_pos: [pos.x, pos.y, pos.z],
+        head_quat: [quat.w, quat.x, quat.y, quat.z],
+        pose: record::read_pose(pos, quat),
+        valid: bool::from(estimate.valid),
+        fk_iters: estimate.fk_iters,
+        fk_residual: estimate.fk_residual,
     }
 }
 
@@ -164,8 +222,8 @@ fn published(cog: &mut PoseTestWrapper) -> Option<Reading> {
 }
 
 /// Publish one sample and run one execution, returning the estimate.
-fn one_sample(cog: &mut PoseTestWrapper, sample: &PoseSample, at_ns: i64) -> Reading {
-    publish(cog, sample, 0, at_ns);
+fn one_sample(cog: &mut PoseTestWrapper, sample: &Sample, at_ns: i64) -> Reading {
+    publish(cog, sample, at_ns);
     assert!(cog.execute(SyncTime::from_nanos(at_ns)));
     published(cog).expect("every sample produces one estimate")
 }
@@ -232,7 +290,7 @@ fn an_incomplete_sample_is_reported_as_such_rather_than_skipped() {
     // A row that did not answer. Everything else about the sample is solvable,
     // so what makes this invalid is the mask and nothing else.
     let mut sample = sample_at(&neutral_head_pose(), T0);
-    sample.miss_mask = 1 << 3;
+    sample.missing = 1 << 3;
 
     let estimate = one_sample(&mut cog, &sample, T0);
     assert!(!estimate.valid, "a row is missing, so there is no reading");
@@ -367,7 +425,7 @@ fn a_burst_folds_to_the_last_sample_and_the_seed_follows_the_whole_run() {
     let route = [neutral_head_pose(), rest_head_pose(), stow_head_pose()];
     for (step, wanted) in route.iter().enumerate() {
         let at = T0 + (step as i64) * PERIOD;
-        publish(&mut cog, &sample_at(wanted, at), step as u32, T0);
+        publish(&mut cog, &sample_at(wanted, at), T0);
     }
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
@@ -382,7 +440,7 @@ fn a_burst_folds_to_the_last_sample_and_the_seed_follows_the_whole_run() {
 }
 
 #[test]
-fn an_undecodable_window_is_reported_as_an_outage_and_leaves_the_seed() {
+fn a_window_of_refused_samples_is_reported_as_an_outage_and_leaves_the_seed() {
     let mut cog = pose_cog();
     cog.initialize(SyncTime::from_nanos(T0));
 
@@ -395,7 +453,7 @@ fn an_undecodable_window_is_reported_as_an_outage_and_leaves_the_seed() {
     // The datagram carries an instant of its own -- it is a well-formed sample
     // this build will not read -- and the estimate must not report that one:
     // nothing decoded it, so the only instant the cog knows is its own.
-    publish_undecodable(&mut cog, 1, T0 + PERIOD);
+    publish_unreadable(&mut cog, T0 + PERIOD);
     assert!(cog.execute(SyncTime::from_nanos(T0 + 2 * PERIOD)));
 
     let estimate = published(&mut cog).expect(
@@ -412,7 +470,7 @@ fn an_undecodable_window_is_reported_as_an_outage_and_leaves_the_seed() {
         "no bytes were read, so no positions are claimed",
     );
 
-    assert_eq!(cog.state_est().undecodable_samples(), 1);
+    assert_eq!(cog.state_est().refused_samples(), 1);
     assert!(cog.state_est().have_seed());
     assert_eq!(
         cog.state_est().seed_pos().z(),
@@ -430,10 +488,10 @@ fn the_totals_count_the_run_and_stand_still_when_nothing_happens() {
 
     for step in 0..3 {
         let at = T0 + step * PERIOD;
-        publish_undecodable(&mut cog, u32::try_from(step).unwrap(), at);
+        publish_unreadable(&mut cog, at);
         assert!(cog.execute(SyncTime::from_nanos(at)));
     }
-    assert_eq!(cog.state_est().undecodable_samples(), 3);
+    assert_eq!(cog.state_est().refused_samples(), 3);
     assert_eq!(cog.state_est().fk_failures(), 0);
     assert_eq!(cog.state_est().refused_seeds(), 0);
 
@@ -444,25 +502,25 @@ fn the_totals_count_the_run_and_stand_still_when_nothing_happens() {
     let estimate = one_sample(&mut cog, &broken, T0 + 3 * PERIOD);
     assert!(!estimate.valid);
     assert_eq!(cog.state_est().fk_failures(), 1);
-    assert_eq!(cog.state_est().undecodable_samples(), 3, "still the run's");
+    assert_eq!(cog.state_est().refused_samples(), 3, "still the run's");
 
     // A sample that solves moves neither counter.
     let good = one_sample(&mut cog, &sample_at(&rest_head_pose(), T0 + 4 * PERIOD), T0);
     assert!(good.valid);
     assert_eq!(cog.state_est().fk_failures(), 1);
-    assert_eq!(cog.state_est().undecodable_samples(), 3);
+    assert_eq!(cog.state_est().refused_samples(), 3);
     assert_eq!(cog.state_est().refused_seeds(), 0);
 }
 
 #[test]
-fn an_undecodable_datagram_does_not_hide_the_samples_around_it() {
+fn a_refused_sample_does_not_hide_the_samples_around_it() {
     let mut cog = pose_cog();
     cog.initialize(SyncTime::from_nanos(T0));
 
     // The drop is per message; it does not poison the rest of the window.
-    publish(&mut cog, &sample_at(&neutral_head_pose(), T0), 0, T0);
-    publish_undecodable(&mut cog, 1, T0);
-    publish(&mut cog, &sample_at(&stow_head_pose(), T0 + PERIOD), 2, T0);
+    publish(&mut cog, &sample_at(&neutral_head_pose(), T0), T0);
+    publish_unreadable(&mut cog, T0);
+    publish(&mut cog, &sample_at(&stow_head_pose(), T0 + PERIOD), T0);
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
     let estimate = published(&mut cog).expect("the last decodable sample in the window");
@@ -481,7 +539,7 @@ fn an_invalid_estimate_carries_no_pose_from_the_one_before_it() {
     assert_ne!(solved.head_pos[2], 0.0);
 
     let mut missing = sample_at(&rest_head_pose(), T0 + PERIOD);
-    missing.miss_mask = 1;
+    missing.missing = 1;
 
     // The output slot is reused memory. What it held is not an estimate of
     // where the head is now, and a consumer reading the pose fields of an
@@ -512,13 +570,28 @@ const UP_NS: i64 = 800_000_000;
 /// How long the move to stow is given.
 const STOW_NS: i64 = 2_000_000_000;
 
-/// One published goal datagram, copied out of the carrier.
+/// One published setpoint, copied out of the message.
 #[derive(Clone, Copy)]
 struct Goal {
-    /// The wire sequence number it carried.
-    seq: u32,
-    /// The setpoint itself.
-    setpoint: GoalSetpoint,
+    /// The grid instant it is due at.
+    execute_at_ns: i64,
+    /// The rows it speaks for.
+    mask: JointFlags,
+    /// The angles asked for, in bus-row order.
+    targets: [f64; JOINT_COUNT],
+}
+
+impl Goal {
+    /// The same setpoint as the channel carries it, for the self-loop the
+    /// wrappers do not wire.
+    fn message(&self) -> GoalSetpointWire {
+        let mut msg = GoalSetpointWire::new();
+        let view = msg.clear_valid();
+        view.execute_at = SyncTime::from_nanos(self.execute_at_ns);
+        view.mask = self.mask;
+        write_rows(&mut view.targets, &self.targets);
+        msg
+    }
 }
 
 /// One published report, copied out of the message.
@@ -527,9 +600,9 @@ struct Report {
     /// The instant it is about.
     time_ns: i64,
     /// What was raised.
-    kind: FaultKind,
+    kind: FaultKindWire,
     /// The servo concerned, or none.
-    joint: JointRef,
+    joint: JointRefWire,
     /// The magnitude that carried the classification.
     detail: f64,
     /// The count that carried it.
@@ -546,13 +619,14 @@ struct Cycle {
     report: Option<Report>,
 }
 
-fn params(period_ns: i64, up_ns: i64, stow_ns: i64) -> MoverParams {
-    let mut params = MoverParams::new();
-    params.set_lag_k(u32::try_from(LAG).expect("a small lag"));
-    params.set_period_ns(period_ns);
-    params.set_up_duration_ns(up_ns);
-    params.set_stow_duration_ns(stow_ns);
-    params
+fn params(period_ns: i64, up_ns: i64, stow_ns: i64) -> MoverParamsWire {
+    let mut message = MoverParamsWire::new();
+    let params = message.clear_valid();
+    params.lag_k = u32::try_from(LAG).expect("a small lag");
+    params.period_ns = period_ns;
+    params.up_duration_ns = up_ns;
+    params.stow_duration_ns = stow_ns;
+    message
 }
 
 /// A decision tick under test, with a machine in front of it.
@@ -564,11 +638,9 @@ struct Mover {
     /// Where the modelled servos are, radians in bus order.
     present: [f64; JOINT_COUNT],
     /// Rows that do not follow their goal: an obstruction, to a position loop.
-    frozen: JointSet,
+    frozen: JointFlags,
     /// Whether the samples carry a reading at all.
     blind: bool,
-    /// The sample stream's own sequence number.
-    sample_seq: u32,
 }
 
 impl Mover {
@@ -578,7 +650,7 @@ impl Mover {
     }
 
     /// The same, configured as written -- including numbers the cog refuses.
-    fn on(params: &MoverParams) -> Self {
+    fn on(params: &MoverParamsWire) -> Self {
         let mut cog = MoverTestWrapper::new();
         cog.input_sample_set_num_slots(8);
         cog.input_sched_set_num_slots(1);
@@ -592,12 +664,9 @@ impl Mover {
         Self {
             cog,
             now: T0,
-            present: rows_from_joints(
-                &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
-            ),
-            frozen: JointSet::EMPTY,
+            present: stow_rows(),
+            frozen: JointFlags::NONE,
             blind: false,
-            sample_seq: 0,
         }
     }
 
@@ -605,12 +674,12 @@ impl Mover {
     ///
     /// The steps are half-open intervals from `T0`, one per posture named, each
     /// as long as `spans` says in cycles.
-    fn schedule(&mut self, engaged: bool, epoch: u32, spans: &[(i64, Option<Posture>)]) {
-        let spans: Vec<(i64, StepKind, Posture)> = spans
+    fn schedule(&mut self, engaged: bool, epoch: u32, spans: &[(i64, Option<PostureWire>)]) {
+        let spans: Vec<(i64, StepKindWire, PostureWire)> = spans
             .iter()
             .map(|(cycles, posture)| match posture {
-                Some(posture) => (*cycles, StepKind::BASE_POSTURE, *posture),
-                None => (*cycles, StepKind::BASE_KEEP, Posture::STOW),
+                Some(posture) => (*cycles, StepKindWire::BASE_POSTURE, *posture),
+                None => (*cycles, StepKindWire::BASE_KEEP, PostureWire::STOW),
             })
             .collect();
         self.schedule_raw(engaged, epoch, &spans);
@@ -619,8 +688,13 @@ impl Mover {
     /// The same, with each step's kind and posture written as given -- including
     /// values this build's vocabulary does not declare, which is what a schedule
     /// from a newer session cog carries.
-    fn schedule_raw(&mut self, engaged: bool, epoch: u32, spans: &[(i64, StepKind, Posture)]) {
-        let mut schedule = SessionSchedule::new();
+    fn schedule_raw(
+        &mut self,
+        engaged: bool,
+        epoch: u32,
+        spans: &[(i64, StepKindWire, PostureWire)],
+    ) {
+        let mut schedule = SessionScheduleWire::new();
         schedule.set_engaged(engaged);
         schedule.set_epoch(epoch);
         {
@@ -629,7 +703,8 @@ impl Mover {
             let mut start = T0;
             for (cycles, kind, posture) in spans {
                 let end = start + cycles * PERIOD;
-                let step: &mut ScheduledStep = steps.try_grow().expect("sixteen steps is plenty");
+                let step: &mut ScheduledStepWire =
+                    steps.try_grow().expect("sixteen steps is plenty");
                 step.set_start(SyncTime::from_nanos(start));
                 step.set_end(SyncTime::from_nanos(end));
                 step.set_kind(*kind);
@@ -643,25 +718,18 @@ impl Mover {
 
     /// Hand the cog one sample, as the driver's channel would.
     fn publish_sample(&mut self, at_ns: i64) {
-        let sample = PoseSample {
+        let sample = Sample {
             nominal_time_ns: at_ns,
             sample_time_ns: at_ns,
             present_valid: !self.blind,
             commanded_valid: true,
             torque_off_latched: false,
-            miss_mask: if self.blind { u16::MAX >> 7 } else { 0 },
+            missing: if self.blind { u16::MAX >> 7 } else { 0 },
             present: self.present,
             commanded: [0.0; JOINT_COUNT],
         };
-        let seq = self.sample_seq;
-        self.sample_seq = self.sample_seq.wrapping_add(1);
-        let mut packet = VarPacket__288::new();
-        assert!(
-            packet.try_set_bytes(&sample.encode(seq)),
-            "the carrier holds a PoseSample datagram",
-        );
         self.cog
-            .publish_sample(&packet, SyncTime::from_nanos(at_ns));
+            .publish_sample(&sample.message(), SyncTime::from_nanos(at_ns));
     }
 
     /// Run one cycle: one sample in, whatever came out, and the machine moved.
@@ -680,24 +748,20 @@ impl Mover {
 
     /// Read this execution's outputs, and close the goal channel's self-loop.
     fn collect(&mut self, nominal: i64) -> Cycle {
-        let bytes = self
-            .cog
-            .try_next_goal()
-            .map(|packet| packet.bytes().as_slice().to_vec());
-        let report = self.cog.try_next_fault().map(read_report);
-        if let Some(bytes) = &bytes {
-            let mut packet = VarPacket__128::new();
-            assert!(packet.try_set_bytes(bytes));
-            self.cog
-                .publish_own_cmd(&packet, SyncTime::from_nanos(nominal));
-        }
-        let goal = bytes.map(|bytes| {
-            let (header, setpoint) = GoalSetpoint::decode(&bytes).expect("a goal datagram");
-            Goal {
-                seq: header.seq,
-                setpoint,
-            }
+        let goal = self.cog.try_next_goal().map(|msg| Goal {
+            execute_at_ns: msg.execute_at().as_nanos(),
+            mask: msg.mask().to_known().expect("a goal names bus rows"),
+            targets: rows_of(
+                &msg.validate()
+                    .expect("the cog publishes a setpoint")
+                    .targets,
+            ),
         });
+        let report = self.cog.try_next_fault().map(read_report);
+        if let Some(goal) = &goal {
+            self.cog
+                .publish_own_cmd(&goal.message(), SyncTime::from_nanos(nominal));
+        }
         Cycle {
             nominal,
             goal,
@@ -714,15 +778,12 @@ impl Mover {
         let Some(goal) = goal else {
             return;
         };
-        for joint in JointSet::from_bits(goal.setpoint.mask)
-            .expect("a goal names bus rows")
-            .iter()
-        {
-            let Some(row) = joint.index() else {
+        for joint in flags::iter(goal.mask) {
+            let Some(row) = row(joint) else {
                 continue;
             };
-            if !self.frozen.contains(joint) {
-                self.present[row] = goal.setpoint.targets[row];
+            if !flags::contains(self.frozen, joint) {
+                self.present[row] = goal.targets[row];
             }
         }
     }
@@ -755,13 +816,13 @@ impl Mover {
     }
 
     /// The angles the machine is at.
-    fn at(&self, joint: JointId) -> f64 {
-        self.present[joint.index().expect("a bus row")]
+    fn at(&self, joint: JointRef) -> f64 {
+        self.present[row(joint).expect("a bus row")]
     }
 }
 
 /// Copy a report out of the cog's memory.
-fn read_report(fault: &TickFault) -> Report {
+fn read_report(fault: &TickFaultWire) -> Report {
     Report {
         time_ns: fault.time().as_nanos(),
         kind: fault.kind(),
@@ -788,11 +849,6 @@ fn direction(angle: f64) -> f64 {
     }
 }
 
-/// The set of joints a mask names.
-fn rows(mask: u16) -> JointSet {
-    JointSet::from_bits(mask).expect("a goal names bus rows")
-}
-
 /// Everything the cycles reported, in order.
 fn reports(cycles: &[Cycle]) -> Vec<Report> {
     cycles.iter().filter_map(|cycle| cycle.report).collect()
@@ -803,7 +859,7 @@ fn standing_up() -> Mover {
     let mut mover = Mover::new();
     // One long step, so the whole run is inside it and a case that wants a
     // retarget publishes a fresh schedule rather than falling off the end.
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     mover
 }
 
@@ -821,16 +877,11 @@ fn engaging_arms_from_the_sample_and_commands_the_posture_the_schedule_names() {
         .goal
         .expect("an armed machine is commanded every sample");
     assert_eq!(
-        goal.setpoint.execute_at_ns,
+        goal.execute_at_ns,
         first.nominal + LAG * PERIOD,
         "a goal names the grid instant the lag puts it at",
     );
-    assert_eq!(goal.seq, 0, "the first datagram this cog ever published");
-    assert_eq!(
-        rows(goal.setpoint.mask),
-        JointSet::ALL,
-        "nothing is out of service",
-    );
+    assert_eq!(goal.mask, flags::all(), "nothing is out of service",);
     assert!(first.report.is_none(), "arming is not news");
 
     // The antennas unfold and the head rises: the run ends somewhere other than
@@ -839,11 +890,12 @@ fn engaging_arms_from_the_sample_and_commands_the_posture_the_schedule_names() {
     let cycles = mover.run(60);
     assert!(cycles.iter().all(|cycle| cycle.goal.is_some()));
     assert!(reports(&cycles).is_empty(), "a clean move raises nothing");
-    for antenna in [JointId::AntennaRight, JointId::AntennaLeft] {
+    for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
         let angle = mover.at(antenna);
         assert!(
             direction(angle).abs() < 1e-9,
-            "{antenna} points upright, at {angle} rad",
+            "{} points upright, at {angle} rad",
+            Name(antenna),
         );
     }
     assert_eq!(
@@ -863,26 +915,26 @@ fn every_goal_names_a_later_instant_and_no_step_is_larger_than_a_servo_may_take(
     let mut previous: Option<Goal> = None;
     for cycle in &cycles {
         let goal = cycle.goal.expect("commanded on every sample");
-        assert_eq!(goal.setpoint.execute_at_ns, cycle.nominal + LAG * PERIOD);
+        assert_eq!(goal.execute_at_ns, cycle.nominal + LAG * PERIOD);
         if let Some(previous) = previous {
             assert!(
-                goal.setpoint.execute_at_ns > previous.setpoint.execute_at_ns,
+                goal.execute_at_ns > previous.execute_at_ns,
                 "the stream is monotonic",
             );
-            assert_eq!(
-                goal.seq,
-                previous.seq.wrapping_add(1),
-                "one stream, in order"
-            );
-            for joint in JointId::ALL {
-                let row = joint.index().expect("a bus row");
-                let delta = (goal.setpoint.targets[row] - previous.setpoint.targets[row]).abs();
-                let bound = match joint.group() {
-                    reachy_motion::joints::JointGroup::Legs => step.legs,
-                    reachy_motion::joints::JointGroup::BodyYaw => step.body_yaw,
-                    reachy_motion::joints::JointGroup::Antennas => step.antennas,
+            for joint in ROWS {
+                let row = row(joint).expect("a bus row");
+                let delta = (goal.targets[row] - previous.targets[row]).abs();
+                let bound = match group_of(joint) {
+                    Some(reachy_motion::joints::JointGroup::Legs) => step.legs,
+                    Some(reachy_motion::joints::JointGroup::BodyYaw) => step.body_yaw,
+                    Some(reachy_motion::joints::JointGroup::Antennas) => step.antennas,
+                    None => continue,
                 };
-                assert!(delta <= bound, "{joint} steps {delta} rad, past {bound}");
+                assert!(
+                    delta <= bound,
+                    "{} steps {delta} rad, past {bound}",
+                    Name(joint)
+                );
             }
         }
         previous = Some(goal);
@@ -907,11 +959,10 @@ fn a_holding_machine_keeps_the_goal_stream_alive_with_the_setpoint_it_is_on() {
     for cycle in &holding {
         let goal = cycle.goal.expect("a holding session is not a stopped one");
         assert_eq!(
-            goal.setpoint.targets, arrived.setpoint.targets,
+            goal.targets, arrived.targets,
             "the setpoint it is already on, republished",
         );
-        assert_eq!(goal.seq, previous.seq.wrapping_add(1), "a fresh datagram");
-        assert!(goal.setpoint.execute_at_ns > previous.setpoint.execute_at_ns);
+        assert!(goal.execute_at_ns > previous.execute_at_ns);
         previous = goal;
     }
     assert!(reports(&holding).is_empty());
@@ -920,7 +971,7 @@ fn a_holding_machine_keeps_the_goal_stream_alive_with_the_setpoint_it_is_on() {
 #[test]
 fn a_session_nobody_engaged_is_never_armed_and_never_commands() {
     let mut mover = Mover::new();
-    mover.schedule(false, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(false, 1, &[(1000, Some(PostureWire::UP))]);
 
     let cycles = mover.run(5);
     assert!(cycles.iter().all(|cycle| cycle.goal.is_none()));
@@ -945,7 +996,7 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
     mover.run(20);
     assert!(mover.cog.state_ctrl().armed());
 
-    mover.schedule(false, 2, &[(1000, Some(Posture::UP))]);
+    mover.schedule(false, 2, &[(1000, Some(PostureWire::UP))]);
     let cycles = mover.run(3);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_none()),
@@ -964,13 +1015,13 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
 
     // Engaging again builds a fresh state from where the machine now stands,
     // rather than resuming the one that ended.
-    mover.schedule(true, 3, &[(1000, Some(Posture::STOW))]);
+    mover.schedule(true, 3, &[(1000, Some(PostureWire::STOW))]);
     let fresh = mover.step();
     assert!(mover.cog.state_ctrl().armed());
     assert!(fresh.goal.is_some());
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "a fresh engagement dispatches the posture its schedule names",
     );
     assert_eq!(
@@ -1045,6 +1096,69 @@ fn a_slot_that_describes_no_machine_re_arms_rather_than_aborting() {
     );
 }
 
+/// A ctrl slot whose bytes this build cannot read at all is cleared, counted
+/// and re-armed on the same cycle, and the goal stream carries on across it.
+///
+/// Distinct from a slot that reads as a state and describes none: this one
+/// fails validation, which is the branch a peer built against another schema
+/// reaches. The clear is what keeps it to one cycle -- without it the cog
+/// returns before ever running the arming path, and the stream stops for good
+/// rather than for a cycle.
+#[test]
+fn a_slot_this_build_cannot_read_is_cleared_and_re_armed() {
+    use brenn_reachy__motion__tick_state_clk_rs::MotionModeWire;
+
+    let mut mover = standing_up();
+    mover.run(3);
+    assert!(mover.cog.state_ctrl().armed());
+    let goals = mover.cog.state_ctrl().goals_published();
+
+    // A discriminant the schema does not declare, written through the open
+    // surface -- the only way one reaches a slot at all.
+    mover
+        .cog
+        .state_ctrl_mut()
+        .snap_mut()
+        .set_mode(MotionModeWire(7));
+    assert!(
+        mover.cog.state_ctrl().snap().validate().is_err(),
+        "the slot is damaged"
+    );
+
+    let cycle = mover.step();
+    assert_eq!(
+        mover.cog.state_ctrl().refused_state(),
+        1,
+        "the refusal is counted once, where a reader can see it",
+    );
+    assert!(
+        mover.cog.state_ctrl().armed(),
+        "the cleared slot armed a fresh state from the pose the sample carried",
+    );
+    assert!(cycle.goal.is_some(), "the same cycle commanded the machine");
+    assert_eq!(
+        mover.cog.state_ctrl().goals_published(),
+        goals + 1,
+        "the stream carried on across the refusal",
+    );
+    assert!(
+        reports(&[cycle]).is_empty(),
+        "bytes nobody in this build wrote are not something the machine did",
+    );
+
+    // And damaged a second time, the same cycle's worth of refusal: the count
+    // rises and the stream does not latch off.
+    mover
+        .cog
+        .state_ctrl_mut()
+        .snap_mut()
+        .set_mode(MotionModeWire(7));
+    let again = mover.step();
+    assert_eq!(mover.cog.state_ctrl().refused_state(), 2);
+    assert!(mover.cog.state_ctrl().armed());
+    assert!(again.goal.is_some());
+}
+
 /// The tick counts a sample with no reading as a miss and keeps holding, so the
 /// goal stream carries on: the machine is still under command, and the report
 /// that eventually comes is about the reads, not about this cycle.
@@ -1060,7 +1174,7 @@ fn a_missing_reading_mid_session_is_a_miss_and_not_a_silence() {
         "a machine nobody can see is still a machine being commanded",
     );
     assert!(reports(&blind).is_empty(), "ten misses is not the fault");
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert_eq!(snap.miss_count, 10, "the run of misses is being counted");
 }
 
@@ -1078,8 +1192,8 @@ fn losing_the_reads_reports_once_and_stops_the_stream() {
     let raised = reports(&blind);
     assert_eq!(raised.len(), 1, "one raise is one message");
     let report = raised[0];
-    assert_eq!(report.kind, FaultKind::POSITION_FEEDBACK_LOST);
-    assert_eq!(report.joint, JointRef::NONE, "the reads, not a servo");
+    assert_eq!(report.kind, FaultKindWire::POSITION_FEEDBACK_LOST);
+    assert_eq!(report.joint, JointRefWire::NONE, "the reads, not a servo");
     assert_eq!(
         report.count,
         default_motion_config().read_loss_ticks + 1,
@@ -1117,16 +1231,16 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
     assert!(mover.step().goal.is_none(), "parked");
 
     mover.blind = false;
-    mover.schedule(false, 2, &[(1000, Some(Posture::UP))]);
+    mover.schedule(false, 2, &[(1000, Some(PostureWire::UP))]);
     mover.step();
-    mover.schedule(true, 3, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 3, &[(1000, Some(PostureWire::UP))]);
     let fresh = mover.step();
     assert!(
         fresh.goal.is_some(),
         "a new engagement is a new state, which commands again",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert!(!matches!(snap.mode, Mode::Faulted(_)));
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert!(snap.mode != MotionMode::Faulted);
 }
 
 /// A jammed antenna is a fault confined to a group: the pair goes out of
@@ -1137,18 +1251,18 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
 fn a_jammed_antenna_takes_the_pair_out_of_service_and_the_goals_stop_naming_them() {
     let mut mover = standing_up();
     mover.frozen = {
-        let mut set = JointSet::EMPTY;
-        set.insert(JointId::AntennaRight);
+        let mut set = JointFlags::NONE;
+        flags::insert(&mut set, JointRef::AntennaRight);
         set
     };
 
     let cycles = mover.run(60);
     let raised = reports(&cycles);
     let first = raised.first().expect("a jammed servo is reported");
-    assert_eq!(first.kind, FaultKind::ANTENNA_OBSTRUCTED);
+    assert_eq!(first.kind, FaultKindWire::ANTENNA_OBSTRUCTED);
     assert_eq!(
         first.joint,
-        JointRef::ANTENNA_RIGHT,
+        JointRefWire::ANTENNA_RIGHT,
         "the servo it is about",
     );
     assert!(first.detail.abs() > 0.5, "how far it stood from its goal");
@@ -1159,15 +1273,15 @@ fn a_jammed_antenna_takes_the_pair_out_of_service_and_the_goals_stop_naming_them
         .expect("it was raised");
     for cycle in &cycles[after + 1..] {
         let goal = cycle.goal.expect("the move carries on without it");
-        let mask = rows(goal.setpoint.mask);
-        for antenna in [JointId::AntennaRight, JointId::AntennaLeft] {
+        let mask = goal.mask;
+        for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
             assert!(
-                !mask.contains(antenna),
+                !flags::contains(mask, antenna),
                 "a servo out of service is never written again",
             );
         }
         assert!(
-            mask.contains(JointId::BodyYaw) && mask.contains(JointId::Leg(0)),
+            flags::contains(mask, JointRef::BodyYaw) && flags::contains(mask, JointRef::Leg0),
             "the head is sound and still being commanded",
         );
     }
@@ -1186,10 +1300,10 @@ fn a_jammed_antenna_takes_the_pair_out_of_service_and_the_goals_stop_naming_them
 fn a_jammed_crank_abandons_the_move_and_the_machine_holds_under_command() {
     let mut mover = standing_up();
     mover.frozen = {
-        let mut set = JointSet::EMPTY;
-        for joint in JointId::ALL {
-            if joint.group() == reachy_motion::joints::JointGroup::Legs {
-                set.insert(joint);
+        let mut set = JointFlags::NONE;
+        for joint in ROWS {
+            if group_of(joint) == Some(reachy_motion::joints::JointGroup::Legs) {
+                flags::insert(&mut set, joint);
             }
         }
         set
@@ -1198,8 +1312,8 @@ fn a_jammed_crank_abandons_the_move_and_the_machine_holds_under_command() {
     let cycles = mover.run(60);
     let raised = reports(&cycles);
     let first = raised.first().expect("a jammed crank is reported");
-    assert_eq!(first.kind, FaultKind::HEAD_OBSTRUCTED);
-    assert_ne!(first.joint, JointRef::NONE, "the crank it is about");
+    assert_eq!(first.kind, FaultKindWire::HEAD_OBSTRUCTED);
+    assert_ne!(first.joint, JointRefWire::NONE, "the crank it is about");
 
     let after = cycles
         .iter()
@@ -1209,12 +1323,12 @@ fn a_jammed_crank_abandons_the_move_and_the_machine_holds_under_command() {
     for cycle in &cycles[after + 1..] {
         let goal = cycle.goal.expect("the keep-alive outlives a hold");
         assert_eq!(
-            goal.setpoint.targets, held.setpoint.targets,
+            goal.targets, held.targets,
             "a hold re-publishes what it is on",
         );
     }
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "it holds, it does not park");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "it holds, it does not park");
 }
 
 #[test]
@@ -1224,7 +1338,7 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
 
     // Mid-move, the session asks for stow instead. The epoch is what says the
     // schedule changed; the posture is what says where to.
-    mover.schedule(true, 2, &[(1000, Some(Posture::STOW))]);
+    mover.schedule(true, 2, &[(1000, Some(PostureWire::STOW))]);
     let cycles = mover.run(120);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_some()),
@@ -1233,16 +1347,17 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
     assert!(reports(&cycles).is_empty(), "a retarget refuses nothing");
 
     let stow = stow_targets(default_geometry()).expect("the baked geometry reaches stow");
-    for joint in JointId::ALL {
+    for joint in ROWS {
         let at = mover.at(joint);
         let wanted = stow.get(joint).expect("a bus row");
         assert!(
             (at - wanted).abs() < 1e-6,
-            "{joint} settled at {at} rather than {wanted}",
+            "{} settled at {at} rather than {wanted}",
+            Name(joint),
         );
     }
     assert_eq!(
-        mover.at(JointId::AntennaRight),
+        mover.at(JointRef::AntennaRight),
         STOW_ANTENNAS[0],
         "the antennas folded back",
     );
@@ -1254,19 +1369,19 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
 fn a_repeated_schedule_dispatches_nothing_new() {
     let mut mover = standing_up();
     mover.run(60);
-    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+    let arrived = mover.step().goal.expect("a goal").targets;
 
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     let same = mover.run(3);
     for cycle in &same {
         assert_eq!(
-            cycle.goal.expect("still commanded").setpoint.targets,
+            cycle.goal.expect("still commanded").targets,
             arrived,
             "the same schedule moves nothing",
         );
     }
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "no move was started");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "no move was started");
     assert_eq!(
         mover.cog.state_ctrl().epochs_answered(),
         1,
@@ -1288,13 +1403,16 @@ fn two_posture_steps_under_one_epoch_answer_it_once() {
     mover.schedule(
         true,
         1,
-        &[(BOUNDARY, Some(Posture::UP)), (1000, Some(Posture::STOW))],
+        &[
+            (BOUNDARY, Some(PostureWire::UP)),
+            (1000, Some(PostureWire::STOW)),
+        ],
     );
 
     let up = mover.run(usize::try_from(BOUNDARY - 1).expect("cycles inside the first step"));
     assert!(reports(&up).is_empty(), "a plain stand-up refuses nothing");
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "the up move is over");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "the up move is over");
     assert_eq!(mover.cog.state_ctrl().epochs_answered(), 1);
     assert_eq!(mover.cog.state_ctrl().schedule_epoch_seen(), 1);
 
@@ -1305,9 +1423,9 @@ fn two_posture_steps_under_one_epoch_answer_it_once() {
         stowing.iter().all(|cycle| cycle.goal.is_some()),
         "a step boundary is a new path, not a gap in the stream",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "the second step was dispatched",
     );
     assert_eq!(
@@ -1327,14 +1445,14 @@ fn two_posture_steps_under_one_epoch_answer_it_once() {
 fn two_bumps_in_one_gap_are_answered_once() {
     let mut mover = standing_up();
     mover.run(60);
-    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+    let arrived = mover.step().goal.expect("a goal").targets;
 
     // A keep span over the samples that follow, then the posture the machine is
     // already on -- the shape of the surviving-bump case, with a second bump
     // published inside the same span.
     const KEEP: usize = 6;
     let keep_until = mover.cycles_from_start() + i64::try_from(KEEP).expect("six cycles") + 1;
-    let spans = [(keep_until, None), (1000, Some(Posture::UP))];
+    let spans = [(keep_until, None), (1000, Some(PostureWire::UP))];
     mover.schedule(true, 2, &spans);
     mover.run(3);
     assert_eq!(
@@ -1347,7 +1465,7 @@ fn two_bumps_in_one_gap_are_answered_once() {
     let keeping = mover.run(KEEP - 3);
     for cycle in &keeping {
         assert_eq!(
-            cycle.goal.expect("still commanded").setpoint.targets,
+            cycle.goal.expect("still commanded").targets,
             arrived,
             "a keep span dispatches nothing, whatever the epoch says",
         );
@@ -1363,9 +1481,9 @@ fn two_bumps_in_one_gap_are_answered_once() {
         moving.iter().all(|cycle| cycle.goal.is_some()),
         "the stream never broke",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "the surviving bump was answered",
     );
     assert_eq!(
@@ -1387,9 +1505,13 @@ fn two_bumps_in_one_gap_are_answered_once() {
 fn an_epoch_bump_alone_dispatches_a_fresh_move() {
     let mut mover = standing_up();
     mover.run(60);
-    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "the move is over before the bump");
+    let arrived = mover.step().goal.expect("a goal").targets;
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(
+        snap.mode,
+        MotionMode::Holding,
+        "the move is over before the bump"
+    );
     assert_eq!(mover.cog.state_ctrl().schedule_epoch_seen(), 1);
     assert_eq!(
         mover.cog.state_ctrl().epochs_answered(),
@@ -1399,7 +1521,7 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
 
     // The same step and the same posture at one epoch higher, covering the
     // instants the samples that follow name.
-    mover.schedule(true, 2, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 2, &[(1000, Some(PostureWire::UP))]);
     let again = mover.run(3);
     assert!(reports(&again).is_empty(), "a retarget refuses nothing");
 
@@ -1412,7 +1534,6 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
             cycle
                 .goal
                 .expect("a retarget is a new path, not a gap")
-                .setpoint
                 .targets,
             arrived,
             "the machine is asked for where it already is, every cycle",
@@ -1424,12 +1545,11 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
     // already at UP, so the setpoints a same-posture retarget produces are the
     // ones it was already holding -- the move's own clock is what says a path
     // exists at all.
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Moving);
     assert_eq!(
-        snap.mode,
-        Mode::Moving {
-            elapsed: Duration::from_nanos(u64::try_from(2 * PERIOD).expect("two cycles")),
-        },
+        snap.moving_elapsed,
+        SlotDuration::from_nanos(2 * PERIOD),
         "the bumped epoch is the whole reason a move was started",
     );
     assert_eq!(
@@ -1447,16 +1567,16 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
     // sees a whole move rather than a mode word that clears on the next tick.
     let length = usize::try_from(UP_NS / PERIOD).expect("a move of whole cycles");
     mover.run(length - 3);
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "one cycle short of the move's length is still moving",
     );
     mover.step();
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert_eq!(
         snap.mode,
-        Mode::Holding,
+        MotionMode::Holding,
         "and the move is over on its length"
     );
 }
@@ -1470,7 +1590,7 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
 fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
     let mut mover = standing_up();
     mover.run(60);
-    let arrived = mover.step().goal.expect("a goal").setpoint.targets;
+    let arrived = mover.step().goal.expect("a goal").targets;
 
     // A keep span over the samples that follow, then the posture the machine is
     // already on. The bump is published under the keep span, which asks for
@@ -1480,11 +1600,15 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
     const KEEP: usize = 4;
     let keep_cycles = i64::try_from(KEEP).expect("four cycles");
     let keep_until = mover.cycles_from_start() + keep_cycles + 1;
-    mover.schedule(true, 2, &[(keep_until, None), (1000, Some(Posture::UP))]);
+    mover.schedule(
+        true,
+        2,
+        &[(keep_until, None), (1000, Some(PostureWire::UP))],
+    );
     let keeping = mover.run(KEEP);
     for cycle in &keeping {
         assert_eq!(
-            cycle.goal.expect("still commanded").setpoint.targets,
+            cycle.goal.expect("still commanded").targets,
             arrived,
             "a keep span dispatches nothing, whatever the epoch says",
         );
@@ -1499,8 +1623,8 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
         1,
         "one epoch answered so far, which is what says the bump is outstanding",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "nothing was dispatched");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "nothing was dispatched");
 
     let moving = mover.run(2);
     assert!(
@@ -1517,9 +1641,9 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
         2,
         "and the answer is what counted it",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "the retarget outlived the gap it landed in",
     );
 }
@@ -1530,20 +1654,20 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
 #[test]
 fn a_step_that_keeps_the_base_and_a_gap_both_hold() {
     let mut mover = Mover::new();
-    mover.schedule(true, 1, &[(5, None), (1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(5, None), (1000, Some(PostureWire::UP))]);
 
     let keeping = mover.run(4);
     for cycle in &keeping {
         assert!(cycle.goal.is_some(), "engaged and armed is commanded");
     }
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "nothing was dispatched");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "nothing was dispatched");
 
     let moving = mover.run(2);
     assert!(moving.iter().all(|cycle| cycle.goal.is_some()));
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "the posture step that follows is dispatched",
     );
 }
@@ -1566,7 +1690,7 @@ fn a_burst_folds_to_the_last_goal() {
     let cycle = mover.collect(mover.now);
     let goal = cycle.goal.expect("one goal, not three");
     assert_eq!(
-        goal.setpoint.execute_at_ns,
+        goal.execute_at_ns,
         base + 3 * PERIOD + LAG * PERIOD,
         "the last sample of the window decided it",
     );
@@ -1587,46 +1711,44 @@ fn a_burst_folds_to_the_last_goal() {
 }
 
 #[test]
-fn a_datagram_the_codec_refuses_is_counted_and_ticks_nothing() {
+fn a_sample_validation_refuses_is_counted_and_ticks_nothing() {
     let mut mover = standing_up();
     mover.run(5);
     let before = mover.cog.state_ctrl().samples_seen();
 
-    // A well-formed sample with the version byte bumped past what this build
-    // speaks: the header is intact and the payload is unreadable, which is what
-    // a driver upgrade looks like from here.
-    let mut bytes = PoseSample {
+    // A well-formed sample whose missing-rows field names a servo above the
+    // ninth bus row: every other field reads, which is what a driver from a
+    // build that knows more servos than this one looks like from here.
+    let mut sample = Sample {
         nominal_time_ns: mover.now + PERIOD,
         sample_time_ns: mover.now + PERIOD,
         present_valid: true,
         commanded_valid: true,
         torque_off_latched: false,
-        miss_mask: 0,
+        missing: 0,
         present: mover.present,
         commanded: [0.0; JOINT_COUNT],
-    }
-    .encode(9);
-    bytes[2] = bytes[2].wrapping_add(1);
-    assert!(PoseSample::decode(&bytes).is_err());
+    };
+    sample.missing = 1 << 15;
+    let msg = sample.message();
+    assert!(msg.validate().is_err());
 
-    let mut packet = VarPacket__288::new();
-    assert!(packet.try_set_bytes(&bytes));
     mover.now += PERIOD;
     mover
         .cog
-        .publish_sample(&packet, SyncTime::from_nanos(mover.now));
+        .publish_sample(&msg, SyncTime::from_nanos(mover.now));
     assert!(mover.cog.execute(SyncTime::from_nanos(mover.now)));
 
     let cycle = mover.collect(mover.now);
     assert!(
         cycle.goal.is_none(),
-        "no sample decoded, so no cycle was decided",
+        "no sample was read, so no cycle was decided",
     );
-    assert_eq!(mover.cog.state_ctrl().undecodable_samples(), 1);
+    assert_eq!(mover.cog.state_ctrl().refused_samples(), 1);
     assert_eq!(
         mover.cog.state_ctrl().samples_seen(),
         before,
-        "a datagram that is not a sample is not a sample",
+        "bytes that are not a sample are not a sample",
     );
 }
 
@@ -1641,21 +1763,21 @@ fn the_tick_state_survives_the_slot_it_is_kept_in() {
     let state = mover.cog.state_ctrl();
     assert!(state.armed());
     assert_eq!(state.schedule_epoch_seen(), 1);
-    assert_eq!(state.desired_kind(), StepKind::BASE_POSTURE);
-    assert_eq!(state.desired_posture(), Posture::UP);
+    assert_eq!(state.desired_kind(), StepKindWire::BASE_POSTURE);
+    assert_eq!(state.desired_posture(), PostureWire::UP);
 
-    let snap = read_motion_snap(state.snap()).expect("a state a tick produced");
-    assert!(matches!(snap.mode, Mode::Moving { .. }));
+    let snap = state_of(state.snap());
+    assert!(snap.mode == MotionMode::Moving);
     assert_eq!(
-        rows_from_joints(&snap.last_goal),
-        last.setpoint.targets,
+        joints::rows_of(&snap.last_goal),
+        last.targets,
         "the goal in the slot is the goal that went out",
     );
     assert!(
-        snap.trajectory.is_some(),
+        bool::from(snap.trajectory.present),
         "the path the move is running on outlived the execution",
     );
-    assert_eq!(snap.masked, JointSet::EMPTY);
+    assert_eq!(snap.masked, JointFlags::NONE);
 }
 
 /// A window that latches a fault part way through commands nothing at all. The
@@ -1689,7 +1811,7 @@ fn a_fault_latching_mid_burst_leaves_the_window_commanding_nothing() {
         "the stream stopped with the latch, whatever the window held",
     );
     let report = cycle.report.expect("the latch is news");
-    assert_eq!(report.kind, FaultKind::POSITION_FEEDBACK_LOST);
+    assert_eq!(report.kind, FaultKindWire::POSITION_FEEDBACK_LOST);
     assert_eq!(
         mover.cog.state_ctrl().samples_seen(),
         u64::try_from(20 + ticks + 2).expect("a small run"),
@@ -1709,15 +1831,15 @@ fn a_command_the_tick_refuses_is_reported_and_moves_nothing() {
     // Far enough round that neither arc back to upright lands inside the
     // antenna's goal band.
     let stranded = 2000.0;
-    mover.present[JointId::AntennaRight.index().expect("a bus row")] = stranded;
+    mover.present[row(JointRef::AntennaRight).expect("a bus row")] = stranded;
 
     let first = mover.step();
     assert!(mover.cog.state_ctrl().armed(), "the refusal is not arming");
     let report = first.report.expect("a refused command is reported");
-    assert_eq!(report.kind, FaultKind::COMMAND_REJECTED);
+    assert_eq!(report.kind, FaultKindWire::COMMAND_REJECTED);
     assert_eq!(
         report.joint,
-        JointRef::ANTENNA_RIGHT,
+        JointRefWire::ANTENNA_RIGHT,
         "the servo the refusal is about",
     );
     assert!(
@@ -1731,8 +1853,8 @@ fn a_command_the_tick_refuses_is_reported_and_moves_nothing() {
         first.goal.is_some(),
         "a refusal changes nothing, and holding is still commanding",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "no move was started");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "no move was started");
     assert_eq!(
         mover.cog.state_ctrl().faults_raised(),
         1,
@@ -1747,24 +1869,27 @@ fn a_move_no_servo_could_step_through_is_abandoned_and_names_the_servo() {
     // The whole stand-up in one cycle, which every crank would have to cross in
     // one bus period.
     let mut mover = Mover::on(&params(PERIOD, PERIOD, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
 
     let cycles = mover.run(4);
     let raised = reports(&cycles);
     let first = raised.first().expect("the move was abandoned");
-    assert_eq!(first.kind, FaultKind::MOVE_ABORTED_STEP);
+    assert_eq!(first.kind, FaultKindWire::MOVE_ABORTED_STEP);
 
-    let row = row_from_joint_ref(first.joint).expect("a report names a bus row or none");
-    let joint = JointId::from_index(usize::from(row)).expect("the servo it is about");
+    let joint = first
+        .joint
+        .to_known()
+        .expect("a report names a servo this build knows, or none");
     let step = default_motion_config().max_step;
-    let bound = match joint.group() {
+    let bound = match group_of(joint).expect("the report names a servo") {
         reachy_motion::joints::JointGroup::Legs => step.legs,
         reachy_motion::joints::JointGroup::BodyYaw => step.body_yaw,
         reachy_motion::joints::JointGroup::Antennas => step.antennas,
     };
     assert!(
         first.detail.abs() > bound,
-        "{joint} was asked for {} rad in a cycle, past the {bound} rad bound the abort is about",
+        "{} was asked for {} rad in a cycle, past the {bound} rad bound the abort is about",
+        Name(joint),
         first.detail,
     );
     assert_eq!(first.count, 0, "an abandoned move has no failed checks");
@@ -1773,9 +1898,9 @@ fn a_move_no_servo_could_step_through_is_abandoned_and_names_the_servo() {
         cycles.iter().all(|cycle| cycle.goal.is_some()),
         "abandoning a move does not stop commanding the machine",
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "it holds where it stood");
-    assert!(snap.trajectory.is_none(), "the path was dropped");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "it holds where it stood");
+    assert!(!bool::from(snap.trajectory.present), "the path was dropped");
 }
 
 /// A posture this build's vocabulary does not declare is not a reason to stand
@@ -1786,13 +1911,13 @@ fn a_posture_this_build_does_not_know_goes_to_stow() {
     let mut mover = standing_up();
     mover.run(60);
     assert!(
-        (mover.at(JointId::AntennaRight) - STOW_ANTENNAS[0]).abs() > 1.0,
+        (mover.at(JointRef::AntennaRight) - STOW_ANTENNAS[0]).abs() > 1.0,
         "the machine is up, so stow is somewhere else",
     );
 
     // A number no enumerator of this build's vocabulary carries, which is what a
     // schedule from a newer session cog would hold.
-    mover.schedule(true, 2, &[(1000, Some(Posture(200)))]);
+    mover.schedule(true, 2, &[(1000, Some(PostureWire(200)))]);
     let cycles = mover.run(140);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_some()),
@@ -1800,12 +1925,13 @@ fn a_posture_this_build_does_not_know_goes_to_stow() {
     );
 
     let stow = stow_targets(default_geometry()).expect("the baked geometry reaches stow");
-    for joint in JointId::ALL {
+    for joint in ROWS {
         let at = mover.at(joint);
         let wanted = stow.get(joint).expect("a bus row");
         assert!(
             (at - wanted).abs() < 1e-6,
-            "{joint} settled at {at} rather than the {wanted} rad stow asks for",
+            "{} settled at {at} rather than the {wanted} rad stow asks for",
+            Name(joint),
         );
     }
 }
@@ -1820,8 +1946,8 @@ fn a_step_kind_this_build_cannot_read_holds() {
         true,
         1,
         &[
-            (5, StepKind(200), Posture::UP),
-            (1000, StepKind::BASE_POSTURE, Posture::UP),
+            (5, StepKindWire(200), PostureWire::UP),
+            (1000, StepKindWire::BASE_POSTURE, PostureWire::UP),
         ],
     );
 
@@ -1834,51 +1960,15 @@ fn a_step_kind_this_build_cannot_read_holds() {
         reports(&unread).is_empty(),
         "an unread step refuses nothing"
     );
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
-    assert_eq!(snap.mode, Mode::Holding, "nothing was dispatched");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "nothing was dispatched");
 
     let moving = mover.run(2);
     assert!(moving.iter().all(|cycle| cycle.goal.is_some()));
-    let snap = read_motion_snap(mover.cog.state_ctrl().snap()).expect("a state a tick produced");
+    let snap = state_of(mover.cog.state_ctrl().snap());
     assert!(
-        matches!(snap.mode, Mode::Moving { .. }),
+        snap.mode == MotionMode::Moving,
         "the posture step that follows is dispatched",
-    );
-}
-
-/// The read-back is where the next sequence number and the instant the next
-/// publish is checked against come from. A carrier this build cannot read leaves
-/// both unknown, so the stream restarts -- and the restart is counted, because
-/// from outside it is indistinguishable from a commander that restarted.
-#[test]
-fn a_read_back_the_codec_refuses_is_counted_and_restarts_the_stream() {
-    let mut mover = standing_up();
-    let cycles = mover.run(3);
-    let last = cycles.last().expect("a run").goal.expect("a goal");
-    assert_eq!(last.seq, 2, "three datagrams, numbered from zero");
-    assert_eq!(mover.cog.state_ctrl().refused_readback(), 0);
-
-    // The cog's own last datagram with its version byte bumped past what this
-    // build speaks: intact bytes, an unreadable payload.
-    let mut bytes = last.setpoint.encode(last.seq);
-    bytes[2] = bytes[2].wrapping_add(1);
-    assert!(GoalSetpoint::decode(&bytes).is_err());
-    let mut packet = VarPacket__128::new();
-    assert!(packet.try_set_bytes(&bytes));
-    mover
-        .cog
-        .publish_own_cmd(&packet, SyncTime::from_nanos(mover.now));
-
-    let cycle = mover.step();
-    assert_eq!(
-        mover.cog.state_ctrl().refused_readback(),
-        1,
-        "the refusal is counted where a reader can see it",
-    );
-    let goal = cycle.goal.expect("the machine is still commanded");
-    assert_eq!(
-        goal.seq, 0,
-        "no sequence to carry on from, so the stream starts again",
     );
 }
 
@@ -1892,16 +1982,16 @@ fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
     // cranks' does, so the two raises are one cycle apart.
     let mut mover = standing_up();
     mover.frozen = {
-        let mut set = JointSet::EMPTY;
-        for joint in JointId::ALL {
-            if joint.group() == reachy_motion::joints::JointGroup::Legs {
-                set.insert(joint);
+        let mut set = JointFlags::NONE;
+        for joint in ROWS {
+            if group_of(joint) == Some(reachy_motion::joints::JointGroup::Legs) {
+                flags::insert(&mut set, joint);
             }
         }
         set
     };
     mover.run(11);
-    mover.frozen = JointSet::ALL;
+    mover.frozen = flags::all();
 
     // Up to the cycle before the first of them, one sample per execution.
     let quiet = mover.run(14);
@@ -1914,7 +2004,7 @@ fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
     let report = cycle.report.expect("the window raised something");
     assert_eq!(
         report.kind,
-        FaultKind::ANTENNA_OBSTRUCTED,
+        FaultKindWire::ANTENNA_OBSTRUCTED,
         "the first raise of the execution keeps the slot",
     );
     assert_eq!(
@@ -1943,7 +2033,7 @@ fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_of_no_length_is_refused() {
     let mut mover = Mover::on(&params(0, UP_NS, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     mover.step();
 }
 
@@ -1951,7 +2041,7 @@ fn a_control_period_of_no_length_is_refused() {
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_running_backwards_is_refused() {
     let mut mover = Mover::on(&params(-PERIOD, UP_NS, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     mover.step();
 }
 
@@ -1959,7 +2049,7 @@ fn a_control_period_running_backwards_is_refused() {
 #[should_panic(expected = "execute() failed")]
 fn a_move_to_the_up_posture_given_no_time_is_refused() {
     let mut mover = Mover::on(&params(PERIOD, 0, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     mover.step();
 }
 
@@ -1967,6 +2057,6 @@ fn a_move_to_the_up_posture_given_no_time_is_refused() {
 #[should_panic(expected = "execute() failed")]
 fn a_move_to_stow_given_no_time_is_refused() {
     let mut mover = Mover::on(&params(PERIOD, UP_NS, 0));
-    mover.schedule(true, 1, &[(1000, Some(Posture::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
     mover.step();
 }

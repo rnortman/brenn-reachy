@@ -1,0 +1,163 @@
+// What the driver says about itself and about the servos: the edges it hits,
+// what its rotating read of the status registers saw, and how one aux
+// transaction turned out.
+//
+// Three records, one module: all three are the driver's diagnostic voice, none
+// of them is per-cycle, and a consumer of one is a consumer of all three -- an
+// operator report, a session's bookkeeping, a bench. The per-cycle pose stream
+// is `driver/pose.clk` and stays out, so a change to a health record does not
+// rebuild the control path.
+//
+// Two conventions hold, and both are worth stating because a reader coming from
+// the datagram layout will expect otherwise: an interval is a `Duration` and an
+// instant a `SyncTime`, never a bare count of microseconds, and a set of servos
+// is `JointFlags`, never a mask of bits a comment explains.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+use cogs::session_aux;
+use hardware::dynamixel::registers;
+use motion::joints;
+
+// Something the driver did, or refused to do, that is not visible in the pose
+// stream.
+//
+// Events are per-occurrence, never per-cycle: a standing condition is a flag on
+// the sample, and an event marks the edge that got it there.
+enum EventKind
+{
+    uuid: e84e7947-0d98-4cd4-b664-e507e8fde8f0;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Nothing happened: what a slot nothing wrote holds, and not an event a
+        // driver ever publishes.
+        #0 none default { underlying_value: 0; }
+
+        // No goal arrived within the hold timeout, so the driver latched torque
+        // off. `silence` is how long the goal stream was quiet.
+        #1 hold_timeout_torque_off { underlying_value: 1; }
+
+        // The driver wrote the minimum risk condition at startup.
+        #2 startup_mrc_write { underlying_value: 2; }
+
+        // A torque-off write was confirmed by every row it named.
+        #3 torque_off_confirmed { underlying_value: 3; }
+
+        // A torque-off write went unconfirmed by at least one row. `rows` names
+        // the ones that did not confirm.
+        #4 torque_off_unconfirmed { underlying_value: 4; }
+
+        // A bus cycle did not run in its slot. `silence` is how late it was.
+        #5 cycle_skipped { underlying_value: 5; }
+
+        // A goal arrived with the queue full and was dropped. `count` is how
+        // many were queued when it arrived.
+        #6 goal_dropped_queue_full { underlying_value: 6; }
+
+        // A goal arrived stale or out of order. It is executed anyway, in
+        // arrival order; this says so. `silence` is how far past its instant it
+        // arrived, and nothing for one that is merely out of order.
+        #7 goal_stale_or_out_of_order { underlying_value: 7; }
+
+        // The bus itself failed. `id` is the failing servo's bus id.
+        #8 bus_failure { underlying_value: 8; }
+    }
+}
+
+// One thing the driver did, and the evidence for it.
+//
+// The evidence is four separate fields rather than one number whose meaning
+// depends on the kind: an interval is an interval, a set of servos is a set, and
+// which of them mean anything is stated per kind on `EventKind`. The fields a
+// kind does not name are zero.
+schema DriverEvent
+{
+    uuid: bf04f679-3588-4977-a494-1504ac789371;
+    fields
+    {
+        // What happened.
+        #0 kind: EventKind;
+
+        // When it happened.
+        #1 time: SyncTime;
+
+        // How long the silence or the lateness the kind names was.
+        #2 silence: Duration;
+
+        // The servos the kind names, where it names a set of them.
+        #3 rows: joints::JointFlags;
+
+        // How many of whatever the kind counts.
+        #4 count: UInt32;
+
+        // The one servo the kind names, as its bus id. Zero where it names
+        // none: a bus id is configuration, and the driver reports what it wrote
+        // to rather than a row it inferred.
+        #5 id: UInt8;
+    }
+}
+
+// One servo's health, as the driver's rotation read it.
+//
+// Per-servo and per-reading rather than a whole-machine summary: the rotation
+// visits one servo at a time, and a report says what that visit saw. A host that
+// wants the machine's picture keeps the latest report per servo.
+schema HealthReport
+{
+    uuid: aa918466-6856-4cab-b342-d0efedd6e87a;
+    fields
+    {
+        // Which servo, by bus id, for the reason `ServoHealthRow` states: bus
+        // ids are configuration, and a reading filed under the wrong id sends
+        // somebody to the wrong servo.
+        #0 id: UInt8;
+
+        // The servo's latched hardware-error byte as read. Bit 0 is the
+        // input-voltage bit; interpreting the rest is the reading layer's
+        // opinion, not this record's.
+        #1 bits: UInt8;
+
+        // Supply voltage at the servo, volts -- the units every threshold in
+        // this stack is written in, so nothing downstream scales it.
+        #2 volts: Float64;
+
+        // Servo temperature, degrees Celsius.
+        #3 temp_c: Int8;
+
+        // When the reading was taken.
+        #4 sample_time: SyncTime;
+    }
+}
+
+// The driver's answer to exactly one aux transaction.
+//
+// `corr` is the join: a host matches an outcome to the request it issued and
+// drops anything else, which is what makes re-issuing an unanswered request safe
+// on a lossy transport.
+schema AuxOutcome
+{
+    uuid: 1d61fb9c-90d1-45af-8b89-f6ce2c8bca4c;
+    fields
+    {
+        // The correlation number of the request this answers.
+        #0 corr: UInt32;
+
+        // How it went. Only `ok` carries an answer below.
+        #1 status: session_aux::AuxStatus;
+
+        // What shape the value below is, and `none` where the transaction
+        // answered no value -- a ping, a plain write, or any failure.
+        #2 value_kind: registers::ValueShape;
+
+        // The answer, as the eight bytes a register value is carried in read as
+        // one little-endian number. Bits rather than a number of anything: what
+        // they mean is `value_kind`, and an angle crosses here as its own
+        // IEEE-754 pattern.
+        #3 value: UInt64;
+    }
+}

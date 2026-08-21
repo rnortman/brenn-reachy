@@ -1,0 +1,142 @@
+// What a session plans: the steps it intends and the overlays it plays over
+// them.
+//
+// The session cog is the writer -- it publishes the whole schedule on every
+// change -- and the mover and the motion tick are the consumers. It sits in a
+// module of its own because a schedule edit has nothing to do with the tick's
+// state or a sequencer's, and none of them should rebuild for it.
+//
+// Two conventions run through the file. Time is `SyncTime` and `Duration`,
+// never a bare nanosecond count. Every interval is half-open: a sample at an
+// end instant belongs to whatever comes next, so consecutive intervals may
+// share an edge without either owning it twice.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+// What a scheduled step asks for.
+//
+// `base_keep` is not "do nothing": it is "hold whatever the base posture
+// already is", which is what a step that exists to occupy time says. A step
+// naming a posture is the only thing that retargets the base.
+enum StepKind
+{
+    uuid: 186ddcf8-bbcd-423c-8544-a4e692c94a5d;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Hold the posture already commanded.
+        #0 base_keep default { underlying_value: 0; }
+        // Move the base to the posture this step names.
+        #1 base_posture { underlying_value: 1; }
+    }
+}
+
+// The base postures a step may name.
+//
+// Two, deliberately: stowed is the posture the machine rests in and the one
+// every de-torqued position is safe from, and up is the working posture. A
+// third arrives when something needs one, not before.
+enum Posture
+{
+    uuid: 9ce82955-0620-4580-9d3a-2670d6350059;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Low, off-centre, pitched up: where the machine rests.
+        #0 stow default { underlying_value: 0; }
+        // The neutral working posture.
+        #1 up { underlying_value: 1; }
+    }
+}
+
+// One step of a session's schedule: a half-open interval and what to do in it.
+schema ScheduledStep
+{
+    uuid: f55ded2c-98ad-46da-a3d3-0ea2f62f8131;
+    fields
+    {
+        // When the step begins, inclusive.
+        #0 start: SyncTime;
+
+        // When the step ends, exclusive. A sample at exactly this instant
+        // belongs to the next step, so consecutive steps may share an edge
+        // without either owning it twice.
+        #1 end: SyncTime;
+
+        // What the step asks for.
+        #2 kind: StepKind;
+
+        // Which posture, meaningful only when `kind` is `base_posture`.
+        #3 posture: Posture;
+    }
+}
+
+// One motion playing over the base posture, and the window it plays in.
+//
+// A window rather than a start and a length because the two ends are what a
+// consumer asks about: whether a window is open at an instant, and whether every
+// window has closed. The motion is named by its index in the configured
+// library's motions -- identity is position there, so nothing here carries a
+// name. Every clip is also a one-segment motion, so naming a bare clip costs a
+// schedule nothing extra.
+schema OverlayWindow
+{
+    uuid: 53e5d185-356d-4ba4-b3a7-116fd136e246;
+    fields
+    {
+        // Which motion, as its index in the configured library's motions.
+        #0 motion_id: UInt16;
+
+        // When the window opens, inclusive.
+        #1 start: SyncTime;
+
+        // When it closes, exclusive -- the same half-open convention a step
+        // uses.
+        #2 end: SyncTime;
+
+        // How much of the motion's delta is applied at full weight.
+        #3 gain: Float64;
+
+        // How fast the motion is played, as a multiple of the rate its clips
+        // were authored at.
+        #4 speed: Float64;
+    }
+}
+
+// The whole schedule, republished in full on every change.
+//
+// State-shaped rather than incremental: a lost publish heals on the next one,
+// and a subscriber that has only ever seen the latest message has seen
+// everything. `epoch` is what makes a change observable when the steps happen
+// to look the same, and what a consumer keys its retargeting on.
+schema SessionSchedule
+{
+    uuid: dd2ae37e-338e-4c53-b059-babcff64dcbc;
+    fields
+    {
+        // The gate: nothing is commanded while this is false. Not a step and
+        // not a posture -- engagement is whether the machine is under command
+        // at all.
+        #0 engaged: Bool;
+
+        // Bumped on every change. A consumer that has acted on this number and
+        // sees it again has nothing to do.
+        #1 epoch: UInt32;
+
+        // The steps, in time order.
+        #2 steps: VarArray<ScheduledStep, 16>;
+
+        // The overlay windows, in time order. Independent of the steps: an
+        // overlay is a delta composed over whatever posture the base is holding,
+        // so a window may span several steps or none at all, and the stream
+        // outlives the last step until the last window closes.
+        #3 overlays: VarArray<OverlayWindow, 4>;
+    }
+}

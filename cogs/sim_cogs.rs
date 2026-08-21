@@ -13,19 +13,24 @@
 //! the evidence the motion tick classifies faults from. It is not a dynamics
 //! model and no scenario may ask it a question about servo fidelity.
 //!
-//! Nothing here holds state of its own: the gate, the plant and the run's
-//! totals all cross the state slot through `sim_slots`, once each way.
+//! Nothing here holds state of its own. The plant, the gate and the run's
+//! totals are the state slot's own fields, read and written through the
+//! validated view the cycle opens once at the top.
 
-use brenn_reachy__cogs__msgs_clk_rs::{SimCmd, SimOp};
-use brenn_reachy__cogs__sim_clk_rs::MotorSimDial;
-use clockwork_rs::Clear as _;
-use motion_slots::{joint_set, read_joints, rows_from_joints};
-use reachy_driver::{AcceptOutcome, GateAction, Goal, JOINT_MASK_ALL};
+use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
+use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSignals};
+use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
+use brenn_reachy__driver__health_clk_rs::{DriverEvent, EventKind};
+use brenn_reachy__driver__pose_clk_rs::PoseSample;
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
+use clockwork_rs::{Duration, SyncTime};
+use motion_slots::{configured, counters};
+use reachy_driver::{AcceptOutcome, GateAction, GoalGate};
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
-use reachy_motion::joints::{JointGroup, JointSet};
-use reachy_wire::{DriverEvent, EventKind, GoalSetpoint, PoseSample, peek_header};
-use sim_slots::{Counters, SimSlot, read_sim, rows_of, write_sim};
+use reachy_motion::joints::{
+    JointGroup, angle_of, flags, group_of, rows_of, set_angle, write_rows, write_vector,
+};
 
 /// How many cycles of plant motion one execution may advance.
 ///
@@ -48,70 +53,111 @@ const TIMER_PERIOD_NS: i64 = 20_000_000;
 /// One cycle of the simulated driver.
 pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     let nominal = dial.start_time().as_nanos();
-    let hold_timeout_ns = dial.configs.params.hold_timeout_ns();
-    let period_ns = dial.configs.params.period_ns();
-    // Read from the slot rather than from the crossing, because reading a set
-    // of servos this build does not know is itself one of the things counted.
+    let params = read_params(dial.configs.params);
+    let hold_timeout_ns = params.hold_timeout_ns;
+    let period_ns = params.period_ns;
+    let since_last_ns = dial.conditions.tick.time_since_last_exec().as_nanos();
+    // Read off the slot's own bytes before anything narrows them: the totals
+    // are plain numbers whatever else the slot holds, and the clear below would
+    // lose them.
     let before = Counters::read(dial.states.sim);
-    let mut sim = read_sim(dial.states.sim);
+    let mut refused_state = 0;
+    if dial.states.sim.validate_mut().is_err() {
+        // Bytes that did not read as a state. This cog is the slot's only
+        // writer, so a refusal is memory nobody wrote: the run starts again
+        // from a cleared slot with the totals it had carried put back, and the
+        // refusal is counted rather than raised -- the process whose job is to
+        // de-torque a machine does not get to panic over its own memory.
+        dial.states.sim.clear_valid();
+        before.store(dial.states.sim);
+        refused_state = 1;
+    }
+    let Ok(state) = dial.states.sim.validate_mut() else {
+        // A cleared slot that does not read as a state either: this build and
+        // the schema disagree about what a cleared state is, and there is
+        // nothing a cycle can do with the slot at all.
+        return;
+    };
+    state.refused_state_fields += refused_state;
     let mut report = Report::default();
 
-    let first = !sim.initialized;
+    let first = !state.initialized.get();
     if first {
-        check_params(dial);
-        sim.initialized = true;
-        sim.plant.positions = rows_from_joints(
+        check_params(params);
+        state.initialized = true.into();
+        write_vector(
+            &mut state.positions,
             &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
         );
-        if dial.configs.params.start_torqued() {
-            sim.plant.torqued = all_rows();
-            sim.gate.note_liveness(nominal);
+        // Torqued only where this is the process starting. A restart from a slot
+        // the cycle could not read is not that: whatever arming the run had is
+        // in the bytes that were refused, and the dead-man may have latched the
+        // machine off. So the modelled machine comes back de-torqued and waits
+        // to be armed, rather than energising itself out of a memory fault --
+        // the one transition the latch exists to prevent.
+        if bool::from(params.start_torqued) && refused_state == 0 {
+            state.torqued = all_rows();
+            GoalGate::over(&mut state.gate).note_liveness(nominal);
         }
     }
 
     for cmd in dial.inputs.cmds.new_msgs() {
-        inject(&mut sim, cmd, nominal);
-    }
-
-    for packet in dial.inputs.goals.new_msgs() {
-        // A datagram that does not decode is not a setpoint: it names no
-        // instant and no rows, so there is nothing to queue and nothing to
-        // report about it beyond the count.
-        let Ok((_, setpoint)) = GoalSetpoint::decode(packet.bytes().as_slice()) else {
-            sim.counters.undecodable_goals += 1;
+        // An injection this build cannot read is refused whole and counted: an
+        // operation it does not know, or one naming servos it does not know.
+        // A scenario written against a newer vocabulary than the binary running
+        // it would otherwise have its hand on the machine discarded in silence.
+        // The boundary refusal is this one call.
+        let Ok(cmd) = cmd.validate() else {
+            state.refused_injections += 1;
             continue;
         };
-        let depth = sim.gate.queued().len();
-        match sim.gate.accept(Goal::from(setpoint), nominal) {
+        inject(state, cmd, nominal);
+    }
+
+    for setpoint in dial.inputs.goals.new_msgs() {
+        // A setpoint naming rows this build does not know is not a setpoint:
+        // the bits mean something to whoever wrote them and this driver does
+        // not know which servos they are, so there is nothing to queue and
+        // nothing to report about it beyond the count. The boundary refusal is
+        // this one call.
+        let Ok(setpoint) = setpoint.validate() else {
+            state.refused_goals += 1;
+            continue;
+        };
+        let due_at = setpoint.execute_at.as_nanos();
+        let depth = state.gate.queue.len();
+        match GoalGate::over(&mut state.gate).accept(setpoint, nominal) {
             AcceptOutcome::Accepted => {}
             AcceptOutcome::AcceptedStaleOrOutOfOrder => {
                 report.raise(
-                    &mut sim.counters,
-                    EventKind::GoalStaleOrOutOfOrder,
-                    // How far past its instant it arrived. Zero for a goal that
-                    // is merely out of order with the one before it, which has
-                    // not missed anything yet.
-                    micros(nominal - setpoint.execute_at_ns),
-                    nominal,
+                    &mut state.events_dropped,
+                    Event {
+                        kind: EventKind::GoalStaleOrOutOfOrder,
+                        // How far past its instant it arrived. Zero for a goal
+                        // that is merely out of order with the one before it,
+                        // which has not missed anything yet.
+                        silence_ns: (nominal - due_at).max(0),
+                        ..Event::at(nominal)
+                    },
                 );
             }
             AcceptOutcome::DroppedQueueFull => {
-                sim.counters.goals_dropped += 1;
+                state.goals_dropped += 1;
                 report.raise(
-                    &mut sim.counters,
-                    EventKind::GoalDroppedQueueFull,
-                    u32::try_from(depth).unwrap_or(u32::MAX),
-                    nominal,
+                    &mut state.events_dropped,
+                    Event {
+                        kind: EventKind::GoalDroppedQueueFull,
+                        count: u32::try_from(depth).unwrap_or(u32::MAX),
+                        ..Event::at(nominal)
+                    },
                 );
             }
         }
     }
 
-    let silence = nominal - sim.gate.last_accept_ns;
-    match sim
-        .gate
-        .tick(nominal, !sim.plant.torqued.is_empty(), hold_timeout_ns)
-    {
+    let silence = nominal - state.gate.last_accept.as_nanos();
+    let torqued = !flags::is_empty(state.torqued);
+    match GoalGate::over(&mut state.gate).tick(nominal, torqued, hold_timeout_ns) {
         GateAction::WriteTorqueOffSweep { just_latched } => {
             // The sweep reaches every row, and a de-torqued servo holds where
             // it stands: this machine's gearboxes do not back-drive. The
@@ -119,30 +165,32 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             // torque, so a machine energised again later stands still until
             // something commands it rather than resuming a move nobody is
             // asking for any more.
-            sim.plant.torqued = JointSet::EMPTY;
-            sim.plant.has_target = JointSet::EMPTY;
+            state.torqued = JointFlags::NONE;
+            state.has_target = JointFlags::NONE;
             if just_latched {
-                sim.counters.hold_timeouts += 1;
+                state.hold_timeouts += 1;
                 report.raise(
-                    &mut sim.counters,
-                    EventKind::HoldTimeoutTorqueOff,
-                    // How long the goal stream was silent, which is what tells
-                    // an operator whether the commander stopped or merely
-                    // stuttered.
-                    micros(silence),
-                    nominal,
+                    &mut state.events_dropped,
+                    Event {
+                        kind: EventKind::HoldTimeoutTorqueOff,
+                        // How long the goal stream was silent, which is what
+                        // tells an operator whether the commander stopped or
+                        // merely stuttered.
+                        silence_ns: silence.max(0),
+                        ..Event::at(nominal)
+                    },
                 );
             }
         }
-        GateAction::WriteGoal(goal) => {
-            sim.counters.goals_executed += 1;
-            command(&mut sim, &goal);
+        GateAction::WriteGoal => {
+            state.goals_executed += 1;
+            command(state);
         }
-        GateAction::Rewrite(goal) => {
+        GateAction::Rewrite => {
             // The same setpoint again, which is what holds a servo's position
             // loop awake between goals. Nothing here counts it: a rewrite is
             // not a goal executed.
-            command(&mut sim, &goal);
+            command(state);
         }
         GateAction::Nothing => {}
     }
@@ -150,37 +198,26 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     let cycles = if first {
         1
     } else {
-        elapsed_cycles(
-            dial.conditions.tick.time_since_last_exec().as_nanos(),
-            period_ns,
-        )
+        elapsed_cycles(since_last_ns, period_ns)
     };
-    advance(dial, &mut sim, cycles);
+    advance(params, state, cycles);
 
     // The sample: published every cycle without exception, because it is the
     // clock the control loop runs on and a missing one is a cycle the loop
     // never sees. A cycle whose replies were lost is a sample saying so, never
     // an absent sample.
-    let blind = sim.plant.drop_replies_left > 0;
-    let sample = PoseSample {
-        nominal_time_ns: nominal,
-        sample_time_ns: nominal,
-        present_valid: !blind,
-        commanded_valid: sim.gate.has_held,
-        torque_off_latched: sim.gate.latched,
-        miss_mask: if blind { JOINT_MASK_ALL } else { 0 },
-        // The modelled truth, whatever the flags say about it. A driver that
-        // read nothing this cycle has last cycle's numbers in hand and reports
-        // them behind a miss mask; what makes them unusable is the mask, not a
-        // blank the receiver would have to tell apart from a real zero.
-        present: sim.plant.positions,
-        commanded: sim.gate.held.targets,
-    };
-    sim.plant.drop_replies_left = sim.plant.drop_replies_left.saturating_sub(1);
+    let blind = state.drop_replies_left > 0;
+    state.drop_replies_left = state.drop_replies_left.saturating_sub(1);
 
-    publish(dial, &sample, report.event.as_ref());
-    write_sim(dial.states.sim, &mut sim);
-    signal(dial, &sim.counters, &before);
+    publish(
+        &mut dial.outputs,
+        state,
+        blind,
+        nominal,
+        report.event.as_ref(),
+    );
+
+    Counters::read(dial.states.sim).report(&before, &mut dial.signals);
 }
 
 /// The one event a cycle reports, and how many it could not.
@@ -192,22 +229,52 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
 #[derive(Default)]
 struct Report {
     /// What will be published, if anything.
-    event: Option<DriverEvent>,
+    event: Option<Event>,
+}
+
+/// One edge the cycle hit, before it reaches the output slot.
+///
+/// Held as ordinary Rust because a cycle can raise more than one and the slot
+/// carries one: the ranking is a decision made here rather than a sequence of
+/// writes into the slot.
+#[derive(Clone, Copy)]
+struct Event {
+    kind: EventKind,
+    time_ns: i64,
+    /// The silence or the lateness, where the kind names one.
+    silence_ns: i64,
+    /// The servos the kind names, where it names a set of them.
+    rows: JointFlags,
+    /// How many of whatever the kind counts.
+    count: u32,
+    /// The one servo the kind names, as its bus id.
+    id: u8,
+}
+
+impl Event {
+    /// An event at `time_ns` with no evidence yet: a raiser fills in the fields
+    /// its own kind names and leaves the rest, which is what the schema says a
+    /// kind that does not name a field carries.
+    fn at(time_ns: i64) -> Self {
+        Self {
+            kind: EventKind::None,
+            time_ns,
+            silence_ns: 0,
+            rows: JointFlags::NONE,
+            count: 0,
+            id: 0,
+        }
+    }
 }
 
 impl Report {
-    /// Offer an event for this cycle's one slot.
-    fn raise(&mut self, counters: &mut Counters, kind: EventKind, detail: u32, time_ns: i64) {
-        let event = DriverEvent {
-            kind,
-            detail,
-            time_ns,
-        };
+    /// Offer an event for this cycle's one slot, counting the one it displaces.
+    fn raise(&mut self, dropped: &mut u64, event: Event) {
         match self.event {
             None => self.event = Some(event),
             Some(held) => {
-                counters.events_dropped += 1;
-                if kind == EventKind::HoldTimeoutTorqueOff && held.kind != kind {
+                *dropped += 1;
+                if event.kind == EventKind::HoldTimeoutTorqueOff && held.kind != event.kind {
                     self.event = Some(event);
                 }
             }
@@ -222,106 +289,79 @@ impl Report {
 /// describing something to a simulator that cannot do it, which is a fact
 /// about the scenario and not about the machine.
 ///
-/// A refusal is the whole injection and not part of one. An operation whose set
-/// of servos does not decode is not carried out at all, because the parts of it
-/// that do not read that set are the parts that matter most: a torque-on whose
-/// mask was refused would otherwise energise nothing and still end a torque-off
-/// latch, which is the one transition the latch exists to guard.
-fn inject(sim: &mut SimSlot, cmd: &SimCmd, nominal: i64) {
-    let op = cmd.op();
-    let mask = if names_servos(op) {
-        match joint_set(cmd.mask()) {
-            Ok(rows) => rows,
-            Err(_) => {
-                sim.counters.refused_injections += 1;
-                return;
-            }
-        }
-    } else {
-        // The mask is not read by this operation, so a value in it decides
-        // nothing and refusing over it would refuse an injection this build can
-        // carry out perfectly well.
-        JointSet::EMPTY
-    };
-    match op {
-        SimOp::TORQUE_ON => {
-            sim.plant.torqued = sim.plant.torqued.union(mask);
+/// A refusal is the whole injection and not part of one, and it happens at the
+/// caller's one validation: an operation this build does not know and a set of
+/// servos it cannot read are the same fact about the scenario, and carrying out
+/// the readable half of one would be worse than carrying out none of it -- a
+/// torque-on whose mask was refused would energise nothing and still end a
+/// torque-off latch, which is the one transition the latch exists to guard.
+fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
+    let mask = cmd.mask;
+    match cmd.op {
+        SimOp::TorqueOn => {
+            state.torqued |= mask;
             // Arming grants a fresh hold-timeout window, whether or not there
             // was a latch to end: the first goal of a session cannot arrive
             // before the session starts.
-            if sim.gate.latched {
-                sim.gate.release_latch(nominal);
+            let mut gate = GoalGate::over(&mut state.gate);
+            if gate.state().latched.get() {
+                gate.release_latch(nominal);
             } else {
-                sim.gate.note_liveness(nominal);
+                gate.note_liveness(nominal);
             }
         }
-        SimOp::TORQUE_OFF => {
-            sim.plant.torqued = sim.plant.torqued.without(mask);
-            if sim.plant.torqued.is_empty() {
+        SimOp::TorqueOff => {
+            state.torqued = flags::without(state.torqued, mask);
+            if flags::is_empty(state.torqued) {
                 // A sweep that reached everything is a confirmed disarm, not a
                 // fault: nothing latches, and nothing is being held any more.
-                sim.gate.clear_commanded();
-                sim.plant.has_target = JointSet::EMPTY;
+                GoalGate::over(&mut state.gate).clear_commanded();
+                state.has_target = JointFlags::NONE;
             }
         }
-        SimOp::SET_POSITIONS => {
-            let positions = rows_from_joints(&read_joints(cmd.positions()));
-            for joint in mask.iter() {
-                if let Some(row) = joint.index() {
-                    sim.plant.positions[row] = positions[row];
+        SimOp::SetPositions => {
+            for joint in flags::iter(mask) {
+                if let Some(angle) = angle_of(&cmd.positions, joint) {
+                    set_angle(&mut state.positions, joint, angle);
                 }
             }
         }
-        SimOp::OBSTRUCT => sim.plant.obstructed = sim.plant.obstructed.union(mask),
-        SimOp::RELEASE_OBSTRUCTION => sim.plant.obstructed = sim.plant.obstructed.without(mask),
-        SimOp::DROP_REPLIES => sim.plant.drop_replies_left = cmd.count(),
-        // An operation this build does not know, counted where a refused
-        // injection is counted: a scenario written against a newer vocabulary
-        // than this binary would otherwise run green with its hand on the
-        // machine discarded, and fail somewhere unrelated.
-        _ => sim.counters.refused_injections += 1,
+        SimOp::Obstruct => state.obstructed |= mask,
+        SimOp::ReleaseObstruction => state.obstructed = flags::without(state.obstructed, mask),
+        SimOp::DropReplies => state.drop_replies_left = cmd.count,
+        // The value a slot nothing wrote holds. A scenario never authors one,
+        // and nothing about the machine changes for it.
+        SimOp::Nop => {}
     }
 }
 
-/// Whether an operation acts on the servos its mask names.
+/// Write the held setpoint's rows into the plant, and remember which rows have
+/// one.
 ///
-/// The ones that do not — an unknown operation, and dropping replies, which is
-/// about the bus rather than about any servo — read no mask at all, so nothing
-/// about their mask can refuse them.
-fn names_servos(op: SimOp) -> bool {
-    matches!(
-        op,
-        SimOp::TORQUE_ON
-            | SimOp::TORQUE_OFF
-            | SimOp::SET_POSITIONS
-            | SimOp::OBSTRUCT
-            | SimOp::RELEASE_OBSTRUCTION
-    )
-}
-
-/// Write a due goal's rows into the plant, and remember which rows have one.
-///
-/// The mask is the goal's own: a setpoint applies to the servos it names and
-/// leaves every other one holding what it already had.
-fn command(sim: &mut SimSlot, goal: &Goal) {
-    let written = goal.apply_to(&mut sim.plant.targets);
-    let rows = rows_of(written, &mut sim.counters.refused_state_fields);
-    sim.plant.has_target = sim.plant.has_target.union(rows);
+/// The mask is the setpoint's own and it is write-side filtering and nothing
+/// else: a setpoint applies to the servos it names and leaves every other one
+/// holding the angle it already had. That is the whole meaning of a partial
+/// mask, stated here because this is the only place in the tree that turns a
+/// commanded setpoint into servo targets.
+fn command(state: &mut SimState) {
+    for joint in flags::iter(state.gate.held.mask) {
+        if let Some(angle) = angle_of(&state.gate.held.targets, joint) {
+            set_angle(&mut state.targets, joint, angle);
+        }
+    }
+    state.has_target |= state.gate.held.mask;
 }
 
 /// Every servo on the bus.
-fn all_rows() -> JointSet {
+fn all_rows() -> JointFlags {
     JointGroup::ALL
         .into_iter()
-        .fold(JointSet::EMPTY, |set, group| set.union(group.joints()))
+        .fold(JointFlags::NONE, |set, group| set | group.joints())
 }
 
-/// A length of time in microseconds, as an event's `detail` carries it.
-///
-/// Saturating at both ends: an interval that ran backwards is nothing, and one
-/// past seventy minutes is as long as this field says.
-fn micros(ns: i64) -> u32 {
-    u32::try_from(ns.max(0) / 1_000).unwrap_or(u32::MAX)
+/// This cog's configuration, as the numbers a scenario wrote down.
+fn read_params(message: &SimParamsWire) -> &SimParams {
+    configured(message, "the plant's")
 }
 
 /// Refuse a scenario whose configuration does not describe a machine.
@@ -330,22 +370,20 @@ fn micros(ns: i64) -> u32 {
 /// these turns a scenario-authoring slip into a plausible-looking run, and a
 /// simulator whose plant quietly ran at the wrong rate certifies nothing: the
 /// assertions still pass, about a machine nobody meant to build.
-fn check_params(dial: &MotorSimDial<'_>) {
-    let params = &dial.configs.params;
+fn check_params(params: &SimParams) {
     assert_eq!(
-        params.period_ns(),
-        TIMER_PERIOD_NS,
+        params.period_ns, TIMER_PERIOD_NS,
         "the plant's cycle must be the cycle this cog is woken on",
     );
     assert!(
-        params.hold_timeout_ns() >= params.period_ns(),
+        params.hold_timeout_ns >= params.period_ns,
         "the dead-man must allow at least one cycle of silence, not {}ns",
-        params.hold_timeout_ns(),
+        params.hold_timeout_ns,
     );
     for (rate, group) in [
-        (params.slew_body_yaw_rad(), "body yaw"),
-        (params.slew_legs_rad(), "legs"),
-        (params.slew_antennas_rad(), "antennas"),
+        (params.slew_body_yaw_rad, "body yaw"),
+        (params.slew_legs_rad, "legs"),
+        (params.slew_antennas_rad, "antennas"),
     ] {
         assert!(
             rate.is_finite() && rate > 0.0,
@@ -371,22 +409,28 @@ fn elapsed_cycles(elapsed_ns: i64, period_ns: i64) -> i64 {
 /// motion tick's obstruction detector reads. A de-torqued one holds too: these
 /// gearboxes do not back-drive, which is why a de-torqued machine at stow is
 /// the safe state and a de-torqued machine anywhere else is not.
-fn advance(dial: &MotorSimDial<'_>, sim: &mut SimSlot, cycles: i64) {
-    let plant = &mut sim.plant;
-    for joint in plant.torqued.iter() {
-        if plant.obstructed.contains(joint) || !plant.has_target.contains(joint) {
+fn advance(params: &SimParams, state: &mut SimState, cycles: i64) {
+    for joint in flags::iter(state.torqued) {
+        if flags::contains(state.obstructed, joint) || !flags::contains(state.has_target, joint) {
             continue;
         }
-        let Some(row) = joint.index() else {
+        let Some(group) = group_of(joint) else {
             continue;
         };
-        let step = slew(dial, joint.group()) * cycles as f64;
-        let gap = plant.targets[row] - plant.positions[row];
-        plant.positions[row] = if gap.abs() <= step {
-            plant.targets[row]
-        } else {
-            plant.positions[row] + step.copysign(gap)
+        let (Some(target), Some(position)) = (
+            angle_of(&state.targets, joint),
+            angle_of(&state.positions, joint),
+        ) else {
+            continue;
         };
+        let step = slew(params, group) * cycles as f64;
+        let gap = target - position;
+        let moved = if gap.abs() <= step {
+            target
+        } else {
+            position + step.copysign(gap)
+        };
+        set_angle(&mut state.positions, joint, moved);
     }
 }
 
@@ -396,101 +440,108 @@ fn advance(dial: &MotorSimDial<'_>, sim: &mut SimSlot, cycles: i64) {
 /// and are the same part, the antennas are a different and much faster one, and
 /// the body yaw is its own. Each rate is a distance rather than a number that
 /// might be one, because [`check_params`] refused the scenario otherwise.
-fn slew(dial: &MotorSimDial<'_>, group: JointGroup) -> f64 {
-    let params = &dial.configs.params;
+fn slew(params: &SimParams, group: JointGroup) -> f64 {
     match group {
-        JointGroup::BodyYaw => params.slew_body_yaw_rad(),
-        JointGroup::Legs => params.slew_legs_rad(),
-        JointGroup::Antennas => params.slew_antennas_rad(),
+        JointGroup::BodyYaw => params.slew_body_yaw_rad,
+        JointGroup::Legs => params.slew_legs_rad,
+        JointGroup::Antennas => params.slew_antennas_rad,
     }
+}
+
+/// This cycle's sample, written into the slot that carries it.
+///
+/// Published every cycle without exception, because it is the clock the control
+/// loop runs on and a missing one is a cycle the loop never sees. A cycle whose
+/// replies were lost is a sample saying so, never an absent sample: `blind`
+/// puts every row in `missing` and clears `present_valid`.
+fn write_sample(sample: &mut PoseSample, state: &SimState, blind: bool, nominal: i64) {
+    let nominal = SyncTime::from_nanos(nominal);
+    sample.nominal_time = nominal;
+    // The modelled bus answers the instant it is asked, so there is no read
+    // jitter to report and the two instants are one.
+    sample.sample_time = nominal;
+    sample.present_valid = (!blind).into();
+    sample.commanded_valid = state.gate.has_held;
+    sample.torque_off_latched = state.gate.latched;
+    sample.missing = if blind {
+        flags::all()
+    } else {
+        JointFlags::NONE
+    };
+    // The modelled truth, whatever the flags say about it. A driver that read
+    // nothing this cycle has last cycle's numbers in hand and reports them
+    // behind the missing rows; what makes them unusable is that set, not a
+    // blank the receiver would have to tell apart from a real zero.
+    write_rows(&mut sample.present, &rows_of(&state.positions));
+    write_rows(&mut sample.commanded, &rows_of(&state.gate.held.targets));
 }
 
 /// Put this cycle's sample, and its event if it has one, on the wire.
 ///
-/// Each carries the sequence number after the last one this cog published, read
-/// back out of its own view of the channel rather than kept in a state field: a
-/// channel is not a queue, so the view over the ring is a loss-free record of
-/// what this cog sent, and an empty view means it has never sent one.
-fn publish(dial: &mut MotorSimDial<'_>, sample: &PoseSample, event: Option<&DriverEvent>) {
-    let pose_seq = next_seq(
-        dial.inputs
-            .own_pose
-            .latest()
-            .map(|msg| msg.bytes().as_slice()),
-    );
-    let out = &mut dial.outputs.pose;
-    out.msg_mut().clear();
-    assert!(
-        out.msg_mut().try_set_bytes(&sample.encode(pose_seq)),
-        "the sample carrier is too small for a PoseSample datagram",
-    );
+/// Both channels carry their schema, so both are written into the output slot
+/// field by field: nothing is encoded and neither carries a sequence number of
+/// its own.
+fn publish(
+    outputs: &mut MotorSimOutputs<'_>,
+    state: &SimState,
+    blind: bool,
+    nominal: i64,
+    event: Option<&Event>,
+) {
+    let out = &mut outputs.pose;
+    write_sample(out.msg_mut().clear_valid(), state, blind, nominal);
     out.mark_for_publish();
 
     let Some(event) = event else {
         return;
     };
-    let evt_seq = next_seq(
-        dial.inputs
-            .own_evt
-            .latest()
-            .map(|msg| msg.bytes().as_slice()),
-    );
-    let out = &mut dial.outputs.evt;
-    out.msg_mut().clear();
-    assert!(
-        out.msg_mut().try_set_bytes(&event.encode(evt_seq)),
-        "the event carrier is too small for a DriverEvent datagram",
-    );
+    let out = &mut outputs.evt;
+    write_event(out.msg_mut().clear_valid(), event);
     out.mark_for_publish();
 }
 
-/// The sequence number after the one those bytes carry, or zero if there are
-/// none.
-///
-/// A datagram that does not parse reads as nothing published: this cog is the
-/// only publisher on both channels and it writes whole datagrams, so that is a
-/// build-time mistake rather than damage to recover from.
-fn next_seq(published: Option<&[u8]>) -> u32 {
-    published
-        .and_then(|bytes| peek_header(bytes).ok())
-        .map_or(0, |header| header.seq.wrapping_add(1))
+fn write_event(out: &mut DriverEvent, event: &Event) {
+    out.kind = event.kind;
+    out.time = SyncTime::from_nanos(event.time_ns);
+    out.silence = Duration::from_nanos(event.silence_ns);
+    out.rows = event.rows;
+    out.count = event.count;
+    out.id = event.id;
 }
 
-/// Report the run's totals, on the executions where one of them moved.
-///
-/// Writing them every cycle would put an observation in the group at the bus
-/// rate and roll its reporting window every few seconds, for numbers that
-/// mostly do not change.
-///
-/// Written out here rather than generated beside the struct, as the
-/// control-rate cogs' totals are: this cog's signals type belongs to the
-/// generated crate that depends, through this one, on the crate the struct
-/// lives in, so it cannot be named there.
-///
-/// Untested: no assertion in this repo covers the values a signal carries, so
-/// which total reaches which signal is held by this function's own reading.
-/// TODO(cogs-signal-report-contents)
-fn signal(dial: &mut MotorSimDial<'_>, now: &Counters, before: &Counters) {
-    if now.goals_executed != before.goals_executed {
-        dial.signals.set_goals_executed(now.goals_executed);
-    }
-    if now.goals_dropped != before.goals_dropped {
-        dial.signals.set_goals_dropped(now.goals_dropped);
-    }
-    if now.hold_timeouts != before.hold_timeouts {
-        dial.signals.set_hold_timeouts(now.hold_timeouts);
-    }
-    if now.undecodable_goals != before.undecodable_goals {
-        dial.signals.set_undecodable_goals(now.undecodable_goals);
-    }
-    if now.events_dropped != before.events_dropped {
-        dial.signals.set_events_dropped(now.events_dropped);
-    }
-    if now.refused_state_fields != before.refused_state_fields {
-        dial.signals
-            .set_refused_state_fields(now.refused_state_fields);
-    }
-    if now.refused_injections != before.refused_injections {
-        dial.signals.set_refused_injections(now.refused_injections);
+counters! {
+    /// The run's totals, as the slot holds them.
+    ///
+    /// Every one of these is an absolute count since the process started, so a
+    /// report carries the run's number whichever reporting window it lands in.
+    /// They are read off the slot's own bytes rather than the validated view,
+    /// because they are the one part of the state that survives a slot this cog
+    /// could not read: a plain number is a plain number whatever the bytes
+    /// around it say.
+    ///
+    /// Reported on the executions where one of them moved. Writing them every
+    /// cycle would put an observation in the group at the bus rate and roll its
+    /// reporting window every few seconds, for numbers that mostly do not
+    /// change.
+    ///
+    /// Untested: no assertion in this repo covers the values a signal carries,
+    /// so which total reaches which signal is held by the pairs below.
+    /// TODO(cogs-signal-report-contents)
+    Counters of SimStateWire, MotorSimSignals<'_>, crossing the_run_totals_cross_the_slot {
+        /// Goals written to the modelled servos.
+        goals_executed / set_goals_executed,
+        /// Goals refused because the queue was full.
+        goals_dropped / set_goals_dropped,
+        /// Times the dead-man latched torque off.
+        hold_timeouts / set_hold_timeouts,
+        /// Goals naming servos this build does not know.
+        refused_goals / set_refused_goals,
+        /// Events raised on a cycle that had already reported one.
+        events_dropped / set_events_dropped,
+        /// Times the slot did not read back as a state.
+        refused_state_fields / set_refused_state_fields,
+        /// Injections this build could not carry out: an operation it does not
+        /// know, or one naming servos it does not know.
+        refused_injections / set_refused_injections,
     }
 }

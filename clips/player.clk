@@ -1,0 +1,167 @@
+// The overlay a motion plays, as the slot between two executions holds it.
+//
+// A player's whole state lives here: where it is on the motion's own clock, the
+// delta each channel was last given while that channel fades, and the weights
+// and ramps those fades run on. A host whose per-execution memory is a
+// fixed-layout slot finds each overlay exactly where the last execution left
+// it, so there is nowhere else for it to be.
+//
+// The three carriage schemas beside it are the player's own fields spelled as
+// records rather than as loose numbers: one frame of deltas, the three blend
+// weights, the three fade-out ramps. They are declared here because the player
+// is their only writer and no consumer takes one without taking the player.
+//
+// Which motion is playing and how strongly are the *host's* facts, not the
+// player's: a window names them and the player is told. They sit in the same
+// record because a row of the mover's state is one overlay, whole.
+//
+// Poses are the geometry package's: a translation in the base head's own frame
+// and a rotation applied in it.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::clips)]
+
+use geometry::primitives;
+
+// One overlay frame's deltas, as a slot holds them.
+//
+// A channel a clip does not drive is absent rather than zero: a zero head delta
+// is the identity rotation applied to the base, which is a channel being driven
+// to no effect, and a clip that drives nothing there must compose as though the
+// channel were not in the frame at all. So every channel carries its own
+// presence flag and the numbers beside it mean nothing without it.
+schema ClipDelta
+{
+    uuid: 98e76bff-4689-498a-b37f-49aecb7e232c;
+    fields
+    {
+        // Whether the head channel is driven.
+        #0 head_present: Bool;
+
+        // The head delta's translation, metres, in the base head's own frame.
+        #1 head_pos: primitives::Vec3;
+
+        // The head delta's rotation, applied in the base head's own frame.
+        #2 head_quat: primitives::Quat;
+
+        // Whether the body-yaw channel is driven.
+        #3 body_yaw_present: Bool;
+
+        // The body-yaw delta, radians, additive.
+        #4 body_yaw: Float64;
+
+        // Whether the antenna channel is driven. One flag for the pair: the
+        // channel is both antennas, and a clip driving one drives the other.
+        #5 antennas_present: Bool;
+
+        // The right antenna's delta, radians, additive.
+        #6 antenna_right: Float64;
+
+        // The left antenna's delta, radians, additive.
+        #7 antenna_left: Float64;
+    }
+}
+
+// How strongly each channel of one overlay contributes.
+//
+// Three numbers rather than one, because a clip need not drive all channels:
+// when the clip ends, each channel it drove fades out on its own ramp while
+// channels it never drove stay at zero.
+schema ClipWeights
+{
+    uuid: 2efd6cc3-eee4-4907-b16c-c883e08c26df;
+    fields
+    {
+        // The head channel's weight, in `[0, 1]`.
+        #0 head: Float64;
+
+        // The body-yaw channel's weight, in `[0, 1]`.
+        #1 body_yaw: Float64;
+
+        // The antenna channel's weight, in `[0, 1]`.
+        #2 antennas: Float64;
+    }
+}
+
+// Each channel's fade-out ramp, milliseconds, from the clip that last drove it.
+//
+// Carried rather than looked up: the clip that set a channel fading may already
+// be over, and the ramp it fades on is that clip's and not the one playing now.
+schema ClipRamps
+{
+    uuid: b6fb1611-651a-420d-aa1a-0e7c2404632e;
+    fields
+    {
+        // The head channel's fade-out, milliseconds.
+        #0 head: UInt32;
+
+        // The body-yaw channel's fade-out, milliseconds.
+        #1 body_yaw: UInt32;
+
+        // The antenna channel's fade-out, milliseconds.
+        #2 antennas: UInt32;
+    }
+}
+
+// One playing overlay, as the slot between two executions holds it.
+//
+// This is the player's state and not a copy of one: `reachy-clips` reads and
+// writes these fields in place. Beside them sit the two facts the host owns --
+// whether the row is occupied and which motion it holds. A player is picked up
+// again against the configured motion `motion_id` names, and `track` is what
+// refuses a slot reused for a different one: every other number here means
+// something only against the walk it was taken from.
+//
+// Where in the motion the player stands is the clock and nothing else: a
+// motion's timeline is a pure function of its lead gap and its segments, so the
+// segment being played is derived from `clock_s` on every execution rather than
+// recorded here, where it could disagree with it.
+//
+// How strongly the overlay applies is not here: a gain is the window's, read
+// from it afresh every execution and applied by whatever composes the players,
+// so a slot copy would be a second answer to a question the window already
+// answers.
+schema ClipPlayerSnap
+{
+    uuid: dee2e93a-dd09-42f9-872a-a85f40ad238f;
+    fields
+    {
+        // Whether an overlay occupies this slot. Every field below means
+        // nothing when this is false.
+        #0 active: Bool;
+
+        // Which motion, as its index in the configured library's motions.
+        #1 motion_id: UInt16;
+
+        // What the motion this was taken from answers to
+        // `reachy_clips::config::motion_fingerprint`.
+        #2 track: UInt64;
+
+        // The invocation speed, as a multiple of the rate the motion's clips
+        // were authored at.
+        #3 speed: Float64;
+
+        // Elapsed on the motion's own timeline at 1.0x, seconds, holds
+        // included. A count of seconds and not a length of time, because it
+        // is the number the player does its arithmetic in and a second
+        // representation of it could not round-trip exactly.
+        #4 clock_s: Float64;
+
+        // The last delta each channel was given, held while that channel fades.
+        #5 frozen: ClipDelta;
+
+        // Each channel's current blend weight.
+        #6 weights: ClipWeights;
+
+        // Each channel's fade-out ramp.
+        #7 ramps: ClipRamps;
+
+        // Whether any tick has been taken yet. The first tick advances the
+        // clock by nothing, so this is what tells a player at zero that has run
+        // from one that has not.
+        #8 started: Bool;
+
+        // Whether the motion and its fade-out are both over.
+        #9 finished: Bool;
+    }
+}

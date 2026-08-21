@@ -19,11 +19,12 @@
 //! deterministic runner puts every sample on the grid exactly and a scenario
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use scenario::author::Step;
 use scenario::{STOW_DURATION_NS, cycle_at, cycles_for};
 
-use brenn_reachy__cogs__msgs_clk_rs::Posture;
-use reachy_motion::joints::{JointGroup, JointId, JointSet};
+use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
+use reachy_motion::joints::JointGroup;
 
 /// The cycle the session is engaged and the machine energised at.
 pub const ENGAGE_CYCLE: i64 = 0;
@@ -81,14 +82,8 @@ pub const DISENGAGED_EPOCH: u32 = 2;
 /// subject. Freezing all six holds the head exactly where it stood, so what the
 /// run is about is the tracking error and nothing else.
 #[must_use]
-pub fn jammed_rows() -> JointSet {
-    let mut rows = JointSet::EMPTY;
-    for joint in JointId::ALL {
-        if joint.group() == JointGroup::Legs {
-            rows.insert(joint);
-        }
-    }
-    rows
+pub fn jammed_rows() -> JointFlags {
+    JointGroup::Legs.joints()
 }
 
 /// The simulated time the run ends at.
@@ -104,12 +99,12 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(UP_START_CYCLE),
             end_ns: cycle_at(STOW_START_CYCLE),
-            posture: Some(Posture::UP),
+            posture: Some(PostureWire::UP),
         },
         Step {
             start_ns: cycle_at(STOW_START_CYCLE),
             end_ns: cycle_at(DISENGAGE_CYCLE),
-            posture: Some(Posture::STOW),
+            posture: Some(PostureWire::STOW),
         },
     ]
 }

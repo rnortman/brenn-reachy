@@ -12,33 +12,36 @@
 //! are baked constants, shared through `reachy-kin` rather than rebuilt here per
 //! execution.
 //!
-//! Every field of every schema type is read and written through `motion_slots`,
-//! so which number lives in which field is said once for the whole system.
+//! Every message this file writes is written through its validated view: one
+//! `clear_valid` or `validate` at the slot, then plain fields. Which number
+//! lives in which field is the schema's own statement, and the readings of a
+//! pose, a joint vector and a command set are `reachy-motion`'s, so a cog and
+//! the library it drives cannot disagree about them.
 
+use brenn_reachy__cogs__config_clk_rs::MoverParams;
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
-use brenn_reachy__cogs__msgs_clk_rs::{
-    FaultKind, JointRef, MoverState, PoseState, Posture, SessionSchedule, StepKind,
-};
-use clockwork_rs::{Clear as _, SyncTime};
+use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
+use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
+use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, SessionScheduleWire, StepKindWire};
+use brenn_reachy__driver__pose_clk_rs::PoseSample;
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
+use clockwork_rs::SyncTime;
 use core::time::Duration;
-use motion_slots::{
-    clear_pose, counters, joint_ref_from_row, joint_ref_of, joints_from_rows, read_motion_snap,
-    read_pose, rows_from_joints, write_joints, write_motion_snap, write_pose,
-};
+use motion_slots::{configured, counters};
 use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeViolations, FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics,
 };
 use reachy_motion::arm::{ArmRecord, rest_pose_seeds};
-use reachy_motion::joints::{JointSet, JointVector};
+use reachy_motion::fault::{self, FaultKind};
+use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
-use reachy_motion::snap::FaultSnapshot;
+use reachy_motion::record;
 use reachy_motion::tick::{
-    CommandDisposition, CommandRejection, Fault, Mode, MotionCommand, MotionState, MoveAbort,
-    TickInputs, TickOutputs, default_motion_config, motion_tick,
+    CommandDisposition, CommandRejection, Fault, MotionCommand, MotionMode, MoveAbort, TickInputs,
+    TickOutputs, arm, default_motion_config, last_goal, motion_tick, resume, standing_fault,
 };
-use reachy_motion::traj::{MoveDurations, Warp};
-use reachy_wire::{GoalSetpoint, PoseSample};
+use reachy_motion::traj::{MoveDurations, WarpKind};
 
 /// Bus rows the six legs occupy: body yaw is row zero and the antennas are the
 /// last two, so the cranks are the block between them.
@@ -61,15 +64,32 @@ struct Estimate {
     solved: Option<(Isometry3<f64>, FkStats)>,
 }
 
+/// The setpoint one sample decided on, before it reaches the output slot.
+///
+/// Held as ordinary Rust for the same reason [`Estimate`] is: a burst of
+/// samples decides a goal each and the slot carries one, so the fold to the
+/// last of them is a decision made here rather than a sequence of writes into
+/// the slot, and a window that ends behind a latched fault publishes none of
+/// them.
+struct GoalOut {
+    /// The grid instant the setpoint is to be written at.
+    execute_at_ns: i64,
+    /// The rows it speaks for.
+    mask: JointFlags,
+    /// The angles asked for.
+    targets: JointVector,
+}
+
 /// Where the head is, once per sample.
 ///
 /// Every execution produces exactly one estimate, valid or not. A consumer of a
 /// pose series needs staleness to be a value it can read at the instant it
 /// happened; a cog that published nothing when it could not solve would leave
 /// that consumer to infer an outage from a hole in the timestamps. That holds
-/// for a window of datagrams none of which decoded, too: those carry no instant
-/// of their own, so the estimate is stamped with the execution's, but silence
-/// there would make a codec-level outage indistinguishable from a stalled cog.
+/// for a window of messages none of which validated, too: those carry no
+/// instant of their own, so the estimate is stamped with the execution's, but
+/// silence there would make a refused window indistinguishable from a stalled
+/// cog.
 pub fn execute_pose(dial: &mut PoseDial<'_>) {
     let geometry = default_geometry();
     let options = FkOptions::default();
@@ -94,20 +114,23 @@ pub fn execute_pose(dial: &mut PoseDial<'_>) {
 
     let mut latest = None;
     let mut solved_any = false;
-    let mut saw_a_datagram = false;
-    for packet in dial.inputs.sample.new_msgs() {
-        saw_a_datagram = true;
-        // A datagram that does not decode is not a sample and cannot be
-        // timestamped, so no estimate can be published for it.
-        let Ok((_, sample)) = PoseSample::decode(packet.bytes().as_slice()) else {
-            counters.undecodable_samples += 1;
+    let mut saw_a_message = false;
+    for message in dial.inputs.sample.new_msgs() {
+        saw_a_message = true;
+        // Bytes that describe no sample cannot be timestamped, so no estimate
+        // can be published for them. The boundary refusal is this one call: a
+        // field this build does not know is refused here rather than at each
+        // reading of it below.
+        let Ok(sample) = message.validate() else {
+            counters.refused_samples += 1;
             continue;
         };
 
-        let complete = sample.present_valid && sample.miss_mask == 0;
+        let rows = rows_of(&sample.present);
+        let complete = bool::from(sample.present_valid) && flags::is_empty(sample.missing);
         let solved = if complete {
             let legs = LegAngles(
-                sample.present[LEG_ROWS]
+                rows[LEG_ROWS]
                     .try_into()
                     .expect("six leg rows between the yaw and the antennas"),
             );
@@ -130,8 +153,8 @@ pub fn execute_pose(dial: &mut PoseDial<'_>) {
         };
 
         latest = Some(Estimate {
-            time_of_validity_ns: sample.sample_time_ns,
-            joints: joints_from_rows(&sample.present),
+            time_of_validity_ns: sample.sample_time.as_nanos(),
+            joints: vector_of(&sample.present),
             solved,
         });
     }
@@ -144,12 +167,12 @@ pub fn execute_pose(dial: &mut PoseDial<'_>) {
 
     let estimate = match latest {
         Some(estimate) => estimate,
-        // Nothing in the window decoded. There is no reading and no instant of
-        // its own to report one at, so the estimate is stamped with the
+        // Nothing in the window validated. There is no reading and no instant
+        // of its own to report one at, so the estimate is stamped with the
         // execution's start time and carries no positions -- `valid` is false
         // and the joints say nothing, which is the point: the series stays
         // continuous, and the outage is a value in it rather than a hole.
-        None if saw_a_datagram => Estimate {
+        None if saw_a_message => Estimate {
             time_of_validity_ns: dial.start_time().as_nanos(),
             joints: JointVector::default(),
             solved: None,
@@ -158,25 +181,18 @@ pub fn execute_pose(dial: &mut PoseDial<'_>) {
     };
 
     let out = &mut dial.outputs.estimate;
-    let msg = out.msg_mut();
-    msg.set_time_of_validity(SyncTime::from_nanos(estimate.time_of_validity_ns));
-    write_joints(msg.joints_mut(), &estimate.joints);
-    msg.set_valid(estimate.solved.is_some());
-    match estimate.solved {
-        Some((pose, stats)) => {
-            write_pose(msg, &pose);
-            msg.set_fk_iters(stats.iters);
-            msg.set_fk_residual(stats.residual);
-        }
-        None => {
-            // An output slot is reused memory holding whatever the previous
-            // execution left. There is no pose to write, so the pose fields are
-            // zeroed rather than left carrying an older answer that `valid`
-            // says nothing about.
-            clear_pose(msg);
-            msg.set_fk_iters(0);
-            msg.set_fk_residual(0.0);
-        }
+    // An output slot is reused memory holding whatever the previous execution
+    // left, so the message starts cleared: an estimate carrying no pose says so
+    // in the pose fields as well as in `valid`, rather than leaving an older
+    // answer standing behind a flag that says nothing about it.
+    let msg = out.msg_mut().clear_valid();
+    msg.time_of_validity = SyncTime::from_nanos(estimate.time_of_validity_ns);
+    write_vector(&mut msg.joints, &estimate.joints);
+    msg.valid = estimate.solved.is_some().into();
+    if let Some((pose, stats)) = estimate.solved {
+        record::write_pose(&mut msg.head_pos, &mut msg.head_quat, &pose);
+        msg.fk_iters = stats.iters;
+        msg.fk_residual = stats.residual;
     }
     out.mark_for_publish();
 }
@@ -186,18 +202,25 @@ pub fn execute_pose(dial: &mut PoseDial<'_>) {
 ///
 /// # Errors
 ///
-/// The neutral pose, in the error arm, when the slot holds numbers that are not
-/// a pose. Refused rather than repaired, and refused the way the crate's own
-/// decoder refuses: a seed picks which configuration of the mechanism a solve
-/// lands in, so reading four arbitrary numbers as a rotation is how a plausible
-/// answer on the wrong assembly mode gets published. Falling back to neutral is
-/// the same thing this cog does before it has ever solved, and the caller counts
-/// it.
-fn seed_pose(state: &PoseState) -> Result<Isometry3<f64>, Isometry3<f64>> {
-    if !state.have_seed() {
-        return Ok(reachy_kin::neutral_head_pose());
+/// The neutral pose, in the error arm, when the slot does not read as a state at
+/// all or holds numbers that are not a pose. Refused rather than repaired, and
+/// refused the way every boundary in this stack refuses: a seed picks which
+/// configuration of the mechanism a solve lands in, so reading four arbitrary
+/// numbers as a rotation is how a plausible answer on the wrong assembly mode
+/// gets published. Falling back to neutral is the same thing this cog does
+/// before it has ever solved, and the caller counts it.
+fn seed_pose(state: &PoseStateWire) -> Result<Isometry3<f64>, Isometry3<f64>> {
+    let neutral = reachy_kin::neutral_head_pose();
+    // Bytes that do not read as a state are the same answer as a seed that is no
+    // pose: the neutral pose, counted. The slot is cleared and reseeded by the
+    // next execution that solves; until one does there is nothing to seed from.
+    let Ok(state) = state.validate() else {
+        return Err(neutral);
+    };
+    if !bool::from(state.have_seed) {
+        return Ok(neutral);
     }
-    read_pose(state).map_err(|_| reachy_kin::neutral_head_pose())
+    record::read_pose(&state.seed_pos, &state.seed_quat).map_err(|_| neutral)
 }
 
 /// Record the seed for the next execution.
@@ -205,12 +228,25 @@ fn seed_pose(state: &PoseState) -> Result<Isometry3<f64>, Isometry3<f64>> {
 /// `solved_any` is false when this execution saw no sample it could solve, and
 /// then the slot is left exactly as it was: writing the same pose back would
 /// cost the same and say the seed had been reconsidered.
-fn store_seed(state: &mut PoseState, seed: &Isometry3<f64>, solved_any: bool) {
+fn store_seed(state: &mut PoseStateWire, seed: &Isometry3<f64>, solved_any: bool) {
     if !solved_any {
         return;
     }
-    state.set_have_seed(true);
-    write_pose(state, seed);
+    // Nothing outside this cog writes the slot, so bytes it cannot read are
+    // memory gone wrong rather than another writer's opinion. Clearing puts it
+    // back to no seed at all, which is where the cog starts; the execution's
+    // totals are written over the cleared bytes at its foot.
+    if state.validate_mut().is_err() {
+        state.clear_valid();
+    }
+    // Validated twice rather than once because a borrow taken by the failing
+    // call outlives the arm that clears the slot; the `expect` sits against that
+    // clear, which leaves bytes validation accepts.
+    let state = state
+        .validate_mut()
+        .expect("a slot that validated, or a cleared one");
+    state.have_seed = true.into();
+    record::write_pose(&mut state.seed_pos, &mut state.seed_quat, seed);
 }
 
 /// What to command next, once per sample.
@@ -236,76 +272,104 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     // The whole schedule every time, so the newest message is all there is to
     // know; no message at all is a session nobody has started.
     let schedule = dial.inputs.sched.latest();
-    let engaged = schedule.is_some_and(SessionSchedule::engaged);
+    let engaged = schedule.is_some_and(SessionScheduleWire::engaged);
 
-    // The last goal this cog published, read back out of its own view rather
-    // than kept in state fields: the sequence number the next datagram carries,
-    // and the instant the last one named, which the publish is checked against.
-    // A carrier this build cannot read is counted rather than passed over: the
-    // answer is a fresh stream -- sequence from zero, no instant to check the
-    // next publish against -- and a consumer watching the sequence numbers would
-    // otherwise have no way to tell that restart from a commander that restarted.
-    let published = match dial.inputs.own_cmd.latest() {
-        None => None,
-        Some(packet) => match GoalSetpoint::decode(packet.bytes().as_slice()) {
-            Ok(decoded) => Some(decoded),
-            Err(_) => {
-                counters.refused_readback += 1;
-                None
-            }
-        },
-    };
-    let last_seq = published.as_ref().map(|(header, _)| header.seq);
-    let last_execute_at = published.as_ref().map(|(_, goal)| goal.execute_at_ns);
+    // The instant the last goal this cog published named, read back out of its
+    // own view rather than kept in a state field: the channel carries the
+    // setpoint itself, so the instant is a field of it and the publish below is
+    // checked against it.
+    let last_execute_at = dial
+        .inputs
+        .own_cmd
+        .latest()
+        .map(|goal| goal.execute_at().as_nanos());
 
-    // Read once, ticked over every sample of the window, written back once: the
-    // slot is only observable between executions, and a state written per
-    // sample would be the same value copied out and back for each of them.
-    let mut state = restore(dial.states.ctrl, &mut counters.refused_state);
+    // The state is the slot, validated once here and handed to the tick as
+    // itself: what a cog carries between executions is what the slot holds, so
+    // there is nothing to read out and nothing to write back.
+    //
+    // A slot this build cannot read is cleared and counted, which leaves the
+    // machine unarmed rather than ticking on bytes nothing wrote. Unarmed is
+    // the safe reading -- the arming path is level-triggered, so the next
+    // sample builds a fresh state off a measured pose, and the goal stream
+    // stops in the meantime, which is what every other loss of command does
+    // here.
+    // The count is the whole trace a refusal leaves; which of them it was is
+    // not reported anywhere.
+    // TODO(refusal-classification-reported)
+    let mut armed = dial.states.ctrl.armed();
+    if dial.states.ctrl.snap_mut().validate_mut().is_err() {
+        dial.states.ctrl.snap_mut().clear_valid();
+        counters.refused_state += 1;
+        armed = false;
+    }
     let mut desired = Desired::of(dial.states.ctrl);
     let mut epoch_seen = dial.states.ctrl.schedule_epoch_seen();
 
     let mut goal_out = None;
     let mut reports = Reports::default();
 
-    for packet in dial.inputs.sample.new_msgs() {
-        // A datagram that does not decode is not a sample: it names no instant
-        // and no positions, so there is no cycle to run and nothing to command
-        // for it.
-        let Ok((_, sample)) = PoseSample::decode(packet.bytes().as_slice()) else {
-            counters.undecodable_samples += 1;
+    // Held for the whole window: the slot is only observable between
+    // executions, so every sample of the burst ticks the same state in place.
+    let Ok(state) = dial.states.ctrl.snap_mut().validate_mut() else {
+        // Bytes that did not read as a state and did not read as one after
+        // being cleared either. Nothing is commanded and the refusal is
+        // counted: the goal stream stopping is what takes the machine down
+        // safely, and a panic here would take the loop with it and say
+        // nothing.
+        counters.refused_state += 1;
+        dial.states.ctrl.set_armed(false);
+        counters.store(dial.states.ctrl);
+        counters.report(&before, &mut dial.signals);
+        return;
+    };
+    if armed && resume(state).is_err() {
+        // Readable bytes that describe no state a tick could be in -- the same
+        // answer as a slot that did not validate, for the same reason.
+        counters.refused_state += 1;
+        armed = false;
+    }
+
+    for message in dial.inputs.sample.new_msgs() {
+        // Bytes that describe no sample name no instant and no positions, so
+        // there is no cycle to run and nothing to command for them. The
+        // boundary refusal is this one call.
+        let Ok(sample) = message.validate() else {
+            counters.refused_samples += 1;
             continue;
         };
         counters.samples_seen += 1;
-        let nominal = sample.nominal_time_ns;
+        let nominal = sample.nominal_time.as_nanos();
 
         if !engaged {
             // Disengaged: the state dies with the engagement, and recovery is a
             // fresh one rather than a flag being cleared. Nothing is commanded,
             // so the goal stream stops and the driver's dead-man takes the
             // machine down.
-            state = None;
+            armed = false;
             desired = Desired::NOTHING_DISPATCHED;
             continue;
         }
 
-        if state.is_none() {
+        let present = reading(sample);
+
+        if !armed {
             // Arming, level-triggered: engaged and not armed is the whole
             // condition, so a solve that failed is retried on the next sample
             // with no edge to remember. A failure here raises nothing -- the
             // machine is not under command yet, and a pre-torque problem is
             // never a fault.
-            let Some(present) = reading(&sample) else {
+            let Some(present) = present.as_ref() else {
                 continue;
             };
-            let Ok(record) = ArmRecord::solve(&cfg.geom, &cfg.fk, &present, &rest_pose_seeds())
+            let Ok(record) = ArmRecord::solve(&cfg.geom, &cfg.fk, present, &rest_pose_seeds())
             else {
                 continue;
             };
-            state = Some(MotionState::new_armed(&record, JointSet::EMPTY));
+            arm(state, &record, JointFlags::NONE);
+            armed = true;
             desired = Desired::NOTHING_DISPATCHED;
         }
-        let state = state.as_mut().expect("armed a moment ago if not before");
 
         // A retarget is spent by the step that answers it, not by the schedule
         // arriving, so it cannot be lost to the gap it happens to land in: a
@@ -327,7 +391,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 })
         });
 
-        let before_mode = state.mode();
+        let before_fault = standing_fault(state);
         let mut out = TickOutputs::default();
         motion_tick(
             cfg,
@@ -340,7 +404,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 // is what the tick does with any clock that went backwards.
                 now: Duration::from_nanos(u64::try_from(nominal).unwrap_or(0)),
                 period: Duration::from_nanos(settings.period_ns),
-                present: reading(&sample).as_ref(),
+                present: present.as_ref(),
                 command: command.as_ref(),
                 // No health poll: this cog holds no bus and reads no error
                 // bits.
@@ -348,7 +412,15 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
             },
             &mut out,
         );
-        reports.collect(&out, before_mode, nominal);
+        reports.collect(&out, before_fault, nominal);
+
+        // A move the state claimed and held nothing to sample: bytes something
+        // other than this tick wrote, which is the same thing a slot that does
+        // not resume is and is counted the same way. The tick has already
+        // dropped to holding, so the machine is still under command.
+        if out.report.unsampleable.is_some() {
+            counters.refused_state += 1;
+        }
 
         // The keep-alive. Every sample of an engaged, armed machine carries a
         // goal, whether or not the tick emitted one: a setpoint unchanged is
@@ -360,58 +432,38 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         // published behind the latch: one more datagram would feed the dead-man
         // one more time and command the machine once past the point the loop
         // decided it must not be.
-        if state.is_faulted() {
+        if state.mode == MotionMode::Faulted {
             goal_out = None;
         } else {
-            goal_out = Some(GoalSetpoint {
+            goal_out = Some(GoalOut {
                 execute_at_ns: nominal.saturating_add(settings.lag_ns()),
                 // Every row the tick still speaks for. A masked servo has been
                 // taken out of service and is never written again.
-                mask: JointSet::ALL.without(out.report.masked).bits(),
-                targets: rows_from_joints(out.goal.as_ref().unwrap_or(state.last_goal())),
+                mask: flags::without(flags::all(), out.report.masked),
+                targets: out.goal.unwrap_or_else(|| last_goal(state)),
             });
         }
     }
 
-    // A snapshot the slot will not hold leaves the machine unarmed rather than
-    // armed over a slot that does not describe it: the next sample re-arms from
-    // a measured pose, which is what a fresh engagement does anyway. The write
-    // is all-or-nothing, so the slot is untouched either way.
-    //
-    // No configuration this cog accepts reaches the refusal: the crossing
-    // refuses a length of time past what a slot's signed nanoseconds hold, and
-    // every duration reaching it is bounded by the signed count the config
-    // fields themselves are. The branch is the boundary's, not this cog's, and
-    // it is here so a host that is not so bounded stops rather than commands
-    // from a slot holding half a state.
-    let mut armed = state.is_some();
-    if let Some(state) = state.as_ref()
-        && write_motion_snap(dial.states.ctrl.snap_mut(), &state.snapshot()).is_err()
-    {
-        counters.refused_state += 1;
-        armed = false;
-    }
     dial.states.ctrl.set_armed(armed);
     dial.states.ctrl.set_schedule_epoch_seen(epoch_seen);
     desired.store(dial.states.ctrl);
 
     // The burst rule, which the deterministic runner never exercises and a
     // scheduling stall online does: the goals are superseded, so the last one
-    // wins the slot and the state effects of the rest are already folded into
-    // the snapshot; the reports are events, so the first one wins and the rest
-    // are counted rather than quietly lost.
+    // wins the slot and the state effects of the rest are already in the state
+    // slot; the reports are events, so the first one wins and the rest are
+    // counted rather than quietly lost.
     if let Some(goal) = goal_out {
         debug_assert!(
             last_execute_at.is_none_or(|last| goal.execute_at_ns > last),
             "a goal must name a later instant than the one before it",
         );
         let out = &mut dial.outputs.goal;
-        out.msg_mut().clear();
-        assert!(
-            out.msg_mut()
-                .try_set_bytes(&goal.encode(next_seq(last_seq))),
-            "the goal carrier is too small for a GoalSetpoint datagram",
-        );
+        let msg = out.msg_mut().clear_valid();
+        msg.execute_at = SyncTime::from_nanos(goal.execute_at_ns);
+        msg.mask = goal.mask;
+        write_vector(&mut msg.targets, &goal.targets);
         out.mark_for_publish();
         counters.goals_published += 1;
     }
@@ -419,12 +471,12 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     counters.reports_dropped += reports.dropped;
     if let Some(raise) = reports.first {
         let out = &mut dial.outputs.fault;
-        let msg = out.msg_mut();
-        msg.set_time(SyncTime::from_nanos(raise.time_ns));
-        msg.set_kind(raise.kind);
-        msg.set_joint(raise.joint);
-        msg.set_detail(raise.detail);
-        msg.set_count(raise.count);
+        let msg = out.msg_mut().clear_valid();
+        msg.time = SyncTime::from_nanos(raise.time_ns);
+        msg.kind = raise.kind;
+        msg.joint = raise.joint;
+        msg.detail = raise.detail;
+        msg.count = raise.count;
         out.mark_for_publish();
     }
 
@@ -434,41 +486,14 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     counters.report(&before, &mut dial.signals);
 }
 
-/// The tick state the last execution left, or `None` when there is none to
-/// restore.
-///
-/// A slot that does not decode is counted and answered `None`, not panicked on:
-/// this is the process that commands the machine, and a cog that aborted on its
-/// own memory would take the loop down with no report of why. Unarmed is the
-/// safe reading — the arming path is level-triggered, so the next sample builds
-/// a fresh state off a measured pose, and the goal stream stops in the meantime,
-/// which is what every other loss of command does here.
-fn restore(state: &MoverState, refusals: &mut u64) -> Option<MotionState> {
-    if !state.armed() {
-        return None;
-    }
-    let restored = read_motion_snap(state.snap())
-        .ok()
-        .and_then(|snap| MotionState::from_snapshot(&snap).ok());
-    if restored.is_none() {
-        *refusals += 1;
-    }
-    restored
-}
-
 /// The measured positions, or `None` where the sample carries no reading.
 ///
 /// A sample the driver marked stale, or one with a row that did not answer, is
 /// not a reading of anything: the tick counts it as a miss rather than being
 /// handed eight good angles and one stale one.
 fn reading(sample: &PoseSample) -> Option<JointVector> {
-    (sample.present_valid && sample.miss_mask == 0).then(|| joints_from_rows(&sample.present))
-}
-
-/// The sequence number after the one the last datagram carried, or zero if
-/// there was none.
-fn next_seq(last: Option<u32>) -> u32 {
-    last.map_or(0, |seq| seq.wrapping_add(1))
+    (bool::from(sample.present_valid) && flags::is_empty(sample.missing))
+        .then(|| vector_of(&sample.present))
 }
 
 /// The grid this cog commands on, and how long a posture change takes.
@@ -490,15 +515,15 @@ struct Settings {
 impl Settings {
     /// Read and check this cog's configuration.
     fn of(dial: &MoverDial<'_>) -> Self {
-        let params = &dial.configs.params;
+        let params: &MoverParams = configured(dial.configs.params, "the mover's");
         Self {
-            lag_k: i64::from(params.lag_k()),
-            period_ns: length_of(params.period_ns(), "the control period"),
+            lag_k: i64::from(params.lag_k),
+            period_ns: length_of(params.period_ns, "the control period"),
             up: Duration::from_nanos(length_of(
-                params.up_duration_ns(),
+                params.up_duration_ns,
                 "the move to the up posture",
             )),
-            stow: Duration::from_nanos(length_of(params.stow_duration_ns(), "the move to stow")),
+            stow: Duration::from_nanos(length_of(params.stow_duration_ns, "the move to stow")),
         }
     }
 
@@ -530,20 +555,20 @@ fn length_of(ns: i64, what: &str) -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Desired {
     /// What the last dispatched step asked for.
-    kind: StepKind,
+    kind: StepKindWire,
     /// Which posture it named.
-    posture: Posture,
+    posture: PostureWire,
 }
 
 impl Desired {
     /// Nothing dispatched: what a freshly armed machine has asked for.
     const NOTHING_DISPATCHED: Self = Self {
-        kind: StepKind::BASE_KEEP,
-        posture: Posture::STOW,
+        kind: StepKindWire::BASE_KEEP,
+        posture: PostureWire::STOW,
     };
 
     /// What the slot says was last dispatched.
-    fn of(state: &MoverState) -> Self {
+    fn of(state: &MoverStateWire) -> Self {
         Self {
             kind: state.desired_kind(),
             posture: state.desired_posture(),
@@ -551,7 +576,7 @@ impl Desired {
     }
 
     /// Record it for the next execution.
-    fn store(self, state: &mut MoverState) {
+    fn store(self, state: &mut MoverStateWire) {
         state.set_desired_kind(self.kind);
         state.set_desired_posture(self.posture);
     }
@@ -564,13 +589,13 @@ impl Desired {
     /// instant no step covers, and a step this build cannot read all answer
     /// with the posture already dispatched -- the machine holds where the last
     /// move left it rather than being sent somewhere by a gap in a schedule.
-    fn at(self, schedule: &SessionSchedule, nominal: i64) -> Option<Self> {
+    fn at(self, schedule: &SessionScheduleWire, nominal: i64) -> Option<Self> {
         let step = schedule
             .steps()
             .iter()
             .find(|step| (step.start().as_nanos()..step.end().as_nanos()).contains(&nominal))?;
-        (step.kind() == StepKind::BASE_POSTURE).then_some(Self {
-            kind: StepKind::BASE_POSTURE,
+        (step.kind() == StepKindWire::BASE_POSTURE).then_some(Self {
+            kind: StepKindWire::BASE_POSTURE,
             posture: step.posture(),
         })
     }
@@ -583,7 +608,7 @@ impl Desired {
     /// commands and the one disarming checks.
     fn command(self, settings: &Settings) -> MotionCommand {
         let (target, duration) = match self.posture {
-            Posture::UP => (neutral_targets(), settings.up),
+            PostureWire::UP => (neutral_targets(), settings.up),
             // Stow is the default of the vocabulary and the posture the machine
             // rests in, so a value this build does not know goes there rather
             // than to the working posture: an unknown posture must not be a
@@ -593,7 +618,7 @@ impl Desired {
         MotionCommand::MoveTo {
             target,
             durations: MoveDurations::uniform(duration),
-            warp: Warp::MinJerk,
+            warp: WarpKind::MinJerk,
         }
     }
 }
@@ -633,13 +658,13 @@ impl Reports {
     /// Take everything this tick raised, in the order a reader would want it:
     /// a fault outranks a group taken out of service, which outranks a move
     /// abandoned, which outranks a command refused.
-    fn collect(&mut self, out: &TickOutputs, before: Mode, nominal: i64) {
+    fn collect(&mut self, out: &TickOutputs, before: Option<Fault>, nominal: i64) {
         // Transitions only. The tick re-reports a standing fault every cycle,
         // and a channel carrying it at the sample rate is a channel nobody can
         // read; a non-latching fault leaves the tick holding, so its detector
         // has to rebuild a whole run before it says so again, and each of those
         // is news.
-        let standing = matches!(before, Mode::Faulted(held) if Some(held) == out.report.fault);
+        let standing = before.is_some() && before == out.report.fault;
         if let Some(fault) = out.report.fault
             && !standing
         {
@@ -648,7 +673,7 @@ impl Reports {
         // A degrade with nothing newly masked is the same servos still out of
         // service, which is not news either.
         if let Some(fault) = out.report.degraded
-            && !out.report.newly_masked.is_empty()
+            && !flags::is_empty(out.report.newly_masked)
         {
             self.offer(Raise::of_fault(&fault, nominal));
         }
@@ -673,17 +698,16 @@ impl Reports {
 impl Raise {
     /// A fault, as the numbers that classified it.
     ///
-    /// Through the library's own flat form, so the message and the state slot
-    /// carry one description of a fault rather than two.
-    fn of_fault(fault: &Fault, nominal: i64) -> Self {
-        let snap = FaultSnapshot::from(fault);
+    /// Through the library's own reading of a fault, so the message, the state
+    /// slot and the operator's log carry one description of it rather than
+    /// three.
+    fn of_fault(raised: &Fault, nominal: i64) -> Self {
         Self {
             time_ns: nominal,
-            kind: FaultKind(snap.code.as_u8()),
-            joint: joint_ref_from_row(snap.joint)
-                .expect("a fault names a bus row the machine has, or none"),
-            detail: snap.error,
-            count: snap.count,
+            kind: fault::kind(raised),
+            joint: fault::joint(raised),
+            detail: fault::detail(raised),
+            count: fault::count(raised),
         }
     }
 
@@ -691,17 +715,14 @@ impl Raise {
     fn of_abort(abort: &MoveAbort, nominal: i64) -> Self {
         let (kind, joint, detail, count) = match abort {
             MoveAbort::EnvelopePath(violations) => (
-                FaultKind::MOVE_ABORTED_ENVELOPE,
-                JointRef::NONE,
+                FaultKind::MoveAbortedEnvelope,
+                JointRef::None,
                 0.0,
                 failed_checks(violations),
             ),
-            MoveAbort::StepTooLarge { joint, delta } => (
-                FaultKind::MOVE_ABORTED_STEP,
-                joint_ref_of(*joint),
-                *delta,
-                0,
-            ),
+            MoveAbort::StepTooLarge { joint, delta } => {
+                (FaultKind::MoveAbortedStep, *joint, *delta, 0)
+            }
         };
         Self {
             time_ns: nominal,
@@ -716,19 +737,17 @@ impl Raise {
     fn of_rejection(rejection: &CommandRejection, nominal: i64) -> Self {
         let (joint, detail, count) = match rejection {
             CommandRejection::Envelope(violations) => {
-                (JointRef::NONE, 0.0, failed_checks(violations))
+                (JointRef::None, 0.0, failed_checks(violations))
             }
             // No magnitude this message has a field for, and the count of
             // nothing is nothing.
-            CommandRejection::Trajectory(_) => (JointRef::NONE, 0.0, 0),
-            CommandRejection::AntennaUnreachable { joint, angle } => {
-                (joint_ref_of(*joint), *angle, 0)
-            }
-            CommandRejection::StepTooLarge { joint, delta } => (joint_ref_of(*joint), *delta, 0),
+            CommandRejection::Trajectory(_) => (JointRef::None, 0.0, 0),
+            CommandRejection::AntennaUnreachable { joint, angle } => (*joint, *angle, 0),
+            CommandRejection::StepTooLarge { joint, delta } => (*joint, *delta, 0),
         };
         Self {
             time_ns: nominal,
-            kind: FaultKind::COMMAND_REJECTED,
+            kind: FaultKind::CommandRejected,
             joint,
             detail,
             count,
@@ -766,11 +785,12 @@ mod tests {
     //! reachable here, where the mapping is a function over the tick's report.
 
     use super::{Raise, Reports, failed_checks};
-    use brenn_reachy__cogs__msgs_clk_rs::{FaultKind, JointRef};
+    use brenn_reachy__motion__joints_clk_rs::JointFlags;
     use reachy_kin::EnvelopeViolations;
-    use reachy_motion::joints::{JointId, JointSet};
+    use reachy_motion::fault::FaultKind;
+    use reachy_motion::joints::{JointRef, flags};
     use reachy_motion::tick::{
-        CommandDisposition, CommandRejection, Fault, Mode, MoveAbort, TickOutputs,
+        CommandDisposition, CommandRejection, Fault, MoveAbort, TickOutputs,
     };
     use reachy_motion::traj::TrajectoryError;
 
@@ -793,9 +813,9 @@ mod tests {
     #[test]
     fn every_way_a_command_is_refused_carries_its_own_evidence() {
         let refused = Raise::of_rejection(&CommandRejection::Envelope(two_violations()), AT);
-        assert_eq!(refused.kind, FaultKind::COMMAND_REJECTED);
+        assert_eq!(refused.kind, FaultKind::CommandRejected);
         assert_eq!(refused.time_ns, AT);
-        assert_eq!(refused.joint, JointRef::NONE, "the pose, not a servo");
+        assert_eq!(refused.joint, JointRef::None, "the pose, not a servo");
         assert_eq!(refused.detail, 0.0, "an envelope refusal has no magnitude");
         assert_eq!(refused.count, 2, "how many checks the pose failed");
 
@@ -803,21 +823,21 @@ mod tests {
             &CommandRejection::Trajectory(TrajectoryError::NonPositiveDuration),
             AT,
         );
-        assert_eq!(refused.kind, FaultKind::COMMAND_REJECTED);
-        assert_eq!(refused.joint, JointRef::NONE);
+        assert_eq!(refused.kind, FaultKind::CommandRejected);
+        assert_eq!(refused.joint, JointRef::None);
         assert_eq!(refused.detail, 0.0);
         assert_eq!(refused.count, 0, "a path refused has nothing to count");
 
         let refused = Raise::of_rejection(
             &CommandRejection::AntennaUnreachable {
-                joint: JointId::AntennaLeft,
+                joint: JointRef::AntennaLeft,
                 angle: 1600.5,
             },
             AT,
         );
         assert_eq!(
             refused.joint,
-            JointRef::ANTENNA_LEFT,
+            JointRef::AntennaLeft,
             "the antenna asked for"
         );
         assert_eq!(refused.detail, 1600.5, "the arc it was asked for");
@@ -825,12 +845,12 @@ mod tests {
 
         let refused = Raise::of_rejection(
             &CommandRejection::StepTooLarge {
-                joint: JointId::Leg(4),
+                joint: JointRef::Leg4,
                 delta: -0.75,
             },
             AT,
         );
-        assert_eq!(refused.joint, JointRef::LEG_4, "the servo asked to jump");
+        assert_eq!(refused.joint, JointRef::Leg4, "the servo asked to jump");
         assert_eq!(refused.detail, -0.75, "how far, sign kept");
         assert_eq!(refused.count, 0);
     }
@@ -838,39 +858,23 @@ mod tests {
     #[test]
     fn both_ways_a_move_is_abandoned_carry_their_own_evidence() {
         let abandoned = Raise::of_abort(&MoveAbort::EnvelopePath(two_violations()), AT);
-        assert_eq!(abandoned.kind, FaultKind::MOVE_ABORTED_ENVELOPE);
+        assert_eq!(abandoned.kind, FaultKind::MoveAbortedEnvelope);
         assert_eq!(abandoned.time_ns, AT);
-        assert_eq!(abandoned.joint, JointRef::NONE, "the path, not a servo");
+        assert_eq!(abandoned.joint, JointRef::None, "the path, not a servo");
         assert_eq!(abandoned.detail, 0.0);
         assert_eq!(abandoned.count, 2);
 
         let abandoned = Raise::of_abort(
             &MoveAbort::StepTooLarge {
-                joint: JointId::BodyYaw,
+                joint: JointRef::BodyYaw,
                 delta: 0.9,
             },
             AT,
         );
-        assert_eq!(abandoned.kind, FaultKind::MOVE_ABORTED_STEP);
-        assert_eq!(abandoned.joint, JointRef::BODY_YAW);
+        assert_eq!(abandoned.kind, FaultKind::MoveAbortedStep);
+        assert_eq!(abandoned.joint, JointRef::BodyYaw);
         assert_eq!(abandoned.detail, 0.9);
         assert_eq!(abandoned.count, 0);
-    }
-
-    #[test]
-    fn a_joint_the_bus_has_no_row_for_names_no_servo() {
-        let refused = Raise::of_rejection(
-            &CommandRejection::StepTooLarge {
-                joint: JointId::Leg(9),
-                delta: 0.5,
-            },
-            AT,
-        );
-        assert_eq!(
-            refused.joint,
-            JointRef::NONE,
-            "a servo this machine does not carry names none rather than another",
-        );
     }
 
     #[test]
@@ -898,16 +902,16 @@ mod tests {
         let mut out = TickOutputs::default();
         out.report.fault = Some(Fault::PositionFeedbackLost { misses: 51 });
         out.report.degraded = Some(Fault::AntennaObstructed {
-            joint: JointId::AntennaRight,
+            joint: JointRef::AntennaRight,
             error: 0.8,
         });
         out.report.newly_masked = {
-            let mut set = JointSet::EMPTY;
-            set.insert(JointId::AntennaRight);
+            let mut set = JointFlags::NONE;
+            flags::insert(&mut set, JointRef::AntennaRight);
             set
         };
         out.report.aborted = Some(MoveAbort::StepTooLarge {
-            joint: JointId::Leg(0),
+            joint: JointRef::Leg0,
             delta: 0.4,
         });
         out.report.command = CommandDisposition::Rejected(CommandRejection::Trajectory(
@@ -915,36 +919,36 @@ mod tests {
         ));
 
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Holding, AT);
+        reports.collect(&out, None, AT);
         assert_eq!(reports.raised, 4, "everything the tick said was counted");
         assert_eq!(reports.dropped, 3, "three of them lost the slot");
         let published = reports.first.expect("something was published");
         assert_eq!(
             published.kind,
-            FaultKind::POSITION_FEEDBACK_LOST,
+            FaultKind::PositionFeedbackLost,
             "the machine that must stop is what goes out",
         );
 
         // The same tick without the fault: the next rank down takes the slot.
         out.report.fault = None;
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Holding, AT);
+        reports.collect(&out, None, AT);
         assert_eq!(reports.raised, 3);
         assert_eq!(reports.dropped, 2);
         assert_eq!(
             reports.first.expect("a raise").kind,
-            FaultKind::ANTENNA_OBSTRUCTED,
+            FaultKind::AntennaObstructed,
         );
 
         // And without the degrade, the abandoned move outranks the refusal.
         out.report.degraded = None;
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Holding, AT);
+        reports.collect(&out, None, AT);
         assert_eq!(reports.raised, 2);
         assert_eq!(reports.dropped, 1);
         assert_eq!(
             reports.first.expect("a raise").kind,
-            FaultKind::MOVE_ABORTED_STEP,
+            FaultKind::MoveAbortedStep,
         );
     }
 
@@ -957,35 +961,35 @@ mod tests {
         out.report.fault = Some(standing);
 
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Faulted(standing), AT);
+        reports.collect(&out, Some(standing), AT);
         assert_eq!(reports.raised, 0, "the same fault, still standing");
         assert!(reports.first.is_none());
 
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Holding, AT);
+        reports.collect(&out, None, AT);
         assert_eq!(reports.raised, 1, "the tick it was raised on is news");
 
         // A degrade whose joints were already out of service says nothing new
         // either: the mask is what changed on the raise, and it did not.
         let mut out = TickOutputs::default();
         out.report.degraded = Some(Fault::AntennaObstructed {
-            joint: JointId::AntennaLeft,
+            joint: JointRef::AntennaLeft,
             error: 0.9,
         });
-        out.report.masked = JointSet::ALL;
+        out.report.masked = flags::all();
         let mut reports = Reports::default();
-        reports.collect(&out, Mode::Holding, AT);
+        reports.collect(&out, None, AT);
         assert_eq!(reports.raised, 0, "nothing entered the mask on this tick");
     }
 }
 
 counters! {
     /// The run's totals, as the pose estimator keeps them.
-    PoseCounters of PoseState, PoseSignals<'_>, crossing the_pose_totals_cross_their_slot {
+    PoseCounters of PoseStateWire, PoseSignals<'_>, crossing the_pose_totals_cross_their_slot {
         /// Solves that found no pose.
         fk_failures / set_fk_failures,
-        /// Datagrams the codec refused.
-        undecodable_samples / set_undecodable_samples,
+        /// Samples that failed validation.
+        refused_samples / set_refused_samples,
         /// Times the seed slot held numbers that were not a pose.
         refused_seeds / set_refused_seeds,
     }
@@ -993,23 +997,20 @@ counters! {
 
 counters! {
     /// The run's totals, as the decision tick keeps them.
-    MoverCounters of MoverState, MoverSignals<'_>, crossing the_mover_totals_cross_their_slot {
-        /// Goal datagrams published.
+    MoverCounters of MoverStateWire, MoverSignals<'_>, crossing the_mover_totals_cross_their_slot {
+        /// Goals published.
         goals_published / set_goals_published,
         /// Reports raised.
         faults_raised / set_faults_raised,
-        /// Samples decoded and ticked on.
+        /// Samples read and ticked on.
         samples_seen / set_samples_seen,
-        /// Datagrams the codec refused.
-        undecodable_samples / set_undecodable_samples,
+        /// Samples that failed validation.
+        refused_samples / set_refused_samples,
         /// Raises that lost the one report slot an execution has.
         reports_dropped / set_reports_dropped,
         /// Times the tick state in this cog's own slot could not be read back,
         /// or would not go back in.
         refused_state / set_refused_state,
-        /// Times this cog's own last goal datagram would not decode, so the
-        /// stream restarted its sequence.
-        refused_readback / set_refused_readback,
         /// Times an epoch this cog had not answered yet was answered by a
         /// posture step. One execution sees only the latest schedule, so bumps
         /// coalesced by a gap count once: this counts epoch changes observed,

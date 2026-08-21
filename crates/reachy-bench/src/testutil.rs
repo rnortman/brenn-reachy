@@ -1,19 +1,17 @@
 //! A scripted nine-servo machine behind the port seam, for tests that need one.
 //!
 //! Both halves of this crate talk to servos: the read-only registry sweeps
-//! registers, and the pump drives a sequencer's writes. They need the same
+//! registers, and the bare-bus commands drive their own. They need the same
 //! fixture — a register file that answers protocol frames — so it lives here
 //! rather than twice, where the two copies could disagree about what a servo
 //! does with a write.
 //!
 //! Test-only: nothing here is compiled into the binary.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use dxl_proto::frame::{
@@ -21,64 +19,16 @@ use dxl_proto::frame::{
     INST_WRITE,
 };
 use dxl_proto::{Reg, crc16, rad_to_counts};
-use reachy_bus::{BusPort, ServoMap, reg_for};
+use reachy_bus::{BusPort, ServoMap, named_reg};
 use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, rest_head_pose, stow_head_pose};
+use reachy_motion::reg;
 use reachy_motion::{EXPECTED_MODELS, ProvisionExpect, ProvisionTable, RegId};
 
+use crate::bare::Clock;
 use crate::config::BenchConfig;
-use crate::pump::Clock;
 
 /// A rail comfortably over the arm floor, in the register's tenths of a volt.
 const HEALTHY_RAIL: u16 = 118;
-
-/// The variable naming the directory the hardware trace recordings arrive in.
-/// The test target sets it; nothing else reads it.
-const TRACE_FIXTURES_ENV: &str = "REACHY_BENCH_TRACE_FIXTURES";
-
-/// A path in the system temporary directory that nothing else in this run is
-/// using, ending in `name`.
-///
-/// One scheme rather than one per module: the crate's tests run in parallel in
-/// one process, so uniqueness has to hold across all of them at once, and a
-/// counter they share is what gives that. The caller names what the file is
-/// for, so one left behind by a panic says which test left it.
-pub(crate) fn scratch_path(name: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    std::env::temp_dir().join(format!(
-        "reachy-bench-{}-{}-{name}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-/// A run recorded on real hardware, read back from the fixture of that name.
-///
-/// The recordings are checked in beside the crate, one file per bench session
-/// and one or more runs per file; their own `README.md` says what each holds.
-/// They are the measurements this machine's guards are sized against, so
-/// replaying them is how a change that would false-trip a validated gesture —
-/// or miss the one collision on record — fails here rather than on the machine.
-///
-/// The directory is not spelled here: `TRACE_FIXTURES_ENV` carries it, set by
-/// the test target beside the `data` attribute that puts the files in runfiles,
-/// so the two halves stay in one place. Its value is relative to the runfiles
-/// root, which is a test's working directory.
-///
-/// Panics rather than answers: neither a missing fixture nor a missing
-/// environment is a test case.
-pub(crate) fn trace_fixture(name: &str) -> crate::trace::metrics::Trace {
-    let dir = std::env::var(TRACE_FIXTURES_ENV).unwrap_or_else(|_| {
-        panic!(
-            "{TRACE_FIXTURES_ENV} is unset: the test target has to name the trace fixture \
-             directory beside the data attribute that supplies it"
-        )
-    });
-    let path = PathBuf::from(dir).join(format!("{name}.csv"));
-    match crate::trace::metrics::Trace::read(&path) {
-        Ok(trace) => trace,
-        Err(error) => panic!("the {name} trace fixture reads: {error}"),
-    }
-}
 
 /// A scripted machine: nine servos with a register file, answering pings, reads
 /// and writes over the port seam.
@@ -130,6 +80,10 @@ pub(crate) struct FakeMachine {
     /// Servos that acknowledge a reboot and are never heard from again: a
     /// restart that did not come back.
     pub(crate) gone_on_reboot: Vec<u8>,
+    /// Per servo, how many pings it answers nothing to before it starts
+    /// answering, counted down as they arrive: a servo still restarting, which
+    /// comes back partway through a polling sweep rather than at once or never.
+    pub(crate) pings_ignored: HashMap<u8, u32>,
     /// Servos the reboot instruction never reaches — a frame lost or corrupted
     /// on the wire. They answer nothing to it and go on holding what they were
     /// holding, which is exactly how a servo that restarted answers a ping.
@@ -158,6 +112,7 @@ impl FakeMachine {
             creep: HashMap::new(),
             stalled: Vec::new(),
             gone_on_reboot: Vec::new(),
+            pings_ignored: HashMap::new(),
             deaf_to_reboot: Vec::new(),
             keeps_latch: Vec::new(),
             out: VecDeque::new(),
@@ -176,7 +131,7 @@ impl FakeMachine {
     /// Whether this servo is holding torque.
     fn torqued(&self, id: u8) -> bool {
         self.regs
-            .get(&(id, reg_for(RegId::TorqueEnable).addr))
+            .get(&(id, named_reg(RegId::TorqueEnable).addr))
             .is_some_and(|bytes| bytes.first().is_some_and(|byte| *byte != 0))
     }
 
@@ -191,8 +146,8 @@ impl FakeMachine {
 
     /// The register a read of `addr` actually comes out of.
     fn source(&self, id: u8, addr: u16) -> u16 {
-        if addr == reg_for(RegId::GoalPosition).addr && self.mirroring(id) {
-            return reg_for(RegId::PresentPosition).addr;
+        if addr == named_reg(RegId::GoalPosition).addr && self.mirroring(id) {
+            return named_reg(RegId::PresentPosition).addr;
         }
         addr
     }
@@ -206,7 +161,7 @@ impl FakeMachine {
     /// and a goal stored by a limp unmirrored one moves nothing: torque is what
     /// makes a target a motion, and a stalled servo not even that.
     fn store(&mut self, id: u8, addr: u16, data: Vec<u8>) {
-        if addr == reg_for(RegId::GoalPosition).addr {
+        if addr == named_reg(RegId::GoalPosition).addr {
             if self.mirroring(id) {
                 return;
             }
@@ -216,7 +171,7 @@ impl FakeMachine {
                 && let Some(reached) = self.arriving(id, &data)
             {
                 self.regs
-                    .insert((id, reg_for(RegId::PresentPosition).addr), reached);
+                    .insert((id, named_reg(RegId::PresentPosition).addr), reached);
             }
         }
         self.regs.insert((id, addr), data);
@@ -268,14 +223,14 @@ impl FakeMachine {
         };
         self.set(
             id,
-            reg_for(RegId::PresentPosition),
+            named_reg(RegId::PresentPosition),
             &(at + moved).to_le_bytes(),
         );
     }
 
     /// What `id`'s four-byte position register holds, as the signed count it is.
     fn counts(&self, id: u8, reg: RegId) -> Option<i32> {
-        let bytes: [u8; 4] = self.get(id, reg_for(reg))?.try_into().ok()?;
+        let bytes: [u8; 4] = self.get(id, named_reg(reg))?.try_into().ok()?;
         Some(i32::from_le_bytes(bytes))
     }
 
@@ -342,6 +297,12 @@ impl BusPort for FakeMachine {
         }
         match instruction {
             INST_PING => {
+                if let Some(left) = self.pings_ignored.get_mut(&id)
+                    && *left > 0
+                {
+                    *left -= 1;
+                    return Ok(());
+                }
                 let model = self
                     .regs
                     .get(&(id, 0))
@@ -355,7 +316,7 @@ impl BusPort for FakeMachine {
                 if self.hushed(id, addr) {
                     return Ok(());
                 }
-                if addr == reg_for(RegId::PresentPosition).addr {
+                if addr == named_reg(RegId::PresentPosition).addr {
                     self.crept(id);
                 }
                 let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
@@ -391,9 +352,9 @@ impl BusPort for FakeMachine {
                     self.silent.push(id);
                     return Ok(());
                 }
-                self.set(id, reg_for(RegId::TorqueEnable), &[0]);
+                self.set(id, named_reg(RegId::TorqueEnable), &[0]);
                 if !self.keeps_latch.contains(&id) {
-                    self.set(id, reg_for(RegId::HardwareErrorStatus), &[0]);
+                    self.set(id, named_reg(RegId::HardwareErrorStatus), &[0]);
                 }
             }
             INST_SYNC_READ => {
@@ -405,7 +366,7 @@ impl BusPort for FakeMachine {
                     if self.hushed(asked, addr) {
                         continue;
                     }
-                    if addr == reg_for(RegId::PresentPosition).addr {
+                    if addr == named_reg(RegId::PresentPosition).addr {
                         self.crept(asked);
                     }
                     let error = self.errors.get(&(asked, addr)).copied().unwrap_or(0);
@@ -459,17 +420,6 @@ impl BusPort for FakeMachine {
     }
 }
 
-/// One grouped write as it went out: the register it addressed, and what each
-/// servo in it was given.
-///
-/// The register file only holds where a run *ended*. A run that swept somewhere
-/// and came back leaves no trace in it, so the frames themselves are the only
-/// record of what a move passed through.
-pub(crate) struct GroupedWrite {
-    pub(crate) addr: u16,
-    pub(crate) entries: Vec<(u8, Vec<u8>)>,
-}
-
 /// A port that records every instruction that crosses it, over a machine the
 /// test keeps a handle on.
 ///
@@ -480,9 +430,6 @@ pub(crate) struct Spy {
     machine: Rc<RefCell<FakeMachine>>,
     log: Rc<RefCell<Vec<(u8, u8)>>>,
     reads: Rc<RefCell<Vec<(u8, u16)>>>,
-    grouped: Rc<RefCell<Vec<u16>>>,
-    addressed: Rc<RefCell<Vec<Vec<u8>>>>,
-    commanded: Rc<RefCell<Vec<GroupedWrite>>>,
 }
 
 impl Spy {
@@ -501,33 +448,7 @@ impl Spy {
             machine,
             log: Rc::new(RefCell::new(Vec::new())),
             reads: Rc::new(RefCell::new(Vec::new())),
-            grouped: Rc::new(RefCell::new(Vec::new())),
-            addressed: Rc::new(RefCell::new(Vec::new())),
-            commanded: Rc::new(RefCell::new(Vec::new())),
         }
-    }
-
-    /// The servos each grouped *write* carried an entry for, one row per frame.
-    ///
-    /// A grouped write is addressed to the broadcast ID, so the only place the
-    /// servos it commands appear is inside its payload — which is exactly what
-    /// says whether a goal went to the joint it belongs to.
-    pub(crate) fn addressed(&self) -> Rc<RefCell<Vec<Vec<u8>>>> {
-        Rc::clone(&self.addressed)
-    }
-
-    /// Every grouped write in full, in the order it went out.
-    pub(crate) fn commanded(&self) -> Rc<RefCell<Vec<GroupedWrite>>> {
-        Rc::clone(&self.commanded)
-    }
-
-    /// The register each grouped read asked for, in the order they were asked.
-    ///
-    /// Separate from [`Self::log`] because every grouped frame is addressed to
-    /// the broadcast ID with the same instruction byte, so the pair that
-    /// identifies a unicast exchange cannot tell two grouped reads apart.
-    pub(crate) fn grouped(&self) -> Rc<RefCell<Vec<u16>>> {
-        Rc::clone(&self.grouped)
     }
 
     /// The machine behind the port, which outlives the port.
@@ -559,29 +480,6 @@ impl BusPort for Spy {
                 .borrow_mut()
                 .push((buf[4], u16::from_le_bytes([buf[8], buf[9]])));
         }
-        if buf[7] == INST_SYNC_READ {
-            self.grouped
-                .borrow_mut()
-                .push(u16::from_le_bytes([buf[8], buf[9]]));
-        }
-        if buf[7] == INST_SYNC_WRITE {
-            let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
-            let params = &buf[8..8 + len - 3];
-            let addr = u16::from_le_bytes([params[0], params[1]]);
-            let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
-            // Parsed once and recorded two ways: which servos a frame carried,
-            // and what each of them was given.
-            let entries: Vec<(u8, Vec<u8>)> = params[4..]
-                .chunks_exact(1 + width)
-                .map(|entry| (entry[0], entry[1..].to_vec()))
-                .collect();
-            self.addressed
-                .borrow_mut()
-                .push(entries.iter().map(|(id, _)| *id).collect());
-            self.commanded
-                .borrow_mut()
-                .push(GroupedWrite { addr, entries });
-        }
         self.machine.borrow_mut().write_all(buf)
     }
 
@@ -594,104 +492,9 @@ impl BusPort for Spy {
     }
 }
 
-/// A port that fails whatever it is asked, so a test can tell a machine's
-/// verdict from the host's own I/O going wrong.
-pub(crate) struct BrokenPort;
-
-impl BusPort for BrokenPort {
-    fn write_all(&mut self, _buf: &[u8]) -> io::Result<()> {
-        Err(io::Error::other("the adapter went away"))
-    }
-
-    fn read_some(&mut self, _buf: &mut [u8], _deadline: Instant) -> io::Result<usize> {
-        Err(io::Error::other("the adapter went away"))
-    }
-
-    fn discard_input(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// A port a test can take away and give back, so a run can carry on over the
-/// same machine after one transaction of it failed.
-///
-/// Distinct from [`FailsAfter`], which never comes back: what a sweep does
-/// about a bus that recovers is only testable against a bus that recovers.
-pub(crate) struct Flaky<P> {
-    port: P,
-    down: Rc<Cell<bool>>,
-}
-
-impl<P> Flaky<P> {
-    pub(crate) fn new(port: P) -> Self {
-        Self {
-            port,
-            down: Rc::new(Cell::new(false)),
-        }
-    }
-
-    /// The switch that takes the adapter away and gives it back.
-    pub(crate) fn switch(&self) -> Rc<Cell<bool>> {
-        Rc::clone(&self.down)
-    }
-}
-
-impl<P: BusPort> BusPort for Flaky<P> {
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        if self.down.get() {
-            return Err(io::Error::other("the adapter went away"));
-        }
-        self.port.write_all(buf)
-    }
-
-    fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
-        if self.down.get() {
-            return Err(io::Error::other("the adapter went away"));
-        }
-        self.port.read_some(buf, deadline)
-    }
-
-    fn discard_input(&mut self) -> io::Result<()> {
-        self.port.discard_input()
-    }
-}
-
-/// A machine whose port carries a few transactions and then goes away, so a
-/// test can place a transport failure in the middle of a run rather than before
-/// its first read.
-pub(crate) struct FailsAfter {
-    machine: FakeMachine,
-    /// Transactions still to be carried before the adapter stops answering.
-    good: usize,
-}
-
-impl FailsAfter {
-    pub(crate) fn new(machine: FakeMachine, good: usize) -> Self {
-        Self { machine, good }
-    }
-}
-
-impl BusPort for FailsAfter {
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        if self.good == 0 {
-            return Err(io::Error::other("the adapter went away"));
-        }
-        self.good -= 1;
-        self.machine.write_all(buf)
-    }
-
-    fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
-        self.machine.read_some(buf, deadline)
-    }
-
-    fn discard_input(&mut self) -> io::Result<()> {
-        self.machine.discard_input()
-    }
-}
-
 /// A clock a test drives by hand: time only moves when something waits.
 ///
-/// The pump's real clock sleeps; this one records what it was asked to wait for
+/// The real clock sleeps; this one records what it was asked to wait for
 /// and jumps straight there, so a thirty-second voltage budget costs a test
 /// nothing and the waits themselves are what gets asserted.
 #[derive(Debug, Default)]
@@ -765,41 +568,45 @@ pub(crate) fn machine_at(cfg: &BenchConfig, legs: &[f64; 6]) -> FakeMachine {
     for (row, id) in ids.iter().enumerate() {
         machine.set(
             *id,
-            reg_for(RegId::ModelNumber),
+            named_reg(RegId::ModelNumber),
             &EXPECTED_MODELS[row].to_le_bytes(),
         );
         machine.set(
             *id,
-            reg_for(RegId::PresentInputVoltage),
+            named_reg(RegId::PresentInputVoltage),
             &HEALTHY_RAIL.to_le_bytes(),
         );
-        machine.set(*id, reg_for(RegId::HardwareErrorStatus), &[0]);
+        machine.set(*id, named_reg(RegId::HardwareErrorStatus), &[0]);
         let angle = match row {
             0 => 0.0,
             1..=6 => legs[row - 1],
             _ => 0.0,
         };
         let counts = rad_to_counts(angle).expect("a resting angle places");
-        machine.set(*id, reg_for(RegId::PresentPosition), &counts.to_le_bytes());
+        machine.set(
+            *id,
+            named_reg(RegId::PresentPosition),
+            &counts.to_le_bytes(),
+        );
     }
 
-    for reg in RegId::ALL {
+    for reg in reg::named() {
         let Some(column) = ProvisionTable::column(reg) else {
             continue;
         };
         for (row, id) in ids.iter().enumerate() {
-            let entry = reg_for(reg);
+            let at = named_reg(reg);
             match table.at(row, column) {
                 Some(ProvisionExpect::Check(value)) => {
                     let raw = map
                         .encode_value(row, reg, value)
                         .expect("a configured expectation encodes");
-                    machine.set(*id, entry, raw.as_slice());
+                    machine.set(*id, at, raw.as_slice());
                 }
                 // A recorded register holds whatever it holds; zero is a value
                 // like any other and the case does not judge it.
                 Some(ProvisionExpect::Record) => {
-                    machine.set(*id, entry, &vec![0u8; usize::from(entry.len)]);
+                    machine.set(*id, at, &vec![0u8; usize::from(at.len)]);
                 }
                 _ => {}
             }

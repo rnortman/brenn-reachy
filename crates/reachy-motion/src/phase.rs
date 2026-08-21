@@ -25,7 +25,7 @@ use core::time::Duration;
 
 use reachy_kin::wrap_to_pi;
 
-use crate::joints::JointId;
+use crate::joints::JointRef;
 
 /// The default contact band, radians: how near straight up an antenna has to be
 /// for the two tips to be able to meet at all — see
@@ -112,7 +112,7 @@ pub struct PhaseSeparation {
     pub offset: f64,
     /// The side that reached the edge second — the one a de-phasing stretch
     /// delays further.
-    pub later: JointId,
+    pub later: JointRef,
     /// When it got there, on the move's own clock.
     pub at: Duration,
     /// How fast the other side was travelling then, radians per second. What a
@@ -212,9 +212,9 @@ impl PhaseWatch {
             self.separation = Some(PhaseSeparation {
                 offset: mirror_offset(antennas[0], antennas[1]),
                 later: if side == 0 {
-                    JointId::AntennaRight
+                    JointRef::AntennaRight
                 } else {
-                    JointId::AntennaLeft
+                    JointRef::AntennaLeft
                 },
                 at,
                 leader_rate,
@@ -275,7 +275,7 @@ mod tests {
         assert!(separation.offset < 1e-9, "{separation:?}");
         assert!(!separation.met(shipped().separation_rad));
         // The tie goes to the right antenna, and the rate is the left's.
-        assert_eq!(separation.later, JointId::AntennaRight);
+        assert_eq!(separation.later, JointRef::AntennaRight);
         assert_eq!(separation.at, at(3));
         assert!((separation.leader_rate - deg(7.0) / 0.02).abs() < 1e-9);
     }
@@ -297,7 +297,7 @@ mod tests {
             watch.look(at(period as u32), [deg(right), deg(-left)]);
         }
         let separation = watch.separation().expect("both sides crossed");
-        assert_eq!(separation.later, JointId::AntennaRight);
+        assert_eq!(separation.later, JointRef::AntennaRight);
         assert_eq!(separation.at, at(3));
         assert!(
             (separation.offset - deg(53.0)).abs() < 1e-9,

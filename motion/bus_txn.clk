@@ -1,0 +1,73 @@
+// The transaction vocabulary: the smallest thing this machine says to a servo.
+//
+// The sequencers write transactions, which is why the module lives here; a
+// driver runs one and a report says what came of it, both as consumers. Held
+// apart from the register module below it because reading a register's value
+// shape is not naming a transaction, and the bench's self-test does the first
+// without the second.
+//
+// Nothing about joints appears below: which servo a transaction addresses is its
+// bus id, a number the datagram carries, and not a `JointRef`.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use hardware::dynamixel::registers;
+
+// Which transaction an aux request asks for.
+//
+// `none` sits at zero: a slot nothing wrote asks for no transaction, and reading
+// one as a ping would put a datagram on the bus nobody asked for.
+enum AuxOpKind
+{
+    uuid: bb133462-0188-49a3-a3d2-05f2bb1ae71c;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No transaction. What an unwritten slot holds.
+        #0 none default { underlying_value: 0; }
+        // Does the servo at this id answer at all.
+        #1 ping { underlying_value: 1; }
+        // Read one register.
+        #2 read_reg { underlying_value: 2; }
+        // Write one register and read it back, so the answer is what the servo
+        // holds rather than what was sent.
+        #3 write_reg_verified { underlying_value: 3; }
+    }
+}
+
+// The transaction a sequencer is waiting an answer to, or that it waits on none.
+//
+// Excludes the correlation number, the send instant and the re-issue count,
+// which are the session's bookkeeping about the datagram carrying it and live in
+// `AuxPending`, in the package of whichever host keeps them.
+schema BusTxn
+{
+    uuid: ded26dbe-293a-4981-b1b1-ad533b134911;
+    fields
+    {
+        // Whether a transaction is outstanding. Every field below means nothing
+        // when this is false, which is the step after a wait and the step before
+        // the first one.
+        #0 active: Bool;
+
+        // Which transaction it is.
+        #1 op: AuxOpKind;
+
+        // Which servo, as its bus id.
+        #2 id: UInt8;
+
+        // Which register, or `none` where the transaction concerns none.
+        #3 reg: registers::RegId;
+
+        // What shape the value below is, or `none` where the transaction
+        // carries no value.
+        #4 value_kind: registers::ValueShape;
+
+        // The value, as eight little-endian bytes.
+        #5 value: UInt64;
+    }
+}

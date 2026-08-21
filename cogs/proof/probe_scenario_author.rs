@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use clockwork_logs::offboard::{OffboardWriter, OffboardWriterConfig};
 use clockwork_rs::SyncTime;
 
-use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmd;
+use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmdWire;
 use probe_scenario::{CMD_CHANNEL, POSITIONS, command, command_time_ns};
 
 fn main() -> ExitCode {
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 /// and the runner schedules on the transmit time.
 fn write_input_log(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut writer = OffboardWriter::create(dir, OffboardWriterConfig::default())?;
-    let channel = writer.create_channel_typed::<ProbeCmd>(CMD_CHANNEL)?;
+    let channel = writer.create_channel_typed::<ProbeCmdWire>(CMD_CHANNEL)?;
     for index in 0..POSITIONS.len() {
         let at = SyncTime::from_nanos(command_time_ns(index));
         // The sequence number is the publisher's own count, from zero. The

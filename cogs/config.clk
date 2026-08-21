@@ -1,15 +1,15 @@
 // What the cogs are built with: the numbers a scenario chooses before the run
 // starts and nothing writes afterwards.
 //
-// A module of its own, apart from the messages and slots in `msgs.clk`, and
+// A module of its own, apart from the slots and messages the cogs keep, and
 // that is forced rather than stylistic. A config is bound to a file of
 // protobuf text, so its schema has to cross the Protobuf backend as well as the
-// C++ one -- and generation is declared per module, not per schema. `msgs.clk`
-// cannot cross that backend: it declares an enum with a negative member
-// (`TrackingSideKind::below`, mirroring the library's own `TrackingSide`), and
-// the Protobuf emitter refuses a negative enumerator outright. So the schemas
-// that must be authored as text live here, where every field is a plain
-// non-negative scalar.
+// C++ one -- and generation is declared per module, not per schema. Most of the
+// vocabulary cannot cross that backend: the tick's state module declares an
+// enum with a negative member (`TrackingSideKind::below` -- a side is a
+// direction, so one of the two is below), and the Protobuf emitter refuses a
+// negative enumerator outright. So the schemas that must be authored as text
+// live here, where every field is a plain non-negative scalar.
 //
 // The nanosecond counts below are the one place in this system bare numbers
 // stand in for time. The Protobuf path carries integers rather than the
@@ -51,6 +51,58 @@ schema MoverParams
     }
 }
 
+// What the session is built with: how long it waits for the driver, and how long
+// it gives a wind-down.
+//
+// Every number here is a budget the session spends on something that may not
+// answer -- an aux transaction, a sample stream, a stow, a torque-off
+// confirmation. None of them gates de-torquing: a budget running out is what
+// makes the session stop waiting and take the answer the doctrine names, never
+// what makes it wait longer.
+//
+// What is deliberately absent is the wake floor. The session's execution
+// condition states it as a literal in `motion.clk`, because a config field
+// cannot control an execution condition and a second statement of the number
+// could only drift from the one that runs.
+schema SessionParams
+{
+    uuid: fb3f9e6f-3cdd-4eb9-988c-bd5221f37d3d;
+    fields
+    {
+        // How long one aux transaction has to be answered, nanoseconds. Past
+        // this the same datagram goes out again with the same correlation
+        // number, which is delivery retry on a lossy link and not a second ask.
+        #0 aux_timeout_ns: Int64;
+
+        // How many times an unanswered datagram is re-issued before the
+        // sequencer is handed a silence and fails the sequence itself. The
+        // classification stays in the library; this is only how long the host
+        // keeps trying to deliver.
+        #1 aux_retries: UInt32;
+
+        // How many nominal periods may pass with no fresh sample before the bus
+        // is declared failed. The driver cannot report its own death, so this is
+        // the only thing that notices it.
+        #2 sample_stale_after: UInt32;
+
+        // How long after start-up the first sample may take, nanoseconds. A
+        // separate number from the one above because there is no last sample to
+        // measure staleness from yet.
+        #3 startup_grace_ns: Int64;
+
+        // How long a wind-down's one clock runs, nanoseconds. Taken once when
+        // the maneuver begins: a servo dropping out re-commands the stow from
+        // where the machine stands and does not extend this.
+        #4 stow_budget_ns: Int64;
+
+        // How long a commanded torque-off has to be confirmed, nanoseconds. Past
+        // it the session says so and keeps commanding -- nothing gates
+        // de-torquing, and a de-torque nobody can confirm is the operator's
+        // problem, not a reason to stop asking.
+        #5 torque_off_confirm_budget_ns: Int64;
+    }
+}
+
 // What the simulated driver is built with: the cycle it runs on, the dead-man
 // it enforces, and how fast the modelled servos move.
 //
@@ -85,5 +137,198 @@ schema SimParams
 
         // How far an antenna servo moves in one cycle, radians.
         #5 slew_antennas_rad: Float64;
+
+        // The minimum spacing between successive health reports, nanoseconds.
+        //
+        // Per report, not per lap: the rotation reads one servo each time it
+        // reports, so a full lap of the nine takes nine of these. A cadence
+        // rather than every cycle because a health read shares the one aux
+        // transaction a cycle has with the host's own requests, and a rotation
+        // that took every cycle it could would leave none.
+        #6 health_poll_period_ns: Int64;
+    }
+}
+
+// The five clip schemas below are `reachy-clips`' own: it is their only writer
+// and their only reader, so their home is a clips-owned configuration module
+// with its own protobuf generation rather than this one.
+// TODO(clip-schemas-config-home)
+//
+// One sampled frame of a clip: the delta every channel contributes at one tick.
+//
+// Every channel's fields are present in the layout and only the ones the clip's
+// mask names carry a value; the rest are zero. A frame is a delta, so zero is
+// the neutral contribution and there is nothing an absent channel could mean
+// other than that -- which is why this is a flat record rather than three
+// optionals. A reader refuses a non-zero value on an unmasked channel: an asset
+// that carries motion it does not claim to drive is wrong about itself.
+//
+// The head delta arrives split into a translation and a quaternion because that
+// is what protobuf text can state; the library composes them into an isometry.
+schema ClipFrame
+{
+    uuid: 244d0e7f-feda-46f0-99e8-13d5aa29f7ec;
+    fields
+    {
+        // Head delta translation along x, metres, in the base head's local
+        // frame.
+        #0 head_dx: Float64;
+
+        // Head delta translation along y, metres.
+        #1 head_dy: Float64;
+
+        // Head delta translation along z, metres.
+        #2 head_dz: Float64;
+
+        // Head delta rotation, real part. `w` first, so the identity rotation
+        // reads as 1, 0, 0, 0. The four together are a unit quaternion.
+        #3 quat_w: Float64;
+
+        // Head delta rotation, i coefficient.
+        #4 quat_x: Float64;
+
+        // Head delta rotation, j coefficient.
+        #5 quat_y: Float64;
+
+        // Head delta rotation, k coefficient.
+        #6 quat_z: Float64;
+
+        // Body yaw delta, radians.
+        #7 body_yaw_d: Float64;
+
+        // Right antenna delta, radians. Right first, the library's own order.
+        #8 antenna_right_d: Float64;
+
+        // Left antenna delta, radians.
+        #9 antenna_left_d: Float64;
+    }
+}
+
+// One clip, as the cogs are handed it: what it drives, how it is sampled, how it
+// blends, how fast it may be played, and its frames.
+//
+// Everything the library's own clip carries except its name, which is the
+// host-side scripter's business -- a script names a clip by its index in the
+// library below, so the running system never needs the string.
+//
+// The derived numbers cross with the frames rather than being re-derived here:
+// deriving one costs a kinematic solve per frame, which no play path can pay,
+// and what crosses is the loader's own output and never a number a document
+// claimed.
+schema ClipConfig
+{
+    uuid: d2ce8a93-cc18-4cf1-8986-7af3e38dda5b;
+    fields
+    {
+        // The channels this clip drives, as joint-set bits: the union of the
+        // joints of each channel it names, one bit per bus row. A bare integer
+        // rather than the `JointFlags` the messages use, because this module
+        // cannot import that one -- the two are pinned to each other by a
+        // conformance test.
+        #0 mask: UInt16;
+
+        // How the frames were sampled, hertz. Stated rather than assumed so a
+        // reader can refuse an asset recorded on another grid instead of
+        // playing it at the wrong speed.
+        #1 frame_rate_hz: Float64;
+
+        // The entry blend ramp, milliseconds.
+        #2 blend_in_ms: UInt32;
+
+        // The exit blend ramp, milliseconds.
+        #3 blend_out_ms: UInt32;
+
+        // The frame track, in time order. Never empty.
+        #4 frames: VarArray<ClipFrame, 512>;
+
+        // The highest invocation speed the frames admit: derived at load from
+        // the frame-to-frame deltas against the machine's step bounds. A window
+        // asking for more than this is refused, because above it consecutive
+        // composed setpoints step further than the tick will accept.
+        #5 max_speed: Float64;
+    }
+}
+
+// One flattened step of a motion: which clip plays, how fast, and the hold that
+// follows it.
+//
+// Flattening happens at load, on the host that emits this asset, so what
+// crosses is a flat list and never a reference graph: nothing in a cog walks a
+// tree, and a composition that could only ever be played out of bounds was
+// refused before it was written here.
+schema MotionSegment
+{
+    uuid: 4570c1f9-292b-4a67-ab75-e340aecf9333;
+    fields
+    {
+        // Which clip this segment plays: an index into the library's `clips`
+        // below.
+        #0 clip_id: UInt16;
+
+        // The multiplier on the clip's own clock, from the nesting the
+        // flattening collapsed. An invocation's own speed multiplies this at
+        // play time and is not baked in, because one flattened motion serves
+        // every invocation.
+        #1 speed: Float64;
+
+        // The hold following this clip's last frame, milliseconds, at 1.0x
+        // invocation speed. Zero when the next segment follows immediately.
+        //
+        // A hold freezes the segment's final delta rather than returning to the
+        // base; the base underneath is live throughout, so a hold rides it.
+        #2 gap_after_ms: UInt32;
+    }
+}
+
+// One playable motion: a clip, or several strung end to end.
+//
+// The uniform playable unit. A bare clip is emitted as a one-segment motion and
+// a composed sequence as an n-segment one, so a script or a schedule names
+// motions only and invoking a single clip costs nothing extra.
+//
+// What the motion is *like* to play -- which channels it drives, how long it
+// runs, how fast it may be invoked, how it blends -- is not here. Every one of
+// those is derived at load from the segments' clips, and a stored derivation is
+// a second opinion able to disagree with the frames.
+schema MotionConfig
+{
+    uuid: eb61b453-f6d3-4c73-870c-fafd52d64dfd;
+    fields
+    {
+        // The segments, in play order. Never empty.
+        #0 segments: VarArray<MotionSegment, 32>;
+
+        // The hold before the first segment, milliseconds, at 1.0x invocation
+        // speed. Zero when the first clip starts at once.
+        //
+        // Its own field rather than a segment's: there is no previous segment
+        // whose delta could be frozen through it, so the base alone holds.
+        #1 lead_gap_ms: UInt32;
+    }
+}
+
+// Everything the running system can play, in one read-only message: the clips,
+// and the motions that string them together.
+//
+// A config rather than state, and that is the whole point: clips are chosen
+// before the run starts and nothing writes them afterwards, so they cross into
+// a cog the way the tick's own numbers do -- handed over read-only, once per
+// execution, with no copy anywhere to go stale. A clip's identity is its index
+// among the clips and a motion's is its index among the motions; the name
+// tables live beside the asset for whoever authors scripts.
+schema ClipLibraryConfig
+{
+    uuid: f2f6953b-cebc-4722-be29-5ec65eb68f2d;
+    fields
+    {
+        // The clips, in the order the emitter wrote them. A script's clip id is
+        // an index into this.
+        #0 clips: VarArray<ClipConfig, 16>;
+
+        // Every motion the system can play, in the order the emitter wrote
+        // them: one per clip, plus one per composed sequence. A schedule's
+        // motion id is an index into this, and it is a different numbering from
+        // the clip ids above.
+        #1 motions: VarArray<MotionConfig, 32>;
     }
 }

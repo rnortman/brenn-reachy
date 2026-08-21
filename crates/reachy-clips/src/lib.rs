@@ -20,15 +20,27 @@
 //! place the rule for which files in a directory *are* assets lives — a rule
 //! the daemon, the bench and the importer all have to agree on.
 //!
+//! The authoring half — [`format`], [`library`], [`vendor`], [`files`] and the
+//! importer binary — is host-side only: playback reads clips out of the
+//! configuration message, so nothing the running machine reaches enters it. It
+//! is one build target with the playback half all the same, which is why this
+//! header has to say so instead of the build.
+//! TODO(clips-authoring-split)
+//!
 //! **Nothing here is a safety gate.** Validation refuses assets that are
 //! malformed or that could not be played over the base they were recorded
 //! against, which is a content-sanity gate. What actually protects the machine
 //! is the per-tick envelope check and step bound in `reachy-motion`, applied to
 //! the composed target, every tick, with no bypass for playback.
+//!
+//! Every type is imported from the module that declares it. There is no
+//! crate-root re-export of the whole surface: two paths to one type is two
+//! spellings of every import for no reader's benefit.
 
 #![forbid(unsafe_code)]
 
 pub mod compose;
+pub mod config;
 pub mod files;
 pub mod format;
 pub mod library;
@@ -36,24 +48,3 @@ pub mod player;
 pub mod sequence;
 pub mod speed;
 pub mod vendor;
-
-pub use compose::{ChannelWeights, OverlaySample, compose, interpolate_pose, lerp, scale_delta};
-pub use files::{DOCUMENT_EXT, document_paths, documents};
-pub use format::{
-    BlendEnd, Channel, ChannelMask, Clip, ClipDoc, ClipError, ClipNote, DEFAULT_BLEND_MS,
-    DeltaFrame, FORMAT_VERSION, FrameDoc, MAX_MOTION_NAME_LEN, MAX_SPEED, MIN_SPEED, NameError,
-    PerChannel, QUAT_NORM_TOL, SPEED_CACHE_TOL, document_name, validate_name,
-};
-pub use library::{
-    AssetNote, AssetSkip, Library, LibraryBuilder, LoadError, MAX_SEQUENCE_DEPTH, Motion,
-    ResolveError, Segment,
-};
-pub use player::ClipPlayer;
-pub use sequence::{Entry, EntryDoc, Sequence, SequenceDoc, SequenceError};
-pub use speed::{
-    ClipLimits, Derivation, DeriveError, FrameMetrics, RAMP_SAMPLES, STEP_MARGIN, derive, seam_step,
-};
-pub use vendor::{
-    CONSTANT_TOL, Import, ImportError, ImportOptions, ROTATION_TOL, VendorFrame, VendorMove,
-    convert,
-};

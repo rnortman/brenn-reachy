@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::format::{FORMAT_VERSION, NameError, validate_name};
+use crate::format::{FORMAT_VERSION, NameError, SEQUENCE_KIND, validate_name};
 
 /// Why a sequence document cannot be loaded.
 ///
@@ -207,7 +207,7 @@ impl Sequence {
                 version: doc.version,
             });
         }
-        if doc.kind != "sequence" {
+        if doc.kind != SEQUENCE_KIND {
             return Err(SequenceError::WrongKind { kind: doc.kind });
         }
         validate_name(&doc.name).map_err(|source| SequenceError::Name {
@@ -253,7 +253,7 @@ impl Sequence {
     pub fn to_doc(&self) -> SequenceDoc {
         SequenceDoc {
             version: FORMAT_VERSION,
-            kind: "sequence".to_owned(),
+            kind: SEQUENCE_KIND.to_owned(),
             name: self.name.clone(),
             description: self.description.clone(),
             entries: self
@@ -318,7 +318,7 @@ mod tests {
     fn doc() -> SequenceDoc {
         SequenceDoc {
             version: FORMAT_VERSION,
-            kind: "sequence".to_owned(),
+            kind: SEQUENCE_KIND.to_owned(),
             name: "pod/greet".to_owned(),
             description: Some("a test".to_owned()),
             entries: vec![

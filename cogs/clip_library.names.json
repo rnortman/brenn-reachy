@@ -1,0 +1,30 @@
+{
+  "clips": [
+    {
+      "clip_id": 0,
+      "name": "bench/nod"
+    },
+    {
+      "clip_id": 1,
+      "name": "bench/perk"
+    },
+    {
+      "clip_id": 2,
+      "name": "bench/sway"
+    }
+  ],
+  "motions": [
+    {
+      "motion_id": 0,
+      "name": "bench/nod"
+    },
+    {
+      "motion_id": 1,
+      "name": "bench/perk"
+    },
+    {
+      "motion_id": 2,
+      "name": "bench/sway"
+    }
+  ]
+}

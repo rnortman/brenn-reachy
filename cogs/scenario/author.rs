@@ -12,14 +12,15 @@
 use clockwork_logs::LogError;
 use clockwork_logs::offboard::{ChannelId, OffboardWriter, OffboardWriterConfig};
 use clockwork_rs::SyncTime;
+use reachy_motion::joints::flags;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__msgs_clk_rs::{
-    JointFlags, Joints, Posture, ScheduledStep, SessionSchedule, SimCmd, SimOp, StepKind,
+use brenn_reachy__cogs__schedule_clk_rs::{
+    PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
 };
-
-use reachy_motion::joints::JointSet;
+use brenn_reachy__cogs__sim_state_clk_rs::{SimCmdWire, SimOpWire};
+use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointsWire};
 
 use crate::{SCHEDULE_CHANNEL, SIM_CMD_CHANNEL};
 
@@ -28,7 +29,10 @@ use crate::{SCHEDULE_CHANNEL, SIM_CMD_CHANNEL};
 /// Folded from the motion library's own set rather than spelled as nine bits, so
 /// a machine that grew a servo energises the rows it has: a literal here would
 /// leave the new one limp while every assertion in the scenario passed.
-pub const ALL_ROWS: JointFlags = JointFlags(JointSet::ALL.bits());
+#[must_use]
+pub fn all_rows() -> JointFlagsWire {
+    JointFlagsWire::from(flags::all())
+}
 
 /// Run one scenario's author: write its input log where the harness asks for
 /// it, and say when the run it describes ends.
@@ -70,7 +74,7 @@ pub struct Step {
     pub end_ns: i64,
     /// The posture it asks for, or `None` for a step that keeps whatever the
     /// machine was last sent to.
-    pub posture: Option<Posture>,
+    pub posture: Option<PostureWire>,
 }
 
 /// The input log being written.
@@ -96,8 +100,8 @@ impl InputLog {
     /// used twice.
     pub fn create(dir: &Path) -> Result<Self, LogError> {
         let mut writer = OffboardWriter::create(dir, OffboardWriterConfig::default())?;
-        let schedule = writer.create_channel_typed::<SessionSchedule>(SCHEDULE_CHANNEL)?;
-        let injections = writer.create_channel_typed::<SimCmd>(SIM_CMD_CHANNEL)?;
+        let schedule = writer.create_channel_typed::<SessionScheduleWire>(SCHEDULE_CHANNEL)?;
+        let injections = writer.create_channel_typed::<SimCmdWire>(SIM_CMD_CHANNEL)?;
         Ok(Self {
             writer,
             schedule,
@@ -127,24 +131,24 @@ impl InputLog {
         epoch: u32,
         steps: &[Step],
     ) -> Result<(), LogError> {
-        let mut message = SessionSchedule::new();
+        let mut message = SessionScheduleWire::new();
         message.set_engaged(engaged);
         message.set_epoch(epoch);
         {
             let mut rows = message.steps_mut();
             rows.clear();
             for step in steps {
-                let row: &mut ScheduledStep = rows
+                let row: &mut ScheduledStepWire = rows
                     .try_grow()
                     .expect("a schedule of no more steps than the schema holds");
                 row.set_start(SyncTime::from_nanos(step.start_ns));
                 row.set_end(SyncTime::from_nanos(step.end_ns));
                 match step.posture {
                     Some(posture) => {
-                        row.set_kind(StepKind::BASE_POSTURE);
+                        row.set_kind(StepKindWire::BASE_POSTURE);
                         row.set_posture(posture);
                     }
-                    None => row.set_kind(StepKind::BASE_KEEP),
+                    None => row.set_kind(StepKindWire::BASE_KEEP),
                 }
             }
         }
@@ -160,7 +164,7 @@ impl InputLog {
     /// # Errors
     ///
     /// Whatever the writer refuses.
-    pub fn inject(&mut self, at_ns: i64, injection: &SimCmd) -> Result<(), LogError> {
+    pub fn inject(&mut self, at_ns: i64, injection: &SimCmdWire) -> Result<(), LogError> {
         let at = SyncTime::from_nanos(at_ns);
         self.writer
             .write_typed(self.injections, self.injection_seq, at, at, injection)?;
@@ -173,8 +177,8 @@ impl InputLog {
     /// # Errors
     ///
     /// Whatever the writer refuses.
-    pub fn torque_on(&mut self, at_ns: i64, rows: JointFlags) -> Result<(), LogError> {
-        self.inject(at_ns, &operation(SimOp::TORQUE_ON, rows))
+    pub fn torque_on(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
+        self.inject(at_ns, &operation(SimOpWire::TORQUE_ON, rows))
     }
 
     /// De-energise the given rows.
@@ -182,8 +186,8 @@ impl InputLog {
     /// # Errors
     ///
     /// Whatever the writer refuses.
-    pub fn torque_off(&mut self, at_ns: i64, rows: JointFlags) -> Result<(), LogError> {
-        self.inject(at_ns, &operation(SimOp::TORQUE_OFF, rows))
+    pub fn torque_off(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
+        self.inject(at_ns, &operation(SimOpWire::TORQUE_OFF, rows))
     }
 
     /// Jam the given rows where they stand.
@@ -191,8 +195,8 @@ impl InputLog {
     /// # Errors
     ///
     /// Whatever the writer refuses.
-    pub fn obstruct(&mut self, at_ns: i64, rows: JointFlags) -> Result<(), LogError> {
-        self.inject(at_ns, &operation(SimOp::OBSTRUCT, rows))
+    pub fn obstruct(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
+        self.inject(at_ns, &operation(SimOpWire::OBSTRUCT, rows))
     }
 
     /// Release the given rows.
@@ -200,8 +204,8 @@ impl InputLog {
     /// # Errors
     ///
     /// Whatever the writer refuses.
-    pub fn release(&mut self, at_ns: i64, rows: JointFlags) -> Result<(), LogError> {
-        self.inject(at_ns, &operation(SimOp::RELEASE_OBSTRUCTION, rows))
+    pub fn release(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
+        self.inject(at_ns, &operation(SimOpWire::RELEASE_OBSTRUCTION, rows))
     }
 
     /// Lose the next `cycles` cycles of position replies.
@@ -210,7 +214,7 @@ impl InputLog {
     ///
     /// Whatever the writer refuses.
     pub fn drop_replies(&mut self, at_ns: i64, cycles: u32) -> Result<(), LogError> {
-        let mut injection = operation(SimOp::DROP_REPLIES, JointFlags::NONE);
+        let mut injection = operation(SimOpWire::DROP_REPLIES, JointFlagsWire::NONE);
         injection.set_count(cycles);
         self.inject(at_ns, &injection)
     }
@@ -227,10 +231,10 @@ impl InputLog {
     pub fn set_positions(
         &mut self,
         at_ns: i64,
-        rows: JointFlags,
-        edit: impl FnOnce(&mut Joints),
+        rows: JointFlagsWire,
+        edit: impl FnOnce(&mut JointsWire),
     ) -> Result<(), LogError> {
-        let mut injection = operation(SimOp::SET_POSITIONS, rows);
+        let mut injection = operation(SimOpWire::SET_POSITIONS, rows);
         edit(injection.positions_mut());
         self.inject(at_ns, &injection)
     }
@@ -246,8 +250,8 @@ impl InputLog {
 }
 
 /// One injection of the given shape, with nothing else set.
-fn operation(op: SimOp, rows: JointFlags) -> SimCmd {
-    let mut injection = SimCmd::new();
+fn operation(op: SimOpWire, rows: JointFlagsWire) -> SimCmdWire {
+    let mut injection = SimCmdWire::new();
     injection.set_op(op);
     injection.set_mask(rows);
     injection

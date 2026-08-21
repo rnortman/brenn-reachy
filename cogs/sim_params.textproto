@@ -25,3 +25,8 @@ start_torqued: false
 slew_legs_rad: 0.15
 slew_body_yaw_rad: 0.15
 slew_antennas_rad: 0.65
+
+# One health report every 120 ms: six cycles apart, so a full lap of the nine
+# servos takes 1.08 s and the aux slot is free for a host request on five cycles
+# out of six.
+health_poll_period_ns: 120000000

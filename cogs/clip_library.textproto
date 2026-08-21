@@ -1,0 +1,193 @@
+# Everything the running system can play, as the cogs are handed it: the clips,
+# and the motions that string them together.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.ClipLibraryConfig`,
+# which the compiler generates from the `ClipLibraryConfig` schema in
+# `config.clk`. A box binds it by path; the casing converts it to the message
+# the dial hands the cog.
+#
+# Generated — do not edit. Regenerate with `make clip-config` after changing a
+# document under `cogs/clips/`, and commit the three files together: this one,
+# its name sidecar, and the documents.
+#
+# An asset's identity is its position here, so the order is load-bearing: it is
+# the order the document paths sort in, and an asset inserted in the middle
+# renumbers every one after it. The two numberings are separate: a clip id
+# indexes the clips, a motion id indexes everything that plays.
+#
+# clip_id  name
+#   0  bench/nod
+#   1  bench/perk
+#   2  bench/sway
+#
+# motion_id  name
+#   0  bench/nod
+#   1  bench/perk
+#   2  bench/sway
+
+# bench/nod
+clips {
+  mask: 126
+  frame_rate_hz: 50.0
+  blend_in_ms: 200
+  blend_out_ms: 200
+  max_speed: 2.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 1.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999804226689539 quat_x: 0.0 quat_y: 0.006257337997928492 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999236077706821 quat_x: 0.0 quat_y: 0.01236036499716533 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9998351186307195 quat_x: 0.0 quat_y: 0.018158621993293267 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999723619530452 quat_x: 0.0 quat_y: 0.023509243988958227 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9996000266708064 quat_x: 0.0 quat_y: 0.02828049999068652 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9994764388941347 quat_x: 0.0 quat_y: 0.03235503199657293 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9993649531328013 quat_x: 0.0 quat_y: 0.03563271600473508 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992764804817473 quat_x: 0.0 quat_y: 0.038033085018335605 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999219678894389 quat_x: 0.0 quat_y: 0.0394972569958254 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992001066689775 quat_x: 0.0 quat_y: 0.039989333986752036 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999219678894389 quat_x: 0.0 quat_y: 0.0394972569958254 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992764804817473 quat_x: 0.0 quat_y: 0.038033085018335605 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9993649531328013 quat_x: 0.0 quat_y: 0.03563271600473508 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9994764388941347 quat_x: 0.0 quat_y: 0.03235503199657293 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9996000266708064 quat_x: 0.0 quat_y: 0.02828049999068652 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999723619530452 quat_x: 0.0 quat_y: 0.023509243988958227 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9998351186307195 quat_x: 0.0 quat_y: 0.018158621993293267 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999236077706821 quat_x: 0.0 quat_y: 0.01236036499716533 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999804226689539 quat_x: 0.0 quat_y: 0.006257337997928492 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 1.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999804226689539 quat_x: 0.0 quat_y: -0.006257337997928492 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999236077706821 quat_x: 0.0 quat_y: -0.01236036499716533 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9998351186307195 quat_x: 0.0 quat_y: -0.018158621993293267 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999723619530452 quat_x: 0.0 quat_y: -0.023509243988958227 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9996000266708064 quat_x: 0.0 quat_y: -0.02828049999068652 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9994764388941347 quat_x: 0.0 quat_y: -0.03235503199657293 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9993649531328013 quat_x: 0.0 quat_y: -0.03563271600473508 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992764804817473 quat_x: 0.0 quat_y: -0.038033085018335605 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999219678894389 quat_x: 0.0 quat_y: -0.0394972569958254 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992001066689775 quat_x: 0.0 quat_y: -0.039989333986752036 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999219678894389 quat_x: 0.0 quat_y: -0.0394972569958254 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9992764804817473 quat_x: 0.0 quat_y: -0.038033085018335605 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9993649531328013 quat_x: 0.0 quat_y: -0.03563271600473508 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9994764388941347 quat_x: 0.0 quat_y: -0.03235503199657293 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9996000266708064 quat_x: 0.0 quat_y: -0.02828049999068652 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.999723619530452 quat_x: 0.0 quat_y: -0.023509243988958227 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9998351186307195 quat_x: 0.0 quat_y: -0.018158621993293267 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999236077706821 quat_x: 0.0 quat_y: -0.01236036499716533 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.9999804226689539 quat_x: 0.0 quat_y: -0.006257337997928492 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# bench/perk
+clips {
+  mask: 384
+  frame_rate_hz: 50.0
+  blend_in_ms: 200
+  blend_out_ms: 200
+  max_speed: 2.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.00382417 antenna_left_d: -0.00382417 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.015129545 antenna_left_d: -0.015129545 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.033422026 antenna_left_d: -0.033422026 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.057902144 antenna_left_d: -0.057902144 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0875 antenna_left_d: -0.0875 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.120922026 antenna_left_d: -0.120922026 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.156707519 antenna_left_d: -0.156707519 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.193292481 antenna_left_d: -0.193292481 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.229077974 antenna_left_d: -0.229077974 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.2625 antenna_left_d: -0.2625 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.292097856 antenna_left_d: -0.292097856 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.316577974 antenna_left_d: -0.316577974 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.334870455 antenna_left_d: -0.334870455 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.34617583 antenna_left_d: -0.34617583 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.35 antenna_left_d: -0.35 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.34617583 antenna_left_d: -0.34617583 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.334870455 antenna_left_d: -0.334870455 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.316577974 antenna_left_d: -0.316577974 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.292097856 antenna_left_d: -0.292097856 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.2625 antenna_left_d: -0.2625 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.229077974 antenna_left_d: -0.229077974 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.193292481 antenna_left_d: -0.193292481 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.156707519 antenna_left_d: -0.156707519 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.120922026 antenna_left_d: -0.120922026 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0875 antenna_left_d: -0.0875 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.057902144 antenna_left_d: -0.057902144 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.033422026 antenna_left_d: -0.033422026 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.015129545 antenna_left_d: -0.015129545 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.00382417 antenna_left_d: -0.00382417 }
+}
+
+# bench/sway
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 200
+  blend_out_ms: 200
+  max_speed: 2.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.018772136 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.037082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.05447886 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.07053423 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.084852814 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.097082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.106920783 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.114126782 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.118522601 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.12 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.118522601 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.114126782 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.106920783 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.097082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.084852814 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.07053423 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.05447886 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.037082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.018772136 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.018772136 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.037082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.05447886 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.07053423 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.084852814 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.097082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.106920783 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.114126782 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.118522601 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.12 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.118522601 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.114126782 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.106920783 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.097082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.084852814 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.07053423 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.05447886 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.037082039 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.018772136 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# bench/nod
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 0
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# bench/perk
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 1
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# bench/sway
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 2
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}

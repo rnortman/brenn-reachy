@@ -10,10 +10,12 @@
 //! a case says at what time each execution happens.
 
 use brenn_reachy__cogs__proof__probe_clk_rs_test::ProbeTestWrapper;
-use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmd;
-use clockwork__clockwork__io__var_packet_clk_rs::VarPacket__288;
-use clockwork_rs::{Duration, SyncTime};
-use reachy_wire::{GoalSetpoint, JOINT_MASK_ALL, peek_header};
+use brenn_reachy__cogs__proof__probe_msgs_clk_rs::{ProbeCmdWire, ProbeStep, ProbeStepWire};
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+use clockwork__clockwork__io__var_packet_clk_rs::VarPacket__288Wire;
+use clockwork_rs::{Blob as _, Duration, SyncTime, blob_as_bytes, blob_from_bytes};
+use probe_scenario::PROBE_MASK;
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -23,8 +25,8 @@ const T0: i64 = 1_700_000_000_000_000_000;
 const PERIOD: i64 = 20_000_000;
 
 /// One command, as the scenario's input log would carry it.
-fn cmd(at_ns: i64, position: f64) -> ProbeCmd {
-    let mut msg = ProbeCmd::new();
+fn cmd(at_ns: i64, position: f64) -> ProbeCmdWire {
+    let mut msg = ProbeCmdWire::new();
     msg.set_at(SyncTime::from_nanos(at_ns));
     msg.set_hold(Duration::from_nanos(PERIOD));
     msg.set_position(position);
@@ -43,19 +45,19 @@ fn probe() -> ProbeTestWrapper {
     cog
 }
 
-/// The datagram an execution published, decoded, or `None` if it published
-/// nothing.
-fn published(cog: &mut ProbeTestWrapper) -> Option<(u32, GoalSetpoint)> {
+/// The setpoint an execution published, or `None` if it published nothing.
+fn published(cog: &mut ProbeTestWrapper) -> Option<GoalSetpointWire> {
     let packet = cog.try_next_packet()?;
-    let (header, goal) =
-        GoalSetpoint::decode(packet.bytes().as_slice()).expect("a whole GoalSetpoint datagram");
-    Some((header.seq, goal))
+    Some(
+        blob_from_bytes::<GoalSetpointWire>(packet.bytes().as_slice())
+            .expect("a whole setpoint's bytes"),
+    )
 }
 
 /// Feed a datagram back into the cog's own-output view, as the channel does.
-fn echo_back(cog: &mut ProbeTestWrapper, seq: u32, goal: &GoalSetpoint, at_ns: i64) {
-    let mut packet = VarPacket__288::new();
-    assert!(packet.try_set_bytes(&goal.encode(seq)));
+fn echo_back(cog: &mut ProbeTestWrapper, goal: &GoalSetpointWire, at_ns: i64) {
+    let mut packet = VarPacket__288Wire::new();
+    assert!(packet.try_set_bytes(blob_as_bytes(goal)));
     cog.publish_own_packet(&packet, SyncTime::from_nanos(at_ns));
 }
 
@@ -74,12 +76,28 @@ fn a_command_becomes_one_datagram_at_the_commanded_instant() {
     );
     assert!(cog.execute(SyncTime::from_nanos(T0 + PERIOD)));
 
-    let (seq, goal) = published(&mut cog).expect("the execution published a datagram");
-    assert_eq!(seq, 0, "the first datagram is sequence zero");
-    assert_eq!(goal.execute_at_ns, T0 + 2 * PERIOD);
-    assert_eq!(goal.mask, 1, "one masked row, the one the probe writes");
-    assert_eq!(goal.targets[0], 0.25);
-    assert_eq!(goal.targets[1..], [0.0; 8], "unwritten rows stay zero");
+    let goal = published(&mut cog).expect("the execution published a datagram");
+    assert_eq!(goal.execute_at().as_nanos(), T0 + 2 * PERIOD);
+    assert_eq!(
+        goal.mask().to_known(),
+        Some(PROBE_MASK),
+        "one servo, the one it writes"
+    );
+    assert_eq!(goal.targets().body_yaw(), 0.25);
+
+    // Every field the cog did not write still holds the schema's declared
+    // zero, asserted as bytes rather than field by field: a cleared setpoint
+    // carrying only the three the cog sets is the whole property, and it stays
+    // the whole property when a field is added.
+    let mut expected = GoalSetpointWire::new();
+    expected.set_execute_at(SyncTime::from_nanos(T0 + 2 * PERIOD));
+    expected.set_mask(JointFlagsWire::from(PROBE_MASK));
+    expected.targets_mut().set_body_yaw(0.25);
+    assert_eq!(
+        blob_as_bytes(&goal),
+        blob_as_bytes(&expected),
+        "unwritten fields stay at their declared zero"
+    );
     assert_eq!(cog.state_kept().commands_seen(), 1);
 }
 
@@ -91,13 +109,16 @@ fn the_first_execution_reads_an_empty_view_of_its_own_output() {
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
     // Nothing was ever published before this execution, and the state records
-    // the zero that stands for it rather than a sequence number from anywhere.
-    assert_eq!(cog.state_kept().echoed_seq(), 0);
-    assert_eq!(published(&mut cog).expect("a datagram").0, 0);
+    // the epoch that stands for it rather than an instant from anywhere.
+    assert_eq!(cog.state_kept().echoed_due().as_nanos(), 0);
+    assert!(
+        published(&mut cog).is_some(),
+        "and it published all the same"
+    );
 }
 
 #[test]
-fn the_sequence_number_comes_back_out_of_the_cogs_own_output() {
+fn what_was_published_comes_back_out_of_the_cogs_own_output() {
     let mut cog = probe();
     cog.initialize(SyncTime::from_nanos(T0));
 
@@ -106,18 +127,22 @@ fn the_sequence_number_comes_back_out_of_the_cogs_own_output() {
         cog.publish_cmds(&cmd(at + PERIOD, f64::from(step)), SyncTime::from_nanos(at));
         assert!(cog.execute(SyncTime::from_nanos(at)));
 
-        let (seq, goal) = published(&mut cog).expect("a datagram per execution");
-        assert_eq!(seq, step, "sequence numbers run consecutively");
-        assert_eq!(goal.targets[0], f64::from(step));
+        let goal = published(&mut cog).expect("a datagram per execution");
+        assert_eq!(goal.targets().body_yaw(), f64::from(step));
 
         // What the channel does between executions, done by hand: the wrapper
         // wires nothing, so the loop is closed here.
-        echo_back(&mut cog, seq, &goal, at);
+        echo_back(&mut cog, &goal, at);
     }
 
     assert_eq!(cog.state_kept().commands_seen(), 4);
-    // The last execution read back the datagram before its own.
-    assert_eq!(cog.state_kept().echoed_seq(), 2);
+    // The last execution read back the datagram before its own, which named the
+    // instant the third command asked for.
+    assert_eq!(
+        cog.state_kept().echoed_due().as_nanos(),
+        T0 + 3 * PERIOD,
+        "the one published before this execution's own",
+    );
 }
 
 #[test]
@@ -133,9 +158,13 @@ fn a_burst_counts_every_command_and_publishes_the_last() {
     }
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
-    let (_, goal) = published(&mut cog).expect("one datagram, not three");
-    assert_eq!(goal.execute_at_ns, T0 + 3 * PERIOD, "the last command wins");
-    assert_eq!(goal.targets[0], 2.0);
+    let goal = published(&mut cog).expect("one datagram, not three");
+    assert_eq!(
+        goal.execute_at().as_nanos(),
+        T0 + 3 * PERIOD,
+        "the last command wins"
+    );
+    assert_eq!(goal.targets().body_yaw(), 2.0);
     assert!(
         published(&mut cog).is_none(),
         "an output slot carries one message per execution",
@@ -147,59 +176,37 @@ fn a_burst_counts_every_command_and_publishes_the_last() {
     );
 }
 
-/// Bytes in the own-output view that are not a datagram read as "nothing
-/// published", which restarts the sequence at zero.
+/// Bytes in the own-output view that are not a whole setpoint read as "nothing
+/// published", which leaves the read-back at the epoch.
 ///
-/// This cog is the only publisher on that channel and it writes whole
-/// datagrams, so the branch is unreachable in the system as composed -- but it
-/// is a branch, the motion cogs take the same read-back-your-own-output shape,
-/// and a checker asserting a publisher's sequence is monotonic would read the
-/// restart as a fresh run rather than as damage. Stated here so that it is a
-/// behaviour rather than an accident.
+/// This cog is the only publisher on that channel and it writes whole messages,
+/// so the branch is unreachable in the system as composed -- but it is a branch,
+/// the motion cogs take the same read-back-your-own-output shape, and a
+/// consumer would otherwise read damage as a run that had just started. Stated
+/// here so that it is a behaviour rather than an accident.
 #[test]
-fn bytes_that_are_not_a_datagram_read_as_nothing_published() {
+fn bytes_that_are_not_a_whole_setpoint_read_as_nothing_published() {
     let mut cog = probe();
     cog.initialize(SyncTime::from_nanos(T0));
 
     let rubbish = [0xff_u8, 0x00, 0x7f];
-    assert!(
-        peek_header(&rubbish).is_err(),
-        "the case rests on these bytes not parsing as a header",
+    assert_ne!(
+        rubbish.len(),
+        GoalSetpointWire::SIZE,
+        "the case rests on these bytes not being a whole message",
     );
-    let mut packet = VarPacket__288::new();
+    let mut packet = VarPacket__288Wire::new();
     assert!(packet.try_set_bytes(&rubbish));
     cog.publish_own_packet(&packet, SyncTime::from_nanos(T0));
 
     cog.publish_cmds(&cmd(T0 + PERIOD, 0.5), SyncTime::from_nanos(T0));
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
-    assert_eq!(
-        published(&mut cog).expect("a datagram").0,
-        0,
+    assert!(
+        published(&mut cog).is_some(),
         "an unreadable view is the same as an empty one",
     );
-    assert_eq!(cog.state_kept().echoed_seq(), 0);
-}
-
-/// The sequence is the wire format's: a counter that wraps rather than one
-/// that saturates or panics at its last value.
-#[test]
-fn the_sequence_after_the_last_one_is_zero_again() {
-    let mut cog = probe();
-    cog.initialize(SyncTime::from_nanos(T0));
-
-    let goal = GoalSetpoint {
-        execute_at_ns: T0,
-        mask: 1,
-        targets: [0.0; 9],
-    };
-    echo_back(&mut cog, u32::MAX, &goal, T0);
-
-    cog.publish_cmds(&cmd(T0 + PERIOD, 0.5), SyncTime::from_nanos(T0));
-    assert!(cog.execute(SyncTime::from_nanos(T0)));
-
-    assert_eq!(published(&mut cog).expect("a datagram").0, 0, "it wrapped");
-    assert_eq!(cog.state_kept().echoed_seq(), u32::MAX);
+    assert_eq!(cog.state_kept().echoed_due().as_nanos(), 0);
 }
 
 #[test]
@@ -214,10 +221,92 @@ fn a_datagram_read_back_out_of_the_carrier_is_byte_identical() {
 
     let packet = cog.try_next_packet().expect("a datagram");
     let bytes = packet.bytes().as_slice();
-    assert_eq!(bytes.len(), GoalSetpoint::LEN);
-    let header = peek_header(bytes).expect("a well-formed header");
-    assert_eq!(header.msg_type, GoalSetpoint::MSG_TYPE);
-    let (_, goal) = GoalSetpoint::decode(bytes).expect("a whole datagram");
-    assert_eq!(bytes, &goal.encode(header.seq)[..]);
-    assert_eq!(goal.mask & !JOINT_MASK_ALL, 0, "no rows outside the bus");
+    assert_eq!(bytes.len(), GoalSetpointWire::SIZE);
+    let goal = blob_from_bytes::<GoalSetpointWire>(bytes).expect("a whole setpoint");
+    assert_eq!(bytes, blob_as_bytes(&goal), "the same bytes, reinterpreted");
+    assert!(
+        goal.validate().is_ok(),
+        "and a message this build can read: no undeclared servo in the mask",
+    );
+}
+
+/// The state slot read as its validated view: real fields, a real Rust enum,
+/// and the same bytes the open accessors read.
+///
+/// The cog body keeps its state this way, and every cog in this repo is meant
+/// to. Asserted from a test rather than trusted from upstream's own suite, which
+/// exercises the validated layer outside a cog.
+#[test]
+fn the_state_slot_reads_as_its_validated_view() {
+    let mut cog = probe();
+    cog.initialize(SyncTime::from_nanos(T0));
+
+    // A slot nobody has written yet: zero, which every field of the schema
+    // narrows cleanly from.
+    let fresh = cog.state_kept().validate().expect("a zeroed slot is valid");
+    assert_eq!(fresh.commands_seen, 0);
+    assert!(matches!(fresh.last_step, ProbeStep::Idle));
+
+    cog.publish_cmds(&cmd(T0 + PERIOD, 0.5), SyncTime::from_nanos(T0));
+    assert!(cog.execute(SyncTime::from_nanos(T0)));
+
+    let after = cog.state_kept().validate().expect("still valid");
+    assert!(matches!(after.last_step, ProbeStep::Published));
+    // The view is a reinterpretation of the slot's own bytes, not a copy taken
+    // from it: what the open accessor reads and what the field holds are one
+    // value.
+    assert_eq!(after.commands_seen, cog.state_kept().commands_seen());
+    assert_eq!(after.echoed_due.as_nanos(), 0);
+}
+
+/// A slot whose bytes no longer validate is restarted from cleared, and the
+/// restart is counted on the slot it cleared.
+///
+/// The damage is written through the open surface, which is the only way an
+/// undeclared discriminant reaches a slot at all -- exactly as a peer writing
+/// the shared memory would. What matters is that the count and the offset
+/// survive the clear: an unrecorded reset reads afterwards like a process that
+/// has just started.
+#[test]
+fn a_slot_that_fails_validation_is_cleared_and_counted() {
+    let mut cog = probe();
+    cog.initialize(SyncTime::from_nanos(T0));
+
+    cog.publish_cmds(&cmd(T0, 0.25), SyncTime::from_nanos(T0));
+    assert!(cog.execute(SyncTime::from_nanos(T0)));
+    assert_eq!(cog.state_kept().commands_seen(), 1);
+
+    // A discriminant the schema does not declare, in the one enum field the
+    // slot carries.
+    cog.state_kept_mut().set_last_step(ProbeStepWire(7));
+    assert!(cog.state_kept().validate().is_err(), "the slot is damaged");
+
+    cog.publish_cmds(&cmd(T0 + PERIOD, 0.5), SyncTime::from_nanos(T0 + PERIOD));
+    assert!(cog.execute(SyncTime::from_nanos(T0 + PERIOD)));
+
+    let after = cog.state_kept().validate().expect("restarted from cleared");
+    assert_eq!(after.state_resets, 1, "the reset is on the record");
+    assert_eq!(
+        after.last_reset_offset, 20,
+        "the offset names the enum field whose bytes were bad",
+    );
+    // The clear is a clear: the count the damaged slot carried is gone, and this
+    // execution's own command is the only one counted.
+    assert_eq!(after.commands_seen, 1);
+    assert!(matches!(after.last_step, ProbeStep::Published));
+
+    // A second reset counts on top of the first rather than restating it.
+    cog.state_kept_mut().set_last_step(ProbeStepWire(7));
+    cog.publish_cmds(
+        &cmd(T0 + 2 * PERIOD, 0.75),
+        SyncTime::from_nanos(T0 + 2 * PERIOD),
+    );
+    assert!(cog.execute(SyncTime::from_nanos(T0 + 2 * PERIOD)));
+    assert_eq!(
+        cog.state_kept()
+            .validate()
+            .expect("valid again")
+            .state_resets,
+        2,
+    );
 }

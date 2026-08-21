@@ -78,6 +78,15 @@
 //! servos that fell short and what each did instead, so a bench session
 //! diagnoses one flaky servo from the run it is already having rather than from
 //! the next one.
+//!
+//! Not in the build: this file is part of the bench's retired motion layer, kept
+//! on disk as the record of how this machine was driven. It no longer compiles.
+//! TODO(bench-motion-delete)
+//!
+//! Two items here have live twins in compiled files: `Clock`/`MonotonicClock`
+//! (in `bare.rs`) and `SettleConfig` (in `config.rs`). The copies here may
+//! differ from the live ones. Everything else -- the sequencer call order, the
+//! fixed-rate loop, the trace it records -- exists only here.
 
 use core::time::Duration;
 use std::fmt;
@@ -93,9 +102,8 @@ use reachy_motion::{
     ArmConfig, ArmRecord, BusFailureSource, BusRequest, BusResult, ClockStretch,
     CommandDisposition, CommandRejection, CommissionSummary, EngageSummary, Fault, JointGroup,
     JointId, JointSet, JointTargets, JointVector, Maneuver, Mode, MotionCommand, MotionConfig,
-    MotionState, MoveAbort, Outcome, RegId, RegValue, Response, SeqAction, SeqError, SeqStep,
-    Sequencer, ServoHealth, TickInputs, TickOutputs, TickReport, WireFailure, floor_move_clock,
-    motion_tick,
+    MotionState, MoveAbort, Outcome, RegId, RegValue, SeqAction, SeqError, SeqStep, Sequencer,
+    ServoHealth, TickInputs, TickOutputs, TickReport, WireFailure, floor_move_clock, motion_tick,
 };
 
 /// Actions every phase but the supply gate takes, together and with room to
@@ -434,122 +442,11 @@ pub enum Phase {
     UnderTorque,
 }
 
-/// What a run's ending asks its caller to do.
+/// What a run's ending asks its caller to do, and where it leaves the machine.
 ///
-/// The response vocabulary of the fault doctrine, less the one response that is
-/// not an ending: degrading the antennas leaves the move running, and travels
-/// in the tick's report rather than as an error.
-///
-/// Every [`PumpError`] maps onto one of these, so what a caller does about an
-/// ending is decided once, here, at compile time — never by a caller reading a
-/// message, and never by a default that a new variant falls into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorClass {
-    /// The ask is declined and nothing changes.
-    Refuse,
-    /// Abandon the move, stow every joint that still commands with the checks
-    /// live, then release. The machine is trusted to command.
-    SlowStowToRest,
-    /// Immediate best-effort torque-off of all nine; the next wake engages
-    /// normally.
-    ImmediateAllTorqueOffToRest,
-    /// Release the faulted servo on the spot, stow on what still commands, then
-    /// release everything and wait for an operator.
-    MaskedSlowStowToPark,
-    /// Immediate best-effort torque-off of all nine, then wait for an operator.
-    ImmediateAllTorqueOffToPark,
-}
-
-impl ErrorClass {
-    /// The ending that carries out `response`.
-    fn answering(response: Response) -> Self {
-        match response {
-            Response::Refuse => Self::Refuse,
-            Response::SlowStowToRest => Self::SlowStowToRest,
-            Response::ImmediateAllTorqueOffToRest => Self::ImmediateAllTorqueOffToRest,
-            Response::MaskedSlowStowToPark => Self::MaskedSlowStowToPark,
-            Response::ImmediateAllTorqueOffToPark => Self::ImmediateAllTorqueOffToPark,
-            // Degrading a pair is not an ending: the antennas go limp and the
-            // move carries on, reported through the tick. An error that
-            // nonetheless names this response says the head is healthy and
-            // still commanding, and a stow under control is what that gets.
-            Response::DegradeAntennas => Self::SlowStowToRest,
-        }
-    }
-
-    /// What this ending actually does to the machine, for the record it is
-    /// reported in.
-    ///
-    /// Beside [`Self::disposition`] and for the same reason: which maneuver a
-    /// class runs is the class's own fact, and a caller spelling one out is a
-    /// second table that can come to disagree with this one. A refusal runs
-    /// none — nothing is done to a machine whose ask was declined.
-    #[must_use]
-    pub fn maneuver(self) -> Option<Maneuver> {
-        match self {
-            Self::Refuse => None,
-            Self::SlowStowToRest => Some(Maneuver::SlowStow),
-            Self::MaskedSlowStowToPark => Some(Maneuver::MaskedSlowStow),
-            Self::ImmediateAllTorqueOffToRest | Self::ImmediateAllTorqueOffToPark => {
-                Some(Maneuver::ImmediateAllTorqueOff)
-            }
-        }
-    }
-
-    /// Which of two endings the machine is judged by: the one that asks more of
-    /// whoever finds it.
-    ///
-    /// What answers a compound ending — a stow defeated by a servo dropping
-    /// out, a torque-off nobody acknowledged on the way out of another fault.
-    /// Beside [`Self::disposition`] and [`Self::maneuver`] for the same reason:
-    /// every question about what a class asks of the machine is the doctrine's,
-    /// and a ranking written a crate away is a second answer to the one that
-    /// decides which maneuver a compound ending runs.
-    ///
-    /// Ranked rather than compared field by field, because the order is a
-    /// judgement and not an arithmetic: a park outranks any rest, and within the
-    /// parks the controlled descent outranks going limp on the spot.
-    /// Wildcard-free, so a class added to the doctrine is ranked here or does
-    /// not compile.
-    #[must_use]
-    pub fn worse(self, other: Self) -> Self {
-        let rank = |class| match class {
-            Self::Refuse => 0,
-            Self::SlowStowToRest => 1,
-            Self::ImmediateAllTorqueOffToRest => 2,
-            Self::MaskedSlowStowToPark => 3,
-            Self::ImmediateAllTorqueOffToPark => 4,
-        };
-        if rank(other) > rank(self) {
-            other
-        } else {
-            self
-        }
-    }
-
-    /// Whether the machine this response leaves behind may be engaged again by
-    /// whatever asks next, or has to wait for a person.
-    ///
-    /// A refusal changed nothing, so there is nothing to wait for.
-    #[must_use]
-    pub fn disposition(self) -> Disposition {
-        match self {
-            Self::Refuse | Self::SlowStowToRest | Self::ImmediateAllTorqueOffToRest => {
-                Disposition::Rest
-            }
-            Self::MaskedSlowStowToPark | Self::ImmediateAllTorqueOffToPark => Disposition::Park,
-        }
-    }
-}
-
-/// Where a response leaves the machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Disposition {
-    /// Torque off, and the next wake engages as usual.
-    Rest,
-    /// Torque off, and nothing engages until an operator has been.
-    Park,
-}
+/// Re-exported from `reachy-motion` so this crate and the daemon share one
+/// vocabulary for what a fault response does to the machine.
+pub use reachy_motion::winddown::{Disposition, ErrorClass};
 
 /// Which side of the torque line an engage failure fell on.
 ///
@@ -622,9 +519,15 @@ fn sequence_verdict(error: &SeqError) -> SeqVerdict {
         | SeqError::VoltageLow { .. }
         | SeqError::SupplyBelowFloor { .. }
         | SeqError::UnhealthyServo { .. } => SeqVerdict::Declined,
-        // The step and the register table disagree about what a register is:
-        // our defect, with a machine that is answering perfectly.
-        SeqError::WrongAnswer { .. } | SeqError::WrongValue { .. } => SeqVerdict::Defect,
+        // The step and the register table disagree about what a register is, or
+        // the driver would not run the transaction at all: our defect either
+        // way, with a machine that is answering perfectly. A refusal is the
+        // driver saying it was asked wrongly — a second request while one was
+        // outstanding, or an operation it does not allow in the state it is in —
+        // and nothing reached the bus, so it is not evidence about the wire.
+        SeqError::WrongAnswer { .. }
+        | SeqError::WrongValue { .. }
+        | SeqError::DriverRefused { .. } => SeqVerdict::Defect,
     }
 }
 
@@ -6241,113 +6144,6 @@ mod tests {
             Fault::MeasuredPoseInvalid { .. } => 5,
             Fault::BusFailure { .. } => 6,
             Fault::TorqueOffUnconfirmed { .. } => 7,
-        }
-    }
-
-    /// A class runs the maneuver its response runs, and answers with it
-    /// itself, so nothing downstream has to spell one out.
-    ///
-    /// The one divergence is the response that is not an ending: an error that
-    /// names `DegradeAntennas` comes from a caller that surfaced the tick's
-    /// degrade as an ending, and what a still-commanding head gets for it is
-    /// the stow — not the antenna torque-off, which has already happened.
-    #[test]
-    fn every_class_names_the_maneuver_it_runs() {
-        let table: Vec<(Response, Option<Maneuver>)> = vec![
-            (Response::Refuse, None),
-            (Response::SlowStowToRest, Some(Maneuver::SlowStow)),
-            (
-                Response::MaskedSlowStowToPark,
-                Some(Maneuver::MaskedSlowStow),
-            ),
-            (
-                Response::ImmediateAllTorqueOffToRest,
-                Some(Maneuver::ImmediateAllTorqueOff),
-            ),
-            (
-                Response::ImmediateAllTorqueOffToPark,
-                Some(Maneuver::ImmediateAllTorqueOff),
-            ),
-            (Response::DegradeAntennas, Some(Maneuver::SlowStow)),
-        ];
-
-        let mut judged = [false; 6];
-        for (response, maneuver) in table {
-            judged[response_slot(response)] = true;
-            assert_eq!(
-                ErrorClass::answering(response).maneuver(),
-                maneuver,
-                "{response:?}"
-            );
-            // Where the response is an ending at all, the class is not a second
-            // opinion about which maneuver that is.
-            if response != Response::DegradeAntennas {
-                assert_eq!(
-                    ErrorClass::answering(response).maneuver(),
-                    response.maneuver(),
-                    "{response:?}"
-                );
-            }
-        }
-        assert!(
-            judged.iter().all(|seen| *seen),
-            "a response named no maneuver: {judged:?}"
-        );
-    }
-
-    /// A compound ending is judged by the one that asks more of whoever finds
-    /// it, whichever order the two arrived in.
-    ///
-    /// The order is the doctrine's: any park outranks any rest, and within each
-    /// pair the maneuver that carries the head down outranks going limp where it
-    /// stands. Pinned as the whole 25-pair table, so a re-ranking — which
-    /// compiles, unlike an added class — has to be re-justified here.
-    #[test]
-    fn the_worse_of_two_endings_is_the_one_that_asks_more() {
-        // Weakest first: this order *is* the ranking, and the assertions below
-        // read it off the position rather than restating the arithmetic.
-        let ranked = [
-            ErrorClass::Refuse,
-            ErrorClass::SlowStowToRest,
-            ErrorClass::ImmediateAllTorqueOffToRest,
-            ErrorClass::MaskedSlowStowToPark,
-            ErrorClass::ImmediateAllTorqueOffToPark,
-        ];
-        for (i, left) in ranked.into_iter().enumerate() {
-            for (j, right) in ranked.into_iter().enumerate() {
-                let expected = ranked[i.max(j)];
-                assert_eq!(left.worse(right), expected, "{left:?} against {right:?}");
-                assert_eq!(right.worse(left), expected, "{right:?} against {left:?}");
-            }
-        }
-        // The rank is not the disposition: a rest can outrank another rest, and
-        // every park outranks every rest.
-        for rest in [
-            ErrorClass::Refuse,
-            ErrorClass::SlowStowToRest,
-            ErrorClass::ImmediateAllTorqueOffToRest,
-        ] {
-            for park in [
-                ErrorClass::MaskedSlowStowToPark,
-                ErrorClass::ImmediateAllTorqueOffToPark,
-            ] {
-                assert_eq!(rest.worse(park).disposition(), Disposition::Park);
-            }
-        }
-    }
-
-    /// Which answer this is, as a slot in the coverage above.
-    ///
-    /// Wildcard-free, so a response added to the doctrine cannot be left out of
-    /// the maneuver table by the table simply not mentioning it.
-    fn response_slot(response: Response) -> usize {
-        match response {
-            Response::Refuse => 0,
-            Response::SlowStowToRest => 1,
-            Response::DegradeAntennas => 2,
-            Response::MaskedSlowStowToPark => 3,
-            Response::ImmediateAllTorqueOffToRest => 4,
-            Response::ImmediateAllTorqueOffToPark => 5,
         }
     }
 

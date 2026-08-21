@@ -1,0 +1,247 @@
+// A commissioning, as the slot holds it: which phase is running, and what the
+// survey has established so far.
+//
+// The commissioning sequencer writes every declaration here, which is why they
+// live together and why nothing else does: a provisioning-grid edit must not
+// rebuild the poll path, so the readings both sequencers share are
+// `motion/servo_health.clk` and the shared verdict forms are `motion/seq.clk`.
+//
+// One convention holds throughout, the same one the joint vocabulary states: a
+// per-servo or per-register collection is named fields, never a positional
+// array. A row misplaced in an array is a silent swap of two servos; a row
+// misplaced across named fields does not compile.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use hardware::dynamixel::registers;
+use motion::bus_txn;
+use motion::joints;
+use motion::seq;
+use motion::servo_health;
+
+// Which phase of a commissioning is running.
+//
+// Phases here run from one rather than zero, because a slot nothing wrote holds
+// zero and the first sweep is not what an unwritten slot means: a commission
+// resumed at `presence` when it had already written gains would write them
+// twice. So `none` is a refusal on the way back in.
+enum CommissionPhaseKind
+{
+    uuid: 048a5077-d41e-40b5-907a-c12e20805f9d;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No phase. What a slot nothing wrote holds, and refused rather than
+        // read as the first sweep.
+        #0 none default { underlying_value: 0; }
+        // Every servo answers a ping.
+        #1 presence { underlying_value: 1; }
+        // Every servo reports the model number it should.
+        #2 identity { underlying_value: 2; }
+        // Every provisioned register reads as configured, or is recorded.
+        #3 provision { underlying_value: 3; }
+        // The supply is up, polled until it is or the budget runs out.
+        #4 voltage { underlying_value: 4; }
+        // Nothing is latched in a hardware-error byte.
+        #5 health { underlying_value: 5; }
+        // The gains and the motion profiles written.
+        #6 gains_profiles { underlying_value: 6; }
+        // Finished: the next step hands back the summary.
+        #7 complete { underlying_value: 7; }
+        // Stopped: the next step hands back the failure.
+        #8 failed { underlying_value: 8; }
+    }
+}
+
+// One model number per servo, in bus order.
+//
+// Named fields rather than an array for the reason the head of this file
+// states: a row misplaced in an array is a silent swap of two servos.
+schema ServoModels
+{
+    uuid: 752d44a6-086a-49f8-bf70-1acfc56b909a;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: UInt16;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: UInt16;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: UInt16;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: UInt16;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: UInt16;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: UInt16;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: UInt16;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: UInt16;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: UInt16;
+    }
+}
+
+// One cell of the provisioning grid: what a register held, or that arming did
+// not read it.
+//
+// `shape` is the key. `none` is not a value of any width -- it is the cell arming
+// never got to, which is what an unwritten slot and an unreached sweep both hold.
+schema ProvisionCell
+{
+    uuid: 0aa4934b-e109-4f9f-918f-a12b9678060b;
+    fields
+    {
+        // What shape the value below is, or `none` for a cell nothing read.
+        #0 shape: registers::ValueShape;
+        // The value, as the eight bytes the wire carries a register value in
+        // read as one little-endian number. Bits rather than a number of
+        // anything: what they mean is `shape`.
+        #1 value: UInt64;
+    }
+}
+
+// One servo's row of the provisioning grid: one cell per register arming
+// provisions, in the order the sweep walks them.
+//
+// Named fields rather than an array for the same reason the servos are named:
+// the cells are a register each, and a column misplaced reports the shutdown
+// mask as a homing offset. The list must agree with
+// `reachy_motion::arm::PROVISION_REGS`.
+schema ProvisionRow
+{
+    uuid: 422289f6-b38e-4e4b-b472-c465c2eace06;
+    fields
+    {
+        // How long the servo waits before answering, its own units.
+        #0 return_delay_time: ProvisionCell;
+        // Which control mode the servo is in.
+        #1 operating_mode: ProvisionCell;
+        // The drive-mode byte: direction and profile flags.
+        #2 drive_mode: ProvisionCell;
+        // The offset between the servo's zero and the model datum, radians.
+        #3 homing_offset: ProvisionCell;
+        // The lower travel fence the servo enforces itself, radians.
+        #4 min_position_limit: ProvisionCell;
+        // The upper travel fence the servo enforces itself, radians.
+        #5 max_position_limit: ProvisionCell;
+        // Which hardware errors the servo shuts itself down for.
+        #6 shutdown: ProvisionCell;
+        // The supply ceiling the servo alarms above, volts.
+        #7 max_voltage_limit: ProvisionCell;
+        // The supply floor the servo alarms below, volts.
+        #8 min_voltage_limit: ProvisionCell;
+        // The temperature the servo alarms above, its own units.
+        #9 temperature_limit: ProvisionCell;
+        // The current ceiling, its own units.
+        #10 current_limit: ProvisionCell;
+        // The velocity ceiling, its own units.
+        #11 velocity_limit: ProvisionCell;
+        // The bus watchdog's own timeout, its own units.
+        #12 bus_watchdog: ProvisionCell;
+        // The motion profile's acceleration, its own units.
+        #13 profile_acceleration: ProvisionCell;
+        // The motion profile's velocity, its own units.
+        #14 profile_velocity: ProvisionCell;
+    }
+}
+
+// The provisioned registers as commissioning found them: one row per servo, in
+// bus order.
+//
+// The recorded cells are the point -- the homing offsets, shutdown masks and
+// model numbers nobody has established a correct value for yet, whose readings in
+// an arm report are what establishes it. So the grid crosses whole rather than
+// being rebuilt from a summary.
+schema ProvisionGrid
+{
+    uuid: 287c3195-3855-489f-9f96-20a9e4b5e3ca;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: ProvisionRow;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: ProvisionRow;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: ProvisionRow;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: ProvisionRow;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: ProvisionRow;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: ProvisionRow;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: ProvisionRow;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: ProvisionRow;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: ProvisionRow;
+    }
+}
+
+// A commissioning, as the numbers a slot holds it between transactions.
+//
+// The commissioning sequencer's own state, read and written in place. A
+// commission is hundreds of transactions and a cog is stepped once per answer,
+// so the sequence lives here between them: the phase and its cursor say where it
+// is, and the readings are what it has established so far.
+//
+// The configuration is deliberately absent. What the sequence was configured
+// with -- the expectations, the fences, the budgets -- is handed to the cog
+// read-only on every execution, and a second copy here could disagree with it.
+schema CommissionSnap
+{
+    uuid: dc70bbdc-ad84-4199-9f5e-9d14f6cc49f0;
+    fields
+    {
+        // Which phase is running. `none` is what an unwritten slot holds and is
+        // refused rather than read as the first sweep.
+        #0 phase: CommissionPhaseKind;
+
+        // Where that phase's sweep stands. Zero in the two endings, and refused
+        // past the sweep's own length -- a cursor at the bound indexes nothing,
+        // because every sweep hands over on its last element.
+        #1 cursor: UInt32;
+
+        // When the supply gate started polling, which is what its budget is
+        // measured from. Meaningful in the voltage phase.
+        #2 voltage_started: SyncTime;
+
+        // Whether the supply gate's next step is the wait that spaces its sweeps
+        // out rather than a read. Meaningful in the voltage phase.
+        #3 voltage_waiting: Bool;
+
+        // The verdict a failed phase hands back. `none` in every other phase,
+        // and a failed phase without one is refused rather than handed an
+        // invented verdict.
+        #4 failure: seq::SeqFailureSnap;
+
+        // The transaction awaiting an answer.
+        #5 pending: bus_txn::BusTxn;
+
+        // Which servos did not answer their ping.
+        #6 absent: joints::JointFlags;
+
+        // Each servo's model number as identity read it. Zero where identity has
+        // not reached it.
+        #7 models: ServoModels;
+
+        // The supply and error-bit readings as the gate and the health sweep
+        // last took them. One field rather than two loose arrays, so a rail
+        // reading that grows a third number grows in one place and the poll
+        // snapshot cannot come to disagree with this one about what a rail
+        // reading is.
+        #8 rail: servo_health::RailSnap;
+
+        // The provisioned registers as they were found.
+        #9 provisioned: ProvisionGrid;
+
+        // How many sweeps the supply gate has taken.
+        #10 voltage_polls: UInt32;
+    }
+}

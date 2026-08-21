@@ -1,0 +1,131 @@
+// What the mover cog keeps between executions: the tick's state, the base it
+// composes over, and the overlays playing on it.
+//
+// The mover is the writer of every field here, which is why the module sits in
+// `cogs/` beside it. What it holds of other components is held whole: the
+// tick's state is `motion/tick_state.clk`'s, an overlay row is
+// `clips/player.clk`'s, and the two schedule facts it remembers are
+// `cogs/schedule.clk`'s. Nothing is restated.
+//
+// Time is `SyncTime` and `Duration` throughout, and the totals are all-run
+// counts a reader compares between executions rather than rates.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+use clips::player;
+use cogs::schedule;
+use motion::targets as target_vocab;
+use motion::tick_state;
+
+// The base an overlay composes over, while the mover is the one sampling it.
+//
+// Ordinarily the tick owns the base: the cog commands a move and the tick
+// shapes it. A composed setpoint is commanded per period instead, which
+// abandons any move the tick is running -- so for as long as an overlay window
+// is open the cog carries the base itself, and this is where it lives. `owned`
+// is the handover: false while the tick has the base, true from the period an
+// overlay first composes until the last window closes.
+schema BaseSnap
+{
+    uuid: 345a620e-07b0-4b1f-baf3-a6d896b98c9b;
+    fields
+    {
+        // Whether the cog is sampling the base. Every field below means nothing
+        // when this is false.
+        #0 owned: Bool;
+
+        // Where the base stands: the configuration an overlay is composed over
+        // this period. Not the last thing commanded -- that is the composed
+        // setpoint, which is the base plus whatever was playing.
+        #1 targets: target_vocab::Targets;
+
+        // The base move in flight, or that none is. Taken over from the tick on
+        // the period the handover happens, and planned here for a step that
+        // arrives while the cog holds the base.
+        #2 path: tick_state::TrajectorySeed;
+
+        // How far into that move, on its own clock. One period per sample, the
+        // same arithmetic the tick does.
+        #3 elapsed: Duration;
+    }
+}
+
+// What the decision tick carries between samples: the tick's own state, and
+// what the cog knows about the schedule it is following.
+//
+// The tick's state is the whole of `snap`, and everything beside it is this
+// cog's: whether a state exists at all, and enough about the last schedule it
+// acted on to tell a change from a repetition. Publish bookkeeping is absent:
+// the cog reads sequence numbers and timestamps back from its own view of the
+// channel it publishes on.
+schema MoverState
+{
+    uuid: f4cb808c-2637-48ba-a16d-1041319208dd;
+    fields
+    {
+        // Whether a motion state exists: the session is engaged and a solve
+        // from a measured pose produced one. Until it does, `snap` is whatever
+        // a default-constructed slot holds and describes no machine.
+        #0 armed: Bool;
+
+        // The tick's state.
+        #1 snap: tick_state::MotionSnap;
+
+        // The `epoch` of the last schedule acted on. A schedule arriving with
+        // this number again asks for nothing new, whatever its steps say.
+        #2 schedule_epoch_seen: UInt32;
+
+        // The kind of the last step dispatched as a move.
+        #3 desired_kind: schedule::StepKind;
+
+        // The posture of that step. Together with `desired_kind` this is what a
+        // fresh schedule is compared against to decide whether the machine has
+        // somewhere new to be.
+        #4 desired_posture: schedule::Posture;
+
+        // How many goal datagrams have been published, all run.
+        #5 goals_published: UInt64;
+
+        // How many reports the tick raised, all run.
+        #6 faults_raised: UInt64;
+
+        // How many samples have been seen, all run.
+        #7 samples_seen: UInt64;
+
+        // How many messages on the sample channel failed validation, all run.
+        // Distinct from a sample that carried no reading: those bytes describe
+        // no sample at all, so they name no instant and no positions and no
+        // tick ran on them.
+        #8 refused_samples: UInt64;
+
+        // How many reports were raised on an execution that had already
+        // reported one, all run. What a reader compares against the reports in
+        // the log to know whether it is reading all of them.
+        #9 reports_dropped: UInt64;
+
+        // How many times the tick state in this slot could not be read back as
+        // a machine, or would not go back into it, all run. Either way the cog
+        // is left unarmed and arms again off the next sample, so a rise says an
+        // engagement ended without anything having asked for it.
+        #10 refused_state: UInt64;
+
+        // How many times an epoch this cog had not answered yet was answered by
+        // a posture step, all run. An epoch stands until a posture step covers
+        // an instant, and one execution sees only the latest schedule, so two
+        // bumps published inside one gap are one answer here: the total counts
+        // epoch changes this cog observed, not epochs a session published, and
+        // subtracting it from a publish count says nothing. Whether the epoch
+        // published now is outstanding is `schedule_epoch_seen` against it.
+        #11 epochs_answered: UInt64;
+
+        // The base, while this cog is the one sampling it.
+        #12 base: BaseSnap;
+
+        // The overlays playing, one row per window the schedule carries. The row
+        // is the window's position in the schedule: a window keeps its row for
+        // as long as it is open, which is what lets a player be picked up again
+        // on the next execution rather than restarted every period.
+        #13 players: FixedArray<player::ClipPlayerSnap, 4>;
+    }
+}

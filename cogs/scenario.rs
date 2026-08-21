@@ -64,6 +64,13 @@ pub const START_TORQUED: bool = false;
 /// How far an antenna moves in one cycle, radians.
 pub const SLEW_ANTENNAS_RAD: f64 = 0.65;
 
+/// The minimum spacing between the simulated driver's health reports.
+///
+/// Per report rather than per lap: the rotation reads one servo each time it
+/// reports, so a scenario counting reports over a stretch divides by this and a
+/// scenario waiting for a full lap of the nine multiplies it by nine.
+pub const HEALTH_POLL_PERIOD_NS: i64 = 120_000_000;
+
 /// How long an execution is modelled to take, which is the gap between the
 /// instant a cog runs at and the log time of what it published.
 ///
@@ -162,19 +169,17 @@ pub fn dead_man_latch_cycle(window_opened_at: i64) -> i64 {
     window_opened_at + hold_timeout_cycles() + 1
 }
 
-/// How long a stretch of cycles is, microseconds: what the gate reports as the
+/// How long a stretch of cycles is, nanoseconds: what the gate reports as the
 /// silence it measured.
 ///
-/// Saturating the way the gate's own conversion does, at both ends: a stretch
-/// that ran backwards is nothing, and one past seventy minutes is as long as the
-/// field says. Two spellings of one conversion that clamped the low end
-/// differently would have a scenario asserting seventy minutes of silence
-/// against a driver reporting none, and send whoever read the failure to the
-/// driver rather than to the arithmetic that asked for it.
+/// Nothing for a stretch that ran backwards, the way the gate's own reading is:
+/// two spellings of one arithmetic that disagreed at the low end would have a
+/// scenario asserting a silence against a driver reporting none, and send
+/// whoever read the failure to the driver rather than to the arithmetic that
+/// asked for it.
 #[must_use]
-pub fn silence_us(from_cycle: i64, to_cycle: i64) -> u32 {
-    let quiet = (to_cycle - from_cycle).max(0) * PERIOD_NS / 1_000;
-    u32::try_from(quiet).unwrap_or(u32::MAX)
+pub fn silence_ns(from_cycle: i64, to_cycle: i64) -> i64 {
+    (to_cycle - from_cycle).max(0) * PERIOD_NS
 }
 
 /// The cycle `nominal` sits on, counted from the epoch.
@@ -247,6 +252,7 @@ pub fn check_params(mover_textproto: &str, sim_textproto: &str) -> Vec<String> {
             ("slew_legs_rad", Value::Float(SLEW_LEGS_RAD)),
             ("slew_body_yaw_rad", Value::Float(SLEW_BODY_YAW_RAD)),
             ("slew_antennas_rad", Value::Float(SLEW_ANTENNAS_RAD)),
+            ("health_poll_period_ns", Value::Int(HEALTH_POLL_PERIOD_NS)),
         ],
         &mut failures,
     );

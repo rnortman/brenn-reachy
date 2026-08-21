@@ -1,0 +1,59 @@
+// What the pose estimator keeps between samples: the seed it solves from, and
+// the totals it reports.
+//
+// The `Pose` cog in the motion box is the only writer, which is why this sits
+// in `cogs/` beside it. Its own module rather than a shelf shared with the
+// simulator's plant: the control-rate box imports six fields, not a model of a
+// machine, and an edit to either subject leaves the other's consumers alone.
+//
+// Position is metres in the body frame and orientation a unit quaternion, the
+// units `reachy-kin` uses, so nothing here converts. The carriage is
+// `geometry/primitives.clk`'s.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+use geometry::primitives;
+
+// What the pose estimator keeps between samples.
+//
+// The seed, and the three totals it reports. The seed is the last pose the
+// solver actually found, which is not the last pose it published: an invalid
+// estimate carries no pose, and seeding the next solve from a pose nobody found
+// would pick the branch of the mechanism by accident. It is a slot rather than a
+// read-back of the output channel for the same reason -- a bounded view cannot
+// promise that a valid estimate is still in it after a long run of invalid ones.
+//
+// The totals are here rather than read back out of the signal group's own fold
+// for a related reason: a post-aggregated group folds over a bounded window and
+// starts a new one when it reports, so a total kept only in the fold restarts at
+// zero mid-run -- and it restarts soonest in exactly the outages these counters
+// exist to make visible, where one of them moves on every execution. Kept in the
+// slot they are the run's totals; the signals are written from them, so what a
+// report carries is an absolute count and never a window's share of one.
+schema PoseState
+{
+    uuid: 7af3ec68-943c-4bf4-9a4b-480b421a7555;
+    fields
+    {
+        // Whether a solve has ever succeeded. False on the first execution,
+        // when the seed below is whatever a default-constructed slot holds.
+        #0 have_seed: Bool;
+
+        // Position of the last pose found, metres in the body frame.
+        #1 seed_pos: primitives::Vec3;
+
+        // Orientation of the last pose found.
+        #2 seed_quat: primitives::Quat;
+
+        // How many complete samples the solver could not answer, all run.
+        #3 fk_failures: UInt64;
+
+        // How many samples failed validation, all run.
+        #4 refused_samples: UInt64;
+
+        // How many times the seed slot held numbers that were not a pose, all
+        // run.
+        #5 refused_seeds: UInt64;
+    }
+}

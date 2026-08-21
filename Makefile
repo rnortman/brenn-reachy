@@ -22,6 +22,7 @@ help:
 	@echo "  make fix           auto-fix what the gate can fix (rustfmt)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
+	@echo "  make clip-config   regenerate the clip library asset from cogs/clips/"
 	@echo ""
 	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
 	@echo "REACHY_HOST naming a reachable unit:"
@@ -166,6 +167,20 @@ setup-hooks:
 scrub-tree:
 	brenn-scrub tree
 
+# Regenerate the clip library the cogs are handed, from the documents under
+# `cogs/clips/`. Not part of the gate and not a prerequisite of anything: the
+# emitted asset is committed, and the gate's own case fails when the two
+# disagree, so this is the command that answers that failure.
+#
+# Absolute paths, because `bazel run` runs the tool in its runfiles tree rather
+# than here.
+.PHONY: clip-config
+clip-config: require-bazel
+	bazel run //cogs:gen_clip_config -- \
+	    --clips $(CURDIR)/cogs/clips \
+	    --out $(CURDIR)/cogs/clip_library.textproto \
+	    --names $(CURDIR)/cogs/clip_library.names.json
+
 # ---------------------------------------------------------------------------
 # The device path: building the bench for the Reachy Mini and running it there.
 #
@@ -230,7 +245,7 @@ bench-config: bench-host
 # Build, push, and run the bench on the unit. ARGS is the command and its
 # arguments, passed verbatim:
 #
-#     make bench-run ARGS="up --trace /var/lib/brenn-app/reachy-trace.csv"
+#     make bench-run ARGS="reboot 17"
 #
 # The build is a prerequisite rather than a step to remember, which is what
 # makes this the entry point that cannot go stale — deploy-bench.sh refuses a

@@ -5,25 +5,20 @@
 //! tests that need no port and no machine. This file owns only the argument
 //! shape, the port, the printing and the exit code.
 //!
-//! `selftest` is read-only. Everything else writes to a servo, so everything
-//! else is behind the standing gate: a crank datum a human wrote into the
-//! configuration, checked before the port is opened.
+//! `selftest` is read-only. The other three write to a servo, and none of them
+//! commands an angle: `provision` writes one non-volatile register on a limp
+//! machine, and `reboot` and `off` are de-torques, which nothing gates.
 
 #![forbid(unsafe_code)]
 
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 
-use reachy_bench::commands;
-use reachy_bench::commands::BaseMove;
-use reachy_bench::config::{self, RECORD_NAME, Resolved, resolve_for_commanding};
-use reachy_bench::pump::{MonotonicClock, PumpError};
+use reachy_bench::bare::{self, BareError, MonotonicClock};
+use reachy_bench::config::{self, RECORD_NAME};
 use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
-use reachy_clips::{ClipLimits, Library, MAX_SPEED, MIN_SPEED, Motion, document_name, documents};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
@@ -33,65 +28,34 @@ const DEFAULT_CONFIG: &str = "reachy-bench.toml";
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
-    /// Where every run of this invocation appends its per-period trace.
-    trace: Option<PathBuf>,
-    /// How fast a played motion runs, as a multiple of its recorded speed.
-    speed: Option<f64>,
-    /// The base transition a played motion runs over, for the layered run.
-    during: Option<BaseMove>,
-    /// The words that were not flags: a yaw in degrees, or two antenna angles.
+    /// The words that were not flags: the one servo a reboot addresses.
     operands: Vec<String>,
 }
 
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH] \
-         [--trace PATH]\n\
+        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH]\n\
          \n\
          commands:\n\
          \x20 selftest              read-only: pings and register reads, no torque, no motion\n\
          \x20 provision             write the antennas' operating mode; no torque, no motion\n\
          \x20 reboot [id]           restart every servo, or one; clears a latched error and \
          drops torque\n\
-         \x20 arm                   verify, pin every joint where it stands, enable torque\n\
-         \x20 up                    lift the head to the neutral configuration\n\
-         \x20 hold                  command nothing and measure the machine holding\n\
-         \x20 stow                  move to the stow configuration; torque stays on\n\
-         \x20 off                   settle, measure against stow, release torque\n\
-         \x20 yaw <deg>             rotate the body\n\
-         \x20 antennas <right> <left>   move the antennas, radians\n\
-         \x20 demo                  up, hold, antennas, yaw, stow, off\n\
-         \x20 play <file>           play a motion document over the neutral configuration\n\
+         \x20 off                   write torque off on every servo\n\
          \n\
-         `play` raises the head to neutral — the configuration a recording's frames are\n\
-         deltas against — and then commands one composed setpoint per control period.\n\
-         `--speed X` runs the motion faster or slower within the bounds the document\n\
-         itself allows; `--during up|stow` starts a base transition first and joins the\n\
-         motion halfway through it, which is the layered case a held base cannot show.\n\
-         The whole directory the file sits in is read, because a sequence names other\n\
-         documents; what is played is the name the named file declares.\n\
-         \n\
-         Every command but `selftest`, `provision`, `reboot` and `off` commissions the\n\
-         machine, polls it and takes hold of it first: nothing is remembered between\n\
-         invocations.\n\
+         Nothing here commands an angle: this tool reads the machine, provisions it and \
+         releases it.\n\
+         Coordinated motion is the cog path's, and there is no command for it here.\n\
          \n\
          `reboot` restarts the servos, which is how a latched hardware error — an\n\
          overload above all — is cleared without cutting power. A restart drops torque,\n\
          so the head settles: take its weight if it is up. It gates on nothing.\n\
          \n\
-         `off` always releases: wherever the machine is, torque comes off and where it\n\
-         was is reported. The head settles as it goes, so take its weight if it is up.\n\
-         That is the way out of any session, at any moment. A move that *faults* also\n\
-         releases, immediately and without measuring, and the head settles then too.\n\
-         \n\
-         `--trace PATH` writes one CSV row per control period — every joint's measured\n\
-         angle against the goal it was being held to, which is the move's velocity\n\
-         profile at the rate it was sampled. Each run of the invocation appends. Give it\n\
-         a path on a memory filesystem the account this runs as can write, \
-         `/var/lib/brenn-app/reachy-trace.csv` on the machine itself:\n\
-         it is written once per run rather than once per period, and nothing this\n\
-         produces belongs on the device's flash.\n\
+         `off` always releases: wherever the machine is, torque comes off. Every servo on\n\
+         the roster is asked whatever the ones before it answered. The head settles as it\n\
+         goes, so take its weight if it is up. That is the way out of any session, at any\n\
+         moment.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -113,34 +77,13 @@ enum Command {
     Selftest,
     Provision,
     Reboot,
-    Arm,
-    Up,
-    Hold,
-    Stow,
     Off,
-    Yaw,
-    Antennas,
-    Demo,
-    Play,
 }
 
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 12] = [
-        Self::Selftest,
-        Self::Provision,
-        Self::Reboot,
-        Self::Arm,
-        Self::Up,
-        Self::Hold,
-        Self::Stow,
-        Self::Off,
-        Self::Yaw,
-        Self::Antennas,
-        Self::Demo,
-        Self::Play,
-    ];
+    const ALL: [Command; 4] = [Self::Selftest, Self::Provision, Self::Reboot, Self::Off];
 
     /// The command `word` names, or nothing.
     fn parse(word: &str) -> Option<Self> {
@@ -148,15 +91,7 @@ impl Command {
             "selftest" => Self::Selftest,
             "provision" => Self::Provision,
             "reboot" => Self::Reboot,
-            "arm" => Self::Arm,
-            "up" => Self::Up,
-            "hold" => Self::Hold,
-            "stow" => Self::Stow,
             "off" => Self::Off,
-            "yaw" => Self::Yaw,
-            "antennas" => Self::Antennas,
-            "demo" => Self::Demo,
-            "play" => Self::Play,
             _ => return None,
         })
     }
@@ -167,35 +102,19 @@ impl Command {
             Self::Selftest => "selftest",
             Self::Provision => "provision",
             Self::Reboot => "reboot",
-            Self::Arm => "arm",
-            Self::Up => "up",
-            Self::Hold => "hold",
-            Self::Stow => "stow",
             Self::Off => "off",
-            Self::Yaw => "yaw",
-            Self::Antennas => "antennas",
-            Self::Demo => "demo",
-            Self::Play => "play",
         }
     }
 
     /// How many operands this command takes beyond its own name, at most.
     ///
     /// The bound is what a stray word is refused against. A command that needs
-    /// every one of them says so where it reads them — `yaw` without its angle
-    /// is a refusal there, while `reboot` without its servo means all of them.
+    /// every one of them says so where it reads them — `reboot` without its
+    /// servo means all of them.
     fn operands(self) -> usize {
         match self {
-            Self::Selftest
-            | Self::Provision
-            | Self::Arm
-            | Self::Up
-            | Self::Hold
-            | Self::Stow
-            | Self::Off
-            | Self::Demo => 0,
-            Self::Reboot | Self::Yaw | Self::Play => 1,
-            Self::Antennas => 2,
+            Self::Selftest | Self::Provision | Self::Off => 0,
+            Self::Reboot => 1,
         }
     }
 }
@@ -210,43 +129,12 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         bail!("reachy-bench: unknown command `{word}`\n\n{}", usage());
     };
     check_invocation(&args, command)?;
-    let name = command.name();
 
     match command {
         Command::Selftest => selftest(&args),
         Command::Provision => provision(&args),
         Command::Reboot => reboot(&args, optional_id(&args)?),
-        Command::Arm => moving(&args, name, |resolved, port, clock, line| {
-            commands::arm(resolved, port, clock, line)
-        }),
-        Command::Up => moving(&args, name, |resolved, port, clock, line| {
-            commands::up(resolved, port, clock, line)
-        }),
-        Command::Hold => moving(&args, name, |resolved, port, clock, line| {
-            commands::hold(resolved, port, clock, line)
-        }),
-        Command::Stow => moving(&args, name, |resolved, port, clock, line| {
-            commands::stow(resolved, port, clock, line)
-        }),
-        Command::Off => moving(&args, name, |resolved, port, clock, line| {
-            commands::off(resolved, port, clock, line)
-        }),
-        Command::Yaw => {
-            let degrees = one_number(&args, "yaw <deg>")?;
-            moving(&args, name, move |resolved, port, clock, line| {
-                commands::yaw(resolved, port, degrees, clock, line)
-            })
-        }
-        Command::Antennas => {
-            let [right, left] = two_numbers(&args, "antennas <right> <left>")?;
-            moving(&args, name, move |resolved, port, clock, line| {
-                commands::antennas(resolved, port, right, left, clock, line)
-            })
-        }
-        Command::Demo => moving(&args, name, |resolved, port, clock, line| {
-            commands::demo(resolved, port, clock, line)
-        }),
-        Command::Play => play(&args),
+        Command::Off => off(&args),
     }
 }
 
@@ -255,9 +143,6 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
-        trace: None,
-        speed: None,
-        during: None,
         operands: Vec::new(),
     };
     let mut argv = argv;
@@ -274,16 +159,6 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         match word.as_str() {
             "--config" => args.config = PathBuf::from(value),
             "--record" => args.record = Some(PathBuf::from(value)),
-            "--trace" => args.trace = Some(PathBuf::from(value)),
-            "--speed" => args.speed = Some(number(&value)?),
-            "--during" => {
-                args.during = Some(BaseMove::parse(&value).with_context(|| {
-                    format!(
-                        "`--during` takes `up` or `stow`, not `{value}`\n\n{}",
-                        usage()
-                    )
-                })?);
-            }
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
@@ -293,9 +168,9 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
 /// Refuse an invocation carrying words this command has no use for.
 ///
 /// Unknown flags are already refused by name, and a stray word is the same kind
-/// of typo: `reachy-bench stow off` would otherwise run `stow`, discard `off`,
-/// and exit success with torque still on — an operator who believes the head is
-/// released ends the session by cutting power.
+/// of typo: `reachy-bench selftest off` would otherwise run the registry,
+/// discard `off`, and exit success with torque wherever it was — an operator who
+/// believes the head is released ends the session by cutting power.
 fn check_invocation(args: &Args, command: Command) -> anyhow::Result<()> {
     let operands = command.operands();
     let name = command.name();
@@ -307,22 +182,6 @@ fn check_invocation(args: &Args, command: Command) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// The one number a command like `yaw` takes.
-fn one_number(args: &Args, shape: &str) -> anyhow::Result<f64> {
-    let [only] = args.operands.as_slice() else {
-        bail!("reachy-bench: {shape} takes one number\n\n{}", usage());
-    };
-    number(only)
-}
-
-/// The two numbers a command like `antennas` takes.
-fn two_numbers(args: &Args, shape: &str) -> anyhow::Result<[f64; 2]> {
-    let [first, second] = args.operands.as_slice() else {
-        bail!("reachy-bench: {shape} takes two numbers\n\n{}", usage());
-    };
-    Ok([number(first)?, number(second)?])
 }
 
 /// The servo a command was pointed at, or nothing for all of them.
@@ -341,24 +200,6 @@ fn optional_id(args: &Args) -> anyhow::Result<Option<u8>> {
     Ok(Some(id))
 }
 
-/// An operand as the number it has to be.
-///
-/// Finite, because everything downstream of a commanded angle refuses a value
-/// nothing can place — and refusing it here says which word on the command line
-/// was wrong.
-fn number(word: &str) -> anyhow::Result<f64> {
-    let value: f64 = word
-        .parse()
-        .with_context(|| format!("`{word}` is not a number\n\n{}", usage()))?;
-    if !value.is_finite() {
-        bail!(
-            "reachy-bench: `{word}` is not a finite number\n\n{}",
-            usage()
-        );
-    }
-    Ok(value)
-}
-
 fn record_path(args: &Args) -> PathBuf {
     args.record
         .clone()
@@ -369,8 +210,7 @@ fn record_path(args: &Args) -> PathBuf {
 ///
 /// The record is written whether the run passed or not — a failing run is
 /// exactly the evidence a bring-up wants kept — and the exit code is the
-/// verdict. Nothing that moves the machine runs against a record short of a
-/// pass.
+/// verdict.
 fn selftest(args: &Args) -> anyhow::Result<()> {
     let cfg = config::load(&args.config)?;
     let registry = Registry::from_config(&cfg)?;
@@ -411,233 +251,90 @@ where
             .map(|case| format!("{case} ({})", record.outcome(*case)))
             .collect();
         bail!(
-            "reachy-bench: the self-test did not pass — {}. Nothing that moves the machine may \
-             be run against this record.",
+            "reachy-bench: the self-test did not pass — {}.",
             short.join(", ")
         );
     }
     Ok(())
 }
 
-/// Write the antennas' operating mode.
+/// The roster and the bus timing a bare-bus command runs on.
 ///
-/// Not behind the datum gate, and deliberately: this moves nothing, so it needs
-/// no envelope, no kinematics and no torque, and reads the roster and the bus
-/// timing straight out of the file.
-fn provision(args: &Args) -> anyhow::Result<()> {
+/// All three of them need exactly this and nothing more: no envelope, no
+/// geometry, no datum — none of them converts an angle. Read before any port is
+/// opened, so a refusal costs the machine nothing.
+fn bare_config(args: &Args) -> anyhow::Result<(ServoMap, reachy_bus::BusTiming, String)> {
     let cfg = config::load(&args.config)?;
     let map = ServoMap::new(cfg.servo_ids()?);
     let timing = cfg.bus_timing()?;
+    Ok((map, timing, cfg.bus.device))
+}
+
+/// Open the port a bare-bus command runs over.
+fn bare_port(device: &str, baud: u32) -> anyhow::Result<SerialBusPort> {
+    SerialBusPort::open(device, baud).with_context(|| format!("opening {device}"))
+}
+
+/// What a bare-bus command's refusal reads as.
+fn refused(command: &str, error: BareError) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!("`{command}`"))
+}
+
+/// Write the antennas' operating mode.
+///
+/// Not gated on anything: this moves nothing, so it needs no envelope, no
+/// kinematics and no torque, and reads the roster and the bus timing straight
+/// out of the file.
+fn provision(args: &Args) -> anyhow::Result<()> {
+    let (map, timing, device) = bare_config(args)?;
 
     println!(
-        "provision over {} at {} baud. This writes one non-volatile register on the two \
+        "provision over {device} at {} baud. This writes one non-volatile register on the two \
          antenna servos and moves nothing.\n\
          Torque must be off on both — release it with `off`, which releases wherever \
          the machine is, and take the head's weight first.",
-        cfg.bus.device, timing.baud
+        timing.baud
     );
 
-    let port = SerialBusPort::open(&cfg.bus.device, timing.baud)
-        .with_context(|| format!("opening {}", cfg.bus.device))?;
-
-    commands::provision(&map, timing, port, &mut |line| println!("{line}"))
-        .map_err(|error| anyhow::Error::new(error).context("`provision`"))
+    let port = bare_port(&device, timing.baud)?;
+    bare::provision(&map, timing, port, &mut |line| println!("{line}"))
+        .map_err(|error| refused("provision", error))
 }
 
 /// Restart the servos and report what they come back holding.
 ///
-/// Not behind the datum gate, and deliberately: a reboot commands no angle, so
-/// it needs no conversion, no envelope and no kinematics — only the roster and
-/// the bus timing. It is also a de-torque, and nothing gates a de-torque.
+/// Not gated on anything: a reboot commands no angle, so it needs no conversion,
+/// no envelope and no kinematics — only the roster and the bus timing. It is
+/// also a de-torque, and nothing gates a de-torque.
 fn reboot(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
-    let cfg = config::load(&args.config)?;
-    let map = ServoMap::new(cfg.servo_ids()?);
-    let timing = cfg.bus_timing()?;
+    let (map, timing, device) = bare_config(args)?;
 
     // The header only: what a reboot costs is said once, by the command itself,
     // where every caller of it hears the same words.
-    println!("reboot over {} at {} baud.", cfg.bus.device, timing.baud);
+    println!("reboot over {device} at {} baud.", timing.baud);
 
-    let port = SerialBusPort::open(&cfg.bus.device, timing.baud)
-        .with_context(|| format!("opening {}", cfg.bus.device))?;
+    let port = bare_port(&device, timing.baud)?;
     let mut clock = MonotonicClock::new();
 
-    commands::reboot(&map, timing, port, target, &mut clock, &mut |line| {
+    bare::reboot(&map, timing, port, target, &mut clock, &mut |line| {
         println!("{line}")
     })
-    .map_err(|error| anyhow::Error::new(error).context("`reboot`"))
+    .map_err(|error| refused("reboot", error))
 }
 
-/// What every command that touches a servo says before it does.
+/// Write torque off on every servo.
 ///
-/// It describes the machine that ships, the way out included: an operator
-/// reading this in the middle of a session is entitled to find the release that
-/// works from anywhere, rather than concluding that cutting power is the only
-/// way to end it.
-fn preamble(command: &str, device: &str, baud: u32) -> String {
-    format!(
-        "{command} over {device} at {baud} baud. Every command but `selftest`, `provision`, \
-         `reboot` and `off` verifies the nine servos, measures where each one is standing, \
-         pins it there and enables torque — which holds it where it stands — before it moves anything; a leg \
-         outside its travel window is pulled to the nearer bound.\n\
-         `off` always releases: wherever the machine is, torque comes off and where it was is \
-         reported. A move that faults releases too, immediately and without measuring. The head \
-         settles as it goes, so take its weight if it is up. That is the way out of any session, \
-         at any point — no session needs to end by cutting power."
-    )
-}
+/// Not gated on anything, and that is the whole point: this is a de-torque, so
+/// where the machine is standing, what a registry said about it, and whether a
+/// datum was ever recorded all decide nothing here.
+fn off(args: &Args) -> anyhow::Result<()> {
+    let (map, timing, device) = bare_config(args)?;
 
-/// Run a command that writes to a servo: resolve the configuration, open the
-/// port, and hand both to the command.
-///
-/// The two halves are split apart for the one command with work between them:
-/// `play` reads its motion against the resolved configuration, and does it
-/// before any port is opened.
-fn moving<F>(args: &Args, command: &str, run: F) -> anyhow::Result<()>
-where
-    F: FnOnce(
-        &Resolved,
-        SerialBusPort,
-        &mut MonotonicClock,
-        &mut dyn FnMut(&str),
-    ) -> Result<(), PumpError>,
-{
-    let resolved = commanding_config(args)?;
-    commanding(&resolved, command, run)
-}
+    println!("off over {device} at {} baud.", timing.baud);
 
-/// The configuration a commanding run resolves against, with the command
-/// line's own say folded in.
-///
-/// Resolved before any port is opened, so a refusal costs the machine nothing.
-/// That is where the recorded crank datum is required — without it every
-/// converted angle is a guess, so there is nothing to command with.
-fn commanding_config(args: &Args) -> anyhow::Result<Resolved> {
-    let cfg = config::load(&args.config)?;
-    let mut resolved = resolve_for_commanding(&cfg)?;
-    // The one thing about a commanding run that comes from the command line
-    // rather than the file: which run an operator wants the periods of.
-    resolved.trace = args.trace.clone();
-    Ok(resolved)
-}
-
-/// Open the port and hand the machine to `run`.
-fn commanding<F>(resolved: &Resolved, command: &str, run: F) -> anyhow::Result<()>
-where
-    F: FnOnce(
-        &Resolved,
-        SerialBusPort,
-        &mut MonotonicClock,
-        &mut dyn FnMut(&str),
-    ) -> Result<(), PumpError>,
-{
-    println!(
-        "{}",
-        preamble(command, &resolved.device, resolved.timing.baud)
-    );
-
-    let port = SerialBusPort::open(&resolved.device, resolved.timing.baud)
-        .with_context(|| format!("opening {}", resolved.device))?;
-    let mut clock = MonotonicClock::new();
-
-    run(resolved, port, &mut clock, &mut |line| println!("{line}")).map_err(|error| match error {
-        // A sequence that refused has already said which phase, which servo,
-        // which register and both values. Wrapping that in "the command failed"
-        // would bury the only part worth reading.
-        PumpError::Sequence(refusal) => anyhow::anyhow!("`{command}` stopped at {refusal}"),
-        other => anyhow::Error::new(other).context(format!("`{command}`")),
-    })
-}
-
-/// Play the motion a path names, over the neutral configuration or over a base
-/// transition.
-///
-/// The document is read and the library resolved before the port is opened: a
-/// motion that will not load is an operator's typo, and paying for it with an
-/// engaged machine would raise the head to say so.
-///
-/// The speed is judged in the same order and for the same reason, and against
-/// the global bounds first: a player's clock must be finite and positive, and a
-/// value that is neither reaches the machine as a panic with torque already on
-/// the head, since the player is built on the period the motion first plays.
-fn play(args: &Args) -> anyhow::Result<()> {
-    let [path] = args.operands.as_slice() else {
-        bail!("reachy-bench: play <file> takes one path\n\n{}", usage());
-    };
-    let speed = args.speed.unwrap_or(1.0);
-    if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
-        bail!(
-            "reachy-bench: --speed is played between {MIN_SPEED:.2}x and {MAX_SPEED:.2}x, not \
-             {speed}\n\n{}",
-            usage()
-        );
-    }
-    let resolved = commanding_config(args)?;
-    let motion = load_motion(&resolved, Path::new(path))?;
-    let during = args.during;
-    if speed > motion.max_speed() {
-        bail!(
-            "reachy-bench: {} plays at up to {:.2}x, not {speed:.2}x",
-            motion.name(),
-            motion.max_speed(),
-        );
-    }
-    commanding(&resolved, "play", move |resolved, port, clock, line| {
-        commands::play(resolved, port, &motion, speed, during, clock, line)
-    })
-}
-
-/// The motion a path names, resolved against the library its directory holds.
-///
-/// The whole directory is read rather than the one file, because a sequence
-/// names other documents and a name resolves only against a library holding
-/// them. What is played is the name the named document declares: a path is how
-/// an operator points at a file, and a name is how the rest of the stack —
-/// the wire above all — addresses a motion.
-///
-/// The bounds come off the resolved configuration, so a speed ceiling and a
-/// blend floor are what *this* machine's step bounds and envelope imply. A
-/// document derived against defaults could otherwise be admitted here and
-/// refused every period by the tick.
-fn load_motion(resolved: &Resolved, path: &Path) -> anyhow::Result<Arc<Motion>> {
-    let asked = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let name =
-        document_name(&asked).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
-    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-    let dir = dir.unwrap_or_else(|| Path::new("."));
-
-    // Which files count as documents, and in what order two of them claiming
-    // one name are decided, is `reachy-clips`' rule and not this command's: the
-    // daemon reads its library directory by the same one, so a motion that
-    // plays here is a motion the machine under a script holds.
-    let read = documents(dir).with_context(|| format!("reading {}", dir.display()))?;
-    let mut assets = Vec::new();
-    for (source, text) in read {
-        match text {
-            Ok(text) => assets.push((source, text)),
-            Err(error) => println!("skipping {source}: {error}"),
-        }
-    }
-
-    let limits = ClipLimits::from_motion_config(&resolved.motion);
-    let (library, skips) = Library::load(
-        assets.iter().map(|(source, text)| (source.clone(), text)),
-        &limits,
-    );
-    for skip in &skips {
-        println!("skipped {}: {}", skip.source, skip.error);
-    }
-    for note in library.notes() {
-        println!("note: {note}");
-    }
-    let motion = library.motion(&name).with_context(|| {
-        format!(
-            "{} names {name}, which is not in the library {} loaded",
-            path.display(),
-            dir.display(),
-        )
-    })?;
-    Ok(Arc::clone(motion))
+    let port = bare_port(&device, timing.baud)?;
+    bare::off(&map, timing, port, &mut |line| println!("{line}"))
+        .map_err(|error| refused("off", error))
 }
 
 #[cfg(test)]
@@ -793,22 +490,6 @@ mod tests {
         assert_eq!(record_path(&args), PathBuf::from("/tmp/r"));
     }
 
-    /// Nothing is traced unless a run was asked for it, and the flag is what
-    /// asks.
-    ///
-    /// A trace is diagnostic output an operator wants on a particular run and
-    /// on a filesystem of their choosing, which is why it is a flag and not a
-    /// key in the configuration file the device carries.
-    #[test]
-    fn a_trace_is_written_only_where_a_run_was_told_to_write_one() {
-        let args = parse_args(argv(&[])).expect("no flags is a valid invocation");
-        assert_eq!(args.trace, None);
-
-        let args = parse_args(argv(&["--trace", "/run/reachy-trace.csv"])).expect("it parses");
-        assert_eq!(args.trace, Some(PathBuf::from("/run/reachy-trace.csv")));
-        assert!(usage().contains("--trace"), "{}", usage());
-    }
-
     /// `reboot` on its own means every servo, and `reboot <id>` means that one.
     ///
     /// The two are one command and not two, so the absent operand has to mean
@@ -852,246 +533,6 @@ mod tests {
         assert!(refused.to_string().contains("usage:"), "{refused}");
     }
 
-    /// A command's numbers are the words that are not flags, in the order they
-    /// were given, and they survive being written either side of a flag.
-    #[test]
-    fn the_operands_are_the_words_that_are_not_flags() {
-        let args = parse_args(argv(&["1.5", "--config", "/etc/r.toml", "-2.5"]))
-            .expect("operands may sit either side of a flag");
-        assert_eq!(args.operands, vec!["1.5".to_string(), "-2.5".to_string()]);
-        assert_eq!(
-            two_numbers(&args, "antennas <right> <left>").expect("two numbers"),
-            [1.5, -2.5]
-        );
-    }
-
-    /// A command given the wrong number of operands, a word that is not a
-    /// number, or one nothing can place, refuses before it reads any
-    /// configuration — so the refusal is about the command line and says so.
-    ///
-    /// Each case carries the words its own refusal has to contain: every
-    /// refusal this file prints ends in the usage banner, so the banner alone
-    /// cannot tell an arity refusal from a parse refusal from a refusal raised
-    /// somewhere the case was never meant to reach.
-    #[test]
-    fn a_bad_operand_is_refused_with_the_shape_the_command_takes() {
-        for (words, expected) in [
-            (vec!["yaw"], "takes one number"),
-            (vec!["yaw", "30", "40"], "operand"),
-            (vec!["yaw", "sideways"], "is not a number"),
-            (vec!["yaw", "nan"], "not a finite number"),
-            (vec!["antennas", "1.0"], "takes two numbers"),
-            (vec!["antennas", "1.0", "inf"], "not a finite number"),
-        ] {
-            let refused = dispatch(argv(&words)).expect_err("that is not a valid invocation");
-            let printed = refused.to_string();
-            assert!(printed.contains(expected), "{words:?}: {printed}");
-            assert!(printed.contains("usage:"), "{words:?}: {printed}");
-        }
-    }
-
-    /// `play`'s own flags are read off the command line, and a base transition
-    /// it cannot name is refused there.
-    #[test]
-    fn a_play_invocation_carries_its_speed_and_its_base_transition() {
-        let args = parse_args(argv(&[
-            "clips/nod.json",
-            "--speed",
-            "1.5",
-            "--during",
-            "stow",
-        ]))
-        .expect("a play invocation");
-        assert_eq!(args.operands, vec!["clips/nod.json".to_string()]);
-        assert_eq!(args.speed, Some(1.5));
-        assert_eq!(args.during, Some(BaseMove::Stow));
-
-        let refused = parse_args(argv(&["clips/nod.json", "--during", "sideways"]))
-            .expect_err("there is no such transition");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("`up` or `stow`"), "{printed}");
-
-        let refused = dispatch(argv(&["play"])).expect_err("play needs a file");
-        assert!(
-            format!("{refused:#}").contains("takes one path"),
-            "{refused:#}"
-        );
-    }
-
-    /// The configuration resolves before anything else about a `play` does.
-    #[test]
-    fn a_play_resolves_its_configuration_before_opening_the_port() {
-        let refused = dispatch(argv(&[
-            "play",
-            "/nonexistent/nod.json",
-            "--config",
-            "/nonexistent/reachy-bench.toml",
-        ]))
-        .expect_err("neither file is there");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("configuration"), "{printed}");
-    }
-
-    /// A configuration file a commanding run resolves against: the shipped
-    /// example with a datum recorded, which is the only shape that resolves.
-    fn playable_config() -> PathBuf {
-        let path = scratch_dir("play-config").join("reachy-bench.toml");
-        let text = format!(
-            "{}\n[datum]\ncrank_datum = \"direct\"\nprovenance = \"a test, not a unit\"\n",
-            include_str!("../reachy-bench.example.toml")
-        );
-        fs::write(&path, text).expect("the configuration writes");
-        path
-    }
-
-    /// A directory of its own for a test's files, swept by [`swept`] on the
-    /// passing path as the suite's scratch files are.
-    fn scratch_dir(name: &str) -> PathBuf {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "reachy-bench-{name}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).expect("a scratch directory");
-        path
-    }
-
-    /// Remove the scratch directory a file sits in, on the passing path only:
-    /// a failing test keeps its files, so what it was looking at is still
-    /// there to look at.
-    fn swept(file: &Path) {
-        let dir = file.parent().expect("a scratch file has a directory");
-        fs::remove_dir_all(dir).expect("the scratch directory goes away");
-    }
-
-    /// An antennas-only clip document written into a directory of its own, and
-    /// the path of the document.
-    ///
-    /// The frames swing further than one period's step bound admits, so the
-    /// ceiling the loader derives is below 1x and a speed above it is a refusal
-    /// this can ask for.
-    fn playable_clip(name: &str, max_speed: f64) -> PathBuf {
-        let dir = scratch_dir("play-clips");
-        let path = dir.join("wiggle.json");
-        let track: Vec<String> = (0..8)
-            .map(|index| format!("{{\"antennas\": [{}, 0.0]}}", f64::from(index % 2) * 0.6))
-            .collect();
-        fs::write(
-            &path,
-            format!(
-                r#"{{"version": 1, "kind": "clip", "name": "{name}",
-                     "channels": ["antennas"], "frame_hz": 50.0,
-                     "max_speed": {max_speed}, "frames": [{}]}}"#,
-                track.join(",")
-            ),
-        )
-        .expect("the document writes");
-        path
-    }
-
-    /// A motion file that is not there is refused, and the refusal names it.
-    ///
-    /// An operator's typo must not cost an engage: raising the head to announce
-    /// that a file is not there is the failure this ordering rules out, and the
-    /// operator has to be told which file it was.
-    #[test]
-    fn a_play_of_a_missing_motion_file_never_reaches_the_machine() {
-        let config = playable_config();
-        let refused = dispatch(argv(&[
-            "play",
-            "/nonexistent/nod.json",
-            "--config",
-            &config.display().to_string(),
-        ]))
-        .expect_err("the motion file is not there");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("/nonexistent/nod.json"), "{printed}");
-        swept(&config);
-    }
-
-    /// A document the directory's library does not hold is refused by name.
-    ///
-    /// A different operator error from a missing file: the file is there but
-    /// the library will not accept it.
-    #[test]
-    fn a_play_of_a_document_the_library_will_not_hold_is_refused_by_name() {
-        let config = playable_config();
-        let path = playable_clip("bench/wiggle", 1.0);
-        // A frame rate below the loader's floor: the document is named but
-        // the library will not hold it.
-        let text = fs::read_to_string(&path)
-            .expect("the document reads")
-            .replace("\"frame_hz\": 50.0", "\"frame_hz\": 40.0");
-        fs::write(&path, text).expect("the document writes");
-
-        let refused = dispatch(argv(&[
-            "play",
-            &path.display().to_string(),
-            "--config",
-            &config.display().to_string(),
-        ]))
-        .expect_err("the library refused the document");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("not in the library"), "{printed}");
-        assert!(printed.contains("bench/wiggle"), "{printed}");
-        swept(&config);
-        swept(&path);
-    }
-
-    /// A speed above the document's own ceiling is refused before the port is
-    /// opened, and the refusal names the motion and the ceiling.
-    #[test]
-    fn a_play_above_the_documents_ceiling_is_refused_with_the_ceiling() {
-        let config = playable_config();
-        let path = playable_clip("bench/wiggle", 1.0);
-
-        let refused = dispatch(argv(&[
-            "play",
-            &path.display().to_string(),
-            "--speed",
-            "2.0",
-            "--config",
-            &config.display().to_string(),
-        ]))
-        .expect_err("the document does not play that fast");
-        let printed = format!("{refused:#}");
-        assert!(printed.contains("bench/wiggle"), "{printed}");
-        assert!(printed.contains("plays at up to"), "{printed}");
-        swept(&config);
-        swept(&path);
-    }
-
-    /// A speed outside the global bounds is refused ahead of the
-    /// configuration, and so ahead of everything else.
-    ///
-    /// The ceiling check alone admits zero and every negative — neither is
-    /// above any ceiling — and a player's clock must be finite and positive. The
-    /// player is built on the period the motion first plays, by which time the
-    /// head has been raised to neutral, so this refusal is the difference
-    /// between a usage error and a process that dies with torque on. Asked here
-    /// with a configuration that is not there: a speed judged second would be
-    /// answered with the configuration's refusal instead of its own.
-    #[test]
-    fn a_play_outside_the_global_speed_bounds_is_refused_ahead_of_everything() {
-        for speed in ["0", "-1", "0.01", "2.5"] {
-            let refused = dispatch(argv(&[
-                "play",
-                "/nonexistent/nod.json",
-                "--speed",
-                speed,
-                "--config",
-                "/nonexistent/reachy-bench.toml",
-            ]))
-            .expect_err("that is not a speed this plays at");
-            let printed = format!("{refused:#}");
-            assert!(
-                printed.contains("--speed is played between"),
-                "{speed}: {printed}"
-            );
-        }
-    }
-
     /// Every command answers to the word it prints, and the usage banner lists
     /// all of them.
     ///
@@ -1110,23 +551,17 @@ mod tests {
 
     /// A word a command has no use for is refused rather than discarded.
     ///
-    /// `stow off` is the case that matters: run as `stow`, it would leave
-    /// torque on and exit success, and an operator who read that as a release
-    /// ends the session by cutting power with the head up.
+    /// `selftest off` is the case that matters: run as `selftest`, it would
+    /// leave torque wherever it was and exit success, and an operator who read
+    /// that as a release ends the session by cutting power with the head up.
     #[test]
     fn a_stray_operand_is_refused_rather_than_discarded() {
         for words in [
             vec!["selftest", "extra"],
+            vec!["selftest", "off"],
             vec!["provision", "now"],
             vec!["reboot", "11", "12"],
-            vec!["arm", "up"],
-            vec!["up", "now"],
-            vec!["hold", "10"],
-            vec!["stow", "off"],
             vec!["off", "please"],
-            vec!["demo", "twice"],
-            vec!["yaw", "10", "20"],
-            vec!["antennas", "0.5", "-0.5", "0.0"],
         ] {
             let refused = dispatch(argv(&words)).expect_err("that word means nothing here");
             let printed = refused.to_string();
@@ -1140,17 +575,7 @@ mod tests {
     /// than silently accepted.
     #[test]
     fn there_is_no_flag_authorising_a_release() {
-        for command in [
-            "selftest",
-            "provision",
-            "reboot",
-            "arm",
-            "up",
-            "hold",
-            "stow",
-            "off",
-            "demo",
-        ] {
+        for command in ["selftest", "provision", "reboot", "off"] {
             let refused =
                 dispatch(argv(&[command, "--drop-head"])).expect_err("no such flag exists");
             let printed = refused.to_string();
@@ -1168,77 +593,76 @@ mod tests {
         assert!(refused.to_string().contains("wiggle"), "{refused}");
     }
 
+    /// The commands this tool no longer has are refused by name rather than
+    /// silently reinterpreted.
+    ///
+    /// An operator with a script from the motion era, or a habit from it, must
+    /// be told the command is gone. A `stow` that fell through to anything at
+    /// all would be a command they did not ask for on a machine they are
+    /// standing next to.
+    #[test]
+    fn the_retired_motion_commands_are_gone_by_name() {
+        for word in [
+            "arm", "up", "hold", "stow", "yaw", "antennas", "demo", "play",
+        ] {
+            let refused = dispatch(argv(&[word])).expect_err("that command is retired");
+            let printed = refused.to_string();
+            assert!(printed.contains(word), "{word}: {printed}");
+            assert!(printed.contains("unknown command"), "{word}: {printed}");
+        }
+    }
+
     /// The way out of a session is in the text an operator has in front of them
     /// when they need it.
     ///
     /// An operator holding a head up with one hand does not read the source:
-    /// they read the banner the last command printed, and if it omits the
-    /// release that works from anywhere, that is a release they do not know
-    /// about.
+    /// they read the banner, and if it omits the release that works from
+    /// anywhere, that is a release they do not know about.
     #[test]
     fn the_operator_text_names_the_release_that_works_from_anywhere() {
-        for text in [usage(), preamble("stow", "/dev/ttyAMA3", 1_000_000)] {
-            assert!(text.contains("`off`"), "{text}");
-            assert!(
-                text.contains("always releases") && text.contains("wherever the machine is"),
-                "the release is named, but not that it works from anywhere: {text}"
-            );
-            assert!(
-                text.contains("weight"),
-                "the release is named, but not what it costs: {text}"
-            );
-            assert!(
-                !text.contains("--drop-head"),
-                "a flag that no longer exists: {text}"
-            );
-        }
-
-        let printed = preamble("up", "/dev/ttyAMA3", 1_000_000);
+        let text = usage();
+        assert!(text.contains("`off`"), "{text}");
         assert!(
-            !printed.contains("only at stow"),
-            "the banner still says stow is the only release: {printed}"
+            text.contains("always releases") && text.contains("wherever the machine is"),
+            "the release is named, but not that it works from anywhere: {text}"
+        );
+        assert!(
+            text.contains("weight"),
+            "the release is named, but not what it costs: {text}"
+        );
+        assert!(
+            !text.contains("--drop-head"),
+            "a flag that no longer exists: {text}"
         );
     }
 
-    /// The commands that enable torque are the ones the operator text says
-    /// enable torque.
-    ///
-    /// Both banners say which commands arm, and an operator reads that as what
-    /// a command is about to do to a machine they are standing next to. A
-    /// read-only command listed among the arming ones is the same defect as a
-    /// missing release: text that describes a different machine from the one
-    /// that ships.
+    /// The banner does not offer a coordinated move, because this tool has
+    /// none: a text describing commands that left the build is a text
+    /// describing a different machine from the one that ships.
     #[test]
-    fn the_operator_text_excepts_every_command_that_does_not_arm() {
-        // `selftest` reads registers, `provision` writes one non-volatile
-        // register, `reboot` restarts the servos and `off` releases; none of
-        // the four arms.
-        let excepted = "Every command but `selftest`, `provision`, `reboot` and `off`";
-        for text in [usage(), preamble("up", "/dev/ttyAMA3", 1_000_000)] {
-            assert!(
-                text.contains(excepted),
-                "a command that arms nothing is claimed to arm: {text}"
-            );
+    fn the_operator_text_offers_no_coordinated_motion() {
+        let text = usage();
+        // The command's own listing shape, not the bare word: `antennas`
+        // still appears in what `provision` writes.
+        for gone in [
+            "arm", "up", "hold", "stow", "yaw", "antennas", "demo", "play",
+        ] {
+            let listed = format!("\x20 {gone}");
+            assert!(!text.contains(&listed), "`{gone}` is still offered: {text}");
         }
+        assert!(text.contains("Nothing here commands an angle"), "{text}");
     }
 
-    /// Every command that writes to a servo goes through the same gates, so a
-    /// missing configuration stops each of them in the same place — before any
-    /// port is opened.
+    /// Every command that writes to a servo reads its configuration first, so a
+    /// missing one stops each of them in the same place — before any port is
+    /// opened.
     #[test]
-    fn every_writing_command_is_gated_before_the_port() {
+    fn every_writing_command_reads_its_configuration_before_the_port() {
         for words in [
             vec!["provision"],
             vec!["reboot"],
             vec!["reboot", "11"],
-            vec!["arm"],
-            vec!["up"],
-            vec!["hold"],
-            vec!["stow"],
             vec!["off"],
-            vec!["yaw", "10"],
-            vec!["antennas", "0.5", "-0.5"],
-            vec!["demo"],
         ] {
             let refused = dispatch(argv(
                 &[&words[..], &["--config", "/nonexistent/reachy-bench.toml"]].concat(),
@@ -1247,55 +671,6 @@ mod tests {
             let printed = format!("{refused:#}");
             assert!(printed.contains("configuration"), "{words:?}: {printed}");
         }
-    }
-
-    /// The shipped example, which carries no datum table, and the same file with
-    /// one recorded.
-    fn example_config(datum: bool) -> reachy_bench::config::BenchConfig {
-        let mut cfg = reachy_bench::config::parse(include_str!("../reachy-bench.example.toml"))
-            .expect("the shipped example parses");
-        if datum {
-            cfg.datum = Some(reachy_bench::config::DatumSection {
-                crank_datum: reachy_bench::config::DatumSetting::Direct,
-                provenance: "a test, not a unit".to_string(),
-            });
-        }
-        cfg
-    }
-
-    /// Without a crank datum written into the configuration, arming refuses —
-    /// before it opens anything. Every converted angle rests on it, so there is
-    /// nothing to command with.
-    #[test]
-    fn arming_refuses_without_a_recorded_datum() {
-        let refused = resolve_for_commanding(&example_config(false))
-            .expect_err("the shipped example resolves no datum");
-        assert!(refused.to_string().contains("datum"), "{refused}");
-    }
-
-    /// A self-test record is not consulted, present or absent, passing or not.
-    /// The registry is a diagnostic and a regression guard; the arm sequence
-    /// re-establishes on its own everything a record could assert.
-    #[test]
-    fn no_self_test_record_is_needed_to_command_the_machine() {
-        // Nothing at this path, and nothing looks for it.
-        let empty = scratch_path();
-        assert!(!empty.exists());
-
-        // A record that passed nothing, sitting where one would be looked for,
-        // changes nothing either.
-        let path = scratch_path();
-        Report::new()
-            .into_record(1_754_000_000)
-            .save(&path)
-            .expect("the scratch record is written");
-        let cfg = example_config(true);
-        let resolved = resolve_for_commanding(&cfg);
-        std::fs::remove_file(&path).expect("the scratch record is removed");
-
-        let resolved = resolved.expect("a resolved datum is the whole of it");
-        assert_eq!(resolved.device, cfg.bus.device);
-        assert_eq!(resolved.timing.baud, cfg.bus.baud);
     }
 
     /// No command, and an unknown one, are refused rather than treated as a

@@ -1,11 +1,14 @@
 """The Rust half of a `.clk` module's build, as one macro.
 
-A copy of rusty-cogs' `bazel/rust_clk.bzl` at rev 4e8f8e8, the revision
+A copy of rusty-cogs' `bazel/rust_clk.bzl` at rev 3145413, the revision
 MODULE.bazel pins. It is copied rather than `load()`ed because `REPO` below is a
 constant of the file and heads every crate name the generator derives: loading
 theirs would compile this repo's modules under crate names spelling their
 repository, which no importer here writes. On a pin bump, re-copy this file and
-re-apply the four label and constant changes named below.
+re-apply the five label and constant changes named below -- of which
+`validated_naming`'s default reading `VALIDATED_NAMING` is one: the policy is a
+property of this repo's whole module web, so it is stated once here rather than
+per target.
 
 TODO(rusty-cogs-macro-parameters)
 
@@ -22,6 +25,7 @@ crate the author's cog code can depend on without pulling the FFI in.
 """
 
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
+load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
 
 # What the C++ standard library is called on the link line of anything that pulls
 # the test shim in. A `rust_test` is linked by rustc, which passes
@@ -166,6 +170,7 @@ def rust_clk_module(
         deps = [],
         cog_impl = None,
         test_wrappers = False,
+        validated_naming = VALIDATED_NAMING,
         visibility = ["//visibility:public"]):
     """Generates Rust for one `.clk` module and declares the crates over it.
 
@@ -196,6 +201,23 @@ def rust_clk_module(
             `<stem>_cc_test.{cc,hh,inl}` outs, because the wrapper is a C ABI
             over the facade that generation emits. Without them the missing
             `:<stem>_cc_test` target fails analysis before anything compiles.
+        validated_naming: Which surface holds each type's short name. Defaults
+            to `VALIDATED_NAMING`, the one policy this repo's whole module web
+            is generated under, so a module that names none is born on the web's.
+            `suffixed` leaves it on the open wire types and
+            suffixes the validated ones `Valid`/`Known`. `flipped` is the
+            eventual arrangement: the validated types hold the short name and the
+            open ones are suffixed `Wire`. `wire-suffixed` is the migration step
+            between them, where both surfaces are suffixed and no type holds the
+            plain name. Migrate in two sweeps, each landing green before the
+            next: `suffixed` to `wire-suffixed` breaks every open reference and
+            no validated one (`Foo` becomes `FooWire`); `wire-suffixed` to
+            `flipped` breaks every validated reference and no open one
+            (`FooValid` becomes `Foo`, `BarKnown` becomes `Bar`). Every
+            `rust_clk_module` in one dependency web moves together on each sweep:
+            an importing module re-derives an imported type's name under its own
+            policy, so a web split across policies fails at rustc, in the
+            consumer, naming the identifier it cannot find.
         visibility: Visibility of the generated crate. The entry archive is not
             published: it is linked by the shim's `cc_library` in this package
             and means nothing anywhere else. The test crate follows this
@@ -258,6 +280,7 @@ def rust_clk_module(
         # What the libraries below are declared as. The generator derives the
         # same name from the module and fails the action if the two disagree.
         "--crate-name %s" % crate,
+        "--validated-naming %s" % validated_naming,
         # The execution root, which is where a Bazel action's paths are relative
         # to and what the upstream compiler's own path resolution assumes.
         "--root .",

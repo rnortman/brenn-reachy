@@ -2,6 +2,8 @@ load("@clockwork//clockwork:rules.bzl", "clk")
 load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
+load("//bazel:clk_schema.bzl", "clk_module_deps")
 load("//bazel:rust_clk.bzl", "rust_clk_module")
 load("//bazel:scenario_suite.bzl", "scenario_suite")
 
@@ -37,28 +39,112 @@ SIM_PUBLISHER_CONFIG = ":system_sim.motion_sim.MotionCpu_channel_publisher_confi
 
 SIM_LOGGER_CONFIG = ":system_sim.motion_sim.MotionCpu_event_logger_config.tachyon"
 
+# The two the checkers are handed as well, to assert the run was configured the
+# way the scenario is written for. The clip library is not among them: it rides
+# in the executable's own runfiles, and no checker has anything to say about it.
 SIM_CONFIGS = [
     "mover_params.textproto",
     "sim_params.textproto",
 ]
 
+# What each `.clk` module here reaches, transitively, written once per module and
+# expanded by `clk_module_deps` into the four spellings a dependent target names
+# it in -- the C++ library, the `.clk` compile, the generator's import path and
+# the Rust crate. Each list is what its module imports plus what those imports
+# reach, which is the import graph. The cog modules ride the mover chain:
+# `motion` over `mover`, and `sim` over `motion` plus the plant. `msgs` is the
+# session vocabulary over `session_aux`, and no cog module imports it -- the slot
+# library is its only consumer -- though `session_aux` itself reaches the sim box
+# anyway, under `//driver:health`'s aux report. The two state modules
+# stand outside both -- the estimator's seed and the simulated plant are each
+# imported by one cog module and nothing else -- so each names what it reaches on
+# its own.
+SESSION_AUX_MODULES = [
+    "//hardware/dynamixel:registers",
+    "//motion:bus_txn",
+]
+
+MSGS_MODULES = SESSION_AUX_MODULES + [
+    "schedule",
+    "session_aux",
+    "//geometry:primitives",
+    "//motion:arm_record",
+    "//motion:commission",
+    "//motion:disarm",
+    "//motion:engage",
+    "//motion:faults",
+    "//motion:fk",
+    "//motion:joints",
+    "//motion:poll",
+    "//motion:reports",
+    "//motion:seq",
+    "//motion:servo_health",
+    "//motion:timeline",
+]
+
+# The mover's own chain, which meets the one above only at the cog module: what
+# the mover keeps is the tick's state, the base and the overlay rows, and a
+# schedule fact or two. Nothing the session keeps reaches any of it.
+MOVER_MODULES = [
+    "schedule",
+    "//clips:player",
+    "//geometry:primitives",
+    "//motion:faults",
+    "//motion:fk",
+    "//motion:joints",
+    "//motion:targets",
+    "//motion:tick_state",
+]
+
+POSE_STATE_MODULES = ["//geometry:primitives"]
+
+SIM_STATE_MODULES = [
+    "//driver:gate",
+    "//driver:goal",
+    "//motion:joints",
+]
+
+MOTION_MODULES = MOVER_MODULES + [
+    "config",
+    "mover",
+    "pose_state",
+    "//driver:goal",
+    "//driver:pose",
+]
+
+SIM_MODULES = MOTION_MODULES + [
+    module
+    for module in SIM_STATE_MODULES + SESSION_AUX_MODULES
+    if module not in MOTION_MODULES
+] + [
+    "motion",
+    "session_aux",
+    "sim_state",
+    "//driver:health",
+]
+
 exports_files([
     "config.clk",
     "motion.clk",
+    "mover.clk",
     "msgs.clk",
+    "pose_state.clk",
     # The three-phase driver every scenario's `sh_test` runs, including the
     # harness proof's next door: one invocation of the deterministic runner for
     # the whole repo.
     "scenario_test.sh",
+    "schedule.clk",
+    "session_aux.clk",
     "sim.clk",
+    "sim_state.clk",
     "system_sim.clk",
 ])
 
 # The configs, in a module of their own because they are the only schemas that
 # cross the Protobuf backend -- which is what lets a box bind one to a file of
-# text -- and generation is declared per module. `msgs.clk` cannot cross it: the
-# emitter refuses a negative enumerator, and the tracking-side enum mirroring
-# the library's own has one.
+# text -- and generation is declared per module. Most of the vocabulary cannot
+# cross it: the emitter refuses a negative enumerator, and the tracking-side enum
+# mirroring the library's own has one.
 clk(
     name = "config_clk",
     srcs = ["config.clk"],
@@ -83,20 +169,50 @@ clk(
 rust_clk_module(
     name = "config_clk_rs",
     src = "config.clk",
+    validated_naming = VALIDATED_NAMING,
 )
 
-# Taking an output log apart, for whatever system wrote it: the binding check, a
-# message to an owned value, a carrier to a datagram. Its own crate rather than a
-# module of `scenario`, because the harness proof next door reads its logs the
-# same way and must not depend on this system's schemas to do it.
+# The clip library asset's emitter, run as
+# `bazel run //cogs:gen_clip_config -- --clips ... --out ... --names ...`, which
+# is what `make clip-config` does with this package's own paths. Offline and
+# host-side: it reads clip documents, not hardware.
+rust_binary(
+    name = "gen_clip_config",
+    srcs = ["gen_clip_config.rs"],
+    # The committed asset and the documents it comes from are embedded, so the
+    # drift case below compares a fresh emit against the file without needing
+    # runfiles or a working directory.
+    compile_data = [
+        "clip_library.names.json",
+        "clip_library.textproto",
+    ] + glob(["clips/*.json"]),
+    edition = "2024",
+    deps = [
+        ":config_clk_rs",
+        "//crates/reachy-clips:reachy_clips",
+        "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# A binary's root is its own crate, so the library's test target never sees the
+# argument parsing, the printer, or the drift check against the committed asset.
+rust_test(
+    name = "gen_clip_config_test",
+    size = "small",
+    crate = ":gen_clip_config",
+)
+
+# Taking an output log apart, for whatever system wrote it: the binding check and
+# a message to an owned value. Its own crate rather than a module of `scenario`,
+# because the harness proof next door reads its logs the same way and must not
+# depend on this system's schemas to do it.
 rust_library(
     name = "log_read",
     srcs = ["log_read.rs"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
-        "//cogs/upstream:var_packet_clk_rs",
-        "//crates/reachy-wire:reachy_wire",
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -119,22 +235,14 @@ clk(
         "motion_clk_cc_test.hh",
         "motion_clk_cc_test.inl",
     ],
-    cpp_deps = [
-        ":config_clk_cc",
-        ":msgs_clk_cc",
-        "@clockwork//clockwork/io:var_packet_clk_cc",
-    ],
+    cpp_deps = clk_module_deps(MOTION_MODULES).cpp,
     generate = [
         "cpp",
         "cpp_cog",
         "cpp_test_cog",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-        ":config_clk",
-        ":msgs_clk",
-        "@clockwork//clockwork/io:var_packet_clk",
-    ],
+    deps = clk_module_deps(MOTION_MODULES).clk,
 )
 
 # Must be named `motion_clk_cc_impl`: the generated `_cc` library depends on
@@ -155,17 +263,10 @@ rust_clk_module(
     name = "motion_clk_rs",
     src = "motion.clk",
     cog_impl = ":motion_cogs",
-    imports = [
-        "config.clk",
-        "msgs.clk",
-        "@clockwork//clockwork/io:var_packet.clk",
-    ],
+    imports = clk_module_deps(MOTION_MODULES).imports,
     test_wrappers = True,
-    deps = [
-        ":config_clk_rs",
-        ":msgs_clk_rs",
-        "//cogs/upstream:var_packet_clk_rs",
-    ],
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(MOTION_MODULES).rs,
 )
 
 rust_test(
@@ -176,12 +277,14 @@ rust_test(
     deps = [
         ":config_clk_rs",
         ":motion_clk_rs_test",
-        ":motion_slots",
-        ":msgs_clk_rs",
-        "//cogs/upstream:var_packet_clk_rs",
+        ":schedule_clk_rs",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:goal_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:tick_state_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -192,12 +295,17 @@ rust_library(
     srcs = ["motion_cogs.rs"],
     edition = "2024",
     deps = [
+        ":config_clk_rs",
         ":motion_clk_rs",
         ":motion_slots",
-        ":msgs_clk_rs",
+        ":mover_clk_rs",
+        ":pose_state_clk_rs",
+        ":schedule_clk_rs",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -223,26 +331,24 @@ rust_test(
     edition = "2024",
     deps = [
         ":motion_slots",
-        ":msgs_clk_rs",
-        "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "@brenn_reachy_crates//:nalgebra",
-        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:tick_state_clk_rs",
     ],
 )
 
-# The one place a motion value meets a schema field. Its own crate rather than a
-# module of the cog bodies, because the cogs' tests and the scenario checkers
-# read the same fields and must read them the same way.
+# The boundary refusal for a set of servos, and the run-totals macro. Its own
+# crate rather than a module of the cog bodies, because the cogs, their tests and
+# the scenario checkers all ask the same question of a raw set of bits and must
+# answer it the same way.
 rust_library(
     name = "motion_slots",
     srcs = ["motion_slots.rs"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
-        ":msgs_clk_rs",
-        "//crates/reachy-motion:reachy_motion",
-        "@brenn_reachy_crates//:nalgebra",
+        "//motion:joints_clk_rs",
         "@brenn_reachy_crates//:thiserror",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -269,6 +375,33 @@ merge_simplelaunch_config(
     ],
 )
 
+# What the mover cog keeps between executions, in a module of its own: the
+# tick's state, the base it composes over, and the overlay rows. A schedule edit
+# and a tick-state edit are different subjects and neither should rebuild the
+# other's consumers, which is why this is a module of its own.
+clk(
+    name = "mover_clk",
+    srcs = ["mover.clk"],
+    outs = [
+        "mover_clk_cc.cc",
+        "mover_clk_cc.hh",
+        "mover_clk_cc.inl",
+    ],
+    cpp_deps = clk_module_deps(MOVER_MODULES).cpp,
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(MOVER_MODULES).clk,
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "mover_clk_rs",
+    src = "mover.clk",
+    imports = clk_module_deps(MOVER_MODULES).imports,
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(MOVER_MODULES).rs,
+)
+
 # A module of its own because a cog member's type is an interface instantiation
 # and the compiler resolves one only against a module the cog's module imports.
 clk(
@@ -279,14 +412,83 @@ clk(
         "msgs_clk_cc.hh",
         "msgs_clk_cc.inl",
     ],
+    cpp_deps = clk_module_deps(MSGS_MODULES).cpp,
     generate = ["cpp"],
     visibility = ["//visibility:public"],
+    deps = clk_module_deps(MSGS_MODULES).clk,
 )
 
 # No `cog_impl`: the module declares no cogs.
 rust_clk_module(
     name = "msgs_clk_rs",
     src = "msgs.clk",
+    imports = clk_module_deps(MSGS_MODULES).imports,
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(MSGS_MODULES).rs,
+)
+
+# The overlay layer of the decision tick: the window screen, the players, and the
+# base a composed setpoint rides on. Its own crate rather than a module of the cog
+# bodies, because the cog and its cases read the same player rows and must read
+# them the same way.
+rust_library(
+    name = "overlay",
+    srcs = ["overlay.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":mover_clk_rs",
+        ":schedule_clk_rs",
+        "//clips:player_clk_rs",
+        "//crates/reachy-clips:reachy_clips",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:thiserror",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# In-crate because half of what is under test is private: the rows of the layer,
+# and the delta crossing a player's frozen frame goes through.
+rust_test(
+    name = "overlay_test",
+    size = "small",
+    crate = ":overlay",
+    # Only the cases need these: a fixture clip is authored as a document and
+    # loaded the way the emitter loads one, so what plays is a real track, and
+    # the refusal cases stamp an undeclared discriminant into the base's own
+    # move, which is the wire form of the seed's vocabulary.
+    deps = [
+        ":config_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//motion:tick_state_clk_rs",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# What the pose estimator keeps between samples, in a module of its own: the
+# motion box imports six fields, not the simulated plant.
+clk(
+    name = "pose_state_clk",
+    srcs = ["pose_state.clk"],
+    outs = [
+        "pose_state_clk_cc.cc",
+        "pose_state_clk_cc.hh",
+        "pose_state_clk_cc.inl",
+    ],
+    cpp_deps = clk_module_deps(POSE_STATE_MODULES).cpp,
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(POSE_STATE_MODULES).clk,
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "pose_state_clk_rs",
+    src = "pose_state.clk",
+    imports = clk_module_deps(POSE_STATE_MODULES).imports,
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(POSE_STATE_MODULES).rs,
 )
 
 # S1, raise-hold-stow, over the real system: three cogs, seven channels, two
@@ -306,7 +508,8 @@ scenario_suite(
     log_writer_config = SIM_LOGGER_CONFIG,
     process_description = SIM_PROCESS,
     scenario_deps = [
-        ":msgs_clk_rs",
+        ":schedule_clk_rs",
+        "//motion:joints_clk_rs",
     ],
 )
 
@@ -315,20 +518,24 @@ scenario_suite(
 scenario_suite(
     name = "s2",
     author_deps = [
-        ":msgs_clk_rs",
+        ":sim_state_clk_rs",
+        "//motion:joints_clk_rs",
     ],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
-        ":msgs_clk_rs",
+        ":sim_state_clk_rs",
+        "//motion:faults_clk_rs",
         "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
     log_writer_config = SIM_LOGGER_CONFIG,
     process_description = SIM_PROCESS,
     scenario_deps = [
-        ":msgs_clk_rs",
+        ":schedule_clk_rs",
         "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
     ],
 )
 
@@ -338,7 +545,7 @@ scenario_suite(
     author_deps = [],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:health_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
@@ -354,17 +561,21 @@ scenario_suite(
     author_deps = [],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
-        ":msgs_clk_rs",
+        ":motion_slots",
+        ":sim_state_clk_rs",
+        "//motion:faults_clk_rs",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:health_clk_rs",
+        "//motion:joints_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
     log_writer_config = SIM_LOGGER_CONFIG,
     process_description = SIM_PROCESS,
     scenario_deps = [
-        ":msgs_clk_rs",
+        ":schedule_clk_rs",
         "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
     ],
 )
 
@@ -385,7 +596,8 @@ scenario_suite(
     log_writer_config = SIM_LOGGER_CONFIG,
     process_description = SIM_PROCESS,
     scenario_deps = [
-        ":msgs_clk_rs",
+        ":schedule_clk_rs",
+        "//motion:joints_clk_rs",
     ],
 )
 
@@ -406,13 +618,108 @@ rust_library(
     deps = [
         ":log_read",
         ":motion_slots",
-        ":msgs_clk_rs",
-        "//cogs/upstream:var_packet_clk_rs",
+        ":schedule_clk_rs",
+        ":sim_state_clk_rs",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# What a session plans -- the steps it intends and the overlays it plays over
+# them -- written by the session cog and read by the mover and the tick. It
+# imports nothing: a schedule names instants, a clip id and a posture, and none
+# of those is another module's type.
+clk(
+    name = "schedule_clk",
+    srcs = ["schedule.clk"],
+    outs = [
+        "schedule_clk_cc.cc",
+        "schedule_clk_cc.hh",
+        "schedule_clk_cc.inl",
+    ],
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "schedule_clk_rs",
+    src = "schedule.clk",
+    validated_naming = VALIDATED_NAMING,
+)
+
+# The session's own aux bookkeeping, in a module of its own: what a transaction
+# is and what shape a register's value has are the packages below this one, and
+# the session host is what writes the record.
+clk(
+    name = "session_aux_clk",
+    srcs = ["session_aux.clk"],
+    outs = [
+        "session_aux_clk_cc.cc",
+        "session_aux_clk_cc.hh",
+        "session_aux_clk_cc.inl",
+    ],
+    cpp_deps = clk_module_deps(SESSION_AUX_MODULES).cpp,
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(SESSION_AUX_MODULES).clk,
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "session_aux_clk_rs",
+    src = "session_aux.clk",
+    imports = clk_module_deps(SESSION_AUX_MODULES).imports,
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(SESSION_AUX_MODULES).rs,
+)
+
+rust_test(
+    name = "session_slot_test",
+    size = "small",
+    srcs = ["session_slot_test.rs"],
+    edition = "2024",
+    deps = [
+        ":msgs_clk_rs",
+        ":session_aux_clk_rs",
+        ":session_slots",
+        "//crates/reachy-motion:reachy_motion",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:fk_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:seq_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The report ring the session keeps in its slot: which row a cursor names, and
+# what a cursor pair may say. Its own crate because the cog, its tests and a
+# scenario checker all read the ring and must read it the same way.
+rust_library(
+    name = "session_slots",
+    srcs = ["session_slots.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":msgs_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:faults_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:seq_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@brenn_reachy_crates//:thiserror",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -442,12 +749,7 @@ clk(
         "sim_clk_exe.hh",
         "sim_clk_exe.inl",
     ],
-    cpp_deps = [
-        ":config_clk_cc",
-        ":motion_clk_cc",
-        ":msgs_clk_cc",
-        "@clockwork//clockwork/io:var_packet_clk_cc",
-    ],
+    cpp_deps = clk_module_deps(SIM_MODULES).cpp,
     cpp_exe_deps = [
         # The two configs arrive as protobuf text, so the executable carries the
         # generated protobuf messages and the conversions into the messages the
@@ -459,6 +761,7 @@ clk(
     # Read by path at process setup, relative to the runfiles of whatever runs
     # the executable.
     data = [
+        "clip_library.textproto",
         "mover_params.textproto",
         "sim_params.textproto",
     ],
@@ -469,12 +772,7 @@ clk(
         "cpp_test_cog",
     ],
     visibility = ["//visibility:public"],
-    deps = [
-        ":config_clk",
-        ":motion_clk",
-        ":msgs_clk",
-        "@clockwork//clockwork/io:var_packet_clk",
-    ],
+    deps = clk_module_deps(SIM_MODULES).clk,
 )
 
 # Must be named `sim_clk_cc_impl`: the generated `_cc` library depends on
@@ -495,19 +793,10 @@ rust_clk_module(
     name = "sim_clk_rs",
     src = "sim.clk",
     cog_impl = ":sim_cogs",
-    imports = [
-        "config.clk",
-        "motion.clk",
-        "msgs.clk",
-        "@clockwork//clockwork/io:var_packet.clk",
-    ],
+    imports = clk_module_deps(SIM_MODULES).imports,
     test_wrappers = True,
-    deps = [
-        ":config_clk_rs",
-        ":motion_clk_rs",
-        ":msgs_clk_rs",
-        "//cogs/upstream:var_packet_clk_rs",
-    ],
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(SIM_MODULES).rs,
 )
 
 rust_test(
@@ -517,15 +806,16 @@ rust_test(
     edition = "2024",
     deps = [
         ":config_clk_rs",
-        ":motion_slots",
-        ":msgs_clk_rs",
         ":sim_clk_rs_test",
-        ":sim_slots",
-        "//cogs/upstream:var_packet_clk_rs",
+        ":sim_state_clk_rs",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:gate_clk_rs",
+        "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -535,45 +825,18 @@ rust_library(
     srcs = ["sim_cogs.rs"],
     edition = "2024",
     deps = [
+        ":config_clk_rs",
         ":motion_slots",
-        ":msgs_clk_rs",
         ":sim_clk_rs",
-        ":sim_slots",
+        ":sim_state_clk_rs",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-wire:reachy_wire",
-        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
-    ],
-)
-
-rust_test(
-    name = "sim_slot_test",
-    size = "small",
-    srcs = ["sim_slot_test.rs"],
-    edition = "2024",
-    deps = [
-        ":motion_slots",
-        ":msgs_clk_rs",
-        ":sim_slots",
-        "//crates/reachy-driver:reachy_driver",
-        "//crates/reachy-motion:reachy_motion",
-        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
-    ],
-)
-
-# Its own crate for the same reason `motion_slots` is: the cog, its tests and a
-# scenario checker all read the slot and must read it the same way.
-rust_library(
-    name = "sim_slots",
-    srcs = ["sim_slots.rs"],
-    edition = "2024",
-    visibility = ["//visibility:public"],
-    deps = [
-        ":motion_slots",
-        ":msgs_clk_rs",
-        "//crates/reachy-driver:reachy_driver",
-        "//crates/reachy-motion:reachy_motion",
+        "//driver:gate_clk_rs",
+        "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -582,9 +845,35 @@ rust_library(
 # totals it declares, which only exists in a test build of the crate the totals
 # are declared in.
 rust_test(
-    name = "sim_slots_test",
+    name = "sim_cogs_test",
     size = "small",
-    crate = ":sim_slots",
+    crate = ":sim_cogs",
+)
+
+# The simulated machine, in a module of its own: what a scenario injects and
+# what the modelled plant carries between cycles. Nothing outside this
+# simulator imports it.
+clk(
+    name = "sim_state_clk",
+    srcs = ["sim_state.clk"],
+    outs = [
+        "sim_state_clk_cc.cc",
+        "sim_state_clk_cc.hh",
+        "sim_state_clk_cc.inl",
+    ],
+    cpp_deps = clk_module_deps(SIM_STATE_MODULES).cpp,
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(SIM_STATE_MODULES).clk,
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "sim_state_clk_rs",
+    src = "sim_state.clk",
+    imports = clk_module_deps(SIM_STATE_MODULES).imports,
+    validated_naming = VALIDATED_NAMING,
+    deps = clk_module_deps(SIM_STATE_MODULES).rs,
 )
 
 clk(

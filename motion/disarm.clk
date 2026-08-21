@@ -1,0 +1,150 @@
+// A release, as the slot holds it: which of the two releases is running, where
+// it stands, and what it found on the way.
+//
+// The disarm sequencer writes every declaration here. Nothing in the module
+// gates a torque-off: every field is a report about what the release saw, and
+// the writes go out whatever any of them say.
+//
+// The per-servo grid below is named fields, never a positional array, for the
+// reason the joint vocabulary states: a verdict filed under the wrong row sends
+// somebody to the wrong servo.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::bus_txn;
+use motion::joints;
+use motion::seq;
+
+// Which phase of a release is running.
+//
+// There is no failed phase: nothing in a release refuses, because torque comes
+// off whatever the measurements say. Phases run from one, and zero read as the
+// settle would wait a dwell nobody asked for -- which delays a torque-off, so it
+// is refused instead.
+enum DisarmPhaseKind
+{
+    uuid: 761bc9e2-f861-4efd-a106-07ad445643b2;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No phase. What a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Waiting out the settle between reaching stow and letting go.
+        #1 dwell { underlying_value: 1; }
+        // The nine position reads the stow verdict is made from.
+        #2 verify { underlying_value: 2; }
+        // The nine torque-off writes.
+        #3 release { underlying_value: 3; }
+        // Finished: the next step hands back the summary.
+        #4 complete { underlying_value: 4; }
+    }
+}
+
+// Which of the two releases is running.
+//
+// Numbered from one, so a slot nothing wrote names neither: the difference
+// between the two is whether the machine was looked at before torque came off,
+// and a restore that guessed would file a release that never measured anything
+// as one that measured and found the head at stow.
+enum ReleaseFormKind
+{
+    uuid: 1ad073fd-39dc-44ae-8c10-b254d0004721;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No release. What a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Settle, measure, release.
+        #1 orderly { underlying_value: 1; }
+        // The nine release writes and nothing else.
+        #2 immediate { underlying_value: 2; }
+    }
+}
+
+// Why each joint's position read produced no angle, in bus order.
+//
+// One verdict per servo, and `none` on a row that answered -- which is the
+// ordinary case, so this is mostly empty and says so. Named fields rather than
+// an array, for the reason the head of this file states.
+schema SeqFailures
+{
+    uuid: 9f9a8055-c976-4fe8-a790-2d0bfebb4879;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: seq::SeqFailureSnap;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: seq::SeqFailureSnap;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: seq::SeqFailureSnap;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: seq::SeqFailureSnap;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: seq::SeqFailureSnap;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: seq::SeqFailureSnap;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: seq::SeqFailureSnap;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: seq::SeqFailureSnap;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: seq::SeqFailureSnap;
+    }
+}
+
+// A release, as the numbers a slot holds it between transactions.
+//
+// This is the release's state: the sequencer reads and writes these fields and
+// keeps nothing beside them. Nothing here gates a torque-off -- every field is a
+// report about what the release found on its way, and the writes go out whatever
+// any of them say.
+schema DisarmSnap
+{
+    uuid: a9d2d84d-711e-4a98-ac6d-70ab3c08e045;
+    fields
+    {
+        // Which of the two releases is running, which is what says whether the
+        // measurement fields below describe a failed look or no look at all.
+        // `none` is what an unwritten slot holds.
+        #0 form: ReleaseFormKind;
+
+        // Which phase is running. `none` is what an unwritten slot holds.
+        #1 phase: DisarmPhaseKind;
+
+        // Where that phase's sweep stands. Zero in the settle and the ending,
+        // refused past the sweep's own length.
+        #2 cursor: UInt32;
+
+        // Whether the settle's next step is the wait rather than the first read.
+        #3 dwell_waiting: Bool;
+
+        // The transaction awaiting an answer.
+        #4 pending: bus_txn::BusTxn;
+
+        // The angles measured so far, in bus order, radians. A row whose read
+        // did not land keeps whatever was there, and `unmeasured` is what says
+        // so.
+        #5 present: joints::Joints;
+
+        // How far each measured joint was from its stow angle, radians:
+        // circular on the antennas, linear elsewhere.
+        #6 deviation: joints::Joints;
+
+        // Why each joint's position read produced no angle, and `none` on a row
+        // that answered.
+        #7 unmeasured: SeqFailures;
+
+        // The servos that acknowledged their torque-off write.
+        #8 released: joints::JointFlags;
+
+        // Whether every joint was measured and every one inside the tolerance.
+        #9 at_stow: Bool;
+    }
+}

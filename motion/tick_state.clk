@@ -1,0 +1,331 @@
+// Everything the motion tick carries from one sample to the next, and the
+// vocabularies that key it.
+//
+// A cog keeps no memory of its own between executions: what survives is what a
+// declared slot holds, so the tick's whole state is one schema here, and the
+// enums naming what it is doing sit with it because nothing else names them.
+// The accumulators are the point of the arrangement -- the tracking runs, the
+// miss count and the failed-solve count are the fault detectors themselves, and
+// a tick that rebuilt its state from each sample could never notice anything
+// that takes more than one period to become true.
+//
+// This is the hottest schema in the tree and deliberately the least imported:
+// a matcher on a fault takes `motion/faults.clk`, which does not reach here, so
+// an edit to the tick's state rebuilds the tick and nothing else. Which way a
+// pose solve failed is `motion/fk.clk` for the same reason -- two recorders
+// write it, and neither is the other's.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use geometry::primitives;
+use motion::faults;
+use motion::fk;
+use motion::joints;
+use motion::targets;
+
+// What the motion tick is doing.
+//
+// The mode's payloads are not in here: a moving mode's elapsed time and a
+// faulted one's fault are fields of their own beside this one, keyed by it.
+// Zero names no mode, so a slot nothing wrote does not read as the state the
+// machine happens to be safe in.
+enum MotionMode
+{
+    uuid: a750bd1c-98da-4b75-a917-3d1e5f9e0596;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No mode. What a never-written slot decodes to, and no state the tick
+        // is ever in.
+        #0 none default { underlying_value: 0; }
+
+        // Holding the last commanded setpoint.
+        #1 holding { underlying_value: 1; }
+        // Running a move, whose elapsed time travels beside this.
+        #2 moving { underlying_value: 2; }
+        // Parked on a fault, which travels beside this.
+        #3 faulted { underlying_value: 3; }
+    }
+}
+
+// How a move's normalised time maps onto its normalised progress.
+//
+// The default is the profile the machine actually moves on, which is the one
+// case in this file where the zero value is a real choice rather than an
+// absence: a move with no warp is not a thing, and the tick's own default is
+// the smooth one.
+enum WarpKind
+{
+    uuid: 9d955d91-c922-4cc5-add1-18f28e20ec63;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Smooth in and out, zero velocity at both ends.
+        #0 min_jerk default { underlying_value: 0; }
+        // Constant rate.
+        #1 linear { underlying_value: 1; }
+    }
+}
+
+// Which side of a tracking run's anchor its goal lies on.
+//
+// The value is the direction, so the side below the anchor is the negative one,
+// and the zero is neither side rather than an absence.
+enum TrackingSideKind
+{
+    uuid: ecbd7614-630e-402f-9e79-3b24ec0d4852;
+    options
+    {
+        underlying_type: Int8;
+    }
+    values
+    {
+        // Neither side: the goal sits on the anchor, or is a number nobody can
+        // place.
+        #0 unplaced default { underlying_value: 0; }
+        // Above the anchor -- closing means rising.
+        #1 above { underlying_value: 1; }
+        // Below it -- closing means falling.
+        #2 below { underlying_value: -1; }
+    }
+}
+
+// Which layer judged the servo bus not to be carrying, or that none did.
+//
+// Keys the failure-kind number beside it: a wire failure when a transaction
+// judged it, a sequencer failure when a sequence did.
+enum BusSourceKind
+{
+    uuid: fe0f9e39-94f9-4100-8c2a-bbbb4eeadd61;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Not about the bus, and the failure-kind number means nothing.
+        #0 not_applicable default { underlying_value: 0; }
+        // The move loop's own transaction.
+        #1 transaction { underlying_value: 1; }
+        // A sequencer's verdict. What restores from it names the failure and
+        // the servo and drops the step context, which the slot never held.
+        #2 sequence { underlying_value: 2; }
+    }
+}
+
+// One joint's open run of live ticks past the tracking threshold.
+//
+// The evidence an obstruction is classified from: how far the joint has failed
+// to close on its goal, and for how long.
+schema TrackingStreakSnap
+{
+    uuid: f2d6d29a-87a7-44bf-933a-af86736b3f80;
+    fields
+    {
+        // Whether a run is open at all. Every field below means nothing when
+        // this is false.
+        #0 active: Bool;
+
+        // Where the joint was when this run last restarted, radians.
+        #1 anchor: Float64;
+
+        // Which side of `anchor` the goal lay on then.
+        #2 side: TrackingSideKind;
+
+        // Live ticks since, this one included.
+        #3 count: UInt32;
+    }
+}
+
+// The four values a running move is rebuilt from.
+//
+// A path is not stored sample by sample: these fully determine it, and a
+// trajectory built from them produces the same samples whenever it is built.
+// That is what lets a move survive a slot at all.
+schema TrajectorySeed
+{
+    uuid: 3cf50833-c1d3-41ef-a648-4e488dbe5341;
+    fields
+    {
+        // Whether a move is running. Every field below means nothing when this
+        // is false.
+        #0 present: Bool;
+
+        // The command set the path starts from.
+        #1 start: targets::Targets;
+
+        // The command set it ends at.
+        #2 target: targets::Targets;
+
+        // The head group's clock.
+        #3 dur_head: Duration;
+
+        // The right antenna's clock. The antennas are clocked apart from the
+        // head and from each other, so a move may finish one before another.
+        #4 dur_antenna_right: Duration;
+
+        // The left antenna's clock.
+        #5 dur_antenna_left: Duration;
+
+        // How normalised time maps onto normalised progress.
+        #6 warp: WarpKind;
+    }
+}
+
+// A standing fault as the numbers a slot holds it in.
+//
+// This declaration is the standing fault: there is no second Rust form of it.
+// It carries identity and actionable evidence; diagnostic error-chain structure
+// is absent because it travels once at raise time, in the `TickFault` message
+// and the log.
+//
+// Every field is present for every fault, because a slot has no room for a
+// variant. Which of them the fault actually said is keyed by `code`, and the
+// rest carry zero -- which says "not part of this fault" and never a
+// measurement of zero.
+schema FaultSnap
+{
+    uuid: 3a3768e7-49c2-41e6-bc5d-eaa21f6e6db8;
+    fields
+    {
+        // Which fault this is. The three non-fault outcomes the tick reports on
+        // the fault channel cannot appear here: a machine does not stand parked
+        // on a refused command.
+        #0 code: faults::FaultKind;
+
+        // The servo concerned, or `none` where the fault is about no single
+        // one.
+        #1 joint: joints::JointRef;
+
+        // The servo's bus id, or zero where the fault names no servo.
+        #2 servo_id: UInt8;
+
+        // The servo's hardware-error byte as read, or zero.
+        #3 error_bits: UInt8;
+
+        // How many consecutive periods the evidence ran for -- missed reads, or
+        // failed solves -- or zero.
+        #4 count: UInt32;
+
+        // How far the joint stood from its goal, radians, or zero.
+        #5 error: Float64;
+
+        // Which way a pose solve failed, or that none did.
+        #6 fk_code: fk::FkFailureKind;
+
+        // The solve failure's first number, keyed by `fk_code`.
+        #7 fk_a: Float64;
+
+        // The solve failure's second number, keyed by `fk_code`.
+        #8 fk_b: Float64;
+
+        // Which layer judged the bus not carrying, or that none did.
+        #9 bus_source: BusSourceKind;
+
+        // What that layer called the failure, as the number its own type
+        // states. Keyed by `bus_source`, so it is never a number without an
+        // owner; zero where no layer is named.
+        #10 bus_failure_kind: UInt8;
+    }
+}
+
+// Everything the motion tick carries from one sample to the next.
+//
+// A cog keeps no memory of its own between executions: what survives is what a
+// declared slot holds, and the tick's state is a running move, a standing fault
+// and a set of accumulators. Fields must agree with
+// `reachy_motion::MotionSnapshot`; the crate's own flat forms fill them.
+//
+// What is deliberately absent is a record of what has been reported. A
+// classification happens once and travels as a value, which for this cog means a
+// `TickFault` message the moment it is raised, so a restored state loses
+// nothing: nothing was keeping the record here.
+//
+// The accumulators are the point of the whole thing. The tracking runs, the
+// miss count and the failed-solve count are not bookkeeping -- they are the
+// fault detectors themselves, and a cog that rebuilt its state from each
+// sample would be a machine that can never notice anything that takes more than
+// one period to become true.
+schema MotionSnap
+{
+    uuid: ae11eebd-b410-434d-812b-36ac7cfab0b0;
+    fields
+    {
+        // What the machine is doing. `none` is what an unwritten slot holds and
+        // is refused rather than read as a state.
+        #0 mode: MotionMode;
+
+        // How far into the running move, meaningful only while `mode` is
+        // `moving`.
+        #1 moving_elapsed: Duration;
+
+        // The standing fault, meaningful only while `mode` is `faulted`.
+        #2 fault: FaultSnap;
+
+        // The running move. Present while `mode` is `moving`, and also while
+        // `mode` is `faulted` -- a latching fault stops commanding without
+        // clearing the path it was on.
+        #3 trajectory: TrajectorySeed;
+
+        // Whether a tick has run at all. False before the first one, when the
+        // time below means nothing.
+        #4 prev_now_valid: Bool;
+
+        // The previous tick's clock reading.
+        #5 prev_now: Duration;
+
+        // The goals last emitted, radians -- or the ones arming pinned, if none
+        // have been. This is the baseline a step bound is measured against, so
+        // a slot that lost it is a machine that would accept any step at all.
+        #6 last_goal: joints::Joints;
+
+        // The Cartesian mirror of `last_goal`: where the head was last asked to
+        // be, which is where the next move starts from.
+        #7 last_targets: targets::Targets;
+
+        // Position the next present-pose solve is seeded from, metres.
+        #8 fk_seed_pos: primitives::Vec3;
+
+        // Orientation the next present-pose solve is seeded from.
+        #9 fk_seed_quat: primitives::Quat;
+
+        // The present pose's smallest toggle margin as of the last live read.
+        #10 present_min_margin: Float64;
+
+        // Per crank, how far the running move's start pose stood outside its
+        // travel window, radians, zero where it was inside. A move that began
+        // outside the envelope is excused back to this baseline, which is what
+        // lets a machine that woke up out of bounds travel home.
+        #11 excursion_cranks: FixedArray<Float64, 6>;
+
+        // How far that start pose's body yaw reached past its cap, radians.
+        #12 excursion_body_yaw: Float64;
+
+        // How far its head-relative yaw reached past its cap, radians.
+        #13 excursion_relative_yaw: Float64;
+
+        // How far its head attitude reached past the cone bound, radians.
+        #14 excursion_cone: Float64;
+
+        // Consecutive periods without a live read.
+        #15 miss_count: UInt32;
+
+        // Consecutive live reads whose pose would not solve.
+        #16 pose_failures: UInt32;
+
+        // Each joint's open tracking run, in bus order. An entry whose `active`
+        // is false is a joint with no run open.
+        #17 tracking: FixedArray<TrackingStreakSnap, 9>;
+
+        // The joints out of service. Nothing is commanded for these and nothing
+        // is judged about them.
+        #18 masked: joints::JointFlags;
+    }
+}

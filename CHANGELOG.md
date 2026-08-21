@@ -25,6 +25,22 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Changed
 
+- **The clip library asset carries motions, and sequence documents load
+  again.** `ClipConfig` gained a derived `max_speed` — the highest invocation
+  speed a clip's own frames admit, which a schedule's window is now screened
+  against — and `ClipLibraryConfig` gained `motions`: one flattened motion per
+  clip, plus one per composed sequence, each a lead gap and a list of
+  (clip, speed, hold) segments. **A clip configuration emitted by an earlier
+  build refuses to load**, loudly and typed rather than partially; regenerate
+  it with `make clip-config`. The name sidecar gained a second table, keyed by
+  motion id. **A schedule's overlay windows name motions**, not clips
+  (`OverlayWindow.motion_id`), and an overlay plays a whole motion: its lead
+  gap holds the base alone, its clips play end to end across their seams, a
+  hold freezes the clip before it, and a channel one clip drives and the next
+  does not fades out on the outgoing clip's ramp instead of vanishing. Since
+  every clip is also a one-segment motion, naming a bare clip costs a schedule
+  nothing.
+
 - **Bazel is the only build system.** Every crate is a `rust_library` with its
   tests, `make check` is one lane (`bazel test --config=lint //...`) and CI one
   job, and the device binary is a cross-compile against the hermetic aarch64

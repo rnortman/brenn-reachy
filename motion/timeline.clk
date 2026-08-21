@@ -1,0 +1,128 @@
+// The story a session tells about a fault: one report as its own timeline holds
+// it, and the maneuver it is running while it tells it.
+//
+// Both are state the session keeps rather than messages it sends. A report is
+// raised faster than one datagram per execution can carry it away, so the ring
+// of entries is what holds the story across the executions that drain it; and a
+// wind-down runs across executions too, on one clock opened once.
+//
+// They sit together because they are the two halves of the same episode -- what
+// is being done about a fault, and what has been said about it -- and because a
+// consumer of one is a consumer of the other. How far a maneuver got is here for
+// the same reason: the wind-down core writes it and the narration carries it as
+// one of a report's numbers. None of the three is the fault vocabulary itself: a
+// matcher on a raise imports `motion/faults.clk` and rebuilds for nothing that
+// changes here.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::faults;
+use motion::reports;
+
+// One report, as the session's own timeline holds it before it goes out.
+//
+// The same five values the wire's `Report` carries, in the fields a state schema
+// holds them in. It stands here because a report leaves at one datagram per
+// execution and a burst is raised faster than that: the ring is what carries the
+// story across the executions that drain it, and it is bounded because a story is
+// narration -- the classification that mattered already travelled on the channel
+// that raised it.
+schema TimelineEntry
+{
+    uuid: 22a9d649-3287-41af-8b4b-98ca9efe34d9;
+    fields
+    {
+        // When it happened -- the instant the report is about, not the execution
+        // that will publish it.
+        #0 time: SyncTime;
+
+        // What it is about. `none` is what an unwritten row holds and is no
+        // report, which is what makes an empty ring readable.
+        #1 kind: reports::ReportKind;
+
+        // The first specific, meaning stated per kind. Zero where the kind names
+        // none.
+        #2 a: UInt32;
+
+        // The second specific, likewise.
+        #3 b: UInt32;
+
+        // The measured specific, likewise. Carried bit for bit, a non-finite
+        // number included: a report is narration, and a story dropped for an
+        // unreadable measurement loses the part that was readable with it.
+        #4 detail: Float64;
+    }
+}
+
+// The wind-down maneuver the session is running, or that it is running none.
+//
+// Two facts and the bookkeeping around them: which ending the machine is being
+// judged by, and when the one clock is spent. The clock is opened once, when the
+// maneuver begins, and a servo dropping out mid-stow re-commands the stow from
+// where the machine stands without ever re-opening it -- which is why the
+// deadline is here rather than derived from a budget and a start.
+schema WindDownSnap
+{
+    uuid: 898a32a4-45cd-41b7-8b1b-b7d7e5a477b2;
+    fields
+    {
+        // Whether a maneuver is running. Every field below means nothing when
+        // this is false.
+        #0 active: Bool;
+
+        // The ending the machine is judged by -- `class` is what this is called
+        // everywhere else in the stack, and is a keyword in the language this
+        // schema is compiled into. The sticky maximum of the ending the maneuver
+        // began with and every one raised since, so it only ever asks more.
+        #1 ending: faults::EndingKind;
+
+        // When the one clock is spent.
+        #2 deadline: SyncTime;
+
+        // The `epoch` of the schedule the stow was last commanded with. What
+        // tells a stow already asked for from one still to be published.
+        //
+        // TODO(winddown-commanded-epoch): nothing writes or reads this yet --
+        // the host that publishes a stow is what compares epochs, and the
+        // wind-down core it is declared beside never sees one.
+        #3 commanded_epoch: UInt32;
+    }
+}
+
+// How far a wind-down got, in the three shapes it can end in.
+//
+// Narrower than the response vocabulary, because a wind-down that has begun
+// ends: the question left is whether the machine was measured where the maneuver
+// was to leave it, reached the end unmeasured, or was given up on.
+//
+// It stands here rather than with the report kinds because the wind-down core is
+// what writes it and the narration is what reads it, which is exactly the pair
+// this module already holds. The number is what a `winddown_outcome` report's
+// first specific carries, so it is append-only: a value inserted among these
+// would move the family under a reader that had already recorded one.
+enum WindDownOutcome
+{
+    uuid: 5d84b0c1-9e32-4a77-b6f0-1c3a7e9d2b48;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No outcome. What a slot that has concluded no maneuver holds, and no
+        // conclusion the core ever reaches.
+        #0 none default { underlying_value: 0; }
+        // The stow reached its end and the machine was measured there.
+        #1 completed { underlying_value: 1; }
+        // The maneuver reached its own end with nothing confirming it landed --
+        // every joint that carries the head went limp before the stow could put
+        // it down, so nothing commanded the descent and nothing measured where it
+        // stopped.
+        #2 unconfirmed { underlying_value: 2; }
+        // The maneuver was given up on and the immediate release took over: the
+        // one clock ran out, or the stow itself ended on something the machine
+        // did.
+        #3 fell_through { underlying_value: 3; }
+    }
+}

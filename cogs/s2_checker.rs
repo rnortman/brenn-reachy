@@ -11,11 +11,12 @@
 
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__msgs_clk_rs::FaultKind;
+use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use reachy_motion::default_motion_config;
+use reachy_motion::joints::{Name, flags, row};
 use reachy_motion::postures::stow_pose_targets;
 use scenario::check;
-use scenario::check::{ARRIVAL_TOLERANCE, goal_at, sample_at};
+use scenario::check::{ARRIVAL_TOLERANCE, goal_at, present_rows, sample_at};
 use scenario::cycle_of;
 use scenario::read::Run;
 
@@ -60,27 +61,29 @@ fn main() -> ExitCode {
 /// cycle the release was published on already shows them moving again.
 fn check_jam_held(run: &Run, failures: &mut Vec<String>) {
     let from = OBSTRUCT_CYCLE;
-    let Some(held) = sample_at(run, from) else {
+    let Some(held) = sample_at(run, from).map(present_rows) else {
         failures.push(format!(
             "no sample for cycle {from}, where the cranks are jammed"
         ));
         return;
     };
     for cycle in from..RELEASE_CYCLE {
-        let Some(sample) = sample_at(run, cycle) else {
+        let Some(sample) = sample_at(run, cycle).map(present_rows) else {
             failures.push(format!("no sample for cycle {cycle}, inside the jam"));
             return;
         };
-        for joint in jammed_rows().iter() {
-            let Some(row) = joint.index() else {
-                failures.push(format!("{joint} sits on no bus row"));
+        for joint in flags::iter(jammed_rows()) {
+            let Some(row) = row(joint) else {
+                failures.push(format!("{} sits on no bus row", Name(joint)));
                 continue;
             };
-            if sample.present[row] != held.present[row] {
+            if sample[row] != held[row] {
                 failures.push(format!(
-                    "at cycle {cycle} the jammed {joint} reads {}, having stood at {} when the jam \
+                    "at cycle {cycle} the jammed {} reads {}, having stood at {} when the jam \
                      settled: the plant let a jammed row move",
-                    sample.present[row], held.present[row]
+                    Name(joint),
+                    sample[row],
+                    held[row]
                 ));
                 return;
             }
@@ -112,7 +115,7 @@ fn check_reports(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
                 continue;
             }
         };
-        if fault.message.kind() != FaultKind::HEAD_OBSTRUCTED {
+        if fault.message.kind() != FaultKindWire::HEAD_OBSTRUCTED {
             failures.push(format!(
                 "the decision tick reported {:?} at cycle {cycle}, and the only thing wrong with \
                  this machine is a jammed crank",
@@ -124,10 +127,11 @@ fn check_reports(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
             None => failures.push(format!(
                 "the report at cycle {cycle} names no crank, and a jam is about a servo"
             )),
-            Some(joint) if !jammed_rows().contains(joint) => failures.push(format!(
-                "the report at cycle {cycle} names {joint}, and the hand in this scenario is on \
+            Some(joint) if !flags::contains(jammed_rows(), joint) => failures.push(format!(
+                "the report at cycle {cycle} names {}, and the hand in this scenario is on \
                  {}",
-                jammed_rows()
+                Name(joint),
+                flags::Names(jammed_rows())
             )),
             Some(_) => {}
         }
@@ -222,22 +226,23 @@ fn check_hold(run: &Run, first_raise: Option<i64>, failures: &mut Vec<String>) {
 /// stow move was too short to recover from it.
 fn check_released(run: &Run, held: &[f64; 9], failures: &mut Vec<String>) {
     let at = STOW_START_CYCLE - 1;
-    let Some(sample) = sample_at(run, at) else {
+    let Some(sample) = sample_at(run, at).map(present_rows) else {
         failures.push(format!(
             "no sample for cycle {at}, where the released cranks should have caught up"
         ));
         return;
     };
-    for joint in jammed_rows().iter() {
-        let Some(row) = joint.index() else {
-            failures.push(format!("{joint} sits on no bus row"));
+    for joint in flags::iter(jammed_rows()) {
+        let Some(row) = row(joint) else {
+            failures.push(format!("{} sits on no bus row", Name(joint)));
             continue;
         };
-        let error = (sample.present[row] - held[row]).abs();
+        let error = (sample[row] - held[row]).abs();
         if error > ARRIVAL_TOLERANCE {
             failures.push(format!(
-                "at cycle {at} the released {joint} is {error} rad from the setpoint the machine \
-                 held it against through the jam: the release left it stuck"
+                "at cycle {at} the released {} is {error} rad from the setpoint the machine \
+                 held it against through the jam: the release left it stuck",
+                Name(joint)
             ));
         }
     }

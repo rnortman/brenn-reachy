@@ -1,0 +1,221 @@
+// How the machine answers a fault: what was raised, what is done about it, and
+// where the maneuver leaves it.
+//
+// Raise-time vocabulary, written by the motion tick and read by everything
+// downstream of a raise -- the session's narration, the wind-down's record, the
+// operator's log. It stays small and cold on purpose: a matcher on a fault is
+// the most widely linked thing in this tree, and a module that also carried a
+// sequencer's state or a tick's tracking streaks would rebuild all of them on
+// every edit.
+//
+// Four vocabularies rather than one, because they answer four different
+// questions and a value of each stands beside the others in the same records:
+// which condition was observed, what is being done about it, which of those
+// doings a wind-down runs to the end, and -- where the condition is the bus not
+// carrying -- what shape the failed transaction had.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::joints;
+
+// Which ending the machine is judged by.
+//
+// The five endings a run can have, numbered from one, with `none` at zero for
+// the slot that is running no maneuver. This is the enum the wind-down core
+// itself matches on -- there is no second Rust spelling of it.
+//
+// The response vocabulary next door is wider: degrading an antenna pair is a
+// fault answered and no ending, so it has no number here and a slot cannot
+// claim a maneuver that does not exist.
+enum EndingKind
+{
+    uuid: 9afdab52-ba1a-4a25-8087-9f8131248180;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No ending. What a slot running no maneuver holds.
+        #0 none default { underlying_value: 0; }
+        // The ask is declined and nothing changes.
+        #1 refuse { underlying_value: 1; }
+        // Stow under control, then release; the next wake engages normally.
+        #2 slow_stow_to_rest { underlying_value: 2; }
+        // Let go of all nine where they stand; the next wake engages normally.
+        #3 immediate_all_torque_off_to_rest { underlying_value: 3; }
+        // Release the faulted servo, stow on what still commands, then wait for
+        // an operator.
+        #4 masked_slow_stow_to_park { underlying_value: 4; }
+        // Let go of all nine where they stand, then wait for an operator.
+        #5 immediate_all_torque_off_to_park { underlying_value: 5; }
+    }
+}
+
+// What a fault is answered with.
+//
+// The whole stack's one classification vocabulary, with `none` ahead of it for
+// the slot that has answered nothing. The classification is made once, where a
+// fault is raised, and travels as one of these; nothing downstream re-derives
+// an answer from the condition.
+//
+// All six are legitimate answers to a fault, which is what separates this from
+// `EndingKind`: an ending is what a wind-down runs, and one of these -- degrading
+// an antenna pair -- is a fault answered without a maneuver. So a wind-down's slot
+// names an ending and a report about a fault's answer names one of these.
+enum ResponseKind
+{
+    uuid: a901e036-dab1-4972-b8bd-e86ffc906923;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No response. What a never-written slot holds, and no answer the
+        // library ever gives.
+        #0 none default { underlying_value: 0; }
+        // The ask is declined and nothing changes.
+        #1 refuse { underlying_value: 1; }
+        // Stow every commanded joint under control, then release.
+        #2 slow_stow_to_rest { underlying_value: 2; }
+        // Release the antenna pair and carry on with the head.
+        #3 degrade_antennas { underlying_value: 3; }
+        // Release the faulted servo, stow on what still commands, then park.
+        #4 masked_slow_stow_to_park { underlying_value: 4; }
+        // Immediate best-effort torque-off of all nine, then rest.
+        #5 immediate_all_torque_off_to_rest { underlying_value: 5; }
+        // Immediate best-effort torque-off of all nine, then park.
+        #6 immediate_all_torque_off_to_park { underlying_value: 6; }
+    }
+}
+// What a tick reported, as a value on a channel.
+//
+// The fault slugs are the doctrine's, and the three non-fault outcomes share
+// this enum rather than a second one: they are all "what the tick had to say
+// about this cycle", they are all one-shot events, and a consumer that must not
+// miss a fault must not miss an aborted move either.
+//
+// Every value states its own number as `underlying_value`, so the numbering
+// does not depend on declaration order and a value inserted among the others
+// renumbers nothing. The numbering is append-only: a fault is never renumbered,
+// because the number is what a recorded log and a running build have in common.
+enum FaultKind
+{
+    uuid: e907b868-2680-42d1-869f-4648bdf5b9f5;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No report. The default a never-written slot decodes to, and not
+        // something any message carries.
+        #0 none default { underlying_value: 0; }
+
+        // An antenna is not tracking its setpoint and something is holding it.
+        #1 antenna_obstructed { underlying_value: 1; }
+        // An antenna servo reported a hardware error.
+        #2 antenna_servo_fault { underlying_value: 2; }
+        // The head is not tracking its setpoint and something is holding it.
+        #3 head_obstructed { underlying_value: 3; }
+        // A head servo reported a hardware error.
+        #4 head_servo_fault { underlying_value: 4; }
+        // Positions stopped coming back for long enough to stop believing them.
+        #5 position_feedback_lost { underlying_value: 5; }
+        // The measured crank angles do not close the linkage: a pose the
+        // machine cannot be in, so the reading is not one.
+        #6 measured_pose_invalid { underlying_value: 6; }
+        // The servo bus itself failed.
+        #7 bus_failure { underlying_value: 7; }
+        // A commanded torque-off was not confirmed by the servos.
+        #8 torque_off_unconfirmed { underlying_value: 8; }
+
+        // A move gave up because it would have left the envelope.
+        #9 move_aborted_envelope { underlying_value: 9; }
+        // A move gave up because a step was larger than the servo may take.
+        #10 move_aborted_step { underlying_value: 10; }
+        // A command was refused.
+        #11 command_rejected { underlying_value: 11; }
+    }
+}
+
+// One raise, at the instant it was raised.
+//
+// One message per raise, never a repetition of a standing condition: a fault
+// that is still true next cycle is not news, and a channel that carries it at
+// poll rate is a channel nobody can read. The evidence fields are the numbers
+// that made the classification, so a reader need not go back to the sample
+// stream to know why.
+//
+// This message carries the classification and the numbers it was made from, but
+// not the servo's own id or its hardware-error byte -- those travel only in the
+// host-side snapshot the restore path consults. The row below names the servo
+// for every fault that is about one; the rest of the diagnostic chain travels
+// once, at raise time, in the value the host holds.
+schema TickFault
+{
+    uuid: 01137aa8-3ca7-42fe-aefa-ef2b9399cfcb;
+    fields
+    {
+        // The nominal instant of the sample that raised it.
+        #0 time: SyncTime;
+
+        // What was raised.
+        #1 kind: FaultKind;
+
+        // The servo concerned, or `none` where the report is about no single
+        // one.
+        #2 joint: joints::JointRef;
+
+        // The magnitude that carried the classification -- a tracking error or
+        // a residual, in the units of whatever `kind` measures.
+        #3 detail: Float64;
+
+        // The count that carried it -- misses, failures, or a streak length.
+        #4 count: UInt32;
+    }
+}
+
+// The shape of a failed transaction, coarse enough to name a condition with.
+//
+// A driver's own error type is not what travels here: the whole detail of the
+// failure is on the ending the same transaction returned, and what a condition
+// needs is the distinction that sends an operator to a different part of the
+// machine -- silence is a connector or a dead servo, a mangled reply is the line
+// or the adapter, a refusal is the servo answering that it will not, and a
+// request this layer would not send at all is ours.
+//
+// It stands with the fault vocabulary because it is only ever read beside one: a
+// bus failure's slot holds this number under a transaction source, and a
+// sequencer's failure kind under a sequence source.
+enum WireFailure
+{
+    uuid: 3c1f9d2e-6b47-4f0a-9a1c-2d5e8b7f4a63;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No failure of a transaction. What a slot holding no bus failure, or
+        // one whose failure came from a sequencer's verdict, holds -- never a
+        // shape a transaction failed in.
+        #0 none default { underlying_value: 0; }
+        // Nothing came back before the deadline, and the retries are spent.
+        #1 silent { underlying_value: 1; }
+        // Bytes came back that disagreed with themselves, or that were not an
+        // answer of the shape the request asked for.
+        #2 corrupt { underlying_value: 2; }
+        // The servo answered with its error field set.
+        #3 refused { underlying_value: 3; }
+        // A verified write read back as something other than what was written.
+        #4 not_written { underlying_value: 4; }
+        // The port itself failed.
+        #5 port { underlying_value: 5; }
+        // The request never went out, because this layer would not put it on the
+        // wire.
+        #6 unsendable { underlying_value: 6; }
+    }
+}

@@ -92,7 +92,9 @@ overheat, but a fault here holds torque and ends a session, and how often a
 sweep really falls short on this bus is unmeasured — the first supervised runs
 with torque on are what say whether the answer is a budget, a config key beside
 `read_loss_ticks`, or a documented decision that a health gap never faults.
-Marked at `read_health` in `crates/reachy-bench/src/pump.rs`.
+Marked at `read_health` in `crates/reachy-bench/src/pump.rs` — out of the build
+and deleted at the cutover under `bench-motion-delete`, so the marker moves to
+whatever hosts the health sweep then.
 
 ## `provisioning-repair`
 
@@ -153,23 +155,98 @@ qualification, a ninth condition is named, or a park-class ending is sanctioned
 to carry no slug. None of the six is reachable from the move loop's own
 transactions today — each would take a register-table or encoder defect to
 produce — which is why it waits. Marked at the `Unsendable` arm of
-`wire_failure` in `crates/reachy-bench/src/pump.rs`.
+`wire_failure` in `crates/reachy-bench/src/pump.rs` — out of the build and
+deleted at the cutover under `bench-motion-delete`, so the marker moves to
+whatever drives the bus then.
 
 ## `reachy-pod-motion-integration`
 
-Host these crates from the pod payload rather than from the bench binary, and
-decide how motion intents reach the loop.
+Host these crates from the cog compositions rather than from the bench binary,
+and decide how motion intents reach the loop.
 
 Deferral context: the four libraries own no loop and no I/O by construction, so
-whoever hosts them supplies the port, the clock and the loop. Today that is the
-bench binary, which is a supervised operator tool: one command per process, a
-loop that runs until the move finishes, and a fault that stops commanding and
-exits. A payload wants none of those — it wants a long-lived loop taking intents
-from elsewhere, and that raises questions this milestone deliberately does not
-answer: what carries an intent, what happens to a fault when there is no operator
-watching, and who owns the port when two things want it. None of it changes the
-libraries; it is a second host beside this one. Marked at the driver in
-`crates/reachy-bench/src/pump.rs`.
+whoever hosts them supplies the port, the clock and the loop. The bench binary
+was that host, and it is one no longer: its motion layer is out of the build, so
+nothing in this tree drives a coordinated move on hardware today. The cog path
+is the host being built, and the questions this entry waits on are the cutover
+slice's: what carries an intent, what happens to a fault when there is no
+operator watching, and who owns the port when two things want it. None of it
+changes the libraries. Marked at the pod seam in
+`crates/reachy-bench/src/pump.rs`, which is out of the build and goes at the
+cutover under `bench-motion-delete`; the marker moves to the cog path where the
+integration actually happens, and this entry is what carries it across.
+
+## `bench-motion-delete`
+
+Delete the bench's retired motion layer from disk.
+
+Deferral context: `crates/reachy-bench/src/{commands.rs,pump.rs,trace.rs,
+trace/metrics.rs,replay.rs}` are out of the build and no longer compile — and
+will not against any version of the crates they name, since the vocabulary and
+player types they import have since been deleted, so they are prose about the
+machine rather than code anything revives. They are kept on disk as the record
+of how this machine was actually driven — the sequencer call order, the fixed-rate loop, the settle policy, and
+the hardware-trace replay that sizes the motion guards — which is the reference
+the cog path is read against while it grows. They go when the cog path
+demonstrably drives hardware, at the cutover; the trace recordings under
+`crates/reachy-bench/fixtures/traces` outlive them and want re-pointing at
+whatever replays them then. Precondition, and it binds before the cutover: while
+`replay.rs` is out of the build nothing replays those recordings against the
+`[motion]` guards they sized, so an edit to any of those bounds — step limits,
+the tracking threshold, the gains, the antenna clocks — re-points the replay
+suite at whatever hosts the loop first, and does not land on the strength of
+`config.rs`'s range checks alone. A measurement nothing replays is folklore by
+the next release. Marked in the header of each of those files, in
+`crates/reachy-bench/src/lib.rs`, and beside the explicit `srcs` list in
+`crates/reachy-bench/BUILD.bazel`.
+
+## `session-aux-crossing`
+
+Give `SessionState.aux` a reader, or drop the field: the session cog's aux path
+is what writes and reads the outstanding transaction's correlation number,
+`issued` count and retries, and it needs a crossing test pinning that a re-issue
+is the same datagram, correlation number included.
+
+Deferral context: the aux twin the field crossed through
+(`session_slots`'s `Pending`, `write_aux_pending`, `read_aux_pending`) was
+deleted with the rest of the aux conversion layer, and its round-trip tests went
+with it. The field itself stays because the session cog will hold exactly this
+state, and the schema is the state under the new doctrine — but until that cog
+lands, the slot carries retry bookkeeping with no reader and no test, and
+nothing marks that the re-issue property is unestablished. Whether the field is
+declared now or when its reader arrives is the follow-on design's call. Marked at
+`SessionState`'s `aux` field in `cogs/msgs.clk`.
+
+## `degrade-maneuver-narration`
+
+Name the antenna torque-off in the report that narrates a degrade, or drop the
+maneuver it would be named by.
+
+Deferral context: `Maneuver::AntennaTorqueOff` is the one fault response the
+doctrine scopes to a group — the antenna pair goes limp and the head keeps its
+presence — and nothing in the build constructs it. The bench host that used to
+report under it is out of the build, and a degrade now travels in the tick's
+report, which carries the fault kind and the newly masked joints but no maneuver
+name. Which host names the maneuver, and whether the outbound report carries one
+at all, is the follow-on session design's call, since that design draws the
+report the session publishes. Until then the variant stays: a degrade's maneuver
+is classified in one place rather than spelled afresh by each host that needs it.
+Marked at the variant in `crates/reachy-motion/src/winddown.rs`.
+
+## `winddown-commanded-epoch`
+
+Give `WindDownSnap.commanded_epoch` a writer and a reader, or drop the field.
+
+Deferral context: the field says which schedule epoch the stow was last
+commanded with, which is what tells a stow already asked for from one still to be
+published. Its previous carrier was the wind-down crossing in the session slot
+mapping, deleted with the rest of the crossings, and the wind-down core never
+picked it up: the maneuver's own decision turns on no epoch, and the host that
+publishes the stow is what compares them — the session cog the follow-on design
+builds. So the field is declared, zero, and unread, and `WindDown::begin` clears
+it along with the rest of the slot, which means a writer arriving later starts
+from a blank at every open. Whether it is declared now or when its writer arrives
+is that design's call. Marked at the field in `motion/timeline.clk`.
 
 ## `override-regen`
 
@@ -186,22 +263,6 @@ not a build error but a graph resolving at versions nobody chose. The fix is a
 script that emits the segment from a drop's `MODULE.bazel` plus this repo's
 named deviations, and a gate target that fails when the committed bytes differ
 from what it emits. Marked in the header of that file.
-
-## `rusty-cogs-pin-bump-merge-order`
-
-Bump the rusty-cogs pin in `MODULE.bazel` past `e934ad2`, "fix: order the
-offboard merge the way upstream's does".
-
-Deferral context: the pin is `4e8f8e8`, the newest revision on rusty-cogs'
-GitHub remote. Its local working tree already carries commits past that, the
-first of which changes the order the offboard log reader merges channels in —
-and that order is exactly what an ordering-sensitive assertion in a scenario
-checker reads through (monotonic setpoint instants, strictly increasing
-estimate times, event ordering). The reader at this pin is therefore known to
-merge in an order that may not match upstream's tooling or the next pin, and a
-checker written against it is written knowing that. Pinning past it is not
-available until those commits are pushed. Marked on the `git_override` line in
-`MODULE.bazel`.
 
 ## `foreign-generic-instantiation-crate`
 
@@ -233,9 +294,8 @@ Deferral context: `include()` is legal only in a root module, so rusty-cogs as a
 dependency fails during main-repository-mapping computation — before any target
 is analyzed — and this repo carries a patch that rewrites that line into ten
 versionless `bazel_dep`s. The patch is exactly the fix, in the wrong repository:
-it is a context diff against a file the pin already needs to move (see
-`rusty-cogs-pin-bump-merge-order`), and every future consumer of rusty-cogs must
-carry a byte-identical copy of it and of the reasoning behind it. Not fixed here
+it is a context diff against a file every pin bump can move under it, and every
+future consumer of rusty-cogs must carry a byte-identical copy of it and of the reasoning behind it. Not fixed here
 because the change belongs to the sibling repo, which this slice does not touch.
 Done when rusty-cogs resolves as a dependency unpatched and the patch package is
 deleted. Marked on the `patches =` line in `MODULE.bazel`.
@@ -337,11 +397,11 @@ three groups, the box gives each a `ReportGroupPolicy`, and the groups do reach
 the output log as channels -- carrying, at this drop, no messages at all over a
 five-second S1 run. So neither half of the surface is covered: not that a total
 reaches the group, and not that each total reaches the signal named for it
-(`counters!` and `sim_cogs::signal` reuse the state slot's setter identifier, so
-two totals declared with each other's setter names compile; the slot crossing is
+(`counters!` reuses the state slot's setter identifier, so two totals declared
+with each other's setter names compile; the slot crossing is
 now pinned field for field by the round-trip case `counters!` emits, which leaves
-unproven that a group setter reaches the signal named for it in the `.clk`, that
-any value reaches the output log, and the hand pairing in `sim_cogs::signal`). Reading
+unproven that a group setter reaches the signal named for it in the `.clk` and
+that any value reaches the output log). Reading
 one takes a Rust type bound to a group's generated schema, which
 `rust_clk_module` is not established to emit; whether the emptiness is the
 policy's reporting window, the run's length, or a drop limitation is the first
@@ -349,6 +409,47 @@ question. Done when a scenario checker reads a
 group's totals and asserts them against its own arithmetic. Marked at
 `signal_groups` in `cogs/scenario/check.rs`, which every scenario of the motion
 system calls.
+
+## `refusal-classification-reported`
+
+Report *which* refusal a cog made, not only how many. `motion_cogs`' mover
+counts a state it cannot read, a state that describes no tick, and a sample that
+does not validate as three totals; `sim_cogs` counts a refused goal the same
+way. Every one of those calls returns a typed error naming the cause --
+`StateError` alone has seven variants, each carrying its own source -- and every
+one is dropped at the call site.
+
+Deferral context: after an incident the count is the only trace, and
+"refused_state: 1" cannot tell a quaternion that is not a rotation from a mode
+byte this build does not know from a publisher writing bytes the schema does not
+declare -- three problems with three different owners. What it takes is a
+decision this slice cannot make on its own: the fault channel carries
+`TickFault` and `FaultKind`, which is raise-time fault vocabulary, and a refused
+slot is not a fault in the ladder, so naming the cause means either a new
+report vocabulary or a signal carrying the discriminant -- a schema and a
+channel change, and a question for the design that plans the session's
+reporting. Marked at the state refusal in `cogs/motion_cogs.rs`.
+
+## `resume-hands-back-the-path`
+
+Build the running move once per control cycle. `resume` calls
+`traj::read_seed`, which runs `Trajectory::new` -- two poses read out of
+quaternion fields, a rotation inverse, a scaled axis and the finite and
+duration checks -- purely to decide whether the bytes are a path, throws the
+result away, and returns `Result<(), _>`; `motion_tick` then builds the same
+object from the same bytes a few microseconds later. `resume` likewise
+recomputes the targets and the seed pose the tick reads again.
+
+Deferral context: the cost is small at 100 Hz and every future field-level
+check added to `resume` doubles the same way, so it is worth removing. What
+stops it being a local edit is that the tick may *write* the seed mid-cycle --
+`take_command` starts a move, and `hold`/`abort` clear one -- so a path handed
+in at the boundary is stale by the time the sampling runs. Removing the second
+read therefore means the tick carrying an in-call second form of a value the
+schema also holds, kept in step at every site that writes the seed, which is
+the arrangement the schema-resident state rules out by design and a change to
+two public entry points. Marked at `resume` in
+`crates/reachy-motion/src/tick.rs`.
 
 ## `cogs-session-channel`
 
@@ -367,6 +468,95 @@ decision is which shape the session slice takes — a second channel into the
 driver, or a multi-publisher channel if the framework grows one — and it is that
 slice's to make, with the aux path's requirements in hand. Marked at the
 `DriverCmd` declaration in `cogs/motion.clk`.
+
+## `follow-on-line-budget`
+
+Set a normative end-state line budget for the animation logic from measurement,
+in the design that finishes the remaining functionality — the mover overlay
+tick, the driver process's own half, the session composition and the scenarios
+past S5.
+
+Deferral context: the budget of record was priced on the assumption that the
+hand-written translation code simply disappears when a schema becomes the
+state. Measured, roughly half of it comes back one layer down as read and write
+modules over the same schemas, so the target it produced is not a number the
+remaining work can meet, and restating it lower would be adopting a fiction.
+The replacement has to start from a per-module accounting of the code as it
+then stands — with `tick.rs` accounted by functional region, since it is the
+largest single remainder and it is envelope discipline and fault handling
+rather than translation — and propose an end state the owner approves against
+that accounting. Unmarked in code: the site is the follow-on design, which does
+not exist yet.
+
+## `clip-schemas-config-home`
+
+Move `ClipFrame`, `ClipConfig` and `ClipLibraryConfig` out of `cogs/config.clk`
+into a clips-owned configuration module with its own protobuf generation, and
+point `reachy-clips` at it instead of at `//cogs:config_clk_rs`.
+
+Deferral context: the placement doctrine puts a schema in the package named for
+the component that writes it, and `reachy-clips` is the only writer and the only
+reader of these three. They sit in `cogs/config.clk` because that module was the
+one crossing the Protobuf backend, and the whole module is one compilation unit,
+so editing a simulator slew rate rebuilds `reachy_clips` and everything above
+it — the inverse of the one-module-per-subject rule. What holds it is that the
+frozen design assigns `cogs/config.clk` unchanged and rules that a declaration
+moving to a different module than assigned is a design question, not an
+implementer's call; the protobuf generation of a second config module also wants
+proving before the move rather than during it. Marked at the clip schemas in
+`cogs/config.clk`.
+
+## `clips-authoring-split`
+
+Split `reachy-clips` so the device build links only what plays a clip. The
+playback half is `compose`, `config`, `player` and `speed`; the authoring half
+is `format`, `library`, `vendor`, `files` and the importer binary, with `serde`,
+`serde_json` and `anyhow` behind it.
+
+Deferral context: playback now reads clips only out of the configuration
+message, so nothing the running machine reaches touches the JSON document
+reader, the loader, the vendor importer or the filesystem walk — yet every cog
+build compiles them, and the crate's own header has to explain which of its
+parts are at the crate's edge instead of the build saying so. The split is a new
+crate with its own package and visibility boundary rather than a target-level
+edit, which is a packaging decision the frozen design does not make, and the
+cost grows each time the authoring side gains a format. Marked in the header of
+`crates/reachy-clips/src/lib.rs`.
+
+## `library-walk-per-execution`
+
+Decide what a cog does with `ValidatedLibrary` between executions, and make the
+per-frame walk something a control period does not repeat: either a fact the
+mover's own state records once, or per-frame checks moved to the two frames a
+tick actually samples.
+
+Deferral context: `ValidatedLibrary::of` walks every frame of every clip — up to
+16 clips of 512 frames, ten field reads and a quaternion norm apiece — and
+exists so that walk is paid once rather than per use. But the handle borrows the
+configuration message, and a cog's only memory between executions is its state
+slot, so the intended caller cannot carry it across executions: as it stands the
+overlay tick re-walks the library every control period to obtain what `take_up`
+requires. Nothing calls it on the control path yet — the mover overlay tick is
+the follow-on design's work — and which answer is right depends on the state
+that design gives the mover, so it is decided there rather than guessed here.
+Marked at `ValidatedLibrary::of` in `crates/reachy-clips/src/config.rs`.
+
+## `overlay-fade-continuity`
+
+Keep a closing overlay window from dropping its player's weighted delta in one
+control period: a playing clip's contribution reaches zero before its row
+vacates.
+
+Deferral context: `take_up` vacates a row on the first execution its window does
+not cover, so a window that closes while its player still carries weight takes
+the whole delta out at once — the composed-setpoint discontinuity a clip's exit
+ramp exists to prevent, arriving by a different door. The invariant above is
+settled; the mechanism is not, and it cannot be settled here: either the
+schedule's windows are authored fade-inclusive and the window screen enforces
+it, or this layer holds a fading player past its window's end. Both answers
+belong to whoever owns the schedule author and this layer's contract at once,
+which is the session design. Nothing reaches it today — `take_up` has no
+control-path caller. Marked at `take_up` in `cogs/overlay.rs`.
 
 ## `bazel-device-config-gate`
 

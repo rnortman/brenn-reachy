@@ -1,11 +1,16 @@
-//! `reachy-driver` — the goal gate and the dead-man, with no motors attached.
+//! `reachy-driver` — a motor driver's decisions, with no motors attached.
 //!
 //! A motor driver's cycle is mostly bus traffic, but the part of it that
 //! decides *whether and what to write* is pure: a small FIFO of goals stamped
 //! with the grid instant they are to be executed at, a held setpoint that gets
 //! rewritten between due goals, and a timer that de-torques the machine when
-//! the process feeding it goals goes quiet. That decision is this crate, and
-//! nothing else is.
+//! the process feeding it goals goes quiet. That is [`GoalGate`], and beside it
+//! sit the three smaller decisions a cycle also makes — what the driver
+//! believes about torque ([`BelievedTorqued`]), whether a commanded
+//! de-torquing has been seen to take ([`TorqueOffConfirm`]), and which one
+//! out-of-band transaction the cycle spends its spare bus time on
+//! ([`AuxSlot`]). Those decisions are this crate, and nothing else is: no
+//! register addresses, no wire, no clock of its own.
 //!
 //! It exists separately because the same decision has to run in three places
 //! and be the same decision in all of them: the real driver process, the
@@ -14,22 +19,22 @@
 //! timer is a second set of conditions under which a machine does not
 //! de-torque.
 //!
-//! The one crate it links is `reachy-wire`, which is the layout the goals it
-//! gates arrive in and is itself dependency-free plain data. Sharing that is
-//! the point: the row count, the mask convention and the setpoint's own fields
-//! are stated once, so a host decoding a datagram and handing it to the gate
-//! writes no conversion of its own that could disagree.
+//! What it links is the joint vocabulary and the transaction vocabulary: the
+//! set of servos this machine has, and the record of one bus transaction. A
+//! gate whose idea of the bus disagreed with its host's would silently stop
+//! writing the rows above the disagreement, so the row count is read off the
+//! vocabulary rather than restated here.
 //!
-//! The whole state is public `Copy` data, because it is mirrored field for
-//! field into a Clockwork state schema: a cog's cross-tick state lives in a
-//! declared slot, so anything with a private field or a heap allocation cannot
-//! be a cog's gate. Public fields mean the one invariant they carry —
-//! `queue_len` is at most [`QUEUE_CAP`] — is not a constructor's to establish,
-//! so a host restoring a gate out of a slot checks it with
-//! [`GoalGate::validate`]. Nothing here panics on a gate that fails it; a
-//! queue length past the end is read as the end, because the process this runs
-//! in is the one that de-torques the machine and it does not get to crash over
-//! a bad slot.
+//! The gate's cross-cycle state is a schema, `driver/gate.clk`, and this crate
+//! decides over it in place: a host validates the slot once at its boundary and
+//! hands the view down, so the simulated driver's state slot and the driver
+//! process's own memory hold one description of a queue rather than two. There
+//! is no second form and nothing to restore: a queue's length is the array's
+//! own, so no number can claim more goals than there are, and a set of servos
+//! that is not a set of servos is refused by the host's one validation rather
+//! than met halfway down here. The rest of the crate is public data with no
+//! heap allocation, for the same reason: a cog's cross-tick state lives in a
+//! declared slot.
 //!
 //! What the gate guarantees to whoever hosts it:
 //!
@@ -47,95 +52,42 @@
 //!   fresh hold-timeout window: the new session commands the machine, and
 //!   nothing the old one asked for is written on its way in.
 //!
-//! Times are nanoseconds since the Unix epoch, positions are radians in bus
-//! order (body yaw, legs 0 through 5, right antenna, left antenna), and masks
-//! are one bit per bus row — the same conventions as `reachy-wire`, which is
-//! what carries these values between processes.
+//! Times taken and answered here are nanoseconds since the Unix epoch, because
+//! a cycle's own instant is a number its host already has; a setpoint carries
+//! its instant as `SyncTime`, which is the vocabulary's own. Angles are radians
+//! and a set of servos is `JointFlags` — the joint vocabulary, never a mask of
+//! bits a comment explains.
 
 #![forbid(unsafe_code)]
 
-use reachy_wire::GoalSetpoint;
+use brenn_reachy__driver__gate_clk_rs::{GateState, GateStateWire};
+use brenn_reachy__driver__goal_clk_rs::{GoalSetpoint, GoalSetpointWire};
+use brenn_reachy__motion__joints_clk_rs::JointRef;
+use clockwork_rs::SyncTime;
 
-/// Servo rows on the bus, and every joint in a mask: re-exported from the wire
-/// layout rather than restated, because a gate whose row count disagreed with
-/// the datagrams feeding it would silently stop writing the rows above the
-/// disagreement.
-pub use reachy_wire::{JOINT_COUNT, JOINT_MASK_ALL};
+pub mod aux_slot;
+pub mod state;
+pub mod torque;
 
-/// How many goals may be queued ahead of execution.
+pub use aux_slot::{AuxOffer, AuxSlot, AuxTask};
+pub use state::DriverStateError;
+pub use torque::{
+    BeliefWrite, BelievedTorqued, ConfirmCredit, ConfirmReport, ConfirmStep, TORQUE_BITS_ALL,
+    TorqueOffConfirm,
+};
+
+/// Servo rows on the bus, and so the length of every position array here.
 ///
-/// A sender running a lag of `k` cycles has `k` goals in flight, so the queue
-/// only has to be deeper than the largest lag anything sensibly uses. Five is
-/// that with room to spare; a sender that overruns it is malfunctioning, and
-/// the drop is reported rather than absorbed.
-pub const QUEUE_CAP: usize = 5;
+/// Counted off the joint vocabulary rather than stated: `JointRef` names every
+/// servo plus the `none` a report about the whole machine carries, so a tenth
+/// servo declared there is a tenth row here without an edit.
+pub const JOINT_COUNT: usize = JointRef::VARIANTS.len() - 1;
 
-/// A commanded setpoint and the grid instant it is for.
+/// Every joint in a mask: the low [`JOINT_COUNT`] bits.
 ///
-/// The same three values a [`GoalSetpoint`] carries on the wire, in the form
-/// the queue holds them. The two convert both ways with [`From`], so no host
-/// writes that conversion by hand: a driver process and a simulated one must
-/// not be able to disagree about which field is which.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Goal {
-    /// The instant this setpoint is to be written at.
-    pub execute_at_ns: i64,
-    /// The rows it writes, one bit per bus row.
-    pub mask: u16,
-    /// Targets in bus order, radians. Rows outside `mask` are not written.
-    pub targets: [f64; JOINT_COUNT],
-}
-
-impl Default for Goal {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
-impl Goal {
-    /// A goal that writes nothing, used to fill unoccupied queue slots.
-    pub const EMPTY: Self = Self {
-        execute_at_ns: 0,
-        mask: 0,
-        targets: [0.0; JOINT_COUNT],
-    };
-
-    /// Write this goal's targets into `targets`, and report which rows moved.
-    ///
-    /// The mask is write-side filtering and nothing else: a row outside it
-    /// keeps whatever it was already holding, and the value carried for that
-    /// row here is not written anywhere. Every host of the gate applies a
-    /// setpoint through this function so that "what does a partial mask mean"
-    /// has exactly one answer.
-    pub fn apply_to(&self, targets: &mut [f64; JOINT_COUNT]) -> u16 {
-        for (row, target) in targets.iter_mut().enumerate() {
-            if self.mask & (1 << row) != 0 {
-                *target = self.targets[row];
-            }
-        }
-        self.mask
-    }
-}
-
-impl From<GoalSetpoint> for Goal {
-    fn from(setpoint: GoalSetpoint) -> Self {
-        Self {
-            execute_at_ns: setpoint.execute_at_ns,
-            mask: setpoint.mask,
-            targets: setpoint.targets,
-        }
-    }
-}
-
-impl From<Goal> for GoalSetpoint {
-    fn from(goal: Goal) -> Self {
-        Self {
-            execute_at_ns: goal.execute_at_ns,
-            mask: goal.mask,
-            targets: goal.targets,
-        }
-    }
-}
+/// Bit `n` is bus row `n`, which is what the vocabulary's `JointFlags`
+/// declares; `every_joint_is_a_bit_of_the_mask` holds the two together.
+pub const JOINT_MASK_ALL: u16 = (1 << JOINT_COUNT) - 1;
 
 /// What became of a goal offered to the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,31 +102,13 @@ pub enum AcceptOutcome {
     DroppedQueueFull,
 }
 
-/// A gate restored from a slot holding something no gate ever wrote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GateStateError {
-    /// More queued goals claimed than the queue holds.
-    QueueLenOutOfRange {
-        /// What the slot said.
-        queue_len: u8,
-    },
-}
-
-impl core::fmt::Display for GateStateError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::QueueLenOutOfRange { queue_len } => write!(
-                f,
-                "queue_len {queue_len} is past the {QUEUE_CAP}-goal queue"
-            ),
-        }
-    }
-}
-
-impl core::error::Error for GateStateError {}
-
 /// What the host should do to the bus this cycle.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// The two writing answers name no setpoint: what is to be written is the
+/// gate's own `held`, which the host reads off the state it already has. A
+/// setpoint handed back here would be a copy of it, and a copy is a second
+/// description of what the machine was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateAction {
     /// De-torque every row. The gate is latched and will say this every cycle
     /// until [`GoalGate::release_latch`].
@@ -193,91 +127,66 @@ pub enum GateAction {
         /// reporting is the one nobody asked for.
         just_latched: bool,
     },
-    /// Write this setpoint: it is a newly due goal.
-    WriteGoal(Goal),
-    /// Write this setpoint again: no new goal is due, and the held one stands.
-    Rewrite(Goal),
+    /// Write the held setpoint: a newly due goal has just become it.
+    WriteGoal,
+    /// Write the held setpoint again: no new goal is due, and it stands.
+    Rewrite,
     /// Write nothing. Nothing has ever been commanded.
     Nothing,
 }
 
-/// The gate: a goal queue, the setpoint it is holding, and the dead-man.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GoalGate {
-    /// Queued goals, oldest first. Only the first `queue_len` are occupied.
-    pub queue: [Goal; QUEUE_CAP],
-    /// How many of `queue` are occupied.
-    pub queue_len: u8,
-    /// The setpoint currently held. Meaningful only when `has_held`.
-    pub held: Goal,
-    /// Whether anything has ever been commanded.
-    pub has_held: bool,
-    /// Whether the gate has latched torque off.
-    pub latched: bool,
-    /// When liveness was last observed. Meaningful only when `has_accepted`.
-    pub last_accept_ns: i64,
-    /// Whether liveness has ever been observed. Until it has, the dead-man
-    /// does not run: a driver that has never been armed is not a machine going
-    /// quiet, it is a machine nobody has spoken to yet.
-    pub has_accepted: bool,
+/// The gate: a goal queue, the setpoint it is holding, and the dead-man,
+/// decided over the state they live in.
+///
+/// Borrows the state for as long as a decision is being made and holds nothing
+/// of its own, so a host keeps its state wherever it keeps state — a cog's slot
+/// or a process's memory — and every read a host wants (what is held, whether
+/// the gate is latched, how deep the queue is) is a field of that state rather
+/// than something to ask for here.
+pub struct GoalGate<'a> {
+    /// The state being decided over.
+    state: &'a mut GateState,
 }
 
-impl Default for GoalGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GoalGate {
-    /// A gate holding nothing, with the dead-man not yet running.
-    #[must_use]
-    pub const fn new() -> Self {
+impl<'a> GoalGate<'a> {
+    /// Take up a slot as a gate that has been told nothing.
+    ///
+    /// The producer's route: the slot is cleared, which is an empty queue,
+    /// nothing held, no latch and a dead-man that is not running.
+    pub fn start(slot: &'a mut GateStateWire) -> Self {
         Self {
-            queue: [Goal::EMPTY; QUEUE_CAP],
-            queue_len: 0,
-            held: Goal::EMPTY,
-            has_held: false,
-            latched: false,
-            last_accept_ns: 0,
-            has_accepted: false,
+            state: slot.clear_valid(),
         }
     }
 
-    /// Whether this gate describes a state a gate can be in.
-    ///
-    /// What a host restoring the gate out of a slot calls before ticking it. A
-    /// slot that no gate wrote — one nothing has written at all, or one written
-    /// by something that disagrees about the layout — can claim more queued
-    /// goals than the queue holds, and a host is better told that than handed a
-    /// gate quietly reading a shorter queue than its own state says it has.
-    ///
-    /// # Errors
-    ///
-    /// [`GateStateError`], naming what about the state is impossible.
-    pub fn validate(&self) -> Result<(), GateStateError> {
-        if usize::from(self.queue_len) > QUEUE_CAP {
-            return Err(GateStateError::QueueLenOutOfRange {
-                queue_len: self.queue_len,
-            });
-        }
-        Ok(())
+    /// Decide over the gate state a previous cycle left.
+    pub fn over(state: &'a mut GateState) -> Self {
+        Self { state }
     }
 
-    /// How many queued goals there really are: what `queue_len` says, or the
-    /// end of the queue if it says something past it.
-    ///
-    /// Every read of the queue goes through this. A host that skipped
-    /// [`Self::validate`] gets a gate that gates, rather than an index panic in
-    /// the process whose whole job is to de-torque a machine when things go
-    /// wrong.
-    fn len(&self) -> usize {
-        usize::from(self.queue_len).min(QUEUE_CAP)
-    }
-
-    /// The queued goals, oldest first.
+    /// The state being decided over.
     #[must_use]
-    pub fn queued(&self) -> &[Goal] {
-        &self.queue[..self.len()]
+    pub fn state(&self) -> &GateState {
+        self.state
+    }
+
+    /// The instant the last goal in line is stamped for: the one a fresh goal
+    /// has to come after to be in order. The tail of the queue, or the held
+    /// setpoint when the queue is empty, or nothing at all when neither has
+    /// been commanded — a first goal is measured against nothing.
+    fn last_instant(&self) -> Option<i64> {
+        let queued = self.state.queue.len();
+        if queued > 0 {
+            return self
+                .state
+                .queue
+                .get(queued - 1)
+                .map(|goal| goal.execute_at.as_nanos());
+        }
+        self.state
+            .has_held
+            .get()
+            .then(|| self.state.held.execute_at.as_nanos())
     }
 
     /// Offer a goal to the gate.
@@ -286,22 +195,14 @@ impl GoalGate {
     /// supposed to be commanding this machine is still there, which is what
     /// the dead-man measures. A dropped one is not — a sender overrunning the
     /// queue must not be able to hold torque on by overrunning it faster.
-    pub fn accept(&mut self, goal: Goal, now_ns: i64) -> AcceptOutcome {
-        let len = self.len();
-        if len >= QUEUE_CAP {
+    pub fn accept(&mut self, goal: &GoalSetpoint, now_ns: i64) -> AcceptOutcome {
+        let due_at = goal.execute_at.as_nanos();
+        let out_of_order = self.last_instant().is_some_and(|last| due_at <= last);
+        let stale = due_at < now_ns;
+        let Some(slot) = self.state.queue.try_grow() else {
             return AcceptOutcome::DroppedQueueFull;
-        }
-        let previous = if len > 0 {
-            Some(self.queue[len - 1])
-        } else if self.has_held {
-            Some(self.held)
-        } else {
-            None
         };
-        let out_of_order = previous.is_some_and(|p| goal.execute_at_ns <= p.execute_at_ns);
-        let stale = goal.execute_at_ns < now_ns;
-        self.queue[len] = goal;
-        self.queue_len += 1;
+        copy_setpoint(slot, goal);
         self.note_liveness(now_ns);
         if stale || out_of_order {
             AcceptOutcome::AcceptedStaleOrOutOfOrder
@@ -318,8 +219,8 @@ impl GoalGate {
     /// session starts. A driver with an auxiliary request path counts those
     /// datagrams as liveness the same way.
     pub fn note_liveness(&mut self, now_ns: i64) {
-        self.last_accept_ns = now_ns;
-        self.has_accepted = true;
+        self.state.last_accept = SyncTime::from_nanos(now_ns);
+        self.state.has_accepted = true.into();
     }
 
     /// Latch torque off and drop everything queued.
@@ -333,18 +234,8 @@ impl GoalGate {
     /// [`GoalGate::release_latch`], which is where it would otherwise become a
     /// write.
     pub fn latch_torque_off(&mut self) {
-        self.latched = true;
-        self.clear_queue();
-    }
-
-    /// Empty the queue, in the one shape [`GoalGate::validate`] accepts.
-    ///
-    /// Written once because the invariant is one invariant: entries past the
-    /// length are `EMPTY`, and a re-establishment that missed a field would
-    /// leave a goal behind for a machine that no longer exists.
-    fn clear_queue(&mut self) {
-        self.queue_len = 0;
-        self.queue = [Goal::EMPTY; QUEUE_CAP];
+        self.state.latched = true.into();
+        self.state.queue.clear();
     }
 
     /// End a torque-off latch at `now_ns`, as part of a fresh arming.
@@ -367,7 +258,7 @@ impl GoalGate {
     /// else's fault, is not something to leave to a caller remembering a second
     /// call.
     pub fn release_latch(&mut self, now_ns: i64) {
-        self.latched = false;
+        self.state.latched = false.into();
         self.clear_commanded();
         self.note_liveness(now_ns);
     }
@@ -386,9 +277,9 @@ impl GoalGate {
     /// that de-torqued the machine stops believing it is torqued in the same
     /// breath, which is what actually holds the dead-man off.
     pub fn clear_commanded(&mut self) {
-        self.clear_queue();
-        self.held = Goal::EMPTY;
-        self.has_held = false;
+        self.state.queue.clear();
+        *clockwork_rs::into_raw(&mut self.state.held) = GoalSetpointWire::new();
+        self.state.has_held = false.into();
     }
 
     /// Decide what to write this cycle.
@@ -408,45 +299,77 @@ impl GoalGate {
         believed_torqued: bool,
         hold_timeout_ns: i64,
     ) -> GateAction {
-        if self.latched {
+        if self.state.latched.get() {
             return GateAction::WriteTorqueOffSweep {
                 just_latched: false,
             };
         }
         if believed_torqued
-            && self.has_accepted
-            && nominal_ns.saturating_sub(self.last_accept_ns) > hold_timeout_ns
+            && self.state.has_accepted.get()
+            && nominal_ns.saturating_sub(self.state.last_accept.as_nanos()) > hold_timeout_ns
         {
             self.latch_torque_off();
             return GateAction::WriteTorqueOffSweep { just_latched: true };
         }
-        if self.len() > 0 && self.queue[0].execute_at_ns <= nominal_ns {
-            let goal = self.pop();
-            self.held = goal;
-            self.has_held = true;
-            return GateAction::WriteGoal(goal);
+        let due = self
+            .state
+            .queue
+            .get(0)
+            .is_some_and(|head| head.execute_at.as_nanos() <= nominal_ns);
+        if due {
+            self.take_head();
+            return GateAction::WriteGoal;
         }
-        if self.has_held {
-            return GateAction::Rewrite(self.held);
+        if self.state.has_held.get() {
+            return GateAction::Rewrite;
         }
         GateAction::Nothing
     }
 
-    /// Remove and return the head of the queue. Only called with a non-empty
-    /// queue.
-    fn pop(&mut self) -> Goal {
-        let head = self.queue[0];
-        let len = self.len();
-        self.queue.copy_within(1..len, 0);
-        self.queue_len = (len - 1) as u8;
-        self.queue[self.len()] = Goal::EMPTY;
-        head
+    /// Make the head of the queue the held setpoint and close the gap behind
+    /// it. Only called with a head to take.
+    ///
+    /// The queue is a line rather than a ring: the goals behind the head move
+    /// up, so "oldest first" is the array's own order and there is no cursor to
+    /// disagree with it.
+    fn take_head(&mut self) {
+        let Some(head) = self.state.queue.get(0).map(clockwork_rs::as_raw).cloned() else {
+            return;
+        };
+        *clockwork_rs::into_raw(&mut self.state.held) = head;
+        self.state.has_held = true.into();
+        for behind in 1..self.state.queue.len() {
+            let Some(goal) = self
+                .state
+                .queue
+                .get(behind)
+                .map(clockwork_rs::as_raw)
+                .cloned()
+            else {
+                break;
+            };
+            if let Some(ahead) = self.state.queue.get_mut(behind - 1) {
+                *clockwork_rs::into_raw(ahead) = goal;
+            }
+        }
+        self.state.queue.pop();
     }
+}
+
+/// Copy a setpoint into the place `dst` names, whole.
+///
+/// One statement of what a setpoint is worth copying: all of it. Copying field
+/// by field is where a queue entry ends up carrying one goal's instant and
+/// another's angles, and the bytes are a validated message either way.
+fn copy_setpoint(dst: &mut GoalSetpoint, src: &GoalSetpoint) {
+    *clockwork_rs::into_raw(dst) = clockwork_rs::as_raw(src).clone();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
+    use clockwork_rs::blob_as_bytes;
 
     const PERIOD: i64 = 20_000_000;
     const HOLD_TIMEOUT: i64 = 200_000_000;
@@ -463,229 +386,348 @@ mod tests {
         just_latched: false,
     };
 
-    fn goal_at(execute_at_ns: i64, value: f64) -> Goal {
-        Goal {
-            execute_at_ns,
-            mask: JOINT_MASK_ALL,
-            targets: [value; JOINT_COUNT],
+    /// A gate's state and the slot it lives in, so a case can hold one value
+    /// and still hand out the borrow every decision takes.
+    struct Fixture {
+        /// The slot the gate decides over.
+        slot: GateStateWire,
+    }
+
+    impl Fixture {
+        /// A gate that has been told nothing.
+        fn new() -> Self {
+            let mut slot = GateStateWire::new();
+            GoalGate::start(&mut slot);
+            Self { slot }
+        }
+
+        /// The gate, for one decision.
+        fn gate(&mut self) -> GoalGate<'_> {
+            GoalGate::over(
+                self.slot
+                    .validate_mut()
+                    .expect("a gate leaves a gate in its slot"),
+            )
+        }
+
+        /// What the last decision left.
+        fn state(&self) -> &GateState {
+            self.slot
+                .validate()
+                .expect("a gate leaves a gate in its slot")
+        }
+
+        /// How many goals are waiting.
+        fn queued(&self) -> usize {
+            self.state().queue.len()
         }
     }
 
     /// A gate that has just been armed: torque on, liveness seeded, nothing
     /// commanded yet.
-    fn armed_at(now_ns: i64) -> GoalGate {
-        let mut gate = GoalGate::new();
-        gate.note_liveness(now_ns);
-        gate
+    fn armed_at(now_ns: i64) -> Fixture {
+        let mut fx = Fixture::new();
+        fx.gate().note_liveness(now_ns);
+        fx
+    }
+
+    /// A setpoint for every servo at one angle, stamped for `execute_at_ns`.
+    fn goal_at(execute_at_ns: i64, value: f64) -> GoalSetpointWire {
+        let mut wire = GoalSetpointWire::new();
+        let goal = wire.clear_valid();
+        goal.execute_at = SyncTime::from_nanos(execute_at_ns);
+        goal.mask = every_joint();
+        for row in [
+            &mut goal.targets.body_yaw,
+            &mut goal.targets.leg_0,
+            &mut goal.targets.leg_1,
+            &mut goal.targets.leg_2,
+            &mut goal.targets.leg_3,
+            &mut goal.targets.leg_4,
+            &mut goal.targets.leg_5,
+            &mut goal.targets.antenna_right,
+            &mut goal.targets.antenna_left,
+        ] {
+            *row = value;
+        }
+        wire
+    }
+
+    /// Every servo on the bus, as a set.
+    fn every_joint() -> JointFlags {
+        JointFlagsWire(JOINT_MASK_ALL)
+            .to_known()
+            .expect("every bus row is a bus row")
+    }
+
+    /// A made setpoint, read the way a host hands one to the gate.
+    fn view(goal: &GoalSetpointWire) -> &GoalSetpoint {
+        goal.validate().expect("a made setpoint is a setpoint")
+    }
+
+    /// Assert the gate is holding exactly that setpoint, byte for byte.
+    fn assert_held(fx: &Fixture, goal: &GoalSetpointWire, what: &str) {
+        assert!(fx.state().has_held.get(), "{what}: nothing is held");
+        assert_eq!(
+            blob_as_bytes(clockwork_rs::as_raw(&fx.state().held)),
+            blob_as_bytes(goal),
+            "{what}"
+        );
+    }
+
+    /// Assert the gate is holding nothing at all.
+    fn assert_holds_nothing(fx: &Fixture, what: &str) {
+        assert!(!fx.state().has_held.get(), "{what}");
+        assert_eq!(
+            blob_as_bytes(clockwork_rs::as_raw(&fx.state().held)),
+            blob_as_bytes(&GoalSetpointWire::new()),
+            "{what}: a setpoint was left behind"
+        );
     }
 
     #[test]
     fn a_fresh_gate_writes_nothing() {
-        let mut gate = GoalGate::new();
-        assert_eq!(gate.tick(T0, false, HOLD_TIMEOUT), GateAction::Nothing);
+        let mut fx = Fixture::new();
+        assert_eq!(fx.gate().tick(T0, false, HOLD_TIMEOUT), GateAction::Nothing);
         assert_eq!(
-            gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT),
             GateAction::Nothing
         );
-        assert!(!gate.has_held);
+        assert!(!fx.state().has_held.get());
     }
 
     #[test]
     fn a_goal_executes_at_its_instant_and_not_before() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let goal = goal_at(T0 + 2 * PERIOD, 0.5);
-        assert_eq!(gate.accept(goal, T0), AcceptOutcome::Accepted);
-        assert_eq!(gate.tick(T0, true, HOLD_TIMEOUT), GateAction::Nothing);
+        assert_eq!(fx.gate().accept(view(&goal), T0), AcceptOutcome::Accepted);
+        assert_eq!(fx.gate().tick(T0, true, HOLD_TIMEOUT), GateAction::Nothing);
         assert_eq!(
-            gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT),
             GateAction::Nothing
         );
         assert_eq!(
-            gate.tick(T0 + 2 * PERIOD, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(goal)
+            fx.gate().tick(T0 + 2 * PERIOD, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
         );
     }
 
     #[test]
     fn a_due_goal_becomes_the_held_setpoint_and_is_rewritten_after() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let goal = goal_at(T0 + PERIOD, 0.25);
-        gate.accept(goal, T0);
+        fx.gate().accept(view(&goal), T0);
         assert_eq!(
-            gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(goal)
+            fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
         );
         for step in 2..6 {
             assert_eq!(
-                gate.tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
-                GateAction::Rewrite(goal),
+                fx.gate().tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
+                GateAction::Rewrite,
                 "cycle {step}"
             );
         }
-        assert_eq!(gate.held, goal);
+        assert_held(&fx, &goal, "the setpoint stands between goals");
     }
 
     #[test]
     fn a_backlog_drains_one_goal_per_tick_in_order() {
-        let mut gate = armed_at(T0);
-        let goals: Vec<Goal> = (1..=3)
+        let mut fx = armed_at(T0);
+        let goals: Vec<GoalSetpointWire> = (1..=3)
             .map(|i| goal_at(T0 + i * PERIOD, f64::from(i as i32)))
             .collect();
         for goal in &goals {
-            assert_eq!(gate.accept(*goal, T0), AcceptOutcome::Accepted);
+            assert_eq!(fx.gate().accept(view(goal), T0), AcceptOutcome::Accepted);
         }
         // All three are due at once: the gate is a cycle behind.
         let late = T0 + 10 * PERIOD;
+        for (nth, goal) in goals.iter().enumerate() {
+            assert_eq!(
+                fx.gate().tick(late, true, HOLD_TIMEOUT),
+                GateAction::WriteGoal,
+                "tick {nth}"
+            );
+            assert_held(&fx, goal, &format!("the {nth}th goal out of the backlog"));
+            // What is still queued is what was behind it, in the order it
+            // arrived: the take shifts the entries down, which is where a
+            // duplicated head or a transposed pair would show.
+            assert_eq!(fx.queued(), goals.len() - nth - 1, "tick {nth}");
+            for (behind, queued) in goals[nth + 1..].iter().enumerate() {
+                assert_eq!(
+                    fx.state()
+                        .queue
+                        .get(behind)
+                        .map(clockwork_rs::as_raw)
+                        .map(blob_as_bytes),
+                    Some(blob_as_bytes(queued)),
+                    "tick {nth}, queue entry {behind}"
+                );
+            }
+        }
         assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(goals[0])
+            fx.gate().tick(late, true, HOLD_TIMEOUT),
+            GateAction::Rewrite
         );
-        assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(goals[1])
-        );
-        assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(goals[2])
-        );
-        assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::Rewrite(goals[2])
-        );
-        assert_eq!(gate.queue_len, 0);
+        assert_held(&fx, &goals[2], "and the last one stands");
+        assert_eq!(fx.queued(), 0);
     }
 
     #[test]
     fn a_full_queue_drops_and_says_so_without_disturbing_what_is_queued() {
-        let mut gate = armed_at(T0);
-        for i in 1..=QUEUE_CAP {
+        let mut fx = armed_at(T0);
+        let depth = fx.state().queue.capacity();
+        let mut queued = Vec::new();
+        for i in 1..=depth {
             let goal = goal_at(T0 + i as i64 * PERIOD, i as f64);
-            assert_eq!(gate.accept(goal, T0), AcceptOutcome::Accepted);
+            assert_eq!(fx.gate().accept(view(&goal), T0), AcceptOutcome::Accepted);
+            queued.push(goal);
         }
-        let before = gate.queued().to_vec();
         let overflow = goal_at(T0 + 99 * PERIOD, 99.0);
-        assert_eq!(gate.accept(overflow, T0), AcceptOutcome::DroppedQueueFull);
-        assert_eq!(gate.queued(), before.as_slice());
-        assert_eq!(gate.queue_len as usize, QUEUE_CAP);
+        assert_eq!(
+            fx.gate().accept(view(&overflow), T0),
+            AcceptOutcome::DroppedQueueFull
+        );
+        assert_eq!(fx.queued(), depth);
+        for (nth, goal) in queued.iter().enumerate() {
+            assert_eq!(
+                fx.state()
+                    .queue
+                    .get(nth)
+                    .map(clockwork_rs::as_raw)
+                    .map(blob_as_bytes),
+                Some(blob_as_bytes(goal)),
+                "queue entry {nth} was disturbed by the refusal"
+            );
+        }
     }
 
     #[test]
     fn a_dropped_goal_is_not_liveness() {
-        let mut gate = armed_at(T0);
-        for i in 1..=QUEUE_CAP {
-            gate.accept(goal_at(T0 + i as i64 * PERIOD, 0.0), T0);
+        let mut fx = armed_at(T0);
+        for i in 1..=fx.state().queue.capacity() {
+            fx.gate()
+                .accept(view(&goal_at(T0 + i as i64 * PERIOD, 0.0)), T0);
         }
-        assert_eq!(gate.last_accept_ns, T0);
-        gate.accept(goal_at(T0 + 99 * PERIOD, 0.0), T0 + 5 * PERIOD);
+        assert_eq!(fx.state().last_accept.as_nanos(), T0);
+        fx.gate()
+            .accept(view(&goal_at(T0 + 99 * PERIOD, 0.0)), T0 + 5 * PERIOD);
         assert_eq!(
-            gate.last_accept_ns, T0,
+            fx.state().last_accept.as_nanos(),
+            T0,
             "a refused goal must not feed the dead-man"
         );
     }
 
     #[test]
     fn a_stale_goal_is_accepted_warned_and_executed_in_arrival_order() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let stale = goal_at(T0 - PERIOD, 1.0);
         assert_eq!(
-            gate.accept(stale, T0),
+            fx.gate().accept(view(&stale), T0),
             AcceptOutcome::AcceptedStaleOrOutOfOrder
         );
         assert_eq!(
-            gate.tick(T0, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(stale)
+            fx.gate().tick(T0, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
         );
     }
 
     #[test]
     fn an_out_of_order_goal_is_accepted_warned_and_never_reordered() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let later = goal_at(T0 + 4 * PERIOD, 1.0);
         let earlier = goal_at(T0 + 2 * PERIOD, 2.0);
-        assert_eq!(gate.accept(later, T0), AcceptOutcome::Accepted);
+        assert_eq!(fx.gate().accept(view(&later), T0), AcceptOutcome::Accepted);
         assert_eq!(
-            gate.accept(earlier, T0),
+            fx.gate().accept(view(&earlier), T0),
             AcceptOutcome::AcceptedStaleOrOutOfOrder
         );
         let late = T0 + 8 * PERIOD;
         assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(later)
+            fx.gate().tick(late, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
         );
+        assert_held(&fx, &later, "the one that arrived first executes first");
         assert_eq!(
-            gate.tick(late, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(earlier)
+            fx.gate().tick(late, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
+        );
+        assert_held(
+            &fx,
+            &earlier,
+            "and the earlier instant executes after it, unreordered",
         );
     }
 
     #[test]
     fn a_goal_no_later_than_the_held_setpoint_is_out_of_order_too() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let first = goal_at(T0 + PERIOD, 1.0);
-        gate.accept(first, T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        fx.gate().accept(view(&first), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         assert_eq!(
-            gate.accept(goal_at(T0 + PERIOD, 2.0), T0 + PERIOD),
+            fx.gate()
+                .accept(view(&goal_at(T0 + PERIOD, 2.0)), T0 + PERIOD),
             AcceptOutcome::AcceptedStaleOrOutOfOrder
         );
     }
 
     #[test]
     fn the_dead_man_fires_one_nanosecond_past_the_timeout_and_not_at_it() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
-        assert!(matches!(
-            gate.tick(T0 + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
-            GateAction::Rewrite(_)
-        ));
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            GateAction::Rewrite
+        );
+        assert_eq!(
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
-        assert!(gate.latched);
+        assert!(fx.state().latched.get());
     }
 
     #[test]
     fn the_dead_man_fires_with_nothing_ever_commanded() {
         // Armed, torqued, and the commander never sent a first goal. This is
         // the window a dead-man written around the held setpoint would miss.
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
             GateAction::Nothing
         );
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
-        assert!(gate.latched);
-        assert!(!gate.has_held);
+        assert!(fx.state().latched.get());
+        assert!(!fx.state().has_held.get());
     }
 
     #[test]
     fn the_dead_man_does_not_run_before_anything_is_armed() {
-        let mut gate = GoalGate::new();
+        let mut fx = Fixture::new();
         assert_eq!(
-            gate.tick(T0 + 10 * HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + 10 * HOLD_TIMEOUT, true, HOLD_TIMEOUT),
             GateAction::Nothing
         );
-        assert!(!gate.latched);
+        assert!(!fx.state().latched.get());
     }
 
     #[test]
     fn the_dead_man_does_not_run_on_a_machine_that_is_not_torqued() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         for step in 1..20 {
-            let action = gate.tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
-            assert!(
-                matches!(action, GateAction::Rewrite(_)),
-                "cycle {step}: {action:?}"
-            );
+            let action = fx
+                .gate()
+                .tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
+            assert!(action == GateAction::Rewrite, "cycle {step}: {action:?}");
         }
-        assert!(!gate.latched);
+        assert!(!fx.state().latched.get());
     }
 
     #[test]
@@ -693,12 +735,12 @@ mod tests {
         // Only a datagram from outside refreshes the window. If rewriting the
         // held setpoint counted, the dead-man would be measuring the driver's
         // own pulse and would never fire.
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
         let mut now = T0 + PERIOD;
         let mut rewrites = 0;
         loop {
-            match gate.tick(now, true, HOLD_TIMEOUT) {
+            match fx.gate().tick(now, true, HOLD_TIMEOUT) {
                 GateAction::WriteTorqueOffSweep { .. } => break,
                 _ => rewrites += 1,
             }
@@ -710,32 +752,31 @@ mod tests {
 
     #[test]
     fn a_live_goal_stream_holds_the_dead_man_off_indefinitely() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let mut now = T0;
         for step in 1..500 {
             now = T0 + step * PERIOD;
-            gate.accept(goal_at(now + 2 * PERIOD, 0.0), now);
-            let action = gate.tick(now, true, HOLD_TIMEOUT);
+            fx.gate().accept(view(&goal_at(now + 2 * PERIOD, 0.0)), now);
+            let action = fx.gate().tick(now, true, HOLD_TIMEOUT);
             assert!(
                 !matches!(action, GateAction::WriteTorqueOffSweep { .. }),
                 "cycle {step}"
             );
         }
-        assert!(!gate.latched);
-        assert_eq!(gate.last_accept_ns, now);
+        assert!(!fx.state().latched.get());
+        assert_eq!(fx.state().last_accept.as_nanos(), now);
     }
 
     #[test]
     fn a_latch_clears_the_queue_and_stays_until_released() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.accept(goal_at(T0 + 2 * PERIOD, 0.0), T0);
-        gate.latch_torque_off();
-        assert_eq!(gate.queue_len, 0);
-        assert_eq!(gate.queued(), &[]);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().accept(view(&goal_at(T0 + 2 * PERIOD, 0.0)), T0);
+        fx.gate().latch_torque_off();
+        assert_eq!(fx.queued(), 0);
         for step in 0..10 {
             assert_eq!(
-                gate.tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
+                fx.gate().tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
                 STANDING_SWEEP
             );
         }
@@ -743,13 +784,13 @@ mod tests {
 
     #[test]
     fn a_goal_that_arrives_during_a_latch_does_not_execute_after_it() {
-        let mut gate = armed_at(T0);
-        gate.latch_torque_off();
-        gate.accept(goal_at(T0 + PERIOD, 1.0), T0);
-        gate.release_latch(T0);
-        assert_eq!(gate.queue_len, 0);
+        let mut fx = armed_at(T0);
+        fx.gate().latch_torque_off();
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 1.0)), T0);
+        fx.gate().release_latch(T0);
+        assert_eq!(fx.queued(), 0);
         assert_eq!(
-            gate.tick(T0 + PERIOD, false, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + PERIOD, false, HOLD_TIMEOUT),
             GateAction::Nothing
         );
     }
@@ -759,37 +800,45 @@ mod tests {
         // The whole of a re-arming, with no second call to remember: if the
         // release left the old liveness instant standing, this cycle would
         // re-latch and report it as a stalled commander.
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let latched_at = T0 + HOLD_TIMEOUT + 1;
-        assert_eq!(gate.tick(latched_at, true, HOLD_TIMEOUT), LATCHING_SWEEP);
-        let rearmed_at = latched_at + PERIOD;
-        gate.release_latch(rearmed_at);
         assert_eq!(
-            gate.tick(rearmed_at, true, HOLD_TIMEOUT),
+            fx.gate().tick(latched_at, true, HOLD_TIMEOUT),
+            LATCHING_SWEEP
+        );
+        let rearmed_at = latched_at + PERIOD;
+        fx.gate().release_latch(rearmed_at);
+        assert_eq!(
+            fx.gate().tick(rearmed_at, true, HOLD_TIMEOUT),
             GateAction::Nothing,
             "a released latch must not fire the dead-man on stale evidence"
         );
-        assert!(!gate.latched);
+        assert!(!fx.state().latched.get());
     }
 
     #[test]
     fn releasing_the_latch_grants_a_fresh_dead_man_window() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let latched_at = T0 + HOLD_TIMEOUT + 1;
-        assert_eq!(gate.tick(latched_at, true, HOLD_TIMEOUT), LATCHING_SWEEP);
-        let rearmed_at = latched_at + PERIOD;
-        gate.release_latch(rearmed_at);
         assert_eq!(
-            gate.tick(rearmed_at, true, HOLD_TIMEOUT),
+            fx.gate().tick(latched_at, true, HOLD_TIMEOUT),
+            LATCHING_SWEEP
+        );
+        let rearmed_at = latched_at + PERIOD;
+        fx.gate().release_latch(rearmed_at);
+        assert_eq!(
+            fx.gate().tick(rearmed_at, true, HOLD_TIMEOUT),
             GateAction::Nothing
         );
         assert_eq!(
-            gate.tick(rearmed_at + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            fx.gate()
+                .tick(rearmed_at + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
             GateAction::Nothing,
             "the window is measured from the re-arming, not from the old latch"
         );
         assert_eq!(
-            gate.tick(rearmed_at + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate()
+                .tick(rearmed_at + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
     }
@@ -798,13 +847,12 @@ mod tests {
     fn a_held_setpoint_survives_a_latch_so_the_sample_stream_stays_truthful() {
         // The latch stops writes; it does not erase what was last commanded,
         // which is what a driver reports as `commanded` in its samples.
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let goal = goal_at(T0 + PERIOD, 0.75);
-        gate.accept(goal, T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
-        gate.latch_torque_off();
-        assert!(gate.has_held);
-        assert_eq!(gate.held, goal);
+        fx.gate().accept(view(&goal), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        fx.gate().latch_torque_off();
+        assert_held(&fx, &goal, "the latch leaves the sample stream truthful");
     }
 
     /// A re-arming after a dead-man latch starts from nothing commanded.
@@ -816,34 +864,34 @@ mod tests {
     /// goal lands.
     #[test]
     fn a_re_armed_gate_writes_nothing_until_the_new_session_commands_something() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let old = goal_at(T0 + PERIOD, 0.75);
-        gate.accept(old, T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        fx.gate().accept(view(&old), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         let latched_at = T0 + PERIOD + HOLD_TIMEOUT + 1;
-        assert_eq!(gate.tick(latched_at, true, HOLD_TIMEOUT), LATCHING_SWEEP);
         assert_eq!(
-            gate.held, old,
-            "the latch leaves the sample stream truthful"
+            fx.gate().tick(latched_at, true, HOLD_TIMEOUT),
+            LATCHING_SWEEP
         );
+        assert_held(&fx, &old, "the latch leaves the sample stream truthful");
 
         let rearmed_at = latched_at + PERIOD;
-        gate.release_latch(rearmed_at);
-        assert!(!gate.has_held, "the dead session's setpoint went with it");
-        assert_eq!(gate.held, Goal::EMPTY);
+        fx.gate().release_latch(rearmed_at);
+        assert_holds_nothing(&fx, "the dead session's setpoint went with it");
         for step in 0..5 {
             assert_eq!(
-                gate.tick(rearmed_at + step * PERIOD, true, HOLD_TIMEOUT),
+                fx.gate()
+                    .tick(rearmed_at + step * PERIOD, true, HOLD_TIMEOUT),
                 GateAction::Nothing,
                 "cycle {step}: a re-armed gate writes nothing of the old session's",
             );
         }
 
         let fresh = goal_at(rearmed_at + 6 * PERIOD, 0.1);
-        gate.accept(fresh, rearmed_at + 5 * PERIOD);
+        fx.gate().accept(view(&fresh), rearmed_at + 5 * PERIOD);
         assert_eq!(
-            gate.tick(rearmed_at + 6 * PERIOD, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(fresh),
+            fx.gate().tick(rearmed_at + 6 * PERIOD, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal,
             "and writes what the new session asks for",
         );
     }
@@ -853,15 +901,16 @@ mod tests {
     /// before the machine was de-torqued.
     #[test]
     fn the_first_goal_after_a_re_arming_is_not_out_of_order() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + 100 * PERIOD, 1.0), T0);
-        gate.tick(T0 + 100 * PERIOD, true, HOLD_TIMEOUT);
-        gate.latch_torque_off();
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + 100 * PERIOD, 1.0)), T0);
+        fx.gate().tick(T0 + 100 * PERIOD, true, HOLD_TIMEOUT);
+        fx.gate().latch_torque_off();
 
         let rearmed_at = T0 + 101 * PERIOD;
-        gate.release_latch(rearmed_at);
+        fx.gate().release_latch(rearmed_at);
         assert_eq!(
-            gate.accept(goal_at(rearmed_at + PERIOD, 2.0), rearmed_at),
+            fx.gate()
+                .accept(view(&goal_at(rearmed_at + PERIOD, 2.0)), rearmed_at),
             AcceptOutcome::Accepted,
             "nothing from the dead session is an ordering baseline",
         );
@@ -869,19 +918,22 @@ mod tests {
 
     #[test]
     fn a_confirmed_disarm_forgets_what_was_commanded_without_latching() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         let goal = goal_at(T0 + PERIOD, 0.5);
-        gate.accept(goal, T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
-        gate.accept(goal_at(T0 + 4 * PERIOD, 0.75), T0 + PERIOD);
+        fx.gate().accept(view(&goal), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        fx.gate()
+            .accept(view(&goal_at(T0 + 4 * PERIOD, 0.75)), T0 + PERIOD);
 
-        gate.clear_commanded();
-        assert!(!gate.has_held, "nothing is being held any more");
-        assert_eq!(gate.held, Goal::EMPTY);
-        assert_eq!(gate.queued(), &[]);
-        assert!(!gate.latched, "a deliberate disarm is not a fault");
+        fx.gate().clear_commanded();
+        assert_holds_nothing(&fx, "nothing is being held any more");
+        assert_eq!(fx.queued(), 0);
+        assert!(
+            !fx.state().latched.get(),
+            "a deliberate disarm is not a fault"
+        );
         assert_eq!(
-            gate.tick(T0 + 5 * PERIOD, false, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + 5 * PERIOD, false, HOLD_TIMEOUT),
             GateAction::Nothing,
             "a gate holding nothing writes nothing"
         );
@@ -891,76 +943,30 @@ mod tests {
     /// what holds the timer off is the host's belief and not this call.
     #[test]
     fn a_confirmed_disarm_leaves_the_dead_man_where_it_was() {
-        let mut gate = armed_at(T0);
-        gate.clear_commanded();
-        assert!(gate.has_accepted, "the arming still happened");
-        assert_eq!(gate.last_accept_ns, T0);
+        let mut fx = armed_at(T0);
+        fx.gate().clear_commanded();
+        assert!(fx.state().has_accepted.get(), "the arming still happened");
+        assert_eq!(fx.state().last_accept.as_nanos(), T0);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP,
             "a machine believed torqued with nobody talking still de-torques"
         );
     }
 
     #[test]
-    fn a_partial_mask_writes_only_its_own_rows() {
-        let mut targets = [0.0; JOINT_COUNT];
-        let goal = Goal {
-            execute_at_ns: T0,
-            mask: 0b0_0000_0101,
-            targets: [1.0; JOINT_COUNT],
-        };
-        assert_eq!(goal.apply_to(&mut targets), 0b0_0000_0101);
-        assert_eq!(targets, [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-
-        let other = Goal {
-            execute_at_ns: T0,
-            mask: JOINT_MASK_ALL & !0b0_0000_0101,
-            targets: [2.0; JOINT_COUNT],
-        };
-        other.apply_to(&mut targets);
-        assert_eq!(targets, [1.0, 2.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]);
-    }
-
-    #[test]
-    fn an_empty_mask_writes_nothing() {
-        let mut targets = [7.0; JOINT_COUNT];
-        let goal = Goal {
-            execute_at_ns: T0,
-            mask: 0,
-            targets: [1.0; JOINT_COUNT],
-        };
-        assert_eq!(goal.apply_to(&mut targets), 0);
-        assert_eq!(targets, [7.0; JOINT_COUNT]);
-    }
-
-    #[test]
     fn extreme_timestamps_do_not_overflow_the_dead_man() {
-        let mut gate = GoalGate::new();
-        gate.note_liveness(i64::MIN);
-        assert_eq!(gate.tick(i64::MAX, true, HOLD_TIMEOUT), LATCHING_SWEEP);
+        let mut fx = Fixture::new();
+        fx.gate().note_liveness(i64::MIN);
+        assert_eq!(fx.gate().tick(i64::MAX, true, HOLD_TIMEOUT), LATCHING_SWEEP);
 
-        let mut gate = GoalGate::new();
-        gate.note_liveness(i64::MAX);
-        assert_eq!(gate.tick(i64::MIN, true, HOLD_TIMEOUT), GateAction::Nothing);
-        assert!(!gate.latched);
-    }
-
-    #[test]
-    fn a_wire_setpoint_and_a_queued_goal_are_the_same_three_values() {
-        // Every host of this gate receives goals as datagrams. The conversion
-        // is here, once, so no host writes a field-by-field copy that could put
-        // the mask where the instant goes.
-        let setpoint = reachy_wire::GoalSetpoint {
-            execute_at_ns: T0 + 3 * PERIOD,
-            mask: 0b0_0001_0110,
-            targets: core::array::from_fn(|row| row as f64 * 0.25),
-        };
-        let goal = Goal::from(setpoint);
-        assert_eq!(goal.execute_at_ns, setpoint.execute_at_ns);
-        assert_eq!(goal.mask, setpoint.mask);
-        assert_eq!(goal.targets, setpoint.targets);
-        assert_eq!(reachy_wire::GoalSetpoint::from(goal), setpoint);
+        let mut fx = Fixture::new();
+        fx.gate().note_liveness(i64::MAX);
+        assert_eq!(
+            fx.gate().tick(i64::MIN, true, HOLD_TIMEOUT),
+            GateAction::Nothing
+        );
+        assert!(!fx.state().latched.get());
     }
 
     /// The dead-man's own latch is announced once and never again.
@@ -972,16 +978,17 @@ mod tests {
     /// work out.
     #[test]
     fn a_dead_man_latch_is_announced_on_its_own_cycle_and_no_other() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
         for step in 2..12 {
             assert_eq!(
-                gate.tick(T0 + HOLD_TIMEOUT + step * PERIOD, true, HOLD_TIMEOUT),
+                fx.gate()
+                    .tick(T0 + HOLD_TIMEOUT + step * PERIOD, true, HOLD_TIMEOUT),
                 STANDING_SWEEP,
                 "cycle {step}"
             );
@@ -993,14 +1000,15 @@ mod tests {
     /// nothing at all.
     #[test]
     fn a_dead_man_latch_before_the_first_goal_is_announced_too() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
-        assert!(!gate.has_held, "nothing was ever commanded");
+        assert!(!fx.state().has_held.get(), "nothing was ever commanded");
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + PERIOD, true, HOLD_TIMEOUT),
+            fx.gate()
+                .tick(T0 + HOLD_TIMEOUT + PERIOD, true, HOLD_TIMEOUT),
             STANDING_SWEEP
         );
     }
@@ -1010,24 +1018,28 @@ mod tests {
     /// here would be a second event for one de-torque.
     #[test]
     fn a_latch_the_host_asked_for_announces_no_edge() {
-        let mut gate = armed_at(T0);
-        gate.latch_torque_off();
-        assert_eq!(gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT), STANDING_SWEEP);
+        let mut fx = armed_at(T0);
+        fx.gate().latch_torque_off();
+        assert_eq!(
+            fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT),
+            STANDING_SWEEP
+        );
     }
 
     /// Two latches in one session are two edges: a release and a fresh stall
     /// announce the second one as loudly as the first.
     #[test]
     fn a_second_stall_after_a_re_arming_is_announced_again() {
-        let mut gate = armed_at(T0);
+        let mut fx = armed_at(T0);
         assert_eq!(
-            gate.tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
         let rearmed_at = T0 + 2 * HOLD_TIMEOUT;
-        gate.release_latch(rearmed_at);
+        fx.gate().release_latch(rearmed_at);
         assert_eq!(
-            gate.tick(rearmed_at + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate()
+                .tick(rearmed_at + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
     }
@@ -1040,20 +1052,19 @@ mod tests {
     /// promises unconditionally.
     #[test]
     fn a_due_goal_does_not_escape_a_standing_latch() {
-        let mut gate = armed_at(T0);
-        gate.latch_torque_off();
+        let mut fx = armed_at(T0);
+        fx.gate().latch_torque_off();
         let due = goal_at(T0 - PERIOD, 1.0);
-        gate.accept(due, T0);
-        assert_eq!(gate.queued(), &[due], "the goal really is queued and due");
+        fx.gate().accept(view(&due), T0);
+        assert_eq!(fx.queued(), 1, "the goal really is queued and due");
 
         for step in 0..3 {
             assert_eq!(
-                gate.tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
+                fx.gate().tick(T0 + step * PERIOD, true, HOLD_TIMEOUT),
                 STANDING_SWEEP,
                 "cycle {step}"
             );
-            assert!(!gate.has_held, "cycle {step}: a setpoint was taken up");
-            assert_eq!(gate.held, Goal::EMPTY, "cycle {step}");
+            assert_holds_nothing(&fx, &format!("cycle {step}: a setpoint was taken up"));
         }
     }
 
@@ -1067,15 +1078,17 @@ mod tests {
     /// already spent.
     #[test]
     fn belief_returning_without_a_word_latches_on_the_first_torqued_cycle() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         for step in 1..20 {
-            let quiet = gate.tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
-            assert!(matches!(quiet, GateAction::Rewrite(_)), "cycle {step}");
+            let quiet = fx
+                .gate()
+                .tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
+            assert!(quiet == GateAction::Rewrite, "cycle {step}");
         }
         assert_eq!(
-            gate.tick(T0 + 20 * HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            fx.gate().tick(T0 + 20 * HOLD_TIMEOUT, true, HOLD_TIMEOUT),
             LATCHING_SWEEP
         );
     }
@@ -1085,90 +1098,116 @@ mod tests {
     /// happened to arrive.
     #[test]
     fn belief_returning_after_an_arming_starts_the_window_at_the_arming() {
-        let mut gate = armed_at(T0);
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        gate.tick(T0 + PERIOD, true, HOLD_TIMEOUT);
+        let mut fx = armed_at(T0);
+        fx.gate().accept(view(&goal_at(T0 + PERIOD, 0.0)), T0);
+        fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT);
         for step in 1..20 {
-            gate.tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
+            fx.gate()
+                .tick(T0 + step * HOLD_TIMEOUT, false, HOLD_TIMEOUT);
         }
 
         let armed_again = T0 + 20 * HOLD_TIMEOUT;
-        gate.note_liveness(armed_again);
-        assert!(matches!(
-            gate.tick(armed_again, true, HOLD_TIMEOUT),
-            GateAction::Rewrite(_)
-        ));
-        assert!(matches!(
-            gate.tick(armed_again + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
-            GateAction::Rewrite(_)
-        ));
+        fx.gate().note_liveness(armed_again);
         assert_eq!(
-            gate.tick(armed_again + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
+            fx.gate().tick(armed_again, true, HOLD_TIMEOUT),
+            GateAction::Rewrite
+        );
+        assert_eq!(
+            fx.gate()
+                .tick(armed_again + HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            GateAction::Rewrite
+        );
+        assert_eq!(
+            fx.gate()
+                .tick(armed_again + HOLD_TIMEOUT + 1, true, HOLD_TIMEOUT),
             LATCHING_SWEEP,
             "the window is measured from the arming"
         );
     }
 
+    /// A gate out of a slot nothing wrote is a gate that has been told nothing.
+    ///
+    /// The state a fresh slot holds is the state the gate starts from, so there
+    /// is nothing to restore and no length to disbelieve: this crate runs in the
+    /// process that de-torques the machine when the commander stops answering,
+    /// and a queue whose depth was a separate number is a way for that process
+    /// to meet one it cannot trust.
     #[test]
-    fn a_queue_length_no_gate_wrote_is_named_rather_than_trusted() {
-        let mut gate = armed_at(T0);
-        assert_eq!(gate.validate(), Ok(()));
-        gate.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        assert_eq!(gate.validate(), Ok(()));
+    fn a_slot_nothing_wrote_is_a_gate_that_has_been_told_nothing() {
+        let slot = GateStateWire::new();
+        let state = slot.validate().expect("a cleared slot is a gate");
+        assert_eq!(state.queue.len(), 0);
+        assert!(!state.has_held.get());
+        assert!(!state.latched.get());
+        assert!(!state.has_accepted.get());
 
-        gate.queue_len = 200;
+        let mut fx = Fixture { slot };
         assert_eq!(
-            gate.validate(),
-            Err(GateStateError::QueueLenOutOfRange { queue_len: 200 })
-        );
-        assert!(
-            GateStateError::QueueLenOutOfRange { queue_len: 200 }
-                .to_string()
-                .contains("200")
+            fx.gate().tick(T0 + 10 * HOLD_TIMEOUT, true, HOLD_TIMEOUT),
+            GateAction::Nothing,
+            "the dead-man does not run on a driver nobody has spoken to"
         );
     }
 
-    /// A gate restored from a slot nothing wrote still gates.
-    ///
-    /// This crate runs in the process that de-torques the machine when the
-    /// commander stops answering. A panic there over a bad state field takes
-    /// the dead-man down with it, so a queue length past the end of the queue
-    /// is read as the end and every path keeps working.
+    /// The queue is as deep as it is declared, and the depth is one number.
     #[test]
-    fn a_corrupt_queue_length_gates_instead_of_panicking() {
-        let mut gate = armed_at(T0);
-        let due = goal_at(T0, 1.0);
-        gate.accept(due, T0);
-        gate.queue_len = u8::MAX;
-
+    fn the_queue_is_exactly_as_deep_as_the_schema_declares() {
+        let mut fx = armed_at(T0);
+        let depth = fx.state().queue.capacity();
+        for i in 1..=depth {
+            assert_eq!(
+                fx.gate()
+                    .accept(view(&goal_at(T0 + i as i64 * PERIOD, 0.0)), T0),
+                AcceptOutcome::Accepted,
+                "goal {i}"
+            );
+        }
         assert_eq!(
-            gate.queued().len(),
-            QUEUE_CAP,
-            "a queue read no further than it has slots"
-        );
-        assert_eq!(
-            gate.accept(goal_at(T0 + PERIOD, 2.0), T0),
+            fx.gate().accept(view(&goal_at(T0 + 99 * PERIOD, 0.0)), T0),
             AcceptOutcome::DroppedQueueFull
         );
-        assert_eq!(
-            gate.tick(T0, true, HOLD_TIMEOUT),
-            GateAction::WriteGoal(due)
-        );
-        assert_eq!(gate.queued().len(), QUEUE_CAP - 1);
-        assert_eq!(gate.validate(), Ok(()), "the length is in range again");
+        assert_eq!(fx.queued(), depth);
     }
 
+    /// The row count and the mask are read off the joint vocabulary, so the
+    /// two cannot disagree about which bit is which servo. What is checked here
+    /// is that every declared servo is inside the mask and that the mask is
+    /// exactly the declared servos -- a tenth servo widens both or fails here.
     #[test]
-    fn the_gate_is_plain_copy_data() {
-        // The gate is mirrored into a Clockwork state slot field for field.
-        // If it ever stops being `Copy` with public fields, that mirror stops
-        // being possible, and this is where that is noticed.
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<GoalGate>();
-        assert_copy::<Goal>();
-        let gate = armed_at(T0);
-        let mut clone = gate;
-        clone.accept(goal_at(T0 + PERIOD, 0.0), T0);
-        assert_eq!(gate.queue_len, 0, "a copy is a copy");
+    fn every_joint_is_a_bit_of_the_mask() {
+        use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
+
+        let mut every = 0u16;
+        for flag in JointFlags::VARIANTS {
+            let bits = JointFlagsWire::from(flag).0;
+            assert_eq!(
+                bits & !JOINT_MASK_ALL,
+                0,
+                "{flag} names a bus row the mask does not have"
+            );
+            every |= bits;
+        }
+        assert_eq!(every, JOINT_MASK_ALL, "the mask is the declared servos");
+        assert_eq!(usize::from(JOINT_MASK_ALL.count_ones() as u16), JOINT_COUNT);
+    }
+
+    /// A decision is made on the state itself, not on a copy of it.
+    ///
+    /// The whole point of the gate's state being a schema: what a decision
+    /// leaves is what the next cycle reads. A gate that could be copied would be
+    /// a second description of a queue, which is how a machine ends up holding
+    /// torque because the copy nobody looked at was the one that timed out.
+    #[test]
+    fn a_decision_lands_in_the_state_the_next_one_reads() {
+        let mut fx = armed_at(T0);
+        let goal = goal_at(T0 + PERIOD, 0.5);
+        fx.gate().accept(view(&goal), T0);
+        assert_eq!(fx.queued(), 1);
+        assert_eq!(
+            fx.gate().tick(T0 + PERIOD, true, HOLD_TIMEOUT),
+            GateAction::WriteGoal
+        );
+        assert_eq!(fx.queued(), 0, "the executed goal left the queue");
+        assert_held(&fx, &goal, "and became what is held");
     }
 }

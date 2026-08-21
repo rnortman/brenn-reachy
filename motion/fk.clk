@@ -1,0 +1,38 @@
+// The flat-form vocabulary of a pose-solve failure: which way the solve failed
+// and which pair of numbers the failure carries.
+//
+// Written wherever a solve failure is flattened, which is more than one place --
+// a sequencer's verdict record and the tick's fault snapshot both key their two
+// numbers off it -- so it belongs to neither writer's state module. It is
+// deliberately cold: three variants pinned to the solver's own failure type,
+// which is safety math and does not move.
+//
+// Nothing here names a fault: raising one is its own vocabulary, and a solve
+// that places no pose is an observation a fault may be made from.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+// Which way a pose solve failed, or that none did.
+//
+// Keys the pair of numbers a solver's failure carries, and is what the motion
+// library matches on.
+enum FkFailureKind
+{
+    uuid: eacad9fa-07aa-4713-9c15-61f96c8f8eda;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Not about a pose solve, and the two numbers beside it mean nothing.
+        #0 not_applicable default { underlying_value: 0; }
+        // The solve ran out of iterations: iterations, then the largest
+        // residual.
+        #1 no_convergence { underlying_value: 1; }
+        // The solve landed on a configuration the machine is not in: head tilt
+        // in degrees, then head height in metres.
+        #2 wrong_assembly_mode { underlying_value: 2; }
+    }
+}

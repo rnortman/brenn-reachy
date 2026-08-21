@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use scenario::author::{self, ALL_ROWS, InputLog};
+use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s5_scenario::{
@@ -30,7 +30,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
 
     let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, ALL_ROWS)?;
+    log.torque_on(engage, author::all_rows())?;
     log.schedule(engage, true, ENGAGED_EPOCH, &up_steps())?;
 
     // The session changes its mind. The machine stays engaged and stays
@@ -46,7 +46,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
 
     let disengage = cycle_at(DISENGAGE_CYCLE);
     log.schedule(disengage, false, DISENGAGED_EPOCH, &[])?;
-    log.torque_off(disengage, ALL_ROWS)?;
+    log.torque_off(disengage, author::all_rows())?;
 
     log.close()
 }

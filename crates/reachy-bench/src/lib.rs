@@ -1,13 +1,12 @@
-//! `reachy-bench` — the bring-up host: a self-test registry and the supervised
-//! motion commands.
+//! `reachy-bench` — the hardware test tool: a read-only self-test registry and
+//! the bare-bus commands.
 //!
-//! Everything else in this workspace is a library that owns no loop. This crate
-//! is the loop: it opens the port, commissions the machine, polls it, takes
-//! hold of it, then runs a fixed-rate cycle of read present positions, call the
-//! tick, write the goals that changed. It is also the only crate here that
-//! reads a configuration file, logs, or prints.
+//! No control loop and no coordinated motion. What this crate does to a machine
+//! is read registers, write the antennas' operating mode, restart the servos,
+//! and sweep torque off. It is also the only crate here that reads a
+//! configuration file, logs, or prints.
 //!
-//! Two halves, and the order between them is the whole point:
+//! Two halves:
 //!
 //! - **The read-only registry.** Port open, presence sweep naming any absent
 //!   servo, model-number grouping, the provisioned-register sweep, rail voltage,
@@ -15,11 +14,10 @@
 //!   the resting pose with its clearance margins. No torque, no motion, nothing
 //!   written to a servo. One line per case, and a case that did not run counts as
 //!   a failure rather than as silence.
-//! - **The supervised commands.** Arm, raise, hold, stow, release, plus antenna
-//!   and base moves. Each re-establishes the machine for itself and needs a
-//!   crank datum a human has written into the configuration; nothing consults a
-//!   registry pass, because a record is evidence about a past moment and the
-//!   commissioning ceremony asks the machine in front of it.
+//! - **The bare-bus commands.** `provision`, `reboot` and `off`: a bus, a
+//!   roster, and no sequencer between them. Nothing here arms anything, and
+//!   `off` reaches the minimum risk condition's de-torqued half from wherever
+//!   the machine stands.
 //!
 //! The registry is how this project brings up hardware: write a case that
 //! asserts the behaviour we expect, let it fail, and read the discovery out of
@@ -30,13 +28,16 @@
 //! The binary is a thin entry point over this library, so everything the bench
 //! decides — configuration and the registry's verdicts — is reachable from tests
 //! that need no port and no machine.
+//!
+//! `commands.rs`, `pump.rs`, `trace.rs` and `trace/metrics.rs` sit beside these
+//! files but are not in the build: they are the bench's retired motion layer,
+//! kept on disk as the executable record of how this machine was driven.
+//! TODO(bench-motion-delete)
 
 #![forbid(unsafe_code)]
 
-pub mod commands;
+pub mod bare;
 pub mod config;
-pub mod pump;
 pub mod selftest;
 #[cfg(test)]
 mod testutil;
-pub mod trace;

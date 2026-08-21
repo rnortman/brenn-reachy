@@ -48,15 +48,18 @@ use thiserror::Error;
 
 use reachy_bus::{BusTiming, DEFAULT_BAUD, MapError, ServoMap};
 use reachy_kin::{EnvelopeConfig, FkOptions, HeadGeometry, IkError, baked};
+use reachy_motion::joints::{ROW_COUNT, ROWS, leg_index, leg_ref};
+use reachy_motion::value;
+#[cfg(test)]
+use reachy_motion::{
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, FLOOR_TICK_HZ, HEAD_GROUP_FLOOR_S,
+    YAW_GOAL_COUNT_MAX, duration_floor_s, yaw_goal_counts,
+};
 use reachy_motion::{
     AntennaPhaseConfig, ArmConfig, DisarmConfig, EXPECTED_OPERATING_MODES, Gains, GroupGains,
-    JointId, JointStep, MotionConfig, MoveDurations, ProfileConfig, ProvisionExpect,
-    ProvisionTable, RegId, RegValue, TrackingFaultConfig, VENDOR_HOMING_OFFSETS, stow_targets,
+    JointStep, MotionConfig, MoveDurations, ProfileConfig, ProvisionExpect, ProvisionTable, RegId,
+    TrackingFaultConfig, VENDOR_HOMING_OFFSETS, stow_targets,
 };
-#[cfg(test)]
-use reachy_motion::{FLOOR_TICK_HZ, HEAD_GROUP_FLOOR_S, duration_floor_s};
-
-use crate::pump::SettleConfig;
 
 /// One encoder count, radians — the finest distinction a position register can
 /// make, and the slack the two per-leg fences are allowed to differ by.
@@ -282,7 +285,7 @@ pub struct BusSection {
     pub retry_spacing_ms: u64,
     /// The nine servo IDs, in bus order: body yaw, legs 1..=6, right antenna,
     /// left antenna.
-    pub servo_ids: [u8; JointId::COUNT],
+    pub servo_ids: [u8; ROW_COUNT],
 }
 
 impl Default for BusSection {
@@ -342,6 +345,13 @@ impl Default for EnvelopeSection {
 
 /// `[motion]` — the tick's rates and bounds, and the move durations the bench
 /// commands with.
+///
+/// These figures were sized off recorded hardware sessions, and the suite that
+/// replays those recordings against them is out of the build with the rest of the
+/// motion layer. So the range checks below are all that stands over them today:
+/// changing one of these bounds means re-pointing the replay first, not trusting
+/// a check that only asks whether the number is finite and ordered.
+/// TODO(bench-motion-delete)
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MotionSection {
@@ -644,7 +654,7 @@ pub struct ProvisionSection {
     /// Current Limit, per servo in bus order. Per servo rather than one value
     /// because the roster is not all one part; on this unit all nine read the
     /// same untouched factory ceiling.
-    pub current_limit: [u16; JointId::COUNT],
+    pub current_limit: [u16; ROW_COUNT],
     /// The per-leg position window the servo itself refuses to be commanded
     /// past, counts, lower then upper, legs 1..=6. Mapped through the servo map
     /// under the configured datum, this must be the envelope's crank window.
@@ -661,7 +671,7 @@ impl Default for ProvisionSection {
             temperature_limit: 70,
             max_voltage_limit: 70,
             min_voltage_limit: 35,
-            current_limit: [1750; JointId::COUNT],
+            current_limit: [1750; ROW_COUNT],
             leg_position_limits: [
                 [1502, 2958],
                 [1138, 2844],
@@ -712,10 +722,39 @@ impl fmt::Display for DatumSetting {
     }
 }
 
+/// How close the machine has to be measured to the goals it was left on before
+/// a run is over, and how long that is waited for.
+///
+/// The tolerance answers a different question from the tick's tracking
+/// threshold, which is why it is a separate and much tighter figure: tracking
+/// asks whether the position loop is keeping up with a *moving* goal, this asks
+/// where the machine physically came to rest once the goal stopped moving.
+///
+/// The window is bounded because a joint that never arrives — a stalled motor,
+/// an antenna held by hand — must end the run with that reported rather than
+/// leave the loop turning. Running out is an outcome, not a fault: nothing here
+/// gates or delays what a caller does about torque.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettleConfig {
+    /// How far a joint may be from its goal and still count as arrived,
+    /// radians.
+    pub tolerance: f64,
+    /// How long after commanding finished arrival is waited for.
+    pub timeout: Duration,
+}
+
 /// A configuration that has passed every check, as the library structs.
 ///
 /// Holding one of these is the evidence that the datum is resolved, the two
 /// per-leg fences agree, and the geometry can reach stow.
+///
+/// No command this binary ships reaches one: the four bare-bus commands take the
+/// map, the timing and the device straight off [`BenchConfig`], and the
+/// commanding side that consumed the motion, settle and trace fields is retired.
+/// It is held rather than parked on purpose -- the fences, the datum and the
+/// stow reachability check are what the cog-path host has to be configured by,
+/// and re-deriving them there instead of reusing this would give the repo two
+/// envelope validators.
 #[derive(Clone, Debug)]
 pub struct Resolved {
     /// The serial device to open.
@@ -843,6 +882,9 @@ pub fn record_path_beside(config: &Path) -> PathBuf {
 /// its own everything a record could assert about the machine in front of you.
 ///
 /// Separate from the run, so the refusal is testable without a port.
+///
+/// Nothing in the shipped binary calls this; it is kept for the cog-path host
+/// for the reason [`Resolved`] states.
 pub fn resolve_for_commanding(cfg: &BenchConfig) -> anyhow::Result<Resolved> {
     cfg.resolve().map_err(Into::into)
 }
@@ -893,7 +935,7 @@ impl BenchConfig {
     }
 
     /// The nine servo IDs, checked for being addressable and distinct.
-    pub fn servo_ids(&self) -> Result<[u8; JointId::COUNT], ConfigError> {
+    pub fn servo_ids(&self) -> Result<[u8; ROW_COUNT], ConfigError> {
         let ids = self.bus.servo_ids;
         for (row, id) in ids.iter().enumerate() {
             if *id > MAX_SERVO_ID {
@@ -984,27 +1026,27 @@ impl BenchConfig {
         let mut table = ProvisionTable::new();
         table.set_all(
             RegId::ReturnDelayTime,
-            ProvisionExpect::Check(RegValue::U8(section.return_delay_time)),
+            ProvisionExpect::Check(value::u8(section.return_delay_time)),
         );
         table.set_all(
             RegId::DriveMode,
-            ProvisionExpect::Check(RegValue::U8(section.drive_mode)),
+            ProvisionExpect::Check(value::u8(section.drive_mode)),
         );
         table.set_all(
             RegId::BusWatchdog,
-            ProvisionExpect::Check(RegValue::U8(section.bus_watchdog)),
+            ProvisionExpect::Check(value::u8(section.bus_watchdog)),
         );
         table.set_all(
             RegId::TemperatureLimit,
-            ProvisionExpect::Check(RegValue::U8(section.temperature_limit)),
+            ProvisionExpect::Check(value::u8(section.temperature_limit)),
         );
         table.set_all(
             RegId::MaxVoltageLimit,
-            ProvisionExpect::Check(RegValue::U16(section.max_voltage_limit)),
+            ProvisionExpect::Check(value::u16(section.max_voltage_limit)),
         );
         table.set_all(
             RegId::MinVoltageLimit,
-            ProvisionExpect::Check(RegValue::U16(section.min_voltage_limit)),
+            ProvisionExpect::Check(value::u16(section.min_voltage_limit)),
         );
         // Read and reported, never judged: the gains-and-profiles phase writes
         // these RAM registers at every arm and verifies its own write, so what
@@ -1023,35 +1065,35 @@ impl BenchConfig {
         table.set_all(RegId::MaxPositionLimit, ProvisionExpect::Record);
         // Checked against the workspace's one record of the datum and of the
         // per-servo modes, neither of them a per-unit setting.
-        for (row, joint) in JointId::ALL.iter().enumerate() {
+        for (row, joint) in ROWS.iter().enumerate() {
             table.set(
                 *joint,
                 RegId::CurrentLimit,
-                ProvisionExpect::Check(RegValue::U16(section.current_limit[row])),
+                ProvisionExpect::Check(value::u16(section.current_limit[row])),
             );
             table.set(
                 *joint,
                 RegId::HomingOffset,
-                ProvisionExpect::Check(RegValue::I32(VENDOR_HOMING_OFFSETS[row])),
+                ProvisionExpect::Check(value::i32(VENDOR_HOMING_OFFSETS[row])),
             );
             table.set(
                 *joint,
                 RegId::OperatingMode,
-                ProvisionExpect::Check(RegValue::U8(EXPECTED_OPERATING_MODES[row])),
+                ProvisionExpect::Check(value::u8(EXPECTED_OPERATING_MODES[row])),
             );
         }
         for leg in 0..6u8 {
             let index = usize::from(leg);
             let [lower, upper] = section.leg_position_limits[index];
             table.set(
-                JointId::Leg(leg),
+                leg_ref(leg),
                 RegId::MinPositionLimit,
-                ProvisionExpect::Check(RegValue::U32(lower)),
+                ProvisionExpect::Check(value::u32(lower)),
             );
             table.set(
-                JointId::Leg(leg),
+                leg_ref(leg),
                 RegId::MaxPositionLimit,
-                ProvisionExpect::Check(RegValue::U32(upper)),
+                ProvisionExpect::Check(value::u32(upper)),
             );
         }
         table
@@ -1174,8 +1216,8 @@ pub fn leg_windows_from_counts(
     let mut windows = [(0.0, 0.0); 6];
     // Walked in bus order and filtered to the legs, so which row a leg's servo
     // sits at comes from the joint layout rather than from arithmetic here.
-    for (row, id) in JointId::ALL.into_iter().enumerate() {
-        let JointId::Leg(index) = id else { continue };
+    for (row, id) in ROWS.into_iter().enumerate() {
+        let Some(index) = leg_index(id) else { continue };
         let leg = usize::from(index);
         let [lower_counts, upper_counts] = counts[leg];
         if lower_counts >= upper_counts {
@@ -1280,6 +1322,7 @@ pub(crate) fn check_table(table: &ProvisionTable) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     /// The example shipped beside the crate, which an operator copies.
@@ -1295,6 +1338,108 @@ mod tests {
     /// operator ends up with after reviewing a run.
     fn example_resolved() -> BenchConfig {
         parse(&format!("{EXAMPLE}{RESOLVED_DATUM}")).expect("the example plus a datum parses")
+    }
+
+    /// Every `[motion]` figure that was sized off a recorded hardware session,
+    /// pinned to the value that sizing produced.
+    ///
+    /// The suite that replays those recordings against these figures is out of
+    /// the build, so the range checks are all that is left over them and a range
+    /// check admits any finite ordered number. This makes an edit to one of them
+    /// a failing test rather than a silent widening: the replay is re-pointed
+    /// first, then the pin moves with the figure in the same commit.
+    /// TODO(bench-motion-delete)
+    #[test]
+    fn the_replay_sized_motion_figures_are_what_the_recordings_sized() {
+        let motion = MotionSection::default();
+
+        assert_eq!(motion.tick_hz, 50);
+        assert!((motion.max_step_legs_rad - 0.15).abs() < f64::EPSILON);
+        assert!((motion.max_step_body_yaw_rad - 0.15).abs() < f64::EPSILON);
+        assert!((motion.max_step_antennas_rad - 0.65).abs() < f64::EPSILON);
+        assert!((motion.tracking_threshold_rad - 0.5).abs() < f64::EPSILON);
+        assert!((motion.tracking_progress_min_rad - 0.01).abs() < f64::EPSILON);
+        assert_eq!(motion.tracking_ticks, 10);
+        assert!(
+            (motion.antenna_contact_band_rad - core::f64::consts::PI / 3.0).abs() < f64::EPSILON
+        );
+        assert!((motion.antenna_phase_separation_rad - 0.60).abs() < f64::EPSILON);
+        assert!((motion.stow_duration_s - 2.0).abs() < f64::EPSILON);
+        assert!((motion.up_duration_s - 0.8).abs() < f64::EPSILON);
+        assert!((motion.move_duration_s - 3.0).abs() < f64::EPSILON);
+    }
+
+    /// The bounds the motion layer refuses a goal or a stored pin on are count
+    /// bounds, and this is the one place the two layers that hold them meet:
+    /// the motion layer states them over its own copy of the count frame, and
+    /// the map is what turns a radian into the count the goal register takes.
+    ///
+    /// Yaw is checked count for count across the turn rather than at its ends
+    /// alone, because its bound is a rounding as much as a range: the last half
+    /// count below +π rounds to a count the single-turn register refuses, and
+    /// the motion layer only refuses it if it rounds the way the map does. Each
+    /// antenna end is exactly the last count extended position mode accepts —
+    /// asymmetric, because zero radians sits at count 2048.
+    #[test]
+    fn the_goal_bounds_are_the_last_counts_the_registers_hold() {
+        const YAW_ROW: usize = 0;
+        const ANTENNA_ROWS: [usize; 2] = [7, 8];
+        const REGISTER_LIMIT: i32 = 1_048_575;
+        let map = ServoMap::new(reachy_motion::arm::SERVO_IDS);
+
+        let count = core::f64::consts::TAU / (YAW_GOAL_COUNT_MAX + 1.0);
+        let probes = [
+            -core::f64::consts::PI,
+            -core::f64::consts::PI + count / 4.0,
+            -1.0,
+            0.0,
+            1.0,
+            core::f64::consts::PI - count,
+            core::f64::consts::PI - count / 4.0,
+        ];
+        for radians in probes {
+            assert_eq!(
+                yaw_goal_counts(radians),
+                f64::from(
+                    map.goal_counts(YAW_ROW, radians)
+                        .expect("a yaw goal counts")
+                ),
+                "{radians} rad"
+            );
+        }
+        assert_eq!(yaw_goal_counts(-core::f64::consts::PI), 0.0);
+        assert_eq!(
+            yaw_goal_counts(core::f64::consts::PI - count),
+            YAW_GOAL_COUNT_MAX
+        );
+        assert_eq!(
+            yaw_goal_counts(core::f64::consts::PI - count / 4.0),
+            YAW_GOAL_COUNT_MAX + 1.0,
+            "the half-count sliver the register refuses"
+        );
+
+        // Both ends on both rows: a sign or an offset wrong on one antenna only
+        // is invisible to a row exercised in the one direction it is right in.
+        let ends = [
+            (ANTENNA_GOAL_MAX_RAD, REGISTER_LIMIT, 1.0),
+            (ANTENNA_GOAL_MIN_RAD, -REGISTER_LIMIT, -1.0),
+        ];
+        for row in ANTENNA_ROWS {
+            for (edge, limit, past) in ends {
+                assert_eq!(
+                    map.goal_counts(row, edge).expect("the bound places"),
+                    limit,
+                    "row {row} at {edge} rad"
+                );
+                let over = map
+                    .goal_counts(row, edge + past)
+                    .expect("a count outside the register's range is still an i32");
+                assert!(
+                    over.abs() > REGISTER_LIMIT,
+                    "row {row}: a radian past the bound is {over} counts"
+                );
+            }
+        }
     }
 
     /// A key and the edit that makes it invalid.
@@ -1672,354 +1817,6 @@ provenance = \"test fixture\"
              carries outright",
             yaw[2],
         );
-    }
-
-    /// The bench night, replayed against the guards it sized.
-    ///
-    /// Every value in `[motion]` is a measurement, and these are the
-    /// measurements. Two questions, asked of the recordings rather than of
-    /// arithmetic: does a shipped guard raise anything on a run that went well,
-    /// and does it catch the one run that did not. A change to a bound, a
-    /// threshold or a duration that would false-trip the validated gesture — or
-    /// miss the collision — fails here instead of on the machine.
-    mod replay {
-        use super::*;
-
-        use reachy_motion::{
-            JointGroup, JointSet, JointTargets, MotionCommand, TrackingMonitor, Warp,
-            dry_pass_peaks, floor_move_clock,
-        };
-
-        use crate::commands::stow_pose_targets;
-        use crate::testutil::trace_fixture;
-        use crate::trace::metrics::{Run, Sample};
-
-        /// The pose every recorded run started from, with the antennas at the
-        /// turn representative the machine was holding them at.
-        ///
-        /// The legs are the stow pose's own, which is where the recordings
-        /// begin to within a degree — asserted below, because the fixtures only
-        /// speak for the shipped command while that holds. A degree and not a
-        /// count because the servos were holding stow on the gains of that
-        /// night, and holding a weight up on a proportional term alone parks a
-        /// loaded crank a little short of where it was sent. The antennas come
-        /// off the recording because an antenna direction has a representative
-        /// per turn, and the sweep the resolver picks depends on which one the
-        /// machine stood at.
-        fn started_at(run: &Run) -> JointTargets {
-            let present = run.samples[0].present.expect("the first period read");
-            let stow = stow_pose_targets();
-            for (leg, angle) in present.legs.iter().enumerate() {
-                let held = crate::testutil::stow_legs()[leg];
-                assert!(
-                    (angle - held).abs() < 1.0_f64.to_radians(),
-                    "leg {leg} began at {angle}, not the stow pose's {held}"
-                );
-            }
-            JointTargets {
-                antennas: present.antennas,
-                ..stow
-            }
-        }
-
-        /// The gesture the recordings are of: stow to neutral, on `durations`.
-        fn gesture(run: &Run, durations: MoveDurations) -> (JointTargets, MotionCommand) {
-            (
-                started_at(run),
-                MotionCommand::MoveTo {
-                    target: JointTargets::default(),
-                    durations,
-                    warp: Warp::MinJerk,
-                },
-            )
-        }
-
-        /// The shipped tracking monitor driven over a recorded run, period by
-        /// period, answering the joints whose window ran out and when.
-        ///
-        /// A period whose grouped read fell short is skipped rather than
-        /// replayed: the live loop compares a fresh goal only against a fresh
-        /// measurement, and a stale one freezes every run where it stands. A
-        /// joint the run had released is handed over as masked, which is what
-        /// the loop does with it.
-        fn trips(cfg: &TrackingFaultConfig, run: &Run) -> Vec<(u64, JointSet)> {
-            let mut monitor = TrackingMonitor::new();
-            let mut out = Vec::new();
-            for sample in &run.samples {
-                let Some(present) = sample.present else {
-                    continue;
-                };
-                // A released joint is commanded nothing, so it stands at its
-                // own angle rather than at a goal it never had.
-                let mut goal = present;
-                for joint in JointId::ALL {
-                    if let Some(angle) = sample.goal_of(joint) {
-                        goal.set(joint, angle);
-                    }
-                }
-                let look = monitor.look(cfg, sample.released(), &present, &goal);
-                if !look.exhausted.is_empty() {
-                    out.push((sample.tick, look.exhausted));
-                }
-            }
-            out
-        }
-
-        /// Neither run that went well raises anything in the shipped tracking
-        /// monitor.
-        ///
-        /// The validated gesture and the fastest sweep on record, measured on
-        /// the machine, both with every joint following its goal at a distance
-        /// the whole way through — 0.245 rad on a loaded leg, 1.38 rad on the
-        /// antenna crossing 187° in four tenths of a second. A threshold sized
-        /// under those, or a progress minimum over what the machine closes in a
-        /// window, shows up here as a fault on a gesture the machine is known
-        /// to make well.
-        #[test]
-        fn the_runs_that_went_well_raise_nothing() {
-            let cfg = example_resolved()
-                .resolve()
-                .expect("the example resolves")
-                .motion
-                .tracking;
-            for name in ["trace-verify2", "trace-fast4"] {
-                let trace = trace_fixture(name);
-                let run = trace.run(0).expect("the run");
-                let trips = trips(&cfg, run);
-                assert!(trips.is_empty(), "{name}: {trips:?}");
-            }
-        }
-
-        /// The one collision on record trips it, on the pair that stalled.
-        ///
-        /// Both antenna tips met at the crossing and stood there for over forty
-        /// periods with the goal three radians away; the head carried on and
-        /// arrived. So the monitor has to name the antennas and only the
-        /// antennas — which is what decides the response: the pair goes out of
-        /// service and the head move finishes, rather than the whole machine
-        /// winding down.
-        #[test]
-        fn the_collision_trips_it_on_the_antennas_and_nothing_else() {
-            let cfg = example_resolved()
-                .resolve()
-                .expect("the example resolves")
-                .motion
-                .tracking;
-            let trace = trace_fixture("trace-stagger");
-            let jam = trace.run(2).expect("the failed stow");
-            let trips = trips(&cfg, jam);
-
-            assert!(
-                !trips.is_empty(),
-                "the stalled pair never ran its window out"
-            );
-            for (at, exhausted) in &trips {
-                for joint in exhausted.iter() {
-                    assert_eq!(
-                        joint.group(),
-                        JointGroup::Antennas,
-                        "a head joint ran its window out at period {at}: {exhausted}"
-                    );
-                }
-            }
-            // Both sides, and inside one window of each other: they met each
-            // other, so neither is the one that failed. Two antennas stalling
-            // hundreds of periods apart would be two single-servo faults, which
-            // is a different condition with a different answer.
-            let ran_out = |side| {
-                trips
-                    .iter()
-                    .find(|(_, out)| out.contains(side))
-                    .map(|(at, _)| *at)
-            };
-            let right = ran_out(JointId::AntennaRight).expect("the right antenna stalled");
-            let left = ran_out(JointId::AntennaLeft).expect("the left antenna stalled");
-            assert!(
-                right.abs_diff(left) <= u64::from(cfg.ticks),
-                "the antennas ran their windows out at periods {right} and {left}, further apart \
-                 than the {} the window itself is: one stalled and the other did not",
-                cfg.ticks
-            );
-        }
-
-        /// The step bounds admit the gestures that were recorded, with the
-        /// headroom over their planned peaks that the example's comments claim.
-        ///
-        /// Against the *plan* and never against the record. The recorded goal
-        /// column is what the loop commanded, and these recordings predate the
-        /// per-period move clock, so a period that started late sampled the
-        /// trajectory further along and commanded a step no planner ever asked
-        /// for. The last case below is that inflation, pinned: the fastest
-        /// sweep's recorded step is past the bound its own plan clears
-        /// comfortably.
-        #[test]
-        fn the_step_bounds_admit_the_recorded_gestures_with_headroom() {
-            let resolved = example_resolved().resolve().expect("the example resolves");
-            let cfg = &resolved.motion;
-            let tick_hz = f64::from(resolved.tick_hz);
-
-            // The validated gesture, on the clock this file ships, and the same
-            // gesture with the staggered antenna pair the file documents —
-            // whose quick side is the 0.3 s sweep the speed record was set on.
-            let verify2 = trace_fixture("trace-verify2");
-            let fast4 = trace_fixture("trace-fast4");
-            let cases = [
-                (
-                    "the validated gesture",
-                    gesture(verify2.run(0).expect("the run"), resolved.up_durations()),
-                ),
-                (
-                    "the staggered pair",
-                    gesture(
-                        fast4.run(0).expect("the run"),
-                        MoveDurations {
-                            head: resolved.up_duration,
-                            antennas: [Duration::from_millis(700), Duration::from_millis(300)],
-                        },
-                    ),
-                ),
-            ];
-
-            let mut planned = Vec::new();
-            for (name, (start, command)) in cases {
-                let peaks = dry_pass_peaks(cfg, &start, &command, tick_hz)
-                    .expect("the gesture is measurable");
-                planned.push(peaks);
-                assert!(
-                    peaks.legs * 2.0 <= cfg.max_step.legs,
-                    "{name}: legs plan {:.4} rad against the {:.4} rad bound",
-                    peaks.legs,
-                    cfg.max_step.legs
-                );
-                for (side, peak) in ["right", "left"].into_iter().zip(peaks.antennas) {
-                    assert!(
-                        peak * 1.5 <= cfg.max_step.antennas,
-                        "{name}: the {side} antenna plans {peak:.4} rad against the {:.4} rad \
-                         bound",
-                        cfg.max_step.antennas
-                    );
-                }
-                // And no clock needs right-sizing for its span, which is the
-                // same statement the shipped durations make about their floors.
-                // The pass may still lengthen an antenna to de-phase the pair —
-                // the head's clock is what says nothing was floored.
-                let stretch = floor_move_clock(cfg, &start, &command, tick_hz).1;
-                assert!(
-                    stretch
-                        .is_none_or(|clocks| clocks.dephased
-                            && clocks.effective.head == clocks.requested.head),
-                    "{name}: the shipped clock does not carry it: {stretch:?}"
-                );
-            }
-
-            // The inflation, pinned. On the quick side the loop commanded half
-            // as much again in a period as the planner ever asked for, because
-            // the periods it woke on were half as long again as the grid it was
-            // sampling. A bound sized to clear the record by the same margin
-            // would be half as wide again for no reason the plan gives.
-            let quick = planned[1].antennas[1];
-            let recorded = fast4
-                .run(0)
-                .expect("the run")
-                .metrics()
-                .joint(JointId::AntennaLeft)
-                .expect("it swept")
-                .peak_goal_step;
-            assert!(
-                recorded > quick * 1.4,
-                "the recorded step {recorded:.4} rad is no longer inflated over the planned \
-                 {quick:.4} rad, so this case no longer says what it is for"
-            );
-        }
-
-        /// The separation the resolver holds a pair to admits the clock pair
-        /// that swept clean and rejects the one that clashed.
-        ///
-        /// Both figures come off the recordings' own commanded goals, which is
-        /// where a clock pair's phase is visible. The pair that clashed is the
-        /// binding end: its widest offset anywhere on the sweep is under the
-        /// constant, so nothing phased like that gets through whatever moment
-        /// the check happens to land on. The stow that clashed and the raise
-        /// that did not are the same two clocks recorded twice — the raise got
-        /// through on the odds the debrief measured, about two inboard sweeps
-        /// in three, and the check rejects it too.
-        #[test]
-        fn the_separation_tells_the_clean_pair_from_the_one_that_clashed() {
-            // The shipped file's own geometry, so the calibration below is a
-            // statement about what an operator's configuration admits and not
-            // about a number only the library can see.
-            let phase = example_resolved()
-                .resolve()
-                .expect("the example resolves")
-                .motion
-                .phase;
-            let band = phase.contact_band_rad;
-            let stagger = trace_fixture("trace-stagger");
-            let fast4 = trace_fixture("trace-fast4");
-
-            let clean = fast4
-                .run(0)
-                .expect("the run")
-                .separation(band, Sample::goal_of)
-                .expect("both antennas cross the band");
-            assert!(clean.met(phase.separation_rad), "{clean:?}");
-            assert!(
-                (clean.offset - 0.876).abs() < 5e-3,
-                "the validated pair plans {:.4} rad",
-                clean.offset
-            );
-
-            let clashed = stagger
-                .run(2)
-                .expect("the stow that clashed")
-                .separation(band, Sample::goal_of)
-                .expect("both antennas cross the band");
-            assert!(!clashed.met(phase.separation_rad), "{clashed:?}");
-            assert!(
-                (clashed.offset - 0.361).abs() < 5e-3,
-                "the pair that clashed planned {:.4} rad",
-                clashed.offset
-            );
-            let widest = stagger
-                .run(2)
-                .expect("the run")
-                .widest_offset(Sample::goal_of)
-                .expect("every period of that run carried both antennas");
-            assert!(
-                widest < phase.separation_rad,
-                "the clashing pair reaches {widest:.4} rad, which the shipped separation now admits"
-            );
-
-            let survived = stagger
-                .run(1)
-                .expect("the raise on the same clocks")
-                .separation(band, Sample::goal_of)
-                .expect("both antennas cross the band");
-            assert!(!survived.met(phase.separation_rad), "{survived:?}");
-
-            // And what the tips themselves did, which is what the plan is a
-            // proxy for: on the raise they passed the band's edge a third of a
-            // radian apart, and on the stow they never reached it at all —
-            // they met inside the band and stalled there.
-            let tips = stagger
-                .run(1)
-                .expect("the run")
-                .separation(band, Sample::present_of)
-                .expect("both antennas cross the band");
-            assert!(
-                (tips.offset - 0.285).abs() < 5e-3,
-                "the tips passed {:.4} rad apart",
-                tips.offset
-            );
-            assert_eq!(
-                stagger
-                    .run(2)
-                    .expect("the run")
-                    .separation(band, Sample::present_of),
-                None,
-                "the jammed pair left the band after all"
-            );
-        }
     }
 
     #[test]
@@ -2535,7 +2332,7 @@ provenance = \"test fixture\"
         for (row, mode) in EXPECTED_OPERATING_MODES.into_iter().enumerate() {
             assert_eq!(
                 table.at(row, column),
-                Some(ProvisionExpect::Check(RegValue::U8(mode))),
+                Some(ProvisionExpect::Check(value::u8(mode))),
                 "row {row}"
             );
         }
@@ -2547,18 +2344,18 @@ provenance = \"test fixture\"
         for (row, offset) in VENDOR_HOMING_OFFSETS.into_iter().enumerate() {
             assert_eq!(
                 table.at(row, column),
-                Some(ProvisionExpect::Check(RegValue::I32(offset))),
+                Some(ProvisionExpect::Check(value::i32(offset))),
                 "row {row}"
             );
         }
-        assert_eq!(RegValue::I32(-1024).to_string(), "-1024");
+        assert_eq!(reachy_motion::Shown(value::i32(-1024)).to_string(), "-1024");
 
         // Per servo, and on this unit every servo holds the same ceiling.
         let column = ProvisionTable::column(RegId::CurrentLimit).expect("provisioned");
-        for row in 0..JointId::COUNT {
+        for row in 0..ROW_COUNT {
             assert_eq!(
                 table.at(row, column),
-                Some(ProvisionExpect::Check(RegValue::U16(1750))),
+                Some(ProvisionExpect::Check(value::u16(1750))),
                 "row {row}"
             );
         }
@@ -2576,7 +2373,7 @@ provenance = \"test fixture\"
         let table = minimal().provision_table();
         for reg in [RegId::ProfileAcceleration, RegId::ProfileVelocity] {
             let column = ProvisionTable::column(reg).expect("read by the sweep");
-            for row in 0..JointId::COUNT {
+            for row in 0..ROW_COUNT {
                 assert_eq!(
                     table.at(row, column),
                     Some(ProvisionExpect::Record),

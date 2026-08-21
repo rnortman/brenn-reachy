@@ -34,6 +34,32 @@ schema ProbeCmd
     }
 }
 
+// What the probe did on its last execution. It carries no information the
+// `commands_seen` counter does not, and exists so one enum crosses the state
+// slot: the validated view over a slot narrows an enum field to a real Rust
+// enum, and nothing else in this module has an enum to narrow.
+enum ProbeStep
+{
+    uuid: 6f3f1a2c-4c30-4a1e-9b2e-6cb0e0b8a911;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Nothing was published. What a never-written slot decodes to, and
+        // what an execution that found no command in its window leaves behind.
+        // The cog must set this before consulting inputs, so the field says
+        // what *this* execution did rather than latching the last one that
+        // published. A command arriving is this cog's only execution
+        // condition, so an empty window is a shape the composition does not
+        // produce -- a copy of the pattern with a periodic condition does.
+        #0 idle default { underlying_value: 0; }
+        // One datagram was published.
+        #1 published { underlying_value: 1; }
+    }
+}
+
 // What the probe remembers between executions.
 schema ProbeState
 {
@@ -43,10 +69,29 @@ schema ProbeState
         // How many commands have been acted on since the process started.
         #0 commands_seen: UInt32;
 
-        // The sequence number the probe read back out of its own output
-        // channel on this execution, and 0 before it has ever published. Kept
-        // so a unit test can observe the read-back rather than infer it from
-        // what was published.
-        #1 echoed_seq: UInt32;
+        // The instant the probe read back out of its own output channel on this
+        // execution -- the one the last datagram it published named -- and the
+        // epoch before it has ever published. Kept so a unit test can observe
+        // the read-back rather than infer it from what was published.
+        #1 echoed_due: SyncTime;
+
+        // What the last execution did.
+        #2 last_step: ProbeStep;
+
+        // How many times a body found this slot's bytes invalid and restarted
+        // it from cleared. Counted rather than discarded because a reset loses
+        // every count above, so a silent one is indistinguishable from a fresh
+        // process.
+        #3 state_resets: UInt32;
+
+        // Byte offset, from the start of this schema, of the field whose bytes
+        // failed on the last reset. Meaningless until `state_resets` is
+        // nonzero, which is the authoritative answer to "has there ever been
+        // one": offset 0 is a real offset, so a zero here says nothing by
+        // itself. The
+        // failing invariant is not carried: mirroring the framework's own
+        // reason enumeration into a schema is the twin this repo does not
+        // write, and the offset with the schema in hand names the field.
+        #4 last_reset_offset: UInt32;
     }
 }

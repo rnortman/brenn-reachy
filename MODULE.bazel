@@ -20,8 +20,6 @@ include("//bazel:clockwork_overrides.MODULE.bazel")
 # Pinned by revision against the GitHub remote rather than by version: rusty-cogs
 # publishes no releases and the module graph has to be fetchable by CI and by any
 # other machine.
-#
-# TODO(rusty-cogs-pin-bump-merge-order)
 bazel_dep(name = "rusty_cogs", version = "")
 #
 # Two patches, each the upstream fix written in the wrong repository, and each
@@ -41,7 +39,7 @@ bazel_dep(name = "rusty_cogs", version = "")
 # TODO(rusty-cogs-signal-trampoline-linkage)
 git_override(
     module_name = "rusty_cogs",
-    commit = "4e8f8e893412020c1a00a57ce8e61ab20aade09e",
+    commit = "31454138b4828c16044ac7507c0bd683a81e2390",
     patch_strip = 1,
     patches = [
         "//bazel/rusty-cogs-patches:module-drop-root-only-include.patch",

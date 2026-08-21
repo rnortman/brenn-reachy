@@ -10,10 +10,10 @@
 
 use std::process::ExitCode;
 
-use reachy_wire::EventKind;
+use brenn_reachy__driver__health_clk_rs::EventKind;
 use scenario::check;
 use scenario::read::Run;
-use scenario::{FIRST_CYCLE, dead_man_latch_cycle, silence_us};
+use scenario::{FIRST_CYCLE, dead_man_latch_cycle, silence_ns};
 
 use s3_scenario::{IDLE_EPOCH, TORQUE_ON_CYCLE, end_cycle};
 
@@ -98,7 +98,7 @@ fn check_dead_man(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
         run,
         EventKind::HoldTimeoutTorqueOff,
         wanted,
-        silence_us(FIRST_CYCLE, wanted),
+        silence_ns(FIRST_CYCLE, wanted),
         failures,
     )
 }

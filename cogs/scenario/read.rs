@@ -19,35 +19,36 @@ use clockwork_logs::offboard::OffboardReader;
 use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage};
 use std::path::Path;
 
-use brenn_reachy__cogs__msgs_clk_rs::{PoseEstimate, SessionSchedule, SimCmd, TickFault};
-use clockwork__clockwork__io__var_packet_clk_rs::{VarPacket__64, VarPacket__128, VarPacket__288};
-use log_read::{Complaints, Logged, binding, datagram, typed};
-use reachy_wire::{DriverEvent, GoalSetpoint, PoseSample};
+use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
+use brenn_reachy__cogs__sim_state_clk_rs::SimCmdWire;
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__driver__health_clk_rs::DriverEventWire;
+use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
+use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
+use log_read::{Complaints, Logged, binding, typed};
 
 use crate::{
     CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL,
     SIM_CMD_CHANNEL,
 };
 
-pub use log_read::Datagram;
-
 /// Everything one run put in the log.
 #[derive(Default)]
 pub struct Run {
     /// What the session asked for, replayed from the input log.
-    pub schedules: Vec<Logged<SessionSchedule>>,
+    pub schedules: Vec<Logged<SessionScheduleWire>>,
     /// What the scenario did to the plant, replayed from the input log.
-    pub injections: Vec<Logged<SimCmd>>,
+    pub injections: Vec<Logged<SimCmdWire>>,
     /// The driver's heartbeat: one per cycle, always.
-    pub samples: Vec<Logged<Datagram<PoseSample>>>,
+    pub samples: Vec<Logged<PoseSampleWire>>,
     /// What the machine was asked to hold next.
-    pub goals: Vec<Logged<Datagram<GoalSetpoint>>>,
+    pub goals: Vec<Logged<GoalSetpointWire>>,
     /// What the gate did that the sample stream does not show.
-    pub events: Vec<Logged<Datagram<DriverEvent>>>,
+    pub events: Vec<Logged<DriverEventWire>>,
     /// What the decision tick raised.
-    pub faults: Vec<Logged<TickFault>>,
+    pub faults: Vec<Logged<TickFaultWire>>,
     /// Where the head was.
-    pub estimates: Vec<Logged<PoseEstimate>>,
+    pub estimates: Vec<Logged<PoseEstimateWire>>,
     /// Every channel the log carries, in the order the reader reports them.
     /// A checker uses this to say something about the channels it does not
     /// otherwise read -- the signal report groups, for one.
@@ -81,59 +82,38 @@ struct Bound {
 const CHANNELS: [Bound; 7] = [
     Bound {
         name: SCHEDULE_CHANNEL,
-        check: binding::<SessionSchedule>,
+        check: binding::<SessionScheduleWire>,
         route: |run, message| typed(message, &mut run.schedules, &mut run.complaints),
     },
     Bound {
         name: SIM_CMD_CHANNEL,
-        check: binding::<SimCmd>,
+        check: binding::<SimCmdWire>,
         route: |run, message| typed(message, &mut run.injections, &mut run.complaints),
     },
     Bound {
         name: FAULT_CHANNEL,
-        check: binding::<TickFault>,
+        check: binding::<TickFaultWire>,
         route: |run, message| typed(message, &mut run.faults, &mut run.complaints),
     },
     Bound {
         name: ESTIMATE_CHANNEL,
-        check: binding::<PoseEstimate>,
+        check: binding::<PoseEstimateWire>,
         route: |run, message| typed(message, &mut run.estimates, &mut run.complaints),
     },
     Bound {
         name: POSE_CHANNEL,
-        check: binding::<VarPacket__288>,
-        route: |run, message| {
-            datagram::<VarPacket__288, _>(
-                message,
-                PoseSample::decode,
-                &mut run.samples,
-                &mut run.complaints,
-            );
-        },
+        check: binding::<PoseSampleWire>,
+        route: |run, message| typed(message, &mut run.samples, &mut run.complaints),
     },
     Bound {
         name: CMD_CHANNEL,
-        check: binding::<VarPacket__128>,
-        route: |run, message| {
-            datagram::<VarPacket__128, _>(
-                message,
-                GoalSetpoint::decode,
-                &mut run.goals,
-                &mut run.complaints,
-            );
-        },
+        check: binding::<GoalSetpointWire>,
+        route: |run, message| typed(message, &mut run.goals, &mut run.complaints),
     },
     Bound {
         name: EVENT_CHANNEL,
-        check: binding::<VarPacket__64>,
-        route: |run, message| {
-            datagram::<VarPacket__64, _>(
-                message,
-                DriverEvent::decode,
-                &mut run.events,
-                &mut run.complaints,
-            );
-        },
+        check: binding::<DriverEventWire>,
+        route: |run, message| typed(message, &mut run.events, &mut run.complaints),
     },
 ];
 

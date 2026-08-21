@@ -12,16 +12,19 @@
 
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__msgs_clk_rs::{FaultKind, JointRef};
+use brenn_reachy__driver__health_clk_rs::EventKind;
+use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
+use brenn_reachy__motion__joints_clk_rs::JointRefWire;
+use motion_slots::joint_set;
+use reachy_motion::joints::flags;
 use reachy_motion::postures::neutral_targets;
-use reachy_wire::EventKind;
 use scenario::check;
 use scenario::cycle_of;
 use scenario::read::Run;
 
 use s4_scenario::{
     ENGAGE_CYCLE, OUTAGE_CYCLE, OUTAGE_CYCLES, end_cycle, fault_cycle, latch_cycle,
-    reported_misses, reported_silence_us, up_cycles,
+    reported_misses, reported_silence_ns, up_cycles,
 };
 
 fn main() -> ExitCode {
@@ -44,7 +47,7 @@ fn main() -> ExitCode {
             run,
             EventKind::HoldTimeoutTorqueOff,
             latch_cycle(),
-            reported_silence_us(),
+            reported_silence_ns(),
             failures,
         );
         check::latch_from(run, latched, failures);
@@ -123,12 +126,12 @@ fn check_arrived_before_the_outage(run: &Run, failures: &mut Vec<String>) {
 fn check_outage(run: &Run, failures: &mut Vec<String>) {
     let blind = OUTAGE_CYCLE..OUTAGE_CYCLE + i64::from(OUTAGE_CYCLES);
     for sample in &run.samples {
-        let sample = &sample.message.message;
-        let Ok(cycle) = cycle_of(sample.nominal_time_ns) else {
+        let sample = &sample.message;
+        let Ok(cycle) = cycle_of(sample.nominal_time().as_nanos()) else {
             continue;
         };
         let wanted = blind.contains(&cycle);
-        let dark = !sample.present_valid;
+        let dark = !sample.present_valid();
         if dark != wanted {
             failures.push(format!(
                 "the sample at cycle {cycle} says its reading is {}, and the outage runs over \
@@ -139,15 +142,20 @@ fn check_outage(run: &Run, failures: &mut Vec<String>) {
             ));
             return;
         }
-        // A driver that read nothing says so twice: the flag and the mask of
-        // the rows it did not hear from. A sample carrying one without the
-        // other is a receiver's choice about which to believe.
-        let masked = sample.miss_mask != 0;
+        // A driver that read nothing says so twice: the flag and the set of
+        // rows it did not hear from. A sample carrying one without the other is
+        // a receiver's choice about which to believe.
+        let missing = joint_set(sample.missing());
+        let masked = !missing.is_ok_and(flags::is_empty);
         if masked != dark {
+            let named = match missing {
+                Ok(set) => flags::Names(set).to_string(),
+                Err(complaint) => complaint.to_string(),
+            };
             failures.push(format!(
-                "the sample at cycle {cycle} carries miss mask {:#b} and a validity flag of {}: \
-                 the two say different things about the same reading",
-                sample.miss_mask, sample.present_valid
+                "the sample at cycle {cycle} says the rows missing are {named} and its validity \
+                 flag is {}: the two say different things about the same reading",
+                sample.present_valid()
             ));
             return;
         }
@@ -211,7 +219,7 @@ fn check_report(run: &Run, failures: &mut Vec<String>) {
                 continue;
             }
         };
-        if fault.message.kind() != FaultKind::POSITION_FEEDBACK_LOST {
+        if fault.message.kind() != FaultKindWire::POSITION_FEEDBACK_LOST {
             failures.push(format!(
                 "the decision tick reported {:?} at cycle {cycle}, and the only thing this \
                  scenario does to the machine is stop reading it",
@@ -234,7 +242,7 @@ fn check_report(run: &Run, failures: &mut Vec<String>) {
                 fault_cycle()
             ));
         }
-        if fault.message.joint() != JointRef::NONE {
+        if fault.message.joint() != JointRefWire::NONE {
             failures.push(format!(
                 "the report at cycle {cycle} names {:?}, and a bus that answered for nothing is \
                  not about one servo",

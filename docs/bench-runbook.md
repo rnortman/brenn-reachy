@@ -86,7 +86,7 @@ how a rebooted unit is brought back afterwards, not how a session begins.
     make bench-build                     # the aarch64 binary, cross-compiled by bazel
     make bench-config                    # push .local/reachy-bench.toml into the unit's RAM
     make bench-run ARGS="selftest"       # read-only: pings and register reads, no torque
-    make bench-run ARGS="up"             # and the rest of the commands
+    make bench-run ARGS="off"            # and the rest of the commands
     make bench-fetch                     # bring the self-test record back, timestamped
 
 `make bench-run` has `bench-build` as a prerequisite, so the blessed entry
@@ -100,22 +100,22 @@ before the first session:
 - `selftest` — read-only. Presence, registers, voltage, health, the resting
   pose, the antennas' fold. Writes a state file that `bench-fetch` retrieves.
   A diagnostic and a regression guard; it gates nothing.
-- `arm` / `off` — take hold, and let go. `off` always releases: wherever the
-  machine is, torque comes off and where it was is reported. That is the way
-  out of any session at any moment, and the head settles as it goes, so take
-  its weight if it is up.
-- `up`, `stow`, `hold`, `yaw <deg>`, `antennas <right> <left>`, `demo`.
-  Every one of them commissions the machine and takes hold of it first —
-  nothing is remembered between invocations — and every one but `demo` leaves
-  the machine holding when it ends, so `up`, `yaw`, `stow` chain without the
-  head dropping in between. Finish with `off`.
+- `provision` — writes the antennas' operating mode. Torque must be off on
+  both; it moves nothing.
+- `off` — writes torque off on every servo on the roster. It gates on nothing
+  and measures nothing: wherever the machine is, torque comes off. Every servo
+  is asked whatever the ones before it answered, and a servo that never
+  acknowledged fails the command rather than riding out on the closing line.
+  The head settles as it goes, so take its weight if it is up.
 - `reboot [id]` — see below.
 
-A clean move prints its period count, jitter, slip and elapsed time; the two
-instants it ended on (commanding finished, and measurably at the goal); and
-the worst lag every joint ran at. A run that faults prints the fault, the
-maneuver that answered it, and the session's whole record as one `incident:`
-line.
+**There is no command here that moves the machine.** The supervised motion
+commands — `arm`, `up`, `hold`, `stow`, `yaw`, `antennas`, `demo`, `play` — are
+gone from the build; the bench is a read-only registry plus the three writes
+above. Coordinated motion is the cog path's, and until it drives hardware,
+nothing in this tree commands a move on a unit. What still works on hardware is
+every read-only check, provisioning, `reboot`, and `off` — so the machine can
+always be read and always be released.
 
 ## Binary freshness
 
@@ -146,7 +146,7 @@ catch, all deliberate:
 To run an old binary deliberately — bisecting a behaviour, reproducing a past
 session — `--stale-ok` is the first token after `--run`:
 
-    tools/deploy-bench.sh "$REACHY_HOST" --run --stale-ok up
+    tools/deploy-bench.sh "$REACHY_HOST" --run --stale-ok selftest
 
 It is this script's flag, not the bench's, so it must be in that position;
 everything from the next token on goes to the bench untouched.
@@ -196,13 +196,18 @@ bound to widen. See the open observations at the end.
 
 ## Traces, and what to do with one
 
-`--trace PATH` writes one CSV row per control period: every joint's measured
-angle against the goal it was being held to, which is the move's velocity
-profile at the rate it was sampled. Each run of the invocation appends, and
-the run number is derived from the file's own last row, so several
-invocations against one path accumulate rather than overwrite.
+No command writes a trace today: `--trace` belonged to the motion commands, and
+they are out of the build. The recordings already taken are checked in under
+`crates/reachy-bench/fixtures/traces` and stay the measurements this machine's
+guards are sized against. What follows describes the format they are in, and the
+workflow whatever records the next one has to fit.
 
-    make bench-run ARGS="up --trace /var/lib/brenn-app/reachy-trace.csv"
+A trace is one CSV row per control period: every joint's measured angle against
+the goal it was being held to, which is the move's velocity profile at the rate
+it was sampled. Each run of an invocation appends, and the run number is derived
+from the file's own last row, so several invocations against one path accumulate
+rather than overwrite. Bringing one back off a unit:
+
     ssh root@"$REACHY_HOST" cat /var/lib/brenn-app/reachy-trace.csv \
         > .local/records/trace-$(date -u +%Y%m%dT%H%M%SZ).csv
 
@@ -210,12 +215,16 @@ A released joint's goal cells are blank from the period after it went out of
 service; its measured cells keep recording. That is the diagnostic of record
 for a degraded run.
 
-**Reading one back.** `reachy_bench::trace::metrics` is the measurement half
-of the old scratch analyzer, in Rust and under test: `Trace::read` parses a
+**Reading one back.** `crates/reachy-bench/src/trace/metrics.rs` is the
+measurement half of the old scratch analyzer, in Rust — out of the build with
+the motion layer it served, and kept on disk under `TODO(bench-motion-delete)`
+until the cog path replaces it: `Trace::read` parses a
 file into runs and periods, and the per-run and per-joint measurements are
 span, peak measured and goal speed, peak goal step, worst lag, arrival,
 residual, settle gap, longest stall, and the antenna pair's phase separation.
-There is no CLI over it — its consumers are the fixture tests below. The
+There is no CLI over it — its consumer was the replay suite now parked in
+`crates/reachy-bench/src/replay.rs`, which drove the four fixtures against the
+shipped guards. The
 plotting half stays scratch in `.local/`, with its own throwaway venv; a
 plotting aid is bench-session tooling, not product.
 
@@ -228,8 +237,9 @@ loop read it, so velocities from it are averages over a period.
 
 **Keeping one.** A recording that settled a question becomes a fixture:
 `crates/reachy-bench/fixtures/traces/`, a row in that directory's `README.md`
-saying what it records, and a test in `trace::metrics` asserting the property
-that qualified it. The four already there are what the shipped step bounds,
+saying what it records, and a test asserting the property that qualified it —
+which needs the replay suite re-pointed at whatever hosts the loop by then, the
+cutover slice's work. The four already there are what the shipped step bounds,
 tracking threshold, gains and antenna clocks are sized against — a measurement
 nothing replays is folklore by the next release. `*.csv` is gitignored
 repo-wide and that directory is negated back in, so a new fixture lands with

@@ -2,6 +2,7 @@ load("@clockwork//clockwork:rules.bzl", "clk")
 load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
 load("//bazel:rust_clk.bzl", "rust_clk_module")
 
 # The Clockwork bring-up probe: the smallest system that answers the questions
@@ -105,6 +106,7 @@ rust_clk_module(
         "@clockwork//clockwork/io:var_packet.clk",
     ],
     test_wrappers = True,
+    validated_naming = VALIDATED_NAMING,
     deps = [
         ":probe_msgs_clk_rs",
         "//cogs/upstream:var_packet_clk_rs",
@@ -120,8 +122,10 @@ rust_test(
     deps = [
         ":probe_clk_rs_test",
         ":probe_msgs_clk_rs",
+        ":probe_scenario",
         "//cogs/upstream:var_packet_clk_rs",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:goal_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -137,7 +141,8 @@ rust_library(
         ":probe_msgs_clk_rs",
         ":probe_scenario",
         "//cogs/upstream:var_packet_clk_rs",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:goal_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -160,6 +165,7 @@ clk(
 rust_clk_module(
     name = "probe_msgs_clk_rs",
     src = "probe_msgs.clk",
+    validated_naming = VALIDATED_NAMING,
 )
 
 # The scenario: what the probe, the author and the checker agree on. No log
@@ -171,6 +177,7 @@ rust_library(
     edition = "2024",
     deps = [
         ":probe_msgs_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -189,10 +196,10 @@ rust_binary(
     ],
 )
 
-# Phase three: the assertions, over the output log. It links the wire codec
-# rather than reimplementing it, so the datagrams are checked by the same code
-# that produced them -- what is under test here is the carrier and the log, not
-# the encoding, which `reachy-wire`'s own suite and its golden vectors own.
+# Phase three: the assertions, over the output log. It builds its expectation as
+# the same message the cog published and compares the carrier's bytes to that
+# message's own -- what is under test here is the carrier and the log, not the
+# layout, which the generated crate's offset asserts own.
 rust_binary(
     name = "probe_scenario_checker",
     srcs = ["probe_scenario_checker.rs"],
@@ -202,7 +209,8 @@ rust_binary(
         ":probe_scenario",
         "//cogs:log_read",
         "//cogs/upstream:var_packet_clk_rs",
-        "//crates/reachy-wire:reachy_wire",
+        "//driver:goal_clk_rs",
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],

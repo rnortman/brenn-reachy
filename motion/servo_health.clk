@@ -1,0 +1,76 @@
+// What a servo says about its own health, and the supply that feeds it.
+//
+// Its own module because two sequencers read it: a commissioning surveys the
+// rail and the error bytes before it arms, and a position sweep re-reads them
+// while it runs. Neither one's provisioning grids or phases belong in the other's
+// rebuilds, so the readings they share sit apart from both.
+//
+// A hardware-error byte is reported, never interpreted here: bit 0 is the
+// input-voltage bit this platform expects, and what any bit means is the reading
+// layer's opinion.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::joints;
+
+// One servo's hardware-error byte, as read, and which servo answered it.
+//
+// The id must travel with the byte: bus ids are configuration, and a reading
+// filed under the wrong id sends somebody to the wrong servo.
+schema ServoHealthRow
+{
+    uuid: 370e83e4-45a3-4d5d-9cc8-3ad7315747d3;
+    fields
+    {
+        // The servo's bus id, as configured. Zero where nothing has been read.
+        #0 id: UInt8;
+        // The hardware-error byte as read. Bit 0 is the input-voltage bit, which
+        // this platform expects and reports; every other bit means the motor.
+        #1 bits: UInt8;
+    }
+}
+
+// One hardware-error reading per servo, in bus order.
+schema ServoHealths
+{
+    uuid: 977b70a3-2127-41bf-95c5-21034b67691b;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: ServoHealthRow;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: ServoHealthRow;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: ServoHealthRow;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: ServoHealthRow;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: ServoHealthRow;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: ServoHealthRow;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: ServoHealthRow;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: ServoHealthRow;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: ServoHealthRow;
+    }
+}
+
+// The supply and the latched error bits, as one sweep read them.
+//
+// Coupled to `reachy_motion::Rail`. The next engage judges the torque-on gates
+// from this snapshot rather than from the wire, so these readings must survive
+// the crossing.
+schema RailSnap
+{
+    uuid: fece3b09-7219-4ff2-a341-071c0e764a90;
+    fields
+    {
+        // Each servo's supply reading, volts.
+        #0 voltages: joints::Joints;
+        // Each servo's hardware-error byte, as read.
+        #1 health: ServoHealths;
+    }
+}

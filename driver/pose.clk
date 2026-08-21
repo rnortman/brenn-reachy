@@ -1,0 +1,106 @@
+// What the machine's pose is: the sample the driver publishes every cycle, and
+// the estimate solved from it.
+//
+// Both are pose and nothing else, which is why they share a module: a consumer
+// of either is a consumer of the other one cycle later, and neither should
+// rebuild when an event kind or a health register changes. The driver half
+// publishes the sample; the pose solver publishes the estimate from it.
+//
+// Two conventions hold throughout, and both are worth stating because a reader
+// coming from the wire format will expect otherwise: time is `SyncTime`, never a
+// bare nanosecond count, and a set of servos is `JointFlags`, never a mask of
+// bits a comment explains. Angles are radians about the model datum, positions
+// metres in the body frame -- the units `reachy-kin` and `reachy-motion` use, so
+// nothing here converts.
+//
+// The joint vocabulary is imported under an alias because `PoseEstimate`
+// carries a field called `joints`, and a field name shadows a module name in the
+// schema's scope, which the compiler refuses as a redefinition.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+use geometry::primitives;
+use motion::joints as joint_vocab;
+
+// The driver's per-cycle report: what it read, what it is holding, and how well
+// the read went.
+//
+// One of these is published every cycle without exception, whatever else
+// happened -- it is the heartbeat the control loop runs on, so a cycle in which
+// the bus went silent is a sample carrying `present_valid` false, never an
+// absent sample.
+schema PoseSample
+{
+    uuid: e35bc005-ecd9-4ade-8c7f-eb8b42f6e4f5;
+    fields
+    {
+        // The cycle's grid instant: when the sample was meant to be taken.
+        #0 nominal_time: SyncTime;
+
+        // When the bus read actually completed. Equal to the nominal instant
+        // only where there is no read jitter to report, as in simulation.
+        #1 sample_time: SyncTime;
+
+        // Whether `present` is a complete reading of every row. False leaves
+        // every angle below as evidence of what was read anyway.
+        #2 present_valid: Bool;
+
+        // Whether `commanded` reflects a setpoint the driver is holding.
+        #3 commanded_valid: Bool;
+
+        // Whether the driver has latched torque off and is refusing to write.
+        // A standing condition, reported every cycle; the edge that got it
+        // there is an event.
+        #4 torque_off_latched: Bool;
+
+        // The rows that did not answer this cycle. Empty is a clean read.
+        #5 missing: joint_vocab::JointFlags;
+
+        // Measured positions, radians.
+        #6 present: joint_vocab::Joints;
+
+        // The setpoint currently held, radians. Meaningless when
+        // `commanded_valid` is false.
+        #7 commanded: joint_vocab::Joints;
+    }
+}
+
+// Where the head is, as the estimator reads it off one sample.
+//
+// Published for every sample, valid or not. A consumer of a pose series needs
+// staleness to be a value it can see rather than a gap it has to infer from
+// timestamps, so an incomplete sample or a solve that did not converge produces
+// a message saying so at the instant it happened.
+schema PoseEstimate
+{
+    uuid: cd21ea37-ddf3-4088-a5c1-583e005f57cc;
+    fields
+    {
+        // When the reading this estimate came from was taken -- the sample's
+        // own sample time, not the instant this message was published.
+        #0 time_of_validity: SyncTime;
+
+        // The measured joint positions the estimate was made from, radians.
+        // Carried even when invalid, because what was read is evidence.
+        #1 joints: joint_vocab::Joints;
+
+        // Head position in the body frame, metres. Meaningless when `valid` is
+        // false -- the solver writes no pose it could not find.
+        #2 head_pos: primitives::Vec3;
+
+        // Head orientation in the body frame. Meaningless when `valid` is
+        // false, as above.
+        #3 head_quat: primitives::Quat;
+
+        // Whether the sample was complete and the solve converged.
+        #4 valid: Bool;
+
+        // Newton iterations the solve took. Zero when the seed already
+        // satisfied the tolerance, and zero when there was no solve.
+        #5 fk_iters: UInt32;
+
+        // The worst per-leg loop-closure residual at the answer, metres.
+        #6 fk_residual: Float64;
+    }
+}

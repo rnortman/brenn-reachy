@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use scenario::author::{self, ALL_ROWS, InputLog};
+use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s1_scenario::{DISENGAGE_CYCLE, DISENGAGED_EPOCH, ENGAGE_CYCLE, ENGAGED_EPOCH, steps};
@@ -34,7 +34,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     // machine would have the decision tick commanding servos that answer
     // nothing, which is a different scenario.
     let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, ALL_ROWS)?;
+    log.torque_on(engage, author::all_rows())?;
     log.schedule(engage, true, ENGAGED_EPOCH, &steps())?;
 
     // The session ends. Disengaging stops the goal stream, so the de-energising
@@ -43,7 +43,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     // this scenario's subject.
     let disengage = cycle_at(DISENGAGE_CYCLE);
     log.schedule(disengage, false, DISENGAGED_EPOCH, &[])?;
-    log.torque_off(disengage, ALL_ROWS)?;
+    log.torque_off(disengage, author::all_rows())?;
 
     log.close()
 }

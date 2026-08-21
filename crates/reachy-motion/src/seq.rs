@@ -20,7 +20,7 @@
 //!
 //! ## Unicast only
 //!
-//! Every request in [`BusRequest`] names one servo. Arming's writes must each be
+//! Every transaction a sequencer emits names one servo. Arming's writes must each be
 //! acknowledged and read back, because a broadcast write that silently fails to
 //! apply is exactly the failure arming exists to catch, and its reads are
 //! per-servo verdicts rather than one aggregate. The grouped traffic — reading
@@ -40,343 +40,60 @@ use core::time::Duration;
 use reachy_kin::FkError;
 use thiserror::Error;
 
-use crate::joints::JointId;
-use crate::slot_enum::slot_enum;
+use crate::joints::{JointRef, Name, ROW_COUNT};
+use crate::txn::BusTxnWire;
+use crate::value::{ShapeName, Shown, Value, ValueShape};
 
-/// A register, named the way this crate thinks of them.
+/// A register, and the operator's word for it.
 ///
-/// Addresses, widths and byte order belong to the layer that owns the wire; the
-/// closed set here is the vocabulary a sequencer may ask for, and the mapping is
-/// somebody else's table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegId {
-    /// Whether the servo holds its goal.
-    TorqueEnable,
-    /// Where the servo is being commanded to.
-    GoalPosition,
-    /// Where the servo says it is.
-    PresentPosition,
-    /// Which control mode the servo is in. Position mode is the only one this
-    /// project ever runs, and the only one whose position limits apply.
-    OperatingMode,
-    /// The offset added to the raw position, which is how this platform's legs
-    /// are datum-shifted in the servo rather than in the host.
-    HomingOffset,
-    /// How long the servo waits before answering.
-    ReturnDelayTime,
-    /// The bottom of the range the servo itself refuses to be commanded past.
-    MinPositionLimit,
-    /// The top of that range.
-    MaxPositionLimit,
-    /// Which hardware errors make the servo shut its own torque off.
-    Shutdown,
-    /// Direction and profile flags.
-    DriveMode,
-    /// The supply ceiling the servo alarms on.
-    MaxVoltageLimit,
-    /// The supply floor it alarms on.
-    MinVoltageLimit,
-    /// The current ceiling.
-    CurrentLimit,
-    /// The velocity ceiling.
-    VelocityLimit,
-    /// The temperature ceiling.
-    TemperatureLimit,
-    /// The timeout after which the servo stops holding its goal because the host
-    /// went quiet. Disabled on this platform: on this linkage a servo that stops
-    /// holding drops the head.
-    BusWatchdog,
-    /// The acceleration limit of the servo's own profile, the backstop under
-    /// host-side shaping.
-    ProfileAcceleration,
-    /// The velocity limit of that profile.
-    ProfileVelocity,
-    /// The position loop's three gains, read and written as one span.
-    PositionGains,
-    /// The latched hardware-error bits.
-    HardwareErrorStatus,
-    /// The measured supply voltage.
-    PresentInputVoltage,
-    /// What kind of servo this is.
-    ModelNumber,
-}
+/// The register is the vocabulary's: one enum, declared in
+/// `hardware/dynamixel/registers.clk`, so the number that crosses a slot and the
+/// name this crate matches on are one thing. Addresses, widths and byte order
+/// belong to the layer that owns the wire, and the mapping is its table.
+pub mod reg {
+    pub use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegId;
 
-impl RegId {
-    /// Every register, for sweeps and tables.
-    pub const ALL: [Self; 22] = [
-        Self::TorqueEnable,
-        Self::GoalPosition,
-        Self::PresentPosition,
-        Self::OperatingMode,
-        Self::HomingOffset,
-        Self::ReturnDelayTime,
-        Self::MinPositionLimit,
-        Self::MaxPositionLimit,
-        Self::Shutdown,
-        Self::DriveMode,
-        Self::MaxVoltageLimit,
-        Self::MinVoltageLimit,
-        Self::CurrentLimit,
-        Self::VelocityLimit,
-        Self::TemperatureLimit,
-        Self::BusWatchdog,
-        Self::ProfileAcceleration,
-        Self::ProfileVelocity,
-        Self::PositionGains,
-        Self::HardwareErrorStatus,
-        Self::PresentInputVoltage,
-        Self::ModelNumber,
-    ];
-}
+    vocab_name! {
+        /// A register as a bring-up report says it.
+        ///
+        /// The generated `Display` renders the variant's name, which is a
+        /// diagnostic spelling and not what an operator reads off a failure line.
+        pub struct Name(RegId) {
+            RegId::None => "no register",
+            RegId::TorqueEnable => "torque enable",
+            RegId::GoalPosition => "goal position",
+            RegId::PresentPosition => "present position",
+            RegId::OperatingMode => "operating mode",
+            RegId::HomingOffset => "homing offset",
+            RegId::ReturnDelayTime => "return delay time",
+            RegId::MinPositionLimit => "minimum position limit",
+            RegId::MaxPositionLimit => "maximum position limit",
+            RegId::Shutdown => "shutdown mask",
+            RegId::DriveMode => "drive mode",
+            RegId::MaxVoltageLimit => "maximum voltage limit",
+            RegId::MinVoltageLimit => "minimum voltage limit",
+            RegId::CurrentLimit => "current limit",
+            RegId::VelocityLimit => "velocity limit",
+            RegId::TemperatureLimit => "temperature limit",
+            RegId::BusWatchdog => "bus watchdog",
+            RegId::ProfileAcceleration => "profile acceleration",
+            RegId::ProfileVelocity => "profile velocity",
+            RegId::PositionGains => "position gains",
+            RegId::HardwareErrorStatus => "hardware error status",
+            RegId::PresentInputVoltage => "present input voltage",
+            RegId::ModelNumber => "model number",
+        }
+    }
 
-impl fmt::Display for RegId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::TorqueEnable => "torque enable",
-            Self::GoalPosition => "goal position",
-            Self::PresentPosition => "present position",
-            Self::OperatingMode => "operating mode",
-            Self::HomingOffset => "homing offset",
-            Self::ReturnDelayTime => "return delay time",
-            Self::MinPositionLimit => "minimum position limit",
-            Self::MaxPositionLimit => "maximum position limit",
-            Self::Shutdown => "shutdown mask",
-            Self::DriveMode => "drive mode",
-            Self::MaxVoltageLimit => "maximum voltage limit",
-            Self::MinVoltageLimit => "minimum voltage limit",
-            Self::CurrentLimit => "current limit",
-            Self::VelocityLimit => "velocity limit",
-            Self::TemperatureLimit => "temperature limit",
-            Self::BusWatchdog => "bus watchdog",
-            Self::ProfileAcceleration => "profile acceleration",
-            Self::ProfileVelocity => "profile velocity",
-            Self::PositionGains => "position gains",
-            Self::HardwareErrorStatus => "hardware error status",
-            Self::PresentInputVoltage => "present input voltage",
-            Self::ModelNumber => "model number",
-        };
-        f.write_str(name)
+    /// Every register the vocabulary names, the no-register zero excluded: that
+    /// one names no control-table entry, and a sweep over registers does not mean
+    /// it.
+    pub fn named() -> impl Iterator<Item = RegId> {
+        crate::vocab::without_zero(RegId::VARIANTS)
     }
 }
 
-/// A register's value, in engineering units wherever the register has any.
-///
-/// Radians and volts cross this boundary as radians and volts. Counts and raw
-/// bytes are the wire layer's business, and nothing above this line may depend
-/// on them.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RegValue {
-    /// A one-byte register.
-    U8(u8),
-    /// A two-byte register.
-    U16(u16),
-    /// A four-byte register.
-    U32(u32),
-    /// A four-byte register whose contents are signed. The homing offset is
-    /// one: it is a quarter turn either side of zero on this platform, and read
-    /// unsigned it reports a negative offset as a number near four billion.
-    I32(i32),
-    /// An angle: a position register, in the model's own frame.
-    Radians(f64),
-    /// A supply voltage.
-    Volts(f64),
-    /// The position loop's three gains as one span. Their order on the wire is
-    /// not this order, and that is the wire layer's problem.
-    Gains {
-        /// Proportional gain.
-        p: u16,
-        /// Integral gain.
-        i: u16,
-        /// Derivative gain.
-        d: u16,
-    },
-}
-
-/// The shape of a [`RegValue`], for saying what was wanted and what arrived.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueKind {
-    /// [`RegValue::U8`].
-    U8,
-    /// [`RegValue::U16`].
-    U16,
-    /// [`RegValue::U32`].
-    U32,
-    /// [`RegValue::I32`].
-    I32,
-    /// [`RegValue::Radians`].
-    Radians,
-    /// [`RegValue::Volts`].
-    Volts,
-    /// [`RegValue::Gains`].
-    Gains,
-}
-
-impl fmt::Display for ValueKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::U8 => "one-byte value",
-            Self::U16 => "two-byte value",
-            Self::U32 => "four-byte value",
-            Self::I32 => "signed four-byte value",
-            Self::Radians => "angle",
-            Self::Volts => "voltage",
-            Self::Gains => "gain span",
-        };
-        f.write_str(name)
-    }
-}
-
-impl RegValue {
-    /// Which shape this is.
-    #[must_use]
-    pub fn kind(&self) -> ValueKind {
-        match self {
-            Self::U8(_) => ValueKind::U8,
-            Self::U16(_) => ValueKind::U16,
-            Self::U32(_) => ValueKind::U32,
-            Self::I32(_) => ValueKind::I32,
-            Self::Radians(_) => ValueKind::Radians,
-            Self::Volts(_) => ValueKind::Volts,
-            Self::Gains { .. } => ValueKind::Gains,
-        }
-    }
-
-    /// The byte, or a failure naming what arrived instead.
-    pub fn u8(&self, context: StepContext) -> Result<u8, SeqError> {
-        match self {
-            Self::U8(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::U8)),
-        }
-    }
-
-    /// The two-byte value, or a failure naming what arrived instead.
-    pub fn u16(&self, context: StepContext) -> Result<u16, SeqError> {
-        match self {
-            Self::U16(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::U16)),
-        }
-    }
-
-    /// The four-byte value, or a failure naming what arrived instead.
-    pub fn u32(&self, context: StepContext) -> Result<u32, SeqError> {
-        match self {
-            Self::U32(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::U32)),
-        }
-    }
-
-    /// The signed four-byte value, or a failure naming what arrived instead.
-    pub fn i32(&self, context: StepContext) -> Result<i32, SeqError> {
-        match self {
-            Self::I32(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::I32)),
-        }
-    }
-
-    /// The angle, or a failure naming what arrived instead.
-    pub fn radians(&self, context: StepContext) -> Result<f64, SeqError> {
-        match self {
-            Self::Radians(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::Radians)),
-        }
-    }
-
-    /// The voltage, or a failure naming what arrived instead.
-    pub fn volts(&self, context: StepContext) -> Result<f64, SeqError> {
-        match self {
-            Self::Volts(value) => Ok(*value),
-            other => Err(other.wrong_shape(context, ValueKind::Volts)),
-        }
-    }
-
-    /// The three gains, or a failure naming what arrived instead.
-    pub fn gains(&self, context: StepContext) -> Result<(u16, u16, u16), SeqError> {
-        match self {
-            Self::Gains { p, i, d } => Ok((*p, *i, *d)),
-            other => Err(other.wrong_shape(context, ValueKind::Gains)),
-        }
-    }
-
-    fn wrong_shape(&self, context: StepContext, wanted: ValueKind) -> SeqError {
-        SeqError::WrongValue {
-            context,
-            expected: wanted,
-            observed: self.kind(),
-        }
-    }
-}
-
-impl fmt::Display for RegValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::U8(value) => write!(f, "{value}"),
-            Self::U16(value) => write!(f, "{value}"),
-            Self::U32(value) => write!(f, "{value}"),
-            Self::I32(value) => write!(f, "{value}"),
-            Self::Radians(value) => write!(f, "{value:.4} rad"),
-            Self::Volts(value) => write!(f, "{value:.1} V"),
-            Self::Gains { p, i, d } => write!(f, "P {p} I {i} D {d}"),
-        }
-    }
-}
-
-/// One transaction a sequencer wants run. Always addressed to a single servo.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum BusRequest {
-    /// Ask whether this servo is there.
-    Ping {
-        /// Its bus ID.
-        id: u8,
-    },
-    /// Read one register.
-    ReadReg {
-        /// The servo's bus ID.
-        id: u8,
-        /// Which register.
-        reg: RegId,
-    },
-    /// Write one register, check the acknowledgement, and read it back.
-    WriteRegVerified {
-        /// The servo's bus ID.
-        id: u8,
-        /// Which register.
-        reg: RegId,
-        /// What to write.
-        value: RegValue,
-    },
-}
-
-impl BusRequest {
-    /// The servo this request is addressed to.
-    #[must_use]
-    pub fn id(&self) -> u8 {
-        match self {
-            Self::Ping { id } | Self::ReadReg { id, .. } | Self::WriteRegVerified { id, .. } => *id,
-        }
-    }
-
-    /// The register it concerns, if it concerns one.
-    #[must_use]
-    pub fn reg(&self) -> Option<RegId> {
-        match self {
-            Self::Ping { .. } => None,
-            Self::ReadReg { reg, .. } | Self::WriteRegVerified { reg, .. } => Some(*reg),
-        }
-    }
-
-    /// The value it writes, if it writes one.
-    ///
-    /// What a read-back is compared against, so a sequencer confirming a write
-    /// takes the expected value from the request it made rather than keeping a
-    /// second copy that could disagree with it.
-    #[must_use]
-    pub fn value(&self) -> Option<RegValue> {
-        match self {
-            Self::Ping { .. } | Self::ReadReg { .. } => None,
-            Self::WriteRegVerified { value, .. } => Some(*value),
-        }
-    }
-}
+pub use reg::RegId;
 
 /// Which servos did not answer.
 ///
@@ -385,16 +102,16 @@ impl BusRequest {
 /// are different observations and read differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AbsentSet {
-    ids: [u8; JointId::COUNT],
+    ids: [u8; ROW_COUNT],
     count: usize,
 }
 
 impl AbsentSet {
     /// The set of IDs among `ids` whose corresponding `absent` flag is set.
     #[must_use]
-    pub fn new(ids: &[u8; JointId::COUNT], absent: &[bool; JointId::COUNT]) -> Self {
+    pub fn new(ids: &[u8; ROW_COUNT], absent: &[bool; ROW_COUNT]) -> Self {
         let mut set = Self {
-            ids: [0; JointId::COUNT],
+            ids: [0; ROW_COUNT],
             count: 0,
         };
         for (id, missing) in ids.iter().zip(absent) {
@@ -425,7 +142,7 @@ impl fmt::Display for AbsentSet {
         // with many possible causes — supply, wiring, adapter, baud, the whole
         // bus held by something else — and naming a cause here would be a guess
         // printed as a finding.
-        if self.count == JointId::COUNT {
+        if self.count == ROW_COUNT {
             return f.write_str("all nine servos");
         }
         if self.count == 1 {
@@ -447,9 +164,10 @@ impl fmt::Display for AbsentSet {
 
 /// How a transaction came out.
 ///
-/// A silent servo, a refusal, a mismatched read-back and a corrupt frame are four
-/// different things, and every one of them is reported as itself. The driver has
-/// already spent whatever retry budget applies to the ones worth retrying.
+/// A silent servo, a servo's refusal, a driver that would not run the
+/// transaction, a mismatched read-back and a corrupt frame are five different
+/// things, and every one of them is reported as itself. The driver has already
+/// spent whatever retry budget applies to the ones worth retrying.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BusResult {
     /// The servo answered a ping, and said what it is.
@@ -458,11 +176,17 @@ pub enum BusResult {
         model: u16,
     },
     /// The read returned this.
-    Value(RegValue),
+    Value(Value),
     /// The write was acknowledged and read back as written.
     Written,
     /// Nothing came back within the deadline, and the retries are spent.
     NoAnswer,
+    /// The driver would not attempt the transaction: it was asked while another
+    /// was outstanding, or asked for something it does not allow in the state it
+    /// is in. Distinct from [`Self::NoAnswer`] because it is evidence about the
+    /// host and the driver rather than about the servo — nothing was put on the
+    /// bus, so a servo that answers perfectly well produces this too.
+    DriverRefused,
     /// The servo answered with its error field set.
     ServoError {
         /// The status error field, verbatim. Never reinterpreted here: one code
@@ -474,59 +198,60 @@ pub enum BusResult {
     /// written.
     VerifyMismatch {
         /// What the register held afterwards.
-        read_back: RegValue,
+        read_back: Value,
     },
     /// A frame came back that the wire mangled. Never retried: a corrupted answer
     /// carries no evidence about what the servo actually did.
     WireCorrupt,
 }
 
-/// The shape of a [`BusResult`], for saying what was wanted and what arrived.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnswerKind {
-    /// [`BusResult::Pinged`].
-    Pinged,
-    /// [`BusResult::Value`].
-    Value,
-    /// [`BusResult::Written`].
-    Written,
-    /// [`BusResult::NoAnswer`].
-    Missing,
-    /// [`BusResult::ServoError`].
-    Refused,
-    /// [`BusResult::VerifyMismatch`].
-    Mismatched,
-    /// [`BusResult::WireCorrupt`].
-    Corrupt,
-}
+/// The shape of a [`BusResult`], and the operator's word for it.
+///
+/// The shape is the vocabulary's: one enum, declared in `motion/seq.clk`, so the
+/// number a verdict crosses a slot in and the name this crate matches on are one
+/// thing. [`AnswerShape::NotApplicable`] is the value a failure that is not about
+/// a mismatch of answer shapes leaves in those fields; nothing a bus answers is
+/// ever that.
+pub mod answer {
+    pub use brenn_reachy__motion__seq_clk_rs::AnswerShape;
 
-impl fmt::Display for AnswerKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Pinged => "ping reply",
-            Self::Value => "register value",
-            Self::Written => "verified write",
-            Self::Missing => "silence",
-            Self::Refused => "refusal",
-            Self::Mismatched => "read-back mismatch",
-            Self::Corrupt => "corrupt frame",
-        };
-        f.write_str(name)
+    vocab_name! {
+        /// An answer shape as a failure line says it.
+        pub struct Name(AnswerShape) {
+            AnswerShape::NotApplicable => "no answer shape",
+            AnswerShape::Pinged => "ping reply",
+            AnswerShape::Value => "register value",
+            AnswerShape::Written => "verified write",
+            AnswerShape::Missing => "silence",
+            AnswerShape::DriverRefused => "a driver that would not run it",
+            AnswerShape::Refused => "refusal",
+            AnswerShape::Mismatched => "read-back mismatch",
+            AnswerShape::Corrupt => "corrupt frame",
+        }
+    }
+
+    /// Every shape a transaction is answered in, the not-applicable zero
+    /// excluded: nothing a bus answers is ever that.
+    pub fn shapes() -> impl Iterator<Item = AnswerShape> {
+        crate::vocab::without_zero(AnswerShape::VARIANTS)
     }
 }
+
+pub use answer::AnswerShape;
 
 impl BusResult {
     /// Which shape this is.
     #[must_use]
-    pub fn kind(&self) -> AnswerKind {
+    pub fn kind(&self) -> AnswerShape {
         match self {
-            Self::Pinged { .. } => AnswerKind::Pinged,
-            Self::Value(_) => AnswerKind::Value,
-            Self::Written => AnswerKind::Written,
-            Self::NoAnswer => AnswerKind::Missing,
-            Self::ServoError { .. } => AnswerKind::Refused,
-            Self::VerifyMismatch { .. } => AnswerKind::Mismatched,
-            Self::WireCorrupt => AnswerKind::Corrupt,
+            Self::Pinged { .. } => AnswerShape::Pinged,
+            Self::Value(_) => AnswerShape::Value,
+            Self::Written => AnswerShape::Written,
+            Self::NoAnswer => AnswerShape::Missing,
+            Self::DriverRefused => AnswerShape::DriverRefused,
+            Self::ServoError { .. } => AnswerShape::Refused,
+            Self::VerifyMismatch { .. } => AnswerShape::Mismatched,
+            Self::WireCorrupt => AnswerShape::Corrupt,
         }
     }
 
@@ -534,36 +259,32 @@ impl BusResult {
     pub fn pinged(&self, context: StepContext) -> Result<u16, SeqError> {
         match self {
             Self::Pinged { model } => Ok(*model),
-            other => Err(other.failure(context, AnswerKind::Pinged, None)),
+            other => Err(other.failure(context, AnswerShape::Pinged, None)),
         }
     }
 
     /// The value a read returned, or the typed failure to report.
-    pub fn value(&self, context: StepContext) -> Result<RegValue, SeqError> {
+    pub fn value(&self, context: StepContext) -> Result<Value, SeqError> {
         match self {
             Self::Value(value) => Ok(*value),
-            other => Err(other.failure(context, AnswerKind::Value, None)),
+            other => Err(other.failure(context, AnswerShape::Value, None)),
         }
     }
 
     /// Confirmation that `wrote` landed, or the typed failure to report. `wrote`
     /// is what the sequencer asked for, so a mismatch can say both halves.
-    pub fn written(&self, context: StepContext, wrote: RegValue) -> Result<(), SeqError> {
+    pub fn written(&self, context: StepContext, wrote: Value) -> Result<(), SeqError> {
         match self {
             Self::Written => Ok(()),
-            other => Err(other.failure(context, AnswerKind::Written, Some(wrote))),
+            other => Err(other.failure(context, AnswerShape::Written, Some(wrote))),
         }
     }
 
     /// The failure this result amounts to, given what the step wanted.
-    fn failure(
-        &self,
-        context: StepContext,
-        wanted: AnswerKind,
-        wrote: Option<RegValue>,
-    ) -> SeqError {
+    fn failure(&self, context: StepContext, wanted: AnswerShape, wrote: Option<Value>) -> SeqError {
         match self {
             Self::NoAnswer => SeqError::NoAnswer { context },
+            Self::DriverRefused => SeqError::DriverRefused { context },
             Self::ServoError { code } => SeqError::Refused {
                 context,
                 code: *code,
@@ -581,7 +302,7 @@ impl BusResult {
                 None => SeqError::WrongAnswer {
                     context,
                     expected: wanted,
-                    observed: AnswerKind::Mismatched,
+                    observed: AnswerShape::Mismatched,
                 },
             },
             other => SeqError::WrongAnswer {
@@ -593,79 +314,35 @@ impl BusResult {
     }
 }
 
-/// Which part of a sequence is running.
+/// Which part of a sequence is running, and the operator's word for it.
 ///
-/// Both sequencers' phases, in one vocabulary, because a failure is reported the
-/// same way whichever sequence raised it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeqStep {
-    /// Every servo answers a ping.
-    Presence,
-    /// Every servo says what it is.
-    Identity,
-    /// Every provisioned register holds what it should.
-    Provision,
-    /// The supply rail, read: a floor commissioning waits for and engaging
-    /// checks against.
-    VoltageGate,
-    /// The latched hardware-error bytes, read.
-    Health,
-    /// Where the platform is standing, and whether those angles place a pose at
-    /// all. What the datum itself rests on — the provisioned homing offsets — is
-    /// verified in the provisioning phase, before anything here is read.
-    PoseAndDatum,
-    /// The position gains and motion profiles, written fresh.
-    GainsProfiles,
-    /// Goals pinned where the joints stand, then torque enabled — which holds
-    /// every joint where it is — then the pose read back.
-    PinAndEnable,
-    /// Waiting out the settle, before the stow pose is measured at all.
-    Dwell,
-    /// The settled platform is measured to be at the stow pose.
-    VerifyAtStow,
-    /// Torque released, servo by servo.
-    TorqueOff,
-}
+/// The phase is the vocabulary's: one enum, declared in `motion/seq.clk`, holding
+/// both sequencers' phases, because a failure is reported the same way whichever
+/// sequence raised it. [`SeqStepKind::None`] is the value a slot nothing wrote
+/// holds; no running sequence is ever in it.
+pub mod step {
+    pub use brenn_reachy__motion__seq_clk_rs::SeqStepKind;
 
-impl SeqStep {
-    /// Every phase any sequencer has, the torque-on ones in order and then
-    /// disarming's.
-    ///
-    /// Exhaustive: a phase added without a name is caught by the name guard
-    /// rather than escaping it.
-    pub const ALL: [Self; 11] = [
-        Self::Presence,
-        Self::Identity,
-        Self::Provision,
-        Self::VoltageGate,
-        Self::Health,
-        Self::PoseAndDatum,
-        Self::GainsProfiles,
-        Self::PinAndEnable,
-        Self::Dwell,
-        Self::VerifyAtStow,
-        Self::TorqueOff,
-    ];
-}
-
-impl fmt::Display for SeqStep {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Presence => "presence",
-            Self::Identity => "identity",
-            Self::Provision => "provisioning",
-            Self::VoltageGate => "voltage gate",
-            Self::Health => "health",
-            Self::PoseAndDatum => "measured pose and datum",
-            Self::GainsProfiles => "gains and profiles",
-            Self::PinAndEnable => "pin and enable",
-            Self::VerifyAtStow => "stow verification",
-            Self::Dwell => "settle dwell",
-            Self::TorqueOff => "torque off",
-        };
-        f.write_str(name)
+    vocab_name! {
+        /// A phase as a bring-up report says it.
+        pub struct Name(SeqStepKind) {
+            SeqStepKind::None => "no phase",
+            SeqStepKind::Presence => "presence",
+            SeqStepKind::Identity => "identity",
+            SeqStepKind::Provision => "provisioning",
+            SeqStepKind::VoltageGate => "voltage gate",
+            SeqStepKind::Health => "health",
+            SeqStepKind::PoseAndDatum => "measured pose and datum",
+            SeqStepKind::GainsProfiles => "gains and profiles",
+            SeqStepKind::PinAndEnable => "pin and enable",
+            SeqStepKind::VerifyAtStow => "stow verification",
+            SeqStepKind::Dwell => "settle dwell",
+            SeqStepKind::TorqueOff => "torque off",
+        }
     }
 }
+
+pub use step::SeqStepKind;
 
 /// What a sequence was doing when something went wrong.
 ///
@@ -674,7 +351,7 @@ impl fmt::Display for SeqStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepContext {
     /// The phase that was running.
-    pub step: SeqStep,
+    pub step: SeqStepKind,
     /// The servo being addressed.
     pub id: u8,
     /// The register concerned, where one was.
@@ -684,7 +361,7 @@ pub struct StepContext {
 impl StepContext {
     /// A context naming a register.
     #[must_use]
-    pub fn reg(step: SeqStep, id: u8, reg: RegId) -> Self {
+    pub fn reg(step: SeqStepKind, id: u8, reg: RegId) -> Self {
         Self {
             step,
             id,
@@ -694,7 +371,7 @@ impl StepContext {
 
     /// A context for a step that concerns no particular register.
     #[must_use]
-    pub fn servo(step: SeqStep, id: u8) -> Self {
+    pub fn servo(step: SeqStepKind, id: u8) -> Self {
         Self {
             step,
             id,
@@ -705,9 +382,9 @@ impl StepContext {
 
 impl fmt::Display for StepContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} of servo {}", self.step, self.id)?;
+        write!(f, "{} of servo {}", step::Name(self.step), self.id)?;
         if let Some(reg) = self.reg {
-            write!(f, ", {reg}")?;
+            write!(f, ", {}", reg::Name(reg))?;
         }
         Ok(())
     }
@@ -722,6 +399,14 @@ pub enum SeqError {
     /// A servo did not answer, and the retries are spent.
     #[error("{context}: no answer")]
     NoAnswer {
+        /// Where this happened.
+        context: StepContext,
+    },
+    /// The driver would not run the transaction. Nothing reached the bus, so this
+    /// says nothing about the servo: it is a request made while another was
+    /// outstanding, or one the driver does not allow in the state it is in.
+    #[error("{context}: the driver would not run it")]
+    DriverRefused {
         /// Where this happened.
         context: StepContext,
     },
@@ -740,46 +425,46 @@ pub enum SeqError {
         context: StepContext,
     },
     /// A register does not hold what was just written to it.
-    #[error("{context}: wrote {expected} and read back {read_back}")]
+    #[error("{context}: wrote {} and read back {}", Shown(*.expected), Shown(*.read_back))]
     VerifyMismatch {
         /// Where this happened.
         context: StepContext,
         /// What the sequencer asked for.
-        expected: RegValue,
+        expected: Value,
         /// What the register held afterwards.
-        read_back: RegValue,
+        read_back: Value,
     },
     /// The driver answered a question the step did not ask — a wiring mistake in
     /// whatever is executing the requests, not a fault of the machine.
-    #[error("{context}: expected a {expected} and got a {observed}")]
+    #[error("{context}: expected a {} and got a {}", answer::Name(*.expected), answer::Name(*.observed))]
     WrongAnswer {
         /// Where this happened.
         context: StepContext,
         /// What the step needed.
-        expected: AnswerKind,
+        expected: AnswerShape,
         /// What arrived.
-        observed: AnswerKind,
+        observed: AnswerShape,
     },
     /// A register's value arrived in the wrong shape, which likewise means the
     /// register table and the step disagree about what this register is.
-    #[error("{context}: expected an {expected} and got a {observed}")]
+    #[error("{context}: expected an {} and got a {}", ShapeName(*.expected), ShapeName(*.observed))]
     WrongValue {
         /// Where this happened.
         context: StepContext,
         /// The shape the step needed.
-        expected: ValueKind,
+        expected: ValueShape,
         /// The shape that arrived.
-        observed: ValueKind,
+        observed: ValueShape,
     },
     /// A measured angle is not a number, so nothing can be decided from it: it
     /// is inside no window, closes no linkage, and would become a meaningless
     /// goal.
-    #[error("{context}: {joint} measured {angle} rad, which is not an angle")]
+    #[error("{context}: {} measured {angle} rad, which is not an angle", Name(*.joint))]
     UnplaceableAngle {
         /// Where this happened.
         context: StepContext,
         /// The joint whose reading it was.
-        joint: JointId,
+        joint: JointRef,
         /// The reading, as it arrived.
         angle: f64,
     },
@@ -807,14 +492,14 @@ pub enum SeqError {
     /// A provisioned register does not hold what this platform was set up with.
     /// Arming verifies provisioning and never repairs it: a register that is
     /// wrong is a question about how the machine was configured.
-    #[error("{context}: provisioned as {expected}, holds {observed}")]
+    #[error("{context}: provisioned as {}, holds {}", Shown(*.expected), Shown(*.observed))]
     ProvisionMismatch {
         /// Where this happened.
         context: StepContext,
         /// What the configuration says it should hold.
-        expected: RegValue,
+        expected: Value,
         /// What it holds.
-        observed: RegValue,
+        observed: Value,
     },
     /// The supply never reached the arming floor within the budget — the
     /// commissioning gate, which polls and waits. A rail found low by a gate
@@ -829,7 +514,7 @@ pub enum SeqError {
         /// Where this happened; the servo reporting `lowest`.
         context: StepContext,
         /// The last sweep's readings, in bus order, volts.
-        readings: [f64; JointId::COUNT],
+        readings: [f64; ROW_COUNT],
         /// The lowest of them, volts.
         lowest: f64,
         /// The floor, volts.
@@ -847,7 +532,7 @@ pub enum SeqError {
         /// Where this happened; the servo reporting `lowest`.
         context: StepContext,
         /// The sweep's readings, in bus order, volts.
-        readings: [f64; JointId::COUNT],
+        readings: [f64; ROW_COUNT],
         /// The lowest of them, volts.
         lowest: f64,
         /// The floor, volts.
@@ -882,6 +567,52 @@ pub enum SeqError {
         /// What the solver said.
         cause: FkError,
     },
+    /// The transaction awaiting an answer is a record this build cannot read:
+    /// an operation or a value shape outside the vocabulary, or a register
+    /// number nothing here names. Whatever wrote it disagrees with this build
+    /// about what a transaction is, so nothing is guessed from it and the
+    /// sequence stops.
+    #[error("{context}: the transaction it is waiting on cannot be read")]
+    PendingUnreadable {
+        /// Where this happened; the servo the record still names.
+        context: StepContext,
+    },
+    /// The verdict the state slot holds does not read as a failure: the fields
+    /// name no failure, no phase, or evidence that does not suit the kind. The
+    /// sequence stopped — the phase says so — and what stopped it is not
+    /// recoverable, so that is what is reported rather than a verdict assembled
+    /// out of the numbers that are there.
+    #[error("{context}: the verdict it stopped on cannot be read")]
+    VerdictUnreadable {
+        /// Where this happened, as far as the fields still say.
+        context: StepContext,
+    },
+    /// A moment this phase has to record is past what the state slot's
+    /// nanosecond count reaches. Where the sequence stands could not be written
+    /// down, so it stops rather than carrying on with a clock the slot disagrees
+    /// with.
+    #[error("{context}: the clock is past what the state slot can hold")]
+    ClockOutOfRange {
+        /// Where this happened.
+        context: StepContext,
+    },
+    /// A solved record the state slot holds does not read as a pose -- a
+    /// quaternion that is no rotation. The sequence plans its next writes from
+    /// that record, so it stops rather than planning from a pose nobody solved.
+    #[error("{context}: a record in the state slot is not a pose")]
+    RecordUnreadable {
+        /// Where this happened.
+        context: StepContext,
+    },
+    /// A step needs a solved record the state slot holds none of. Where the
+    /// unreadable record above says the bytes are damaged, this says a sequence
+    /// reached a step no sequence of steps reaches a record-less one at, so the
+    /// two are reported apart: the causes have nothing in common.
+    #[error("{context}: the state slot holds no record for this step")]
+    RecordAbsent {
+        /// Where this happened.
+        context: StepContext,
+    },
 }
 
 impl SeqError {
@@ -890,6 +621,7 @@ impl SeqError {
     pub fn context(&self) -> StepContext {
         match self {
             Self::NoAnswer { context }
+            | Self::DriverRefused { context }
             | Self::Refused { context, .. }
             | Self::WireCorrupt { context }
             | Self::VerifyMismatch { context, .. }
@@ -903,110 +635,98 @@ impl SeqError {
             | Self::SupplyBelowFloor { context, .. }
             | Self::UnhealthyServo { context, .. }
             | Self::RestPoseImplausible { context, .. }
-            | Self::PinnedPoseUnsolvable { context, .. } => *context,
+            | Self::PinnedPoseUnsolvable { context, .. }
+            | Self::PendingUnreadable { context }
+            | Self::VerdictUnreadable { context }
+            | Self::ClockOutOfRange { context }
+            | Self::RecordUnreadable { context }
+            | Self::RecordAbsent { context } => *context,
         }
     }
 
     /// Which failure this is, without any of what it saw.
     ///
     /// What survives a trip through a fixed-layout slot, where the context and
-    /// the readings have nowhere to go. See [`SeqErrorKind`].
+    /// the readings have nowhere to go. See [`SeqFailureKind`].
     #[must_use]
-    pub fn kind(&self) -> SeqErrorKind {
+    pub fn kind(&self) -> SeqFailureKind {
         match self {
-            Self::NoAnswer { .. } => SeqErrorKind::NoAnswer,
-            Self::Refused { .. } => SeqErrorKind::Refused,
-            Self::WireCorrupt { .. } => SeqErrorKind::WireCorrupt,
-            Self::VerifyMismatch { .. } => SeqErrorKind::VerifyMismatch,
-            Self::WrongAnswer { .. } => SeqErrorKind::WrongAnswer,
-            Self::WrongValue { .. } => SeqErrorKind::WrongValue,
-            Self::UnplaceableAngle { .. } => SeqErrorKind::UnplaceableAngle,
-            Self::AbsentServos { .. } => SeqErrorKind::AbsentServos,
-            Self::IdentityMismatch { .. } => SeqErrorKind::IdentityMismatch,
-            Self::ProvisionMismatch { .. } => SeqErrorKind::ProvisionMismatch,
-            Self::VoltageLow { .. } => SeqErrorKind::VoltageLow,
-            Self::SupplyBelowFloor { .. } => SeqErrorKind::SupplyBelowFloor,
-            Self::UnhealthyServo { .. } => SeqErrorKind::UnhealthyServo,
-            Self::RestPoseImplausible { .. } => SeqErrorKind::RestPoseImplausible,
-            Self::PinnedPoseUnsolvable { .. } => SeqErrorKind::PinnedPoseUnsolvable,
+            Self::NoAnswer { .. } => SeqFailureKind::NoAnswer,
+            Self::PendingUnreadable { .. } => SeqFailureKind::PendingUnreadable,
+            Self::VerdictUnreadable { .. } => SeqFailureKind::VerdictUnreadable,
+            Self::ClockOutOfRange { .. } => SeqFailureKind::ClockOutOfRange,
+            Self::RecordUnreadable { .. } => SeqFailureKind::RecordUnreadable,
+            Self::RecordAbsent { .. } => SeqFailureKind::RecordAbsent,
+            Self::DriverRefused { .. } => SeqFailureKind::DriverRefused,
+            Self::Refused { .. } => SeqFailureKind::Refused,
+            Self::WireCorrupt { .. } => SeqFailureKind::WireCorrupt,
+            Self::VerifyMismatch { .. } => SeqFailureKind::VerifyMismatch,
+            Self::WrongAnswer { .. } => SeqFailureKind::WrongAnswer,
+            Self::WrongValue { .. } => SeqFailureKind::WrongValue,
+            Self::UnplaceableAngle { .. } => SeqFailureKind::UnplaceableAngle,
+            Self::AbsentServos { .. } => SeqFailureKind::AbsentServos,
+            Self::IdentityMismatch { .. } => SeqFailureKind::IdentityMismatch,
+            Self::ProvisionMismatch { .. } => SeqFailureKind::ProvisionMismatch,
+            Self::VoltageLow { .. } => SeqFailureKind::VoltageLow,
+            Self::SupplyBelowFloor { .. } => SeqFailureKind::SupplyBelowFloor,
+            Self::UnhealthyServo { .. } => SeqFailureKind::UnhealthyServo,
+            Self::RestPoseImplausible { .. } => SeqFailureKind::RestPoseImplausible,
+            Self::PinnedPoseUnsolvable { .. } => SeqFailureKind::PinnedPoseUnsolvable,
         }
     }
 }
 
-slot_enum! {
-/// Which [`SeqError`] a failure was, with none of its payload.
+/// Which [`SeqError`] a failure was, and the operator's word for it.
+///
+/// The name is the vocabulary's: one enum, declared in `motion/seq.clk`, so the
+/// number a slot holds a stopped sequence's verdict in and the name this crate
+/// matches on are one thing. [`SeqFailureKind::None`] is no failure, which is
+/// what a running phase and an unwritten slot hold.
 ///
 /// [`SeqError`] carries a [`StepContext`] and, variant by variant, registers,
-/// readings and solver causes — none of which fit a fixed-layout slot, and all
-/// of which have already been reported by the time anything reads a slot back.
-/// The name of the failure does fit, and the name is what still tells an
+/// readings and solver causes — none of which fit a fixed-layout enum field, and
+/// all of which have already been reported by the time anything reads a slot
+/// back. The name of the failure does fit, and the name is what still tells an
 /// operator which half of the machine to look at.
-///
-/// Public data with a stated integer numbering, for a host writing the name
-/// into a slot with an integer field.
-    pub enum SeqErrorKind: u8 {
-        encode: as_u8;
-        decode: from_u8;
-        refusal: "A number outside the fifteen was written by something that \
-                  does not agree with this type about what the failures are, \
-                  and guessing one would put a name on a failure nobody \
-                  reported.";
+pub mod failure {
+    pub use brenn_reachy__motion__seq_clk_rs::SeqFailureKind;
 
-    /// [`SeqError::NoAnswer`].
-    NoAnswer = 1,
-    /// [`SeqError::Refused`].
-    Refused = 2,
-    /// [`SeqError::WireCorrupt`].
-    WireCorrupt = 3,
-    /// [`SeqError::VerifyMismatch`].
-    VerifyMismatch = 4,
-    /// [`SeqError::WrongAnswer`].
-    WrongAnswer = 5,
-    /// [`SeqError::WrongValue`].
-    WrongValue = 6,
-    /// [`SeqError::UnplaceableAngle`].
-    UnplaceableAngle = 7,
-    /// [`SeqError::AbsentServos`].
-    AbsentServos = 8,
-    /// [`SeqError::IdentityMismatch`].
-    IdentityMismatch = 9,
-    /// [`SeqError::ProvisionMismatch`].
-    ProvisionMismatch = 10,
-    /// [`SeqError::VoltageLow`].
-    VoltageLow = 11,
-    /// [`SeqError::SupplyBelowFloor`].
-    SupplyBelowFloor = 12,
-    /// [`SeqError::UnhealthyServo`].
-    UnhealthyServo = 13,
-    /// [`SeqError::RestPoseImplausible`].
-    RestPoseImplausible = 14,
-    /// [`SeqError::PinnedPoseUnsolvable`].
-    PinnedPoseUnsolvable = 15,
+    vocab_name! {
+        /// A failure as a bring-up report says it.
+        pub struct Name(SeqFailureKind) {
+            SeqFailureKind::None => "no failure",
+            SeqFailureKind::NoAnswer => "no answer",
+            SeqFailureKind::PendingUnreadable => "a transaction this build cannot read",
+            SeqFailureKind::VerdictUnreadable => "a verdict this build cannot read",
+            SeqFailureKind::ClockOutOfRange => "a clock the state slot cannot hold",
+            SeqFailureKind::RecordUnreadable => "a solved record this build cannot read",
+            SeqFailureKind::RecordAbsent => "a step with no solved record to plan from",
+            SeqFailureKind::Refused => "a refusal",
+            SeqFailureKind::WireCorrupt => "a corrupt reply",
+            SeqFailureKind::VerifyMismatch => "a write that did not read back",
+            SeqFailureKind::WrongAnswer => "an answer of the wrong shape",
+            SeqFailureKind::WrongValue => "a value of the wrong shape",
+            SeqFailureKind::UnplaceableAngle => "an angle that is not a number",
+            SeqFailureKind::AbsentServos => "servos that did not answer a ping",
+            SeqFailureKind::IdentityMismatch => "a servo of another model",
+            SeqFailureKind::ProvisionMismatch => "a register provisioned otherwise",
+            SeqFailureKind::VoltageLow => "a supply that never reached the arming floor",
+            SeqFailureKind::SupplyBelowFloor => "a supply below the arming floor",
+            SeqFailureKind::UnhealthyServo => "latched hardware error bits",
+            SeqFailureKind::RestPoseImplausible => "resting angles that place no pose",
+            SeqFailureKind::PinnedPoseUnsolvable => "pinned angles that place no pose",
+            SeqFailureKind::DriverRefused => "a driver that would not run a transaction",
+        }
+    }
+
+    /// Every failure a sequence stops on, the no-failure zero excluded: that one
+    /// is what a running phase and an unwritten slot hold.
+    pub fn raised() -> impl Iterator<Item = SeqFailureKind> {
+        crate::vocab::without_zero(SeqFailureKind::VARIANTS)
     }
 }
 
-impl fmt::Display for SeqErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            Self::NoAnswer => "no answer",
-            Self::Refused => "a refusal",
-            Self::WireCorrupt => "a corrupt reply",
-            Self::VerifyMismatch => "a write that did not read back",
-            Self::WrongAnswer => "an answer of the wrong shape",
-            Self::WrongValue => "a value of the wrong shape",
-            Self::UnplaceableAngle => "an angle that is not a number",
-            Self::AbsentServos => "servos that did not answer a ping",
-            Self::IdentityMismatch => "a servo of another model",
-            Self::ProvisionMismatch => "a register provisioned otherwise",
-            Self::VoltageLow => "a supply that never reached the arming floor",
-            Self::SupplyBelowFloor => "a supply below the arming floor",
-            Self::UnhealthyServo => "latched hardware error bits",
-            Self::RestPoseImplausible => "resting angles that place no pose",
-            Self::PinnedPoseUnsolvable => "pinned angles that place no pose",
-        };
-        f.write_str(text)
-    }
-}
+pub use failure::SeqFailureKind;
 
 /// What a sequencer wants to happen next.
 ///
@@ -1015,8 +735,13 @@ impl fmt::Display for SeqErrorKind {
 /// driver.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SeqAction<S> {
-    /// Run this transaction and bring the result back.
-    Transact(BusRequest),
+    /// Run the transaction the sequencer is holding — [`Sequencer::pending`] —
+    /// and bring the result back.
+    ///
+    /// Carried by reference rather than in the arm: the transaction is the
+    /// vocabulary's own record, which lives in the sequencer's state and is
+    /// handed to a slot or a datagram as itself.
+    Transact,
     /// Come back no earlier than this time on the driver's own clock. Used where
     /// a value needs re-reading at a spacing, not where a delay would hide a
     /// failure.
@@ -1050,40 +775,25 @@ pub trait Sequencer {
     /// the call after a [`SeqAction::Wait`] — and decide what happens next.
     fn next(&mut self, now: Duration, prior: Option<&BusResult>) -> SeqAction<Self::Summary>;
 
+    /// The transaction awaiting an answer, which a [`SeqAction::Transact`] is
+    /// about. Inactive on the step after a wait, before the first step, and
+    /// once the sequence has ended.
+    fn pending(&self) -> &BusTxnWire;
+
     /// Which phase the sequence is in, which is the phase the action just
     /// handed out belongs to. The driver logs against it.
-    fn step(&self) -> SeqStep;
+    fn step(&self) -> SeqStepKind;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
+
+    use crate::value;
 
     fn context() -> StepContext {
-        StepContext::reg(SeqStep::Provision, 12, RegId::OperatingMode)
-    }
-
-    /// Every register and every phase has its own name. These names are the whole
-    /// content of a bring-up failure report, and two registers sharing one, or a
-    /// name left empty, would be invisible until the day it mattered.
-    #[test]
-    fn every_name_is_distinct_and_says_something() {
-        let mut names = BTreeSet::new();
-        for reg in RegId::ALL {
-            let name = reg.to_string();
-            assert!(name.len() > 3, "{reg:?} renders as {name:?}");
-            assert!(names.insert(name), "{reg:?} shares a name");
-        }
-        assert_eq!(names.len(), 22);
-
-        let mut names = BTreeSet::new();
-        for step in SeqStep::ALL {
-            let name = step.to_string();
-            assert!(name.len() > 3, "{step:?} renders as {name:?}");
-            assert!(names.insert(name), "{step:?} shares a name");
-        }
-        assert_eq!(names.len(), SeqStep::ALL.len());
+        StepContext::reg(SeqStepKind::Provision, 12, RegId::OperatingMode)
     }
 
     /// The absent set at every size that reads differently: none, one, a few,
@@ -1093,9 +803,9 @@ mod tests {
     #[test]
     fn an_absent_set_reads_at_every_size() {
         let ids = [10, 11, 12, 13, 14, 15, 16, 17, 18];
-        let of = |absent: [bool; JointId::COUNT]| AbsentSet::new(&ids, &absent);
+        let of = |absent: [bool; ROW_COUNT]| AbsentSet::new(&ids, &absent);
 
-        let none = of([false; JointId::COUNT]);
+        let none = of([false; ROW_COUNT]);
         assert_eq!(none.count(), 0);
         assert_eq!(none.ids(), [] as [u8; 0]);
         assert_eq!(none.to_string(), "no servos");
@@ -1110,8 +820,8 @@ mod tests {
         assert_eq!(few.ids(), [10, 13, 18], "the set is in bus order");
         assert_eq!(few.to_string(), "servos 10, 13, 18");
 
-        let all = of([true; JointId::COUNT]);
-        assert_eq!(all.count(), JointId::COUNT);
+        let all = of([true; ROW_COUNT]);
+        assert_eq!(all.count(), ROW_COUNT);
         assert_eq!(all.ids(), ids);
         assert_eq!(all.to_string(), "all nine servos");
     }
@@ -1125,7 +835,7 @@ mod tests {
             "provisioning of servo 12, operating mode"
         );
         assert_eq!(
-            StepContext::servo(SeqStep::Presence, 17).to_string(),
+            StepContext::servo(SeqStepKind::Presence, 17).to_string(),
             "presence of servo 17"
         );
     }
@@ -1134,28 +844,33 @@ mod tests {
     /// shapes become four different errors rather than one flattened one.
     #[test]
     fn every_outcome_keeps_its_own_shape() {
-        assert_eq!(BusResult::Pinged { model: 1 }.kind(), AnswerKind::Pinged);
-        assert_eq!(BusResult::Value(RegValue::U8(3)).kind(), AnswerKind::Value);
-        assert_eq!(BusResult::Written.kind(), AnswerKind::Written);
-        assert_eq!(BusResult::NoAnswer.kind(), AnswerKind::Missing);
+        assert_eq!(BusResult::Pinged { model: 1 }.kind(), AnswerShape::Pinged);
+        assert_eq!(BusResult::Value(value::u8(3)).kind(), AnswerShape::Value);
+        assert_eq!(BusResult::Written.kind(), AnswerShape::Written);
+        assert_eq!(BusResult::NoAnswer.kind(), AnswerShape::Missing);
+        assert_eq!(BusResult::DriverRefused.kind(), AnswerShape::DriverRefused);
         assert_eq!(
             BusResult::ServoError { code: 7 }.kind(),
-            AnswerKind::Refused
+            AnswerShape::Refused
         );
         assert_eq!(
             BusResult::VerifyMismatch {
-                read_back: RegValue::U8(0)
+                read_back: value::u8(0)
             }
             .kind(),
-            AnswerKind::Mismatched
+            AnswerShape::Mismatched
         );
-        assert_eq!(BusResult::WireCorrupt.kind(), AnswerKind::Corrupt);
+        assert_eq!(BusResult::WireCorrupt.kind(), AnswerShape::Corrupt);
 
-        let wrote = RegValue::U8(3);
+        let wrote = value::u8(3);
         let cases = [
             (
                 BusResult::NoAnswer,
                 SeqError::NoAnswer { context: context() },
+            ),
+            (
+                BusResult::DriverRefused,
+                SeqError::DriverRefused { context: context() },
             ),
             (
                 BusResult::ServoError { code: 0x07 },
@@ -1170,12 +885,12 @@ mod tests {
             ),
             (
                 BusResult::VerifyMismatch {
-                    read_back: RegValue::U8(0),
+                    read_back: value::u8(0),
                 },
                 SeqError::VerifyMismatch {
                     context: context(),
                     expected: wrote,
-                    read_back: RegValue::U8(0),
+                    read_back: value::u8(0),
                 },
             ),
         ];
@@ -1192,13 +907,13 @@ mod tests {
         // driver reporting one to a read is reporting a wiring mistake.
         assert_eq!(
             BusResult::VerifyMismatch {
-                read_back: RegValue::U8(0)
+                read_back: value::u8(0)
             }
             .value(context()),
             Err(SeqError::WrongAnswer {
                 context: context(),
-                expected: AnswerKind::Value,
-                observed: AnswerKind::Mismatched,
+                expected: AnswerShape::Value,
+                observed: AnswerShape::Mismatched,
             })
         );
     }
@@ -1207,17 +922,14 @@ mod tests {
     #[test]
     fn a_good_answer_is_taken_apart() {
         assert_eq!(
-            BusResult::Value(RegValue::Radians(0.5)).value(context()),
-            Ok(RegValue::Radians(0.5))
+            BusResult::Value(value::radians(0.5)).value(context()),
+            Ok(value::radians(0.5))
         );
         assert_eq!(
             BusResult::Pinged { model: 1200 }.pinged(context()),
             Ok(1200)
         );
-        assert_eq!(
-            BusResult::Written.written(context(), RegValue::U8(3)),
-            Ok(())
-        );
+        assert_eq!(BusResult::Written.written(context(), value::u8(3)), Ok(()));
     }
 
     /// A mismatched read-back reports both halves: what was asked for and what
@@ -1225,16 +937,16 @@ mod tests {
     #[test]
     fn a_mismatch_reports_both_halves() {
         let failure = BusResult::VerifyMismatch {
-            read_back: RegValue::U8(0),
+            read_back: value::u8(0),
         }
-        .written(context(), RegValue::U8(3))
+        .written(context(), value::u8(3))
         .expect_err("a mismatch is a failure");
         assert_eq!(
             failure,
             SeqError::VerifyMismatch {
                 context: context(),
-                expected: RegValue::U8(3),
-                read_back: RegValue::U8(0),
+                expected: value::u8(3),
+                read_back: value::u8(0),
             }
         );
         assert_eq!(
@@ -1252,16 +964,16 @@ mod tests {
             BusResult::Written.value(context()),
             Err(SeqError::WrongAnswer {
                 context: context(),
-                expected: AnswerKind::Value,
-                observed: AnswerKind::Written,
+                expected: AnswerShape::Value,
+                observed: AnswerShape::Written,
             })
         );
         assert_eq!(
-            BusResult::Value(RegValue::U8(1)).pinged(context()),
+            BusResult::Value(value::u8(1)).pinged(context()),
             Err(SeqError::WrongAnswer {
                 context: context(),
-                expected: AnswerKind::Pinged,
-                observed: AnswerKind::Value,
+                expected: AnswerShape::Pinged,
+                observed: AnswerShape::Value,
             })
         );
         assert_eq!(
@@ -1273,115 +985,28 @@ mod tests {
         );
     }
 
-    /// Values are taken apart by shape, and a value of the wrong shape names both
-    /// shapes rather than being silently coerced.
-    #[test]
-    fn values_are_taken_apart_by_shape() {
-        assert_eq!(RegValue::U8(3).u8(context()), Ok(3));
-        assert_eq!(RegValue::U16(1750).u16(context()), Ok(1750));
-        assert_eq!(RegValue::U32(4096).u32(context()), Ok(4096));
-        assert_eq!(RegValue::I32(-1024).i32(context()), Ok(-1024));
-        assert_eq!(RegValue::Radians(-0.5).radians(context()), Ok(-0.5));
-        assert_eq!(RegValue::Volts(7.4).volts(context()), Ok(7.4));
-        assert_eq!(
-            RegValue::Gains { p: 300, i: 0, d: 0 }.gains(context()),
-            Ok((300, 0, 0))
-        );
-
-        assert_eq!(
-            RegValue::U16(3).u8(context()),
-            Err(SeqError::WrongValue {
-                context: context(),
-                expected: ValueKind::U8,
-                observed: ValueKind::U16,
-            })
-        );
-        assert_eq!(
-            RegValue::U8(3)
-                .radians(context())
-                .expect_err("a byte is not an angle")
-                .to_string(),
-            "provisioning of servo 12, operating mode: expected an angle and got a one-byte value"
-        );
-        // The confusion the signed shape exists to prevent, named in both
-        // directions: the same four bytes read unsigned are a homing offset of
-        // about four billion.
-        let confused = RegValue::U32(1024)
-            .i32(context())
-            .expect_err("an unsigned four bytes is not the signed register")
-            .to_string();
-        assert!(
-            confused.contains("signed four-byte value") && confused.ends_with("four-byte value"),
-            "{confused}"
-        );
-        assert_eq!(
-            RegValue::I32(-1024).u32(context()),
-            Err(SeqError::WrongValue {
-                context: context(),
-                expected: ValueKind::U32,
-                observed: ValueKind::I32,
-            })
-        );
-    }
-
-    /// Values render as what they are, units included, because these strings are
-    /// what an operator compares against a data sheet.
-    #[test]
-    fn values_render_with_their_units() {
-        assert_eq!(RegValue::U8(3).to_string(), "3");
-        assert_eq!(RegValue::Radians(-0.628_3).to_string(), "-0.6283 rad");
-        assert_eq!(RegValue::Volts(7.38).to_string(), "7.4 V");
-        // A tenth is the register's own resolution, so nothing is lost here; a
-        // value sitting on the half rounds down, because the nearest double to
-        // 7.35 is below it.
-        assert_eq!(RegValue::Volts(7.35).to_string(), "7.3 V");
-        assert_eq!(
-            RegValue::Gains { p: 300, i: 1, d: 2 }.to_string(),
-            "P 300 I 1 D 2"
-        );
-    }
-
-    /// Every request names exactly one servo, and says which register it is
-    /// about when it is about one. Nothing here can address the whole bus.
-    #[test]
-    fn every_request_is_addressed_to_one_servo() {
-        let requests = [
-            BusRequest::Ping { id: 10 },
-            BusRequest::ReadReg {
-                id: 10,
-                reg: RegId::PresentPosition,
-            },
-            BusRequest::WriteRegVerified {
-                id: 10,
-                reg: RegId::TorqueEnable,
-                value: RegValue::U8(1),
-            },
-        ];
-        for request in requests {
-            assert_eq!(request.id(), 10);
-        }
-        assert_eq!(requests[0].reg(), None);
-        assert_eq!(requests[1].reg(), Some(RegId::PresentPosition));
-        assert_eq!(requests[2].reg(), Some(RegId::TorqueEnable));
-    }
-
     /// A three-step stand-in for the real sequencers: ping one servo, wait out a
     /// poll interval, report what it said. Enough to exercise the framework's
     /// whole contract, and small enough to read.
     struct Toy {
         step: u8,
         model: u16,
+        pending: BusTxnWire,
     }
 
     impl Toy {
         const CONTEXT: StepContext = StepContext {
-            step: SeqStep::Presence,
+            step: SeqStepKind::Presence,
             id: 10,
             reg: None,
         };
 
         fn new() -> Self {
-            Self { step: 0, model: 0 }
+            Self {
+                step: 0,
+                model: 0,
+                pending: crate::txn::none(),
+            }
         }
     }
 
@@ -1392,7 +1017,8 @@ mod tests {
             match self.step {
                 0 => {
                     self.step = 1;
-                    SeqAction::Transact(BusRequest::Ping { id: 10 })
+                    self.pending = crate::txn::ping(10);
+                    SeqAction::Transact
                 }
                 1 => match prior.map(|result| result.pinged(Self::CONTEXT)) {
                     Some(Ok(model)) => {
@@ -1411,8 +1037,12 @@ mod tests {
             }
         }
 
-        fn step(&self) -> SeqStep {
-            SeqStep::Presence
+        fn step(&self) -> SeqStepKind {
+            SeqStepKind::Presence
+        }
+
+        fn pending(&self) -> &BusTxnWire {
+            &self.pending
         }
     }
 
@@ -1430,8 +1060,8 @@ mod tests {
             let action = toy.next(now, prior.as_ref());
             assert_eq!(action.is_terminal(), matches!(action, SeqAction::Done(_)));
             match action {
-                SeqAction::Transact(request) => {
-                    assert_eq!(request, BusRequest::Ping { id: 10 });
+                SeqAction::Transact => {
+                    assert_eq!(*toy.pending(), crate::txn::ping(10));
                     transactions += 1;
                     prior = Some(BusResult::Pinged { model: 1200 });
                 }
@@ -1458,7 +1088,7 @@ mod tests {
         let mut toy = Toy::new();
         assert!(matches!(
             toy.next(Duration::ZERO, None),
-            SeqAction::Transact(_)
+            SeqAction::Transact
         ));
 
         let action = toy.next(Duration::ZERO, Some(&BusResult::NoAnswer));
@@ -1467,5 +1097,71 @@ mod tests {
             panic!("expected a failure, got {action:?}");
         };
         assert_eq!(error.to_string(), "presence of servo 10: no answer");
+    }
+
+    /// The two symmetric register pairs, and one phase, render as themselves.
+    ///
+    /// The adapters' generated guard proves every word is distinct and says
+    /// something, which a swapped pair of arms passes: "minimum" and "maximum"
+    /// stay distinct when they trade places, and the operator reading a
+    /// provisioning mismatch is then sent to the wrong limit. These are the
+    /// renderings where a swap is both plausible and invisible.
+    #[test]
+    fn the_symmetric_names_are_not_each_other() {
+        assert_eq!(
+            reg::Name(RegId::MinPositionLimit).to_string(),
+            "minimum position limit"
+        );
+        assert_eq!(
+            reg::Name(RegId::MaxPositionLimit).to_string(),
+            "maximum position limit"
+        );
+        assert_eq!(
+            reg::Name(RegId::MinVoltageLimit).to_string(),
+            "minimum voltage limit"
+        );
+        assert_eq!(
+            reg::Name(RegId::MaxVoltageLimit).to_string(),
+            "maximum voltage limit"
+        );
+        assert_eq!(
+            step::Name(SeqStepKind::VerifyAtStow).to_string(),
+            "stow verification"
+        );
+    }
+
+    crate::vocab_numbering! {
+        /// The register numbering is the one written down here.
+        ///
+        /// It keys what a transaction asks a servo to do, in a slot and at the
+        /// process edge, so the list is appended to and never renumbered: a
+        /// register inserted among these turns a goal write into a shutdown
+        /// write in a peer built at the other revision.
+        the_register_numbering_is_the_one_written_down:
+            RegId as RegIdWire, past the end 23 {
+            RegId::None => 0,
+            RegId::TorqueEnable => 1,
+            RegId::GoalPosition => 2,
+            RegId::PresentPosition => 3,
+            RegId::OperatingMode => 4,
+            RegId::HomingOffset => 5,
+            RegId::ReturnDelayTime => 6,
+            RegId::MinPositionLimit => 7,
+            RegId::MaxPositionLimit => 8,
+            RegId::Shutdown => 9,
+            RegId::DriveMode => 10,
+            RegId::MaxVoltageLimit => 11,
+            RegId::MinVoltageLimit => 12,
+            RegId::CurrentLimit => 13,
+            RegId::VelocityLimit => 14,
+            RegId::TemperatureLimit => 15,
+            RegId::BusWatchdog => 16,
+            RegId::ProfileAcceleration => 17,
+            RegId::ProfileVelocity => 18,
+            RegId::PositionGains => 19,
+            RegId::HardwareErrorStatus => 20,
+            RegId::PresentInputVoltage => 21,
+            RegId::ModelNumber => 22,
+        }
     }
 }

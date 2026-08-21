@@ -188,8 +188,7 @@ pub enum DeriveError {
 ///
 /// The crank angles are the inverse-kinematic solution of the frame's head
 /// pose; the other two are the deltas themselves, since the neutral base is
-/// zero in both. Kept for a clip's first and last frames so a sequence can
-/// measure the step at a seam between two clips without re-solving either.
+/// zero in both.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameMetrics {
     /// The six crank angles, radians.
@@ -219,7 +218,7 @@ pub struct Derivation {
 /// Derive a clip's speed ceiling and blend floors from its frames.
 ///
 /// `frames` must be non-empty and must carry exactly the channels `mask` names
-/// — the invariants [`crate::Clip`] establishes before it calls this.
+/// — the invariants [`crate::format::Clip`] establishes before it calls this.
 ///
 /// # Panics
 ///
@@ -846,8 +845,6 @@ mod tests {
         assert_eq!(seam_step(&out, mask, &incoming, head_only, &limits), 0.0);
     }
 
-    /// Head seams difference six solved crank angles and answer with the worst;
-    /// body yaw is a scalar difference.
     #[test]
     fn a_head_or_yaw_seam_measures_the_worst_of_its_joints() {
         let limits = ClipLimits::default();

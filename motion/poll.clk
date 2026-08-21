@@ -1,0 +1,85 @@
+// One sweep of the resting watch, as the slot holds it: which phase is running
+// and what it has measured.
+//
+// The poll sequencer writes both declarations here. Its own module rather than
+// a corner of the commissioning one: the two sequencers share the readings in
+// `motion/servo_health.clk` and the verdict forms in `motion/seq.clk`, and
+// nothing else, so a phase added to either must not rebuild the other.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::bus_txn;
+use motion::joints;
+use motion::seq;
+use motion::servo_health;
+
+// Which phase of a resting-watch sweep is running.
+//
+// Phases run from one for the same reason: zero is what nothing wrote, and the
+// position sweep is a thing a poll would then go and do.
+enum PollPhaseKind
+{
+    uuid: f6cb8316-20bf-42dc-a9b1-a45a1c7ddca2;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No phase. What a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // The nine position reads.
+        #1 position { underlying_value: 1; }
+        // The nine supply reads, on the slow cadence.
+        #2 voltage { underlying_value: 2; }
+        // The nine hardware-error reads, on the slow cadence.
+        #3 health { underlying_value: 3; }
+        // Finished: the next step hands back the posture.
+        #4 complete { underlying_value: 4; }
+        // Stopped: the next step hands back the failure.
+        #5 failed { underlying_value: 5; }
+    }
+}
+
+// One sweep of the resting watch, as the numbers a slot holds it between
+// transactions.
+//
+// The poll sequencer's own state, read and written in place. The watch runs
+// while the platform rests limp, because a hand can move the head and the next
+// engage plans from wherever it actually is -- so this slot is what a poll
+// interrupted by a slot crossing resumes from, and never a verdict about
+// anything.
+schema PollSnap
+{
+    uuid: e8c939dd-fb9b-459c-baa1-e54ef4c6dfd0;
+    fields
+    {
+        // Which phase is running. `none` is what an unwritten slot holds.
+        #0 phase: PollPhaseKind;
+
+        // Where that phase's sweep stands. Zero in the two endings, refused past
+        // the sweep's own length.
+        #1 cursor: UInt32;
+
+        // The verdict a failed phase hands back, `none` in every other phase.
+        #2 failure: seq::SeqFailureSnap;
+
+        // The transaction awaiting an answer.
+        #3 pending: bus_txn::BusTxn;
+
+        // The angles measured so far, in bus order, radians.
+        #4 present: joints::Joints;
+
+        // The supply and error-bit readings: re-read by this sweep, or carried
+        // in from the last one.
+        #5 rail: servo_health::RailSnap;
+
+        // Whether this sweep reads the rail itself rather than carrying it,
+        // which is also what the finished posture reports.
+        #6 rail_read: Bool;
+
+        // Re-reads already spent on the joint the position sweep is at.
+        #7 rereads: UInt32;
+    }
+}

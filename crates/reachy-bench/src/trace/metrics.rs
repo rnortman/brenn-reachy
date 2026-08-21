@@ -22,6 +22,10 @@
 //! - **A measured column is the servo's own encoder**, at the rate the loop
 //!   read it. Velocities here are differences of that series, so they are
 //!   averages over a period rather than instantaneous rates.
+//!
+//! Not in the build: this file is part of the bench's retired motion layer, kept
+//! on disk as the record of how this machine was driven. It no longer compiles.
+//! TODO(bench-motion-delete)
 
 use core::time::Duration;
 use std::fs;

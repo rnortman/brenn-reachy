@@ -1,8 +1,8 @@
 // The bring-up probe: one Rust cog, two channels, and the wiring that makes the
 // four open Clockwork questions answerable by a test.
 //
-// The cog itself does almost nothing -- it turns each command into one
-// `reachy-wire` datagram carried as a `VarPacket` -- and that is the point.
+// The cog itself does almost nothing -- it turns each command into one setpoint
+// carried as a `VarPacket` of that schema's own bytes -- and that is the point.
 // Everything shaped here is a mechanism the motion cogs rest on:
 //
 //   * `ProbeCmds` carries a `LogReaderPolicy` -- declared next door in
@@ -10,9 +10,9 @@
 //     and a module that generates C++ may not import one that does not -- so
 //     the deterministic runner feeds this channel from an input log. That is
 //     how `session`'s schedules and the simulator's injections will arrive.
-//   * `ProbePackets` is a `VarPacket` channel, which is how every wire-format
-//     channel in the motion system carries its bytes, and it is logged, so the
-//     checker has to recover a datagram from a logged payload.
+//   * `ProbePackets` is a `VarPacket` channel, which is how a datagram bound
+//     for a socket is carried in this repo, and it is logged, so the checker
+//     has to recover a message from a logged payload.
 //   * `probe.own_packet` is wired to the channel `probe.packet` publishes. A
 //     cog reading back its own last publication is the rule the motion cogs use
 //     in place of publish-bookkeeping state, and nothing upstream demonstrates
@@ -37,7 +37,8 @@ channel ProbeCmds
     max_num_messages: 8;
 }
 
-// The datagrams the probe emits, as opaque bytes.
+// The datagrams the probe emits, as opaque bytes: the blob bytes of one
+// setpoint, which is what a socket would put on the wire.
 channel ProbePackets
 {
     message_type: Tachyon<var_packet::VarPacket288>;

@@ -1,0 +1,15 @@
+# Apache-2.0. The mathematical carriage types: a point and a rotation, with no
+# opinion about the machine.
+#
+# The one package here named for a subject rather than for the component that
+# writes it, because these types have no single writer. The name is the whole
+# licence: mathematics only. A schema that names a servo, a register or a phase
+# lives with whichever component publishes it.
+#
+# Nothing in this package depends on anything but `clockwork_rs`. No cogs, no
+# runtime, no I/O -- a schema module is types, and a host is what gives them a
+# slot.
+
+load("//bazel:clk_schema.bzl", "clk_schema_module")
+
+clk_schema_module(name = "primitives")

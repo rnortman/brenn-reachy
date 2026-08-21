@@ -27,9 +27,9 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use scenario::author::Step;
-use scenario::{UP_DURATION_NS, cycle_at, cycles_for, dead_man_latch_cycle, silence_us};
+use scenario::{UP_DURATION_NS, cycle_at, cycles_for, dead_man_latch_cycle, silence_ns};
 
-use brenn_reachy__cogs__msgs_clk_rs::Posture;
+use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use reachy_motion::default_motion_config;
 
 /// The cycle the session is engaged and the machine energised at.
@@ -93,10 +93,10 @@ pub fn latch_cycle() -> i64 {
     dead_man_latch_cycle(fault_cycle())
 }
 
-/// How long the gate should say the goal stream was silent for, microseconds.
+/// How long the gate should say the goal stream was silent for, nanoseconds.
 #[must_use]
-pub fn reported_silence_us() -> u32 {
-    silence_us(fault_cycle(), latch_cycle())
+pub fn reported_silence_ns() -> i64 {
+    silence_ns(fault_cycle(), latch_cycle())
 }
 
 /// The last cycle of the run.
@@ -122,7 +122,7 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(ENGAGE_CYCLE),
         end_ns: cycle_at(end_cycle()),
-        posture: Some(Posture::UP),
+        posture: Some(PostureWire::UP),
     }]
 }
 

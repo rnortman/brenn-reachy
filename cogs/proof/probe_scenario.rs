@@ -1,6 +1,6 @@
 //! What the probe, the scenario author and the checker have to agree on.
 //!
-//! Three programs share this: the cog body writes the row named here, the
+//! Three programs share this: the cog body writes the servo named here, the
 //! author binary turns the table below into the input log, and the checker
 //! joins the output log back to that same table. A scenario whose expectations
 //! were restated in the checker would pass by agreeing with itself; here there
@@ -16,7 +16,8 @@
 
 use clockwork_rs::{Duration, SyncTime};
 
-use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmd;
+use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmdWire;
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
 
 /// The channel the system's `LogReaderPolicy` names as its source. The policy
 /// carries no `source_name`, so the source is the channel's own name, and this
@@ -26,9 +27,10 @@ pub const CMD_CHANNEL: &str = "ProbeCmds";
 /// The channel the probe's datagrams are logged on.
 pub const PACKET_CHANNEL: &str = "ProbePackets";
 
-/// The bus row the probe writes. Row 0 is `BodyYaw`; which row it is does not
-/// matter here, only that a masked write names exactly one.
-pub const PROBE_ROW: usize = 0;
+/// The servo the probe writes: the body's yaw, which is the field the cog sets
+/// by name. Which one it is does not matter here, only that a masked write
+/// names exactly one.
+pub const PROBE_MASK: JointFlags = JointFlags::BODY_YAW;
 
 /// The scenario epoch: an arbitrary round Unix time, far enough from zero that
 /// a dropped or defaulted timestamp reads as obviously wrong rather than as a
@@ -84,8 +86,8 @@ pub fn end_time_ns() -> i64 {
 
 /// The command the scenario publishes at `index`.
 #[must_use]
-pub fn command(index: usize) -> ProbeCmd {
-    let mut cmd = ProbeCmd::default();
+pub fn command(index: usize) -> ProbeCmdWire {
+    let mut cmd = ProbeCmdWire::default();
     cmd.set_at(SyncTime::from_nanos(command_time_ns(index)));
     cmd.set_hold(Duration::from_nanos(HOLD_NS));
     cmd.set_position(POSITIONS[index]);

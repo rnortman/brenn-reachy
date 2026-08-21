@@ -1,0 +1,14 @@
+# Apache-2.0. The Dynamixel bus layer's schemas: what a register's value is
+# shaped like.
+#
+# Named for the hardware whose vocabulary it is, so that a consumer's dependency
+# list says why it takes one -- it touches motor registers. `dxl-proto` and
+# `reachy-bus` own the addresses and the widths; what lives here is the register
+# itself, as a name the compiler knows.
+#
+# Nothing in this package depends on anything but `clockwork_rs` and sibling
+# schema modules. No cogs, no runtime, no I/O.
+
+load("//bazel:clk_schema.bzl", "clk_schema_module")
+
+clk_schema_module(name = "registers")

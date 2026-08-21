@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use scenario::author::{self, ALL_ROWS, InputLog};
+use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s4_scenario::{ENGAGE_CYCLE, ENGAGED_EPOCH, OUTAGE_CYCLE, OUTAGE_CYCLES, steps};
@@ -25,7 +25,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
 
     let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, ALL_ROWS)?;
+    log.torque_on(engage, author::all_rows())?;
     log.schedule(engage, true, ENGAGED_EPOCH, &steps())?;
 
     // The outage. The servos keep holding whatever they were last written --

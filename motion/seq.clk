@@ -1,0 +1,325 @@
+// The sequencer vocabulary: which sequence is running, where it is, and how it
+// stopped.
+//
+// The sequencers write these, which is why the module lives here. Every
+// sequencer's own state schema carries a `failure: SeqFailureSnap`, and the
+// session names the running sequence with a `SeqKind`, so this is the one
+// vocabulary all four sequencers and their host share -- held apart from any one
+// sequencer's phases, which are that sequencer's own module and no concern of the
+// others.
+//
+// The verdict record below is a union written out, for the reason its own
+// comment states, and it is the widest thing here; a sequencer's phases are
+// narrower and change on their own schedule, which is why they are not here.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use hardware::dynamixel::registers;
+use motion::joints;
+use motion::fk;
+
+// Which sequencer the session is driving over the aux path, or none.
+//
+// One at a time, always: the phase machine runs a commission, then an engage,
+// then a disarm, and never two at once. This names which of the snapshot slots
+// the session keeps describes a live sequence.
+enum SeqKind
+{
+    uuid: 3da17b33-acfe-4936-9b9e-9543f9128d72;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No sequence is running.
+        #0 none default { underlying_value: 0; }
+        // The start-up survey.
+        #1 commission { underlying_value: 1; }
+        // A position sweep.
+        #2 poll { underlying_value: 2; }
+        // Arming.
+        #3 engage { underlying_value: 3; }
+        // The orderly release.
+        #4 disarm { underlying_value: 4; }
+        // The release that does not wait to verify a stow.
+        #5 disarm_immediate { underlying_value: 5; }
+    }
+}
+
+// Which failure a sequencer stopped on.
+//
+// The one name of every failure the sequencers raise, matched on directly by the
+// motion library. The numbering runs from one, with `none` at zero for the slot
+// that holds no failure at all -- which is what a snapshot in a running phase
+// holds, and what a slot nothing wrote holds. It is append-only: the number is
+// what a slot written by one build is read back as by the next, so it grows at
+// the end and never shifts.
+//
+// Every failure carries different evidence, and a slot has no union to hold it
+// in: this field is the key, and every payload field of `SeqFailureSnap` states
+// which failures it is meaningful for.
+enum SeqFailureKind
+{
+    uuid: a167620e-0ebd-45dc-a3b4-3c6cfd69ca4b;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No failure. What a running phase holds, and what a slot nothing wrote
+        // holds -- so an active failure claiming it is refused rather than read
+        // as a silent servo.
+        #0 none default { underlying_value: 0; }
+        // Nothing came back at all.
+        #1 no_answer { underlying_value: 1; }
+        // The servo answered with its error field set.
+        #2 refused { underlying_value: 2; }
+        // Something came back and was not a reply.
+        #3 wire_corrupt { underlying_value: 3; }
+        // A verified write read back as something else.
+        #4 verify_mismatch { underlying_value: 4; }
+        // The answer was a shape the step did not ask for.
+        #5 wrong_answer { underlying_value: 5; }
+        // A value of the wrong shape for the register it is about.
+        #6 wrong_value { underlying_value: 6; }
+        // A position read that places no angle.
+        #7 unplaceable_angle { underlying_value: 7; }
+        // Servos that did not answer a ping.
+        #8 absent_servos { underlying_value: 8; }
+        // A servo that is not the model this platform has at that address.
+        #9 identity_mismatch { underlying_value: 9; }
+        // A provisioned register that is not as configured.
+        #10 provision_mismatch { underlying_value: 10; }
+        // The supply never came up inside the commissioning gate's budget.
+        #11 voltage_low { underlying_value: 11; }
+        // The supply stands below the arming floor.
+        #12 supply_below_floor { underlying_value: 12; }
+        // A servo with something latched in its hardware-error byte.
+        #13 unhealthy_servo { underlying_value: 13; }
+        // The resting angles place no pose.
+        #14 rest_pose_implausible { underlying_value: 14; }
+        // The pinned goals place no pose.
+        #15 pinned_pose_unsolvable { underlying_value: 15; }
+        // The driver declined to run the transaction, so nothing reached the
+        // bus. The numbering grows at the end and never shifts; a slot depends
+        // on it.
+        #16 driver_refused { underlying_value: 16; }
+        // The transaction the sequencer was waiting on is a record this build
+        // cannot read. Appended for the same reason.
+        #17 pending_unreadable { underlying_value: 17; }
+        // The verdict the state slot holds does not read as a failure, so what
+        // stopped the sequence is not recoverable from it. Appended for the same
+        // reason.
+        #18 verdict_unreadable { underlying_value: 18; }
+        // The moment a phase started is past what the slot's nanosecond count
+        // reaches, so where the sequence stands cannot be recorded. Appended for
+        // the same reason.
+        #19 clock_out_of_range { underlying_value: 19; }
+        // A solved record the state slot holds does not read as a pose, so the
+        // sequence cannot go on planning from it. Appended for the same reason.
+        #20 record_unreadable { underlying_value: 20; }
+        // A step needs a solved record the state slot holds none of at all,
+        // which is a different observation from one that does not read: no
+        // sequence of steps reaches such a step. Appended for the same reason.
+        #21 record_absent { underlying_value: 21; }
+    }
+}
+
+// Which phase of arming or releasing a failure happened in.
+//
+// The arming phases in the order they run, then releasing's three, numbered from
+// one, with `none` at zero. A failure filed under the wrong phase sends somebody
+// looking at the wrong half of a bring-up, so a failure carrying the zero is
+// refused rather than read as the first phase a commission runs.
+enum SeqStepKind
+{
+    uuid: bbf83b5d-9e8e-4bfb-b48b-6ac533fe6b5f;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No phase. What a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Every servo answers a ping.
+        #1 presence { underlying_value: 1; }
+        // Every servo reports the model number it should.
+        #2 identity { underlying_value: 2; }
+        // Every provisioned register reads as configured.
+        #3 provision { underlying_value: 3; }
+        // The supply is up, polled until it is or the budget runs out.
+        #4 voltage_gate { underlying_value: 4; }
+        // Nothing is latched in a hardware-error byte.
+        #5 health { underlying_value: 5; }
+        // Where the machine is resting, solved.
+        #6 pose_and_datum { underlying_value: 6; }
+        // The gains and the motion profiles written.
+        #7 gains_profiles { underlying_value: 7; }
+        // The goals pinned and the torque enabled.
+        #8 pin_and_enable { underlying_value: 8; }
+        // The settle between reaching stow and letting go.
+        #9 dwell { underlying_value: 9; }
+        // The position reads the stow verdict is made from.
+        #10 verify_at_stow { underlying_value: 10; }
+        // The torque-off writes.
+        #11 torque_off { underlying_value: 11; }
+    }
+}
+
+// What shape a transaction answered in, or that the field names none.
+//
+// Carried twice by a failure about a
+// mismatch of answer shapes -- what the step needed, and what arrived -- and at
+// `not_applicable` for every other failure, because a mismatch between shapes
+// nobody can name says nothing about what the driver did wrong.
+enum AnswerShape
+{
+    uuid: 5591a884-879e-4bf2-80c8-c93b6a73fc57;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // The failure is not about a mismatch of answer shapes.
+        #0 not_applicable default { underlying_value: 0; }
+        // The servo answered a ping.
+        #1 pinged { underlying_value: 1; }
+        // A register value came back.
+        #2 value { underlying_value: 2; }
+        // A write was acknowledged.
+        #3 written { underlying_value: 3; }
+        // Nothing came back.
+        #4 missing { underlying_value: 4; }
+        // The driver declined to run it.
+        #5 driver_refused { underlying_value: 5; }
+        // The servo refused it.
+        #6 refused { underlying_value: 6; }
+        // A verified write read back as something else.
+        #7 mismatched { underlying_value: 7; }
+        // What came back was not a reply.
+        #8 corrupt { underlying_value: 8; }
+    }
+}
+
+// A sequencer's verdict, as the numbers a slot holds it in.
+//
+// The library's failure type is one shape per way a sequence can stop, each
+// carrying its own evidence, and a fixed-layout slot has no union to hold them
+// in. So this is
+// the union written out: `kind` says which failure it is, `step` and `servo_id`
+// say where -- both always meaningful, because every failure has a context --
+// and every remaining field is meaningful for the failures that name it and at
+// its own "not part of this failure" value for the rest.
+//
+// Nothing infers a failure from the payload fields. The kind is the key, so a
+// blank field is never read as an observation, and reading one back refuses
+// rather than repairs: a repair would report a failure of a register, a servo or
+// a solve that nobody observed.
+schema SeqFailureSnap
+{
+    uuid: 8ff26666-2902-46af-92b4-babd8a7cbeb3;
+    fields
+    {
+        // Which failure this is, and the key to every field below. `none` is no
+        // failure, which is what a running phase and an unwritten slot hold.
+        #0 kind: SeqFailureKind;
+
+        // Which phase it happened in. Always meaningful.
+        #1 step: SeqStepKind;
+
+        // Which servo was being addressed, as its bus id. Always meaningful;
+        // zero where the phase addressed the bus as a whole.
+        #2 servo_id: UInt8;
+
+        // Which register, or `none` where the phase concerned none.
+        #3 reg: registers::RegId;
+
+        // The status byte a servo refused with. Meaningful for `refused`.
+        #4 status_code: UInt8;
+
+        // A servo's latched hardware-error byte. Meaningful for
+        // `unhealthy_servo`.
+        #5 error_bits: UInt8;
+
+        // Which joint the reading was about, or `none`. Meaningful for
+        // `unplaceable_angle`.
+        #6 joint: joints::JointRef;
+
+        // The reading that places no angle, as it arrived, radians. Meaningful
+        // for `unplaceable_angle`, and the one field here that carries a
+        // non-finite number on purpose -- it is the evidence.
+        #7 angle: Float64;
+
+        // The bus ids that did not answer a ping, the first `absent_count` of
+        // them meaningful. A packed list rather than one field per servo,
+        // because what it holds is the ids in the order they were found silent
+        // and not a value per bus row. Meaningful for `absent_servos`.
+        #8 absent_ids: FixedArray<UInt8, 9>;
+
+        // How many of `absent_ids` are meaningful. Refused past the bus's own
+        // nine.
+        #9 absent_count: UInt8;
+
+        // What a servo says it is. Meaningful for `identity_mismatch`.
+        #10 model: UInt16;
+
+        // What a servo at that address says it is on this platform. Meaningful
+        // for `identity_mismatch`.
+        #11 expected_model: UInt16;
+
+        // The shape of what was wanted. Meaningful for `verify_mismatch`,
+        // `provision_mismatch` and `wrong_value` -- the last of which is only
+        // about the shapes, so its value bytes are blank.
+        #12 expected_kind: registers::ValueShape;
+
+        // What was wanted, as the eight bytes the wire carries a register value
+        // in read as one little-endian number. Bits rather than a number of
+        // anything: what they mean is `expected_kind`.
+        #13 expected_value: UInt64;
+
+        // The shape of what arrived. Meaningful for the same three.
+        #14 observed_kind: registers::ValueShape;
+
+        // What arrived, in the same carriage.
+        #15 observed_value: UInt64;
+
+        // The answer shape the step needed. Meaningful for `wrong_answer`.
+        #16 expected_answer: AnswerShape;
+
+        // The answer shape that arrived. Meaningful for `wrong_answer`.
+        #17 observed_answer: AnswerShape;
+
+        // The sweep's supply readings, in bus order, volts. Meaningful for
+        // `voltage_low` and `supply_below_floor` -- both carry all nine, because
+        // one low servo and nine low servos point at different halves of the
+        // wiring.
+        #18 readings: joints::Joints;
+
+        // The lowest of them, volts. Meaningful for the same two.
+        #19 lowest: Float64;
+
+        // The arming floor those readings were judged against, volts.
+        // Meaningful for the same two.
+        #20 limit: Float64;
+
+        // How long the commissioning gate waited for the supply. Meaningful for
+        // `voltage_low`, which is the gate that polls; the gate that does not
+        // carries zero.
+        #21 waited: Duration;
+
+        // Which way a pose solve failed, or that none did. Meaningful for
+        // `rest_pose_implausible` and `pinned_pose_unsolvable`.
+        #22 fk_code: fk::FkFailureKind;
+
+        // The solve failure's first number, as `fk_code` pairs them.
+        #23 fk_a: Float64;
+
+        // The solve failure's second number.
+        #24 fk_b: Float64;
+    }
+}

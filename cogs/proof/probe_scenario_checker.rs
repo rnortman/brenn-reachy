@@ -15,8 +15,8 @@
 //!   framework's C++ logger, read by the Rust reader, decoded into the same
 //!   generated type the scenario author wrote with, `SyncTime` and `Duration`
 //!   fields included;
-//! * that a `VarPacket` channel's logged payload yields the datagram the cog
-//!   put in it, byte for byte.
+//! * that a `VarPacket` channel's logged payload yields the message the cog put
+//!   in it, byte for byte.
 //!
 //! The reading is `log_read`'s, which is what the motion scenarios read their
 //! logs with too: a break in it fails here, where the failure is about the
@@ -28,22 +28,23 @@ use std::process::ExitCode;
 use clockwork_logs::ChannelMetadata;
 use clockwork_logs::offboard::OffboardReader;
 
-use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmd;
-use clockwork__clockwork__io__var_packet_clk_rs::VarPacket__288;
-use log_read::{Complaints, Datagram, Logged, binding, datagram, typed};
+use brenn_reachy__cogs__proof__probe_msgs_clk_rs::ProbeCmdWire;
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+use clockwork__clockwork__io__var_packet_clk_rs::VarPacket__288Wire;
+use clockwork_rs::{SyncTime, blob_as_bytes, blob_from_bytes};
+use log_read::{Complaints, Logged, binding, typed};
 use probe_scenario::{
-    CMD_CHANNEL, PACKET_CHANNEL, POSITIONS, PROBE_ROW, command, command_time_ns, packet_time_ns,
+    CMD_CHANNEL, PACKET_CHANNEL, POSITIONS, PROBE_MASK, command, command_time_ns, packet_time_ns,
 };
-use reachy_wire::golden::to_hex as hex;
-use reachy_wire::{GoalSetpoint, JOINT_COUNT};
 
 /// Everything the run put in the log.
 #[derive(Default)]
 struct Run {
     /// The commands the runner replayed out of the input log.
-    commands: Vec<Logged<ProbeCmd>>,
-    /// The datagrams the cog published, out of their carriers.
-    packets: Vec<Logged<Datagram<GoalSetpoint>>>,
+    commands: Vec<Logged<ProbeCmdWire>>,
+    /// The carriers the cog published, payload and all.
+    packets: Vec<Logged<VarPacket__288Wire>>,
     /// Every message the reader yielded, in the order it yielded them: which
     /// channel it was on and when it was published. What the ordering assertion
     /// reads, and the only thing that needs the two streams merged.
@@ -55,6 +56,12 @@ struct Run {
 /// A failure of the run, as the checker reports it: a line naming what was
 /// expected and what the log held instead.
 type Failures = Vec<String>;
+
+/// Bytes as a hex string, for a failure that has to show two payloads that
+/// differ somewhere.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -97,12 +104,7 @@ fn check(dir: &std::path::Path) -> Result<Failures, clockwork_logs::LogError> {
         ));
         match message.metadata.channel_name.as_str() {
             CMD_CHANNEL => typed(&message, &mut run.commands, &mut run.complaints),
-            PACKET_CHANNEL => datagram::<VarPacket__288, _>(
-                &message,
-                GoalSetpoint::decode,
-                &mut run.packets,
-                &mut run.complaints,
-            ),
+            PACKET_CHANNEL => typed(&message, &mut run.packets, &mut run.complaints),
             other => run
                 .complaints
                 .push(format!("no type is bound to channel {other}")),
@@ -125,8 +127,8 @@ fn check(dir: &std::path::Path) -> Result<Failures, clockwork_logs::LogError> {
 /// Both channels are in the log, and each carries the schema the checker is
 /// about to decode it as.
 fn check_channel_types(channels: &[ChannelMetadata], complaints: &mut Complaints) {
-    binding::<ProbeCmd>(channels, CMD_CHANNEL, complaints);
-    binding::<VarPacket__288>(channels, PACKET_CHANNEL, complaints);
+    binding::<ProbeCmdWire>(channels, CMD_CHANNEL, complaints);
+    binding::<VarPacket__288Wire>(channels, PACKET_CHANNEL, complaints);
 }
 
 /// The commands the runner published, read back as the type they were authored
@@ -160,7 +162,7 @@ fn check_commands(run: &Run, failures: &mut Failures) {
     }
 }
 
-/// The datagrams the cog emitted, recovered from the logged `VarPacket`
+/// The messages the cog emitted, recovered from the logged `VarPacket`
 /// payloads. One per command, in order, carrying that command's instant and
 /// position.
 fn check_packets(run: &Run, failures: &mut Failures) {
@@ -173,26 +175,23 @@ fn check_packets(run: &Run, failures: &mut Failures) {
         return;
     }
     for (index, received) in run.packets.iter().enumerate() {
-        let datagram = &received.message.bytes;
-        let mut expected_targets = [0.0; JOINT_COUNT];
-        expected_targets[PROBE_ROW] = POSITIONS[index];
-        let expected = GoalSetpoint {
-            execute_at_ns: command_time_ns(index),
-            mask: 1 << PROBE_ROW,
-            targets: expected_targets,
-        };
-        // The datagram is compared as bytes rather than field by field: the
+        let payload = received.message.bytes().as_slice();
+        let mut expected = GoalSetpointWire::new();
+        expected.set_execute_at(SyncTime::from_nanos(command_time_ns(index)));
+        expected.set_mask(JointFlagsWire::from(PROBE_MASK));
+        expected.targets_mut().set_body_yaw(POSITIONS[index]);
+        // The payload is compared as bytes rather than field by field: the
         // carrier is meant to be transparent, so what is under test is that
-        // exactly the bytes the cog encoded came back, and encoding the
-        // expectation is how that is stated.
-        let expected_seq = u32::try_from(index).expect("the scenario has few enough commands");
-        let expected_bytes = expected.encode(expected_seq);
-        if *datagram != expected_bytes {
+        // exactly the bytes the cog put in came back, and building the
+        // expectation as the same message is how that is stated.
+        let expected_bytes = blob_as_bytes(&expected);
+        if payload != expected_bytes {
             failures.push(format!(
-                "packet {index} on {PACKET_CHANNEL} is {}, expected {} (decoded: {:?})",
-                hex(datagram),
-                hex(&expected_bytes),
-                received.message.message
+                "packet {index} on {PACKET_CHANNEL} is {}, expected {} (read back: {:?})",
+                hex(payload),
+                hex(expected_bytes),
+                blob_from_bytes::<GoalSetpointWire>(payload)
+                    .map(|goal| goal.execute_at().as_nanos())
             ));
         }
     }

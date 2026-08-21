@@ -9,11 +9,14 @@
 //! names are refused, nesting depth is bounded, and the result is **flattened**
 //! into a flat list of segments.
 //!
-//! Flattening is the point. Composition is a load-time construct; the runtime
-//! only ever plays a flat list of (clip, effective speed, following gap). No
-//! player walks a tree, no per-tick code can recurse, and a sequence that can
-//! only ever be played out of bounds is refused here rather than at the moment
-//! someone asks for it.
+//! Flattening is the point. Composition is a load-time construct; what plays is
+//! only ever a flat list of (clip, effective speed, following gap). No player
+//! walks a tree, no per-tick code can recurse, and a sequence that can only ever
+//! be played out of bounds is refused here rather than at the moment someone
+//! asks for it.
+//!
+//! A clip is a one-segment motion, so a name resolves to the same shape
+//! whichever kind of document it came from.
 //!
 //! Sans-I/O like the rest of the crate: documents arrive as strings the caller
 //! read. Which directory they came from, and what to do about a skip, are the
@@ -21,12 +24,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::config::MAX_SEGMENTS;
 use crate::format::{
-    Channel, ChannelMask, Clip, ClipError, ClipNote, MAX_SPEED, MIN_SPEED, document_kind,
+    CLIP_KIND, Clip, ClipError, ClipNote, MAX_SPEED, MIN_SPEED, SEQUENCE_KIND, document_kind,
 };
 use crate::sequence::{Entry, Sequence, SequenceError};
 use crate::speed::{ClipLimits, seam_step};
@@ -45,7 +48,26 @@ pub const MAX_SEQUENCE_DEPTH: usize = 8;
 /// `2.0`. Refusing a sequence over the last ulp of that product would be
 /// refusing arithmetic rather than refusing motion; the tolerance is far below
 /// any speed difference anybody could see or the machine could feel.
-const SPEED_EPS: f64 = 1e-9;
+pub const SPEED_EPS: f64 = 1e-9;
+
+/// Whether `speed` is a rate the machine plays at, to the tolerance above.
+///
+/// One statement of the arithmetic for everyone who asks: the flattening asks
+/// of a nesting product and the play path asks again of the message that
+/// carries it, and a tolerance the two read differently would let one accept
+/// what the other refuses. A speed that is not finite is outside every range
+/// and so is refused here too.
+#[must_use]
+pub fn speed_in_bounds(speed: f64) -> bool {
+    (MIN_SPEED - SPEED_EPS..=MAX_SPEED + SPEED_EPS).contains(&speed)
+}
+
+/// Whether `speed` is within `ceiling`, the highest rate a clip's own frames
+/// admit, to the same tolerance.
+#[must_use]
+pub fn within_ceiling(speed: f64, ceiling: f64) -> bool {
+    speed <= ceiling + SPEED_EPS
+}
 
 /// One flattened step of a motion: a clip, the speed it runs at, and the hold
 /// that follows it.
@@ -56,15 +78,15 @@ const SPEED_EPS: f64 = 1e-9;
 /// flattened motion serves every invocation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Segment {
-    clip: Arc<Clip>,
+    clip: String,
     speed: f64,
     gap_after_s: f64,
 }
 
 impl Segment {
-    /// The clip this segment plays.
+    /// The library name of the clip this segment plays.
     #[must_use]
-    pub fn clip(&self) -> &Arc<Clip> {
+    pub fn clip(&self) -> &str {
         &self.clip
     }
 
@@ -88,39 +110,33 @@ impl Segment {
 /// A playable motion: what a name resolves to.
 ///
 /// A clip becomes a one-segment motion and a sequence becomes an n-segment one,
-/// so everything downstream — wire validation, the player, the daemon's window
-/// arithmetic — has a single shape to handle and never asks which kind of asset
+/// so everything downstream — the emitted configuration, the window arithmetic,
+/// the player — has a single shape to handle and never asks which kind of asset
 /// it was handed.
+///
+/// What the motion is *like* to play — how long it runs, which channels it
+/// drives, how fast it may be invoked — is derived from its segments' clips
+/// wherever it is needed, and is not stored here or in the emitted asset: a
+/// stored derivation is a second opinion waiting to disagree with the frames.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Motion {
     name: String,
-    description: Option<String>,
-    mask: ChannelMask,
     lead_gap_s: f64,
     segments: Vec<Segment>,
-    duration_s: f64,
-    max_speed: f64,
     depth: usize,
 }
 
 impl Motion {
     /// The one-segment motion a bare clip plays as.
-    fn from_clip(clip: Arc<Clip>) -> Self {
-        let mask = clip.mask();
-        let duration_s = clip.duration_s();
-        let max_speed = clip.max_speed();
+    fn from_clip(name: &str) -> Self {
         Self {
-            name: clip.name().to_owned(),
-            description: clip.description().map(str::to_owned),
-            mask,
+            name: name.to_owned(),
             lead_gap_s: 0.0,
             segments: vec![Segment {
-                clip,
+                clip: name.to_owned(),
                 speed: 1.0,
                 gap_after_s: 0.0,
             }],
-            duration_s,
-            max_speed,
             depth: 0,
         }
     }
@@ -131,24 +147,10 @@ impl Motion {
         &self.name
     }
 
-    /// The asset's description, if it carried one.
-    #[must_use]
-    pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    /// Every channel any of this motion's clips drives.
-    ///
-    /// The union, not an intersection: a channel is *driven* by the motion even
-    /// if only one segment touches it. Between such segments the channel simply
-    /// contributes no delta, which is not the same as the motion having nothing
-    /// to say about it.
-    #[must_use]
-    pub fn mask(&self) -> ChannelMask {
-        self.mask
-    }
-
     /// The hold before the first clip, seconds, at 1.0×.
+    ///
+    /// The base alone holds through it: there is no previous segment whose
+    /// delta could be frozen.
     #[must_use]
     pub fn lead_gap_s(&self) -> f64 {
         self.lead_gap_s
@@ -158,56 +160,6 @@ impl Motion {
     #[must_use]
     pub fn segments(&self) -> &[Segment] {
         &self.segments
-    }
-
-    /// How long the motion runs at 1.0×, seconds, holds included.
-    #[must_use]
-    pub fn duration_s(&self) -> f64 {
-        self.duration_s
-    }
-
-    /// How long the motion runs at `speed`, seconds.
-    ///
-    /// Gaps scale with the clips: an invocation at 2× plays the whole motion,
-    /// holds and all, in half the time. A hold that kept its wall-clock length
-    /// while the clips around it halved would be a different motion, not the
-    /// same one faster.
-    ///
-    /// # Panics
-    ///
-    /// If `speed` is not finite and positive — the same invariant
-    /// [`crate::ClipPlayer::joining_at`] holds, for the same reason: this
-    /// duration is what the daemon's overlay-window arithmetic is built on, and
-    /// a NaN or infinite window is a script that never stops being active.
-    #[must_use]
-    pub fn duration_s_at(&self, speed: f64) -> f64 {
-        assert!(
-            speed.is_finite() && speed > 0.0,
-            "an invocation speed must be finite and positive, not {speed}"
-        );
-        self.duration_s / speed
-    }
-
-    /// The fastest invocation speed this motion may be played at.
-    ///
-    /// For a sequence this is the tightest child's limit divided by what the
-    /// nesting already spends of it, so the bound holds for every segment at
-    /// once, and never above the global ceiling.
-    #[must_use]
-    pub fn max_speed(&self) -> f64 {
-        self.max_speed
-    }
-
-    /// How long this motion's overlay takes to fade out after its last frame,
-    /// milliseconds. Determined by the final segment's clip alone.
-    ///
-    /// This is a wall-clock number independent of invocation speed — callers
-    /// must add it to the motion's scaled duration, not scale it.
-    #[must_use]
-    pub fn blend_out_ms(&self) -> u32 {
-        self.segments
-            .last()
-            .map_or(0, |segment| segment.clip.blend_out_ms())
     }
 }
 
@@ -230,6 +182,10 @@ pub enum ResolveError {
     #[error("sequence reference cycle: {}", path.join(" -> "))]
     Cycle {
         /// The chain of sequence names, closing on its own first element.
+        ///
+        /// Only the cycle: a sequence that reaches one from outside is refused
+        /// too, but the names it took to get there are not part of the loop and
+        /// are not reported as if they were.
         path: Vec<String>,
     },
 
@@ -248,6 +204,23 @@ pub enum ResolveError {
         sequence: String,
         /// How deep the nesting had run when it was refused.
         depth: usize,
+    },
+
+    /// A sequence flattening to more segments than one motion carries.
+    ///
+    /// Refused as the segments are pushed rather than once the list is
+    /// finished: nesting multiplies, so eight small documents referencing each
+    /// other can name more segments than any machine could hold, and the only
+    /// bound that stops that is one applied where the list grows. What it is
+    /// bounded to is what the emitted asset carries — a longer motion could
+    /// never cross into the configuration, so flattening the rest of it buys
+    /// nothing.
+    #[error(
+        "sequence {sequence:?} flattens past {MAX_SEGMENTS} segments, which is all one motion carries"
+    )]
+    TooManySegments {
+        /// The sequence whose flattening ran past the bound.
+        sequence: String,
     },
 
     /// A sequence that flattens to nothing but holds.
@@ -338,6 +311,10 @@ pub enum LoadError {
     #[error(transparent)]
     Sequence(#[from] SequenceError),
 
+    /// A sequence that would not resolve against the rest of the library.
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
+
     /// A name a previously loaded asset already holds.
     ///
     /// Refused rather than overwritten: the name is what a script invokes, and
@@ -349,10 +326,6 @@ pub enum LoadError {
         /// Where the asset holding it came from.
         first_source: String,
     },
-
-    /// A sequence that would not resolve against the rest of the library.
-    #[error(transparent)]
-    Resolve(#[from] ResolveError),
 }
 
 /// One skipped document, for the report the loader's caller writes.
@@ -371,6 +344,20 @@ pub struct AssetSkip {
     pub name: Option<String>,
     /// Why it was skipped.
     pub error: LoadError,
+}
+
+/// One document a load accepted, in the order it was read.
+///
+/// The loader's own account of what became an asset and under which name. A
+/// consumer that numbers clips or motions by document order takes the
+/// association from here rather than probing the documents a second time: two
+/// routings of one directory that disagree renumber the library.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetLoaded {
+    /// Where the document came from.
+    pub source: String,
+    /// The name the asset loaded under.
+    pub name: String,
 }
 
 /// One thing a load changed about an asset it accepted.
@@ -395,10 +382,12 @@ impl fmt::Display for AssetNote {
     }
 }
 
-/// The loaded, resolved set of motions, addressed by name.
+/// The loaded, resolved set of assets, addressed by name.
 #[derive(Clone, Debug, Default)]
 pub struct Library {
-    motions: BTreeMap<String, Arc<Motion>>,
+    clips: BTreeMap<String, Clip>,
+    motions: BTreeMap<String, Motion>,
+    motions_loaded: Vec<AssetLoaded>,
     notes: Vec<AssetNote>,
 }
 
@@ -409,7 +398,7 @@ impl Library {
         Self::default()
     }
 
-    /// Load every document, then resolve.
+    /// Load every document.
     ///
     /// Each item is a source label and the document's text. `limits` are the
     /// bounds every clip's speed ceiling and blend floors are derived against —
@@ -431,33 +420,66 @@ impl Library {
         builder.build()
     }
 
+    /// The clips the load accepted, in the order the documents were read.
+    ///
+    /// The motions filtered to the ones a clip document authored, which is the
+    /// clip numbering: stating the filter here rather than storing a second
+    /// vector is what keeps the two numberings the same read order.
+    pub fn loaded(&self) -> impl Iterator<Item = &AssetLoaded> {
+        self.motions_loaded
+            .iter()
+            .filter(|asset| self.clips.contains_key(&asset.name))
+    }
+
+    /// Every asset that became a motion, in the order the documents were read.
+    ///
+    /// Clips and resolved sequences together, since both play as motions. A
+    /// sequence the resolution refused is not here: it is a skip.
+    #[must_use]
+    pub fn motions_loaded(&self) -> &[AssetLoaded] {
+        &self.motions_loaded
+    }
+
+    /// The motion a name resolves to, if the library holds it.
+    #[must_use]
+    pub fn motion(&self, name: &str) -> Option<&Motion> {
+        self.motions.get(name)
+    }
+
     /// What the load changed about the assets it accepted.
     #[must_use]
     pub fn notes(&self) -> &[AssetNote] {
         &self.notes
     }
 
-    /// The motion a name resolves to, if the library holds it.
+    /// The clip a name resolves to, if the library holds it.
     #[must_use]
-    pub fn motion(&self, name: &str) -> Option<&Arc<Motion>> {
-        self.motions.get(name)
+    pub fn clip(&self, name: &str) -> Option<&Clip> {
+        self.clips.get(name)
     }
 
-    /// Every loaded name, sorted.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
+    /// Every loaded clip name, sorted.
+    pub fn clip_names(&self) -> impl Iterator<Item = &str> {
+        self.clips.keys().map(String::as_str)
+    }
+
+    /// Every loaded motion name, sorted. Clips and resolved sequences together,
+    /// since both play as motions.
+    pub fn motion_names(&self) -> impl Iterator<Item = &str> {
         self.motions.keys().map(String::as_str)
     }
 
-    /// How many motions are loaded.
+    /// How many clips are loaded. Not a motion count: a clip id and a motion id
+    /// are different numberings, and only the second bounds what plays.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.motions.len()
+    pub fn clip_count(&self) -> usize {
+        self.clips.len()
     }
 
-    /// Whether nothing is loaded.
+    /// How many motions are loaded. A motion id is an index below this.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.motions.is_empty()
+    pub fn motion_count(&self) -> usize {
+        self.motions.len()
     }
 }
 
@@ -468,8 +490,9 @@ impl Library {
 #[derive(Debug, Default)]
 pub struct LibraryBuilder {
     limits: ClipLimits,
-    clips: BTreeMap<String, (String, Arc<Clip>)>,
+    clips: BTreeMap<String, Clip>,
     sequences: BTreeMap<String, (String, Sequence)>,
+    accepted: Vec<AssetLoaded>,
     skips: Vec<AssetSkip>,
     notes: Vec<AssetNote>,
 }
@@ -499,14 +522,10 @@ impl LibraryBuilder {
         };
 
         match kind.as_str() {
-            "clip" => match Clip::from_json(document, &self.limits) {
+            CLIP_KIND => match Clip::from_json(document, &self.limits) {
                 Ok(clip) => {
                     let name = clip.name().to_owned();
-                    if let Some(first) = self.holder_of(&name) {
-                        let error = LoadError::Duplicate {
-                            name: name.clone(),
-                            first_source: first,
-                        };
+                    if let Some(error) = self.duplicate(&name) {
                         self.skip(source, Some(name), error);
                     } else {
                         // Only an asset that is kept reports what its load
@@ -519,55 +538,49 @@ impl LibraryBuilder {
                                 note: *note,
                             });
                         }
-                        self.clips.insert(name, (source, Arc::new(clip)));
+                        self.accepted.push(AssetLoaded {
+                            source,
+                            name: name.clone(),
+                        });
+                        self.clips.insert(name, clip);
                     }
                 }
                 Err(error) => self.skip(source, None, error.into()),
             },
-            "sequence" => match Sequence::from_json(document) {
+            SEQUENCE_KIND => match Sequence::from_json(document) {
                 Ok(sequence) => {
                     let name = sequence.name().to_owned();
-                    if let Some(first) = self.holder_of(&name) {
-                        let error = LoadError::Duplicate {
-                            name: name.clone(),
-                            first_source: first,
-                        };
+                    if let Some(error) = self.duplicate(&name) {
                         self.skip(source, Some(name), error);
                     } else {
+                        self.accepted.push(AssetLoaded {
+                            source: source.clone(),
+                            name: name.clone(),
+                        });
                         self.sequences.insert(name, (source, sequence));
                     }
                 }
                 Err(error) => self.skip(source, None, error.into()),
             },
-            other => self.skip(
-                source,
-                None,
-                LoadError::UnknownKind {
-                    kind: other.to_owned(),
-                },
-            ),
+            _ => self.skip(source, None, LoadError::UnknownKind { kind }),
         }
     }
 
     /// Resolve every sequence and produce the library.
     #[must_use]
     pub fn build(mut self) -> (Library, Vec<AssetSkip>) {
-        // One `Motion` per clip, built once and shared by every reference to
-        // it: two sequences naming the same clip hold the same `Arc`, so the
-        // handle means what its type says it means.
-        let mut clip_motions: BTreeMap<String, Arc<Motion>> = BTreeMap::new();
-        for (name, (_, clip)) in &self.clips {
-            clip_motions.insert(name.clone(), Arc::new(Motion::from_clip(clip.clone())));
+        let mut motions: BTreeMap<String, Motion> = BTreeMap::new();
+        for name in self.clips.keys() {
+            motions.insert(name.clone(), Motion::from_clip(name));
         }
-        let mut motions = clip_motions.clone();
 
-        let mut resolved: BTreeMap<String, Result<Arc<Motion>, ResolveError>> = BTreeMap::new();
+        let mut resolved: BTreeMap<String, Result<Motion, ResolveError>> = BTreeMap::new();
         let names: Vec<String> = self.sequences.keys().cloned().collect();
         for name in names {
             let mut stack = Vec::new();
             let outcome = resolve(
                 &name,
-                &clip_motions,
+                &self.clips,
                 &self.sequences,
                 &self.limits,
                 &mut resolved,
@@ -588,21 +601,35 @@ impl LibraryBuilder {
             }
         }
 
+        // The motion numbering is the read order of everything that survived
+        // and plays; the clip numbering is that order filtered again, which
+        // `Library::loaded` does.
+        let motions_loaded: Vec<AssetLoaded> = self
+            .accepted
+            .into_iter()
+            .filter(|asset| motions.contains_key(&asset.name))
+            .collect();
+
         (
             Library {
+                clips: self.clips,
                 motions,
+                motions_loaded,
                 notes: self.notes,
             },
             self.skips,
         )
     }
 
-    /// Where the asset already holding `name` came from, if one does.
-    fn holder_of(&self, name: &str) -> Option<String> {
-        self.clips
-            .get(name)
-            .map(|(source, _)| source.clone())
-            .or_else(|| self.sequences.get(name).map(|(source, _)| source.clone()))
+    /// The refusal an already-taken name earns, if this one is taken.
+    fn duplicate(&self, name: &str) -> Option<LoadError> {
+        self.accepted
+            .iter()
+            .find(|asset| asset.name == name)
+            .map(|first| LoadError::Duplicate {
+                name: name.to_owned(),
+                first_source: first.source.clone(),
+            })
     }
 
     /// Record a skipped document.
@@ -621,20 +648,24 @@ impl LibraryBuilder {
 /// it is the cycle.
 fn resolve(
     name: &str,
-    clip_motions: &BTreeMap<String, Arc<Motion>>,
+    clips: &BTreeMap<String, Clip>,
     sequences: &BTreeMap<String, (String, Sequence)>,
     limits: &ClipLimits,
-    resolved: &mut BTreeMap<String, Result<Arc<Motion>, ResolveError>>,
+    resolved: &mut BTreeMap<String, Result<Motion, ResolveError>>,
     stack: &mut Vec<String>,
-) -> Result<Arc<Motion>, ResolveError> {
-    if let Some(motion) = clip_motions.get(name) {
-        return Ok(motion.clone());
+) -> Result<Motion, ResolveError> {
+    if clips.contains_key(name) {
+        return Ok(Motion::from_clip(name));
     }
     if let Some(outcome) = resolved.get(name) {
         return outcome.clone();
     }
-    if stack.iter().any(|entry| entry == name) {
-        let mut path = stack.clone();
+    if let Some(closes) = stack.iter().position(|entry| entry == name) {
+        // From the first time the repeated name was entered: whatever chain
+        // reached the loop from outside is refused with it, but naming those
+        // sequences as members of the loop would point an author at files that
+        // are only guilty of referring to it.
+        let mut path = stack[closes..].to_vec();
         path.push(name.to_owned());
         return Err(ResolveError::Cycle { path });
     }
@@ -658,7 +689,7 @@ fn resolve(
     }
 
     stack.push(name.to_owned());
-    let outcome = flatten(sequence, clip_motions, sequences, limits, resolved, stack).map(Arc::new);
+    let outcome = flatten(sequence, clips, sequences, limits, resolved, stack);
     stack.pop();
 
     // Two refusals are properties of the chain rather than of the sequence:
@@ -679,10 +710,10 @@ fn resolve(
 /// Flatten one sequence's entries into segments.
 fn flatten(
     sequence: &Sequence,
-    clip_motions: &BTreeMap<String, Arc<Motion>>,
+    clips: &BTreeMap<String, Clip>,
     sequences: &BTreeMap<String, (String, Sequence)>,
     limits: &ClipLimits,
-    resolved: &mut BTreeMap<String, Result<Arc<Motion>, ResolveError>>,
+    resolved: &mut BTreeMap<String, Result<Motion, ResolveError>>,
     stack: &mut Vec<String>,
 ) -> Result<Motion, ResolveError> {
     let mut lead_gap_s = 0.0;
@@ -694,15 +725,20 @@ fn flatten(
         match entry {
             Entry::Gap { ms } => pending_gap_s += f64::from(*ms) / 1000.0,
             Entry::Play { reference, speed } => {
-                let child = resolve(reference, clip_motions, sequences, limits, resolved, stack)?;
+                let child = resolve(reference, clips, sequences, limits, resolved, stack)?;
                 deepest_child = deepest_child.max(child.depth);
                 // The child's own leading hold is a hold in this sequence too,
                 // merging with whatever gap already stands before it.
                 pending_gap_s += child.lead_gap_s / speed;
                 place_gap(&mut lead_gap_s, &mut segments, &mut pending_gap_s);
                 for segment in &child.segments {
+                    if segments.len() >= MAX_SEGMENTS {
+                        return Err(ResolveError::TooManySegments {
+                            sequence: sequence.name().to_owned(),
+                        });
+                    }
                     let effective = segment.speed * speed;
-                    check_speed(sequence.name(), &segment.clip, effective)?;
+                    check_speed(sequence.name(), &segment.clip, clips, effective)?;
                     segments.push(Segment {
                         clip: segment.clip.clone(),
                         speed: effective,
@@ -726,35 +762,12 @@ fn flatten(
         });
     }
     place_gap(&mut lead_gap_s, &mut segments, &mut pending_gap_s);
-    check_seams(sequence.name(), &segments, limits)?;
-
-    let mut mask = ChannelMask::empty();
-    let mut duration_s = lead_gap_s;
-    let mut max_speed = MAX_SPEED;
-    for segment in &segments {
-        for channel in Channel::ALL {
-            if segment.clip.mask().contains(channel) {
-                mask.insert(channel);
-            }
-        }
-        duration_s += segment.clip.duration_s() / segment.speed + segment.gap_after_s;
-        max_speed = max_speed.min(segment.clip.max_speed() / segment.speed);
-    }
-    // Every segment has just been proven legal at 1.0×, so the motion is
-    // playable at 1.0× by construction. Without the floor it need not say so: a
-    // nesting product landing an ulp above a child's own limit is admitted by
-    // `SPEED_EPS` and divides back out an ulp *below* one, which would refuse
-    // the default invocation of a motion the loader accepted.
-    let max_speed = max_speed.max(1.0);
+    check_seams(sequence.name(), &segments, clips, limits)?;
 
     Ok(Motion {
         name: sequence.name().to_owned(),
-        description: sequence.description().map(str::to_owned),
-        mask,
         lead_gap_s,
         segments,
-        duration_s,
-        max_speed,
         depth,
     })
 }
@@ -783,23 +796,28 @@ fn place_gap(lead_gap_s: &mut f64, segments: &mut [Segment], pending_gap_s: &mut
 fn check_seams(
     sequence: &str,
     segments: &[Segment],
+    clips: &BTreeMap<String, Clip>,
     limits: &ClipLimits,
 ) -> Result<(), ResolveError> {
     for pair in segments.windows(2) {
-        let (_, out_last) = pair[0].clip.end_metrics();
-        let (in_first, _) = pair[1].clip.end_metrics();
+        // A segment exists only because its name was found in this map, so the
+        // lookups hold; a miss is this module having lost track of its own
+        // invariant, not a document saying something.
+        let (out_clip, in_clip) = (&clips[&pair[0].clip], &clips[&pair[1].clip]);
+        let (_, out_last) = out_clip.end_metrics();
+        let (in_first, _) = in_clip.end_metrics();
         let step = seam_step(
             &out_last,
-            pair[0].clip.mask(),
+            out_clip.mask(),
             &in_first,
-            pair[1].clip.mask(),
+            in_clip.mask(),
             limits,
         );
         if step > 1.0 {
             return Err(ResolveError::Seam {
                 sequence: sequence.to_owned(),
-                from: pair[0].clip.name().to_owned(),
-                to: pair[1].clip.name().to_owned(),
+                from: pair[0].clip.clone(),
+                to: pair[1].clip.clone(),
                 step,
             });
         }
@@ -808,20 +826,27 @@ fn check_seams(
 }
 
 /// Refuse a flattened speed the nesting alone has already pushed out of range.
-fn check_speed(sequence: &str, clip: &Clip, speed: f64) -> Result<(), ResolveError> {
-    if !(MIN_SPEED - SPEED_EPS..=MAX_SPEED + SPEED_EPS).contains(&speed) {
+fn check_speed(
+    sequence: &str,
+    clip: &str,
+    clips: &BTreeMap<String, Clip>,
+    speed: f64,
+) -> Result<(), ResolveError> {
+    if !speed_in_bounds(speed) {
         return Err(ResolveError::SpeedOutOfBounds {
             sequence: sequence.to_owned(),
-            clip: clip.name().to_owned(),
+            clip: clip.to_owned(),
             speed,
         });
     }
-    if speed > clip.max_speed() + SPEED_EPS {
+    // A segment exists only because its name was found in this map.
+    let max_speed = clips[clip].max_speed();
+    if !within_ceiling(speed, max_speed) {
         return Err(ResolveError::SpeedAboveClip {
             sequence: sequence.to_owned(),
-            clip: clip.name().to_owned(),
+            clip: clip.to_owned(),
             speed,
-            max_speed: clip.max_speed(),
+            max_speed,
         });
     }
     Ok(())
@@ -831,6 +856,7 @@ fn check_speed(sequence: &str, clip: &Clip, speed: f64) -> Result<(), ResolveErr
 mod tests {
     use super::*;
 
+    use crate::format::Channel;
     use crate::speed::STEP_MARGIN;
 
     /// The bounds every test derives clips against: the machine's defaults.
@@ -843,8 +869,7 @@ mod tests {
     /// A clip document of `frames` antennas-only frames, named `name`.
     /// The frames alternate between zero and one step, so the track derives
     /// exactly `max_speed` from its own per-frame deltas — the loader ignores
-    /// the number in the document — and both its endpoints sit within one step
-    /// of any other fixture's, which keeps a seam between two of them legal.
+    /// the number in the document.
     fn clip_json(name: &str, frames: usize, max_speed: f64) -> String {
         let limits = limits();
         let step = limits.max_step.antennas * STEP_MARGIN / max_speed;
@@ -856,17 +881,6 @@ mod tests {
                  "channels": ["antennas"], "frame_hz": {FLOOR_TICK_HZ},
                  "max_speed": {max_speed}, "frames": [{}]}}"#,
             track.join(",")
-        )
-    }
-
-    /// A head-and-yaw clip, for mask-union checks.
-    fn head_clip_json(name: &str) -> String {
-        format!(
-            r#"{{"version": 1, "kind": "clip", "name": "{name}",
-                 "channels": ["head", "body_yaw"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": 2.0,
-                 "frames": [{{"dt": [0.0, 0.0, 0.0], "dq": [1.0, 0.0, 0.0, 0.0],
-                              "body_yaw": 0.1}}]}}"#
         )
     }
 
@@ -912,20 +926,78 @@ mod tests {
     }
 
     #[test]
+    fn a_clip_loads_under_its_own_name() {
+        let library = library(&[("a.json", clip_json("pod/wiggle", 50, 1.5))]);
+        let clip = library.clip("pod/wiggle").expect("loaded");
+        assert_eq!(clip.name(), "pod/wiggle");
+        assert!((clip.duration_s() - 1.0).abs() < 1e-12);
+        assert!(
+            (clip.max_speed() - 1.5).abs() < 1e-9,
+            "{}",
+            clip.max_speed()
+        );
+        assert!(clip.mask().contains(Channel::Antennas));
+    }
+
+    #[test]
+    fn one_bad_document_does_not_take_the_library_with_it() {
+        let (library, skips) = Library::load(
+            [
+                ("good.json", clip_json("pod/good", 50, 2.0)),
+                ("corrupt.json", "{ not json".to_owned()),
+                (
+                    "wrong-rate.json",
+                    clip_json("pod/bad", 50, 2.0).replace("50", "30"),
+                ),
+                ("empty-seq.json", sequence_json("pod/empty", "")),
+            ],
+            &limits(),
+        );
+        assert_eq!(library.clip_count(), 1);
+        assert!(library.clip("pod/good").is_some());
+        assert_eq!(skips.len(), 3, "{skips:?}");
+        assert!(matches!(skips[0].error, LoadError::Kind { .. }));
+        assert_eq!(skips[0].source, "corrupt.json");
+        assert!(matches!(
+            skips[1].error,
+            LoadError::Clip(ClipError::FrameRate { .. })
+        ));
+        assert_eq!(
+            skips[2].error,
+            LoadError::Sequence(SequenceError::NoEntries)
+        );
+        assert_eq!(skips[2].source, "empty-seq.json");
+        assert_eq!(skips[2].name, None);
+    }
+
+    #[test]
+    fn an_unreadable_kind_is_skipped() {
+        let (library, skips) = Library::load(
+            [(
+                "x.json",
+                r#"{"kind": "recording", "name": "pod/x"}"#.to_owned(),
+            )],
+            &limits(),
+        );
+        assert_eq!(library.clip_count(), 0);
+        assert_eq!(
+            skips[0].error,
+            LoadError::UnknownKind {
+                kind: "recording".to_owned()
+            }
+        );
+    }
+
+    #[test]
     fn a_clip_is_a_one_segment_motion() {
         let library = library(&[("a.json", clip_json("pod/wiggle", 50, 1.5))]);
         let motion = library.motion("pod/wiggle").expect("loaded");
+        assert_eq!(motion.name(), "pod/wiggle");
         assert_eq!(motion.segments().len(), 1);
+        assert_eq!(motion.segments()[0].clip(), "pod/wiggle");
         assert_eq!(motion.segments()[0].speed(), 1.0);
         assert_eq!(motion.segments()[0].gap_after_s(), 0.0);
         assert_eq!(motion.lead_gap_s(), 0.0);
-        assert!((motion.duration_s() - 1.0).abs() < 1e-12);
-        assert!(
-            (motion.max_speed() - 1.5).abs() < 1e-9,
-            "{}",
-            motion.max_speed()
-        );
-        assert!(motion.mask().contains(Channel::Antennas));
     }
 
     #[test]
@@ -943,14 +1015,11 @@ mod tests {
         ]);
         let motion = library.motion("pod/greet").expect("loaded");
         assert_eq!(motion.segments().len(), 2);
-        assert_eq!(motion.segments()[0].clip().name(), "pod/a");
+        assert_eq!(motion.segments()[0].clip(), "pod/a");
         assert_eq!(motion.segments()[0].speed(), 1.0);
         assert!((motion.segments()[0].gap_after_s() - 0.3).abs() < 1e-12);
-        assert_eq!(motion.segments()[1].clip().name(), "pod/b");
+        assert_eq!(motion.segments()[1].clip(), "pod/b");
         assert_eq!(motion.segments()[1].speed(), 2.0);
-        // 1 s + 0.3 s hold + 2 s at 2× = 2.3 s.
-        assert!((motion.duration_s() - 2.3).abs() < 1e-12);
-        assert!((motion.duration_s_at(2.0) - 1.15).abs() < 1e-12);
     }
 
     #[test]
@@ -975,44 +1044,6 @@ mod tests {
         assert!((motion.segments()[0].speed() - 2.0).abs() < 1e-12);
         // The inner sequence's own hold is divided by the outer entry's speed.
         assert!((motion.segments()[0].gap_after_s() - 0.32).abs() < 1e-12);
-        assert!((motion.duration_s() - (0.5 + 0.32)).abs() < 1e-12);
-        // Nothing is left of the clip's own 2.0× ceiling — and the bound says
-        // so from the legal side. The product lands an ulp either way of the
-        // clip's limit, and a bound an ulp below 1.0 would refuse the default
-        // invocation of a motion this load just accepted.
-        assert!((motion.max_speed() - 1.0).abs() < 1e-9);
-        assert!(motion.max_speed() >= 1.0, "{}", motion.max_speed());
-    }
-
-    #[test]
-    fn a_motion_the_loader_accepted_is_always_playable_at_one_times() {
-        // Every nesting that admits a clip at its exact limit, at each of the
-        // speeds float arithmetic reaches it by.
-        for (inner, outer) in [(1.6, 1.25), (0.5, 4.0), (2.0, 1.0), (0.8, 2.5)] {
-            let library = library(&[
-                ("a.json", clip_json("pod/a", 50, 2.0)),
-                (
-                    "inner.json",
-                    sequence_json(
-                        "pod/inner",
-                        &format!(r#"{{"ref": "pod/a", "speed": {inner}}}"#),
-                    ),
-                ),
-                (
-                    "outer.json",
-                    sequence_json(
-                        "pod/outer",
-                        &format!(r#"{{"ref": "pod/inner", "speed": {outer}}}"#),
-                    ),
-                ),
-            ]);
-            let motion = library.motion("pod/outer").expect("loaded");
-            assert!(
-                motion.max_speed() >= 1.0,
-                "{inner} × {outer} gave {}",
-                motion.max_speed()
-            );
-        }
     }
 
     #[test]
@@ -1031,7 +1062,6 @@ mod tests {
         assert!((motion.lead_gap_s() - 0.5).abs() < 1e-12);
         assert_eq!(motion.segments().len(), 1);
         assert!((motion.segments()[0].gap_after_s() - 0.2).abs() < 1e-12);
-        assert!((motion.duration_s() - 1.7).abs() < 1e-12);
     }
 
     #[test]
@@ -1055,36 +1085,6 @@ mod tests {
         // The parent's 100 ms plus the child's 400 ms halved by the entry speed.
         assert!((motion.segments()[0].gap_after_s() - 0.3).abs() < 1e-12);
         assert_eq!(motion.lead_gap_s(), 0.0);
-    }
-
-    #[test]
-    fn a_sequence_mask_is_the_union_of_its_clips() {
-        let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            ("h.json", head_clip_json("pod/h")),
-            (
-                "s.json",
-                sequence_json("pod/both", r#"{"ref": "pod/a"}, {"ref": "pod/h"}"#),
-            ),
-        ]);
-        let mask = library.motion("pod/both").expect("loaded").mask();
-        assert!(mask.contains(Channel::Antennas));
-        assert!(mask.contains(Channel::Head));
-        assert!(mask.contains(Channel::BodyYaw));
-    }
-
-    #[test]
-    fn a_sequences_max_speed_is_the_tightest_child_after_the_nesting_spends_it() {
-        let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            ("b.json", clip_json("pod/b", 50, 1.2)),
-            (
-                "s.json",
-                sequence_json("pod/s", r#"{"ref": "pod/a"}, {"ref": "pod/b"}"#),
-            ),
-        ]);
-        let derived = library.motion("pod/s").expect("loaded").max_speed();
-        assert!((derived - 1.2).abs() < 1e-9, "{derived}");
     }
 
     #[test]
@@ -1112,7 +1112,7 @@ mod tests {
             ],
             &limits(),
         );
-        assert!(library.is_empty());
+        assert_eq!(library.motion_count(), 0);
         assert_eq!(skips.len(), 2, "{skips:?}");
         for skip in &skips {
             match &skip.error {
@@ -1276,34 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flattened_speed_outside_the_global_bounds_is_refused() {
-        let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            (
-                "s.json",
-                sequence_json("pod/s", r#"{"ref": "pod/a", "speed": 0.1}"#),
-            ),
-        ]);
-        assert!(matches!(
-            skip.error,
-            LoadError::Resolve(ResolveError::SpeedOutOfBounds { .. })
-        ));
-
-        let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            (
-                "s.json",
-                sequence_json("pod/s", r#"{"ref": "pod/a", "speed": 4.0}"#),
-            ),
-        ]);
-        assert!(matches!(
-            skip.error,
-            LoadError::Resolve(ResolveError::SpeedOutOfBounds { .. })
-        ));
-    }
-
-    #[test]
-    fn the_global_speed_bounds_admit_their_own_endpoints() {
+    fn the_global_speed_bounds_admit_their_own_endpoints_and_refuse_past_them() {
         for speed in [MIN_SPEED, 1.0, MAX_SPEED] {
             let library = library(&[
                 ("a.json", clip_json("pod/a", 50, 2.0)),
@@ -1333,98 +1306,137 @@ mod tests {
         }
     }
 
+    /// A sequence resolved once and referenced twice lands twice, and each
+    /// landing carries its own entry's speed: what is memoised is the child as
+    /// written, never a child already scaled by one caller's entry, which the
+    /// second caller would then scale again.
     #[test]
-    fn one_bad_document_does_not_take_the_library_with_it() {
-        let (library, skips) = Library::load(
-            [
-                ("good.json", clip_json("pod/good", 50, 2.0)),
-                ("corrupt.json", "{ not json".to_owned()),
-                (
-                    "wrong-rate.json",
-                    clip_json("pod/bad", 50, 2.0).replace("50", "30"),
-                ),
-                ("empty-seq.json", sequence_json("pod/empty", "")),
-            ],
-            &limits(),
-        );
-        assert_eq!(library.len(), 1);
-        assert!(library.motion("pod/good").is_some());
-        assert_eq!(skips.len(), 3, "{skips:?}");
-        assert!(matches!(skips[0].error, LoadError::Kind { .. }));
-        assert_eq!(skips[0].source, "corrupt.json");
-        assert!(matches!(
-            skips[1].error,
-            LoadError::Clip(ClipError::FrameRate { .. })
-        ));
-        assert_eq!(
-            skips[2].error,
-            LoadError::Sequence(SequenceError::NoEntries)
-        );
-        assert_eq!(skips[2].source, "empty-seq.json");
-        assert_eq!(skips[2].name, None);
-    }
-
-    #[test]
-    fn an_unreadable_kind_is_skipped() {
-        let (library, skips) = Library::load(
-            [(
-                "x.json",
-                r#"{"kind": "recording", "name": "pod/x"}"#.to_owned(),
-            )],
-            &limits(),
-        );
-        assert!(library.is_empty());
-        assert_eq!(
-            skips[0].error,
-            LoadError::UnknownKind {
-                kind: "recording".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn a_duplicate_name_is_refused_rather_than_overwritten() {
-        let skip = one_skip(&[
-            ("first.json", clip_json("pod/a", 50, 2.0)),
-            ("second.json", clip_json("pod/a", 100, 1.0)),
-        ]);
-        assert_eq!(
-            skip.error,
-            LoadError::Duplicate {
-                name: "pod/a".to_owned(),
-                first_source: "first.json".to_owned(),
-            }
-        );
-
-        // A sequence may not take a clip's name either.
-        let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            ("s.json", sequence_json("pod/a", r#"{"ref": "pod/a"}"#)),
-        ]);
-        assert!(matches!(skip.error, LoadError::Duplicate { .. }));
-    }
-
-    #[test]
-    fn the_empty_library_holds_nothing() {
-        let library = Library::empty();
-        assert!(library.is_empty());
-        assert_eq!(library.motion("pod/anything"), None);
-        assert_eq!(library.names().count(), 0);
-    }
-
-    #[test]
-    fn a_sequence_referenced_twice_resolves_once_and_lands_twice() {
+    fn a_sequence_referenced_twice_lands_twice_at_each_entrys_own_speed() {
         let library = library(&[
             ("a.json", clip_json("pod/a", 50, 2.0)),
-            ("i.json", sequence_json("pod/i", r#"{"ref": "pod/a"}"#)),
+            (
+                "i.json",
+                sequence_json(
+                    "pod/i",
+                    r#"{"ref": "pod/a"}, {"gap_ms": 200}, {"ref": "pod/a"}"#,
+                ),
+            ),
             (
                 "o.json",
-                sequence_json("pod/o", r#"{"ref": "pod/i"}, {"ref": "pod/i"}"#),
+                sequence_json(
+                    "pod/o",
+                    r#"{"ref": "pod/i", "speed": 1.5}, {"ref": "pod/i", "speed": 0.5}"#,
+                ),
             ),
         ]);
         let motion = library.motion("pod/o").expect("loaded");
-        assert_eq!(motion.segments().len(), 2);
-        assert!((motion.duration_s() - 2.0).abs() < 1e-12);
+        assert_eq!(motion.segments().len(), 4);
+        for segment in motion.segments() {
+            assert_eq!(segment.clip(), "pod/a");
+        }
+        let speeds: Vec<f64> = motion.segments().iter().map(Segment::speed).collect();
+        assert_eq!(speeds, [1.5, 1.5, 0.5, 0.5]);
+
+        // The child's own hold scales with the entry that reached it, so the
+        // two landings hold for different lengths of time.
+        assert!(
+            (motion.segments()[0].gap_after_s() - 0.2 / 1.5).abs() < 1e-12,
+            "{:?}",
+            motion.segments()[0]
+        );
+        assert!(
+            (motion.segments()[2].gap_after_s() - 0.2 / 0.5).abs() < 1e-12,
+            "{:?}",
+            motion.segments()[2]
+        );
+
+        // The child itself is untouched by either caller.
+        let child = library.motion("pod/i").expect("loaded");
+        assert_eq!(child.segments()[0].speed(), 1.0);
+        assert_eq!(child.segments()[0].gap_after_s(), 0.2);
+    }
+
+    /// A sequence that is not itself in a cycle but reaches one is refused with
+    /// it — and the chain it is refused with is the loop, not the approach.
+    #[test]
+    fn a_cycle_reached_from_outside_names_only_the_cycle() {
+        let (library, skips) = Library::load(
+            [
+                ("a.json", sequence_json("pod/a", r#"{"ref": "pod/b"}"#)),
+                ("b.json", sequence_json("pod/b", r#"{"ref": "pod/a"}"#)),
+                ("c.json", sequence_json("pod/c", r#"{"ref": "pod/a"}"#)),
+            ],
+            &limits(),
+        );
+        assert_eq!(library.motion_count(), 0);
+        assert_eq!(skips.len(), 3, "{skips:?}");
+        let outside = skips
+            .iter()
+            .find(|skip| skip.name.as_deref() == Some("pod/c"))
+            .expect("the approaching sequence is skipped too");
+        let LoadError::Resolve(ResolveError::Cycle { path }) = &outside.error else {
+            panic!("expected a cycle refusal: {:?}", outside.error);
+        };
+        assert_eq!(path.first(), path.last(), "the chain closes: {path:?}");
+        assert!(
+            !path.contains(&"pod/c".to_owned()),
+            "the approach is named as part of the loop: {path:?}"
+        );
+        assert_eq!(path, &["pod/a", "pod/b", "pod/a"]);
+    }
+
+    /// Nesting multiplies, so the segment count is bounded where it grows: two
+    /// levels of six references are thirty-six segments, and thirty-six is more
+    /// than one motion carries. Without the bound at the push, eight levels of a
+    /// handful of references each is a flattening no machine finishes.
+    #[test]
+    fn a_flattening_past_the_segment_bound_is_refused_as_it_grows() {
+        let refs = |count: usize, name: &str| {
+            (0..count)
+                .map(|_| format!(r#"{{"ref": "{name}"}}"#))
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+
+        let skip = one_skip(&[
+            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("l0.json", sequence_json("pod/l0", &refs(6, "pod/a"))),
+            ("l1.json", sequence_json("pod/l1", &refs(6, "pod/l0"))),
+        ]);
+        assert_eq!(skip.name.as_deref(), Some("pod/l1"));
+        assert_eq!(
+            skip.error,
+            LoadError::Resolve(ResolveError::TooManySegments {
+                sequence: "pod/l1".to_owned(),
+            })
+        );
+
+        // One past the bound is refused, and the bound itself loads: the last
+        // segment a motion carries is one an author may write.
+        let skip = one_skip(&[
+            ("a.json", clip_json("pod/a", 50, 2.0)),
+            (
+                "m.json",
+                sequence_json("pod/many", &refs(MAX_SEGMENTS + 1, "pod/a")),
+            ),
+        ]);
+        assert_eq!(
+            skip.error,
+            LoadError::Resolve(ResolveError::TooManySegments {
+                sequence: "pod/many".to_owned(),
+            })
+        );
+        let library = library(&[
+            ("a.json", clip_json("pod/a", 50, 2.0)),
+            (
+                "m.json",
+                sequence_json("pod/many", &refs(MAX_SEGMENTS, "pod/a")),
+            ),
+        ]);
+        assert_eq!(
+            library.motion("pod/many").expect("loaded").segments().len(),
+            MAX_SEGMENTS
+        );
     }
 
     /// Two head clips that end and begin at poses further apart than one tick's
@@ -1471,12 +1483,172 @@ mod tests {
         );
     }
 
+    /// The seam check runs over the finished flat list, so two clips that only
+    /// ever meet because one sequence was nested after another are checked
+    /// exactly like two written side by side. Neither child is refused: what
+    /// does not meet is the composition, and that is what the refusal names.
+    #[test]
+    fn clips_that_meet_only_across_two_nestings_are_refused_the_same_way() {
+        let (library, skips) = Library::load(
+            [
+                ("low.json", head_lift_json("pod/low", 0.0)),
+                ("high.json", head_lift_json("pod/high", 0.02)),
+                ("a.json", sequence_json("pod/a", r#"{"ref": "pod/low"}"#)),
+                ("b.json", sequence_json("pod/b", r#"{"ref": "pod/high"}"#)),
+                (
+                    "r.json",
+                    sequence_json("pod/root", r#"{"ref": "pod/a"}, {"ref": "pod/b"}"#),
+                ),
+            ],
+            &limits(),
+        );
+        assert_eq!(skips.len(), 1, "{skips:?}");
+        assert_eq!(skips[0].name.as_deref(), Some("pod/root"));
+        let LoadError::Resolve(ResolveError::Seam {
+            sequence, from, to, ..
+        }) = &skips[0].error
+        else {
+            panic!("expected a seam refusal: {:?}", skips[0].error);
+        };
+        assert_eq!(
+            (sequence.as_str(), from.as_str(), to.as_str()),
+            ("pod/root", "pod/low", "pod/high")
+        );
+        assert!(library.motion("pod/a").is_some());
+        assert!(library.motion("pod/b").is_some());
+    }
+
+    /// A hold between two clips that do not meet postpones the step; it does not
+    /// soften it. The same whole difference is still commanded in one tick when
+    /// the hold ends, so the seam is refused across a gap exactly as without it.
+    #[test]
+    fn a_hold_between_two_clips_does_not_excuse_a_seam() {
+        let skip = one_skip(&[
+            ("low.json", head_lift_json("pod/low", 0.0)),
+            ("high.json", head_lift_json("pod/high", 0.02)),
+            (
+                "s.json",
+                sequence_json(
+                    "pod/jump",
+                    r#"{"ref": "pod/low"}, {"gap_ms": 2000}, {"ref": "pod/high"}"#,
+                ),
+            ),
+        ]);
+        assert!(
+            matches!(
+                &skip.error,
+                LoadError::Resolve(ResolveError::Seam { from, to, .. })
+                    if from == "pod/low" && to == "pod/high"
+            ),
+            "{:?}",
+            skip.error
+        );
+    }
+
+    #[test]
+    fn a_duplicate_name_is_refused_rather_than_overwritten() {
+        let skip = one_skip(&[
+            ("first.json", clip_json("pod/a", 50, 2.0)),
+            ("second.json", clip_json("pod/a", 100, 1.0)),
+        ]);
+        assert_eq!(
+            skip.error,
+            LoadError::Duplicate {
+                name: "pod/a".to_owned(),
+                first_source: "first.json".to_owned(),
+            }
+        );
+        assert_eq!(
+            skip.name.as_deref(),
+            Some("pod/a"),
+            "the document became an asset before it was refused, so it is named"
+        );
+
+        // A sequence may not take a clip's name either: what a script invokes
+        // is one name over both kinds.
+        let skip = one_skip(&[
+            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("s.json", sequence_json("pod/a", r#"{"ref": "pod/a"}"#)),
+        ]);
+        assert!(matches!(skip.error, LoadError::Duplicate { .. }));
+    }
+
+    /// What the load accepted, in the order it read the documents — the
+    /// numbering a clip id is an index into. Not the names' order, which the
+    /// library itself is kept in, and never the loser of a duplicate fight: a
+    /// clip appearing here that nothing plays would shift every id after it.
+    /// The motions carry a numbering of their own, over both kinds.
+    #[test]
+    fn what_loaded_answers_is_the_read_order_of_what_was_accepted() {
+        let (library, skips) = Library::load(
+            [
+                ("c.json", clip_json("pod/c", 50, 1.0)),
+                ("a.json", clip_json("pod/a", 50, 1.0)),
+                ("again.json", clip_json("pod/a", 100, 1.0)),
+                ("s.json", sequence_json("pod/s", r#"{"ref": "pod/a"}"#)),
+                (
+                    "dead.json",
+                    sequence_json("pod/dead", r#"{"ref": "pod/x"}"#),
+                ),
+                ("b.json", clip_json("pod/b", 50, 1.0)),
+            ],
+            &limits(),
+        );
+
+        let motions: Vec<&str> = library
+            .motions_loaded()
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .collect();
+        assert_eq!(
+            motions,
+            ["pod/c", "pod/a", "pod/s", "pod/b"],
+            "every asset that plays, in read order, and only those"
+        );
+
+        let loaded: Vec<(&str, &str)> = library
+            .loaded()
+            .map(|asset| (asset.source.as_str(), asset.name.as_str()))
+            .collect();
+        assert_eq!(
+            loaded,
+            [
+                ("c.json", "pod/c"),
+                ("a.json", "pod/a"),
+                ("b.json", "pod/b")
+            ]
+        );
+        assert_eq!(
+            library.clip_names().collect::<Vec<_>>(),
+            ["pod/a", "pod/b", "pod/c"],
+            "the case rests on read order and name order differing"
+        );
+        assert_eq!(
+            library.motion_names().collect::<Vec<_>>(),
+            ["pod/a", "pod/b", "pod/c", "pod/s"],
+            "a sequence is a motion and no clip"
+        );
+        assert_eq!(skips.len(), 2, "{skips:?}");
+        assert_eq!(skips[0].source, "again.json");
+        assert_eq!(skips[1].source, "dead.json");
+    }
+
+    #[test]
+    fn the_empty_library_holds_nothing() {
+        let library = Library::empty();
+        assert_eq!(library.clip_count(), 0);
+        assert_eq!(library.motion_count(), 0);
+        assert!(library.clip("pod/anything").is_none());
+        assert_eq!(library.clip_names().count(), 0);
+        assert_eq!(library.motion_names().count(), 0);
+    }
+
     /// What the loader changed about a clip reaches the operator through the
     /// library, named and attributed, rather than dying inside the clip.
     #[test]
     fn a_clips_load_notes_reach_the_library_named_and_attributed() {
         let library = library(&[("cautious.json", clip_json_claiming("pod/cautious", 1.05))]);
-        let derived = library.motion("pod/cautious").expect("loaded").max_speed();
+        let derived = library.clip("pod/cautious").expect("loaded").max_speed();
         assert_eq!(
             library.notes(),
             [AssetNote {
@@ -1507,30 +1679,5 @@ mod tests {
             "the loser's note escaped: {:?}",
             library.notes()
         );
-    }
-
-    #[test]
-    fn a_motions_blend_out_is_its_last_clips() {
-        // Fifty frames is a second of clip, so each authored ramp fits inside
-        // the clip it belongs to and is carried rather than refused.
-        let blending = |name: &str, blend_out_ms: u32| {
-            clip_json(name, 50, 2.0).replace(
-                "\"max_speed\": 2",
-                &format!("\"blend_out_ms\": {blend_out_ms}, \"max_speed\": 2"),
-            )
-        };
-        let library = library(&[
-            ("first.json", blending("first", 600)),
-            ("last.json", blending("last", 900)),
-            (
-                "seq.json",
-                sequence_json(
-                    "seq",
-                    r#"{"ref": "first"}, {"gap_ms": 100}, {"ref": "last"}"#,
-                ),
-            ),
-        ]);
-        assert_eq!(library.motion("first").unwrap().blend_out_ms(), 600);
-        assert_eq!(library.motion("seq").unwrap().blend_out_ms(), 900);
     }
 }

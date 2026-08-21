@@ -1,0 +1,109 @@
+// An engagement, as the slot holds it: which phase is running, and what torque
+// coming on did to the machine.
+//
+// The engage sequencer writes both declarations here. The records it brackets
+// the engagement with are `motion/arm_record.clk`, which disarm also reads, so
+// they are not here.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+use motion::arm_record;
+use motion::bus_txn;
+use motion::joints;
+use motion::seq;
+
+// Which phase of an engagement is running.
+//
+// Phases run from one for the reason `CommissionPhaseKind` states: zero is what
+// an unwritten slot holds, and read as the first phase that would be the goal
+// sweep -- so a resume from a slot nobody wrote would re-run the enables.
+enum EngagePhaseKind
+{
+    uuid: 5fa9d705-2c73-486a-98e2-9330ec5367c0;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No phase. What a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // The nine goal-register writes.
+        #1 pin { underlying_value: 1; }
+        // The nine torque enables.
+        #2 enable { underlying_value: 2; }
+        // The nine read-backs the first trajectory starts from.
+        #3 settle { underlying_value: 3; }
+        // Finished: the next step hands back the summary.
+        #4 complete { underlying_value: 4; }
+        // Stopped: the next step hands back the failure.
+        #5 failed { underlying_value: 5; }
+    }
+}
+
+// An engagement, as the numbers a slot holds it between transactions.
+//
+// The engage sequencer's own state: it reads and writes these fields directly and
+// there is no second form of them. This is the one sequence that runs with torque
+// coming on underneath it, so the slot carries `torque_written`: a session
+// resuming this and finding it set knows the machine may be holding torque with
+// nobody controlling it, which is what the keep-alive and the release-immediately
+// paths turn on.
+//
+// The configuration is deliberately absent, as in `CommissionSnap`: the fences,
+// the geometry and the solver options are handed to a cog read-only on every
+// execution.
+schema EngageSnap
+{
+    uuid: 7ea45425-db2c-4155-a2c8-930f5dd681f6;
+    fields
+    {
+        // Which phase is running. `none` is what an unwritten slot holds and is
+        // refused rather than read as the goal sweep.
+        #0 phase: EngagePhaseKind;
+
+        // Where that phase's sweep stands. Zero in the two endings, and refused
+        // past the sweep's own length.
+        #1 cursor: UInt32;
+
+        // The record the settle sweep solved, present only once the engagement
+        // has finished.
+        #2 armed: arm_record::ArmRecordSnap;
+
+        // The verdict a failed phase hands back. `none` in every other phase.
+        #3 failure: seq::SeqFailureSnap;
+
+        // The transaction awaiting an answer.
+        #4 pending: bus_txn::BusTxn;
+
+        // Where the poll found the platform, solved. Always present: an
+        // engagement plans its pins from it.
+        #5 rest: arm_record::ArmRecordSnap;
+
+        // The goals written, and how far each pin pulled a leg.
+        #6 pins: arm_record::PinSnap;
+
+        // The angles the poll measured before torque, in bus order, radians:
+        // the baseline each joint's post-enable shift is computed against.
+        #7 measured: joints::Joints;
+
+        // The angles the armed record is solved from, in bus order, radians.
+        #8 post_enable: joints::Joints;
+
+        // Per joint, its position after torque came on less the position it was
+        // resting at, radians.
+        #9 post_enable_shift: joints::Joints;
+
+        // Whether an enable write has gone out, so the machine may be holding
+        // torque with nobody controlling it.
+        #10 torque_written: Bool;
+
+        // The joints the health gate left out of service: limp for the whole
+        // engagement.
+        #11 degraded: joints::JointFlags;
+
+        // Re-reads already spent on the joint the settle sweep is at.
+        #12 rereads: UInt32;
+    }
+}

@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use scenario::author::{self, ALL_ROWS, InputLog};
+use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s3_scenario::{IDLE_EPOCH, TORQUE_ON_CYCLE};
@@ -32,7 +32,7 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
 
     let at = cycle_at(TORQUE_ON_CYCLE);
-    log.torque_on(at, ALL_ROWS)?;
+    log.torque_on(at, author::all_rows())?;
     log.schedule(at, false, IDLE_EPOCH, &[])?;
 
     log.close()

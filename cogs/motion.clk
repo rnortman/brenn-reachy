@@ -17,23 +17,25 @@
 // across "instances" is asking a question with a wrong answer available.
 // TODO(clockwork-single-instance-signal)
 //
-// The sample channel carries `reachy-wire` datagrams as opaque bytes, which is
-// what makes this file identical in the simulation and on the machine: a cog
-// cannot tell a socket-fed channel from a simulator-fed one, and the parse path
-// in the body is the same code either way. The carrier size is chosen off
-// `var_packet.clk`'s own menu of instantiations rather than declared here.
-// TODO(foreign-generic-instantiation-crate)
+// Every channel here declares the schema it carries. A cog cannot tell a
+// socket-fed channel from a simulator-fed one either way: what crosses a socket
+// is the blob bytes of the same schema, so the parse path is the same code and
+// the type says what the bytes are.
 
 #![generate(cpp, cpp_cog, cpp_test_cog)]
 #![cpp(namespace=brenn_reachy::motion)]
 
 use cogs::config;
-use cogs::msgs;
-use @clockwork::clockwork::io::var_packet;
+use cogs::mover;
+use cogs::pose_state;
+use cogs::schedule;
+use driver::goal as goal_vocab;
+use driver::pose;
+use motion::faults;
 use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
     ReportGroupLogType};
 
-// The driver's sample stream: one datagram per bus cycle, always, whether or
+// The driver's sample stream: one message per bus cycle, always, whether or
 // not the read succeeded. One publisher -- the driver -- as every channel in
 // this repo's systems has.
 //
@@ -43,18 +45,18 @@ use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
 // machine long before that.
 channel DriverPose
 {
-    message_type: Tachyon<var_packet::VarPacket288>;
+    message_type: Tachyon<pose::PoseSample>;
     max_num_messages: 16;
 }
 
 // Where the head is, one message per sample.
 channel Estimates
 {
-    message_type: Tachyon<msgs::PoseEstimate>;
+    message_type: Tachyon<pose::PoseEstimate>;
     max_num_messages: 16;
 }
 
-// The goal stream: what the machine is being asked to hold next, one datagram
+// The goal stream: what the machine is being asked to hold next, one message
 // per sample while a session is under way. One publisher -- the decision tick.
 //
 // Sixteen deep against the deepest view on it, which is eight, for the same
@@ -71,7 +73,7 @@ channel Estimates
 // TODO(cogs-session-channel)
 channel DriverCmd
 {
-    message_type: Tachyon<var_packet::VarPacket128>;
+    message_type: Tachyon<goal_vocab::GoalSetpoint>;
     max_num_messages: 16;
 }
 
@@ -84,7 +86,7 @@ channel DriverCmd
 // lapped here has lost nothing it would have acted on.
 channel ScheduleChan
 {
-    message_type: Tachyon<msgs::SessionSchedule>;
+    message_type: Tachyon<schedule::SessionSchedule>;
     max_num_messages: 4;
 }
 
@@ -96,7 +98,7 @@ channel ScheduleChan
 // not a rate.
 channel TickFaults
 {
-    message_type: Tachyon<msgs::TickFault>;
+    message_type: Tachyon<faults::TickFault>;
     max_num_messages: 8;
 }
 
@@ -128,7 +130,7 @@ cog Pose
     states
     {
         // The solver's seed, and the run's totals for the three signals below.
-        est: Tappy<msgs::PoseState>
+        est: Tappy<pose_state::PoseState>
         {
             mutable: true;
         }
@@ -145,13 +147,13 @@ cog Pose
             multi_instance: true;
         }
 
-        // How many datagrams the codec refused. Distinct from a solve failure:
-        // the bytes were not a sample at all, so they name no instant and no
-        // positions. An execution that refused every datagram in its window
+        // How many samples failed validation. Distinct from a solve failure:
+        // the bytes describe no sample at all, so they name no instant and no
+        // positions. An execution that refused every message in its window
         // still publishes an invalid estimate, at its own instant; this counter
-        // is what says why, and separates a driver speaking a version this
-        // build does not from a machine that stopped answering.
-        undecodable_samples: signal UInt64
+        // is what says why, and separates a driver writing a field this build
+        // does not know from a machine that stopped answering.
+        refused_samples: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
@@ -172,7 +174,7 @@ cog Pose
     {
         // The sample stream, sized to see every message rather than the latest
         // one.
-        sample: Tappy<var_packet::VarPacket288>
+        sample: Tappy<pose::PoseSample>
         {
             max_msgs: 8;
         }
@@ -180,7 +182,7 @@ cog Pose
 
     outputs
     {
-        estimate: Tappy<msgs::PoseEstimate>;
+        estimate: Tappy<pose::PoseEstimate>;
     }
 
     execution
@@ -241,7 +243,7 @@ policy ReportGroupPolicy for Pose.stats
 // reported.
 //
 // The `simulation_options` at the foot say how long an execution is modelled to
-// take: a goal datagram is logged that long after the sample that decided it,
+// take: a goal message is logged that long after the sample that decided it,
 // while the instant the goal names is arithmetic off the sample's own nominal.
 // A checker reading timestamps must not conflate the two. (Neither a block
 // header nor a field inside one may carry a comment of its own, which is why
@@ -252,13 +254,18 @@ cog Mover
     {
         // The grid goals are dated on, and how long a posture change takes.
         params: Tappy<config::MoverParams>;
+
+        // Every clip an overlay can name, read-only. A clip's id is its index
+        // here, and nothing writes this: clips are chosen before the run
+        // starts, so they arrive the way the tick's own numbers do.
+        clips: Tappy<config::ClipLibraryConfig>;
     }
 
     states
     {
         // The tick's own state, and what this cog knows about the schedule it
         // is following.
-        ctrl: Tappy<msgs::MoverState>
+        ctrl: Tappy<mover::MoverState>
         {
             mutable: true;
         }
@@ -266,7 +273,7 @@ cog Mover
 
     signals stats
     {
-        // How many goal datagrams went out. One per execution at most, so under
+        // How many goals went out. One per execution at most, so under
         // the deterministic runner this is one per sample of an engaged
         // session.
         goals_published: signal UInt64
@@ -283,17 +290,17 @@ cog Mover
             multi_instance: true;
         }
 
-        // How many samples were decoded and ticked on.
+        // How many samples were read and ticked on.
         samples_seen: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
 
-        // How many datagrams the codec refused. A driver speaking a version
-        // this build does not is a machine that looks stopped from here; this
+        // How many samples failed validation. A driver writing a field this
+        // build does not know is a machine that looks stopped from here; this
         // counter is what tells the two apart.
-        undecodable_samples: signal UInt64
+        refused_samples: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
@@ -318,16 +325,6 @@ cog Mover
             multi_instance: true;
         }
 
-        // How many times this cog's own last goal datagram would not decode.
-        // The stream's sequence numbers restart at zero when it happens, and a
-        // consumer watching them cannot otherwise tell that from a commander
-        // that restarted.
-        refused_readback: signal UInt64
-        {
-            post_aggregation: ["final_value"];
-            multi_instance: true;
-        }
-
         // How many times an epoch this cog had not answered yet was answered by
         // a posture step. Counted per epoch value the cog saw, and the schedule
         // channel is latest-wins, so bumps superseded before an execution are
@@ -346,7 +343,7 @@ cog Mover
         // The driver's sample stream, sized to see every message rather than
         // the latest one: a sample missed is a control cycle that never
         // happened, and this cog's whole clock is that stream.
-        sample: Tappy<var_packet::VarPacket288>
+        sample: Tappy<pose::PoseSample>
         {
             max_msgs: 8;
         }
@@ -356,21 +353,20 @@ cog Mover
         // there is to know. Deliberately not a condition -- a schedule arriving
         // between samples changes what the next sample decides, not when this
         // cog runs.
-        sched: Tappy<msgs::SessionSchedule>;
+        sched: Tappy<schedule::SessionSchedule>;
 
         // This cog's own goal channel, at the default view of 1: the last
-        // datagram it published, or an empty view before it ever has. The wire
-        // sequence number of the next one, and the instant the last one named,
-        // are read back from it rather than kept in state fields. Deliberately
-        // not a condition -- a cog woken by its own publication would never
-        // stop.
-        own_cmd: Tappy<var_packet::VarPacket128>;
+        // setpoint it published, or an empty view before it ever has. The
+        // instant that one named, which the next publish is checked against, is
+        // read back from it rather than kept in a state field. Deliberately not
+        // a condition -- a cog woken by its own publication would never stop.
+        own_cmd: Tappy<goal_vocab::GoalSetpoint>;
     }
 
     outputs
     {
-        goal: Tappy<var_packet::VarPacket128>;
-        fault: Tappy<msgs::TickFault>;
+        goal: Tappy<goal_vocab::GoalSetpoint>;
+        fault: Tappy<faults::TickFault>;
     }
 
     execution

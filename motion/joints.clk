@@ -1,0 +1,142 @@
+// The joint vocabulary: which servo, which set of servos, and one number per
+// servo.
+//
+// The machine's servos, and nothing else. The three declarations here are
+// coupled by the one topology -- a tenth servo touches all of them -- which is
+// why they share a module, and why nothing about task space, faults, sequencing
+// or the bus appears below: a consumer that only names a servo must not rebuild
+// when a pose or a register changes.
+//
+// Two conventions hold, and both are worth stating because a reader coming from
+// the wire format will expect otherwise:
+//
+//   * Joints are named fields, never a positional array, and the names run in
+//     the bus order the datagrams use -- body yaw, the six legs, right antenna,
+//     left antenna. A row misplaced in an array is a silent swap of two servos;
+//     a row misplaced across named fields does not compile.
+//   * Angles are radians about the model datum -- the same units `reachy-kin`
+//     and `reachy-motion` use, so nothing here converts.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::motion)]
+
+// One number per servo, in bus order. Positions, targets or errors, radians --
+// what the numbers mean is the field that carries this, not this.
+schema Joints
+{
+    uuid: 8ac1ca43-1e41-42c0-9806-ef41ba165023;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: Float64;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: Float64;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: Float64;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: Float64;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: Float64;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: Float64;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: Float64;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: Float64;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: Float64;
+    }
+}
+
+// One servo, or none.
+//
+// The vocabulary a field naming a single joint takes, so that "which joint" is a
+// name the compiler knows rather than a number a comment explains. `none` is a
+// value of the vocabulary and not a sentinel outside it: a report about the
+// machine as a whole names no joint, and a slot nothing wrote decodes to that
+// rather than to the body yaw.
+//
+// The numbers are one past the bus row: a Clockwork default carries the value
+// zero, `none` is the default, and the nine rows follow it in bus order. The
+// motion library's arrays number the same nine from zero, so the two numberings
+// are one offset apart; the offset is applied in exactly one place, `row` and
+// its inverse `joint_ref` in `crates/reachy-motion/src/joints.rs`, and pinned in
+// both directions by `cogs/motion_slot_test.rs`. A fault snapshot spells "no
+// joint" 255, which is that record's own sentinel rather than a second
+// numbering, and `cogs/motion_slots.rs` is where it is put on and taken off.
+enum JointRef
+{
+    uuid: a2bc4328-a051-422d-898d-3ed306ede2af;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No single servo: what a report about the whole machine names, and
+        // what a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Bus row 0: the body's yaw servo.
+        #1 body_yaw { underlying_value: 1; }
+        // Bus row 1: the first crank servo.
+        #2 leg_0 { underlying_value: 2; }
+        // Bus row 2: the second crank servo.
+        #3 leg_1 { underlying_value: 3; }
+        // Bus row 3: the third crank servo.
+        #4 leg_2 { underlying_value: 4; }
+        // Bus row 4: the fourth crank servo.
+        #5 leg_3 { underlying_value: 5; }
+        // Bus row 5: the fifth crank servo.
+        #6 leg_4 { underlying_value: 6; }
+        // Bus row 6: the sixth crank servo.
+        #7 leg_5 { underlying_value: 7; }
+        // Bus row 7: the right antenna.
+        #8 antenna_right { underlying_value: 8; }
+        // Bus row 8: the left antenna.
+        #9 antenna_left { underlying_value: 9; }
+    }
+}
+
+// A set of servos, one bit per bus row.
+//
+// Bit `n` is bus row `n`, which is the numbering the motion library's joint sets
+// and the wire format's masks both use, so a set crosses between them as the
+// number it already is. Values combine: two legs is a value of this type, not a
+// value outside it, which is why the generated membership predicate is no use
+// here -- it answers for the declared bits only. What refuses a bit above the
+// ninth is this declaration itself: validating a message carrying one of these
+// refuses an undeclared bit, so a set that reached a reader through a validated
+// view names bus rows and nothing else. `cogs/motion_slots.rs` spells the same
+// refusal for a set read by hand rather than through a message.
+enum JointFlags
+{
+    uuid: 274718d8-c081-410b-9849-5757dd628c9a;
+    options
+    {
+        underlying_type: UInt16;
+        bit_flags;
+    }
+    values
+    {
+        // No servo at all: the empty set, and what a slot nothing wrote holds.
+        #0 none default { underlying_value: 0; }
+        // Bus row 0: the body's yaw servo.
+        #1 body_yaw { underlying_value: 1; }
+        // Bus row 1: the first crank servo.
+        #2 leg_0 { underlying_value: 2; }
+        // Bus row 2: the second crank servo.
+        #3 leg_1 { underlying_value: 4; }
+        // Bus row 3: the third crank servo.
+        #4 leg_2 { underlying_value: 8; }
+        // Bus row 4: the fourth crank servo.
+        #5 leg_3 { underlying_value: 16; }
+        // Bus row 5: the fifth crank servo.
+        #6 leg_4 { underlying_value: 32; }
+        // Bus row 6: the sixth crank servo.
+        #7 leg_5 { underlying_value: 64; }
+        // Bus row 7: the right antenna.
+        #8 antenna_right { underlying_value: 128; }
+        // Bus row 8: the left antenna.
+        #9 antenna_left { underlying_value: 256; }
+    }
+}

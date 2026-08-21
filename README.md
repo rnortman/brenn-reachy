@@ -83,6 +83,40 @@ vocabularies — a joint and a register name on one side, an address and a count
 on the other — and it is typed against both. The property that matters survives
 the edge: `reachy-motion` still carries no I/O, no addresses and no counts.
 
+### Clockwork vocabulary, Clockwork runtime
+
+Clockwork **vocabulary** — the generated schema and enum crates, and
+`clockwork_rs` (no dependencies, no I/O, no clock) — may be depended on
+anywhere in this repo. Clockwork **runtime** — cog dials, channels, execution,
+generated entry points, anything that makes code *run as a cog* — appears only
+in `cogs/` compositions. The sans-I/O rule above is unchanged and still binding:
+a library takes time as a parameter, owns no ports, no sockets, no sleeps, and
+reads no clock. State that has to survive between executions lives in a schema,
+and a library reaches it the same way a cog does — by reference.
+
+Generated types come in two surfaces. The validated one carries the plain name
+(`FaultKind` is a real Rust enum, `CommissionSnap` a struct of plain fields over
+the slot's own bytes) and is what logic code speaks; the open one carries a
+`Wire` suffix and appears only at a wire boundary, where one
+`validate()`/`validate_mut()`/`clear_valid()` call per crossing narrows it and a
+failure is a typed refusal. Every module in the tree generates under that
+naming; a consumer still reading a slot through the open surface writes the
+`Wire` type and is ported to the validated view as its layer is reworked.
+
+A `.clk` module lives in a top-level package named for the component that writes
+or publishes its types — `motion/` for what `reachy-motion` writes, `driver/` for
+what the motor driver publishes and consumes, `cogs/` for what a cog writes —
+and consumers import from there. `geometry/` is the one
+exception, holding the mathematical carriage types no single component produces;
+its name is the whole licence for what may go in it. There is no central schema
+bucket: a path has to say what a module is about before a reader opens it. The
+directories are not the hyphenated crate directories because a module's `use`
+path and generated crate name are its path from the repo root verbatim.
+
+Within a package the knife cuts to minimise visibility, because visibility is
+recompilation: one `.clk` module per type or per tightly coupled set, so that a
+change to a sequencer's state does not rebuild the clip player.
+
 ## Status
 
 Implemented through the bench milestone: all five crates are functional and

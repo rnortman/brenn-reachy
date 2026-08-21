@@ -1,3 +1,4 @@
+load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
 # Rust crates for Clockwork's own `.clk` modules.
@@ -24,6 +25,12 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 # here, and the crate below is where their Rust types come from.
 # TODO(foreign-generic-instantiation-crate)
 #
+# `--validated-naming` is interpolated from the same constant `rust_clk_module`
+# defaults to, because a module re-derives an imported type's name under its own
+# policy: a dependency web split across policies fails at rustc in the consumer,
+# and this longhand invocation is the one site a search for the macro's keyword
+# would not find.
+#
 # `--root` is derived from the source's own path rather than written down: the
 # generator names a module by its path relative to the root it is given, and
 # the drop arrives under a canonical repository directory whose spelling Bazel
@@ -40,6 +47,7 @@ genrule(
           "--repo clockwork " +
           "--crate-name clockwork__clockwork__io__var_packet_clk_rs " +
           "--root $${src%/clockwork/io/var_packet.clk} " +
+          "--validated-naming %s " % VALIDATED_NAMING +
           "--rustfmt $(location @rules_rust//rust/toolchain:current_rustfmt_toolchain)",
     tools = [
         "@rules_rust//rust/toolchain:current_rustfmt_toolchain",

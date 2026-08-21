@@ -46,44 +46,28 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use thiserror::Error;
 
 use crate::joints::JointTargets;
-use crate::slot_enum::slot_enum;
+use crate::record;
+use crate::snap::{DurationError, PoseSnapshotError, duration_from_nanos, duration_nanos};
+use clockwork_rs::Duration as SlotDuration;
 
-slot_enum! {
-    /// How normalised time maps onto normalised progress.
-    ///
-    /// Zero is the shape a move gets when nobody said otherwise, which is why
-    /// this one numbering starts there rather than at one.
-    pub enum Warp: u8 {
-        encode: as_u8;
-        decode: from_u8;
-        refusal: "A number outside the two is not read as the default: a slot \
-                  holding one was written by something that does not agree with \
-                  this type about what shapes exist, and reading it as \
-                  minimum-jerk would restore a path that moves differently from \
-                  the one that was running.";
+/// How normalised time maps onto normalised progress.
+///
+/// The vocabulary's own enum, declared in `motion/tick_state.clk`. Zero is the
+/// shape a move gets when nobody said otherwise, which is why this one
+/// numbering starts there rather than at one: a move with no warp is not a
+/// thing, and minimum-jerk is what the head actually moves on, because the
+/// linkage's own compliance rings on a velocity step.
+pub use brenn_reachy__motion__tick_state_clk_rs::WarpKind;
 
-        /// Minimum-jerk: starts and ends at zero velocity *and* zero
-        /// acceleration. The default for anything the head does, because the
-        /// linkage's own compliance rings on a velocity step.
-        MinJerk = 0,
-        /// Constant rate. For test paths and for motion whose endpoints are
-        /// already at rest by construction.
-        Linear = 1,
-    }
-}
-
-impl Warp {
-    /// Progress at normalised time `u`, which the caller has already placed in
-    /// `[0, 1]`.
-    ///
-    /// `MinJerk` is `10u³ − 15u⁴ + 6u⁵`: the quintic with `s(0) = 0`,
-    /// `s(1) = 1` and both first and second derivatives zero at each end.
-    #[must_use]
-    fn progress(self, u: f64) -> f64 {
-        match self {
-            Warp::MinJerk => u * u * u * (10.0 + u * (6.0 * u - 15.0)),
-            Warp::Linear => u,
-        }
+/// Progress at normalised time `u`, which the caller has already placed in
+/// `[0, 1]`.
+///
+/// `MinJerk` is `10u³ − 15u⁴ + 6u⁵`: the quintic with `s(0) = 0`, `s(1) = 1` and
+/// both first and second derivatives zero at each end. `Linear` is `u`.
+fn progress(warp: WarpKind, u: f64) -> f64 {
+    match warp {
+        WarpKind::MinJerk => u * u * u * (10.0 + u * (6.0 * u - 15.0)),
+        WarpKind::Linear => u,
     }
 }
 
@@ -94,6 +78,11 @@ pub enum TrajectoryError {
     /// would divide by it.
     #[error("trajectory duration must be greater than zero")]
     NonPositiveDuration,
+    /// A clock longer than the count a state holds it in. Refused at
+    /// construction because the state a move runs in is the schema: a path
+    /// nobody could sit through is refused rather than stored short.
+    #[error("a trajectory clock is longer than a state can hold: {0}")]
+    UnstorableClock(#[from] DurationError),
     /// Some endpoint carries a non-finite number. Refused here rather than
     /// carried to the envelope check as a violation on every tick of a move
     /// that was never going to arrive.
@@ -179,7 +168,7 @@ pub struct Trajectory {
     target: JointTargets,
     head_s: f64,
     antennas_s: [f64; 2],
-    warp: Warp,
+    warp: WarpKind,
     /// The geodesic from the start orientation to the target one, as a rotation
     /// vector in the *start's* frame. Precomputed: it costs a square root and
     /// an inverse trigonometric call, and the sample path runs every tick.
@@ -198,7 +187,7 @@ impl Trajectory {
         start: &JointTargets,
         target: &JointTargets,
         durations: MoveDurations,
-        warp: Warp,
+        warp: WarpKind,
     ) -> Result<Self, TrajectoryError> {
         if durations.head.is_zero() || durations.antennas.iter().any(Duration::is_zero) {
             return Err(TrajectoryError::NonPositiveDuration);
@@ -206,17 +195,32 @@ impl Trajectory {
         if !start.is_finite() || !target.is_finite() {
             return Err(TrajectoryError::NonFinite);
         }
+        // Every clock is one a state can hold. Checked on the way in, before
+        // anything converts them, so a length of time no state could hold is
+        // refused rather than turned into seconds that no longer describe one.
+        duration_nanos(durations.head)?;
+        duration_nanos(durations.antennas[0])?;
+        duration_nanos(durations.antennas[1])?;
         // The relative rotation's scaled axis carries an angle in [0, π]: of
         // the two ways round the same pair of orientations, the shorter one.
         let relative = start.head_pose_body.rotation.inverse() * target.head_pose_body.rotation;
-        Ok(Self {
+        let path = Self {
             start: *start,
             target: *target,
             head_s: durations.head.as_secs_f64(),
             antennas_s: durations.antennas.map(|d| d.as_secs_f64()),
             warp,
             rotvec_rel: relative.scaled_axis(),
-        })
+        };
+        // And again on the clocks the path answers with, seconds and back
+        // again, so that writing a path into the state it runs in has nothing
+        // left to refuse: a clock that rounds up over the count's ceiling on
+        // the way through is one this path cannot be stored at.
+        let stored = path.durations();
+        duration_nanos(stored.head)?;
+        duration_nanos(stored.antennas[0])?;
+        duration_nanos(stored.antennas[1])?;
+        Ok(path)
     }
 
     /// The command set this path ends at.
@@ -242,7 +246,7 @@ impl Trajectory {
 
     /// The shape this path was built with.
     #[must_use]
-    pub fn warp(&self) -> Warp {
+    pub fn warp(&self) -> WarpKind {
         self.warp
     }
 
@@ -294,7 +298,7 @@ impl Trajectory {
     /// rounding in the division alone, and it is on elapsed time, never on a
     /// commanded quantity.
     fn progress(&self, secs: f64, duration_s: f64) -> f64 {
-        self.warp.progress((secs / duration_s).clamp(0.0, 1.0))
+        progress(self.warp, (secs / duration_s).clamp(0.0, 1.0))
     }
 }
 
@@ -306,9 +310,122 @@ fn lerp(a: f64, b: f64, s: f64) -> f64 {
     a + (b - a) * s
 }
 
+/// A command set as the schema holds one: a head pose and three scalars.
+pub use brenn_reachy__motion__targets_clk_rs::Targets;
+
+/// A running move as the schema holds one, and the boundary form of it.
+pub use brenn_reachy__motion__tick_state_clk_rs::{TrajectorySeed, TrajectorySeedWire};
+
+/// Why a seed's numbers describe no running move.
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+pub enum SeedError {
+    /// A head pose that is not one.
+    #[error("a command set in the seed is not one: {0}")]
+    Pose(#[from] PoseSnapshotError),
+    /// A clock that is not a length of time.
+    #[error("a clock in the seed is not one: {0}")]
+    Duration(#[from] DurationError),
+    /// Numbers that are a command set each and no path between them.
+    #[error("the seed is no path: {0}")]
+    Path(#[from] TrajectoryError),
+}
+
+/// Write a command set into the fields the schema holds one in.
+pub fn write_targets(out: &mut Targets, targets: &JointTargets) {
+    record::write_pose(
+        &mut out.head_pos,
+        &mut out.head_quat,
+        &targets.head_pose_body,
+    );
+    out.body_yaw = targets.body_yaw;
+    out.antenna_right = targets.antennas[0];
+    out.antenna_left = targets.antennas[1];
+}
+
+/// The command set those fields describe.
+///
+/// # Errors
+///
+/// [`PoseSnapshotError::NotARotation`] for a head pose that is not one — which
+/// is what a field nothing wrote holds, the zeroed quaternion being no rotation.
+pub fn targets_of(slot: &Targets) -> Result<JointTargets, PoseSnapshotError> {
+    Ok(JointTargets {
+        head_pose_body: record::read_pose(&slot.head_pos, &slot.head_quat)?,
+        body_yaw: slot.body_yaw,
+        antennas: [slot.antenna_right, slot.antenna_left],
+    })
+}
+
+/// Write the path a move runs, as the four values it is rebuilt from.
+///
+/// Total: a trajectory refuses a clock a state cannot hold at construction, so
+/// there is nothing left to refuse on the way out.
+pub fn write_seed(out: &mut TrajectorySeed, path: &Trajectory) {
+    let durations = path.durations();
+    write_targets(&mut out.start, path.start());
+    write_targets(&mut out.target, path.target());
+    out.dur_head = stored(durations.head);
+    out.dur_antenna_right = stored(durations.antennas[0]);
+    out.dur_antenna_left = stored(durations.antennas[1]);
+    out.warp = path.warp();
+    out.present = true.into();
+}
+
+/// A clock as the count a seed holds it in.
+///
+/// Structurally total: [`Trajectory::new`] refuses a clock past what the count
+/// reaches, so a path in hand has three that fit.
+fn stored(clock: Duration) -> SlotDuration {
+    SlotDuration::from_nanos(
+        duration_nanos(clock).expect("a trajectory's clocks are ones a state holds"),
+    )
+}
+
+/// Leave the fields holding no move at all.
+///
+/// The whole seed is written, not just the flag: a path from a move that ended
+/// is still a path, and a reader that trusted the flag alone would carry it.
+/// The declared initial state, taken from the schema rather than restated here:
+/// a fresh message cleared through the generated route, swapped in over what the
+/// slot held.
+pub fn clear_seed(out: &mut TrajectorySeed) {
+    let mut fresh = TrajectorySeedWire::new();
+    core::mem::swap(out, fresh.clear_valid());
+}
+
+/// The move those fields describe, or `None` where none is running.
+///
+/// The path is rebuilt rather than stored sample by sample: the seed fully
+/// determines it, so a move picked up out of a slot carries on along the same
+/// path it was on.
+///
+/// # Errors
+///
+/// [`SeedError`], for an endpoint that is not a command set, a clock that is
+/// not a length of time, or numbers that are no path.
+pub fn read_seed(slot: &TrajectorySeed) -> Result<Option<Trajectory>, SeedError> {
+    if !bool::from(slot.present) {
+        return Ok(None);
+    }
+    let durations = MoveDurations {
+        head: duration_from_nanos(slot.dur_head.as_nanos())?,
+        antennas: [
+            duration_from_nanos(slot.dur_antenna_right.as_nanos())?,
+            duration_from_nanos(slot.dur_antenna_left.as_nanos())?,
+        ],
+    };
+    Ok(Some(Trajectory::new(
+        &targets_of(&slot.start)?,
+        &targets_of(&slot.target)?,
+        durations,
+        slot.warp,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clockwork_rs::blob_as_bytes;
     use nalgebra::{Quaternion, Vector3};
     use reachy_kin::stow_head_pose;
 
@@ -318,30 +435,6 @@ mod tests {
 
     fn neutral() -> JointTargets {
         JointTargets::default()
-    }
-
-    /// The numbering over the whole `u8` domain. That `ALL` names both shapes
-    /// comes from `slot_enum!`, which emits the enum and the list together.
-    #[test]
-    fn the_warp_numbering_is_the_one_written_down() {
-        for warp in Warp::ALL {
-            let number = match warp {
-                Warp::MinJerk => 0,
-                Warp::Linear => 1,
-            };
-            assert_eq!(warp.as_u8(), number, "{warp:?}");
-        }
-        // The decoder against the literal numbers rather than against `ALL`:
-        // asserting it against the list it is defined over restates the
-        // definition and cannot fail.
-        for value in 0..=u8::MAX {
-            let named = match value {
-                0 => Some(Warp::MinJerk),
-                1 => Some(Warp::Linear),
-                _ => None,
-            };
-            assert_eq!(Warp::from_u8(value), named, "the number {value}");
-        }
     }
 
     fn stow() -> JointTargets {
@@ -371,7 +464,7 @@ mod tests {
     #[test]
     fn endpoint_is_bitwise_the_target() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), WarpKind::MinJerk)
             .expect("valid move");
         for t in [secs(2.0), secs(2.000_000_001), secs(60.0)] {
             let mut out = JointTargets::default();
@@ -386,7 +479,7 @@ mod tests {
     #[test]
     fn zero_time_reproduces_the_start() {
         let (a, b) = (neutral(), stow());
-        for warp in [Warp::MinJerk, Warp::Linear] {
+        for warp in WarpKind::VARIANTS {
             let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), warp)
                 .expect("valid move");
             let mut out = JointTargets::default();
@@ -401,7 +494,7 @@ mod tests {
     #[test]
     fn consecutive_moves_chain_without_a_step() {
         let (a, b) = (neutral(), stow());
-        let first = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+        let first = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), WarpKind::MinJerk)
             .expect("valid move");
         let mut landed = JointTargets::default();
         first.sample(secs(2.0), &mut landed);
@@ -410,7 +503,7 @@ mod tests {
             &landed,
             &a,
             MoveDurations::uniform(secs(1.5)),
-            Warp::MinJerk,
+            WarpKind::MinJerk,
         )
         .expect("valid move");
         let mut resumed = JointTargets::default();
@@ -438,7 +531,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                Trajectory::new(&a, &b, durations, Warp::MinJerk),
+                Trajectory::new(&a, &b, durations, WarpKind::MinJerk),
                 Err(TrajectoryError::NonPositiveDuration),
                 "{durations:?}"
             );
@@ -449,7 +542,7 @@ mod tests {
                 &a,
                 &b,
                 MoveDurations::uniform(Duration::from_nanos(1)),
-                Warp::MinJerk
+                WarpKind::MinJerk
             )
             .is_ok()
         );
@@ -477,7 +570,7 @@ mod tests {
                         &bad,
                         &good,
                         MoveDurations::uniform(secs(1.0)),
-                        Warp::MinJerk
+                        WarpKind::MinJerk
                     ),
                     Err(TrajectoryError::NonFinite),
                     "bad start with {bad_value}"
@@ -487,7 +580,7 @@ mod tests {
                         &good,
                         &bad,
                         MoveDurations::uniform(secs(1.0)),
-                        Warp::MinJerk
+                        WarpKind::MinJerk
                     ),
                     Err(TrajectoryError::NonFinite),
                     "bad target with {bad_value}"
@@ -500,16 +593,17 @@ mod tests {
     /// and leaves and arrives with zero velocity and zero acceleration.
     #[test]
     fn min_jerk_boundary_conditions() {
-        assert_eq!(Warp::MinJerk.progress(0.0), 0.0);
-        assert!((Warp::MinJerk.progress(1.0) - 1.0).abs() < 1e-15);
-        assert!((Warp::MinJerk.progress(0.5) - 0.5).abs() < 1e-15);
+        assert_eq!(progress(WarpKind::MinJerk, 0.0), 0.0);
+        assert!((progress(WarpKind::MinJerk, 1.0) - 1.0).abs() < 1e-15);
+        assert!((progress(WarpKind::MinJerk, 0.5) - 0.5).abs() < 1e-15);
 
         let h = 1e-4;
-        let d1 =
-            |u: f64| (Warp::MinJerk.progress(u + h) - Warp::MinJerk.progress(u - h)) / (2.0 * h);
+        let d1 = |u: f64| {
+            (progress(WarpKind::MinJerk, u + h) - progress(WarpKind::MinJerk, u - h)) / (2.0 * h)
+        };
         let d2 = |u: f64| {
-            (Warp::MinJerk.progress(u + h) - 2.0 * Warp::MinJerk.progress(u)
-                + Warp::MinJerk.progress(u - h))
+            (progress(WarpKind::MinJerk, u + h) - 2.0 * progress(WarpKind::MinJerk, u)
+                + progress(WarpKind::MinJerk, u - h))
                 / (h * h)
         };
         for end in [0.0, 1.0] {
@@ -525,16 +619,16 @@ mod tests {
     /// overshoots its endpoints or doubles back.
     #[test]
     fn warps_are_monotone_and_bounded() {
-        for warp in [Warp::MinJerk, Warp::Linear] {
+        for warp in WarpKind::VARIANTS {
             let mut previous = f64::NEG_INFINITY;
             for step in 0..=1000 {
                 let u = f64::from(step) / 1000.0;
-                let s = warp.progress(u);
+                let s = progress(warp, u);
                 assert!((0.0..=1.0).contains(&s), "{warp:?} at {u}: {s}");
                 assert!(s >= previous, "{warp:?} not monotone at {u}");
                 previous = s;
             }
-            assert!((warp.progress(1.0) - 1.0).abs() < 1e-15);
+            assert!((progress(warp, 1.0) - 1.0).abs() < 1e-15);
         }
     }
 
@@ -542,7 +636,7 @@ mod tests {
     fn linear_warp_is_the_identity() {
         for step in 0..=100 {
             let u = f64::from(step) / 100.0;
-            assert_eq!(Warp::Linear.progress(u), u);
+            assert_eq!(progress(WarpKind::Linear, u), u);
         }
     }
 
@@ -554,7 +648,7 @@ mod tests {
     #[test]
     fn one_warp_scalar_drives_every_component() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), WarpKind::MinJerk)
             .expect("valid move");
         let total_translation =
             (b.head_pose_body.translation.vector - a.head_pose_body.translation.vector).norm();
@@ -566,7 +660,7 @@ mod tests {
         for step in 1..20 {
             let t = 2.0 * f64::from(step) / 20.0;
             traj.sample(secs(t), &mut out);
-            let s = Warp::MinJerk.progress(t / 2.0);
+            let s = progress(WarpKind::MinJerk, t / 2.0);
 
             let done_translation = (out.head_pose_body.translation.vector
                 - a.head_pose_body.translation.vector)
@@ -604,7 +698,7 @@ mod tests {
         b.head_pose_body.rotation = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.5_f64)
             * UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.3_f64);
 
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), Warp::Linear)
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), WarpKind::Linear)
             .expect("valid move");
         let axis = (a.head_pose_body.rotation.inverse() * b.head_pose_body.rotation)
             .axis()
@@ -641,7 +735,7 @@ mod tests {
         b.head_pose_body.rotation =
             UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 350.0_f64.to_radians());
 
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), Warp::Linear)
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.0)), WarpKind::Linear)
             .expect("valid move");
         let mut out = JointTargets::default();
         traj.sample(secs(0.5), &mut out);
@@ -654,7 +748,7 @@ mod tests {
     #[test]
     fn sampling_overwrites_and_repeats_exactly() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), Warp::MinJerk)
+        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(2.0)), WarpKind::MinJerk)
             .expect("valid move");
 
         let mut fresh = JointTargets::default();
@@ -677,8 +771,13 @@ mod tests {
     #[test]
     fn done_agrees_with_the_endpoint_snap() {
         let (a, b) = (neutral(), stow());
-        let traj = Trajectory::new(&a, &b, MoveDurations::uniform(secs(1.25)), Warp::MinJerk)
-            .expect("valid move");
+        let traj = Trajectory::new(
+            &a,
+            &b,
+            MoveDurations::uniform(secs(1.25)),
+            WarpKind::MinJerk,
+        )
+        .expect("valid move");
         let mut out = JointTargets::default();
         for nanos in [0_u64, 1, 1_249_999_999, 1_250_000_000, 1_250_000_001] {
             let t = Duration::from_nanos(nanos);
@@ -697,12 +796,12 @@ mod tests {
             head: secs(3.5),
             antennas: [secs(1.25), secs(0.75)],
         };
-        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
+        let traj = Trajectory::new(&a, &b, durations, WarpKind::Linear).expect("valid move");
         assert_eq!(bits(traj.start()), bits(&a));
         assert_eq!(bits(traj.target()), bits(&b));
         assert_eq!(traj.durations(), durations);
         assert_eq!(traj.durations().longest(), secs(3.5));
-        assert_eq!(traj.warp(), Warp::Linear);
+        assert_eq!(traj.warp(), WarpKind::Linear);
     }
 
     /// The clocks are independent: at any sample the head group's progress is
@@ -712,7 +811,7 @@ mod tests {
     fn group_clocks_run_independently() {
         let (a, b) = (neutral(), stow());
         let durations = MoveDurations::split(secs(1.0), secs(4.0));
-        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
+        let traj = Trajectory::new(&a, &b, durations, WarpKind::Linear).expect("valid move");
 
         let mut out = JointTargets::default();
         for step in 1..10 {
@@ -737,7 +836,7 @@ mod tests {
     fn the_short_group_waits_at_its_target() {
         let (a, b) = (neutral(), stow());
         let durations = MoveDurations::split(secs(1.0), secs(4.0));
-        let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, durations, WarpKind::MinJerk).expect("valid move");
 
         let mut out = JointTargets::default();
         for t in [secs(1.0), secs(2.0), secs(3.9)] {
@@ -766,7 +865,7 @@ mod tests {
     fn either_group_may_be_the_shorter_one() {
         let (a, b) = (neutral(), stow());
         let durations = MoveDurations::split(secs(3.0), secs(0.5));
-        let traj = Trajectory::new(&a, &b, durations, Warp::MinJerk).expect("valid move");
+        let traj = Trajectory::new(&a, &b, durations, WarpKind::MinJerk).expect("valid move");
 
         let mut out = JointTargets::default();
         traj.sample(secs(1.0), &mut out);
@@ -792,7 +891,7 @@ mod tests {
             head: secs(1.0),
             antennas: [secs(0.8), secs(0.7)],
         };
-        let traj = Trajectory::new(&a, &b, durations, Warp::Linear).expect("valid move");
+        let traj = Trajectory::new(&a, &b, durations, WarpKind::Linear).expect("valid move");
 
         let mut out = JointTargets::default();
         for step in 1..7 {
@@ -853,6 +952,90 @@ mod tests {
         );
     }
 
+    /// A clock longer than the count a state holds it in is refused at
+    /// construction, on whichever of the three carries it.
+    ///
+    /// This refusal is what makes writing a path into a state total: the seed's
+    /// three counts are written without a check, on the strength of a path in
+    /// hand having three clocks that fit.
+    #[test]
+    fn a_clock_no_state_can_hold_is_refused() {
+        // Past the 292 years a signed nanosecond count reaches, and past what
+        // the same length of time rounds to going through seconds and back.
+        let unstorable = Duration::from_secs(1 << 40);
+        let ordinary = secs(2.0);
+        let cases = [
+            MoveDurations {
+                head: unstorable,
+                antennas: [ordinary; 2],
+            },
+            MoveDurations {
+                head: ordinary,
+                antennas: [unstorable, ordinary],
+            },
+            MoveDurations {
+                head: ordinary,
+                antennas: [ordinary, unstorable],
+            },
+        ];
+        for durations in cases {
+            assert_eq!(
+                Trajectory::new(&neutral(), &stow(), durations, WarpKind::MinJerk),
+                Err(TrajectoryError::UnstorableClock(DurationError::TooLong(
+                    unstorable
+                ))),
+                "{durations:?}"
+            );
+        }
+
+        // A clock the count holds comfortably builds, and survives the trip
+        // through the slot it is stored in.
+        let long = MoveDurations::uniform(Duration::from_secs(1 << 32));
+        let path = Trajectory::new(&neutral(), &stow(), long, WarpKind::MinJerk)
+            .expect("a clock the count holds");
+        let mut slot = TrajectorySeedWire::new();
+        write_seed(slot.clear_valid(), &path);
+        assert_eq!(
+            read_seed(slot.validate().expect("the seed validates")),
+            Ok(Some(path))
+        );
+    }
+
+    /// A cleared seed is a fresh one, not a live one with its flag down: a path
+    /// from a move that ended is still a path, and a reader that trusted the
+    /// flag alone would carry it.
+    #[test]
+    fn a_cleared_seed_keeps_no_trace_of_the_move_that_ended() {
+        let mut slot = TrajectorySeedWire::new();
+        let path = Trajectory::new(
+            &neutral(),
+            &stow(),
+            MoveDurations {
+                head: secs(2.0),
+                antennas: [secs(1.0), secs(3.0)],
+            },
+            WarpKind::Linear,
+        )
+        .expect("the fixture shapes");
+        write_seed(slot.clear_valid(), &path);
+        assert_ne!(
+            blob_as_bytes(&slot),
+            blob_as_bytes(&TrajectorySeedWire::new()),
+            "the fixture never wrote a move"
+        );
+
+        clear_seed(slot.validate_mut().expect("the seed validates"));
+        assert_eq!(
+            blob_as_bytes(&slot),
+            blob_as_bytes(&TrajectorySeedWire::new()),
+            "the ended move is still in the slot"
+        );
+        assert_eq!(
+            read_seed(slot.validate().expect("a cleared seed validates")),
+            Ok(None)
+        );
+    }
+
     /// Each side resolves its clock independently, and a side that states
     /// nothing takes the shared clock, then the head's.
     ///
@@ -892,6 +1075,38 @@ mod tests {
                 head,
                 antennas: [secs(1.5), secs(0.3)],
             }
+        );
+    }
+
+    /// A command set is carried into the fields the schema holds one in and
+    /// comes back whole: the head pose bit for bit, the yaw and both antennas
+    /// on their own fields.
+    #[test]
+    fn a_command_set_survives_the_fields_it_is_held_in() {
+        let targets = JointTargets {
+            head_pose_body: Isometry3::from_parts(
+                nalgebra::Translation3::new(0.011, -0.023, 0.157),
+                nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(
+                    0.31, -0.17, 0.09,
+                )),
+            ),
+            body_yaw: -0.41,
+            antennas: [1.23, -1.24],
+        };
+        let mut wire = brenn_reachy__motion__targets_clk_rs::TargetsWire::new();
+        let slot = wire.clear_valid();
+        write_targets(slot, &targets);
+
+        let back = targets_of(slot).expect("a written command set is one");
+        assert_eq!(back.body_yaw, targets.body_yaw);
+        assert_eq!(back.antennas, targets.antennas);
+        assert_eq!(
+            back.head_pose_body.translation.vector.as_slice(),
+            targets.head_pose_body.translation.vector.as_slice()
+        );
+        assert_eq!(
+            back.head_pose_body.rotation.as_ref().coords.as_slice(),
+            targets.head_pose_body.rotation.as_ref().coords.as_slice()
         );
     }
 }

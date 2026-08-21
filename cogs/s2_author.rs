@@ -12,8 +12,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__msgs_clk_rs::JointFlags;
-use scenario::author::{self, ALL_ROWS, InputLog};
+use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s2_scenario::{
@@ -34,20 +34,20 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
 
     let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, ALL_ROWS)?;
+    log.torque_on(engage, author::all_rows())?;
     log.schedule(engage, true, ENGAGED_EPOCH, &steps())?;
 
     // The jam. A jammed servo on this machine holds where it stands, which is
     // what the modelled plant does with an obstructed row: the scenario is not
     // asking what a servo does when something pushes back, it is asking what
     // the control loop does about a joint that stopped arriving.
-    let jammed = JointFlags(jammed_rows().bits());
+    let jammed = JointFlagsWire::from(jammed_rows());
     log.obstruct(cycle_at(OBSTRUCT_CYCLE), jammed)?;
     log.release(cycle_at(RELEASE_CYCLE), jammed)?;
 
     let disengage = cycle_at(DISENGAGE_CYCLE);
     log.schedule(disengage, false, DISENGAGED_EPOCH, &[])?;
-    log.torque_off(disengage, ALL_ROWS)?;
+    log.torque_off(disengage, author::all_rows())?;
 
     log.close()
 }

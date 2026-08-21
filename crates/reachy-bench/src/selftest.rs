@@ -32,15 +32,18 @@ use thiserror::Error;
 
 use dxl_proto::conv::COUNTS_PER_REV;
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
-use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, reg_for, with_retry};
+use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, with_retry};
 use reachy_kin::{
     FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose, stow_head_pose,
 };
+use reachy_motion::joints::{ROW_COUNT, ROWS, group_of};
+use reachy_motion::reg::{self, Name as RegName};
 use reachy_motion::{
-    ArmRecord, EXPECTED_MODELS, JointGroup, JointId, JointVector, ProvisionExpect, ProvisionTable,
-    RegId, RegValue, VENDOR_HOMING_OFFSETS,
+    ArmRecord, EXPECTED_MODELS, JointGroup, JointVector, ProvisionExpect, ProvisionTable, RegId,
+    Shown, VENDOR_HOMING_OFFSETS, Value,
 };
 
+use crate::bare;
 use crate::config::{BenchConfig, ConfigError, DatumSetting, positive};
 
 /// What a case decided.
@@ -266,8 +269,8 @@ fn first_not_passed(cases: &[CaseResult]) -> Option<(Case, Outcome)> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Report {
     results: Vec<CaseResult>,
-    rest_counts: Option<[i32; JointId::COUNT]>,
-    models: Option<[u16; JointId::COUNT]>,
+    rest_counts: Option<[i32; ROW_COUNT]>,
+    models: Option<[u16; ROW_COUNT]>,
     datum: Option<DatumRecord>,
 }
 
@@ -302,12 +305,12 @@ impl Report {
     }
 
     /// The resting position readings, as counts in bus order.
-    pub fn set_rest_counts(&mut self, counts: [i32; JointId::COUNT]) {
+    pub fn set_rest_counts(&mut self, counts: [i32; ROW_COUNT]) {
         self.rest_counts = Some(counts);
     }
 
     /// The model numbers, in bus order.
-    pub fn set_models(&mut self, models: [u16; JointId::COUNT]) {
+    pub fn set_models(&mut self, models: [u16; ROW_COUNT]) {
         self.models = Some(models);
     }
 
@@ -349,13 +352,13 @@ pub struct DatumRecord {
     pub crank_datum: DatumSetting,
     /// The nine homing offset registers as read, counts in bus order — the
     /// evidence the datum rests on.
-    pub homing_offsets: [i32; JointId::COUNT],
+    pub homing_offsets: [i32; ROW_COUNT],
 }
 
 impl DatumRecord {
     /// Record the datum the observed offsets establish.
     #[must_use]
-    pub fn new(crank_datum: DatumSetting, homing_offsets: [i32; JointId::COUNT]) -> Self {
+    pub fn new(crank_datum: DatumSetting, homing_offsets: [i32; ROW_COUNT]) -> Self {
         Self {
             crank_datum,
             homing_offsets,
@@ -376,11 +379,11 @@ pub struct SelftestRecord {
     pub taken_at_unix: u64,
     /// The resting position readings, counts in bus order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rest_counts: Option<[i32; JointId::COUNT]>,
+    pub rest_counts: Option<[i32; ROW_COUNT]>,
     /// The model numbers, bus order — recorded for human review before any
     /// expected value is baked into the identity case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<[u16; JointId::COUNT]>,
+    pub models: Option<[u16; ROW_COUNT]>,
     /// What the datum case read, present only when the offsets matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datum: Option<DatumRecord>,
@@ -522,7 +525,7 @@ pub fn margin_verdict(min_margin: f64, floor: Option<f64>, detail: &str) -> Case
 #[derive(Clone, Debug)]
 pub struct Registry {
     device: String,
-    ids: [u8; JointId::COUNT],
+    ids: [u8; ROW_COUNT],
     timing: BusTiming,
     map: ServoMap,
     expected: ProvisionTable,
@@ -691,11 +694,11 @@ impl Registry {
         let mut wrong = Vec::new();
         let mut readings = Vec::new();
 
-        for reg in RegId::ALL {
+        for reg in reg::named() {
             let Some(column) = ProvisionTable::column(reg) else {
                 continue;
             };
-            let mut row_values = Vec::with_capacity(JointId::COUNT);
+            let mut row_values = Vec::with_capacity(ROW_COUNT);
             let mut read_any = false;
             for (row, id) in self.ids.iter().enumerate() {
                 let expect = self.expected.at(row, column).unwrap_or_default();
@@ -711,13 +714,16 @@ impl Registry {
                     }
                 };
                 read_any = true;
-                row_values.push(value.to_string());
+                row_values.push(Shown(value).to_string());
                 match expect {
                     ProvisionExpect::Check(expected) => {
                         checked += 1;
                         if value != expected {
                             wrong.push(format!(
-                                "servo {id} {reg}: expected {expected}, read {value}"
+                                "servo {id} {}: expected {}, read {}",
+                                RegName(reg),
+                                Shown(expected),
+                                Shown(value)
                             ));
                         }
                     }
@@ -726,7 +732,7 @@ impl Registry {
                 }
             }
             if read_any {
-                readings.push(format!("{reg} [{}]", row_values.join(" ")));
+                readings.push(format!("{} [{}]", RegName(reg), row_values.join(" ")));
             }
         }
 
@@ -820,7 +826,7 @@ impl Registry {
         &self,
         bus: &mut Bus<P>,
         report: &mut Report,
-    ) -> Option<[i32; JointId::COUNT]> {
+    ) -> Option<[i32; ROW_COUNT]> {
         let counts = match self.sweep_i32(bus, RegId::PresentPosition) {
             Ok(counts) => counts,
             Err(detail) => {
@@ -880,7 +886,7 @@ impl Registry {
             }
         };
 
-        let mut readings = Vec::with_capacity(JointId::COUNT);
+        let mut readings = Vec::with_capacity(ROW_COUNT);
         let mut wrong = Vec::new();
         let mut holding = 0usize;
         for (row, id) in self.ids.iter().enumerate() {
@@ -917,7 +923,7 @@ impl Registry {
 
         let detail = format!(
             "{} limp, {holding} holding torque and exempt, against a {:.3} deg tolerance: {}",
-            JointId::COUNT - holding,
+            ROW_COUNT - holding,
             self.goal_shadow_tolerance.to_degrees(),
             readings.join("; ")
         );
@@ -995,11 +1001,11 @@ impl Registry {
     /// it is a person's to look at: the count frame is the datum every antenna
     /// command is planned in, and a bound widened to admit an unfolded reading
     /// would launder the anomaly into accepted behaviour.
-    fn antenna_fold(&self, counts: &[i32; JointId::COUNT], report: &mut Report) {
+    fn antenna_fold(&self, counts: &[i32; ROW_COUNT], report: &mut Report) {
         let mut readings = Vec::new();
         let mut unfolded = Vec::new();
-        for (row, joint) in JointId::ALL.into_iter().enumerate() {
-            if joint.group() != JointGroup::Antennas {
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            if group_of(joint) != Some(JointGroup::Antennas) {
                 continue;
             }
             let (id, count) = (self.ids[row], counts[row]);
@@ -1029,11 +1035,11 @@ impl Registry {
 
     /// The clearance the resting pose leaves from the linkage's singular
     /// configurations.
-    fn rest_margins(&self, counts: &[i32; JointId::COUNT], report: &mut Report) {
+    fn rest_margins(&self, counts: &[i32; ROW_COUNT], report: &mut Report) {
         let mut joints = JointVector::default();
         // The joint layout is asked for rather than restated: each reading is
         // filed against the joint that bus row belongs to.
-        for (row, (id, count)) in JointId::ALL.into_iter().zip(counts.iter()).enumerate() {
+        for (row, (id, count)) in ROWS.into_iter().zip(counts.iter()).enumerate() {
             let angle = match self.map.present_rad(row, *count) {
                 Ok(angle) => angle,
                 Err(error) => {
@@ -1071,17 +1077,17 @@ impl Registry {
     }
 
     /// One register from one servo, as its engineering value.
+    ///
+    /// The read itself is `bare`'s, so the crate has one answer to "read one
+    /// register from one servo"; what is added here is the string a report
+    /// carries, which is this module's own boundary.
     fn read_value<P: BusPort>(
         &self,
         bus: &mut Bus<P>,
         row: usize,
         reg: RegId,
-    ) -> Result<RegValue, String> {
-        let raw = self.read_raw(bus, row, reg)?;
-        let id = self.ids[row];
-        self.map
-            .decode_value(row, reg, &raw)
-            .map_err(|error| format!("servo {id} {reg}: {error}"))
+    ) -> Result<Value, String> {
+        bare::read_value(bus, &self.map, row, reg).map_err(|error| error.to_string())
     }
 
     /// One register from one servo, as the bytes it holds.
@@ -1091,10 +1097,7 @@ impl Registry {
         row: usize,
         reg: RegId,
     ) -> Result<RawValue, String> {
-        let id = self.ids[row];
-        let entry = reg_for(reg);
-        with_retry(bus, |bus| bus.read_reg(id, entry))
-            .map_err(|error| format!("servo {id} {reg}: {error}"))
+        bare::read_raw(bus, &self.map, row, reg).map_err(|error| error.to_string())
     }
 
     /// One register from all nine servos, taken apart by `extract`.
@@ -1107,8 +1110,8 @@ impl Registry {
         bus: &mut Bus<P>,
         reg: RegId,
         extract: impl Fn(&RawValue) -> Option<T>,
-    ) -> Result<[T; JointId::COUNT], String> {
-        let mut out = [T::default(); JointId::COUNT];
+    ) -> Result<[T; ROW_COUNT], String> {
+        let mut out = [T::default(); ROW_COUNT];
         for (row, slot) in out.iter_mut().enumerate() {
             let raw = self.read_raw(bus, row, reg)?;
             *slot = extract(&raw).ok_or_else(|| self.width_detail(row, reg, &raw))?;
@@ -1121,7 +1124,7 @@ impl Registry {
         &self,
         bus: &mut Bus<P>,
         reg: RegId,
-    ) -> Result<[u8; JointId::COUNT], String> {
+    ) -> Result<[u8; ROW_COUNT], String> {
         self.sweep(bus, reg, RawValue::u8)
     }
 
@@ -1130,7 +1133,7 @@ impl Registry {
         &self,
         bus: &mut Bus<P>,
         reg: RegId,
-    ) -> Result<[u16; JointId::COUNT], String> {
+    ) -> Result<[u16; ROW_COUNT], String> {
         self.sweep(bus, reg, RawValue::u16)
     }
 
@@ -1139,7 +1142,7 @@ impl Registry {
         &self,
         bus: &mut Bus<P>,
         reg: RegId,
-    ) -> Result<[i32; JointId::COUNT], String> {
+    ) -> Result<[i32; ROW_COUNT], String> {
         self.sweep(bus, reg, RawValue::i32)
     }
 
@@ -1148,8 +1151,9 @@ impl Registry {
     /// than assumed away because the case's job is saying what it saw.
     fn width_detail(&self, row: usize, reg: RegId, raw: &RawValue) -> String {
         format!(
-            "servo {} {reg}: {} bytes are not the width this register reads as",
+            "servo {} {}: {} bytes are not the width this register reads as",
             self.ids[row],
+            RegName(reg),
             raw.len()
         )
     }
@@ -1169,8 +1173,11 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod runner_tests {
     use dxl_proto::frame::{INST_PING, INST_READ};
+    use reachy_motion::joints::{Name, leg_index};
 
     use super::*;
+    use reachy_bus::named_reg;
+
     use crate::testutil::{FakeMachine, Spy, machine_at, rest_legs, stow_legs, undatumed_config};
 
     /// A run of the registry against a machine, with the port already open, and
@@ -1329,8 +1336,8 @@ mod runner_tests {
         let mut machine = machine_at(&cfg, &stow_legs());
         // Operating mode 0 on one servo: the reading that voids the servo-side
         // position envelope.
-        machine.set(13, reg_for(RegId::OperatingMode), &[0]);
-        machine.set(16, reg_for(RegId::TemperatureLimit), &[95]);
+        machine.set(13, named_reg(RegId::OperatingMode), &[0]);
+        machine.set(16, named_reg(RegId::TemperatureLimit), &[95]);
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
@@ -1341,6 +1348,27 @@ mod runner_tests {
         // not a reason to stop reading.
         assert_eq!(report.outcome(Case::Voltage), Outcome::Pass);
         assert_eq!(report.outcome(Case::Health), Outcome::Pass);
+    }
+
+    /// A register a servo will not answer at all fails the sweep with the servo
+    /// and the register in the text an operator reads.
+    ///
+    /// The read itself is `bare`'s and the string is this module's: what a
+    /// failure prints comes from `BareError`'s own rendering, so the servo
+    /// and the register have to survive that hand-off.
+    #[test]
+    fn a_register_a_servo_will_not_answer_fails_the_sweep_by_servo_and_register() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine
+            .mute
+            .insert((13, named_reg(RegId::OperatingMode).addr), u32::MAX);
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("servo 13"), "{printed}");
+        assert!(printed.contains("operating mode"), "{printed}");
     }
 
     /// An antenna still in single-turn position mode fails the sweep by name.
@@ -1354,7 +1382,7 @@ mod runner_tests {
     fn an_antenna_in_single_turn_mode_fails_the_sweep_by_name() {
         let cfg = undatumed_config();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(17, reg_for(RegId::OperatingMode), &[3]);
+        machine.set(17, named_reg(RegId::OperatingMode), &[3]);
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
@@ -1378,7 +1406,7 @@ mod runner_tests {
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             15,
-            reg_for(RegId::PresentInputVoltage),
+            named_reg(RegId::PresentInputVoltage),
             &45u16.to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
@@ -1397,13 +1425,13 @@ mod runner_tests {
         let legs = stow_legs();
 
         let mut voltage_only = machine_at(&cfg, &legs);
-        voltage_only.set(11, reg_for(RegId::HardwareErrorStatus), &[0x01]);
+        voltage_only.set(11, named_reg(RegId::HardwareErrorStatus), &[0x01]);
         let (report, _) = run(&cfg, voltage_only);
         assert_eq!(report.outcome(Case::Health), Outcome::Pass);
         assert!(report.to_string().contains("0x01"), "the byte is reported");
 
         let mut overload = machine_at(&cfg, &legs);
-        overload.set(11, reg_for(RegId::HardwareErrorStatus), &[0x20]);
+        overload.set(11, named_reg(RegId::HardwareErrorStatus), &[0x20]);
         let (report, _) = run(&cfg, overload);
         assert_eq!(report.outcome(Case::Health), Outcome::Fail);
         assert!(
@@ -1421,7 +1449,7 @@ mod runner_tests {
         // The right antenna answering as one of the legs.
         machine.set(
             17,
-            reg_for(RegId::ModelNumber),
+            named_reg(RegId::ModelNumber),
             &EXPECTED_MODELS[1].to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
@@ -1455,7 +1483,7 @@ mod runner_tests {
     fn a_servo_without_its_vendor_homing_offset_fails_the_datum_case() {
         let cfg = undatumed_config();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(13, reg_for(RegId::HomingOffset), &0i32.to_le_bytes());
+        machine.set(13, named_reg(RegId::HomingOffset), &0i32.to_le_bytes());
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::Datum), Outcome::Fail);
@@ -1488,7 +1516,11 @@ mod runner_tests {
     fn an_antenna_outside_its_turn_fails_the_fold_case_by_name() {
         let cfg = undatumed_config();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(17, reg_for(RegId::PresentPosition), &8250i32.to_le_bytes());
+        machine.set(
+            17,
+            named_reg(RegId::PresentPosition),
+            &8250i32.to_le_bytes(),
+        );
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::AntennaFold), Outcome::Fail);
@@ -1515,7 +1547,11 @@ mod runner_tests {
     fn the_fold_case_judges_only_the_antennas() {
         let cfg = undatumed_config();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(13, reg_for(RegId::PresentPosition), &9000i32.to_le_bytes());
+        machine.set(
+            13,
+            named_reg(RegId::PresentPosition),
+            &9000i32.to_le_bytes(),
+        );
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::AntennaFold), Outcome::Pass);
@@ -1550,7 +1586,7 @@ mod runner_tests {
         ] {
             let cfg = undatumed_config();
             let mut machine = machine_at(&cfg, &stow_legs());
-            machine.set(17, reg_for(RegId::PresentPosition), &count.to_le_bytes());
+            machine.set(17, named_reg(RegId::PresentPosition), &count.to_le_bytes());
             let (report, _) = run(&cfg, machine);
 
             assert_eq!(
@@ -1567,10 +1603,14 @@ mod runner_tests {
     fn two_unfolded_antennas_are_both_named_on_one_line() {
         let cfg = undatumed_config();
         let mut machine = machine_at(&cfg, &stow_legs());
-        machine.set(17, reg_for(RegId::PresentPosition), &6000i32.to_le_bytes());
+        machine.set(
+            17,
+            named_reg(RegId::PresentPosition),
+            &6000i32.to_le_bytes(),
+        );
         machine.set(
             18,
-            reg_for(RegId::PresentPosition),
+            named_reg(RegId::PresentPosition),
             &(-100i32).to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
@@ -1622,14 +1662,14 @@ mod runner_tests {
         machine.unmirrored = vec![14];
         let resting = i32::from_le_bytes(
             machine
-                .get(14, reg_for(RegId::PresentPosition))
+                .get(14, named_reg(RegId::PresentPosition))
                 .expect("the fixture rests somewhere")
                 .try_into()
                 .expect("a position is four bytes"),
         );
         machine.set(
             14,
-            reg_for(RegId::GoalPosition),
+            named_reg(RegId::GoalPosition),
             &(resting + 200).to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
@@ -1658,15 +1698,15 @@ mod runner_tests {
         let mut machine = machine_at(&cfg, &stow_legs());
         let resting = i32::from_le_bytes(
             machine
-                .get(14, reg_for(RegId::PresentPosition))
+                .get(14, named_reg(RegId::PresentPosition))
                 .expect("the fixture rests somewhere")
                 .try_into()
                 .expect("a position is four bytes"),
         );
-        machine.set(14, reg_for(RegId::TorqueEnable), &[1]);
+        machine.set(14, named_reg(RegId::TorqueEnable), &[1]);
         machine.set(
             14,
-            reg_for(RegId::GoalPosition),
+            named_reg(RegId::GoalPosition),
             &(resting + 200).to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
@@ -1701,7 +1741,7 @@ mod runner_tests {
             let asked = |reg: RegId| {
                 reads
                     .iter()
-                    .filter(|(servo, addr)| *servo == id && *addr == reg_for(reg).addr)
+                    .filter(|(servo, addr)| *servo == id && *addr == named_reg(reg).addr)
                     .count()
             };
             // Torque state and goal are read once each, by this case and nothing
@@ -1749,7 +1789,7 @@ mod runner_tests {
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .errors
-            .insert((14, reg_for(RegId::PresentPosition).addr), 7);
+            .insert((14, named_reg(RegId::PresentPosition).addr), 7);
         let (report, _) = run(&cfg, machine);
 
         assert_eq!(report.outcome(Case::RestPose), Outcome::Fail);
@@ -1820,10 +1860,10 @@ mod runner_tests {
     #[test]
     fn the_vendor_offsets_are_alternating_quarter_turns_on_the_legs_alone() {
         let quarter_turn = dxl_proto::conv::COUNTS_PER_REV / 4;
-        for (row, joint) in JointId::ALL.into_iter().enumerate() {
+        for (row, joint) in ROWS.into_iter().enumerate() {
             let offset = VENDOR_HOMING_OFFSETS[row];
-            match joint {
-                JointId::Leg(leg) => {
+            match leg_index(joint) {
+                Some(leg) => {
                     assert_eq!(offset.abs(), quarter_turn, "leg {}", leg + 1);
                     assert_eq!(
                         offset > 0,
@@ -1832,7 +1872,7 @@ mod runner_tests {
                         leg + 1
                     );
                 }
-                _ => assert_eq!(offset, 0, "{joint} is a single-turn joint"),
+                None => assert_eq!(offset, 0, "{} is a single-turn joint", Name(joint)),
             }
         }
     }
@@ -1848,7 +1888,7 @@ mod tests {
         for case in Case::ALL {
             report.push(CaseResult::pass(case, "as expected"));
         }
-        report.set_rest_counts([2048; JointId::COUNT]);
+        report.set_rest_counts([2048; ROW_COUNT]);
         report.set_models([1200, 1200, 1200, 1200, 1200, 1200, 1200, 1020, 1020]);
         report.set_datum(DatumRecord::new(
             DatumSetting::Direct,

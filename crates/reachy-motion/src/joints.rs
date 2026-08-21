@@ -1,5 +1,5 @@
-//! The two command vectors, the names of the nine joints, and a servo's health
-//! byte.
+//! The two command vectors, the helpers over the joint vocabulary, and a
+//! servo's health byte.
 //!
 //! Two views of the same machine, and the tick's whole job is turning one into
 //! the other:
@@ -20,9 +20,23 @@
 //! mean once the configured datum has been applied. Counts, registers and the
 //! datum itself live below this crate.
 //!
-//! [`ServoHealth`] is here for the same reason the joint names are: it is
+//! [`ServoHealth`] is here for the same reason the joint helpers are: it is
 //! shared between tick and arming rather than owned by either.
+//!
+//! One servo is the vocabulary's [`JointRef`] and a set of them is its
+//! `JointFlags`, and nothing else. What this module adds is what the generator
+//! does not emit: [`row`] and [`joint_ref`], which carry the one offset between
+//! the vocabulary's numbering and the bus rows the arrays here are indexed by,
+//! [`group_of`] and [`Name`], the [`flags`] module's membership
+//! operations — the only code that knows which bit is which bus row — and
+//! [`angle_of`]/[`set_angle`] and their row-array pair, which address the
+//! schema's own nine-angle vector by joint rather than by field order.
 
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
+/// Which servo a report, a fault or a slot names — the vocabulary's own enum,
+/// re-exported so a consumer takes the name and the helpers below from one
+/// path.
+pub use brenn_reachy__motion__joints_clk_rs::JointRef;
 use nalgebra::Isometry3;
 use reachy_kin::neutral_head_pose;
 
@@ -43,31 +57,35 @@ pub struct JointVector {
 }
 
 impl JointVector {
-    /// The angle at `id`, or `None` for a leg index past the sixth.
+    /// The angle at `id`, or `None` if `id` names no servo.
     #[must_use]
-    pub fn get(&self, id: JointId) -> Option<f64> {
+    pub fn get(&self, id: JointRef) -> Option<f64> {
         match id {
-            JointId::BodyYaw => Some(self.body_yaw),
-            JointId::Leg(leg) => self.legs.get(usize::from(leg)).copied(),
-            JointId::AntennaRight => Some(self.antennas[0]),
-            JointId::AntennaLeft => Some(self.antennas[1]),
+            JointRef::None => None,
+            JointRef::BodyYaw => Some(self.body_yaw),
+            JointRef::AntennaRight => Some(self.antennas[0]),
+            JointRef::AntennaLeft => Some(self.antennas[1]),
+            crank => self.legs.get(usize::from(leg_index(crank)?)).copied(),
         }
     }
 
-    /// Set the angle at `id`, reporting `false` — and changing nothing — for a
-    /// leg index past the sixth.
+    /// Set the angle at `id`, reporting `false` — and changing nothing — if
+    /// `id` names no servo.
     ///
     /// The mirror of [`Self::get`], for filling a vector one servo's answer at a
     /// time as the reads come back.
-    pub fn set(&mut self, id: JointId, angle: f64) -> bool {
+    pub fn set(&mut self, id: JointRef, angle: f64) -> bool {
         match id {
-            JointId::BodyYaw => self.body_yaw = angle,
-            JointId::Leg(leg) => match self.legs.get_mut(usize::from(leg)) {
-                Some(slot) => *slot = angle,
-                None => return false,
-            },
-            JointId::AntennaRight => self.antennas[0] = angle,
-            JointId::AntennaLeft => self.antennas[1] = angle,
+            JointRef::None => return false,
+            JointRef::BodyYaw => self.body_yaw = angle,
+            JointRef::AntennaRight => self.antennas[0] = angle,
+            JointRef::AntennaLeft => self.antennas[1] = angle,
+            JointRef::Leg0 => self.legs[0] = angle,
+            JointRef::Leg1 => self.legs[1] = angle,
+            JointRef::Leg2 => self.legs[2] = angle,
+            JointRef::Leg3 => self.legs[3] = angle,
+            JointRef::Leg4 => self.legs[4] = angle,
+            JointRef::Leg5 => self.legs[5] = angle,
         }
         true
     }
@@ -77,17 +95,17 @@ impl JointVector {
     /// A single pass over all nine joints ensures no joint is checked by one
     /// guard and missed by another. Fixed size, so nothing allocates.
     #[must_use]
-    pub fn joints(&self) -> [(JointId, f64); JointId::COUNT] {
+    pub fn joints(&self) -> [(JointRef, f64); ROW_COUNT] {
         [
-            (JointId::BodyYaw, self.body_yaw),
-            (JointId::Leg(0), self.legs[0]),
-            (JointId::Leg(1), self.legs[1]),
-            (JointId::Leg(2), self.legs[2]),
-            (JointId::Leg(3), self.legs[3]),
-            (JointId::Leg(4), self.legs[4]),
-            (JointId::Leg(5), self.legs[5]),
-            (JointId::AntennaRight, self.antennas[0]),
-            (JointId::AntennaLeft, self.antennas[1]),
+            (JointRef::BodyYaw, self.body_yaw),
+            (JointRef::Leg0, self.legs[0]),
+            (JointRef::Leg1, self.legs[1]),
+            (JointRef::Leg2, self.legs[2]),
+            (JointRef::Leg3, self.legs[3]),
+            (JointRef::Leg4, self.legs[4]),
+            (JointRef::Leg5, self.legs[5]),
+            (JointRef::AntennaRight, self.antennas[0]),
+            (JointRef::AntennaLeft, self.antennas[1]),
         ]
     }
 
@@ -96,7 +114,7 @@ impl JointVector {
     /// Named rather than counted, so a fault raised from this can name the
     /// joint the bad number arrived on.
     #[must_use]
-    pub fn first_non_finite(&self) -> Option<JointId> {
+    pub fn first_non_finite(&self) -> Option<JointRef> {
         self.joints()
             .into_iter()
             .find(|(_, angle)| !angle.is_finite())
@@ -176,13 +194,16 @@ pub struct JointStep {
 }
 
 impl JointStep {
-    /// The bound that applies to `id`.
+    /// The bound that applies to `id`, and the tightest of the three for
+    /// [`JointRef::None`], which names no group and must not read as the
+    /// loosest one.
     #[must_use]
-    pub fn for_joint(&self, id: JointId) -> f64 {
-        match id.group() {
-            JointGroup::BodyYaw => self.body_yaw,
-            JointGroup::Legs => self.legs,
-            JointGroup::Antennas => self.antennas,
+    pub fn for_joint(&self, id: JointRef) -> f64 {
+        match group_of(id) {
+            Some(JointGroup::BodyYaw) => self.body_yaw,
+            Some(JointGroup::Legs) => self.legs,
+            Some(JointGroup::Antennas) => self.antennas,
+            None => self.legs.min(self.body_yaw).min(self.antennas),
         }
     }
 }
@@ -250,7 +271,7 @@ fn worse_error(candidate: f64, incumbent: f64) -> bool {
 /// seeded below every value can leave a joint named because nothing displaced
 /// the seed; seeded at a floor of zero it can name a joint with no deviation at
 /// all. Ties keep the earlier row, so the report is the same on every run.
-pub(crate) fn worst_row(deviations: &[f64; JointId::COUNT]) -> usize {
+pub(crate) fn worst_row(deviations: &[f64; ROW_COUNT]) -> usize {
     let mut worst = 0;
     for (row, deviation) in deviations.iter().enumerate() {
         if worse_error(*deviation, deviations[worst]) {
@@ -261,73 +282,252 @@ pub(crate) fn worst_row(deviations: &[f64; JointId::COUNT]) -> usize {
 }
 
 /// The joint furthest out and how far, from deviations in bus order.
-pub(crate) fn worst_joint(deviations: &[f64; JointId::COUNT]) -> (JointId, f64) {
+pub(crate) fn worst_joint(deviations: &[f64; ROW_COUNT]) -> (JointRef, f64) {
     let row = worst_row(deviations);
-    (JointId::ALL[row], deviations[row])
+    (ROWS[row], deviations[row])
 }
 
-/// Names one joint, for fault causes and reports.
+/// How many servos the bus carries.
+pub const ROW_COUNT: usize = 9;
+
+/// How many cranks carry the head.
 ///
-/// The `Leg` payload is 0-based, matching the leg index the kinematics reports an
-/// unreachable pose against. It **renders** 1-based, matching the servo numbering
-/// on the bus and the way the envelope names a leg: an operator reading a fault
-/// and an envelope refusal in the same log must be reading about the same crank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JointId {
-    /// The body yaw servo.
-    BodyYaw,
-    /// A crank, 0-based in servo order.
-    Leg(u8),
-    /// The right antenna.
-    AntennaRight,
-    /// The left antenna.
-    AntennaLeft,
+/// The legs alone, in leg order: how the kinematics reports a per-leg number
+/// and how a record of an arming holds one.
+pub const LEG_COUNT: usize = 6;
+
+/// Every servo, in bus order.
+///
+/// The vocabulary's [`JointRef`] also names `None` — a report about the machine
+/// as a whole — which is not a servo and is not here.
+pub const ROWS: [JointRef; ROW_COUNT] = [
+    JointRef::BodyYaw,
+    JointRef::Leg0,
+    JointRef::Leg1,
+    JointRef::Leg2,
+    JointRef::Leg3,
+    JointRef::Leg4,
+    JointRef::Leg5,
+    JointRef::AntennaRight,
+    JointRef::AntennaLeft,
+];
+
+/// Position in bus order, or `None` for [`JointRef::None`], which names no row.
+///
+/// The vocabulary numbers the nine servos from one, because zero is the value a
+/// slot nothing wrote carries; the arrays in this crate number them from zero.
+/// This function and its inverse [`joint_ref`] are the only places that offset
+/// is applied; a crossing that needs it goes through them.
+#[must_use]
+pub fn row(joint: JointRef) -> Option<usize> {
+    match joint {
+        JointRef::None => None,
+        other => Some(other as usize - 1),
+    }
 }
 
-impl JointId {
-    /// How many joints there are.
-    pub const COUNT: usize = 9;
+/// The servo at `row` in bus order, or `None` past the ninth.
+#[must_use]
+pub fn joint_ref(row: usize) -> Option<JointRef> {
+    ROWS.get(row).copied()
+}
 
-    /// Every joint, in bus order.
-    pub const ALL: [JointId; Self::COUNT] = [
-        JointId::BodyYaw,
-        JointId::Leg(0),
-        JointId::Leg(1),
-        JointId::Leg(2),
-        JointId::Leg(3),
-        JointId::Leg(4),
-        JointId::Leg(5),
-        JointId::AntennaRight,
-        JointId::AntennaLeft,
-    ];
+/// The crank at `leg`, 0-based in servo order, or [`JointRef::None`] past the
+/// sixth.
+///
+/// 0-based because that is the leg index the kinematics reports an unreachable
+/// pose against; the rendering is 1-based, matching the servo numbering on the
+/// bus and the way the envelope names a leg.
+#[must_use]
+pub fn leg_ref(index: u8) -> JointRef {
+    match index {
+        0..=5 => joint_ref(1 + usize::from(index)).unwrap_or(JointRef::None),
+        _ => JointRef::None,
+    }
+}
 
-    /// Position in bus order, or `None` for a leg index past the sixth.
-    #[must_use]
-    pub fn index(self) -> Option<usize> {
-        match self {
-            JointId::BodyYaw => Some(0),
-            JointId::Leg(leg) if leg < 6 => Some(1 + usize::from(leg)),
-            JointId::Leg(_) => None,
-            JointId::AntennaRight => Some(7),
-            JointId::AntennaLeft => Some(8),
+/// The 0-based crank index of `joint`, or `None` if it is not a crank.
+#[must_use]
+pub fn leg_index(joint: JointRef) -> Option<u8> {
+    match joint {
+        JointRef::Leg0 => Some(0),
+        JointRef::Leg1 => Some(1),
+        JointRef::Leg2 => Some(2),
+        JointRef::Leg3 => Some(3),
+        JointRef::Leg4 => Some(4),
+        JointRef::Leg5 => Some(5),
+        _ => None,
+    }
+}
+
+/// Which group `joint` belongs to, or `None` for [`JointRef::None`].
+#[must_use]
+pub fn group_of(joint: JointRef) -> Option<JointGroup> {
+    match joint {
+        JointRef::None => None,
+        JointRef::BodyYaw => Some(JointGroup::BodyYaw),
+        JointRef::AntennaRight | JointRef::AntennaLeft => Some(JointGroup::Antennas),
+        JointRef::Leg0
+        | JointRef::Leg1
+        | JointRef::Leg2
+        | JointRef::Leg3
+        | JointRef::Leg4
+        | JointRef::Leg5 => Some(JointGroup::Legs),
+    }
+}
+
+vocab_name! {
+    /// A servo rendered for a message an operator reads.
+    ///
+    /// Legs render 1-based, as the servos and the envelope's own messages number
+    /// them.
+    pub struct Name(JointRef) {
+        JointRef::None => "no joint",
+        JointRef::BodyYaw => "body yaw",
+        JointRef::AntennaRight => "right antenna",
+        JointRef::AntennaLeft => "left antenna",
+        JointRef::Leg0 => "leg 1",
+        JointRef::Leg1 => "leg 2",
+        JointRef::Leg2 => "leg 3",
+        JointRef::Leg3 => "leg 4",
+        JointRef::Leg4 => "leg 5",
+        JointRef::Leg5 => "leg 6",
+    }
+}
+
+/// Pair each of a schema's nine servo-named fields with the servo whose value
+/// lives in it.
+///
+/// Every schema that holds one value per servo spells the nine out as named
+/// fields rather than as an array — a row misplaced in an array is a silent swap
+/// of two servos, and a row misplaced across named fields does not compile — and
+/// every one of them uses the same nine field names. So the pairing is written
+/// here once, and a schema of that shape asks for it by naming its type: a joint
+/// and the field its value lives in cannot be paired differently in two places.
+///
+/// The nine patterns are counted against [`ROW_COUNT`], so a bus row the machine
+/// grows is a build failure here rather than a servo whose value goes nowhere.
+/// A joint no field answers — a leg index past the sixth, which [`JointRef`] can
+/// spell and no machine carries, and the `none` that names no servo — is the one
+/// answered with `None`.
+macro_rules! rows_by_joint {
+    ($vis:vis $type:ty, $row:ty, $of:ident, $of_mut:ident) => {
+        const _: () = assert!(9 == ROW_COUNT);
+
+        /// The field `joint`'s value lives in, or `None` for a joint no field
+        /// answers.
+        #[must_use]
+        $vis fn $of(rows: &$type, joint: JointRef) -> Option<&$row> {
+            match joint {
+                JointRef::BodyYaw => Some(&rows.body_yaw),
+                JointRef::Leg0 => Some(&rows.leg_0),
+                JointRef::Leg1 => Some(&rows.leg_1),
+                JointRef::Leg2 => Some(&rows.leg_2),
+                JointRef::Leg3 => Some(&rows.leg_3),
+                JointRef::Leg4 => Some(&rows.leg_4),
+                JointRef::Leg5 => Some(&rows.leg_5),
+                JointRef::AntennaRight => Some(&rows.antenna_right),
+                JointRef::AntennaLeft => Some(&rows.antenna_left),
+                JointRef::None => None,
+            }
+        }
+
+        /// The same field, to write.
+        $vis fn $of_mut(rows: &mut $type, joint: JointRef) -> Option<&mut $row> {
+            match joint {
+                JointRef::BodyYaw => Some(&mut rows.body_yaw),
+                JointRef::Leg0 => Some(&mut rows.leg_0),
+                JointRef::Leg1 => Some(&mut rows.leg_1),
+                JointRef::Leg2 => Some(&mut rows.leg_2),
+                JointRef::Leg3 => Some(&mut rows.leg_3),
+                JointRef::Leg4 => Some(&mut rows.leg_4),
+                JointRef::Leg5 => Some(&mut rows.leg_5),
+                JointRef::AntennaRight => Some(&mut rows.antenna_right),
+                JointRef::AntennaLeft => Some(&mut rows.antenna_left),
+                JointRef::None => None,
+            }
+        }
+    };
+}
+
+pub(crate) use rows_by_joint;
+
+/// A nine-angle vector as the schema declares it: one field per bus row.
+///
+/// The vocabulary's own vector, re-exported beside the helpers that index it, so
+/// a consumer writing one into a slot takes both from one path.
+pub use brenn_reachy__motion__joints_clk_rs::Joints;
+
+rows_by_joint!(Joints, f64, angle_ref, angle_ref_mut);
+
+/// The angle at `id`, or `None` if `id` names no servo.
+///
+/// The schema's vector by field name, addressed by joint the way
+/// [`JointVector::get`] addresses the library's own: a servo's angle can only be
+/// read off the field that servo names.
+#[must_use]
+pub fn angle_of(joints: &Joints, id: JointRef) -> Option<f64> {
+    angle_ref(joints, id).copied()
+}
+
+/// Set the angle at `id`, reporting `false` — and changing nothing — if `id`
+/// names no servo. The mirror of [`angle_of`].
+pub fn set_angle(joints: &mut Joints, id: JointRef, angle: f64) -> bool {
+    if let Some(field) = angle_ref_mut(joints, id) {
+        *field = angle;
+        return true;
+    }
+    false
+}
+
+/// The library's own vector from the nine numbers the schema's vector holds.
+///
+/// Addressed by joint in both directions, so neither this nor [`write_vector`]
+/// can put one servo's angle on another servo's name.
+#[must_use]
+pub fn vector_of(joints: &Joints) -> JointVector {
+    let mut angles = JointVector::default();
+    for joint in ROWS {
+        if let Some(angle) = angle_of(joints, joint) {
+            angles.set(joint, angle);
         }
     }
+    angles
+}
 
-    /// The joint at `index` in bus order.
-    #[must_use]
-    pub fn from_index(index: usize) -> Option<Self> {
-        Self::ALL.get(index).copied()
-    }
-
-    /// Which group this joint belongs to.
-    #[must_use]
-    pub fn group(self) -> JointGroup {
-        match self {
-            JointId::BodyYaw => JointGroup::BodyYaw,
-            JointId::Leg(_) => JointGroup::Legs,
-            JointId::AntennaRight | JointId::AntennaLeft => JointGroup::Antennas,
+/// The same nine angles, written into the fields the schema holds them in.
+pub fn write_vector(out: &mut Joints, angles: &JointVector) {
+    for joint in ROWS {
+        if let Some(angle) = angles.get(joint) {
+            set_angle(out, joint, angle);
         }
     }
+}
+
+/// Write nine angles in bus-row order into the fields the schema holds them in.
+///
+/// The rows and the servos are matched through [`joint_ref`] rather than by
+/// writing the field order out a second time, so neither this function nor its
+/// inverse can put one servo's angle on another servo's name.
+pub fn write_rows(out: &mut Joints, rows: &[f64; ROW_COUNT]) {
+    for (row, angle) in rows.iter().enumerate() {
+        if let Some(id) = joint_ref(row) {
+            set_angle(out, id, *angle);
+        }
+    }
+}
+
+/// The inverse of [`write_rows`]: the nine angles those fields hold, in bus-row
+/// order.
+#[must_use]
+pub fn rows_of(joints: &Joints) -> [f64; ROW_COUNT] {
+    let mut rows = [0.0; ROW_COUNT];
+    for (row, slot) in rows.iter_mut().enumerate() {
+        if let Some(angle) = joint_ref(row).and_then(|id| angle_of(joints, id)) {
+            *slot = angle;
+        }
+    }
+    rows
 }
 
 /// The joints that move as one.
@@ -353,158 +553,166 @@ impl JointGroup {
 
     /// The joints this group covers, in bus order.
     #[must_use]
-    pub fn joints(self) -> JointSet {
-        let mut set = JointSet::EMPTY;
-        for joint in JointId::ALL {
-            if joint.group() == self {
-                set.insert(joint);
+    pub fn joints(self) -> JointFlags {
+        let mut set = JointFlags::NONE;
+        for joint in ROWS {
+            if group_of(joint) == Some(self) {
+                flags::insert(&mut set, joint);
             }
         }
         set
     }
 }
 
-/// A set of joints, one bit per bus row.
+/// Membership operations on [`JointFlags`] by [`JointRef`].
 ///
-/// What names the joints a decision covers without allocating or fixing an
-/// order on the caller: the servos a fault took out of service, the rows a
-/// write skips. Membership is by bus row, so a leg index past the sixth — a
-/// [`JointId`] no machine carries — is in no set and cannot be put in one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct JointSet(u16);
-
-impl JointSet {
-    /// The set with nothing in it.
-    pub const EMPTY: Self = Self(0);
+/// The only code that knows which bit is which bus row. Bit for bus row `n`
+/// is `1 << n`, matching the vocabulary's declared constants, the wire masks
+/// and the sequencers' per-row arrays. A leg index past the sixth names no
+/// bit: it is in no set and cannot be put in one.
+pub mod flags {
+    use super::{JointGroup, JointRef, Name, ROW_COUNT, ROWS, row};
+    use brenn_reachy__motion__joints_clk_rs::JointFlags;
 
     /// Every servo on the bus.
     ///
-    /// Spelled as the nine low bits rather than folded from [`JointId::ALL`],
-    /// because a constant cannot fold; that the two describe the same nine
-    /// servos is a test rather than a comment. What it is for is the caller
-    /// that has to say "all of them" — the mask on a goal that leaves nothing
-    /// out, a machine energised whole — without each such caller assembling its
-    /// own nine and getting to disagree.
-    pub const ALL: Self = Self((1u16 << JointId::COUNT) - 1);
+    /// The canonical source for "all of them"; that this is the same nine
+    /// [`ROWS`] names is a test, not a comment. A function and not a
+    /// constant because the vocabulary's union operator is not `const fn`.
+    #[must_use]
+    pub fn all() -> JointFlags {
+        from_rows(&[true; ROW_COUNT])
+    }
+
+    /// The single-servo set `joint` names, or the empty set if it names no
+    /// servo.
+    #[must_use]
+    pub fn bit(joint: JointRef) -> JointFlags {
+        match row(joint) {
+            Some(row) => BITS[row],
+            None => JointFlags::NONE,
+        }
+    }
+
+    /// One bit per bus row, in bus order.
+    const BITS: [JointFlags; ROW_COUNT] = [
+        JointFlags::BODY_YAW,
+        JointFlags::LEG_0,
+        JointFlags::LEG_1,
+        JointFlags::LEG_2,
+        JointFlags::LEG_3,
+        JointFlags::LEG_4,
+        JointFlags::LEG_5,
+        JointFlags::ANTENNA_RIGHT,
+        JointFlags::ANTENNA_LEFT,
+    ];
 
     /// Add `joint`, reporting whether it was not already there.
     ///
     /// The return is what makes an entry an event: a fault that names a servo
-    /// already in the set is the same fault standing, not a new one.
-    pub fn insert(&mut self, joint: JointId) -> bool {
-        let Some(index) = joint.index() else {
+    /// already in the set is the same fault standing, not a new one. A ref that
+    /// names no servo adds nothing and reports nothing added.
+    pub fn insert(set: &mut JointFlags, joint: JointRef) -> bool {
+        let bit = bit(joint);
+        if bit == JointFlags::NONE || set.contains(bit) {
             return false;
-        };
-        let bit = 1 << index;
-        let fresh = self.0 & bit == 0;
-        self.0 |= bit;
-        fresh
+        }
+        *set |= bit;
+        true
     }
 
-    /// Whether `joint` is in the set.
+    /// Whether `joint` is in `set`.
     #[must_use]
-    pub fn contains(self, joint: JointId) -> bool {
-        joint
-            .index()
-            .is_some_and(|index| self.0 & (1 << index) != 0)
+    pub fn contains(set: JointFlags, joint: JointRef) -> bool {
+        let bit = bit(joint);
+        bit != JointFlags::NONE && set.contains(bit)
     }
 
     /// Whether the set is empty.
     #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
+    pub fn is_empty(set: JointFlags) -> bool {
+        set == JointFlags::NONE
     }
 
-    /// The joints in either set.
+    /// How many servos are in it.
+    #[must_use]
+    pub fn len(set: JointFlags) -> u32 {
+        u32::try_from(iter(set).count()).unwrap_or(0)
+    }
+
+    /// The servos in `set` and not in `other`.
     ///
-    /// What a caller holding a set of servos does instead of reaching for the
-    /// bits: a union written as bit arithmetic is a place a servo's bit can
-    /// land on another servo's name.
+    /// The vocabulary type has no complement operator — the bits above the ninth
+    /// belong to no servo and a complement would hand them out — so a difference
+    /// is taken over the servos rather than over the word.
     #[must_use]
-    pub fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
+    pub fn without(set: JointFlags, other: JointFlags) -> JointFlags {
+        let mut kept = JointFlags::NONE;
+        for joint in iter(set) {
+            if !contains(other, joint) {
+                insert(&mut kept, joint);
+            }
+        }
+        kept
     }
 
-    /// The joints in this set and not in `other`.
+    /// Whether every servo of `group` is in `set`.
     #[must_use]
-    pub fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
+    pub fn covers(set: JointFlags, group: JointGroup) -> bool {
+        set.contains(group.joints())
     }
 
-    /// How many joints are in it.
-    #[must_use]
-    pub fn len(self) -> u32 {
-        self.0.count_ones()
-    }
-
-    /// Whether every joint of `group` is in the set.
-    #[must_use]
-    pub fn covers(self, group: JointGroup) -> bool {
-        JointId::ALL
-            .into_iter()
-            .filter(|joint| joint.group() == group)
-            .all(|joint| self.contains(joint))
-    }
-
-    /// The set as the bit field a slot holds it in, one bit per bus row.
+    /// The set those nine flags name, one flag per bus row.
     ///
-    /// Bit `n` is the joint at bus row `n`, which is the same convention the
-    /// wire's masks use, so a host mirroring this into an integer field writes
-    /// this number and nothing derived from it.
+    /// `[bool; ROW_COUNT]` is how the sequencers carry a per-servo answer
+    /// and a set is how a slot, a mask and a wire field carry one, so the two
+    /// shapes meet in several hosts and the convention is written down once.
     #[must_use]
-    pub const fn bits(self) -> u16 {
-        self.0
+    pub fn from_rows(rows: &[bool; ROW_COUNT]) -> JointFlags {
+        let mut set = JointFlags::NONE;
+        for (row, present) in rows.iter().enumerate() {
+            if *present {
+                set |= BITS[row];
+            }
+        }
+        set
     }
 
-    /// The set `bits` names, or `None` if it names a row no joint has.
-    ///
-    /// The nine rows occupy the low nine bits; anything above them was written
-    /// by something that does not agree with this type about how many joints
-    /// there are, and masking it off would restore a set that leaves a servo
-    /// commanding which the state had taken out of service.
+    /// The inverse of [`from_rows`]: one flag per bus row.
     #[must_use]
-    pub fn from_bits(bits: u16) -> Option<Self> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "JointId::COUNT is 9, which fits a shift width"
-        )]
-        const OCCUPIED: u16 = (1 << JointId::COUNT as u16) - 1;
-        (bits & !OCCUPIED == 0).then_some(Self(bits))
+    pub fn rows(set: JointFlags) -> [bool; ROW_COUNT] {
+        let mut rows = [false; ROW_COUNT];
+        for (row, flag) in rows.iter_mut().enumerate() {
+            *flag = set.contains(BITS[row]);
+        }
+        rows
     }
 
     /// Everything in the set, in bus order.
-    pub fn iter(self) -> impl Iterator<Item = JointId> {
-        JointId::ALL
-            .into_iter()
-            .filter(move |joint| self.contains(*joint))
+    pub fn iter(set: JointFlags) -> impl Iterator<Item = JointRef> {
+        ROWS.into_iter().filter(move |joint| contains(set, *joint))
     }
-}
 
-impl core::fmt::Display for JointSet {
-    /// The joints by name, comma-separated, or `nothing` for an empty set.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.is_empty() {
-            return f.write_str("nothing");
-        }
-        for (written, joint) in self.iter().enumerate() {
-            if written > 0 {
-                f.write_str(", ")?;
+    /// A set rendered as the servos it holds, for a message an operator reads.
+    ///
+    /// An adapter and not a `Display` impl on the set itself, because the type
+    /// belongs to the vocabulary crate and a rendering is this layer's opinion
+    /// rather than the vocabulary's.
+    pub struct Names(pub JointFlags);
+
+    impl core::fmt::Display for Names {
+        /// The servos by name, comma-separated, or `nothing` for an empty set.
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            if is_empty(self.0) {
+                return f.write_str("nothing");
             }
-            write!(f, "{joint}")?;
-        }
-        Ok(())
-    }
-}
-
-impl core::fmt::Display for JointId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            JointId::BodyYaw => write!(f, "body yaw"),
-            // 1-based, as the servos and the envelope's own messages number the
-            // legs; the payload stays the 0-based index.
-            JointId::Leg(leg) => write!(f, "leg {}", u16::from(*leg) + 1),
-            JointId::AntennaRight => write!(f, "right antenna"),
-            JointId::AntennaLeft => write!(f, "left antenna"),
+            for (written, joint) in iter(self.0).enumerate() {
+                if written > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", Name(joint))?;
+            }
+            Ok(())
         }
     }
 }
@@ -512,6 +720,7 @@ impl core::fmt::Display for JointId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brenn_reachy__motion__joints_clk_rs::JointsWire;
     use reachy_kin::{
         EnvelopeConfig, EnvelopeReport, EnvelopeViolations, HeadGeometry, check_envelope,
     };
@@ -520,56 +729,77 @@ mod tests {
     /// safe while they agree.
     #[test]
     fn the_whole_bus_is_every_joint_the_bus_has() {
-        let folded = JointId::ALL
-            .into_iter()
-            .fold(JointSet::EMPTY, |set, joint| {
-                let mut set = set;
-                assert!(set.insert(joint), "{joint} is on the bus once");
-                set
-            });
-        assert_eq!(JointSet::ALL, folded);
+        let folded = ROWS.into_iter().fold(JointFlags::NONE, |set, joint| {
+            let mut set = set;
+            assert!(
+                flags::insert(&mut set, joint),
+                "{} is on the bus once",
+                Name(joint)
+            );
+            set
+        });
+        assert_eq!(flags::all(), folded);
         assert_eq!(
-            usize::try_from(JointSet::ALL.len()).expect("nine servos is a small number"),
-            JointId::COUNT,
+            usize::try_from(flags::len(flags::all())).expect("nine servos is a small number"),
+            ROW_COUNT,
         );
-        for joint in JointId::ALL {
-            assert!(JointSet::ALL.contains(joint), "{joint} is on the bus");
-        }
-        assert_eq!(
-            JointSet::from_bits(JointSet::ALL.bits()),
-            Some(JointSet::ALL),
-            "the whole bus is a set of rows the bus has",
-        );
-    }
-
-    #[test]
-    fn a_set_restores_from_the_bits_a_slot_holds_it_in() {
-        let mut set = JointSet::EMPTY;
-        assert_eq!(set.bits(), 0);
-        for joint in [JointId::BodyYaw, JointId::Leg(4), JointId::AntennaLeft] {
-            set.insert(joint);
-        }
-        assert_eq!(set.bits(), 0b1_0010_0001, "rows 0, 5 and 8");
-        assert_eq!(JointSet::from_bits(set.bits()), Some(set));
-
-        // Every subset of the nine rows is a set something could have masked.
-        for bits in 0..=0b1_1111_1111u16 {
-            let restored = JointSet::from_bits(bits).expect("nine rows are nine rows");
-            assert_eq!(restored.bits(), bits);
-        }
-    }
-
-    #[test]
-    fn a_row_no_joint_has_is_refused_rather_than_masked_off() {
-        for bit in JointId::COUNT..16 {
-            let bits = 1 << bit;
-            assert_eq!(
-                JointSet::from_bits(bits),
-                None,
-                "bit {bit} names no joint and is no set"
+        for joint in ROWS {
+            assert!(
+                flags::contains(flags::all(), joint),
+                "{} is on the bus",
+                Name(joint)
             );
         }
-        assert_eq!(JointSet::from_bits(u16::MAX), None);
+    }
+
+    /// The bit for a bus row is the vocabulary's own bit for that row, in both
+    /// directions, and the nine rows are the whole of the type.
+    ///
+    /// The set a slot holds and the set this crate operates on are one value, so
+    /// what is worth pinning is that a row's name, its bit and its index agree —
+    /// a disagreement would put one servo's mask on another servo's name.
+    #[test]
+    fn a_row_and_its_bit_name_the_same_servo() {
+        let declared = [
+            (JointRef::BodyYaw, JointFlags::BODY_YAW),
+            (JointRef::Leg0, JointFlags::LEG_0),
+            (JointRef::Leg1, JointFlags::LEG_1),
+            (JointRef::Leg2, JointFlags::LEG_2),
+            (JointRef::Leg3, JointFlags::LEG_3),
+            (JointRef::Leg4, JointFlags::LEG_4),
+            (JointRef::Leg5, JointFlags::LEG_5),
+            (JointRef::AntennaRight, JointFlags::ANTENNA_RIGHT),
+            (JointRef::AntennaLeft, JointFlags::ANTENNA_LEFT),
+        ];
+        for (index, (joint, bit)) in declared.into_iter().enumerate() {
+            assert_eq!(
+                row(joint),
+                Some(index),
+                "{} is bus row {index}",
+                Name(joint)
+            );
+            assert_eq!(
+                flags::bit(joint),
+                bit,
+                "{} carries its own bit",
+                Name(joint)
+            );
+            let mut one = JointFlags::NONE;
+            assert!(flags::insert(&mut one, joint));
+            assert_eq!(one, bit, "a set of one is that servo's bit");
+            assert!(flags::rows(one)[index], "{} is row {index}", Name(joint));
+        }
+    }
+
+    /// A leg index past the sixth names no bit, so it is in no set and cannot be
+    /// put in one.
+    #[test]
+    fn a_leg_the_machine_does_not_have_is_in_no_set() {
+        let mut set = flags::all();
+        assert!(!flags::insert(&mut set, leg_ref(6)));
+        assert_eq!(set, flags::all(), "and the set it was offered to stands");
+        assert!(!flags::contains(flags::all(), leg_ref(9)));
+        assert_eq!(flags::bit(leg_ref(6)), JointFlags::NONE);
     }
 
     /// The worst-deviation selection is an ordering, and a value nobody can
@@ -595,22 +825,22 @@ mod tests {
     /// unplaceable deviation is named wherever it sits in the order.
     #[test]
     fn the_worst_joint_sweep_covers_its_own_seed() {
-        let mut deviations = [0.0; JointId::COUNT];
+        let mut deviations = [0.0; ROW_COUNT];
         assert_eq!(
             worst_joint(&deviations),
-            (JointId::BodyYaw, 0.0),
+            (JointRef::BodyYaw, 0.0),
             "all equal keeps the first row"
         );
 
         deviations[0] = 0.4;
         assert_eq!(
             worst_joint(&deviations),
-            (JointId::BodyYaw, 0.4),
+            (JointRef::BodyYaw, 0.4),
             "the seed row wins when it is the worst"
         );
 
         deviations[8] = 0.5;
-        assert_eq!(worst_joint(&deviations), (JointId::AntennaLeft, 0.5));
+        assert_eq!(worst_joint(&deviations), (JointRef::AntennaLeft, 0.5));
 
         deviations[3] = 0.5;
         assert_eq!(
@@ -621,7 +851,7 @@ mod tests {
 
         deviations[6] = f64::NAN;
         let (joint, deviation) = worst_joint(&deviations);
-        assert_eq!(joint, JointId::Leg(5));
+        assert_eq!(joint, JointRef::Leg5);
         assert!(
             deviation.is_nan(),
             "unplaceable, and named as its own joint"
@@ -637,11 +867,11 @@ mod tests {
         };
         let joints = v.joints();
         for (index, (id, angle)) in joints.iter().enumerate() {
-            assert_eq!(JointId::from_index(index), Some(*id), "index {index}");
-            assert_eq!(id.index(), Some(index), "index {index}");
+            assert_eq!(joint_ref(index), Some(*id), "index {index}");
+            assert_eq!(row(*id), Some(index), "index {index}");
             assert_eq!(v.get(*id), Some(*angle), "index {index}");
         }
-        assert_eq!(JointId::from_index(JointId::COUNT), None);
+        assert_eq!(joint_ref(ROW_COUNT), None);
     }
 
     /// Writing a joint writes that joint and leaves the other eight alone.
@@ -653,7 +883,7 @@ mod tests {
     /// no test of a whole armed sequence would see it.
     #[test]
     fn every_slot_is_written_where_it_is_named() {
-        for (index, id) in JointId::ALL.into_iter().enumerate() {
+        for (index, id) in ROWS.into_iter().enumerate() {
             let before = JointVector {
                 body_yaw: 0.5,
                 legs: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -664,36 +894,43 @@ mod tests {
             assert_eq!(after.get(id), Some(-1.0), "slot {index}");
             for (other, angle) in before.joints() {
                 if other != id {
-                    assert_eq!(after.get(other), Some(angle), "{other} changed with {id}");
+                    assert_eq!(
+                        after.get(other),
+                        Some(angle),
+                        "{} changed with {}",
+                        Name(other),
+                        Name(id)
+                    );
                 }
             }
         }
 
-        // A leg index past the sixth writes nothing anywhere.
+        // A ref naming no servo writes nothing anywhere.
         let mut v = JointVector::default();
-        assert!(!v.set(JointId::Leg(6), 1.0));
-        assert!(!v.set(JointId::Leg(200), 1.0));
+        assert!(!v.set(JointRef::None, 1.0));
         assert_eq!(v, JointVector::default());
     }
 
-    /// A leg index past the sixth names nothing, and says so rather than
-    /// indexing something else.
+    /// A leg index past the sixth names no servo, and says so rather than
+    /// naming another one.
     #[test]
     fn out_of_range_leg_has_no_slot() {
         let v = JointVector::default();
-        assert_eq!(JointId::Leg(6).index(), None);
-        assert_eq!(JointId::Leg(200).index(), None);
-        assert_eq!(v.get(JointId::Leg(6)), None);
+        assert_eq!(leg_ref(6), JointRef::None);
+        assert_eq!(leg_ref(200), JointRef::None);
+        assert_eq!(row(JointRef::None), None);
+        assert_eq!(v.get(JointRef::None), None);
     }
 
     #[test]
     fn joint_names() {
-        assert_eq!(JointId::BodyYaw.to_string(), "body yaw");
-        assert_eq!(JointId::Leg(0).to_string(), "leg 1");
-        assert_eq!(JointId::Leg(3).to_string(), "leg 4");
-        assert_eq!(JointId::Leg(5).to_string(), "leg 6");
-        assert_eq!(JointId::AntennaRight.to_string(), "right antenna");
-        assert_eq!(JointId::AntennaLeft.to_string(), "left antenna");
+        assert_eq!(Name(JointRef::None).to_string(), "no joint");
+        assert_eq!(Name(JointRef::BodyYaw).to_string(), "body yaw");
+        assert_eq!(Name(JointRef::Leg0).to_string(), "leg 1");
+        assert_eq!(Name(JointRef::Leg3).to_string(), "leg 4");
+        assert_eq!(Name(JointRef::Leg5).to_string(), "leg 6");
+        assert_eq!(Name(JointRef::AntennaRight).to_string(), "right antenna");
+        assert_eq!(Name(JointRef::AntennaLeft).to_string(), "left antenna");
     }
 
     /// The two crates must name the same physical crank the same way. Two
@@ -705,7 +942,7 @@ mod tests {
             let mut violations = EnvelopeViolations::default();
             violations.unreachable[leg] = true;
             let envelope_says = violations.to_string();
-            let motion_says = JointId::Leg(leg as u8).to_string();
+            let motion_says = Name(leg_ref(leg as u8)).to_string();
             assert!(
                 envelope_says.starts_with(&format!("{motion_says} ")),
                 "the envelope says {envelope_says:?}, the tick says {motion_says:?}"
@@ -720,7 +957,7 @@ mod tests {
     #[test]
     fn every_slot_is_checked_for_finiteness() {
         assert_eq!(JointVector::default().first_non_finite(), None);
-        for (index, expected) in JointId::ALL.iter().enumerate() {
+        for (index, expected) in ROWS.iter().enumerate() {
             for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut v = JointVector::default();
                 match index {
@@ -787,10 +1024,10 @@ mod tests {
             body_yaw: 0.02,
             antennas: 0.1,
         };
-        assert_eq!(step.for_joint(JointId::BodyYaw), 0.02);
-        assert_eq!(step.for_joint(JointId::Leg(4)), 0.05);
-        assert_eq!(step.for_joint(JointId::AntennaRight), 0.1);
-        assert_eq!(step.for_joint(JointId::AntennaLeft), 0.1);
+        assert_eq!(step.for_joint(JointRef::BodyYaw), 0.02);
+        assert_eq!(step.for_joint(JointRef::Leg4), 0.05);
+        assert_eq!(step.for_joint(JointRef::AntennaRight), 0.1);
+        assert_eq!(step.for_joint(JointRef::AntennaLeft), 0.1);
     }
 
     /// The three groups partition the nine joints, and each one is a run of
@@ -801,10 +1038,10 @@ mod tests {
         let mut seen = 0;
         let mut first_row = Vec::new();
         for group in JointGroup::ALL {
-            let rows: Vec<usize> = JointId::ALL
+            let rows: Vec<usize> = ROWS
                 .into_iter()
                 .enumerate()
-                .filter(|(_, joint)| joint.group() == group)
+                .filter(|(_, joint)| group_of(*joint) == Some(group))
                 .map(|(row, _)| row)
                 .collect();
             assert!(!rows.is_empty(), "{group:?} names no joint");
@@ -814,7 +1051,7 @@ mod tests {
             first_row.push(rows[0]);
             seen += rows.len();
         }
-        assert_eq!(seen, JointId::COUNT);
+        assert_eq!(seen, ROW_COUNT);
         assert_eq!(first_row, vec![0, 1, 7]);
     }
 
@@ -822,21 +1059,27 @@ mod tests {
     /// the no-op it is — the distinction a fault raise turns on.
     #[test]
     fn a_joint_set_admits_each_joint_once() {
-        let mut set = JointSet::EMPTY;
-        assert!(set.is_empty());
-        assert_eq!(set.len(), 0);
-        assert!(set.insert(JointId::AntennaLeft), "the first entry is news");
-        assert!(!set.insert(JointId::AntennaLeft), "the second is not");
-        assert!(set.insert(JointId::Leg(2)));
-        assert_eq!(set.len(), 2);
-        assert!(set.contains(JointId::Leg(2)) && !set.contains(JointId::Leg(3)));
+        let mut set = JointFlags::NONE;
+        assert!(flags::is_empty(set));
+        assert_eq!(flags::len(set), 0);
+        assert!(
+            flags::insert(&mut set, JointRef::AntennaLeft),
+            "the first entry is news"
+        );
+        assert!(
+            !flags::insert(&mut set, JointRef::AntennaLeft),
+            "the second is not"
+        );
+        assert!(flags::insert(&mut set, JointRef::Leg2));
+        assert_eq!(flags::len(set), 2);
+        assert!(flags::contains(set, JointRef::Leg2) && !flags::contains(set, JointRef::Leg3));
         assert_eq!(
-            set.iter().collect::<Vec<JointId>>(),
-            vec![JointId::Leg(2), JointId::AntennaLeft],
+            flags::iter(set).collect::<Vec<JointRef>>(),
+            vec![JointRef::Leg2, JointRef::AntennaLeft],
             "bus order, whatever order they went in"
         );
-        assert_eq!(format!("{set}"), "leg 3, left antenna");
-        assert_eq!(format!("{}", JointSet::EMPTY), "nothing");
+        assert_eq!(format!("{}", flags::Names(set)), "leg 3, left antenna");
+        assert_eq!(format!("{}", flags::Names(JointFlags::NONE)), "nothing");
     }
 
     /// A leg index no machine carries is in no set: it has no bus row to be a
@@ -844,10 +1087,10 @@ mod tests {
     /// something it claimed to hold.
     #[test]
     fn a_joint_set_holds_only_joints_that_exist() {
-        let mut set = JointSet::EMPTY;
-        assert!(!set.insert(JointId::Leg(9)));
-        assert!(set.is_empty());
-        assert!(!set.contains(JointId::Leg(9)));
+        let mut set = JointFlags::NONE;
+        assert!(!flags::insert(&mut set, leg_ref(9)));
+        assert!(flags::is_empty(set));
+        assert!(!flags::contains(set, leg_ref(9)));
     }
 
     /// Union and difference, which is how a caller holding a set adds servos to
@@ -857,17 +1100,17 @@ mod tests {
         let cranks = JointGroup::Legs.joints();
         let antennas = JointGroup::Antennas.joints();
 
-        let both = cranks.union(antennas);
-        assert_eq!(both.len(), cranks.len() + antennas.len());
-        assert!(both.covers(JointGroup::Legs) && both.covers(JointGroup::Antennas));
-        assert!(!both.contains(JointId::BodyYaw));
-        assert_eq!(both.union(cranks), both, "a union with a subset is itself");
+        let both = cranks | antennas;
+        assert_eq!(flags::len(both), flags::len(cranks) + flags::len(antennas));
+        assert!(flags::covers(both, JointGroup::Legs) && flags::covers(both, JointGroup::Antennas));
+        assert!(!flags::contains(both, JointRef::BodyYaw));
+        assert_eq!(both | cranks, both, "a union with a subset is itself");
 
-        let left = both.without(antennas);
+        let left = flags::without(both, antennas);
         assert_eq!(left, cranks);
-        assert!(left.without(cranks).is_empty());
+        assert!(flags::is_empty(flags::without(left, cranks)));
         assert_eq!(
-            left.without(JointSet::EMPTY),
+            flags::without(left, JointFlags::NONE),
             cranks,
             "taking nothing out changes nothing"
         );
@@ -877,21 +1120,20 @@ mod tests {
     /// service.
     #[test]
     fn a_joint_set_covers_a_group_only_when_it_holds_all_of_it() {
-        let mut set = JointSet::EMPTY;
-        set.insert(JointId::AntennaRight);
-        assert!(!set.covers(JointGroup::Antennas));
-        set.insert(JointId::AntennaLeft);
-        assert!(set.covers(JointGroup::Antennas));
-        assert!(!set.covers(JointGroup::Legs));
-        assert!(!set.covers(JointGroup::BodyYaw));
+        let mut set = JointFlags::NONE;
+        flags::insert(&mut set, JointRef::AntennaRight);
+        assert!(!flags::covers(set, JointGroup::Antennas));
+        flags::insert(&mut set, JointRef::AntennaLeft);
+        assert!(flags::covers(set, JointGroup::Antennas));
+        assert!(!flags::covers(set, JointGroup::Legs));
+        assert!(!flags::covers(set, JointGroup::BodyYaw));
         for group in JointGroup::ALL {
             let whole = group.joints();
-            assert!(whole.covers(group));
+            assert!(flags::covers(whole, group));
             assert_eq!(
-                whole.len(),
-                JointId::ALL
-                    .into_iter()
-                    .filter(|joint| joint.group() == group)
+                flags::len(whole),
+                ROWS.into_iter()
+                    .filter(|joint| group_of(*joint) == Some(group))
                     .count()
                     .try_into()
                     .expect("nine joints fit in a u32"),
@@ -914,5 +1156,146 @@ mod tests {
             &mut report,
         )
         .expect("the neutral pose is inside the envelope");
+    }
+
+    /// Every joint's flag lands on its own bus row and comes back off it, one
+    /// joint at a time — which is the transposition the row form exists to make
+    /// impossible.
+    #[test]
+    fn one_flag_per_row_crosses_both_ways() {
+        for joint in ROWS {
+            let row = row(joint).expect("every joint has a bus row");
+            let mut rows = [false; ROW_COUNT];
+            rows[row] = true;
+
+            let set = flags::from_rows(&rows);
+            assert_eq!(flags::len(set), 1, "{} alone", Name(joint));
+            assert!(
+                flags::contains(set, joint),
+                "{} is the one in it",
+                Name(joint)
+            );
+            assert_eq!(
+                flags::rows(set),
+                rows,
+                "{} back on its own row",
+                Name(joint)
+            );
+        }
+    }
+
+    /// The empty set and the whole bus, the two ends of the crossing.
+    #[test]
+    fn the_empty_set_and_the_whole_bus_cross() {
+        assert_eq!(flags::from_rows(&[false; ROW_COUNT]), JointFlags::NONE);
+        assert_eq!(flags::rows(JointFlags::NONE), [false; ROW_COUNT]);
+        assert_eq!(flags::from_rows(&[true; ROW_COUNT]), flags::all());
+        assert_eq!(flags::rows(flags::all()), [true; ROW_COUNT]);
+    }
+
+    /// A servo's angle lands on the field that servo names.
+    ///
+    /// Written through [`set_angle`] and read off the schema's own nine fields,
+    /// listed here in bus order rather than asked for through the same mapping
+    /// that wrote them: a round trip through one mapping says only that the
+    /// mapping is a bijection, and the swap named fields exist to prevent — one
+    /// servo's reading under another servo's name — is a bijection too. This is
+    /// the second, independent statement of the pairing, and it covers every
+    /// schema [`rows_by_joint`] is instantiated for, since all of them get the
+    /// nine field names from the one macro body.
+    #[test]
+    fn an_angle_lands_on_the_field_its_own_servo_names() {
+        let mut wire = JointsWire::new();
+        let joints = wire.clear_valid();
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            assert!(
+                set_angle(
+                    joints,
+                    joint,
+                    f64::from(u8::try_from(row).expect("a small row")) + 1.0
+                ),
+                "{} has a field",
+                Name(joint)
+            );
+        }
+        assert_eq!(
+            [
+                joints.body_yaw,
+                joints.leg_0,
+                joints.leg_1,
+                joints.leg_2,
+                joints.leg_3,
+                joints.leg_4,
+                joints.leg_5,
+                joints.antenna_right,
+                joints.antenna_left,
+            ],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+        );
+        assert!(
+            !set_angle(joints, JointRef::None, 9.9),
+            "no servo, no field"
+        );
+    }
+
+    /// A mixed set survives the round trip whole.
+    #[test]
+    fn a_mixed_set_is_the_same_set_after_a_round_trip() {
+        let mut set = JointFlags::NONE;
+        flags::insert(&mut set, JointRef::AntennaLeft);
+        flags::insert(&mut set, JointRef::Leg2);
+        flags::insert(&mut set, JointRef::BodyYaw);
+        assert_eq!(flags::from_rows(&flags::rows(set)), set);
+    }
+
+    /// Every angle of the library's vector lands on the field its own servo
+    /// names, and comes back on the same one.
+    #[test]
+    fn every_joint_lands_on_its_own_named_field() {
+        let angles = JointVector {
+            body_yaw: 0.101,
+            legs: [0.201, 0.202, 0.203, 0.204, 0.205, 0.206],
+            antennas: [0.301, -0.302],
+        };
+        let mut wire = JointsWire::new();
+        let joints = wire.clear_valid();
+        write_vector(joints, &angles);
+
+        assert_eq!(joints.body_yaw, angles.body_yaw);
+        assert_eq!(
+            [
+                joints.leg_0,
+                joints.leg_1,
+                joints.leg_2,
+                joints.leg_3,
+                joints.leg_4,
+                joints.leg_5
+            ],
+            angles.legs
+        );
+        assert_eq!([joints.antenna_right, joints.antenna_left], angles.antennas);
+        assert_eq!(vector_of(joints), angles);
+    }
+
+    /// The seam where a row of angles meets a name: every row has to arrive at
+    /// the joint whose bus row it is, and come back on the same row.
+    #[test]
+    fn a_row_of_angles_keeps_its_bus_order_both_ways() {
+        let rows: [f64; ROW_COUNT] =
+            core::array::from_fn(|row| f64::from(u8::try_from(row).expect("nine rows")) + 0.5);
+        let mut wire = JointsWire::new();
+        let joints = wire.clear_valid();
+        write_rows(joints, &rows);
+
+        for id in ROWS {
+            let at = row(id).expect("every servo has a row");
+            assert_eq!(
+                angle_of(joints, id).expect("every servo has an angle"),
+                rows[at],
+                "{} took row {at}",
+                Name(id)
+            );
+        }
+        assert_eq!(rows_of(joints), rows);
     }
 }

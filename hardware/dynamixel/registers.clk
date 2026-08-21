@@ -1,0 +1,123 @@
+// The Dynamixel register vocabulary: which register, and what shape its value
+// is.
+//
+// A register and the shape of its value are one vocabulary -- the bus table
+// binds a shape to every register it names -- so they share a module, and a
+// consumer takes this dependency only if it touches motor registers. The
+// transaction that carries a register is `motion/bus_txn.clk`, one module up:
+// the bench's self-test reads registers without ever naming a transaction.
+//
+// Nothing here is a servo address. Addresses and widths are the bus layer's, in
+// `dxl-proto`'s register table; what this module names is the register itself.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::hardware::dynamixel)]
+
+// Which register a transaction concerns.
+//
+// The numbers are stated per register rather than taken from declaration order:
+// they are what a peer built at a different revision reads out of a slot or a
+// datagram, so this list is appended to and never renumbered. Zero means no
+// register, which is what a ping carries.
+//
+// Not an address. A register's address and width are the bus layer's table, and
+// two parts of this machine could place the same register differently; what a
+// name means is the same everywhere.
+enum RegId
+{
+    uuid: d087bb84-78ab-4573-9669-7d27b78e3c2c;
+    options
+    {
+        underlying_type: UInt16;
+    }
+    values
+    {
+        // No register: what a ping concerns, and what an unwritten slot holds.
+        #0 none default { underlying_value: 0; }
+        // Whether the servo holds its goal.
+        #1 torque_enable { underlying_value: 1; }
+        // Where the servo is being commanded to.
+        #2 goal_position { underlying_value: 2; }
+        // Where the servo says it is.
+        #3 present_position { underlying_value: 3; }
+        // Which control mode the servo is in. Position mode is the only one this
+        // project ever runs, and the only one whose position limits apply.
+        #4 operating_mode { underlying_value: 4; }
+        // The offset added to the raw position, which is how this platform's
+        // legs are datum-shifted in the servo rather than in the host.
+        #5 homing_offset { underlying_value: 5; }
+        // How long the servo waits before answering.
+        #6 return_delay_time { underlying_value: 6; }
+        // The bottom of the range the servo itself refuses to be commanded past.
+        #7 min_position_limit { underlying_value: 7; }
+        // The top of that range.
+        #8 max_position_limit { underlying_value: 8; }
+        // Which hardware errors make the servo shut its own torque off.
+        #9 shutdown { underlying_value: 9; }
+        // Direction and profile flags.
+        #10 drive_mode { underlying_value: 10; }
+        // The supply ceiling the servo alarms on.
+        #11 max_voltage_limit { underlying_value: 11; }
+        // The supply floor it alarms on.
+        #12 min_voltage_limit { underlying_value: 12; }
+        // The current ceiling.
+        #13 current_limit { underlying_value: 13; }
+        // The velocity ceiling.
+        #14 velocity_limit { underlying_value: 14; }
+        // The temperature ceiling.
+        #15 temperature_limit { underlying_value: 15; }
+        // The timeout after which the servo stops holding its goal because the
+        // host went quiet. Disabled on this platform: on this linkage a servo
+        // that stops holding drops the head.
+        #16 bus_watchdog { underlying_value: 16; }
+        // The acceleration limit of the servo's own profile, the backstop under
+        // host-side shaping.
+        #17 profile_acceleration { underlying_value: 17; }
+        // The velocity limit of that profile.
+        #18 profile_velocity { underlying_value: 18; }
+        // The position loop's three gains, read and written as one span.
+        #19 position_gains { underlying_value: 19; }
+        // The latched hardware-error bits.
+        #20 hardware_error_status { underlying_value: 20; }
+        // The measured supply voltage.
+        #21 present_input_voltage { underlying_value: 21; }
+        // What kind of servo this is.
+        #22 model_number { underlying_value: 22; }
+    }
+}
+
+// What shape eight value bytes are to be read as.
+//
+// The zero is the shape a ping and a read carry -- no value at all -- so this is
+// a vocabulary whose default is a shape something writes on purpose. Whether any
+// of it is about a value is the field beside it -- a pending request's
+// operation, a verdict's failure kind -- and not this.
+enum ValueShape
+{
+    uuid: d22fe200-ab10-4ef9-8e33-f7592333b8a2;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // No value: what a ping carries, and what a failure about no value
+        // holds.
+        #0 none default { underlying_value: 0; }
+        // A one-byte register, in the leading byte.
+        #1 u8 { underlying_value: 1; }
+        // A two-byte register, little-endian in the leading two bytes.
+        #2 u16 { underlying_value: 2; }
+        // A four-byte register, little-endian in the leading four bytes.
+        #3 u32 { underlying_value: 3; }
+        // A signed four-byte register, little-endian in the leading four bytes.
+        #4 i32 { underlying_value: 4; }
+        // An angle in radians about the model datum, IEEE-754.
+        #5 radians { underlying_value: 5; }
+        // A voltage in volts, IEEE-754.
+        #6 volts { underlying_value: 6; }
+        // The position loop's three gains, little-endian two bytes each, in
+        // `p, i, d` order.
+        #7 gains { underlying_value: 7; }
+    }
+}

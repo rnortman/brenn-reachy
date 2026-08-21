@@ -1,0 +1,39 @@
+// What the machine is asked to do: one setpoint, and the instant it is for.
+//
+// Its own module, apart from what the driver reports back, because a command
+// and a telemetry record have different blast radii: whoever commands the
+// machine must not rebuild when the shape of a health reading changes. Written
+// by whatever decides where the machine goes, consumed by the driver.
+//
+// Time is `SyncTime`, never a bare nanosecond count, and a set of servos is
+// `JointFlags`, never a mask of bits a comment explains. Angles are radians
+// about the model datum.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+use motion::joints;
+
+// A commanded setpoint and the grid instant it is to be written at.
+//
+// The mask is write-side filtering and nothing else: a row outside it keeps
+// whatever it was already holding, and the angle carried for it is not written.
+// That is the whole meaning of the mask to a driver, and every host of the goal
+// gate honours it identically.
+schema GoalSetpoint
+{
+    uuid: ad8f6f1e-4623-4fb0-bb08-bb73d155d81b;
+    fields
+    {
+        // The grid instant this setpoint is to be written at. A driver holding
+        // it until then is what makes a late goal late rather than wrong.
+        #0 execute_at: SyncTime;
+
+        // The rows this setpoint writes. The empty set writes nothing, which is
+        // what a slot nothing wrote asks for.
+        #1 mask: joints::JointFlags;
+
+        // The commanded angles, radians. Only the rows in `mask` mean anything.
+        #2 targets: joints::Joints;
+    }
+}

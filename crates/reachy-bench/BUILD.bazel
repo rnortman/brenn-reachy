@@ -1,8 +1,8 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
-# Bench binary for Reachy Mini bring-up: read-only self-test registry and
-# supervised motion commands. The deployable — cross-compiled for the device
-# with `--platforms=//bazel/platform:reachy-device`.
+# Bench binary for Reachy Mini bring-up: read-only self-test registry and the
+# bare-bus commands. The deployable — cross-compiled for the device with
+# `--platforms=//bazel/platform:reachy-device`.
 #
 # `crate_name` rather than the derived name: `src/main.rs` says
 # `reachy_bench::`, and the target name is taken by the binary below.
@@ -11,15 +11,22 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 # the binary's root — it is a separate crate.
 rust_library(
     name = "reachy_bench_lib",
-    srcs = glob(
-        ["src/**/*.rs"],
-        exclude = ["src/main.rs"],
-    ),
+    # An explicit list rather than a glob: `commands.rs`, `pump.rs`, `trace.rs`,
+    # `trace/metrics.rs` and `replay.rs` sit beside these files and are not in
+    # the build. They are the retired bench motion layer, kept on disk as the
+    # record of how this machine was driven, and a glob would pull them back in.
+    # TODO(bench-motion-delete)
+    srcs = [
+        "src/bare.rs",
+        "src/config.rs",
+        "src/lib.rs",
+        "src/selftest.rs",
+        "src/testutil.rs",
+    ],
     crate_name = "reachy_bench",
     deps = [
         "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-bus:reachy_bus",
-        "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "@brenn_reachy_crates//:anyhow",
@@ -29,25 +36,19 @@ rust_library(
     ],
 )
 
-# Two kinds of test input, and they reach the test by different routes.
-#
 # The example configuration comes in through `include_str!`, which is resolved
-# by the compiler against its declared inputs and never through the source glob,
-# so it is `compile_data`.
+# by the compiler against its declared inputs, so it is `compile_data`.
 #
-# The hardware trace recordings are read at run time by
-# `trace::metrics::Trace::read`, so they are `data` and arrive as runfiles.
-# Where they land is stated here rather than in the source that opens them —
-# beside the glob that supplies them, so moving this package moves one fact.
-# The path is relative to the runfiles root, which is a test's working
-# directory.
+# The hardware trace recordings under `fixtures/traces` reach no test in this
+# build: the suite that replayed them is `src/replay.rs`, which is out of the
+# build with the trace reader it used. The recordings stay checked in — they are
+# the measurements this machine's guards are sized against.
+# TODO(bench-motion-delete)
 rust_test(
     name = "reachy_bench_lib_test",
     size = "medium",
     compile_data = ["reachy-bench.example.toml"],
     crate = ":reachy_bench_lib",
-    data = glob(["fixtures/**"]),
-    env = {"REACHY_BENCH_TRACE_FIXTURES": "crates/reachy-bench/fixtures/traces"},
 )
 
 # The entry point: argument parsing, the configuration file it reads off disk,
@@ -58,7 +59,6 @@ rust_binary(
     deps = [
         ":reachy_bench_lib",
         "//crates/reachy-bus:reachy_bus",
-        "//crates/reachy-clips:reachy_clips",
         "@brenn_reachy_crates//:anyhow",
     ],
 )

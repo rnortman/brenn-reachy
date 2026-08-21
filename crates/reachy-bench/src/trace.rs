@@ -12,6 +12,10 @@
 //! waits on a file. For the same reason the destination belongs on a memory
 //! filesystem — `/run` on the machine this drives — and never on the device's
 //! flash.
+//!
+//! Not in the build: this file is part of the bench's retired motion layer, kept
+//! on disk as the record of how this machine was driven. It no longer compiles.
+//! TODO(bench-motion-delete)
 
 pub mod metrics;
 

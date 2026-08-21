@@ -1,9 +1,11 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# The goal gate: the arbitration a driver applies to a commanded goal, and the
-# dead-man timer over it. The simulated driver cog hosts exactly this logic --
-# the point of the crate is that the simulation and the real driver cannot
-# disagree about when a machine de-torques.
+# A driver cycle's pure decisions: the arbitration applied to a commanded goal
+# and the dead-man timer over it, what the driver believes about torque, the
+# confirmation of a commanded de-torquing, and which auxiliary transaction the
+# cycle spends its spare bus time on. The simulated driver cog hosts exactly
+# this logic -- the point of the crate is that the simulation and the real
+# driver cannot disagree about when a machine de-torques.
 #
 # The target name is the crate name, underscored: rules_rust derives the crate
 # name from the target, and `reachy-driver` is not a Rust identifier.
@@ -11,7 +13,13 @@ rust_library(
     name = "reachy_driver",
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
-    deps = ["//crates/reachy-wire:reachy_wire"],
+    deps = [
+        "//driver:gate_clk_rs",
+        "//driver:goal_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:joints_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
 )
 
 # The dead-man timer is the last thing between a stalled commander and a machine
@@ -20,4 +28,7 @@ rust_test(
     name = "reachy_driver_test",
     size = "small",
     crate = ":reachy_driver",
+    deps = [
+        "//hardware/dynamixel:registers_clk_rs",
+    ],
 )

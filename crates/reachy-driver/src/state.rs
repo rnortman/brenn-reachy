@@ -1,0 +1,83 @@
+//! What a driver-state slot can hold that no driver ever wrote.
+//!
+//! The machines here that are still public data mirrored field for field into
+//! a Clockwork state schema — the belief, the confirmation — are restorable out
+//! of a slot that something else wrote: a slot never initialised, or one
+//! written by a version that disagreed about a field's meaning. Both refuse
+//! through this one type, so a host restoring them has one error to handle
+//! rather than one per machine: they answer the same shape of question, which
+//! is a cursor or a bit set naming something the bus does not have. The gate is
+//! not among them, and needs no entry: its state is a schema, and what a slot
+//! nothing wrote holds is a gate that has been told nothing.
+//!
+//! Nothing here panics on a state that fails validation. The process this runs
+//! in is the one that de-torques the machine, and it does not get to crash over
+//! a bad slot: every read of a cursor is clamped, and a host that wants to know
+//! asks.
+
+use crate::JOINT_COUNT;
+
+/// A driver-cycle machine restored from a slot holding something impossible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverStateError {
+    /// Torque bits set for rows the bus does not have.
+    TorqueBitsOutOfRange {
+        /// What the slot said.
+        bits: u16,
+    },
+    /// The health rotation's cursor names a row past the end of the bus.
+    HealthCursorOutOfRange {
+        /// What the slot said.
+        row: u8,
+    },
+    /// The confirmation pass's cursor names a row past the end of the bus.
+    ///
+    /// One past the last row is not this error: that is the pass having read
+    /// every row clean, which is the state confirmation is reached in.
+    ConfirmCursorOutOfRange {
+        /// What the slot said.
+        row: u8,
+    },
+    /// A confirmation machine that is not running, carrying the work of one
+    /// that was: a pass part-way through, or a report already made.
+    IdleConfirmWithProgress {
+        /// How far the pass had got.
+        cursor: u8,
+    },
+    /// A confirmation claiming it has said so while its cursor has not read
+    /// every row back: progress no pass produces, and a shape that would keep
+    /// the confirmation silent for the rest of the process.
+    ConfirmedWithIncompletePass {
+        /// How far the pass had got.
+        cursor: u8,
+    },
+}
+
+impl core::fmt::Display for DriverStateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TorqueBitsOutOfRange { bits } => write!(
+                f,
+                "torque bits {bits:#06x} reach past the {JOINT_COUNT} bus rows"
+            ),
+            Self::HealthCursorOutOfRange { row } => write!(
+                f,
+                "health rotation cursor {row} is past the {JOINT_COUNT} bus rows"
+            ),
+            Self::ConfirmCursorOutOfRange { row } => write!(
+                f,
+                "confirmation cursor {row} is past the {JOINT_COUNT} bus rows"
+            ),
+            Self::IdleConfirmWithProgress { cursor } => write!(
+                f,
+                "a confirmation that is not running carries a pass at row {cursor}"
+            ),
+            Self::ConfirmedWithIncompletePass { cursor } => write!(
+                f,
+                "a confirmation says it confirmed with the pass at row {cursor} of {JOINT_COUNT}"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for DriverStateError {}

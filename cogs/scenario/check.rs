@@ -16,13 +16,18 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__msgs_clk_rs::{JointRef, PoseEstimate};
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__driver__health_clk_rs::EventKind;
+use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
+use brenn_reachy__motion__joints_clk_rs::JointRefWire;
 use log_read::Logged;
-use motion_slots::{read_pose, row_from_joint_ref};
+use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use reachy_kin::wrap_to_pi;
-use reachy_motion::joints::{JointGroup, JointId, JointTargets};
-use reachy_wire::{EventKind, JOINT_MASK_ALL, PoseSample};
+use reachy_motion::joints::{
+    JointGroup, JointRef, JointTargets, ROW_COUNT, flags, group_of, joint_ref, row, rows_of,
+};
+use reachy_motion::record;
 
 use crate::read::Run;
 use crate::{
@@ -46,7 +51,8 @@ pub const STEP_SLACK: f64 = 1e-9;
 /// in a command's antenna pair: which bus rows they sit on and which way round
 /// the pair reads are both the motion library's statement, and a checker holding
 /// its own copy would go on asserting about rows 7 and 8 whatever moved there.
-pub const ANTENNAS: [(JointId, usize); 2] = [(JointId::AntennaRight, 0), (JointId::AntennaLeft, 1)];
+pub const ANTENNAS: [(JointRef, usize); 2] =
+    [(JointRef::AntennaRight, 0), (JointRef::AntennaLeft, 1)];
 
 /// The driver's heartbeat: one sample per cycle, on the grid, without a gap,
 /// from the cycle the driver first runs on through the end of the scenario. The
@@ -71,7 +77,7 @@ pub fn heartbeat(run: &Run, end_cycle: i64, failures: &mut Vec<String>) -> Optio
         failures.push("the driver published no samples at all".to_owned());
         return None;
     }
-    let first = match cycle_of(run.samples[0].message.message.nominal_time_ns) {
+    let first = match cycle_of(run.samples[0].message.nominal_time().as_nanos()) {
         Ok(cycle) => cycle,
         Err(complaint) => {
             failures.push(format!("the first sample is not on the grid: {complaint}"));
@@ -85,7 +91,7 @@ pub fn heartbeat(run: &Run, end_cycle: i64, failures: &mut Vec<String>) -> Optio
         ));
     }
     for (index, sample) in run.samples.iter().enumerate() {
-        let nominal = sample.message.message.nominal_time_ns;
+        let nominal = sample.message.nominal_time().as_nanos();
         let expected = cycle_at(first + index as i64);
         if nominal != expected {
             failures.push(format!(
@@ -119,11 +125,12 @@ pub fn heartbeat(run: &Run, end_cycle: i64, failures: &mut Vec<String>) -> Optio
 /// subject rather than a background condition.
 pub fn readings_present(run: &Run, failures: &mut Vec<String>) {
     for sample in &run.samples {
-        let sample = &sample.message.message;
-        if !sample.present_valid || sample.miss_mask != 0 {
+        let sample = &sample.message;
+        let complete = joint_set(sample.missing()).is_ok_and(flags::is_empty);
+        if !sample.present_valid() || !complete {
             failures.push(format!(
                 "the sample nominal at {} carries no reading, and this scenario takes none away",
-                sample.nominal_time_ns
+                sample.nominal_time().as_nanos()
             ));
             break;
         }
@@ -176,40 +183,43 @@ pub fn goal_stream(run: &Run, failures: &mut Vec<String>) -> Option<GoalStream> 
             ));
             break;
         }
-        let datagram = &goal.message.message;
+        let setpoint = &goal.message;
+        let execute_at_ns = setpoint.execute_at().as_nanos();
+        let targets = targets_of(setpoint);
         let due = nominal + LAG_K * PERIOD_NS;
-        if datagram.execute_at_ns != due {
+        if execute_at_ns != due {
             due_at.push(
-                format!(
-                    "the goal decided at {nominal} is due at {}, expected {due}",
-                    datagram.execute_at_ns
-                ),
+                format!("the goal decided at {nominal} is due at {execute_at_ns}, expected {due}"),
                 failures,
             );
         }
-        if datagram.mask != JOINT_MASK_ALL {
-            speaks_for.push(
+        match joint_set(setpoint.mask()) {
+            Ok(mask) if mask == flags::all() => {}
+            Ok(mask) => speaks_for.push(
                 format!(
-                    "the goal decided at {nominal} speaks for rows {:#b}, and no servo went out of \
+                    "the goal decided at {nominal} speaks for {}, and no servo went out of \
                      service in this scenario",
-                    datagram.mask
+                    flags::Names(mask)
                 ),
                 failures,
-            );
+            ),
+            Err(complaint) => speaks_for.push(
+                format!("the goal decided at {nominal} names no set of servos: {complaint}"),
+                failures,
+            ),
         }
         if let Some((was_due, was)) = previous {
-            if datagram.execute_at_ns <= was_due {
+            if execute_at_ns <= was_due {
                 ordered.push(
                     format!(
-                        "the goal decided at {nominal} is due at {}, not after the one before it \
-                         at {was_due}",
-                        datagram.execute_at_ns
+                        "the goal decided at {nominal} is due at {execute_at_ns}, not after the \
+                         one before it at {was_due}"
                     ),
                     failures,
                 );
             }
             for (row, before) in was.iter().enumerate() {
-                let step = (datagram.targets[row] - before).abs();
+                let step = (targets[row] - before).abs();
                 let Some(cap) = slew_of(row) else {
                     travel.push(
                         format!(
@@ -231,7 +241,7 @@ pub fn goal_stream(run: &Run, failures: &mut Vec<String>) -> Option<GoalStream> 
                 }
             }
         }
-        previous = Some((datagram.execute_at_ns, datagram.targets));
+        previous = Some((execute_at_ns, targets));
     }
     for property in [due_at, speaks_for, ordered, travel] {
         property.summarise(failures);
@@ -240,6 +250,20 @@ pub fn goal_stream(run: &Run, failures: &mut Vec<String>) -> Option<GoalStream> 
         first_cycle: first,
         last_cycle: first + run.goals.len() as i64 - 1,
     })
+}
+
+/// The angles a setpoint asks for, in bus-row order.
+///
+/// Read through the same mapping the cogs write with, so a checker cannot put a
+/// servo's angle under another servo's row while asserting that the run did
+/// not. Nine scalars carry nothing a validation can refuse, so the fall-back
+/// stands only where the generated route insists on an answer.
+fn targets_of(setpoint: &GoalSetpointWire) -> [f64; ROW_COUNT] {
+    setpoint
+        .targets()
+        .validate()
+        .map(rows_of)
+        .unwrap_or_default()
 }
 
 /// One property of the goal stream, asserted per goal and reported without
@@ -295,7 +319,7 @@ impl PerGoal {
 /// bound taken from the wrong group permits a jump the plant cannot make.
 #[must_use]
 pub fn slew_of(row: usize) -> Option<f64> {
-    Some(match JointId::from_index(row)?.group() {
+    Some(match group_of(joint_ref(row)?)? {
         JointGroup::Antennas => SLEW_ANTENNAS_RAD,
         JointGroup::BodyYaw => SLEW_BODY_YAW_RAD,
         JointGroup::Legs => SLEW_LEGS_RAD,
@@ -388,7 +412,7 @@ pub fn estimates_per_sample(run: &Run, failures: &mut Vec<String>) {
     }
     for (index, (estimate, sample)) in run.estimates.iter().zip(&run.samples).enumerate() {
         let validity = estimate.message.time_of_validity().as_nanos();
-        let reading = sample.message.message.sample_time_ns;
+        let reading = sample.message.sample_time().as_nanos();
         if validity != reading {
             failures.push(format!(
                 "estimate {index} is valid at {validity}, and the reading it is the {index}th of \
@@ -446,7 +470,7 @@ pub fn arrived_at(
         ));
         return;
     };
-    let Ok(found) = read_pose(&estimate.message) else {
+    let Some(found) = solved_pose(&estimate.message) else {
         failures.push(format!(
             "the estimate at {at} holds numbers that are not a pose, where the machine should be \
              {what}"
@@ -465,16 +489,17 @@ pub fn arrived_at(
         return;
     };
     for (antenna, slot) in ANTENNAS {
-        let Some(row) = antenna.index() else {
+        let Some(row) = row(antenna) else {
             failures.push(format!("{antenna:?} sits on no bus row"));
             continue;
         };
-        let error = wrap_to_pi(sample.present[row] - wanted.antennas[slot]).abs();
+        let present = present_rows(sample);
+        let error = wrap_to_pi(present[row] - wanted.antennas[slot]).abs();
         if error > ARRIVAL_TOLERANCE {
             failures.push(format!(
                 "at cycle {cycle} {antenna:?} points {error} rad away from where {what} puts it: \
                  it reads {} rad and the posture names {} rad",
-                sample.present[row], wanted.antennas[slot]
+                present[row], wanted.antennas[slot]
             ));
         }
     }
@@ -534,11 +559,14 @@ pub fn schedules_replayed(run: &Run, wanted: &[Session], failures: &mut Vec<Stri
     }
 }
 
-/// The joint a report names, or `None` where it names none or names a row this
-/// machine has not got.
+/// The joint a report names, or `None` where it names none or names a servo this
+/// build's vocabulary has not got.
 #[must_use]
-pub fn joint_of(joint: JointRef) -> Option<JointId> {
-    JointId::from_index(usize::from(row_from_joint_ref(joint).ok()?))
+pub fn joint_of(joint: JointRefWire) -> Option<JointRef> {
+    match joint.to_known()? {
+        JointRef::None => None,
+        named => Some(named),
+    }
 }
 
 /// One step is long enough for the move it asks for.
@@ -577,10 +605,20 @@ pub fn no_faults(run: &Run, failures: &mut Vec<String>) {
 pub fn no_events(run: &Run, failures: &mut Vec<String>) {
     for event in &run.events {
         failures.push(format!(
-            "the driver's gate raised {:?} at {}, and nothing in this scenario asks it to",
-            event.message.message.kind, event.message.message.time_ns
+            "the driver's gate raised {} at {}, and nothing in this scenario asks it to",
+            event.message.kind(),
+            event.message.time().as_nanos()
         ));
     }
+}
+
+/// The nine measured angles a sample carries, in bus order.
+///
+/// The one reading of a sample's positions the checkers share, so a scenario
+/// asks for a row by the number the plant and the cogs use.
+#[must_use]
+pub fn present_rows(sample: &PoseSampleWire) -> [f64; ROW_COUNT] {
+    sample.present().validate().map(rows_of).unwrap_or_default()
 }
 
 /// The sample the driver published for `cycle`, if the log has one.
@@ -588,11 +626,11 @@ pub fn no_events(run: &Run, failures: &mut Vec<String>) {
 /// By the instant the sample is *about* rather than the instant it was logged
 /// at, because those are two clocks and a scenario reasons in the first one.
 #[must_use]
-pub fn sample_at(run: &Run, cycle: i64) -> Option<&PoseSample> {
+pub fn sample_at(run: &Run, cycle: i64) -> Option<&PoseSampleWire> {
     at_instant(&run.samples, cycle_at(cycle), |sample| {
-        sample.message.message.nominal_time_ns
+        sample.message.nominal_time().as_nanos()
     })
-    .map(|sample| &sample.message.message)
+    .map(|sample| &sample.message)
 }
 
 /// The message of a dense, ordered stream whose own instant is `at`.
@@ -625,7 +663,7 @@ pub fn goal_at(run: &Run, cycle: i64) -> Option<[f64; 9]> {
     at_instant(&run.goals, cycle_at(cycle) + CONTROL_DELAY_NS, |goal| {
         goal.at_ns
     })
-    .map(|goal| goal.message.message.targets)
+    .map(|goal| targets_of(&goal.message))
 }
 
 /// The estimate the pose cog published for `cycle`, if the log has one.
@@ -634,7 +672,7 @@ pub fn goal_at(run: &Run, cycle: i64) -> Option<[f64; 9]> {
 /// other way to reach a pose in this module goes through here, so there is one
 /// answer to "which estimate is cycle N's" rather than one per caller.
 #[must_use]
-pub fn estimate_at(run: &Run, cycle: i64) -> Option<&Logged<PoseEstimate>> {
+pub fn estimate_at(run: &Run, cycle: i64) -> Option<&Logged<PoseEstimateWire>> {
     at_instant(&run.estimates, cycle_at(cycle), |estimate| {
         estimate.message.time_of_validity().as_nanos()
     })
@@ -644,18 +682,33 @@ pub fn estimate_at(run: &Run, cycle: i64) -> Option<&Logged<PoseEstimate>> {
 #[must_use]
 pub fn head_pose_at(run: &Run, cycle: i64) -> Option<Isometry3<f64>> {
     let estimate = estimate_at(run, cycle)?;
-    if !estimate.message.valid() {
+    if !bool::from(estimate.message.validate().ok()?.valid) {
         return None;
     }
-    read_pose(&estimate.message).ok()
+    solved_pose(&estimate.message)
+}
+
+/// The pose an estimate message describes, whatever its `valid` flag says.
+///
+/// `None` for bytes that do not read as an estimate and for a rotation that is
+/// no rotation -- one question, because to a checker they are the same answer:
+/// this message names no pose.
+fn solved_pose(estimate: &PoseEstimateWire) -> Option<Isometry3<f64>> {
+    let estimate = estimate.validate().ok()?;
+    record::read_pose(&estimate.head_pos, &estimate.head_quat).ok()
 }
 
 /// The driver's gate raised exactly one event, of `kind`, on the cycle the
-/// scenario's arithmetic names, carrying the number it should carry.
+/// scenario's arithmetic names, carrying the silence it should carry.
 ///
 /// Both numbers are named exactly rather than bracketed, because both are
 /// arithmetic: a deterministic run does not drift, so a bracket would be a
 /// tolerance for a mistake rather than for a machine.
+///
+/// `silence_ns` is the evidence field the two kinds this helper is asked about
+/// carry. A kind whose evidence is a count or a set of servos is not one any
+/// scenario asserts today, and would want its own reading rather than this
+/// one's.
 ///
 /// The cycle it fired on, for a caller that wants to say what the machine did
 /// afterwards.
@@ -663,52 +716,60 @@ pub fn sole_event(
     run: &Run,
     kind: EventKind,
     at_cycle: i64,
-    detail: u32,
+    silence_ns: i64,
     failures: &mut Vec<String>,
 ) -> Option<i64> {
     let mut fired = None;
     for event in &run.events {
-        let event = &event.message.message;
-        let cycle = match cycle_of(event.time_ns) {
+        let event = &event.message;
+        let cycle = match cycle_of(event.time().as_nanos()) {
             Ok(cycle) => cycle,
             Err(complaint) => {
                 failures.push(format!("an event is not on the grid: {complaint}"));
                 continue;
             }
         };
-        if event.kind != kind {
+        let raised = match event.kind().to_known() {
+            Some(raised) => raised,
+            None => {
+                failures.push(format!(
+                    "an event at cycle {cycle} names a kind this build does not know"
+                ));
+                continue;
+            }
+        };
+        if raised != kind {
             failures.push(format!(
-                "the driver's gate raised {:?} at cycle {cycle}, and the only event this scenario \
-                 asks it for is {kind:?}",
-                event.kind
+                "the driver's gate raised {raised} at cycle {cycle}, and the only event this \
+                 scenario asks it for is {kind}"
             ));
             continue;
         }
         if fired.is_some() {
             failures.push(format!(
-                "the gate raised {kind:?} again at cycle {cycle}: a latch is a transition, and the \
+                "the gate raised {kind} again at cycle {cycle}: a latch is a transition, and the \
                  standing condition is not news"
             ));
             continue;
         }
         if cycle != at_cycle {
             failures.push(format!(
-                "the gate raised {kind:?} at cycle {cycle}, and the scenario's arithmetic puts it \
+                "the gate raised {kind} at cycle {cycle}, and the scenario's arithmetic puts it \
                  at cycle {at_cycle}"
             ));
         }
-        if event.detail != detail {
+        if event.silence().as_nanos() != silence_ns {
             failures.push(format!(
-                "the {kind:?} at cycle {cycle} carries {}, and the scenario's arithmetic makes it \
-                 {detail}",
-                event.detail
+                "the {kind} at cycle {cycle} carries a silence of {}ns, and the scenario's \
+                 arithmetic makes it {silence_ns}ns",
+                event.silence().as_nanos()
             ));
         }
         fired = Some(cycle);
     }
     if fired.is_none() {
         failures.push(format!(
-            "the gate never raised {kind:?}, and this scenario is about the cycle it does"
+            "the gate never raised {kind}, and this scenario is about the cycle it does"
         ));
     }
     fired
@@ -725,16 +786,16 @@ pub fn latch_from(run: &Run, fired: Option<i64>, failures: &mut Vec<String>) {
         return;
     };
     for sample in &run.samples {
-        let sample = &sample.message.message;
-        let Ok(cycle) = cycle_of(sample.nominal_time_ns) else {
+        let sample = &sample.message;
+        let Ok(cycle) = cycle_of(sample.nominal_time().as_nanos()) else {
             continue;
         };
         let wanted = cycle >= fired;
-        if sample.torque_off_latched != wanted {
+        if sample.torque_off_latched() != wanted {
             failures.push(format!(
                 "the sample at cycle {cycle} says the torque-off latch is {}, and the gate fired \
                  at cycle {fired}",
-                sample.torque_off_latched
+                sample.torque_off_latched()
             ));
             return;
         }
@@ -789,21 +850,21 @@ pub fn stands_still(
     why: &str,
     failures: &mut Vec<String>,
 ) {
-    let Some(stood) = sample_at(run, from_cycle).map(|sample| sample.present) else {
+    let Some(stood) = sample_at(run, from_cycle).map(present_rows) else {
         failures.push(format!(
             "no sample for cycle {from_cycle}, where the machine was {why}"
         ));
         return;
     };
     for sample in &run.samples {
-        let sample = &sample.message.message;
-        let Ok(cycle) = cycle_of(sample.nominal_time_ns) else {
+        let sample = &sample.message;
+        let Ok(cycle) = cycle_of(sample.nominal_time().as_nanos()) else {
             continue;
         };
         if cycle < from_cycle || cycle > through_cycle {
             continue;
         }
-        if sample.present != stood {
+        if present_rows(sample) != stood {
             failures.push(format!(
                 "the machine moved by cycle {cycle}, and from cycle {from_cycle} it was {why}"
             ));

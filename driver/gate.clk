@@ -1,0 +1,60 @@
+// The goal gate's state: what has been commanded, what is queued for later,
+// and when the commander was last heard from.
+//
+// This is the driver's own cross-cycle memory, and it is a schema because every
+// host of the gate keeps it somewhere a process restart or a slot crossing can
+// read: the simulated driver keeps it in its state slot, and the motor driver
+// process keeps the same declaration in its own memory. One description, so the
+// two cannot disagree about which goal is due or about how long silence has
+// gone on.
+//
+// Its own module, apart from the setpoint it queues, because a gate is state
+// and a setpoint is a message: whoever only commands the machine must not
+// rebuild when the gate grows a field.
+//
+// Time is `SyncTime`, never a bare nanosecond count. A queue's length is the
+// array's own, so no separate number can disagree with it.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+use driver::goal;
+
+// A goal queue, the setpoint being held, and the dead-man's last observation.
+//
+// A slot nothing wrote reads as a gate that has been told nothing: an empty
+// queue, nothing held, no latch, and a dead-man that is not running -- which is
+// what a driver nobody has spoken to yet is, rather than a driver that has gone
+// quiet.
+schema GateState
+{
+    uuid: 4d0c6f2a-9b3e-4a51-8f6d-2c7a1e5b04d9;
+    fields
+    {
+        // Goals accepted and not yet executed, oldest first. One executes per
+        // cycle, so a burst drains at the cycle rate rather than becoming a
+        // jump; a goal offered to a full queue is refused rather than absorbed.
+        #0 queue: VarArray<goal::GoalSetpoint, 5>;
+
+        // The setpoint currently held, rewritten every cycle no new goal is due
+        // for -- what keeps a servo's position loop awake between goals.
+        // Meaningful only when `has_held`.
+        #1 held: goal::GoalSetpoint;
+
+        // Whether anything has ever been commanded.
+        #2 has_held: Bool;
+
+        // Whether the gate has latched torque off. Only a fresh arming ends a
+        // latch, and while it stands the gate asks for a torque-off sweep every
+        // cycle.
+        #3 latched: Bool;
+
+        // When liveness was last observed -- an accepted goal, or an arming.
+        // Meaningful only when `has_accepted`.
+        #4 last_accept: SyncTime;
+
+        // Whether liveness has ever been observed. Until it has, the dead-man
+        // does not run.
+        #5 has_accepted: Bool;
+    }
+}

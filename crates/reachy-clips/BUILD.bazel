@@ -18,8 +18,13 @@ rust_library(
     ),
     visibility = ["//visibility:public"],
     deps = [
+        "//clips:player_clk_rs",
+        "//cogs:config_clk_rs",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//geometry:primitives_clk_rs",
+        "//motion:joints_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
         "@brenn_reachy_crates//:anyhow",
         "@brenn_reachy_crates//:nalgebra",
         "@brenn_reachy_crates//:serde",

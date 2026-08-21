@@ -227,22 +227,25 @@ What is autonomous is reaching the MRC itself.
 
 ## How a fault is reported
 
-One channel: an append-only, per-session **fault timeline** of typed entries —
-a fault with its slug and detail, a response with its maneuver and how far it
-got (started, expanded, fell through, ended unconfirmed, completed). A
-compound ending reads back as the sequence it was, so "the head was grabbed,
-the stow started, a servo dropped out, the stow carried on without it,
-everything ended limp" is data rather than prose to be reconstructed.
+A classification happens once, where the condition is observed, and travels as
+the value it was classified as: a fault on the report of the period that raised
+it, a maneuver's ending on the wind-down's. Nothing downstream re-derives a
+class, and nothing parses one back out of rendered text.
 
-Readable two ways from the start: **pull** — the record is handed out with the
-result and queryable while the session runs; **push** — a subscriber receives
-each entry as it appends, which is how a daemon turns a fault into an alert
-without polling. An operator line is a *rendering* of entries. Nothing parses
-a class back out of rendered text.
+The narration is the session's own **fault timeline** — typed rows, each a
+fault with its slug and detail or a response with its maneuver and how far it
+got (started, expanded, fell through, ended unconfirmed, completed). A compound
+ending reads back as the sequence it was, so "the head was grabbed, the stow
+started, a servo dropped out, the stow carried on without it, everything ended
+limp" is data rather than prose to be reconstructed. It is bounded and lives in
+the session's own state, because a story is narration: what mattered already
+travelled on the channel that raised it. An operator line, a status file and a
+daemon's alert are all *renderings* of those rows; none of them is the record.
 
-The timeline never grows at poll rate: a fault appends the once, on the period
-it is raised, so a servo whose error bits stay latched for the rest of the
-session adds nothing after the entry that took it out of service.
+The timeline never grows at poll rate: a fault is narrated the once, on the
+period it is raised, so a servo whose error bits stay latched for the rest of
+the session adds nothing after the row that took it out of service. Entry into
+the mask is the raise.
 
 ## Attended and unattended differ in exactly one place
 

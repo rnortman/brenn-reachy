@@ -12,18 +12,19 @@
 //! whether the condition is met -- which is itself asserted: a cycle offered
 //! early must not run.
 
-use brenn_reachy__cogs__config_clk_rs::SimParams;
-use brenn_reachy__cogs__msgs_clk_rs::{JointFlags, Joints, SimCmd, SimOp, SimState};
+use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
 use brenn_reachy__cogs__sim_clk_rs_test::MotorSimTestWrapper;
-use clockwork__clockwork__io__var_packet_clk_rs::{VarPacket__64, VarPacket__128, VarPacket__288};
+use brenn_reachy__cogs__sim_state_clk_rs::{SimCmdWire, SimOpWire, SimState, SimStateWire};
+use brenn_reachy__driver__gate_clk_rs::GateState;
+use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+use brenn_reachy__driver__health_clk_rs::EventKind;
+use brenn_reachy__driver__pose_clk_rs::PoseSample;
+use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointsWire};
 use clockwork_rs::SyncTime;
-use motion_slots::{joint_flags, rows_from_joints, write_joints};
-use reachy_driver::QUEUE_CAP;
+use reachy_driver::{JOINT_COUNT, JOINT_MASK_ALL};
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
-use reachy_motion::joints::{JointId, JointSet};
-use reachy_wire::{DriverEvent, EventKind, GoalSetpoint, JOINT_COUNT, JOINT_MASK_ALL, PoseSample};
-use sim_slots::read_sim;
+use reachy_motion::joints::{self, JointRef, flags, rows_of, write_rows, write_vector};
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -52,7 +53,15 @@ const MAX_CATCHUP_CYCLES: f64 = 8.0;
 
 /// The nine angles the machine rests at, which is where every case finds it.
 fn stow_rows() -> [f64; JOINT_COUNT] {
-    rows_from_joints(&stow_targets(default_geometry()).expect("the baked geometry reaches stow"))
+    let mut slot = JointsWire::new();
+    write_vector(
+        slot.clear_valid(),
+        &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
+    );
+    rows_of(
+        slot.validate()
+            .expect("a cleared vector of angles reads back"),
+    )
 }
 
 /// What one cycle published.
@@ -60,11 +69,73 @@ struct Cycle {
     /// The cycle's grid instant.
     nominal: i64,
     /// The sample, which every cycle publishes without exception.
-    sample: PoseSample,
-    /// Its wire sequence number.
-    sample_seq: u32,
+    sample: Sample,
     /// The event, if the cycle had one to report.
-    event: Option<(DriverEvent, u32)>,
+    event: Option<Event>,
+}
+
+/// One published event, copied out of the message for the reason [`Sample`] is.
+#[derive(Clone, Copy)]
+struct Event {
+    kind: EventKind,
+    time_ns: i64,
+    /// The silence or the lateness the kind names, nanoseconds.
+    silence_ns: i64,
+    /// How many of whatever the kind counts.
+    count: u32,
+}
+
+/// One published sample, copied out of the message.
+///
+/// Copied because the wrapper returns a borrow into cog memory that the next
+/// cog call invalidates, and a case compares two cycles.
+struct Sample {
+    /// The cycle's grid instant.
+    nominal_time_ns: i64,
+    /// When the read completed.
+    sample_time_ns: i64,
+    /// Whether the reading is a complete one.
+    present_valid: bool,
+    /// Whether a setpoint is being held.
+    commanded_valid: bool,
+    torque_off_latched: bool,
+    /// The rows that did not answer, as the bits the schema holds.
+    missing: u16,
+    /// Measured positions, radians in bus order.
+    present: [f64; JOINT_COUNT],
+    /// The setpoint held, radians in bus order.
+    commanded: [f64; JOINT_COUNT],
+}
+
+impl Sample {
+    fn of(msg: &PoseSample) -> Self {
+        Self {
+            nominal_time_ns: msg.nominal_time.as_nanos(),
+            sample_time_ns: msg.sample_time.as_nanos(),
+            present_valid: msg.present_valid.into(),
+            commanded_valid: msg.commanded_valid.into(),
+            torque_off_latched: msg.torque_off_latched.into(),
+            missing: JointFlagsWire::from(msg.missing).0,
+            present: rows_of(&msg.present),
+            commanded: rows_of(&msg.commanded),
+        }
+    }
+}
+
+/// One setpoint, as the control loop's channel carries it.
+///
+/// Written here in the bus-row terms the cases reason in -- a mask of bits and
+/// nine angles in row order -- and mapped into the schema's vocabulary once, so
+/// a case says what it means and only this function knows which field is which.
+fn setpoint(execute_at_ns: i64, mask: u16, targets: [f64; JOINT_COUNT]) -> GoalSetpointWire {
+    let mut msg = GoalSetpointWire::new();
+    let view = msg.clear_valid();
+    view.execute_at = SyncTime::from_nanos(execute_at_ns);
+    view.mask = JointFlagsWire(mask)
+        .to_known()
+        .expect("the cases name servos this build knows");
+    write_rows(&mut view.targets, &targets);
+    msg
 }
 
 /// A cog under test, with its own channels looped back by hand.
@@ -73,9 +144,6 @@ struct Sim {
     cog: MotorSimTestWrapper,
     /// The instant of the last cycle run.
     now: i64,
-    /// The sequence number the next goal datagram carries. The control loop
-    /// numbers its own datagrams; here the harness stands in for it.
-    goal_seq: u32,
 }
 
 impl Sim {
@@ -97,53 +165,41 @@ impl Sim {
         cog.input_goals_set_num_slots(8);
         cog.input_cmds_set_num_slots(8);
         cog.input_own_pose_set_num_slots(1);
-        cog.input_own_evt_set_num_slots(1);
 
         // Seeded after `initialize`: a config record is not reachable before
         // the wrapper has stood the cog up, and the first execution has not run
         // yet, so nothing reads it in between.
         cog.initialize(SyncTime::from_nanos(T0));
 
-        let mut params = SimParams::new();
-        params.set_period_ns(PERIOD);
-        params.set_hold_timeout_ns(HOLD_TIMEOUT);
-        params.set_start_torqued(start_torqued);
-        params.set_slew_legs_rad(SLEW_LEGS);
-        params.set_slew_body_yaw_rad(SLEW_LEGS);
-        params.set_slew_antennas_rad(SLEW_ANTENNAS);
-        edit(&mut params);
-        cog.set_config_params(&params);
+        let mut message = SimParamsWire::new();
+        let params = message.clear_valid();
+        params.period_ns = PERIOD;
+        params.hold_timeout_ns = HOLD_TIMEOUT;
+        params.start_torqued = start_torqued.into();
+        params.slew_legs_rad = SLEW_LEGS;
+        params.slew_body_yaw_rad = SLEW_LEGS;
+        params.slew_antennas_rad = SLEW_ANTENNAS;
+        edit(params);
+        cog.set_config_params(&message);
 
-        Self {
-            cog,
-            now: T0,
-            goal_seq: 0,
-        }
+        Self { cog, now: T0 }
     }
 
-    /// Hand the cog a goal datagram, as the control loop's channel would.
-    fn send_goal(&mut self, goal: &GoalSetpoint) {
-        let seq = self.goal_seq;
-        self.goal_seq = self.goal_seq.wrapping_add(1);
-        let mut packet = VarPacket__128::new();
-        assert!(
-            packet.try_set_bytes(&goal.encode(seq)),
-            "the carrier holds a GoalSetpoint datagram",
-        );
-        self.cog
-            .publish_goals(&packet, SyncTime::from_nanos(self.now));
+    /// Hand the cog a setpoint, as the control loop's channel would.
+    fn send_goal(&mut self, goal: &GoalSetpointWire) {
+        self.cog.publish_goals(goal, SyncTime::from_nanos(self.now));
     }
 
     /// Hand the cog one of the scenario's injections.
-    fn inject(&mut self, op: SimOp, mask: JointSet) {
-        let mut cmd = SimCmd::new();
+    fn inject(&mut self, op: SimOpWire, mask: JointFlags) {
+        let mut cmd = SimCmdWire::new();
         cmd.set_op(op);
-        cmd.set_mask(joint_flags(mask));
+        cmd.set_mask(JointFlagsWire::from(mask));
         self.cog.publish_cmds(&cmd, SyncTime::from_nanos(self.now));
     }
 
     /// Inject a command carrying a payload the plain form has no room for.
-    fn inject_full(&mut self, cmd: &SimCmd) {
+    fn inject_full(&mut self, cmd: &SimCmdWire) {
         self.cog.publish_cmds(cmd, SyncTime::from_nanos(self.now));
     }
 
@@ -162,39 +218,30 @@ impl Sim {
             self.now
         );
 
-        let bytes = self
+        let published = self
             .cog
             .try_next_pose()
-            .map(|packet| packet.bytes().as_slice().to_vec())
             .expect("every cycle publishes a sample");
-        let event_bytes = self
-            .cog
-            .try_next_evt()
-            .map(|packet| packet.bytes().as_slice().to_vec());
-
-        let (header, sample) = PoseSample::decode(&bytes).expect("a sample datagram");
-        let event = event_bytes.as_ref().map(|bytes| {
-            let (header, event) = DriverEvent::decode(bytes).expect("an event datagram");
-            (event, header.seq)
+        let sample = Sample::of(published.validate().expect("a sample the driver wrote"));
+        let message = published.clone();
+        let event = self.cog.try_next_evt().map(|published| {
+            let event = published.validate().expect("an event the driver wrote");
+            Event {
+                kind: event.kind,
+                time_ns: event.time.as_nanos(),
+                silence_ns: event.silence.as_nanos(),
+                count: event.count,
+            }
         });
 
-        // The self-loop, which a box would have made: the next cycle's sequence
-        // numbers are read out of these.
-        let mut packet = VarPacket__288::new();
-        assert!(packet.try_set_bytes(&bytes));
+        // The self-loop, which a box would have made: the sample the cog reads
+        // its own last publication back from.
         self.cog
-            .publish_own_pose(&packet, SyncTime::from_nanos(self.now));
-        if let Some(bytes) = event_bytes {
-            let mut packet = VarPacket__64::new();
-            assert!(packet.try_set_bytes(&bytes));
-            self.cog
-                .publish_own_evt(&packet, SyncTime::from_nanos(self.now));
-        }
+            .publish_own_pose(&message, SyncTime::from_nanos(self.now));
 
         Cycle {
             nominal: self.now,
             sample,
-            sample_seq: header.seq,
             event,
         }
     }
@@ -207,11 +254,7 @@ impl Sim {
     /// Run one cycle having commanded `targets` for the rows in `mask`, at the
     /// lag a well-formed goal stream uses.
     fn commanded_step(&mut self, targets: &[f64; JOINT_COUNT], mask: u16) -> Cycle {
-        let goal = GoalSetpoint {
-            execute_at_ns: self.now + PERIOD + LAG * PERIOD,
-            mask,
-            targets: *targets,
-        };
+        let goal = setpoint(self.now + PERIOD + LAG * PERIOD, mask, *targets);
         self.send_goal(&goal);
         self.step()
     }
@@ -219,18 +262,22 @@ impl Sim {
     /// The same, `cycles` after the last one: the goal stream carries on, so
     /// what the late cycle shows is the plant catching up and not the dead-man.
     fn commanded_step_by(&mut self, targets: &[f64; JOINT_COUNT], mask: u16, cycles: i64) -> Cycle {
-        let goal = GoalSetpoint {
-            execute_at_ns: self.now + cycles * PERIOD,
-            mask,
-            targets: *targets,
-        };
+        let goal = setpoint(self.now + cycles * PERIOD, mask, *targets);
         self.send_goal(&goal);
         self.step_by(cycles)
     }
 
-    /// What the state slot holds, read the way everything reads it.
-    fn slot(&self) -> sim_slots::SimSlot {
-        read_sim(self.cog.state_sim())
+    /// What the state slot holds, read the way the cog reads it.
+    fn slot(&self) -> &SimState {
+        self.cog
+            .state_sim()
+            .validate()
+            .expect("the cog leaves a state in its slot")
+    }
+
+    /// The gate the last cycle left.
+    fn gate(&self) -> &GateState {
+        &self.slot().gate
     }
 }
 
@@ -254,31 +301,69 @@ fn the_machine_starts_stowed_de_torqued_and_saying_so() {
         "nothing has been commanded yet"
     );
     assert!(!cycle.sample.torque_off_latched);
-    assert_eq!(cycle.sample.miss_mask, 0);
+    assert_eq!(cycle.sample.missing, 0);
     assert!(cycle.event.is_none(), "a quiet cycle reports nothing");
 
     let slot = sim.slot();
-    assert!(slot.initialized);
+    assert!(slot.initialized.get());
     assert_eq!(
-        slot.plant.torqued,
-        JointSet::EMPTY,
+        slot.torqued,
+        JointFlags::NONE,
         "the scenario has not armed it"
     );
-    assert_eq!(slot.plant.positions, stow_rows());
+    assert_eq!(rows_of(&slot.positions), stow_rows());
 }
 
 #[test]
-fn a_sample_goes_out_every_cycle_and_its_sequence_comes_from_the_last_one() {
+fn a_sample_goes_out_every_cycle_stamped_with_the_cycle_it_is_for() {
     let mut sim = Sim::new();
     for (step, cycle) in sim.quiet(5).into_iter().enumerate() {
         assert_eq!(
-            cycle.sample_seq, step as u32,
-            "the first datagram is sequence zero and each one after is the last plus one",
-        );
-        assert_eq!(
             cycle.sample.nominal_time_ns,
-            T0 + (step as i64 + 1) * PERIOD
+            T0 + (step as i64 + 1) * PERIOD,
+            "one sample per cycle, on the grid",
         );
+    }
+}
+
+/// A partial mask writes its own rows and leaves every other servo holding what
+/// it already had.
+///
+/// The whole meaning of a mask to a driver, and the one place in the tree that
+/// turns a commanded setpoint into servo targets, so this is where it is held.
+/// A mask applied the other way round -- or ignored -- moves servos nobody
+/// asked to move.
+#[test]
+fn a_partial_mask_commands_only_its_own_rows() {
+    let mut sim = Sim::with(true);
+    let stow = stow_rows();
+    let mut asked = stow;
+    for row in &mut asked {
+        *row += 0.05;
+    }
+
+    let commanded = set_of(&[JointRef::BodyYaw, JointRef::Leg1]);
+    sim.commanded_step(&asked, JointFlagsWire::from(commanded).0);
+    let due = sim.quiet(1 + LAG as usize).pop().expect("a cycle ran");
+
+    assert!(due.sample.commanded_valid);
+    assert_eq!(
+        due.sample.commanded, asked,
+        "the sample reports the setpoint as it was sent, mask and all"
+    );
+
+    // Which rows those are comes from the set, not from a hand-written pair of
+    // indices: the joint-to-row numbering is the vocabulary's, and this is the
+    // case whose whole subject is that a mask reaches the rows it names.
+    let mut wanted = stow;
+    for joint in flags::iter(commanded) {
+        let row = joints::row(joint).expect("a masked joint is a servo");
+        wanted[row] = asked[row];
+    }
+
+    let moved = sim.quiet(20).pop().expect("a cycle ran");
+    for (row, (found, want)) in moved.sample.present.iter().zip(wanted.iter()).enumerate() {
+        assert_close(*found, *want, &format!("present row {row}"));
     }
 }
 
@@ -293,7 +378,7 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
         !first.sample.commanded_valid,
         "the goal is queued, not yet due"
     );
-    assert_eq!(sim.slot().gate.queued().len(), 1);
+    assert_eq!(sim.gate().queue.len(), 1);
 
     let waiting = sim.step();
     assert!(!waiting.sample.commanded_valid, "still one cycle early");
@@ -301,7 +386,7 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
     let due = sim.step();
     assert!(due.sample.commanded_valid, "its instant has come round");
     assert_eq!(due.sample.commanded, targets);
-    assert_eq!(sim.slot().counters.goals_executed, 1);
+    assert_eq!(sim.slot().goals_executed, 1);
     assert_eq!(
         due.sample.present[0],
         stow_rows()[0] + 0.05,
@@ -316,7 +401,7 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
         let quiet = sim.step();
         assert_eq!(quiet.sample.commanded, targets, "cycle {step}");
         assert_eq!(
-            sim.slot().counters.goals_executed,
+            sim.slot().goals_executed,
             1,
             "cycle {step}: one goal has been executed, however many rewrites",
         );
@@ -368,8 +453,8 @@ fn a_partial_mask_moves_only_its_own_rows() {
         *row += 0.05;
     }
     // Two rows, chosen apart so a mask applied to the wrong end is visible.
-    let rows = set_of(&[JointId::BodyYaw, JointId::AntennaLeft]);
-    let mask = rows.bits();
+    let rows = set_of(&[JointRef::BodyYaw, JointRef::AntennaLeft]);
+    let mask = JointFlagsWire::from(rows).0;
 
     for _ in 0..(LAG + 2) {
         sim.commanded_step(&targets, mask);
@@ -385,7 +470,7 @@ fn a_partial_mask_moves_only_its_own_rows() {
         );
     }
     let slot = sim.slot();
-    assert_eq!(slot.plant.has_target, rows, "only those rows are commanded");
+    assert_eq!(slot.has_target, rows, "only those rows are commanded");
 }
 
 #[test]
@@ -399,7 +484,7 @@ fn a_jammed_servo_holds_while_the_rest_of_the_machine_tracks() {
 
     // One crank jammed where it stands. Everything else is asked for the same
     // move, so what separates them is the obstruction and nothing else.
-    sim.inject(SimOp::OBSTRUCT, one(JointId::Leg(2)));
+    sim.inject(SimOpWire::OBSTRUCT, one(JointRef::Leg2));
     for _ in 0..(LAG + 2) {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
@@ -410,7 +495,7 @@ fn a_jammed_servo_holds_while_the_rest_of_the_machine_tracks() {
     );
     assert_close(jammed.sample.present[1], targets[1], "its neighbour tracks");
 
-    sim.inject(SimOp::RELEASE_OBSTRUCTION, one(JointId::Leg(2)));
+    sim.inject(SimOpWire::RELEASE_OBSTRUCTION, one(JointRef::Leg2));
     let freed = sim.commanded_step(&targets, JOINT_MASK_ALL);
     assert_close(
         freed.sample.present[3],
@@ -443,17 +528,17 @@ fn a_de_torqued_servo_holds_where_it_stands() {
 #[test]
 fn a_teleport_puts_the_servos_where_the_scenario_says() {
     let mut sim = Sim::new();
-    let mut positions = Joints::new();
+    let mut positions = JointsWire::new();
     let mut wanted = stow_rows();
     wanted[2] = 1.25;
     wanted[8] = -0.5;
-    write_joints(&mut positions, &motion_slots::joints_from_rows(&wanted));
+    write_rows(positions.clear_valid(), &wanted);
 
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp::SET_POSITIONS);
-    cmd.set_mask(joint_flags(set_of(&[
-        JointId::Leg(1),
-        JointId::AntennaLeft,
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::SET_POSITIONS);
+    cmd.set_mask(JointFlagsWire::from(set_of(&[
+        JointRef::Leg1,
+        JointRef::AntennaLeft,
     ])));
     *cmd.positions_mut() = positions;
     sim.inject_full(&cmd);
@@ -475,8 +560,8 @@ fn a_cycle_whose_replies_were_lost_says_so_and_the_machine_keeps_moving() {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
 
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp::DROP_REPLIES);
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::DROP_REPLIES);
     cmd.set_count(3);
     sim.inject_full(&cmd);
 
@@ -487,7 +572,7 @@ fn a_cycle_whose_replies_were_lost_says_so_and_the_machine_keeps_moving() {
             !cycle.sample.present_valid,
             "cycle {step}: nothing was read this cycle"
         );
-        assert_eq!(cycle.sample.miss_mask, JOINT_MASK_ALL, "cycle {step}");
+        assert_eq!(cycle.sample.missing, JOINT_MASK_ALL, "cycle {step}");
         last = Some(cycle.sample.present[1]);
     }
 
@@ -496,7 +581,7 @@ fn a_cycle_whose_replies_were_lost_says_so_and_the_machine_keeps_moving() {
         back.sample.present_valid,
         "the outage was three cycles long"
     );
-    assert_eq!(back.sample.miss_mask, 0);
+    assert_eq!(back.sample.missing, 0);
     assert!(
         back.sample.present[1] > last.expect("three cycles ran"),
         "the machine kept moving while nobody could see it"
@@ -515,7 +600,7 @@ fn silence_de_torques_the_machine_and_is_announced_exactly_once() {
     let mut latched = Vec::new();
     for _ in 0..(HOLD_TIMEOUT / PERIOD + 4) {
         let cycle = sim.step();
-        if let Some((event, _)) = cycle.event {
+        if let Some(event) = cycle.event {
             latched.push((event, cycle.nominal));
         }
     }
@@ -524,7 +609,7 @@ fn silence_de_torques_the_machine_and_is_announced_exactly_once() {
     let (event, at) = latched[0];
     assert_eq!(event.kind, EventKind::HoldTimeoutTorqueOff);
     assert_eq!(event.time_ns, at);
-    let silence = i64::from(event.detail) * 1_000;
+    let silence = event.silence_ns;
     assert!(
         (HOLD_TIMEOUT..=HOLD_TIMEOUT + PERIOD).contains(&silence),
         "the event says how long the stream was silent, and it is the window it \
@@ -536,9 +621,10 @@ fn silence_de_torques_the_machine_and_is_announced_exactly_once() {
     );
 
     let slot = sim.slot();
-    assert!(slot.gate.latched, "the latch stands until a fresh arming");
-    assert_eq!(slot.plant.torqued, JointSet::EMPTY);
-    assert_eq!(slot.counters.hold_timeouts, 1);
+    let gate = sim.gate();
+    assert!(gate.latched.get(), "the latch stands until a fresh arming");
+    assert_eq!(slot.torqued, JointFlags::NONE);
+    assert_eq!(slot.hold_timeouts, 1);
 
     let after = sim.step();
     assert!(
@@ -556,11 +642,11 @@ fn silence_before_the_first_goal_de_torques_too() {
     // The window a dead-man written around the held setpoint would miss: armed,
     // torqued, and the commander never said anything at all.
     let mut sim = Sim::new();
-    sim.inject(SimOp::TORQUE_ON, all_joints());
+    sim.inject(SimOpWire::TORQUE_ON, all_joints());
 
     let mut events = Vec::new();
     for _ in 0..(HOLD_TIMEOUT / PERIOD + 3) {
-        if let Some((event, _)) = sim.step().event {
+        if let Some(event) = sim.step().event {
             events.push(event);
         }
     }
@@ -568,29 +654,30 @@ fn silence_before_the_first_goal_de_torques_too() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, EventKind::HoldTimeoutTorqueOff);
     let slot = sim.slot();
-    assert!(!slot.gate.has_held, "nothing was ever commanded");
-    assert_eq!(slot.plant.torqued, JointSet::EMPTY);
+    let gate = sim.gate();
+    assert!(!gate.has_held.get(), "nothing was ever commanded");
+    assert_eq!(slot.torqued, JointFlags::NONE);
 }
 
 #[test]
 fn arming_ends_a_latch_and_grants_a_fresh_window() {
     let mut sim = Sim::new();
-    sim.inject(SimOp::TORQUE_ON, all_joints());
+    sim.inject(SimOpWire::TORQUE_ON, all_joints());
     for _ in 0..(HOLD_TIMEOUT / PERIOD + 3) {
         sim.step();
     }
     assert!(
-        sim.slot().gate.latched,
+        sim.gate().latched.get(),
         "the case rests on a standing latch"
     );
 
-    sim.inject(SimOp::TORQUE_ON, all_joints());
+    sim.inject(SimOpWire::TORQUE_ON, all_joints());
     let armed = sim.step();
     assert!(
         !armed.sample.torque_off_latched,
         "a fresh arming ends the latch"
     );
-    assert_eq!(sim.slot().plant.torqued, all_joints());
+    assert_eq!(sim.slot().torqued, all_joints());
 
     // And the window is measured from the arming rather than from the stall it
     // ended, so nothing fires for another whole timeout.
@@ -628,11 +715,11 @@ fn a_machine_re_armed_after_a_stall_moves_nothing_until_it_is_told_to() {
         stalled_at = sim.step().sample.present;
     }
     assert!(
-        sim.slot().gate.latched,
+        sim.gate().latched.get(),
         "the case rests on a standing latch"
     );
 
-    sim.inject(SimOp::TORQUE_ON, all_joints());
+    sim.inject(SimOpWire::TORQUE_ON, all_joints());
     for step in 0..5 {
         let cycle = sim.step();
         assert!(!cycle.sample.torque_off_latched, "cycle {step}");
@@ -671,10 +758,10 @@ fn a_partial_disarm_keeps_the_setpoint_the_rest_of_the_machine_is_holding() {
     for _ in 0..(LAG + 2) {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
-    assert!(sim.slot().gate.has_held, "something is being held");
+    assert!(sim.gate().has_held.get(), "something is being held");
 
-    let antennas = set_of(&[JointId::AntennaRight, JointId::AntennaLeft]);
-    sim.inject(SimOp::TORQUE_OFF, antennas);
+    let antennas = set_of(&[JointRef::AntennaRight, JointRef::AntennaLeft]);
+    sim.inject(SimOpWire::TORQUE_OFF, antennas);
     let cycle = sim.step();
 
     assert!(
@@ -685,14 +772,15 @@ fn a_partial_disarm_keeps_the_setpoint_the_rest_of_the_machine_is_holding() {
     assert!(!cycle.sample.torque_off_latched, "and nothing latched");
 
     let slot = sim.slot();
-    assert!(slot.gate.has_held);
+    let gate = sim.gate();
+    assert!(gate.has_held.get());
     assert_eq!(
-        slot.plant.torqued,
-        all_joints().without(antennas),
+        slot.torqued,
+        flags::without(all_joints(), antennas),
         "the named rows went off and no others"
     );
     assert_eq!(
-        slot.plant.has_target,
+        slot.has_target,
         all_joints(),
         "and every row still has the setpoint it was given"
     );
@@ -706,9 +794,9 @@ fn a_confirmed_disarm_forgets_the_setpoint_without_latching() {
     for _ in 0..(LAG + 2) {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
-    assert!(sim.slot().gate.has_held, "something is being held");
+    assert!(sim.gate().has_held.get(), "something is being held");
 
-    sim.inject(SimOp::TORQUE_OFF, all_joints());
+    sim.inject(SimOpWire::TORQUE_OFF, all_joints());
     let cycle = sim.step();
     assert!(
         !cycle.sample.torque_off_latched,
@@ -720,9 +808,10 @@ fn a_confirmed_disarm_forgets_the_setpoint_without_latching() {
     );
 
     let slot = sim.slot();
-    assert_eq!(slot.plant.torqued, JointSet::EMPTY);
-    assert_eq!(slot.plant.has_target, JointSet::EMPTY);
-    assert!(!slot.gate.latched);
+    let gate = sim.gate();
+    assert_eq!(slot.torqued, JointFlags::NONE);
+    assert_eq!(slot.has_target, JointFlags::NONE);
+    assert!(!gate.latched.get());
 }
 
 #[test]
@@ -732,49 +821,46 @@ fn a_sender_overrunning_the_queue_is_dropped_and_told() {
 
     // More goals in one cycle than the queue holds, all stamped far enough
     // ahead that none of them becomes due and drains a slot.
-    for i in 0..(QUEUE_CAP as i64 + 2) {
-        let goal = GoalSetpoint {
-            execute_at_ns: sim.now + (10 + i) * PERIOD,
-            mask: JOINT_MASK_ALL,
-            targets,
-        };
+    for i in 0..(queue_depth() as i64 + 2) {
+        let goal = setpoint(sim.now + (10 + i) * PERIOD, JOINT_MASK_ALL, targets);
         sim.send_goal(&goal);
     }
     let cycle = sim.step();
 
-    let (event, seq) = cycle.event.expect("the overrun is reported");
+    let event = cycle.event.expect("the overrun is reported");
     assert_eq!(event.kind, EventKind::GoalDroppedQueueFull);
     assert_eq!(
-        event.detail, QUEUE_CAP as u32,
+        event.count,
+        queue_depth() as u32,
         "and says how deep the queue was when it hit it"
     );
-    assert_eq!(seq, 0, "the first event this cog ever published");
-    let slot = sim.slot();
-    assert_eq!(slot.counters.goals_dropped, 2);
     assert_eq!(
-        slot.counters.events_dropped, 1,
+        event.silence_ns, 0,
+        "a queue overrun is not a lateness, so the field it does not name is zero"
+    );
+    let slot = sim.slot();
+    let gate = sim.gate();
+    assert_eq!(slot.goals_dropped, 2);
+    assert_eq!(
+        slot.events_dropped, 1,
         "two drops, one slot to report them in"
     );
-    assert_eq!(slot.gate.queued().len(), QUEUE_CAP);
+    assert_eq!(gate.queue.len(), queue_depth());
 }
 
 #[test]
 fn a_goal_stamped_for_an_instant_already_past_is_taken_and_warned() {
     let mut sim = Sim::with(true);
-    let goal = GoalSetpoint {
-        execute_at_ns: T0 - PERIOD,
-        mask: JOINT_MASK_ALL,
-        targets: stow_rows(),
-    };
+    let goal = setpoint(T0 - PERIOD, JOINT_MASK_ALL, stow_rows());
     sim.send_goal(&goal);
     let cycle = sim.step();
 
-    let (event, _) = cycle.event.expect("a stale goal is remarked on");
+    let event = cycle.event.expect("a stale goal is remarked on");
     assert_eq!(event.kind, EventKind::GoalStaleOrOutOfOrder);
     assert_eq!(
-        event.detail,
-        u32::try_from(2 * PERIOD / 1_000).expect("forty milliseconds is a small number"),
-        "and says how far past its instant it arrived, microseconds",
+        event.silence_ns,
+        2 * PERIOD,
+        "and says how far past its instant it arrived",
     );
     assert!(
         cycle.sample.commanded_valid,
@@ -783,35 +869,27 @@ fn a_goal_stamped_for_an_instant_already_past_is_taken_and_warned() {
 }
 
 /// A goal stamped ahead of now but behind the one before it has missed nothing
-/// yet, so what it is late by is nothing. The `detail` a stale goal carries is
+/// yet, so what it is late by is nothing. The silence a stale goal carries is
 /// how far past its instant it arrived, and this is the other situation the
 /// same outcome covers.
 #[test]
 fn a_goal_merely_out_of_order_says_it_is_late_by_nothing() {
     let mut sim = Sim::with(true);
     let targets = stow_rows();
-    let later = GoalSetpoint {
-        execute_at_ns: sim.now + 5 * PERIOD,
-        mask: JOINT_MASK_ALL,
-        targets,
-    };
-    let earlier = GoalSetpoint {
-        execute_at_ns: sim.now + 3 * PERIOD,
-        mask: JOINT_MASK_ALL,
-        targets,
-    };
+    let later = setpoint(sim.now + 5 * PERIOD, JOINT_MASK_ALL, targets);
+    let earlier = setpoint(sim.now + 3 * PERIOD, JOINT_MASK_ALL, targets);
     sim.send_goal(&later);
     sim.send_goal(&earlier);
     let cycle = sim.step();
 
-    let (event, _) = cycle.event.expect("the reordering is remarked on");
+    let event = cycle.event.expect("the reordering is remarked on");
     assert_eq!(event.kind, EventKind::GoalStaleOrOutOfOrder);
     assert_eq!(
-        event.detail, 0,
+        event.silence_ns, 0,
         "a goal whose instant is still ahead is late by nothing"
     );
     assert_eq!(
-        sim.slot().gate.queued().len(),
+        sim.gate().queue.len(),
         2,
         "and both are queued, in arrival order"
     );
@@ -829,28 +907,24 @@ fn the_dead_mans_latch_takes_the_slot_from_a_goal_event_raised_first() {
     let targets = stow_rows();
     // Far enough ahead that none of them ever becomes due and drains a slot.
     fn overrun(sim: &mut Sim, targets: &[f64; JOINT_COUNT]) {
-        let goal = GoalSetpoint {
-            execute_at_ns: sim.now + 1_000 * PERIOD,
-            mask: JOINT_MASK_ALL,
-            targets: *targets,
-        };
+        let goal = setpoint(sim.now + 1_000 * PERIOD, JOINT_MASK_ALL, *targets);
         sim.send_goal(&goal);
     }
-    for _ in 0..QUEUE_CAP {
+    for _ in 0..queue_depth() {
         overrun(&mut sim, &targets);
     }
     sim.step();
-    assert_eq!(sim.slot().gate.queued().len(), QUEUE_CAP);
+    assert_eq!(sim.gate().queue.len(), queue_depth());
 
     let mut latches = Vec::new();
     let mut dropped_before_latch = 0;
     for _ in 0..(HOLD_TIMEOUT / PERIOD + 4) {
-        let before = sim.slot().counters.events_dropped;
+        let before = sim.slot().events_dropped;
         overrun(&mut sim, &targets);
         let cycle = sim.step();
-        let after = sim.slot().counters.events_dropped;
+        let after = sim.slot().events_dropped;
         match cycle.event {
-            Some((event, _)) if event.kind == EventKind::HoldTimeoutTorqueOff => {
+            Some(event) if event.kind == EventKind::HoldTimeoutTorqueOff => {
                 assert_eq!(
                     after,
                     before + 1,
@@ -858,7 +932,7 @@ fn the_dead_mans_latch_takes_the_slot_from_a_goal_event_raised_first() {
                 );
                 latches.push(event);
             }
-            Some((event, _)) => {
+            Some(event) => {
                 assert_eq!(event.kind, EventKind::GoalDroppedQueueFull);
                 assert_eq!(after, before, "one event, one slot, nothing displaced");
                 if latches.is_empty() {
@@ -874,7 +948,7 @@ fn the_dead_mans_latch_takes_the_slot_from_a_goal_event_raised_first() {
         dropped_before_latch > 0,
         "the case rests on goal events being raised on the way there"
     );
-    assert!(sim.slot().gate.latched);
+    assert!(sim.gate().latched.get());
 }
 
 /// An injection this build cannot read does not reach the machine at all -- and
@@ -885,18 +959,18 @@ fn the_dead_mans_latch_takes_the_slot_from_a_goal_event_raised_first() {
 #[test]
 fn a_refused_arming_does_not_end_a_latch() {
     let mut sim = Sim::new();
-    sim.inject(SimOp::TORQUE_ON, all_joints());
+    sim.inject(SimOpWire::TORQUE_ON, all_joints());
     for _ in 0..(HOLD_TIMEOUT / PERIOD + 3) {
         sim.step();
     }
     assert!(
-        sim.slot().gate.latched,
+        sim.gate().latched.get(),
         "the case rests on a standing latch"
     );
 
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp::TORQUE_ON);
-    cmd.set_mask(JointFlags(1 << JOINT_COUNT));
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::TORQUE_ON);
+    cmd.set_mask(JointFlagsWire(1 << JOINT_COUNT));
     sim.inject_full(&cmd);
     let cycle = sim.step();
 
@@ -905,86 +979,173 @@ fn a_refused_arming_does_not_end_a_latch() {
         "a set nobody could read energises nothing and ends nothing"
     );
     let slot = sim.slot();
-    assert!(slot.gate.latched);
-    assert_eq!(slot.plant.torqued, JointSet::EMPTY);
+    let gate = sim.gate();
+    assert!(gate.latched.get());
+    assert_eq!(slot.torqued, JointFlags::NONE);
     assert_eq!(
-        slot.counters.refused_injections, 1,
+        slot.refused_injections, 1,
         "counted once for the one injection"
     );
 }
 
-/// Dropping replies reads no mask, so nothing about its mask can refuse it.
+/// An injection is refused whole at the one reading of it, whichever of its
+/// fields this build could not read. Dropping replies acts on no servo, but a
+/// scenario that named servos this build does not know was written against a
+/// different machine, and carrying out the readable half of such a message is
+/// how a scenario runs green with part of its hand on the machine discarded.
 #[test]
-fn an_injection_that_reads_no_mask_is_not_refused_over_one() {
+fn an_injection_naming_servos_this_build_does_not_know_is_refused_whole() {
     let mut sim = Sim::with(true);
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp::DROP_REPLIES);
-    cmd.set_mask(JointFlags(1 << JOINT_COUNT));
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::DROP_REPLIES);
+    cmd.set_mask(JointFlagsWire(1 << JOINT_COUNT));
+    cmd.set_count(2);
+    sim.inject_full(&cmd);
+
+    let cycle = sim.step();
+    assert!(cycle.sample.present_valid, "no outage was carried out");
+    assert_eq!(
+        sim.slot().refused_injections,
+        1,
+        "and the refusal was counted"
+    );
+}
+
+/// The same operation with a set this build can read is carried out.
+#[test]
+fn an_injection_this_build_can_read_whole_is_carried_out() {
+    let mut sim = Sim::with(true);
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::DROP_REPLIES);
     cmd.set_count(2);
     sim.inject_full(&cmd);
 
     let cycle = sim.step();
     assert!(!cycle.sample.present_valid, "the outage happened");
+    assert_eq!(sim.slot().refused_injections, 0);
+}
+
+/// A slot this build cannot read is cleared and counted, and the run's totals
+/// survive the clear: they are plain numbers whatever the bytes around them
+/// say, and a scenario checker reading a total must not see it restart because
+/// one field of the slot was damaged.
+#[test]
+fn a_state_this_build_cannot_read_is_cleared_and_counted() {
+    let mut sim = Sim::with(true);
+    let mut goal = setpoint(T0 + PERIOD, JOINT_MASK_ALL, stow_rows());
+    goal.set_mask(JointFlagsWire(1 << 15));
+    sim.send_goal(&goal);
+    sim.step();
     assert_eq!(
-        sim.slot().counters.refused_injections,
-        0,
-        "and no refusal was counted for a set the operation never reads"
+        sim.slot().refused_goals,
+        1,
+        "the case rests on a total to lose"
+    );
+
+    // A bit above the ninth bus row, which no build of this cog wrote: what a
+    // slot written by a machine with more servos would look like from here.
+    sim.cog
+        .state_sim_mut()
+        .set_torqued(JointFlagsWire(1 << JOINT_COUNT));
+    let cycle = sim.step();
+
+    let slot = sim.slot();
+    assert_eq!(slot.refused_state_fields, 1, "counted once");
+    assert_eq!(slot.refused_goals, 1, "and the totals survive the clear");
+    assert!(
+        slot.initialized.get(),
+        "the run starts again from a machine this build can describe"
+    );
+    assert_eq!(rows_of(&slot.positions), stow_rows());
+    assert_eq!(
+        slot.torqued,
+        JointFlags::NONE,
+        "and it comes back de-torqued: the arming was in the bytes that were refused"
+    );
+    assert!(cycle.sample.present_valid, "and the cycle still reported");
+}
+
+/// A slot damaged while the dead-man holds the machine off does not re-energise
+/// it. The latch is in the bytes the cycle refused, so the restart cannot know
+/// whether it stands -- and a modelled machine that torqued itself out of a
+/// memory fault would certify the one transition the latch exists to prevent.
+#[test]
+fn a_slot_damaged_while_the_dead_man_is_latched_comes_back_de_torqued() {
+    let mut sim = Sim::with(true);
+    let mut targets = stow_rows();
+    targets[1] += 0.05;
+    sim.commanded_step(&targets, JOINT_MASK_ALL);
+    for _ in 0..(HOLD_TIMEOUT / PERIOD + 4) {
+        sim.step();
+    }
+    assert!(
+        sim.gate().latched.get(),
+        "the case rests on a standing latch"
+    );
+    assert_eq!(sim.slot().torqued, JointFlags::NONE);
+
+    sim.cog
+        .state_sim_mut()
+        .set_torqued(JointFlagsWire(1 << JOINT_COUNT));
+    let cycle = sim.step();
+
+    let slot = sim.slot();
+    assert_eq!(slot.refused_state_fields, 1);
+    assert_eq!(
+        slot.torqued,
+        JointFlags::NONE,
+        "nothing re-energises the machine but an arming"
+    );
+    assert!(
+        !cycle.sample.torque_off_latched,
+        "and the latch itself is gone with the bytes, which is why the torque is off"
     );
 }
 
 #[test]
-fn a_datagram_the_codec_refuses_is_counted_and_nothing_else() {
+fn a_goal_naming_servos_this_build_does_not_know_is_counted_and_nothing_else() {
     let mut sim = Sim::with(true);
-    let goal = GoalSetpoint {
-        execute_at_ns: T0 + PERIOD,
-        mask: JOINT_MASK_ALL,
-        targets: stow_rows(),
-    };
-    // A well-formed goal with the version byte bumped past this build's, which
-    // is the failure a driver upgrade produces online.
-    let mut bytes = goal.encode(0);
-    bytes[2] = bytes[2].wrapping_add(1);
-    assert!(GoalSetpoint::decode(&bytes).is_err());
-    let mut packet = VarPacket__128::new();
-    assert!(packet.try_set_bytes(&bytes));
-    sim.cog
-        .publish_goals(&packet, SyncTime::from_nanos(sim.now));
+    let mut goal = setpoint(T0 + PERIOD, JOINT_MASK_ALL, stow_rows());
+    // A bit above the ninth bus row: a set this build cannot read, which is
+    // what a machine with more servos than this one would publish.
+    goal.set_mask(JointFlagsWire(1 << 15));
+    sim.send_goal(&goal);
 
     let cycle = sim.step();
     assert!(
         cycle.event.is_none(),
-        "bytes that are not a setpoint name no instant to report at"
+        "a set of servos this build cannot read names nobody to report about"
     );
     assert!(!cycle.sample.commanded_valid, "nothing was queued");
     let slot = sim.slot();
-    assert_eq!(slot.counters.undecodable_goals, 1);
-    assert_eq!(
-        slot.counters.goals_dropped, 0,
-        "a drop is a different thing"
-    );
+    assert_eq!(slot.refused_goals, 1);
+    assert_eq!(slot.goals_dropped, 0, "a drop is a different thing");
 }
 
+/// Events are sparse and the channel is not a queue, so two of them separated
+/// by quiet cycles are two published messages, each naming the cycle it is
+/// about. Neither is lost behind the quiet between them, and neither is the
+/// other one read twice.
 #[test]
-fn an_event_sequence_carries_on_from_the_last_event_however_long_ago() {
+fn two_events_separated_by_quiet_cycles_each_name_their_own_cycle() {
     let mut sim = Sim::with(true);
-    let stale = GoalSetpoint {
-        execute_at_ns: T0 - PERIOD,
-        mask: JOINT_MASK_ALL,
-        targets: stow_rows(),
-    };
+    let stale = setpoint(T0 - PERIOD, JOINT_MASK_ALL, stow_rows());
     sim.send_goal(&stale);
     let first = sim.step();
-    assert_eq!(first.event.expect("the first event").1, 0);
+    let first_event = first.event.expect("the first event");
+    assert_eq!(first_event.time_ns, first.nominal);
 
-    sim.quiet(5);
-    let mut later = stale;
-    later.execute_at_ns = sim.now - PERIOD;
+    for cycle in sim.quiet(5) {
+        assert!(cycle.event.is_none(), "nothing happened on a quiet cycle");
+    }
+    let later = setpoint(sim.now - PERIOD, JOINT_MASK_ALL, stow_rows());
     sim.send_goal(&later);
     let second = sim.step();
-    assert_eq!(
-        second.event.expect("the second event").1,
-        1,
-        "an event view holds the last event however long ago it was sent",
+    let second_event = second.event.expect("the second event");
+    assert_eq!(second_event.time_ns, second.nominal);
+    assert!(
+        second_event.time_ns > first_event.time_ns,
+        "and the two are five quiet cycles apart, not one message read twice"
     );
 }
 
@@ -1021,35 +1182,35 @@ fn an_injection_this_build_cannot_carry_out_is_counted_and_does_nothing() {
 
     // A set naming a tenth bus row, which no machine has: refused rather than
     // masked down to the nine it does have.
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp::TORQUE_OFF);
-    cmd.set_mask(JointFlags(1 << JOINT_COUNT));
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::TORQUE_OFF);
+    cmd.set_mask(JointFlagsWire(1 << JOINT_COUNT));
     sim.inject_full(&cmd);
     sim.step();
 
     let slot = sim.slot();
-    assert_eq!(slot.counters.refused_injections, 1);
+    assert_eq!(slot.refused_injections, 1);
     assert_eq!(
-        slot.plant.torqued,
+        slot.torqued,
         all_joints(),
         "nothing was de-torqued by a set nobody could read"
     );
     assert_eq!(
-        slot.counters.refused_state_fields, 0,
+        slot.refused_state_fields, 0,
         "an injection is not a field of this cog's own slot"
     );
 
     // An operation this build does not know, which is what a scenario written
     // against a newer vocabulary sends.
-    let mut cmd = SimCmd::new();
-    cmd.set_op(SimOp(200));
-    cmd.set_mask(joint_flags(all_joints()));
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire(200));
+    cmd.set_mask(JointFlagsWire::from(all_joints()));
     sim.inject_full(&cmd);
     sim.step();
 
     let slot = sim.slot();
-    assert_eq!(slot.counters.refused_injections, 2);
-    assert_eq!(slot.plant.torqued, all_joints());
+    assert_eq!(slot.refused_injections, 2);
+    assert_eq!(slot.torqued, all_joints());
 }
 
 /// A cycle that is not the cycle this cog is woken on is a scenario describing
@@ -1062,7 +1223,7 @@ fn an_injection_this_build_cannot_carry_out_is_counted_and_does_nothing() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.set_period_ns(PERIOD / 2));
+    let mut sim = Sim::with_params(true, |params| params.period_ns = PERIOD / 2);
     sim.step();
 }
 
@@ -1071,7 +1232,7 @@ fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_servos_have_no_rate_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.set_slew_antennas_rad(0.0));
+    let mut sim = Sim::with_params(true, |params| params.slew_antennas_rad = 0.0);
     sim.step();
 }
 
@@ -1082,28 +1243,26 @@ fn a_scenario_whose_servos_have_no_rate_is_refused() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_dead_man_allows_no_silence_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.set_hold_timeout_ns(0));
+    let mut sim = Sim::with_params(true, |params| params.hold_timeout_ns = 0);
     sim.step();
 }
 
-/// The queue depth is one number written in two languages: the schema's array
-/// and the gate's constant. A disagreement must fail a build rather than panic
-/// inside the cog that owns the dead-man.
-#[test]
-fn the_slots_queue_is_as_deep_as_the_gates() {
-    assert_eq!(SimState::new().queue().capacity(), QUEUE_CAP);
+/// How many goals the gate's queue holds -- the schema's own depth, which is
+/// the only place the number is written.
+fn queue_depth() -> usize {
+    SimStateWire::new().gate().queue().capacity()
 }
 
 /// A set holding one joint.
-fn one(joint: JointId) -> JointSet {
+fn one(joint: JointRef) -> JointFlags {
     set_of(&[joint])
 }
 
 /// A set holding those joints.
-fn set_of(joints: &[JointId]) -> JointSet {
-    let mut set = JointSet::EMPTY;
+fn set_of(joints: &[JointRef]) -> JointFlags {
+    let mut set = JointFlags::NONE;
     for joint in joints {
-        set.insert(*joint);
+        flags::insert(&mut set, *joint);
     }
     set
 }
@@ -1118,6 +1277,8 @@ fn assert_close(found: f64, wanted: f64, what: &str) {
 }
 
 /// Every servo on the bus.
-fn all_joints() -> JointSet {
-    JointSet::from_bits(JOINT_MASK_ALL).expect("every bus row is a bus row")
+fn all_joints() -> JointFlags {
+    JointFlagsWire(JOINT_MASK_ALL)
+        .to_known()
+        .expect("every bus row is a bus row")
 }
