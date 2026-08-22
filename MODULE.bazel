@@ -21,30 +21,10 @@ include("//bazel:clockwork_overrides.MODULE.bazel")
 # publishes no releases and the module graph has to be fetchable by CI and by any
 # other machine.
 bazel_dep(name = "rusty_cogs", version = "")
-#
-# Two patches, each the upstream fix written in the wrong repository, and each
-# with its own header explaining itself. Both are context diffs and fail loudly
-# on a pin bump that moves the lines they name.
-#
-# The first removes one line of their MODULE.bazel: an `include()` of their copy
-# of the Clockwork override table. `include()` is legal only in the root module,
-# so without this nothing in the graph resolves at all -- and the table it pulls
-# in is the same table this repo already includes from its own root, so the graph
-# is unchanged by dropping it.
-# TODO(rusty-cogs-root-only-include)
-#
-# The second gives the generated signal trampolines internal linkage. Without it
-# two cog modules' C++ shims define the same unmangled symbols and no process
-# holding cogs from more than one module links at all.
-# TODO(rusty-cogs-signal-trampoline-linkage)
+
 git_override(
     module_name = "rusty_cogs",
-    commit = "31454138b4828c16044ac7507c0bd683a81e2390",
-    patch_strip = 1,
-    patches = [
-        "//bazel/rusty-cogs-patches:module-drop-root-only-include.patch",
-        "//bazel/rusty-cogs-patches:shim-trampolines-internal-linkage.patch",
-    ],
+    commit = "f21185e98359d31bba13d3199acd9f9a872015aa",
     remote = "https://github.com/rnortman/rusty-cogs.git",
 )
 

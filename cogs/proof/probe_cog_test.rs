@@ -8,6 +8,10 @@
 //!
 //! Time is passed per call rather than simulated: the harness has no clock, so
 //! a case says at what time each execution happens.
+//!
+//! The `*Wire` spellings below are also the tree's generator naming policy in
+//! force: no build file names that policy any more, so hand-written Rust naming
+//! a type the other policy would not emit is what fails if it changes.
 
 use brenn_reachy__cogs__proof__probe_clk_rs_test::ProbeTestWrapper;
 use brenn_reachy__cogs__proof__probe_msgs_clk_rs::{ProbeCmdWire, ProbeStep, ProbeStepWire};

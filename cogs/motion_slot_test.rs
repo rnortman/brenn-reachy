@@ -1,4 +1,8 @@
 //! What the joint vocabulary has to get right on the way in from a slot.
+//!
+//! The `*Wire` spellings below are also the tree's generator naming policy in
+//! force: no build file names that policy any more, so hand-written Rust naming
+//! a type the other policy would not emit is what fails if it changes.
 
 use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointRefWire};

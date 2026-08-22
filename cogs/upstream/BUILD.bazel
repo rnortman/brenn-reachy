@@ -1,21 +1,13 @@
-load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel:rust_clk.bzl", "rust_clk_module")
 
 # Rust crates for Clockwork's own `.clk` modules.
 #
-# `rust_clk_module` generates the Rust for a module *of this repo*: it derives
-# the crate name from the package the module sits in and compiles it under this
-# repository's name. A module that belongs to the Clockwork drop needs neither,
-# and needs both to come out exactly as the generator spells them elsewhere --
-# a dial that carries an upstream message writes that message's type as
-# `<upstream module's crate>::<type>`, and the crate has to exist under that
-# name or nothing links.
-#
-# So this package calls the generator longhand for the upstream modules our cogs
-# carry messages from. There is one today, and every one added after it is
-# another hand-written invocation tracking the generator's flags by itself --
-# which is what a `repo`/`root`/`crate_name` override on the macro would end.
-# TODO(rusty-cogs-macro-parameters)
+# A module that belongs to the drop is compiled under the drop's repository word
+# rather than ours, and its crate name has to come out exactly as the generator
+# spells it elsewhere -- a dial that carries an upstream message writes that
+# message's type as `<upstream module's crate>::<type>`, and the crate has to
+# exist under that name or nothing links. So each call here names `repo` and
+# `crate_name` instead of taking the tree's defaults.
 
 # The variable-size byte packet, which is how every wire-format channel in this
 # repo's cog systems carries its datagrams. Its module instantiates a fixed menu
@@ -24,42 +16,9 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 # so the sizes our channels use are chosen off that menu rather than declared
 # here, and the crate below is where their Rust types come from.
 # TODO(foreign-generic-instantiation-crate)
-#
-# `--validated-naming` is interpolated from the same constant `rust_clk_module`
-# defaults to, because a module re-derives an imported type's name under its own
-# policy: a dependency web split across policies fails at rustc in the consumer,
-# and this longhand invocation is the one site a search for the macro's keyword
-# would not find.
-#
-# `--root` is derived from the source's own path rather than written down: the
-# generator names a module by its path relative to the root it is given, and
-# the drop arrives under a canonical repository directory whose spelling Bazel
-# owns. Stripping the known suffix is what gets the two to agree without this
-# file knowing that spelling.
-genrule(
-    name = "var_packet_clk_rs_gen",
-    srcs = ["@clockwork//clockwork/io:var_packet.clk"],
-    outs = ["var_packet_clk_rs.rs"],
-    cmd = "src=$(location @clockwork//clockwork/io:var_packet.clk); " +
-          "$(location @rusty_cogs//generator:rusty_cogs_gen) generate " +
-          "--input $$src " +
-          "--output $@ " +
-          "--repo clockwork " +
-          "--crate-name clockwork__clockwork__io__var_packet_clk_rs " +
-          "--root $${src%/clockwork/io/var_packet.clk} " +
-          "--validated-naming %s " % VALIDATED_NAMING +
-          "--rustfmt $(location @rules_rust//rust/toolchain:current_rustfmt_toolchain)",
-    tools = [
-        "@rules_rust//rust/toolchain:current_rustfmt_toolchain",
-        "@rusty_cogs//generator:rusty_cogs_gen",
-    ],
-)
-
-rust_library(
+rust_clk_module(
     name = "var_packet_clk_rs",
-    srcs = [":var_packet_clk_rs_gen"],
+    src = "@clockwork//clockwork/io:var_packet.clk",
     crate_name = "clockwork__clockwork__io__var_packet_clk_rs",
-    edition = "2024",
-    visibility = ["//visibility:public"],
-    deps = ["@rusty_cogs//crates/clockwork-rs:clockwork_rs"],
+    repo = "clockwork",
 )

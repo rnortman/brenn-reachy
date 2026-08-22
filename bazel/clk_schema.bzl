@@ -20,7 +20,6 @@ extern-"C" archive -- is not this shape and spells its own stanzas, which is wha
 """
 
 load("@clockwork//clockwork:rules.bzl", "clk")
-load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
 load("//bazel:rust_clk.bzl", "rust_clk_module")
 
 def _module_label(module, suffix):
@@ -109,6 +108,5 @@ def clk_schema_module(name, imports = []):
         name = name + "_clk_rs",
         src = src,
         imports = _labels(imports, ".clk"),
-        validated_naming = VALIDATED_NAMING,
         deps = _labels(imports, "_clk_rs"),
     )

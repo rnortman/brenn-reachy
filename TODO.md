@@ -224,8 +224,9 @@ than diffing it by hand, and gate the result.
 Deferral context: Bazel honours a `bazel_dep` override only in the root module,
 and every dependency the pinned Clockwork drop declares is versionless, so the
 drop's whole override table has to be restated in this repo's root — all of it,
-not the subset our targets reach. The copy is currently taken from rusty-cogs,
-which took it from the drop, and both hops are a manual diff. Two hand-copied
+not the subset our targets reach. The copy is currently taken from the delimited
+region of rusty-cogs' own `MODULE.bazel`, which took it from the drop, and both
+hops are a manual diff. Two hand-copied
 tables in two repos is exactly the shape that drifts silently: the failure is
 not a build error but a graph resolving at versions nobody chose. The fix is a
 script that emits the segment from a drop's `MODULE.bazel` plus this repo's
@@ -251,64 +252,6 @@ channels use sizes from `var_packet.clk`'s own `instantiate` menu (64, 128, 288,
 some slack in every packet carrier and nothing else, which is why it is a TODO
 and not a blocker. Marked at the `instantiate` menu comment in
 `cogs/upstream/BUILD.bazel`.
-
-## `rusty-cogs-root-only-include`
-
-Drop the `include()` from rusty-cogs' own `MODULE.bazel` upstream, inlining the
-`bazel_dep`s its `.bzl` and `BUILD` files need, and delete
-`bazel/rusty-cogs-patches/` here.
-
-Deferral context: `include()` is legal only in a root module, so rusty-cogs as a
-dependency fails during main-repository-mapping computation — before any target
-is analyzed — and this repo carries a patch that rewrites that line into ten
-versionless `bazel_dep`s. The patch is exactly the fix, in the wrong repository:
-it is a context diff against a file every pin bump can move under it, and every
-future consumer of rusty-cogs must carry a byte-identical copy of it and of the reasoning behind it. Not fixed here
-because the change belongs to the sibling repo, which this slice does not touch.
-Done when rusty-cogs resolves as a dependency unpatched and the patch package is
-deleted. Marked on the `patches =` line in `MODULE.bazel`.
-
-## `rusty-cogs-macro-parameters`
-
-Give rusty-cogs' `rust_clk_module` the parameters that force this repo to copy
-it — the repository name, the runtime and generator labels, and per-call `repo`,
-`root` and `crate_name` overrides — then `load()` theirs and delete the copies.
-
-Deferral context: `bazel/rust_clk.bzl` (336 lines) and `bazel/BUILD.bazel`'s
-`framework_clk_imports` filegroup are verbatim copies of rusty-cogs artifacts at
-the pinned revision, copied because `REPO` is a file-level constant heading every
-crate name the generator derives and because the macro names the filegroup label
-in the module being compiled. Re-syncing means re-applying four named changes
-across 336 lines at every pin bump, with no gate: a copy that drifts still
-builds, and the divergence surfaces as a crate name no importer spells.
-`cogs/upstream/BUILD.bazel` is the same cost paid a second way — the generator
-invocation and its `rust_library` written longhand because the macro derives what
-that module needs spelled out — and every further upstream module our cogs carry
-messages from adds another hand-written copy that must track the generator's flag
-set. Not fixed here because the fix is in the sibling repo, which this slice does
-not touch; until it lands, the fallback is `override-regen`'s shape — a target
-that diffs the copies against the pinned upstream files modulo the named changes.
-Marked in the header of `bazel/rust_clk.bzl`, at the filegroup in
-`bazel/BUILD.bazel`, and at the longhand invocation in `cogs/upstream/BUILD.bazel`.
-
-## `rusty-cogs-signal-trampoline-linkage`
-
-Give the signal trampolines rusty-cogs' C++ shim emits internal linkage
-upstream, then drop the patch this repo carries at
-`bazel/rusty-cogs-patches/shim-trampolines-internal-linkage.patch`.
-
-Deferral context: the shim writes one `extern "C"` trampoline per signal method,
-named `signal_<cog index>_<method>` -- unique within its own file only -- inside
-an anonymous namespace that its own comment says is there "so that nothing links
-against a trampoline". C language linkage defeats that: the symbols are external
-and unmangled, so two cog modules' shims linked into one process define the same
-names and the link fails. That blocks any process hosting cogs from more than
-one module, which is what `cogs/sim.clk`'s box is. The patch replaces `extern
-"C"` with `static`, which is what the anonymous namespace was reaching for, and
-changes nothing else. Not fixed here because the change belongs to the sibling
-repo, which this slice does not touch. Done when two cog modules link into one
-executable against an unpatched rusty-cogs and the patch file is deleted. Marked
-on the `patches =` list in `MODULE.bazel`.
 
 ## `clockwork-single-instance-signal`
 
@@ -617,3 +560,21 @@ scenario is for. Arranging the other order needs either a way to suppress the
 driver's declaration for a window, which is a new injection, or different
 tolerances, which are motion-guard bounds this arc's design does not edit. Marked
 where the deleted assertion stood in `cogs/s4_checker.rs`.
+
+## `repo-word-agreement`
+
+Gate that `REPO` in `bazel/rust_clk.bzl` and the module name in `MODULE.bazel`
+are the same word.
+
+Deferral context: the word reaches the generator as `--repo` and heads every
+crate name it derives, while a cross-repo importer spells that crate under this
+repo's apparent name, which is its Bazel module name. The generator's
+crate-name refusal cannot catch a disagreement — the macro and the generator
+agree with each other and are both wrong together — so it surfaces as a missing
+identifier at rustc in whatever tree imports us, far from the edit. Deferred
+because the check is a new gate lane and this repo's gate has rules about
+lanes: every tool it runs is pinned and nothing may skip when a tool is absent,
+so where the lane lives (a `bazel test` target versus a `make check` step) and
+how it reads a Starlark constant and a `module()` call without a parser is a
+gate-design decision rather than a patch. Marked on `REPO` in
+`bazel/rust_clk.bzl`.

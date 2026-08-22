@@ -2,7 +2,6 @@ load("@clockwork//clockwork:rules.bzl", "clk")
 load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
-load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
 load("//bazel:clk_schema.bzl", "clk_module_deps", "clk_schema_module")
 load("//bazel:rust_clk.bzl", "rust_clk_module")
 load("//bazel:scenario_suite.bzl", "scenario_suite")
@@ -182,7 +181,6 @@ clk(
 rust_clk_module(
     name = "config_clk_rs",
     src = "config.clk",
-    validated_naming = VALIDATED_NAMING,
 )
 
 # The clip library asset's emitter, run as
@@ -278,7 +276,6 @@ rust_clk_module(
     cog_impl = ":motion_cogs",
     imports = clk_module_deps(MOTION_MODULES).imports,
     test_wrappers = True,
-    validated_naming = VALIDATED_NAMING,
     deps = clk_module_deps(MOTION_MODULES).rs,
 )
 
@@ -446,7 +443,6 @@ rust_clk_module(
     name = "mover_clk_rs",
     src = "mover.clk",
     imports = clk_module_deps(MOVER_MODULES).imports,
-    validated_naming = VALIDATED_NAMING,
     deps = clk_module_deps(MOVER_MODULES).rs,
 )
 
@@ -510,7 +506,6 @@ rust_clk_module(
     name = "pose_state_clk_rs",
     src = "pose_state.clk",
     imports = clk_module_deps(POSE_STATE_MODULES).imports,
-    validated_naming = VALIDATED_NAMING,
     deps = clk_module_deps(POSE_STATE_MODULES).rs,
 )
 
@@ -831,7 +826,6 @@ clk(
 rust_clk_module(
     name = "schedule_clk_rs",
     src = "schedule.clk",
-    validated_naming = VALIDATED_NAMING,
 )
 
 # What arrives from outside: a script, as a request measured in offsets from the
@@ -912,6 +906,13 @@ rust_library(
 #
 # `offline_main` rather than the online main: it carries the deterministic
 # runner, which is what a scenario drives this process under.
+#
+# The box holds cogs from two modules -- `MotorSim` here, the motion cogs from
+# `motion.clk` -- so this executable links two generated shims. That is what
+# holds rusty-cogs' file-local signal-trampoline spelling honest at every pin
+# bump: under an externally-linked spelling the two shims define the same
+# trampoline names and this link fails. Splitting the cogs across processes, or
+# dropping `motion` from `SIM_MODULES`, drops that guard.
 clk(
     name = "sim_clk",
     srcs = ["sim.clk"],
@@ -976,7 +977,6 @@ rust_clk_module(
     cog_impl = ":sim_cogs",
     imports = clk_module_deps(SIM_MODULES).imports,
     test_wrappers = True,
-    validated_naming = VALIDATED_NAMING,
     deps = clk_module_deps(SIM_MODULES).rs,
 )
 
@@ -1065,7 +1065,6 @@ rust_clk_module(
     name = "sim_state_clk_rs",
     src = "sim_state.clk",
     imports = clk_module_deps(SIM_STATE_MODULES).imports,
-    validated_naming = VALIDATED_NAMING,
     deps = clk_module_deps(SIM_STATE_MODULES).rs,
 )
 

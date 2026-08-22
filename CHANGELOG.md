@@ -49,6 +49,18 @@ Nothing has been released, and nothing here has driven a motor.
   or on a runner invokes `cargo` or `rustup`, and the pinned `RUST_VERSION` in
   `MODULE.bazel` is the single compiler and the single statement of the edition.
 
+- **rusty-cogs is consumed as it ships.** The two patches this repo applied to
+  it — internal linkage for the generated signal trampolines, and dropping the
+  root-only `include()` from its `MODULE.bazel` — are fixed upstream, so the pin
+  carries no `patches` and `bazel/rusty-cogs-patches/` is gone. `rust_clk_module`
+  now takes the repository word, the generation root and the crate name as
+  parameters, so `bazel/rust_clk.bzl` is a thin wrapper over
+  `@rusty_cogs//bazel:rust_clk.bzl` fixing this tree's repository word and
+  naming policy instead of a verbatim copy re-synced by hand at every pin bump.
+  With the copy go `bazel/BUILD.bazel`'s `framework_clk_imports` filegroup,
+  which the macro now reaches for itself, and `cogs/upstream`'s longhand
+  generator invocation, which is a macro call naming `repo` and `crate_name`.
+
 ### Removed
 
 - **The Cargo lane.** The workspace manifest, every crate manifest,

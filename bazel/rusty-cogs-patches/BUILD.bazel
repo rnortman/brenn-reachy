@@ -1,7 +1,0 @@
-# The patches applied to rusty-cogs at the `git_override` in MODULE.bazel.
-#
-# Bazel takes a patch label only from the root module, so a consumer's patches
-# live in the consumer. This package exists so the labels resolve; nothing is
-# built here.
-
-exports_files(glob(["*.patch"]))
