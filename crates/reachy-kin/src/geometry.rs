@@ -51,11 +51,17 @@ pub struct LegGeometry {
 
 /// The whole head linkage: two link lengths and six legs.
 ///
-/// TODO(geometry-fit): the defaults are the vendor's nominal model, and a
-/// second parameter set differing by a few millimetres has been written down for
-/// this linkage. Millimetres are large against the clearance the crank stops
-/// leave at the top of travel, so this unit's dimensions want fitting on the
-/// bench and substituting here.
+/// The defaults are the vendor's nominal model, and that model is what this
+/// code solves against. Its provenance is the vendor's
+/// `assets/kinematics_data.json`, transcribed in [`crate::baked`] and pinned
+/// number for number against a vendored copy of that file by a fixture test.
+/// No per-unit fitting is owed: this project did not do the mechanism's
+/// hardware engineering, and the vendor's working software is what is
+/// authoritative about the linkage's dimensions.
+///
+/// The struct stays a runtime configuration seam — a caller with dimensions of
+/// its own builds one and passes it to the solver — but nothing here is
+/// awaiting a measurement.
 #[derive(Clone, Debug)]
 pub struct HeadGeometry {
     /// Crank (motor arm) length, metres.

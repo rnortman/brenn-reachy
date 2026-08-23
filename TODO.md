@@ -60,22 +60,6 @@ publishes at three fidelities plus a segment-distance test that the envelope
 does not currently carry. Marked at `EnvelopeConfig` in
 `crates/reachy-kin/src/envelope.rs`.
 
-## `geometry-fit`
-
-Measure this unit's crank length, rod length, base radius and platform radius on
-the bench, and substitute the fitted values for the vendor's nominal ones in
-`HeadGeometry`.
-
-Deferral context: the defaults are the vendor's published nominal model, and a
-second parameter set differing from it by a few millimetres has been written down
-for this linkage — evidence that more than one set exists, not that more than one
-build does. Millimetres are large against the clearance the crank stops leave at
-the top of vertical travel, which is about one, so the nominal numbers should not
-be treated as the only ones that have ever described the mechanism. The struct is
-already a runtime configuration seam for exactly this substitution; what is
-missing is the measurement, which needs the machine. Marked at `HeadGeometry` in
-`crates/reachy-kin/src/geometry.rs`.
-
 ## `health-read-budget`
 
 Decide whether a run of health sweeps that fall short should stop the tick loop
@@ -115,22 +99,6 @@ and that remains the right answer while one machine is in play. What would
 change it is a second unit, or a servo replaced in the field, at which point the
 question is which registers this project is willing to author rather than
 compare. Marked at the non-volatile refusal in `crates/reachy-bus/src/bus.rs`.
-
-## `rail-curve`
-
-Set the supply floor arming refuses to proceed below from a measurement of what
-the rail actually does under load, and decide whether one threshold covers both
-a bench supply and a battery.
-
-Deferral context: the figure in the code is 6.0 V — a round number above the
-servos' own minimum-voltage alarm and below anything a healthy supply should sag
-to, chosen with a margin rather than measured. What matters is the sag while nine
-servos take up the head's weight, which is the moment arming enables torque, and
-nobody has recorded the rail through that transient on this platform. Too high a
-floor refuses to arm a machine that would have been fine; too low a floor arms
-one that will brown out mid-motion, and a brown-out under load drops the head.
-The reading needs the machine and a scope or a logging meter on the rail. Marked
-at `DEFAULT_MIN_ARM_VOLTAGE` in `crates/reachy-motion/src/arm.rs`.
 
 ## `unsendable-frame-condition`
 

@@ -304,11 +304,11 @@ that the next person to see one knows it is not new.
 - **The chronic `0x01` input-voltage latch.** All nine servos latch the
   input-voltage bit during ordinary running. A `reboot` clears them to `0x00`
   and running re-latches them. The suspicion is a supply dip under load, and
-  the measurement that would settle it is the rail under the current nine
-  servos draw taking up the head's weight. The bit is deliberately excluded
-  from the health predicate — the engage-time supply gate is what owns supply
-  — so this does not stop anything today; it is an unexplained reading on a
-  machine whose other readings are trusted. `reboot` is the tripwire on the
+  nothing here confirms or refutes it: no rail measurement is owed or awaited,
+  so this stays a reading nobody has explained. The bit is deliberately
+  excluded from the health predicate — the engage-time supply gate is what owns
+  supply — so this does not stop anything today; it is an unexplained reading
+  on a machine whose other readings are trusted. `reboot` is the tripwire on the
   clearing half of it: the command fails on any byte a servo still holds after
   its restart, this bit included, so a `0x01` that ever survives a reboot is a
   non-zero exit naming the servo rather than a line printed past. That is this

@@ -147,11 +147,10 @@ pub const VENDOR_HOMING_OFFSETS: [i32; ROW_COUNT] =
 
 /// The supply floor torque is not switched on below, volts.
 ///
-/// Provisional. It is a round number above the point where the servos' own
-/// minimum-voltage alarm sits, not a measurement: what the rail does under the
-/// current draw of nine servos taking up the head's weight has not been
-/// recorded, and until it has, this figure is a guess with a margin.
-/// TODO(rail-curve)
+/// An accepted guard: a round number chosen with margin above the point where
+/// the servos' own minimum-voltage alarm sits, and below anything a healthy
+/// supply should sag to. It refuses to arm a machine whose rail is already low
+/// rather than characterising the rail.
 pub const DEFAULT_MIN_ARM_VOLTAGE: f64 = 6.0;
 
 /// How often the supply voltage is re-read while commissioning waits for the
