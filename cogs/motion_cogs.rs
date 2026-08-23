@@ -3,7 +3,11 @@
 //! One function per cog declared in `motion.clk`, named `execute_<cog name in
 //! snake case>` and taking `&mut <CogName>Dial`. The dial type, the entry point
 //! that calls it and the C++ shim that calls that are all generated from the
-//! same `.clk`; this file is the whole of what an author writes.
+//! same `.clk`; this file and the session's own modules beside it are the whole
+//! of what an author writes. The session sits in modules of its own because it
+//! shares nothing with the two control-rate bodies but the crate the generated
+//! entry points call into: `session_cog` is its body, `session_bus` the sequence
+//! it drives over the driver, and `session_ladder` what it does about evidence.
 //!
 //! Nothing here holds state of its own. A cog is a function over its declared
 //! slots, its inputs and the execution's start time, and a `static` or a lazily
@@ -18,6 +22,23 @@
 //! pose, a joint vector and a command set are `reachy-motion`'s, so a cog and
 //! the library it drives cannot disagree about them.
 
+mod mover_overlay;
+mod session_cog;
+// Public for the one figure the scenario harness cannot derive for itself: the
+// clocks a base move runs on once this cog has floored them, which is what says
+// whether a scripted step leaves the antennas time to arrive.
+pub use mover_overlay::{Goal, floored_clocks};
+// Public for one figure each, both read by the scenario harness: the
+// provisioning grid, whose readable cells are most of what the start-up survey
+// costs in transactions, and the bus cycle the session's staleness window counts
+// in, which the harness checks against the cycle the simulated driver is built
+// with.
+pub mod session_bus;
+pub mod session_ladder;
+mod session_stow;
+
+pub use session_cog::execute_session;
+
 use brenn_reachy__cogs__config_clk_rs::MoverParams;
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
@@ -25,9 +46,11 @@ use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
 use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, SessionScheduleWire, StepKindWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
+use brenn_reachy__motion__tick_state_clk_rs::MotionSnap;
 use clockwork_rs::SyncTime;
 use core::time::Duration;
 use motion_slots::{configured, counters};
+use mover_overlay::{Anchor, Ask, Screen};
 use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeViolations, FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics,
@@ -38,10 +61,10 @@ use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, wr
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
-    CommandDisposition, CommandRejection, Fault, MotionCommand, MotionMode, MoveAbort, TickInputs,
-    TickOutputs, arm, default_motion_config, last_goal, motion_tick, resume, standing_fault,
+    CommandDisposition, CommandRejection, Fault, MotionMode, MoveAbort, TickInputs, TickOutputs,
+    arm, default_motion_config, last_goal, motion_tick, resume, standing_fault,
 };
-use reachy_motion::traj::{MoveDurations, WarpKind};
+use reachy_motion::traj::MoveDurations;
 
 /// Bus rows the six legs occupy: body yaw is row zero and the antennas are the
 /// last two, so the cranks are the block between them.
@@ -266,6 +289,7 @@ fn store_seed(state: &mut PoseStateWire, seed: &Isometry3<f64>, solved_any: bool
 pub fn execute_mover(dial: &mut MoverDial<'_>) {
     let cfg = default_motion_config();
     let settings = Settings::of(dial);
+    let clips = dial.configs.clips;
     let before = MoverCounters::read(dial.states.ctrl);
     let mut counters = before;
 
@@ -273,6 +297,14 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     // know; no message at all is a session nobody has started.
     let schedule = dial.inputs.sched.latest();
     let engaged = schedule.is_some_and(SessionScheduleWire::engaged);
+
+    // Which overlays this run will play, screened once against the configured
+    // library rather than once per sample: the schedule is one message and its
+    // windows are the same windows for every period it stands for.
+    let Screen {
+        windows,
+        mut latched,
+    } = mover_overlay::screen(clips, dial.states.ctrl, schedule, engaged, &mut counters);
 
     // The instant the last goal this cog published named, read back out of its
     // own view rather than kept in a state field: the channel carries the
@@ -295,8 +327,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     // stops in the meantime, which is what every other loss of command does
     // here.
     // The count is the whole trace a refusal leaves; which of them it was is
-    // not reported anywhere.
-    // TODO(refusal-classification-reported)
+    // recoverable from the input log, which reproduces the whole run.
     let mut armed = dial.states.ctrl.armed();
     if dial.states.ctrl.snap_mut().validate_mut().is_err() {
         dial.states.ctrl.snap_mut().clear_valid();
@@ -309,25 +340,42 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     let mut goal_out = None;
     let mut reports = Reports::default();
 
-    // Held for the whole window: the slot is only observable between
-    // executions, so every sample of the burst ticks the same state in place.
-    let Ok(state) = dial.states.ctrl.snap_mut().validate_mut() else {
-        // Bytes that did not read as a state and did not read as one after
-        // being cleared either. Nothing is commanded and the refusal is
-        // counted: the goal stream stopping is what takes the machine down
-        // safely, and a panic here would take the loop with it and say
-        // nothing.
-        counters.refused_state += 1;
-        dial.states.ctrl.set_armed(false);
-        counters.store(dial.states.ctrl);
-        counters.report(&before, &mut dial.signals);
-        return;
-    };
-    if armed && resume(state).is_err() {
-        // Readable bytes that describe no state a tick could be in -- the same
-        // answer as a slot that did not validate, for the same reason.
-        counters.refused_state += 1;
-        armed = false;
+    // Where the last period left the commanded stream. Carried across samples
+    // rather than re-read per sample: the state is taken up once a sample for
+    // the tick, so the two numbers the overlay layer needs off it are read
+    // through that same take-up -- here before the first sample, and again at
+    // every point below that writes the state. `None` until a state that has
+    // been armed says where the stream stands: an unarmed slot commands nothing,
+    // and a machine is armed before any window is taken up.
+    let mut anchor: Option<Anchor> = None;
+
+    // Taken up once here and again per sample below. The slot is only
+    // observable between executions, so every sample of a burst ticks the same
+    // state in place; what a per-sample take-up buys is the base and the overlay
+    // rows beside it, which live in the same slot and cannot be borrowed
+    // alongside a state held for the whole window.
+    {
+        let Ok(state) = dial.states.ctrl.snap_mut().validate_mut() else {
+            // Bytes that did not read as a state and did not read as one after
+            // being cleared either. Nothing is commanded and the refusal is
+            // counted: the goal stream stopping is what takes the machine down
+            // safely, and a panic here would take the loop with it and say
+            // nothing.
+            counters.refused_state += 1;
+            dial.states.ctrl.set_armed(false);
+            counters.store(dial.states.ctrl);
+            counters.report(&before, &mut dial.signals);
+            return;
+        };
+        if armed && resume(state).is_err() {
+            // Readable bytes that describe no state a tick could be in -- the
+            // same answer as a slot that did not validate, for the same reason.
+            counters.refused_state += 1;
+            armed = false;
+        }
+        if armed {
+            anchor = Some(Anchor::of(state));
+        }
     }
 
     for message in dial.inputs.sample.new_msgs() {
@@ -345,9 +393,12 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
             // Disengaged: the state dies with the engagement, and recovery is a
             // fresh one rather than a flag being cleared. Nothing is commanded,
             // so the goal stream stops and the driver's dead-man takes the
-            // machine down.
+            // machine down. The base and the players go with it -- they belong
+            // to the engagement that ended.
             armed = false;
             desired = Desired::NOTHING_DISPATCHED;
+            latched = false;
+            mover_overlay::release(dial.states.ctrl, nominal);
             continue;
         }
 
@@ -366,7 +417,17 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
             else {
                 continue;
             };
-            arm(state, &record, JointFlags::NONE);
+            {
+                let state = snap_of(dial.states.ctrl);
+                arm(state, &record, JointFlags::NONE);
+                // The arming wrote the state, so the setpoint the layer would
+                // hand a base over from is the one it just established.
+                anchor = Some(Anchor::of(state));
+            }
+            // A fresh engagement is a fresh base: the record in the slot belongs
+            // to whatever engagement ended, and the state this arming built has
+            // no history the base could be continuous with.
+            mover_overlay::release(dial.states.ctrl, nominal);
             armed = true;
             desired = Desired::NOTHING_DISPATCHED;
         }
@@ -376,21 +437,45 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         // bumped epoch stands, sample over sample and across the slot, until a
         // posture step covers an instant and the machine is sent somewhere. One
         // site, so the dispatch and the consumption cannot come apart.
-        let command = schedule.and_then(|schedule| {
+        let asked = schedule.and_then(|schedule| {
             let retarget = schedule.epoch() != epoch_seen;
             desired
                 .at(schedule, nominal)
                 .filter(|asked| retarget || *asked != desired)
-                .map(|asked| {
+                .inspect(|&asked| {
                     desired = asked;
                     epoch_seen = schedule.epoch();
                     if retarget {
                         counters.epochs_answered += 1;
                     }
-                    asked.command(&settings)
                 })
         });
 
+        // What the base does this period, and what rides on it. Three answers
+        // in one call: the ordinary posture move while the tick owns the base, a
+        // composed setpoint while an overlay window is open, and the re-anchored
+        // move that hands the base back when the last one closes.
+        let commanded = mover_overlay::decide(
+            cfg,
+            dial.states.ctrl,
+            &windows,
+            latched,
+            &Ask {
+                now_ns: nominal,
+                period: Duration::from_nanos(settings.period_ns),
+                tick_hz: settings.tick_hz(),
+                fresh: asked.and_then(|asked| asked.goal(&settings)),
+                standing: desired.goal(&settings),
+            },
+            // Every armed state has one: it was read off the arming that
+            // established this one, off the tick that last advanced it, or off
+            // the resume this execution opened with.
+            anchor.as_ref().expect("an armed machine has a setpoint"),
+            &mut counters,
+        );
+        let command = commanded.command;
+
+        let state = snap_of(dial.states.ctrl);
         let before_fault = standing_fault(state);
         let mut out = TickOutputs::default();
         motion_tick(
@@ -422,6 +507,19 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
             counters.refused_state += 1;
         }
 
+        // A composed setpoint the tick would not have. The overlays are dropped
+        // for this schedule, whole: the same clips over the same base compose
+        // the same setpoint, so a layer that took its windows up again would
+        // offer the tick what it has just refused, once a period, for as long as
+        // the windows stayed open. The refusal itself travels on the report
+        // channel like any other, and it is never a fault -- a refused command
+        // changes nothing, and the base carries on alone through the next
+        // sample's hand-back.
+        if commanded.overlaid && matches!(out.report.command, CommandDisposition::Rejected(_)) {
+            latched = true;
+            counters.overlays_refused += 1;
+        }
+
         // The keep-alive. Every sample of an engaged, armed machine carries a
         // goal, whether or not the tick emitted one: a setpoint unchanged is
         // still a setpoint being asked for, and a commander that fell silent
@@ -443,10 +541,16 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 targets: out.goal.unwrap_or_else(|| last_goal(state)),
             });
         }
+
+        // The tick wrote the state, so the next sample's layer reads its
+        // setpoint and its margin off this take-up rather than paying for
+        // another one.
+        anchor = Some(Anchor::of(state));
     }
 
     dial.states.ctrl.set_armed(armed);
     dial.states.ctrl.set_schedule_epoch_seen(epoch_seen);
+    dial.states.ctrl.set_overlay_latch(latched);
     desired.store(dial.states.ctrl);
 
     // The burst rule, which the deterministic runner never exercises and a
@@ -484,6 +588,22 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
     // Untested: no assertion in this repo covers the values a signal carries.
     // TODO(cogs-signal-report-contents)
     counters.report(&before, &mut dial.signals);
+}
+
+/// The tick state in this cog's slot, taken up for one sample.
+///
+/// The whole of what a per-sample take-up costs: validation is a check over
+/// bytes rather than a copy of them, and the execution has already established
+/// that these bytes read as a state.
+///
+/// # Panics
+///
+/// If they do not, which the caller ruled out before its first sample.
+fn snap_of(state: &mut MoverStateWire) -> &mut MotionSnap {
+    state
+        .snap_mut()
+        .validate_mut()
+        .expect("a state this execution has already validated")
 }
 
 /// The measured positions, or `None` where the sample carries no reading.
@@ -525,6 +645,15 @@ impl Settings {
             )),
             stow: Duration::from_nanos(length_of(params.stow_duration_ns, "the move to stow")),
         }
+    }
+
+    /// The grid rate, hertz -- what a plan's per-tick step bounds are judged
+    /// at.
+    ///
+    /// Derived from the period rather than configured beside it: two numbers
+    /// stating one grid is one of them being wrong.
+    fn tick_hz(&self) -> f64 {
+        1e9 / self.period_ns as f64
     }
 
     /// How far ahead of a sample the goal it produces is dated, nanoseconds.
@@ -600,13 +729,17 @@ impl Desired {
         })
     }
 
-    /// The move that reaches it.
+    /// Where this sends the base, and over what clocks -- or `None` for a
+    /// dispatch that names no posture, which is what nothing dispatched is.
     ///
     /// Where each posture is is the motion library's statement, not this cog's:
     /// stow is the posture the minimum risk condition names, and a host
     /// composing its own would be free to disagree with the one the bench
     /// commands and the one disarming checks.
-    fn command(self, settings: &Settings) -> MotionCommand {
+    fn goal(self, settings: &Settings) -> Option<Goal> {
+        if self.kind != StepKindWire::BASE_POSTURE {
+            return None;
+        }
         let (target, duration) = match self.posture {
             PostureWire::UP => (neutral_targets(), settings.up),
             // Stow is the default of the vocabulary and the posture the machine
@@ -615,11 +748,10 @@ impl Desired {
             // reason to stand up.
             _ => (stow_pose_targets(), settings.stow),
         };
-        MotionCommand::MoveTo {
+        Some(Goal {
             target,
             durations: MoveDurations::uniform(duration),
-            warp: WarpKind::MinJerk,
-        }
+        })
     }
 }
 
@@ -1016,5 +1148,19 @@ counters! {
         /// coalesced by a gap count once: this counts epoch changes observed,
         /// not epochs the session published.
         epochs_answered / set_epochs_answered,
+        /// Overlay windows this cog would not play: the screen's refusals,
+        /// counted once per schedule, plus each composed setpoint an overlay
+        /// rode that the tick refused.
+        overlays_refused / set_overlays_refused,
+        /// Overlay rows in this cog's own slot that would not read back as a
+        /// player of the motion their window names.
+        players_refused / set_players_refused,
+        /// Base plans this cog could not make or could not read back.
+        refused_base / set_refused_base,
+        /// Base plans the library adjusted for a reason that is not routine: a
+        /// clock that could not carry its own span, or a pair it could not part.
+        base_stretched / set_base_stretched,
+        /// Base plans adjusted only to part the antenna pair at their crossing.
+        base_dephased / set_base_dephased,
     }
 }

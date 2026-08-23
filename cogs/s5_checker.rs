@@ -1,6 +1,6 @@
 //! S5's assertions, over the output log.
 //!
-//! Three arguments: the output log directory and the two config textprotos the
+//! Four arguments: the output log directory and the three config textprotos the
 //! process ran against. What S5 shares with a healthy run is asserted by
 //! `scenario::check` -- and most of the retarget's own contract is in there
 //! already, because "the goal stream is one datagram per sample, each due after
@@ -14,6 +14,7 @@
 
 use std::process::ExitCode;
 
+use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use nalgebra::Isometry3;
 use reachy_kin::{neutral_head_pose, stow_head_pose};
 use reachy_motion::postures::stow_pose_targets;
@@ -21,9 +22,11 @@ use scenario::check;
 use scenario::check::head_pose_at;
 use scenario::read::Run;
 
+use scenario::{stow_clocks, up_cycles};
+
 use s5_scenario::{
-    DISENGAGE_CYCLE, DISENGAGED_EPOCH, END_CYCLE, ENGAGE_CYCLE, ENGAGED_EPOCH, RETARGET_CYCLE,
-    RETARGET_EPOCH, TURNAROUND_CYCLES, stow_cycles, up_cycles,
+    RETARGET_AFTER, SCRIPT_ID, TURNAROUND_CYCLES, disengage_cycle, end_cycle, retarget_cycle,
+    script_sent_cycle,
 };
 
 /// How far the head may drift back from the posture it is closing on between
@@ -46,49 +49,50 @@ const MID_MOVE_SHARE: f64 = 0.25;
 
 fn main() -> ExitCode {
     check::main("s5_checker", |run, failures| {
-        check::heartbeat(run, END_CYCLE, failures);
+        check::heartbeat(run, end_cycle(), failures);
         check::readings_present(run, failures);
+        check::scripts_sent(run, &[(SCRIPT_ID, script_sent_cycle())], failures);
+        let engaged = check::engagement(run, failures);
+        check::ended_promptly(
+            engaged.map(|engaged| engaged.released),
+            disengage_cycle(),
+            failures,
+        );
         // The goal stream is where a retarget breaks if it breaks at all: a gap
         // in it, an instant out of order, or a step past what the plant can
         // travel are all this scenario's failure modes, and all three are
         // asserted for every cycle of the run rather than only around the
         // turnaround.
-        if let Some(stream) = check::goal_stream(run, failures) {
-            check::stream_covers_session(&stream, ENGAGE_CYCLE, DISENGAGE_CYCLE, failures);
+        if let (Some(stream), Some(engaged)) = (check::goal_stream(run, failures), engaged) {
+            check::stream_starts_with_session(&stream, engaged.taken, failures);
+            check::stream_stops_with_release(&stream, engaged.released, failures);
         }
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
-        // The retarget is an epoch changing, so the three epochs reaching the
-        // run is the mechanism itself. The turnaround alone would leave a run
-        // whose second schedule never arrived looking like one that did, up to
-        // the behaviour it happens to differ in.
-        check::schedules_replayed(
-            run,
-            &[
-                check::Session {
-                    cycle: ENGAGE_CYCLE,
-                    engaged: true,
-                    epoch: ENGAGED_EPOCH,
-                },
-                check::Session {
-                    cycle: RETARGET_CYCLE,
-                    engaged: true,
-                    epoch: RETARGET_EPOCH,
-                },
-                check::Session {
-                    cycle: DISENGAGE_CYCLE,
-                    engaged: false,
-                    epoch: DISENGAGED_EPOCH,
-                },
-            ],
-            failures,
-        );
-
         check_mid_move(run, failures);
         check_closing(run, failures);
         check_arrival(run, failures);
         check::no_faults(run, failures);
         check::no_events(run, failures);
+        // Exactly this narration and nothing else: a refused script or a fault
+        // read off a health rotation fails here rather than passing unseen.
+        // There is no report of the retarget itself -- a step handing over to
+        // the next is the schedule being carried out rather than news about it.
+        check::narration(
+            run,
+            &[
+                ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::SCRIPT_ACCEPTED,
+                ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::SCHEDULE_PUBLISHED,
+                ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::SCHEDULE_PUBLISHED,
+                ReportKindWire::SESSION_ENDED,
+                ReportKindWire::PHASE_CHANGED,
+            ],
+            failures,
+        );
         check::signal_groups(run, failures);
     })
 }
@@ -103,17 +107,20 @@ fn main() -> ExitCode {
 /// a machine that had arrived early or never set off would satisfy the first
 /// while making every assertion below meaningless.
 fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
+    // The head group's configured clock, deliberately: this guard is about the
+    // head pose being between the two postures, and the shorter figure makes it
+    // stricter. The antennas' own floored clock runs past it and asserting
+    // against that would loosen the window a retarget has to land inside.
     let move_cycles = up_cycles();
-    if RETARGET_CYCLE >= move_cycles {
+    if RETARGET_AFTER >= move_cycles {
         failures.push(format!(
-            "the retarget is at cycle {RETARGET_CYCLE} and the raise is given {move_cycles} \
-             cycles: the scenario does not change the posture during a move"
+            "the posture changes {RETARGET_AFTER} cycles into a raise given {move_cycles}: the \
+             scenario does not change the posture during a move"
         ));
     }
-    let Some(found) = head_pose_at(run, RETARGET_CYCLE) else {
-        failures.push(format!(
-            "no pose for cycle {RETARGET_CYCLE}, where the schedule changed"
-        ));
+    let at = retarget_cycle();
+    let Some(found) = head_pose_at(run, at) else {
+        failures.push(format!("no pose for cycle {at}, where the posture changed"));
         return;
     };
     let span = apart(&neutral_head_pose(), &stow_head_pose());
@@ -124,7 +131,7 @@ fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
         let offset = apart(&found, &posture);
         if offset <= span * MID_MOVE_SHARE {
             failures.push(format!(
-                "at cycle {RETARGET_CYCLE} the head is {offset} m from {what}, out of the {span} m \
+                "at cycle {at} the head is {offset} m from {what}, out of the {span} m \
                  between the two postures: the schedule changed under a machine that had all but \
                  arrived rather than under a move"
             ));
@@ -141,7 +148,7 @@ fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
 /// than about what it was asked for.
 fn check_closing(run: &Run, failures: &mut Vec<String>) {
     let stow = stow_head_pose();
-    let from = RETARGET_CYCLE + TURNAROUND_CYCLES;
+    let from = retarget_cycle() + TURNAROUND_CYCLES;
     let Some(start) = head_pose_at(run, from) else {
         failures.push(format!(
             "no pose for cycle {from}, where the machine should have turned round"
@@ -149,7 +156,7 @@ fn check_closing(run: &Run, failures: &mut Vec<String>) {
         return;
     };
     let mut previous = apart(&start, &stow);
-    for cycle in from + 1..DISENGAGE_CYCLE {
+    for cycle in from + 1..disengage_cycle() {
         let Some(found) = head_pose_at(run, cycle) else {
             failures.push(format!("no pose for cycle {cycle}, inside the stow move"));
             return;
@@ -171,14 +178,14 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
     check::arrived_at(
         run,
         "stowed",
-        DISENGAGE_CYCLE - 1,
+        disengage_cycle() - 1,
         &stow_pose_targets(),
         failures,
     );
     check::room(
         "stow",
-        DISENGAGE_CYCLE - RETARGET_CYCLE,
-        stow_cycles(),
+        disengage_cycle() - retarget_cycle(),
+        &stow_clocks(),
         failures,
     );
 }

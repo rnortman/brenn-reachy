@@ -17,15 +17,13 @@
 //! for is a slot holding bytes nothing wrote.
 //!
 //! A sequencer's verdict is not crossed here either: the schema is the form the
-//! library itself writes ([`reachy_motion::verdict`]), so this module validates
-//! that field once and hands the view down.
+//! library itself writes, and the sequencer that owns the snapshot writes and
+//! reads it in place.
 
-use brenn_reachy__cogs__msgs_clk_rs::SessionStateWire;
-use brenn_reachy__motion__seq_clk_rs::{SeqFailureKind, SeqFailureSnapWire};
+use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
+use brenn_reachy__motion__reports_clk_rs::ReportKind;
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 use clockwork_rs::Invalid;
-use reachy_motion::SeqError;
-use reachy_motion::verdict::{self, VerdictError};
 use reachy_motion::vocab::known_nonzero;
 use thiserror::Error;
 
@@ -36,11 +34,7 @@ use thiserror::Error;
 /// field a wrong reading would make dangerous: a timeline row with no kind would
 /// narrate nothing, and a wind-down restored with the wrong disposition would
 /// leave a machine resting after a fault that asked for an operator.
-///
-/// Not `Eq`: a refusal about a solve failure carries the number that was not a
-/// count, and a non-finite one is not equal to itself. Compared as written where
-/// that matters, exactly as the verdicts carrying such a number are.
-#[derive(Clone, Copy, Debug, Error, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SessionSlotError {
     /// A report kind this build does not know, zero included — which is what an
     /// unwritten timeline row holds.
@@ -52,10 +46,6 @@ pub enum SessionSlotError {
     /// boundary rather than at every field that would have narrowed one.
     #[error("the slot does not hold what its schema declares: {0}")]
     Invalid(#[from] Invalid),
-    /// A verdict whose evidence does not suit the failure it is filed under, or
-    /// which will not cross into the slot's numbers at all.
-    #[error("the slot's verdict is not one: {0}")]
-    Verdict(#[from] VerdictError),
     /// Timeline cursors that describe a ring this build does not have: more
     /// reports waiting than the ring holds. Refused rather than clamped.
     #[error("{unpublished} reports are waiting in a ring of {TIMELINE_LEN}")]
@@ -152,11 +142,14 @@ pub fn push_report(
     Ok(dropped)
 }
 
-/// The row the oldest unpublished report stands in, or `None` where none is
-/// waiting.
+/// The row the oldest unpublished report stands in and the kind it narrates, or
+/// `None` where none is waiting.
 ///
 /// A peek rather than a take: the cursor advances only on [`mark_published`], so
-/// a caller that could not publish leaves the report in place.
+/// a caller that could not publish leaves the report in place. The kind comes
+/// out with the row because it was read to hand the row over at all: a caller
+/// therefore has the narratable kind in hand and no second reading of it to
+/// answer for.
 ///
 /// # Errors
 ///
@@ -167,14 +160,14 @@ pub fn push_report(
 /// of reports about nothing.
 pub fn oldest_unpublished(
     state: &SessionStateWire,
-) -> Result<Option<&TimelineEntryWire>, SessionSlotError> {
+) -> Result<Option<(&TimelineEntryWire, ReportKind)>, SessionSlotError> {
     if unpublished_reports(state)? == 0 {
         return Ok(None);
     }
     let row = &state.timeline()[timeline_row(state.timeline_published())];
     match known_nonzero(row.kind().to_known()) {
         None => Err(SessionSlotError::NoSuchReportKind(row.kind().0)),
-        Some(_) => Ok(Some(row)),
+        Some(kind) => Ok(Some((row, kind))),
     }
 }
 
@@ -204,50 +197,4 @@ pub fn clear_timeline(state: &mut SessionStateWire) {
     }
     state.set_timeline_head(0);
     state.set_timeline_published(0);
-}
-
-/// Write the verdict a stopped sequence left, or that the sequence is running.
-///
-/// The slot is cleared to the schema's declared initial state and then filled by
-/// [`verdict::write`], so a field the verdict does not name carries nothing from
-/// the verdict before it. A cleared slot is the no-failure zero, which is what
-/// [`read_opt_seq_failure`] answers "no verdict" for.
-///
-/// # Errors
-///
-/// [`SessionSlotError::Verdict`] for a verdict that will not cross — a
-/// non-finite register value, or a wait past what the slot's count reaches.
-pub fn write_opt_seq_failure(
-    out: &mut SeqFailureSnapWire,
-    failure: Option<&SeqError>,
-) -> Result<(), SessionSlotError> {
-    let out = out.clear_valid();
-    let Some(failure) = failure else {
-        return Ok(());
-    };
-    Ok(verdict::write(out, failure)?)
-}
-
-/// The verdict those fields describe, or `None` where the slot holds none.
-///
-/// The one validation of this field, and the only place its numbers are narrowed
-/// to the vocabulary. The zero kind is no verdict rather than a refusal: a
-/// snapshot in a running phase carries no failure, and that is the common case,
-/// not a corrupt slot. Whether a *phase* may carry none is
-/// [`CommissionSequencer::resume`](reachy_motion::CommissionSequencer::resume)'s
-/// question, asked once for every host of a sequencer.
-///
-/// # Errors
-///
-/// [`SessionSlotError::Invalid`] for bytes the schema does not declare, and
-/// [`SessionSlotError::Verdict`] for fields that name no failure this build
-/// raises or evidence that does not suit the failure it is filed under.
-pub fn read_opt_seq_failure(
-    slot: &SeqFailureSnapWire,
-) -> Result<Option<SeqError>, SessionSlotError> {
-    let slot = slot.validate()?;
-    if slot.kind == SeqFailureKind::None {
-        return Ok(None);
-    }
-    Ok(Some(verdict::read(slot)?))
 }

@@ -2263,6 +2263,12 @@ pub struct ClockStretch {
     /// Whether an antenna clock here was lengthened to de-phase the pair, as
     /// against to fit its own span inside the step bounds.
     pub dephased: bool,
+    /// Whether any clock here was lengthened to carry its own span inside the
+    /// per-tick step bounds. Distinct from `dephased`, and the two combine: a
+    /// clock lengthened for its span and then de-phased says both, and a caller
+    /// that reads only `dephased` cannot tell such a move from a pair the pass
+    /// merely parted.
+    pub span_stretched: bool,
 }
 
 /// The worst per-tick step one dry pass saw, per clock, as a fraction of the
@@ -2418,6 +2424,7 @@ pub fn floor_move_clock(
             separation,
             separation_required: cfg.phase.separation_rad,
             dephased,
+            span_stretched: sized != requested,
         }),
     )
 }
@@ -4940,6 +4947,52 @@ mod tests {
             "de-phased to {:.4} rad, which is still under the bound",
             separated.offset
         );
+    }
+
+    /// The report says which of the two things happened to the clocks, and a
+    /// caller that must tell a clock too short for its path from a pair merely
+    /// parted has both answers.
+    ///
+    /// Three shapes: a yaw sweep on a clock that cannot carry it, with no pair
+    /// to judge; a pair in step on clocks that carry their own arcs, parted and
+    /// nothing else; and a pair whose clocks carry neither, which says both.
+    #[test]
+    fn the_report_says_whether_a_span_was_stretched_or_only_a_pair_parted() {
+        let cfg = MotionConfig::default();
+        let (state, _) = armed_at(&cfg, &JointTargets::default());
+        let yaw = MotionCommand::MoveTo {
+            target: JointTargets {
+                body_yaw: 1.0,
+                ..JointTargets::default()
+            },
+            durations: MoveDurations::uniform(secs(0.2)),
+            warp: WarpKind::MinJerk,
+        };
+        let (_, stretch) = floor_move_clock(&cfg, &last_targets(&state), &yaw, FLOOR_TICK_HZ);
+        let stretch = stretch.expect("a fifth of a second cannot carry a radian of yaw");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(!stretch.dephased, "{stretch:?}");
+
+        let (swept, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
+        let (_, stretch) = floor_move_clock(
+            &cfg,
+            &last_targets(&swept),
+            &inboard_sweep(0.8, [0.8, 0.8]),
+            FLOOR_TICK_HZ,
+        );
+        let stretch = stretch.expect("a pair in step is de-phased");
+        assert!(!stretch.span_stretched, "{stretch:?}");
+        assert!(stretch.dephased, "{stretch:?}");
+
+        let (_, stretch) = floor_move_clock(
+            &cfg,
+            &last_targets(&swept),
+            &inboard_sweep(0.8, [0.05, 0.06]),
+            FLOOR_TICK_HZ,
+        );
+        let stretch = stretch.expect("neither side carries its sweep in a twentieth of a second");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(stretch.dephased, "{stretch:?}");
     }
 
     /// A stagger a floor collapses is caught by the same check, because the

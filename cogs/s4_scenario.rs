@@ -1,25 +1,27 @@
 //! S4, feedback loss: the scenario that says a machine the loop can no longer
-//! see ends up de-torqued.
+//! see ends up de-torqued, by command.
 //!
-//! S1's session, held at the upright posture, and then the bus stops answering
-//! for a while. What that exercises is the path no other scenario reaches: the
-//! decision tick counting reads that did not arrive, latching once the run of
-//! them is long enough to mean something, reporting that exactly once, and
-//! then commanding nothing ever again -- which stops the keep-alive, which
-//! leaves the driver's gate measuring a silence, which de-torques the machine.
+//! S1's run, held at the upright posture, and then the bus stops answering for
+//! a while. The driver notices: twenty-five cycles of hearing nothing at all is
+//! a bus it declares gone, which is the one fault it can raise about itself. The
+//! session answers that evidence with the doctrine's response for a machine
+//! nothing can be commanded through -- an immediate best-effort torque-off, and
+//! a park an operator has to clear -- publishes a schedule nobody is engaged on,
+//! and the driver reads the release back and confirms it once it can read
+//! anything at all.
 //!
-//! That last step is the point. A latching fault in this slice has no
-//! sequencer to run a stow ladder, and it does not need one: the goal stream
-//! ceasing *is* the response, and the dead-man behind it is what puts the
-//! machine in the minimum-risk condition. The scenario asserts the whole chain,
-//! link by link, because each link is a different cog and any one of them
-//! quietly not doing its part would leave a machine energised with nobody
-//! commanding it.
+//! The order is the point, and it is arithmetic rather than luck: the driver's
+//! evidence is a run of blind cycles and the decision tick's would be a longer
+//! run of missed reads, so the machine is released and the session over before
+//! the tick's own tolerance runs out. What the tick therefore reports is
+//! nothing, and the goal stream ends because the session let go rather than
+//! because the loop gave up -- the one window in which goals reach a gate that
+//! has already let go is the cycle between the release and the disengagement
+//! reaching the mover.
 //!
-//! The reads come back before the gate's window runs out, deliberately: nothing
-//! recovers. A latched fault dies with the engagement, and a scenario where the
-//! bus returned and the machine carried on would be describing a flag that
-//! cleared itself.
+//! Nothing recovers. The reads come back after the machine has been released and
+//! parked, and the run continues past them: a session that took a script or a
+//! stream that started again would be describing a latch that cleared itself.
 //!
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. The instants are all cycle counts from the epoch, because the
@@ -27,36 +29,69 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use scenario::author::Step;
-use scenario::{UP_DURATION_NS, cycle_at, cycles_for, dead_man_latch_cycle, silence_ns};
+use scenario::{BLIND_CYCLES_BEFORE_BUS_FAILURE, cycle_at, up_cycles};
 
 use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use reachy_motion::default_motion_config;
+use reachy_motion::joints::ROW_COUNT;
 
-/// The cycle the session is engaged and the machine energised at.
-pub const ENGAGE_CYCLE: i64 = 0;
+// The shape of an ordinary run, stated once for every scenario: where a run
+// begins, the cycle a script may first be taken on, and the cycle the machine
+// is armed and holding by.
+pub use scenario::{START_CYCLE, armed_cycle as up_start_cycle, script_cycle as script_sent_cycle};
+
+/// The script's number.
+pub const SCRIPT_ID: u32 = 4;
+
+/// How long the machine holds upright before the bus goes away, in cycles: the
+/// move plus room to arrive and settle into its hold.
+pub const SETTLE_CYCLES: i64 = 20;
 
 /// The cycle the bus stops answering on.
 ///
-/// Well after the machine has arrived upright and settled into its hold, so
-/// what the run is about is a loop that lost its measurements rather than one
-/// that lost them mid-move. A move interrupted by an outage is a different
-/// question, and mixing the two would leave every assertion here with two
-/// possible causes.
-pub const OUTAGE_CYCLE: i64 = 60;
+/// Past the start-up survey and past the arming, because a bus that goes away
+/// carries their transactions off with it: this run is about a session that had
+/// established the machine and taken hold of it and then lost the wire, and one
+/// that never got through either would fail from a different phase and prove a
+/// different thing. And well after the machine has arrived upright and settled
+/// into its hold, so what the run is about is a loop that lost its measurements
+/// rather than one that lost them mid-move -- a move interrupted by an outage is
+/// a different question, and mixing the two would leave every assertion here
+/// with two possible causes.
+#[must_use]
+pub fn outage_cycle() -> i64 {
+    up_start_cycle() + up_cycles() + SETTLE_CYCLES
+}
 
-/// How many cycles of position replies are lost.
+/// How many cycles of replies are lost.
 ///
-/// Longer than the tick's tolerance, so the outage is long enough to mean
-/// something, and long enough afterwards that the reads are back well before
-/// the gate de-torques the machine -- which is what makes "nothing recovers" an
-/// assertion about the loop rather than about the timing.
+/// Longer than the run of blind cycles the driver calls a dead bus, so its
+/// evidence is on the record; and long enough after the release for the driver's
+/// own confirmation budget to run out on a read-back that can read nothing,
+/// which is the half of the handshake this run carries that no other does.
 pub const OUTAGE_CYCLES: u32 = 60;
 
-/// How long the run continues past the de-torquing, in cycles.
+/// How long the run continues past the reads coming back, in cycles.
+///
+/// Long enough to carry the confirmation the driver owes once it can read again
+/// -- one row a cycle over the whole bus -- and a stretch past that in which
+/// nothing recovers.
 pub const TAIL_CYCLES: i64 = 20;
 
-/// The epoch of the one schedule the run carries.
-pub const ENGAGED_EPOCH: u32 = 1;
+/// The script's one step: upright, for the whole run.
+///
+/// One step rather than S1's two, because a schedule that moved on to another
+/// posture part way through would be commanding a machine that had already
+/// stopped taking commands -- and one that ran out would end the session at rest,
+/// which is the opposite of what this run is about.
+#[must_use]
+pub fn steps() -> [Step; 1] {
+    [Step {
+        start_ns: cycle_at(up_start_cycle()),
+        end_ns: cycle_at(end_cycle()),
+        posture: Some(PostureWire::UP),
+    }]
+}
 
 /// How many missed reads in a row the decision tick tolerates before it says
 /// the machine's position feedback is gone.
@@ -65,69 +100,50 @@ pub fn read_loss_cycles() -> i64 {
     i64::from(default_motion_config().read_loss_ticks)
 }
 
-/// The cycle the decision tick reports the loss on.
+/// The cycle the decision tick would report the loss on, if it were still
+/// running by then.
 ///
-/// The tick raises once the run of misses is *past* what it tolerates, so the
-/// report lands on the read after the last one it forgave: the first blind
-/// sample is one miss, and the raise is on the miss numbered one past the
-/// tolerance.
+/// It is not: the session parks the machine and publishes a schedule nobody is
+/// engaged on well before this, and a disengaged mover neither ticks nor
+/// reports. Kept because the ordering is what says so -- the driver's own
+/// evidence arrives first, which is why the tick's tolerance never runs out.
 #[must_use]
 pub fn fault_cycle() -> i64 {
-    OUTAGE_CYCLE + read_loss_cycles()
+    outage_cycle() + read_loss_cycles()
 }
 
-/// How many missed reads the report should name.
-#[must_use]
-pub fn reported_misses() -> u32 {
-    u32::try_from(read_loss_cycles() + 1).unwrap_or(u32::MAX)
-}
-
-/// The cycle the gate de-torques the machine on.
+/// The cycle the driver says its own bus is gone on.
 ///
-/// The last goal the tick published was decided on the cycle before it faulted,
-/// and the driver drains it on the cycle after that -- which is the fault cycle
-/// itself. So the gate's window opens there, and when it latches is the gate's
-/// own arithmetic rather than this scenario's.
+/// The first observer, and the only one in this run: the tick reports a control
+/// loop that has lost its measurements, and the driver reports a bus that is
+/// answering nothing at all. The first blind cycle counts, so the report lands
+/// on the cycle the run reaches its length.
 #[must_use]
-pub fn latch_cycle() -> i64 {
-    dead_man_latch_cycle(fault_cycle())
+pub fn bus_failure_cycle() -> i64 {
+    outage_cycle() + i64::from(BLIND_CYCLES_BEFORE_BUS_FAILURE) - 1
 }
 
-/// How long the gate should say the goal stream was silent for, nanoseconds.
+/// The cycle the machine is released on.
+///
+/// The driver publishes its bus-failure evidence inside the cycle it declares
+/// it on, the session is woken by it there -- an edge waits for no floor -- and
+/// the datagram it answers with is drained by the next cycle. So the release
+/// lands one cycle after the evidence, and the arithmetic is the assertion: a
+/// session that answered a cycle later would be one that waited for its own
+/// wake floor.
 #[must_use]
-pub fn reported_silence_ns() -> i64 {
-    silence_ns(fault_cycle(), latch_cycle())
+pub fn release_cycle() -> i64 {
+    bus_failure_cycle() + 1
 }
 
 /// The last cycle of the run.
 #[must_use]
 pub fn end_cycle() -> i64 {
-    latch_cycle() + TAIL_CYCLES
+    reads_back_cycle() + ROW_COUNT as i64 + TAIL_CYCLES
 }
 
-/// The simulated time the run ends at.
+/// The cycle the replies come back on.
 #[must_use]
-pub fn end_time_ns() -> i64 {
-    cycle_at(end_cycle())
-}
-
-/// The session's one step: upright, for the whole run.
-///
-/// One step rather than S1's two, because a schedule that moved on to another
-/// posture part way through would be commanding a machine that had already
-/// stopped taking commands -- which says nothing, and would make the run's
-/// silence ambiguous between a fault and a session that ran out of steps.
-#[must_use]
-pub fn steps() -> [Step; 1] {
-    [Step {
-        start_ns: cycle_at(ENGAGE_CYCLE),
-        end_ns: cycle_at(end_cycle()),
-        posture: Some(PostureWire::UP),
-    }]
-}
-
-/// How many cycles a move to the upright posture is given, rounded up.
-#[must_use]
-pub fn up_cycles() -> i64 {
-    cycles_for(UP_DURATION_NS)
+pub fn reads_back_cycle() -> i64 {
+    outage_cycle() + i64::from(OUTAGE_CYCLES)
 }

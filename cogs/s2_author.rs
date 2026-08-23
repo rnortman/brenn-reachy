@@ -17,37 +17,41 @@ use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s2_scenario::{
-    DISENGAGE_CYCLE, DISENGAGED_EPOCH, ENGAGE_CYCLE, ENGAGED_EPOCH, OBSTRUCT_CYCLE, RELEASE_CYCLE,
-    jammed_rows, steps,
+    SCRIPT_ID, SECOND_SCRIPT_ID, START_CYCLE, jammed_rows, obstruct_cycle, release_cycle,
+    script_sent_cycle, second_script_cycle, second_steps, steps,
 };
 
 fn main() -> ExitCode {
-    author::main("s2_author", s2_scenario::end_time_ns(), write)
+    author::main("s2_author", s2_scenario::end_cycle(), write)
 }
 
 /// Write S2's input log into `dir`.
 ///
-/// S1's four messages, with two more between them: the hand that jams the head
-/// cranks and the hand that takes them back off. Everything the scenario is
-/// about follows from those two.
+/// S1's two messages, with three more after them: the hand that jams the head
+/// cranks, the hand that takes it back off, and the script a machine the
+/// maneuver let go of is asked to run. Everything the scenario is about follows
+/// from those three.
 fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
-
-    let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, author::all_rows())?;
-    log.schedule(engage, true, ENGAGED_EPOCH, &steps())?;
+    log.begin(cycle_at(START_CYCLE))?;
+    log.script(cycle_at(script_sent_cycle()), SCRIPT_ID, &steps())?;
 
     // The jam. A jammed servo on this machine holds where it stands, which is
     // what the modelled plant does with an obstructed row: the scenario is not
     // asking what a servo does when something pushes back, it is asking what
     // the control loop does about a joint that stopped arriving.
     let jammed = JointFlagsWire::from(jammed_rows());
-    log.obstruct(cycle_at(OBSTRUCT_CYCLE), jammed)?;
-    log.release(cycle_at(RELEASE_CYCLE), jammed)?;
+    log.obstruct(cycle_at(obstruct_cycle()), jammed)?;
+    log.release(cycle_at(release_cycle()), jammed)?;
 
-    let disengage = cycle_at(DISENGAGE_CYCLE);
-    log.schedule(disengage, false, DISENGAGED_EPOCH, &[])?;
-    log.torque_off(disengage, author::all_rows())?;
+    // The second engagement. A rest-class response ends the session and leaves
+    // the machine unlatched, so a script sent after it is taken -- which is the
+    // half of the park/rest split no other run in the suite says anything about.
+    log.script(
+        cycle_at(second_script_cycle()),
+        SECOND_SCRIPT_ID,
+        &second_steps(),
+    )?;
 
     log.close()
 }

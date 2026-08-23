@@ -1,0 +1,121 @@
+// What somebody asks the machine to do: a script, as it arrives from outside.
+//
+// A script is not a schedule. A schedule names absolute instants and is the
+// session's own published statement of what it is doing; a script names offsets
+// from the instant its sender stamped on it, and is a request that may be
+// refused. The session screens one into the other whole, or declines it whole --
+// there is no partial acceptance, and nothing here is ever half-applied.
+//
+// The offsets are the contract that keeps a clock out of the consumer: the
+// sender stamps `arrival` and every offset is measured from it, so the session
+// turns a script into absolute times by arithmetic and never by reading a clock
+// to decide what "now" meant to the sender. A sender whose clock is wrong sends
+// a script that plays at the wrong time, which is visible; a consumer that
+// substituted its own instant would silently reinterpret the request.
+//
+// The module lives beside the session that defines the contract rather than
+// beside whatever produces one -- the log reader in the simulated system, a
+// bridge process online -- because the shape is the session's statement of what
+// it will accept, and the producers are interchangeable.
+//
+// Bounds mirror `SessionSchedule`'s exactly: sixteen steps and four overlay
+// windows. A script that would not fit the schedule it becomes is refused at the
+// screen rather than truncated, so the two capacities must be the same number.
+//
+// Times are milliseconds here and only here: an offset stamped by a sender is a
+// number in a request, not an instant this system holds. Everything downstream
+// of the screen is `SyncTime` and `Duration`.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+use cogs::schedule;
+
+// One step of a script: how long after arrival it starts, how long it lasts,
+// and what it asks for.
+//
+// The `kind` and `posture` vocabularies are the schedule's own, not restated:
+// what a step asks the base to do is the same question either side of the
+// screen, and two spellings of it would be two things to keep in step.
+schema ScriptStep
+{
+    uuid: ea709794-a7bc-4fa5-91d8-59c181064089;
+    fields
+    {
+        // How long after the script's arrival instant the step begins,
+        // milliseconds. Non-decreasing across the steps, which the screen
+        // checks: a script whose steps go backwards is not a timeline.
+        #0 after_ms: UInt32;
+
+        // How long the step lasts, milliseconds. Positive, which the screen
+        // checks: a zero-length step is an interval that owns no instant.
+        #1 duration_ms: UInt32;
+
+        // What the step asks for.
+        #2 kind: schedule::StepKind;
+
+        // Which posture, meaningful only when `kind` is `base_posture`.
+        #3 posture: schedule::Posture;
+    }
+}
+
+// One motion a script asks to be played over the base, and the window it plays
+// in.
+//
+// Independent of the steps, exactly as an `OverlayWindow` is: an overlay is a
+// delta composed over whatever posture the base holds, so a window may span
+// several steps or none of them.
+schema ScriptOverlay
+{
+    uuid: c0aa23e1-7cb7-4379-bed3-444b2bcd7c87;
+    fields
+    {
+        // Which motion, as its index in the configured library's motions. The
+        // screen checks only that the index could name a motion at all; whether
+        // this library holds one is the mover's question at play time, because
+        // the session does not carry the library.
+        #0 motion_id: UInt16;
+
+        // How long after the script's arrival instant the window opens,
+        // milliseconds.
+        #1 after_ms: UInt32;
+
+        // How long the window stays open, milliseconds. Positive, likewise.
+        #2 duration_ms: UInt32;
+
+        // How much of the motion's delta is applied at full weight.
+        #3 gain: Float64;
+
+        // How fast the motion is played, as a multiple of the rate its clips
+        // were authored at.
+        #4 speed: Float64;
+    }
+}
+
+// A whole request: the steps, the overlays, and the instant every offset in it
+// is measured from.
+//
+// All-or-nothing, which is why it is one message rather than a stream of steps:
+// the session screens what it has in hand and either publishes a schedule built
+// from the whole of it or refuses it with one reason. A script arriving in
+// pieces would be a request the session could partially act on.
+schema Script
+{
+    uuid: 49dd0342-7330-40e2-ab01-41df665b9df0;
+    fields
+    {
+        // Which script this is, as the sender numbers them. Carried through to
+        // the reports about the session it opens, so a sender can tell which of
+        // its requests a report is about.
+        #0 script_id: UInt32;
+
+        // The instant the sender stamped, and the origin of every offset below.
+        #1 arrival: SyncTime;
+
+        // The steps, in time order.
+        #2 steps: VarArray<ScriptStep, 16>;
+
+        // The overlay windows, in time order.
+        #3 overlays: VarArray<ScriptOverlay, 4>;
+    }
+}

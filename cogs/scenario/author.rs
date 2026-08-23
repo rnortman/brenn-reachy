@@ -1,8 +1,10 @@
 //! Phase one of the harness: turn a scenario's statement into an input log.
 //!
 //! The two channels the deterministic runner publishes from a log are the ones
-//! nothing in this system produces -- the session's schedule and the scenario's
-//! hand on the plant. Everything else in the run follows from them.
+//! nothing in this system produces -- the scripts somebody asks the machine to
+//! run, and the scenario's hand on the plant. Everything else in the run follows
+//! from them: the session screens a script, commissions and arms the machine over
+//! the bus, and publishes the schedule the decision tick streams.
 //!
 //! The log time and the transmit time of every message are the same instant.
 //! They differ on a real recording -- one is when the message was sent, the
@@ -16,13 +18,13 @@ use reachy_motion::joints::flags;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__schedule_clk_rs::{
-    PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
-};
+use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmdWire, SimOpWire};
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointsWire};
 
-use crate::{SCHEDULE_CHANNEL, SIM_CMD_CHANNEL};
+use crate::{SCRIPT_CHANNEL, SIM_CMD_CHANNEL};
 
 /// Every servo on the bus, as the schema's flags.
 ///
@@ -37,15 +39,15 @@ pub fn all_rows() -> JointFlagsWire {
 /// Run one scenario's author: write its input log where the harness asks for
 /// it, and say when the run it describes ends.
 ///
-/// The end time goes to standard output because it is a fact about the scenario
-/// rather than about the harness: the shell script that runs the three phases
-/// passes it to the runner without knowing what it is, so the scenario's
-/// schedule is stated in exactly one place. That protocol -- one argument, the
-/// end time on stdout -- is the harness's rather than any one scenario's, so it
-/// is stated here and each author is the log it writes.
+/// The end cycle is what a scenario states; the instant it becomes is what goes
+/// to standard output, because that is the harness's protocol rather than the
+/// scenario's: the shell script that runs the three phases passes the number to
+/// the runner without knowing what it is. Taking the cycle here is what keeps a
+/// scenario from restating the conversion -- one argument in, the end time on
+/// stdout, and each author is then the log it writes.
 pub fn main(
     name: &str,
-    end_time_ns: i64,
+    end_cycle: i64,
     write: impl FnOnce(&Path) -> Result<(), LogError>,
 ) -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -56,7 +58,7 @@ pub fn main(
     let dir = PathBuf::from(dir);
     match write(&dir) {
         Ok(()) => {
-            println!("{end_time_ns}");
+            println!("{}", crate::cycle_at(end_cycle));
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -66,7 +68,13 @@ pub fn main(
     }
 }
 
-/// One step of a schedule, as a scenario states it.
+/// One step of a script, as a scenario states it.
+///
+/// Absolute instants rather than the offsets a script carries, because a scenario
+/// reasons in cycles of the run and every other assertion it makes is against the
+/// same numbers. [`InputLog::script`] is where they become offsets from the
+/// arrival the sender stamps, which is the only clock a script's times are
+/// measured from.
 pub struct Step {
     /// When the step begins, inclusive.
     pub start_ns: i64,
@@ -77,12 +85,32 @@ pub struct Step {
     pub posture: Option<PostureWire>,
 }
 
+/// One overlay window of a script, as a scenario states it.
+///
+/// Absolute instants for the same reason a step's are, and the motion is named
+/// by the index the configured library gives it -- the numbering the emitted
+/// asset's name sidecar carries, which is what a script author reads.
+pub struct Overlay {
+    /// Which motion, as its index among the configured motions.
+    pub motion_id: u16,
+    /// When the window opens, inclusive.
+    pub start_ns: i64,
+    /// When it closes, exclusive. A window that closes before its motion has
+    /// played out truncates it, which is a thing a scenario may want to say.
+    pub end_ns: i64,
+    /// How much of the motion's delta is applied at full weight.
+    pub gain: f64,
+    /// How fast it is played, as a multiple of the rate its clips were authored
+    /// at.
+    pub speed: f64,
+}
+
 /// The input log being written.
 pub struct InputLog {
     writer: OffboardWriter,
-    schedule: ChannelId,
+    scripts: ChannelId,
     injections: ChannelId,
-    schedule_seq: u32,
+    script_seq: u32,
     injection_seq: u32,
 }
 
@@ -100,22 +128,41 @@ impl InputLog {
     /// used twice.
     pub fn create(dir: &Path) -> Result<Self, LogError> {
         let mut writer = OffboardWriter::create(dir, OffboardWriterConfig::default())?;
-        let schedule = writer.create_channel_typed::<SessionScheduleWire>(SCHEDULE_CHANNEL)?;
+        let scripts = writer.create_channel_typed::<ScriptWire>(SCRIPT_CHANNEL)?;
         let injections = writer.create_channel_typed::<SimCmdWire>(SIM_CMD_CHANNEL)?;
         Ok(Self {
             writer,
-            schedule,
+            scripts,
             injections,
-            schedule_seq: 0,
+            script_seq: 0,
             injection_seq: 0,
         })
     }
 
-    /// Publish a schedule at `at_ns`, as the session cog's channel would.
+    /// Anchor the run at `at_ns`, stating the world it begins in: nothing is
+    /// holding any row of the machine.
     ///
-    /// The whole schedule every time: it is state rather than an event, and the
-    /// epoch is what makes a change observable when two schedules happen to look
-    /// alike.
+    /// The deterministic runner starts its clock at the first message the input
+    /// log carries, so a scenario whose first message is its script would begin
+    /// at the script -- and the start-up survey the session runs before it will
+    /// take one would never have happened, which makes the script arrive at a
+    /// machine that refuses it. So every scenario says what the world is at the
+    /// epoch, and what it says is true of a machine nothing has touched.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    pub fn begin(&mut self, at_ns: i64) -> Result<(), LogError> {
+        self.release(at_ns, all_rows())
+    }
+
+    /// Ask the machine to run a script, sent at `at_ns`.
+    ///
+    /// The instant it is sent is the arrival the sender stamps it with, and every
+    /// step's offset is measured from that: a consumer never reads a clock to
+    /// interpret a script, so a sender whose clock is wrong asks for a script
+    /// that plays at the wrong time rather than one that is silently
+    /// reinterpreted.
     ///
     /// # Errors
     ///
@@ -123,26 +170,48 @@ impl InputLog {
     ///
     /// # Panics
     ///
-    /// If more steps are given than the schema holds.
-    pub fn schedule(
+    /// If more steps are given than the schema holds, or a step begins before the
+    /// script arrives, or a step's bounds are not a whole number of milliseconds
+    /// apart -- a script carries millisecond offsets, so an instant off that grid
+    /// is a scenario asking for something it cannot state.
+    pub fn script(&mut self, at_ns: i64, script_id: u32, steps: &[Step]) -> Result<(), LogError> {
+        self.playing(at_ns, script_id, steps, &[])
+    }
+
+    /// Ask the machine to run a script that also plays motions over its
+    /// postures, sent at `at_ns`.
+    ///
+    /// The same request as [`Self::script`] with the overlay half filled in: a
+    /// script is one message, so a scenario asking for a composition asks for it
+    /// and the base it rides on together.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    ///
+    /// # Panics
+    ///
+    /// On the same statements [`Self::script`] refuses, and for more windows
+    /// than the schema holds.
+    pub fn playing(
         &mut self,
         at_ns: i64,
-        engaged: bool,
-        epoch: u32,
+        script_id: u32,
         steps: &[Step],
+        overlays: &[Overlay],
     ) -> Result<(), LogError> {
-        let mut message = SessionScheduleWire::new();
-        message.set_engaged(engaged);
-        message.set_epoch(epoch);
+        let mut message = ScriptWire::new();
+        message.set_script_id(script_id);
+        message.set_arrival(SyncTime::from_nanos(at_ns));
         {
             let mut rows = message.steps_mut();
             rows.clear();
             for step in steps {
-                let row: &mut ScheduledStepWire = rows
+                let row: &mut ScriptStepWire = rows
                     .try_grow()
-                    .expect("a schedule of no more steps than the schema holds");
-                row.set_start(SyncTime::from_nanos(step.start_ns));
-                row.set_end(SyncTime::from_nanos(step.end_ns));
+                    .expect("a script of no more steps than the schema holds");
+                row.set_after_ms(offset_ms(at_ns, step.start_ns));
+                row.set_duration_ms(offset_ms(step.start_ns, step.end_ns));
                 match step.posture {
                     Some(posture) => {
                         row.set_kind(StepKindWire::BASE_POSTURE);
@@ -152,10 +221,24 @@ impl InputLog {
                 }
             }
         }
+        {
+            let mut rows = message.overlays_mut();
+            rows.clear();
+            for overlay in overlays {
+                let row: &mut ScriptOverlayWire = rows
+                    .try_grow()
+                    .expect("a script of no more windows than the schema holds");
+                row.set_motion_id(overlay.motion_id);
+                row.set_after_ms(offset_ms(at_ns, overlay.start_ns));
+                row.set_duration_ms(offset_ms(overlay.start_ns, overlay.end_ns));
+                row.set_gain(overlay.gain);
+                row.set_speed(overlay.speed);
+            }
+        }
         let at = SyncTime::from_nanos(at_ns);
         self.writer
-            .write_typed(self.schedule, self.schedule_seq, at, at, &message)?;
-        self.schedule_seq += 1;
+            .write_typed(self.scripts, self.script_seq, at, at, &message)?;
+        self.script_seq += 1;
         Ok(())
     }
 
@@ -188,6 +271,50 @@ impl InputLog {
     /// Whatever the writer refuses.
     pub fn torque_off(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
         self.inject(at_ns, &operation(SimOpWire::TORQUE_OFF, rows))
+    }
+
+    /// Write `bits` into the given rows' hardware-error byte: the servos start
+    /// complaining about themselves.
+    ///
+    /// The one condition a scenario can state that the plant has no other way
+    /// to express. What a servo's error byte means is the servo's own business
+    /// and nothing in the modelled machine produces one, so a run about a
+    /// machine whose motor is in trouble says so here and the driver's rotating
+    /// read is what carries it to the session.
+    ///
+    /// Through the register the real bus holds it in, so the reading the session
+    /// classifies is the reading a real rotation would have taken.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    pub fn set_error_bits(
+        &mut self,
+        at_ns: i64,
+        rows: JointFlagsWire,
+        bits: u8,
+    ) -> Result<(), LogError> {
+        let mut injection = operation(SimOpWire::SET_REGISTER, rows);
+        injection.set_reg(RegIdWire::HARDWARE_ERROR_STATUS);
+        injection.set_value(u64::from(bits));
+        self.inject(at_ns, &injection)
+    }
+
+    /// Take the given rows off the bus: nothing answers for them at all.
+    ///
+    /// No ping, no register read, no write, no health report. The stand-in for a
+    /// servo that is dead, unplugged or was never fitted, which is the one
+    /// condition a start-up survey has to refuse the whole machine over.
+    ///
+    /// The set replaces whatever was named before, so a call naming no rows puts
+    /// the whole bus back: an absence a scenario could not end is one it could
+    /// not show a machine surviving.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    pub fn absent(&mut self, at_ns: i64, rows: JointFlagsWire) -> Result<(), LogError> {
+        self.inject(at_ns, &operation(SimOpWire::ABSENT_SERVO, rows))
     }
 
     /// Jam the given rows where they stand.
@@ -255,4 +382,21 @@ fn operation(op: SimOpWire, rows: JointFlagsWire) -> SimCmdWire {
     injection.set_op(op);
     injection.set_mask(rows);
     injection
+}
+
+/// How many milliseconds `to` is after `from`.
+///
+/// # Panics
+///
+/// If it is before it, or if the gap is not a whole number of milliseconds: a
+/// script's offsets are milliseconds, so either is a scenario stating an instant
+/// no script can carry.
+fn offset_ms(from: i64, to: i64) -> u32 {
+    let gap = to - from;
+    assert!(gap >= 0, "a step at {to} cannot precede {from}");
+    assert!(
+        gap % 1_000_000 == 0,
+        "{gap}ns is not a whole number of milliseconds",
+    );
+    u32::try_from(gap / 1_000_000).expect("an offset a script can carry")
 }

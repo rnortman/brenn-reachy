@@ -134,6 +134,42 @@ pub fn compose(base: JointTargets, overlays: &[OverlaySample]) -> JointTargets {
     out
 }
 
+/// The base `composed` was folded onto, given the overlays that were riding it.
+///
+/// [`compose`] run backwards, over the same arithmetic and in the reverse order,
+/// so the two cannot come to disagree about what a fold took out.
+///
+/// What a caller needs it for: an overlay that stops riding a base takes its
+/// whole weighted delta out of the composed stream in one period unless the base
+/// absorbs it. Re-anchoring the base at this — the composed setpoint that was
+/// last commanded, less what still rides it — makes the next composed setpoint
+/// the same setpoint, and the offset then decays as a planned move under
+/// whatever bounds the caller's own commands are held to.
+///
+/// Exact for the scalars and to the arithmetic's own precision for the head:
+/// the rotation is unwound along the same arc it was wound along.
+#[must_use]
+pub fn uncompose(composed: JointTargets, overlays: &[OverlaySample]) -> JointTargets {
+    let mut out = composed;
+    for sample in overlays.iter().rev() {
+        if let Some(delta) = sample.frame.head {
+            let weight = sample.weights.get(Channel::Head);
+            if weight > 0.0 {
+                out.head_pose_body *= scale_delta(&delta, weight).inverse();
+            }
+        }
+        if let Some(delta) = sample.frame.body_yaw {
+            out.body_yaw -= delta * sample.weights.get(Channel::BodyYaw);
+        }
+        if let Some(delta) = sample.frame.antennas {
+            let weight = sample.weights.get(Channel::Antennas);
+            out.antennas[0] -= delta[0] * weight;
+            out.antennas[1] -= delta[1] * weight;
+        }
+    }
+    out
+}
+
 /// A rigid delta scaled by `weight`: the same motion, `weight` of the way
 /// through it.
 ///
@@ -404,6 +440,50 @@ mod tests {
     fn a_silent_sample_changes_nothing() {
         let base = moved_base();
         assert_eq!(compose(base, &[OverlaySample::silent()]), base);
+    }
+
+    /// The fold is undone by the same arithmetic that made it: a base that goes
+    /// through both comes back out, whatever was riding it and in whatever
+    /// order. What a caller re-anchoring a base off a composed setpoint relies
+    /// on, and the reason head deltas are unwound in the reverse order.
+    #[test]
+    fn uncomposing_a_setpoint_hands_back_the_base_it_stood_on() {
+        let base = moved_base();
+        let mut pitch = head_yaw_sample(0.0, 0.75);
+        pitch.frame.head = Some(Isometry3::from_parts(
+            Translation3::new(0.03, -0.01, 0.0),
+            UnitQuaternion::from_scaled_axis(Vector3::y() * 0.5),
+        ));
+        let mut both = antennas_sample(0.1, -0.2, 0.5);
+        both.frame.body_yaw = Some(0.07);
+        both.weights.set(Channel::BodyYaw, 0.25);
+        let riding = [pitch, head_yaw_sample(0.7, 1.0), both];
+
+        for overlays in [&riding[..], &riding[..1], &riding[2..], &[][..]] {
+            let composed = compose(base, overlays);
+            let found = uncompose(composed, overlays);
+            assert!(
+                (found.head_pose_body.translation.vector - base.head_pose_body.translation.vector)
+                    .norm()
+                    < 1e-12,
+                "{found:?}"
+            );
+            assert!(
+                found
+                    .head_pose_body
+                    .rotation
+                    .angle_to(&base.head_pose_body.rotation)
+                    < 1e-12
+            );
+            assert!((found.body_yaw - base.body_yaw).abs() < 1e-12);
+            assert!((found.antennas[0] - base.antennas[0]).abs() < 1e-12);
+            assert!((found.antennas[1] - base.antennas[1]).abs() < 1e-12);
+        }
+
+        // And it is the fold's inverse rather than a no-op: a setpoint nothing
+        // was riding is the base, and one something was is not.
+        assert_ne!(compose(base, &riding), base);
+        assert_eq!(uncompose(base, &[]), base);
     }
 
     #[test]

@@ -38,6 +38,15 @@ clk_schema_module(
 )
 
 clk_schema_module(
+    name = "aux",
+    imports = [
+        "//hardware/dynamixel:registers",
+        "//motion:bus_txn",
+        "//motion:joints",
+    ],
+)
+
+clk_schema_module(
     name = "gate",
     imports = [
         "goal",
@@ -48,9 +57,7 @@ clk_schema_module(
 clk_schema_module(
     name = "health",
     imports = [
-        "//cogs:session_aux",
         "//hardware/dynamixel:registers",
-        "//motion:bus_txn",
         "//motion:joints",
     ],
 )
@@ -68,7 +75,6 @@ rust_test(
         ":health_clk_rs",
         ":pose_clk_rs",
         ":wire_clk_rs",
-        "//cogs:session_aux_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
         "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",

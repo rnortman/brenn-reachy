@@ -20,10 +20,9 @@
 //! Every vector is written little-endian, which is the only byte order
 //! `clockwork_rs` compiles for.
 
-use brenn_reachy__cogs__session_aux_clk_rs::AuxStatus;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::{
-    AuxOutcomeWire, DriverEventWire, EventKind, HealthReportWire,
+    AuxOutcomeWire, AuxStatus, DriverEventWire, EventKind, HealthReportWire,
 };
 use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use brenn_reachy__driver__wire_clk_rs::DatagramHeaderWire;
@@ -163,11 +162,12 @@ fn an_aux_outcome_is_the_bytes_it_was() {
     outcome.status = AuxStatus::Timeout;
     outcome.value_kind = ValueShape::Radians;
     outcome.value = 0.25f64.to_bits();
+    outcome.model = 0x0708;
 
     pins(
         "AuxOutcome",
         blob_as_bytes(&msg),
-        "000000000000d03f0403020101050000",
+        "000000000000d03f0403020108070105",
     );
 }
 

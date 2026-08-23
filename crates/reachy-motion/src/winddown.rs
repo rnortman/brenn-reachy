@@ -49,9 +49,6 @@ pub enum Maneuver {
     MaskedSlowStow,
     /// Torque off the antenna pair and stop commanding it. The head is
     /// untouched and the move carries on.
-    ///
-    /// TODO(degrade-maneuver-narration): nothing in the build reports under this
-    /// name — the degrade travels in the tick's report, which names no maneuver.
     AntennaTorqueOff,
     /// Immediate best-effort torque-off of all nine.
     ImmediateAllTorqueOff,
@@ -73,6 +70,33 @@ impl Maneuver {
 impl fmt::Display for Maneuver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.slug())
+    }
+}
+
+/// The maneuver `response` runs, or `None` where it runs none.
+///
+/// The response half of the same table [`ending::maneuver`] answers for an
+/// ending, and the two differ in exactly one place: degrading a pair is not an
+/// ending, so an ending that names that response answers with the stow, while
+/// the response itself runs the antenna torque-off. A host carrying out a
+/// response asks here — which is what keeps the one group-scoped maneuver
+/// classified beside the rest of them rather than spelled out by whoever runs
+/// it.
+///
+/// Total, wildcard-free: a response added to the doctrine is a decision made
+/// here at compile time.
+#[must_use]
+pub fn maneuver_of(response: ResponseKind) -> Option<Maneuver> {
+    match response {
+        ResponseKind::SlowStowToRest => Some(Maneuver::SlowStow),
+        ResponseKind::MaskedSlowStowToPark => Some(Maneuver::MaskedSlowStow),
+        ResponseKind::DegradeAntennas => Some(Maneuver::AntennaTorqueOff),
+        ResponseKind::ImmediateAllTorqueOffToRest | ResponseKind::ImmediateAllTorqueOffToPark => {
+            Some(Maneuver::ImmediateAllTorqueOff)
+        }
+        // A refusal does nothing to the machine -- an ask was declined -- and no
+        // answer runs no maneuver.
+        ResponseKind::Refuse | ResponseKind::None => None,
     }
 }
 
@@ -422,9 +446,21 @@ impl<'a> WindDown<'a> {
     /// and can change which servos carry the head down, and it never re-opens
     /// the clock and never starts a second wind-down.
     pub fn raised(&mut self, fault: &Fault) {
+        self.re_ranked(crate::fault::kind(fault));
+    }
+
+    /// The same, for a host whose evidence is the classified condition rather
+    /// than the tick's own value.
+    ///
+    /// A raise that crossed a process boundary arrives as its kind: the
+    /// evidence that classified it travels beside it as numbers a report
+    /// carries, and the kind is the whole of what the ranking reads. So both
+    /// callers rank through this, and neither of them decides what a condition
+    /// asks of whoever finds the machine.
+    pub fn re_ranked(&mut self, kind: crate::fault::FaultKind) {
         let worse = ending::worse(
             self.state.ending,
-            ending::answering(crate::fault::response(crate::fault::kind(fault))),
+            ending::answering(crate::fault::response(kind)),
         );
         self.set_ending(worse);
     }
@@ -634,6 +670,57 @@ mod tests {
             ending::answering(ResponseKind::None),
             EndingKind::None,
             "no answer is no ending"
+        );
+    }
+
+    /// A response names the maneuver it runs, and it is the ending's maneuver
+    /// everywhere but the degrade.
+    ///
+    /// The whole vocabulary, and the one divergence asserted as the divergence:
+    /// a host that reads a response off the classifier and asks what to do about
+    /// it gets the antenna torque-off, where a host that turned the same
+    /// response into an ending first would get the stow. Both are right for
+    /// their question, and this is what says so.
+    #[test]
+    fn a_response_names_the_maneuver_it_runs() {
+        let mut judged = [false; 7];
+        for (response, maneuver) in [
+            (ResponseKind::Refuse, None),
+            (ResponseKind::SlowStowToRest, Some(Maneuver::SlowStow)),
+            (
+                ResponseKind::MaskedSlowStowToPark,
+                Some(Maneuver::MaskedSlowStow),
+            ),
+            (
+                ResponseKind::DegradeAntennas,
+                Some(Maneuver::AntennaTorqueOff),
+            ),
+            (
+                ResponseKind::ImmediateAllTorqueOffToRest,
+                Some(Maneuver::ImmediateAllTorqueOff),
+            ),
+            (
+                ResponseKind::ImmediateAllTorqueOffToPark,
+                Some(Maneuver::ImmediateAllTorqueOff),
+            ),
+            (ResponseKind::None, None),
+        ] {
+            judged[response_slot(response)] = true;
+            assert_eq!(maneuver_of(response), maneuver, "{response:?}");
+            let as_ending = ending::maneuver(ending::answering(response));
+            if matches!(response, ResponseKind::DegradeAntennas) {
+                assert_eq!(
+                    as_ending,
+                    Some(Maneuver::SlowStow),
+                    "an ending that names the degrade stows the still-commanding head",
+                );
+            } else {
+                assert_eq!(as_ending, maneuver, "{response:?} runs one maneuver");
+            }
+        }
+        assert!(
+            judged.iter().all(|seen| *seen),
+            "a response named no maneuver: {judged:?}"
         );
     }
 

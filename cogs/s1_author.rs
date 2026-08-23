@@ -15,35 +15,23 @@ use std::process::ExitCode;
 use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
-use s1_scenario::{DISENGAGE_CYCLE, DISENGAGED_EPOCH, ENGAGE_CYCLE, ENGAGED_EPOCH, steps};
+use s1_scenario::{SCRIPT_ID, START_CYCLE, script_sent_cycle, steps};
 
 fn main() -> ExitCode {
-    author::main("s1_author", s1_scenario::end_time_ns(), write)
+    author::main("s1_author", s1_scenario::end_cycle(), write)
 }
 
 /// Write S1's input log into `dir`.
 ///
-/// Four messages: the machine energised and the session engaged at the start,
-/// and the session ended and the machine de-energised at the finish. Everything
-/// between them is what the loop does about it.
+/// Two messages: the world the run begins in, and the script. Everything else in
+/// the run is the system's own answer to that script -- the survey it takes
+/// before it will accept one, the arming it drives over the bus, the goals it
+/// streams, and the release it ends at. The machine itself is never touched from
+/// outside, which is what makes every assertion in the checker a statement about
+/// the loop rather than about the scenario's hand.
 fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
-
-    // The arming sequencer's job, done by the scenario: the machine is
-    // energised before anything commands it. A schedule that engaged a cold
-    // machine would have the decision tick commanding servos that answer
-    // nothing, which is a different scenario.
-    let engage = cycle_at(ENGAGE_CYCLE);
-    log.torque_on(engage, author::all_rows())?;
-    log.schedule(engage, true, ENGAGED_EPOCH, &steps())?;
-
-    // The session ends. Disengaging stops the goal stream, so the de-energising
-    // has to come with it: the alternative is a machine holding torque with
-    // nobody feeding the dead-man, which is the driver's job to end and not
-    // this scenario's subject.
-    let disengage = cycle_at(DISENGAGE_CYCLE);
-    log.schedule(disengage, false, DISENGAGED_EPOCH, &[])?;
-    log.torque_off(disengage, author::all_rows())?;
-
+    log.begin(cycle_at(START_CYCLE))?;
+    log.script(cycle_at(script_sent_cycle()), SCRIPT_ID, &steps())?;
     log.close()
 }

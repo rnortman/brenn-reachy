@@ -1,30 +1,30 @@
 //! S4's assertions, over the output log.
 //!
-//! Three arguments: the output log directory and the two config textprotos the
+//! Four arguments: the output log directory and the three config textprotos the
 //! process ran against. What S4 shares with a healthy run is asserted by
 //! `scenario::check`; what is here is the chain the outage sets off -- the
-//! samples that carry no reading, the one report, the goal stream ending with
-//! it, the gate de-torquing the machine, and the machine standing still through
-//! all of it.
+//! samples that carry no reading, the driver's own evidence, the session
+//! parking and commanding the release, the driver confirming it, the goals
+//! dropped at a gate that has already let go, the goal stream ending with the
+//! disengagement, and the machine standing still through all of it.
 //!
 //! Every failure is collected rather than thrown, so one run reports everything
 //! that was wrong with it.
 
 use std::process::ExitCode;
 
+use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__driver__health_clk_rs::EventKind;
-use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
-use brenn_reachy__motion__joints_clk_rs::JointRefWire;
-use motion_slots::joint_set;
-use reachy_motion::joints::flags;
 use reachy_motion::postures::neutral_targets;
 use scenario::check;
 use scenario::cycle_of;
 use scenario::read::Run;
 
+use scenario::up_clocks;
+
 use s4_scenario::{
-    ENGAGE_CYCLE, OUTAGE_CYCLE, OUTAGE_CYCLES, end_cycle, fault_cycle, latch_cycle,
-    reported_misses, reported_silence_ns, up_cycles,
+    OUTAGE_CYCLES, SCRIPT_ID, bus_failure_cycle, end_cycle, fault_cycle, outage_cycle,
+    reads_back_cycle, release_cycle, script_sent_cycle, up_start_cycle,
 };
 
 fn main() -> ExitCode {
@@ -36,27 +36,92 @@ fn main() -> ExitCode {
         // measured against.
         check::heartbeat(run, end_cycle(), failures);
         check::estimates_per_sample(run, failures);
+        check::scripts_sent(run, &[(SCRIPT_ID, script_sent_cycle())], failures);
+
+        // First, because the rest is measured against the cycles these land on.
+        // Four changes and no more -- a fifth would be a session that did
+        // something with the reads coming back.
+        let phases = check::phases(
+            run,
+            &[
+                (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
+                (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
+                (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
+                (SessionPhaseWire::PARKED, SessionPhaseWire::ACTIVE),
+            ],
+            failures,
+        );
+        let engaged = phases
+            .get(2)
+            .zip(phases.get(3))
+            .map(|(&taken, &released)| check::Engaged { taken, released });
+        if let Some(engaged) = engaged
+            && engaged.released != bus_failure_cycle()
+        {
+            failures.push(format!(
+                "the session parked on cycle {}, and the evidence it answered was published on \
+                 cycle {}: an edge waits for no wake floor",
+                engaged.released,
+                bus_failure_cycle()
+            ));
+        }
+        // The disengagement goes out on the same wake the machine was parked on:
+        // a machine that must let go is not one to go on commanding.
+        check::schedules_published(run, engaged, failures);
 
         check_the_reads_come_back_first(failures);
         check_arrived_before_the_outage(run, failures);
         check_outage(run, failures);
         check_estimates(run, failures);
-        check_report(run, failures);
-        check_stream_stops(run, failures);
-        let latched = check::sole_event(
+        // And the tick reported nothing at all. The session's answer to the
+        // driver's evidence takes the machine out from under it long before its
+        // own tolerance for missed reads runs out, so the loop never gives up on
+        // a machine it has already been told it is not commanding. Which means
+        // no scenario covers the other order, where the tick's own latch is what
+        // ends the stream.
+        // TODO(tick-feedback-latch-composed)
+        check::no_faults(run, failures);
+        let disengaged = check_stream_stops(run, engaged, failures);
+        // The driver said, on its own account, that its bus had stopped
+        // answering: the outage outlasts what a stuttering bus looks like, and a
+        // driver that read nothing for that long is the one fault it can raise
+        // about itself. Once, whatever the reads do afterwards.
+        check::sole_event(run, EventKind::BusFailure, bus_failure_cycle(), 0, failures);
+        // The session answered it: the machine is released on the next cycle and
+        // every sample from there says the latch stands. The read-back cannot
+        // land while the bus is answering nothing, so the driver says it cannot
+        // confirm the release and then confirms it once the reads come back --
+        // the one thing it must never do is credit a de-torquing to silence. The
+        // dead-man never comes into it -- there is no `HoldTimeoutTorqueOff` in
+        // the kinds below -- because the release was commanded before the goal
+        // stream stopped.
+        check::latch_from(run, Some(release_cycle()), failures);
+        check::confirmed_off_when_the_bus_returns(
             run,
-            EventKind::HoldTimeoutTorqueOff,
-            latch_cycle(),
-            reported_silence_ns(),
+            release_cycle(),
+            reads_back_cycle(),
             failures,
         );
-        check::latch_from(run, latched, failures);
+        check_dropped_goals(run, disengaged, failures);
+        check::only_kinds(
+            run,
+            &[
+                EventKind::BusFailure,
+                EventKind::TorqueOffUnconfirmed,
+                EventKind::TorqueOffConfirmed,
+                EventKind::GoalDroppedQueueFull,
+            ],
+            failures,
+        );
         // It had arrived and was holding when the reads went, so there was
-        // nowhere left to travel; then the tick stopped commanding it, and then
-        // the gate took its torque away.
+        // nowhere left to travel; then the session let go of it, and then the
+        // gate took its torque away. Measured from the last sample anybody could
+        // read: the samples of the outage itself carry no positions, so what
+        // this compares is where the machine was before the reads went against
+        // where it is when they come back.
         check::stands_still(
             run,
-            OUTAGE_CYCLE,
+            outage_cycle() - 1,
             end_cycle(),
             "holding, then uncommanded, then de-torqued",
             failures,
@@ -66,31 +131,73 @@ fn main() -> ExitCode {
 }
 
 /// The scenario still describes the run it claims to: the reads come back after
-/// the tick has given up on them and before the gate takes the torque away.
+/// both observers have given up on the bus and after the machine has been
+/// released, and the run outlasts the tick's own latch.
 ///
-/// Three numbers this file does not own decide that ordering -- how many misses
-/// the tick tolerates, how long the gate's window is, and how long a cycle is --
-/// and a one-cycle move in any of them flips it. If the outage outlasted the
-/// latch, "nothing recovers when the reads come back" would stop being tested at
-/// all while every assertion below still passed, because they are all derived
-/// from the same shifted arithmetic. A hollowed scenario is worse than a missing
-/// one, so the ordering is asserted rather than described.
+/// Numbers this file does not own decide that ordering -- how many misses the
+/// tick tolerates, how many blind cycles the driver forgives, and how long a
+/// cycle is -- and a move in any of them can flip it. If the outage ended before
+/// the evidence, "nothing recovers when the reads come back" would stop being
+/// tested at all while every assertion below still passed, because they are all
+/// derived from the same shifted arithmetic. A hollowed scenario is worse than a
+/// missing one, so the ordering is asserted rather than described.
 fn check_the_reads_come_back_first(failures: &mut Vec<String>) {
-    let back = OUTAGE_CYCLE + i64::from(OUTAGE_CYCLES);
-    if back <= fault_cycle() {
+    let back = reads_back_cycle();
+    if fault_cycle() <= bus_failure_cycle() {
         failures.push(format!(
-            "the reads come back at cycle {back} and the tick gives up on them at cycle {}: this \
-             scenario is about a loop that latched, and this outage ends before it would",
-            fault_cycle()
+            "the tick would give up on the reads at cycle {} and the driver calls its bus gone at \
+             cycle {}: this scenario is about the driver noticing first, and the session taking \
+             the machine out from under a tick that never gave up",
+            fault_cycle(),
+            bus_failure_cycle()
         ));
     }
-    if back >= latch_cycle() {
+    if back <= bus_failure_cycle() {
         failures.push(format!(
-            "the reads come back at cycle {back} and the gate de-torques the machine at cycle {}: \
-             this scenario is about a loop that does not recover when they do, and this outage \
-             outlasts the gate",
-            latch_cycle()
+            "the reads come back at cycle {back} and the driver calls its bus gone at cycle {}: \
+             this scenario carries the driver's own evidence as well as the tick's, and this \
+             outage ends before it",
+            bus_failure_cycle()
         ));
+    }
+    if back <= release_cycle() {
+        failures.push(format!(
+            "the reads come back at cycle {back} and the machine is released at cycle {}: this \
+             scenario is about a machine that stays parked when they do, and this outage ends \
+             before the release",
+            release_cycle()
+        ));
+    }
+}
+
+/// The goals the gate dropped are exactly the ones nobody could have executed.
+///
+/// Every one of them falls between the release and the last goal the mover
+/// published, which is the whole of the window: the machine has let go, and the
+/// mover has not yet read the schedule saying the session is over, so for a cycle
+/// or so it goes on commanding a gate that refuses to write. Asserted as a
+/// window rather than counted, because what matters is that no goal was dropped
+/// while the machine could still have taken one -- a drop before the release
+/// would be a queue overrunning under a working gate, which is a different fault
+/// entirely.
+fn check_dropped_goals(run: &Run, disengaged: Option<i64>, failures: &mut Vec<String>) {
+    let Some(disengaged) = disengaged else {
+        return;
+    };
+    for event in &run.events {
+        if event.message.kind().to_known() != Some(EventKind::GoalDroppedQueueFull) {
+            continue;
+        }
+        let Ok(cycle) = cycle_of(event.message.time().as_nanos()) else {
+            continue;
+        };
+        if cycle < release_cycle() || cycle > disengaged {
+            failures.push(format!(
+                "the gate dropped a goal on cycle {cycle}, and the window in which nobody could \
+                 have executed one runs from cycle {} to cycle {disengaged}",
+                release_cycle()
+            ));
+        }
     }
 }
 
@@ -103,63 +210,24 @@ fn check_arrived_before_the_outage(run: &Run, failures: &mut Vec<String>) {
     check::arrived_at(
         run,
         "upright",
-        OUTAGE_CYCLE - 1,
+        outage_cycle() - 1,
         &neutral_targets(),
         failures,
     );
     check::room(
         "upright",
-        OUTAGE_CYCLE - ENGAGE_CYCLE,
-        up_cycles(),
+        outage_cycle() - up_start_cycle(),
+        &up_clocks(),
         failures,
     );
 }
 
-/// The outage is exactly where the scenario put it: every sample inside the
-/// window says the bus answered for no row, and every sample outside it carries
-/// a reading.
-///
-/// The window's own boundaries are the assertion. An injection takes effect on
-/// the cycle it names -- the driver drains what arrived and then advances the
-/// plant -- so the first blind sample is the one for the cycle the outage was
-/// published on, and the reads are back on the cycle after the last of them.
+/// The outage is exactly where the scenario put it, on [`check::outage`]'s
+/// terms: the window is this scenario's, and the reads come back at the end of
+/// it, which is what S10 -- the same outage, never ending -- cannot say.
 fn check_outage(run: &Run, failures: &mut Vec<String>) {
-    let blind = OUTAGE_CYCLE..OUTAGE_CYCLE + i64::from(OUTAGE_CYCLES);
-    for sample in &run.samples {
-        let sample = &sample.message;
-        let Ok(cycle) = cycle_of(sample.nominal_time().as_nanos()) else {
-            continue;
-        };
-        let wanted = blind.contains(&cycle);
-        let dark = !sample.present_valid();
-        if dark != wanted {
-            failures.push(format!(
-                "the sample at cycle {cycle} says its reading is {}, and the outage runs over \
-                 cycles {}..{}",
-                if dark { "missing" } else { "present" },
-                blind.start,
-                blind.end
-            ));
-            return;
-        }
-        // A driver that read nothing says so twice: the flag and the set of
-        // rows it did not hear from. A sample carrying one without the other is
-        // a receiver's choice about which to believe.
-        let missing = joint_set(sample.missing());
-        let masked = !missing.is_ok_and(flags::is_empty);
-        if masked != dark {
-            let named = match missing {
-                Ok(set) => flags::Names(set).to_string(),
-                Err(complaint) => complaint.to_string(),
-            };
-            failures.push(format!(
-                "the sample at cycle {cycle} says the rows missing are {named} and its validity \
-                 flag is {}: the two say different things about the same reading",
-                sample.present_valid()
-            ));
-            return;
-        }
-    }
+    let blind = outage_cycle()..outage_cycle() + i64::from(OUTAGE_CYCLES);
+    check::outage(run, blind, failures);
 }
 
 /// The estimator says so too: the pose series carries an invalid estimate for
@@ -170,7 +238,7 @@ fn check_outage(run: &Run, failures: &mut Vec<String>) {
 /// sample is asserted with the heartbeat -- so what is left to say is that each
 /// one tells the truth about the reading behind it.
 fn check_estimates(run: &Run, failures: &mut Vec<String>) {
-    let blind = OUTAGE_CYCLE..OUTAGE_CYCLE + i64::from(OUTAGE_CYCLES);
+    let blind = outage_cycle()..outage_cycle() + i64::from(OUTAGE_CYCLES);
     let mut invalid = 0;
     for estimate in &run.estimates {
         let at = estimate.message.time_of_validity().as_nanos();
@@ -201,91 +269,24 @@ fn check_estimates(run: &Run, failures: &mut Vec<String>) {
     }
 }
 
-/// The report: one message, of that kind, on the cycle the tolerance puts it
-/// on, naming the run of misses it counted.
+/// The goal stream ends with the disengagement and never starts again.
 ///
-/// One is the whole point. The fault latches, so the tick re-reports it on every
-/// cycle from here to the end of the run -- fifty of them -- and a channel
-/// carrying that is a channel nobody can read. What reaches the log is the
-/// transition, once.
-fn check_report(run: &Run, failures: &mut Vec<String>) {
-    let mut seen = false;
-    for fault in &run.faults {
-        let at = fault.message.time().as_nanos();
-        let cycle = match cycle_of(at) {
-            Ok(cycle) => cycle,
-            Err(complaint) => {
-                failures.push(format!("a report is not on the grid: {complaint}"));
-                continue;
-            }
-        };
-        if fault.message.kind() != FaultKindWire::POSITION_FEEDBACK_LOST {
-            failures.push(format!(
-                "the decision tick reported {:?} at cycle {cycle}, and the only thing this \
-                 scenario does to the machine is stop reading it",
-                fault.message.kind()
-            ));
-            continue;
-        }
-        if seen {
-            failures.push(format!(
-                "the tick reported the loss again at cycle {cycle}: it latches, so every cycle \
-                 after the raise re-reports a standing fault, and a standing fault is not news"
-            ));
-            continue;
-        }
-        seen = true;
-        if cycle != fault_cycle() {
-            failures.push(format!(
-                "the tick reported the loss at cycle {cycle}, and the run of misses passes what it \
-                 tolerates at cycle {}",
-                fault_cycle()
-            ));
-        }
-        if fault.message.joint() != JointRefWire::NONE {
-            failures.push(format!(
-                "the report at cycle {cycle} names {:?}, and a bus that answered for nothing is \
-                 not about one servo",
-                fault.message.joint()
-            ));
-        }
-        if fault.message.count() != reported_misses() {
-            failures.push(format!(
-                "the report at cycle {cycle} counts {} missed reads, and the raise is on the miss \
-                 numbered {}",
-                fault.message.count(),
-                reported_misses()
-            ));
-        }
-    }
-    if !seen {
-        failures.push(format!(
-            "the tick never reported the loss, and the bus answered for nothing over \
-             {OUTAGE_CYCLES} cycles from cycle {OUTAGE_CYCLE}"
-        ));
-    }
-}
-
-/// The goal stream ends with the report and never starts again.
-///
-/// This is the fault response in this slice: there is no sequencer to run a
-/// stow ladder, and there does not need to be one -- a latched tick commands
-/// nothing, and what covers the machine is the gate behind it. So the last goal
-/// is the one decided on the cycle before the raise, and the reads coming back
+/// This is the fault response reaching the cog that commands: the session parks
+/// the machine, publishes a schedule nobody is engaged on, and the mover drops
+/// its engagement on the next sample it reads. So the last goal is the one
+/// decided within a cycle of that schedule going out, and the reads coming back
 /// afterwards does not bring the stream back with them.
-fn check_stream_stops(run: &Run, failures: &mut Vec<String>) {
-    let Some(stream) = check::goal_stream(run, failures) else {
-        return;
-    };
-    check::stream_starts_with_session(&stream, ENGAGE_CYCLE, failures);
-    let last = fault_cycle() - 1;
-    if stream.last_cycle != last {
-        failures.push(format!(
-            "the goal stream runs to cycle {}, and the tick latched on cycle {}: the last goal is \
-             the one decided on the cycle before the raise, and nothing commands the machine after \
-             it -- not even the reads coming back",
-            stream.last_cycle,
-            fault_cycle()
-        ));
-    }
+///
+/// The cycle the stream ended on, for the dropped-goal window to close at: the
+/// goals a latched gate refused are the ones between the release and this.
+fn check_stream_stops(
+    run: &Run,
+    engaged: Option<check::Engaged>,
+    failures: &mut Vec<String>,
+) -> Option<i64> {
+    let stream = check::goal_stream(run, failures)?;
+    let engaged = engaged?;
+    check::stream_starts_with_session(&stream, engaged.taken, failures);
+    check::stream_stops_with_release(&stream, engaged.released, failures);
+    Some(stream.last_cycle)
 }

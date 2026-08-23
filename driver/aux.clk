@@ -1,0 +1,101 @@
+// The driver's out-of-band machinery, as state: which one auxiliary
+// transaction a cycle spends its spare bus time on, what the driver believes
+// about torque, and how far a commanded de-torquing has been read back.
+//
+// A schema for the reason the gate's state is one: every host of these
+// decisions keeps them somewhere a cycle boundary can read. The simulated
+// driver keeps them in its state slot and the motor driver process keeps the
+// same declaration in its own memory, so the two cannot disagree about which
+// request is pending, which servos are believed to be holding, or whether a
+// sweep has been seen to take.
+//
+// One module, because one writer owns all of it: the driver's aux machinery
+// picks the transaction, records the belief the picked transaction's answer
+// changes, and runs the confirmation pass that spends the same slot. Whoever
+// only commands the machine reads none of it.
+//
+// Time is `SyncTime`, never a bare nanosecond count.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+use motion::bus_txn;
+use motion::joints;
+
+// The auxiliary slot: one pending host request, the health rotation's place in
+// its lap, and the torque belief the slot's answers move.
+//
+// A slot nothing wrote reads as a driver with no request pending, a rotation at
+// row 0 and due, and nothing believed torqued -- which is what a driver that has
+// just started is.
+schema AuxSlotState
+{
+    uuid: b0990dbe-7513-4082-b4e5-77617f1aef84;
+    fields
+    {
+        // The pending transaction. Meaningful only when `has_pending`, and
+        // copied in rather than referred to: the slot outlives the cycle that
+        // offered it, and a re-issue must be the same transaction.
+        #0 pending: bus_txn::BusTxn;
+
+        // The correlation number the pending transaction was offered under, and
+        // which its outcome echoes. Meaningful only when `has_pending`.
+        #1 corr: UInt32;
+
+        // Whether a host request is pending. The queue is one deep because the
+        // host that fills it is serial by construction.
+        #2 has_pending: Bool;
+
+        // The bus row the health rotation will read next.
+        #3 next_row: UInt8;
+
+        // When the last health report was scheduled. Meaningful only when
+        // `has_reported`.
+        #4 last_report: SyncTime;
+
+        // Whether the rotation has ever been scheduled. Until it has, it is
+        // due: a driver that has just started has nothing to say about its
+        // servos yet.
+        #5 has_reported: Bool;
+
+        // Which servos the driver believes are holding torque. The set the
+        // goal masks are drawn from, so a belief names bus rows and nothing
+        // else: validating this record refuses a bit no servo answers to,
+        // which is the refusal a belief in a tenth servo has to meet
+        // somewhere. The set moves only on evidence the driver has itself -- a
+        // verified write to a row's torque-enable register, or a confirmed
+        // sweep -- because this is what the dead-man is measured against.
+        #6 believed_torqued: joints::JointFlags;
+    }
+}
+
+// A torque-off confirmation pass: how far a commanded de-torquing has been read
+// back, and what has been said about it.
+//
+// A slot nothing wrote reads as a machine that is not running, which asks for
+// no read-back and reports nothing until it is begun.
+schema TorqueConfirmState
+{
+    uuid: 51d3c724-2997-4835-90c9-9dc23b2a397d;
+    fields
+    {
+        // Whether a pass is running.
+        #0 active: Bool;
+
+        // When the running pass opened, which the budget is measured from.
+        // Meaningful only while `active`.
+        #1 started: SyncTime;
+
+        // How many rows from row 0 have read back clean in a row. A row found
+        // still torqued sends this back to zero, because what is being
+        // confirmed is that the machine is off now.
+        #2 cursor: UInt8;
+
+        // Whether this pass has already reported that it came clean.
+        #3 said_confirmed: Bool;
+
+        // Whether this pass has already reported that its budget ran out. The
+        // pass keeps reading afterwards, and still confirms if it comes clean.
+        #4 said_unconfirmed: Bool;
+    }
+}

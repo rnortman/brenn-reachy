@@ -13,11 +13,20 @@
 //! the evidence the motion tick classifies faults from. It is not a dynamics
 //! model and no scenario may ask it a question about servo fidelity.
 //!
-//! Nothing here holds state of its own. The plant, the gate and the run's
-//! totals are the state slot's own fields, read and written through the
-//! validated view the cycle opens once at the top.
+//! Between the plant and anything that addresses a servo sits the register
+//! file, [`sim_regs`]: the modelled control tables. A transaction reaches a
+//! register and never the plant directly, which is what makes the simulated
+//! driver's observable contract the real one's, and the cycle's own pose sample
+//! is read from those cells too -- the sample is a read of the present-position
+//! registers, and a second route from the plant to what the machine reports
+//! about itself is a second thing to keep in step.
+//!
+//! Nothing here holds state of its own. The plant, the register file, the gate
+//! and the run's totals are the state slot's own fields, read and written
+//! through the validated view the cycle opens once at the top.
 
 use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
+use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKind;
 use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSignals};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
 use brenn_reachy__driver__health_clk_rs::{DriverEvent, EventKind};
@@ -25,12 +34,22 @@ use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use clockwork_rs::{Duration, SyncTime};
 use motion_slots::{configured, counters};
-use reachy_driver::{AcceptOutcome, GateAction, GoalGate};
+use reachy_driver::{
+    AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, GateAction, GoalGate,
+    TorqueOffConfirm,
+};
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
-    JointGroup, angle_of, flags, group_of, rows_of, set_angle, write_rows, write_vector,
+    JointGroup, ROW_COUNT, angle_of, flags, group_of, row, rows_of, set_angle, write_rows,
+    write_vector,
 };
+
+pub mod sim_aux;
+pub mod sim_regs;
+
+use sim_aux::{Answer, Request};
+use sim_regs::Regs;
 
 /// How many cycles of plant motion one execution may advance.
 ///
@@ -41,6 +60,38 @@ use reachy_motion::joints::{
 /// tested on. Falling behind shows up as a machine that did not get where it
 /// was asked, which is the truthful reading of a driver that missed its cycles.
 const MAX_CATCHUP_CYCLES: i64 = 8;
+
+/// How long a commanded de-torquing may go unconfirmed before the driver says
+/// so, nanoseconds.
+///
+/// The driver's own budget and not the host's: the confirmation pass reads one
+/// row back per cycle, so a clean pass over the nine takes nine cycles, and a
+/// budget that did not clear that would report a de-torquing as unconfirmed
+/// while it was still being read. The room above that is for the host requests
+/// that outrank the pass: each one costs it a cycle, and a de-torquing reported
+/// as unconfirmed because a sequencer was talking would be a report about the
+/// traffic rather than about the machine. Running out of it changes nothing
+/// about what the driver does -- the sweep is still written every cycle and the
+/// pass keeps reading -- it only makes the silence visible.
+pub const TORQUE_OFF_CONFIRM_BUDGET_NS: i64 = 300_000_000;
+
+const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > ROW_COUNT as i64 * TIMER_PERIOD_NS);
+
+/// How many cycles in a row the bus may answer nothing before the driver says
+/// its bus is gone.
+///
+/// The one fault a driver raises about itself. Long enough that a burst of lost
+/// replies is not it -- the decision tick tolerates a run of blind reads and
+/// keeps commanding through them, and a driver crying failure inside that
+/// window would be reporting the same outage twice from two places. Short
+/// enough that half a second of a machine nobody can see is not left to the
+/// dead-man alone: the host takes a bus failure straight to the minimum-risk
+/// condition, where the dead-man would first wait out its own silence.
+///
+/// Raised once per outage, on the cycle the run reaches this length: the
+/// standing condition is not news, and a host that has been told once has
+/// already stopped trusting the bus.
+pub const BLIND_CYCLES_BEFORE_BUS_FAILURE: u32 = 25;
 
 /// The cycle this cog's execution condition waits for, nanoseconds.
 ///
@@ -89,6 +140,10 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             &mut state.positions,
             &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
         );
+        // The provisioning, before anything reads a register: a machine this
+        // process has just met is a correctly provisioned one, and a scenario
+        // that wants otherwise says so with an injection.
+        Regs::over(&mut state.regs).init();
         // Torqued only where this is the process starting. A restart from a slot
         // the cycle could not read is not that: whatever arming the run had is
         // in the bytes that were refused, and the dead-man may have latched the
@@ -96,7 +151,8 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
         // to be armed, rather than energising itself out of a memory fault --
         // the one transition the latch exists to prevent.
         if bool::from(params.start_torqued) && refused_state == 0 {
-            state.torqued = all_rows();
+            state.torqued = flags::all();
+            believe(state, flags::all(), true);
             GoalGate::over(&mut state.gate).note_liveness(nominal);
         }
     }
@@ -112,6 +168,62 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             continue;
         };
         inject(state, cmd, nominal);
+    }
+
+    // What the host asked of the driver. Every accepted datagram is evidence
+    // the host is alive, whichever kind it is: the dead-man measures silence,
+    // and a host with nothing to ask still owes the driver a word.
+    for cmd in dial.inputs.session_cmds.new_msgs() {
+        let Ok(cmd) = cmd.validate() else {
+            // A datagram this build cannot read. Counted as the boundary failure
+            // it is -- a schema-version mismatch, not an ask this driver would
+            // not run -- and deliberately not counted as liveness: what the
+            // sender meant is unknown, and feeding the dead-man off bytes nobody
+            // could read is holding a machine energised on the strength of noise.
+            state.undecodable_inbound += 1;
+            continue;
+        };
+        if cmd.kind == SessionCmdKind::None {
+            // A datagram asking nothing is a slot nothing wrote, published. Same
+            // treatment for the same reason.
+            state.aux_refused += 1;
+            continue;
+        }
+        GoalGate::over(&mut state.gate).note_liveness(nominal);
+        match cmd.kind {
+            // Liveness and nothing else. The asking-nothing arm is unreachable:
+            // it was answered and counted above.
+            SessionCmdKind::None | SessionCmdKind::KeepAlive => {}
+            SessionCmdKind::TorqueOffNow => {
+                // Host-requested and idempotent: the goal queue goes with the
+                // latch, the transaction the host had outstanding is abandoned,
+                // the plant goes limp, and the confirmation pass opens if one is
+                // not already running -- its budget runs from the first of these
+                // rather than from the latest, because the de-torquing was
+                // commanded once. Nothing gates any of it.
+                //
+                // The abandonment is the same one the host performs on its own
+                // side: a release outranks whatever was asked for before it, and
+                // a torque-enable write run out of the slot after the latch
+                // would re-energise the row this datagram exists to release.
+                GoalGate::over(&mut state.gate).latch_torque_off();
+                AuxSlot::over(&mut state.aux).abandon();
+                state.torqued = JointFlags::NONE;
+                state.has_target = JointFlags::NONE;
+                TorqueOffConfirm::over(&mut state.confirm).begin(nominal);
+            }
+            SessionCmdKind::Aux => {
+                if AuxSlot::over(&mut state.aux).offer(cmd.corr, &cmd.txn) == AuxOffer::RefusedBusy
+                {
+                    // The host that fills this slot is serial by construction,
+                    // so a second request is a host that is not what it claims
+                    // to be. Loud both ways: an outcome against the turned-away
+                    // request's own number, and a count.
+                    state.aux_refused += 1;
+                    report.answer(Answer::busy(cmd.corr));
+                }
+            }
+        }
     }
 
     for setpoint in dial.inputs.goals.new_msgs() {
@@ -156,7 +268,10 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     }
 
     let silence = nominal - state.gate.last_accept.as_nanos();
-    let torqued = !flags::is_empty(state.torqued);
+    // What the driver believes, not what the plant is: the real driver has no
+    // window onto the plant, and a dead-man measured against one would be a
+    // dead-man the real machine does not have.
+    let torqued = AuxSlot::over(&mut state.aux).belief().any();
     match GoalGate::over(&mut state.gate).tick(nominal, torqued, hold_timeout_ns) {
         GateAction::WriteTorqueOffSweep { just_latched } => {
             // The sweep reaches every row, and a de-torqued servo holds where
@@ -167,6 +282,11 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             // asking for any more.
             state.torqued = JointFlags::NONE;
             state.has_target = JointFlags::NONE;
+            // The sweep is being written, so what it took is a question worth
+            // reading back. Idempotent: the pass keeps the instant it opened
+            // at, because the budget is measured from when the de-torquing was
+            // commanded.
+            TorqueOffConfirm::over(&mut state.confirm).begin(nominal);
             if just_latched {
                 state.hold_timeouts += 1;
                 report.raise(
@@ -202,34 +322,48 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     };
     advance(params, state, cycles);
 
+    // A cycle in which the bus answers nothing at all. Decided before anything
+    // is read, because it decides whether anything is: the outage is the wire's
+    // and not one read's, so the proprioception, the host's transaction, the
+    // confirmation's read-back and the health rotation are all silent for it.
+    let blind = state.drop_replies_left > 0;
+    state.drop_replies_left = state.drop_replies_left.saturating_sub(1);
+    if !blind {
+        read_registers(state);
+    }
+    run_aux(state, params, nominal, blind, &mut report);
+
     // The sample: published every cycle without exception, because it is the
     // clock the control loop runs on and a missing one is a cycle the loop
     // never sees. A cycle whose replies were lost is a sample saying so, never
     // an absent sample.
-    let blind = state.drop_replies_left > 0;
-    state.drop_replies_left = state.drop_replies_left.saturating_sub(1);
+    count_blind(state, blind, nominal, &mut report);
 
-    publish(
-        &mut dial.outputs,
-        state,
-        blind,
-        nominal,
-        report.event.as_ref(),
-    );
+    publish(&mut dial.outputs, state, blind, nominal, &report);
 
     Counters::read(dial.states.sim).report(&before, &mut dial.signals);
 }
 
-/// The one event a cycle reports, and how many it could not.
+/// What a cycle has to say, in the three slots that carry it.
 ///
 /// An output carries one message per execution, so a cycle that raises two
 /// events publishes one. The dead-man's latch outranks the rest: it is the
 /// machine changing state, where the others are remarks about a datagram that
 /// the sender can see the consequences of anyway.
+///
+/// The other two are the aux path's. At most one transaction runs per cycle, so
+/// the outcome slot collides only when a request was turned away in the same
+/// cycle one was served; the first answer wins and the displaced one comes back
+/// to the host as a silence, which is the case its own re-issue exists for. A
+/// health report cannot collide at all: the rotation names at most one row.
 #[derive(Default)]
 struct Report {
     /// What will be published, if anything.
     event: Option<Event>,
+    /// The answer to one aux transaction.
+    outcome: Option<Answer>,
+    /// The row the health rotation read.
+    health_row: Option<u8>,
 }
 
 /// One edge the cycle hit, before it reaches the output slot.
@@ -268,6 +402,13 @@ impl Event {
 }
 
 impl Report {
+    /// Offer an answer for this cycle's one outcome slot.
+    fn answer(&mut self, answer: Answer) {
+        if self.outcome.is_none() {
+            self.outcome = Some(answer);
+        }
+    }
+
     /// Offer an event for this cycle's one slot, counting the one it displaces.
     fn raise(&mut self, dropped: &mut u64, event: Event) {
         match self.event {
@@ -289,29 +430,47 @@ impl Report {
 /// describing something to a simulator that cannot do it, which is a fact
 /// about the scenario and not about the machine.
 ///
-/// A refusal is the whole injection and not part of one, and it happens at the
-/// caller's one validation: an operation this build does not know and a set of
-/// servos it cannot read are the same fact about the scenario, and carrying out
-/// the readable half of one would be worse than carrying out none of it -- a
+/// Reading one is all-or-nothing, and that happens at the caller's one
+/// validation: an operation this build does not know and a set of servos it
+/// cannot read are the same fact about the scenario, and carrying out the
+/// readable half of one would be worse than carrying out none of it -- a
 /// torque-on whose mask was refused would energise nothing and still end a
 /// torque-off latch, which is the one transition the latch exists to guard.
+///
+/// Two of them stand in for the bus rather than for the machine: a run of
+/// transactions swallowed before they reach it, and a set of servos that answer
+/// nothing at all. Neither touches the modelled machine -- what they model is a
+/// host talking to something that is not listening.
+///
+/// A register write is the one injection that can be carried out for part of its
+/// mask: the refusals a control table has are per servo -- a non-volatile
+/// register takes a write from a de-torqued servo and not from an energised one
+/// -- so the refusal is per row. It is refused outright for the cells the plant
+/// owns, which this cycle's proprioception writes whatever anything else put
+/// there.
 fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
     let mask = cmd.mask;
     match cmd.op {
         SimOp::TorqueOn => {
             state.torqued |= mask;
+            believe(state, mask, true);
             // Arming grants a fresh hold-timeout window, whether or not there
             // was a latch to end: the first goal of a session cannot arrive
-            // before the session starts.
+            // before the session starts. A fresh arming also ends whatever
+            // confirmation pass was reading the old de-torquing back: the
+            // machine is being energised deliberately, and read-backs saying so
+            // are not evidence of anything failing.
             let mut gate = GoalGate::over(&mut state.gate);
             if gate.state().latched.get() {
                 gate.release_latch(nominal);
+                TorqueOffConfirm::over(&mut state.confirm).stand_down();
             } else {
                 gate.note_liveness(nominal);
             }
         }
         SimOp::TorqueOff => {
             state.torqued = flags::without(state.torqued, mask);
+            believe(state, mask, false);
             if flags::is_empty(state.torqued) {
                 // A sweep that reached everything is a confirmed disarm, not a
                 // fault: nothing latches, and nothing is being held any more.
@@ -329,9 +488,71 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
         SimOp::Obstruct => state.obstructed |= mask,
         SimOp::ReleaseObstruction => state.obstructed = flags::without(state.obstructed, mask),
         SimOp::DropReplies => state.drop_replies_left = cmd.count,
+        SimOp::RefuseAux => state.aux_unanswered_left = cmd.count,
+        // The set replaces whatever was off the bus, so a scenario puts servos
+        // back by naming fewer of them and puts the whole bus back by naming
+        // none: an outage a scenario cannot end is one it cannot show a machine
+        // surviving.
+        SimOp::AbsentServo => state.absent = mask,
+        SimOp::SetRegister => {
+            for joint in flags::iter(mask) {
+                let Some(index) = row(joint) else {
+                    continue;
+                };
+                // A cell the plant owns is written from the plant every cycle,
+                // so a value injected into one would be overwritten before
+                // anything read it. Refused and counted rather than accepted:
+                // a scenario whose hand is on where a servo is, or on whether
+                // it is energised, reaches for the plant -- `set_positions`,
+                // `torque_on`, `torque_off`, `obstruct` -- and one that reached
+                // here instead has its premise answered rather than lost.
+                if sim_regs::is_plant_owned(cmd.reg) {
+                    state.refused_injections += 1;
+                    continue;
+                }
+                let torqued = flags::contains(state.torqued, joint);
+                if Regs::over(&mut state.regs)
+                    .write_bits(index, cmd.reg, cmd.value, torqued)
+                    .is_err()
+                {
+                    state.refused_injections += 1;
+                }
+            }
+        }
         // The value a slot nothing wrote holds. A scenario never authors one,
         // and nothing about the machine changes for it.
         SimOp::Nop => {}
+    }
+}
+
+/// Count how long the bus has been answering nothing, and say so once the run
+/// is long enough to mean the bus is gone.
+///
+/// The one fault a driver raises about itself, and the run of blind cycles is
+/// all the evidence there is: a cycle that read no row read nothing about what
+/// is wrong with it either. The count goes back to zero on the first cycle that
+/// reads something, and the event is raised on the cycle the run reaches its
+/// length and not again while it continues -- a standing outage is not news, and
+/// a host told once has already stopped trusting the bus.
+fn count_blind(state: &mut SimState, blind: bool, nominal: i64, report: &mut Report) {
+    if !blind {
+        state.blind_cycles = 0;
+        return;
+    }
+    state.blind_cycles = state.blind_cycles.saturating_add(1);
+    let run = state.blind_cycles;
+    if run == BLIND_CYCLES_BEFORE_BUS_FAILURE {
+        report.raise(
+            &mut state.events_dropped,
+            Event {
+                kind: EventKind::BusFailure,
+                // How many cycles went unanswered, which is what says whether
+                // the report is about the threshold or about a bus that has
+                // been gone far longer.
+                count: run,
+                ..Event::at(nominal)
+            },
+        );
     }
 }
 
@@ -352,11 +573,149 @@ fn command(state: &mut SimState) {
     state.has_target |= state.gate.held.mask;
 }
 
-/// Every servo on the bus.
-fn all_rows() -> JointFlags {
-    JointGroup::ALL
-        .into_iter()
-        .fold(JointFlags::NONE, |set, group| set | group.joints())
+/// Take the cycle's proprioception: bring the live register cells up to date
+/// with the plant.
+///
+/// The only route from the modelled world into anything that addresses a servo.
+/// Run
+/// after the plant has moved and before any register is read, so a verification
+/// of a stow or of a de-torquing reads where the machine actually is rather than
+/// where it was last asked to be.
+///
+/// Not run at all on a cycle the bus answers nothing on: a driver reads its
+/// cells over the same wire everything else goes over, so what it holds about
+/// the machine through an outage is what it held when the outage began.
+///
+/// A reading with no eight-byte carriage -- a non-finite angle -- is counted
+/// rather than stored: the cell keeps the last number it held, so what the
+/// sample reports is a stale angle and the count is the only place that says
+/// so. No scenario asserts that count is zero, so the substitution is loud only
+/// in this cog's own cases.
+/// TODO(sim-refused-readings-asserted)
+fn read_registers(state: &mut SimState) {
+    let positions = rows_of(&state.positions);
+    let targets = rows_of(&state.targets);
+    let torqued = flags::rows(state.torqued);
+    let refused = Regs::over(&mut state.regs).refresh(&positions, &targets, &torqued);
+    state.refused_readings += u64::from(refused);
+}
+
+/// Spend this cycle's one out-of-band transaction.
+///
+/// Three things want it and [`reachy_driver::AuxSlot`] is what picks, in the
+/// order it documents: a host request first, then the confirmation pass's
+/// read-back, then the health rotation. Run after the proprioception, so every
+/// cell a transaction reads answers about the machine as this cycle left it --
+/// a verification of a stow or of a de-torquing that read a stale cell would
+/// confirm the cycle before.
+///
+/// The confirmation is stepped before the slot is asked, because what it wants
+/// read is an input to the choice. Its two reports are events: a whole clean
+/// pass says the commanded de-torquing took, and a budget that ran out says it
+/// cannot be confirmed -- after which the pass keeps reading and the sweep keeps
+/// being written, because nothing gates de-torquing.
+///
+/// `blind` is a cycle whose bus answered nothing. Everything below is a round
+/// trip on that wire, so nothing completes: the host's transaction is dropped
+/// unanswered, the read-back observes nothing -- which counts as a row still
+/// holding, because a de-torquing credited to silence is the one report this
+/// driver must never make -- and the rotation publishes nothing about a machine
+/// nobody heard from.
+fn run_aux(
+    state: &mut SimState,
+    params: &SimParams,
+    nominal: i64,
+    blind: bool,
+    report: &mut Report,
+) {
+    let step =
+        TorqueOffConfirm::over(&mut state.confirm).step(nominal, TORQUE_OFF_CONFIRM_BUDGET_NS);
+    match step.report {
+        ConfirmReport::Nothing => {}
+        ConfirmReport::Confirmed => {
+            // Every row read back zero. The belief goes to nothing here rather
+            // than when the sweep was commanded: a de-torquing that has not been
+            // read back is one the dead-man must keep running over.
+            AuxSlot::over(&mut state.aux).belief().confirmed_off();
+            GoalGate::over(&mut state.gate).clear_commanded();
+            report.raise(
+                &mut state.events_dropped,
+                Event {
+                    kind: EventKind::TorqueOffConfirmed,
+                    ..Event::at(nominal)
+                },
+            );
+        }
+        ConfirmReport::Unconfirmed => {
+            // Which servos have not gone limp, read off their own control
+            // tables: what the machine says, rather than what the writes said.
+            let rows = sim_aux::rows_still_torqued(state);
+            report.raise(
+                &mut state.events_dropped,
+                Event {
+                    kind: EventKind::TorqueOffUnconfirmed,
+                    rows,
+                    ..Event::at(nominal)
+                },
+            );
+        }
+    }
+
+    let task =
+        AuxSlot::over(&mut state.aux).take(nominal, params.health_poll_period_ns, step.read_row);
+    match task {
+        AuxTask::Nothing => {}
+        // The whole bus is silent, so the transaction is dropped exactly as a
+        // swallowed one is -- and the swallow countdown is left alone, because
+        // this datagram never reached the wire it was going to be swallowed on.
+        AuxTask::Host { .. } if blind => {}
+        AuxTask::Host { .. } if state.aux_unanswered_left > 0 => {
+            // The request was swallowed before it reached the bus. Nothing about
+            // the machine changes and nothing goes back to the host, which is
+            // the silence its own delivery timeout is for -- an outcome saying
+            // "timeout" would be an answer, and a host that got one would know
+            // more than a host whose datagram was lost. The slot is free
+            // either way: `take` consumed the request, so the re-issue this
+            // provokes is accepted like any other.
+            state.aux_unanswered_left -= 1;
+        }
+        AuxTask::Host { corr } => {
+            // The record stays in the slot and the transaction is run from a
+            // copy of it, because running it writes the state it lives in.
+            let request = AuxSlot::over(&mut state.aux).taken(corr).map(Request::of);
+            if let Some(request) = request {
+                let answer = sim_aux::answer(state, nominal, corr, &request);
+                report.answer(answer);
+            }
+        }
+        AuxTask::ConfirmTorqueOff { row } => {
+            let torqued = blind || sim_aux::reads_torqued(state, usize::from(row));
+            TorqueOffConfirm::over(&mut state.confirm).observed(row, torqued);
+        }
+        // A servo off the bus reports nothing, so the rotation's read of it goes
+        // out as no report at all rather than as a report of zeroes about a
+        // machine nobody heard from. The cadence was stamped when the read was
+        // named, so the rotation walks on to the next row either way.
+        AuxTask::Health { row } if blind || sim_aux::is_absent(state, usize::from(row)) => {}
+        AuxTask::Health { row } => report.health_row = Some(row),
+    }
+}
+
+/// Record what a verified torque-enable write would have said about these rows.
+///
+/// What the injections stand in for: a hand on the machine, or an arming
+/// sequencer that ran before this process started. The belief moves with the
+/// plant because the write is modelled as verified -- an unverified one says
+/// nothing about the machine, and a dead-man measured against beliefs built out
+/// of those is measuring the wrong thing in both directions.
+fn believe(state: &mut SimState, rows: JointFlags, enabled: bool) {
+    let mut slot = AuxSlot::over(&mut state.aux);
+    let mut belief = slot.belief();
+    for joint in flags::iter(rows) {
+        if let Some(index) = row(joint) {
+            belief.verified_write(u8::try_from(index).unwrap_or(u8::MAX), enabled);
+        }
+    }
 }
 
 /// This cog's configuration, as the numbers a scenario wrote down.
@@ -468,11 +827,14 @@ fn write_sample(sample: &mut PoseSample, state: &SimState, blind: bool, nominal:
     } else {
         JointFlags::NONE
     };
-    // The modelled truth, whatever the flags say about it. A driver that read
-    // nothing this cycle has last cycle's numbers in hand and reports them
-    // behind the missing rows; what makes them unusable is that set, not a
-    // blank the receiver would have to tell apart from a real zero.
-    write_rows(&mut sample.present, &rows_of(&state.positions));
+    // The present-position registers, out of the control tables. Reported
+    // whatever the flags say about them: what makes a missing row's values
+    // unusable is that set, not a blank the receiver would have to tell apart
+    // from a real zero. Every cell is finite, because a reading with no
+    // carriage was counted instead of stored -- so a sample never carries a
+    // non-finite angle, and a plant that went non-finite shows up as a stale
+    // one with `refused_readings` above zero.
+    write_rows(&mut sample.present, &sim_regs::present_rows(&state.regs));
     write_rows(&mut sample.commanded, &rows_of(&state.gate.held.targets));
 }
 
@@ -486,18 +848,34 @@ fn publish(
     state: &SimState,
     blind: bool,
     nominal: i64,
-    event: Option<&Event>,
+    report: &Report,
 ) {
     let out = &mut outputs.pose;
     write_sample(out.msg_mut().clear_valid(), state, blind, nominal);
     out.mark_for_publish();
 
-    let Some(event) = event else {
-        return;
-    };
-    let out = &mut outputs.evt;
-    write_event(out.msg_mut().clear_valid(), event);
-    out.mark_for_publish();
+    if let Some(event) = report.event.as_ref() {
+        let out = &mut outputs.evt;
+        write_event(out.msg_mut().clear_valid(), event);
+        out.mark_for_publish();
+    }
+
+    if let Some(answer) = report.outcome.as_ref() {
+        let out = &mut outputs.aux_out;
+        answer.write(out.msg_mut().clear_valid());
+        out.mark_for_publish();
+    }
+
+    if let Some(row) = report.health_row {
+        let out = &mut outputs.health_out;
+        sim_aux::health(
+            state,
+            nominal,
+            usize::from(row),
+            out.msg_mut().clear_valid(),
+        );
+        out.mark_for_publish();
+    }
 }
 
 fn write_event(out: &mut DriverEvent, event: &Event) {
@@ -541,7 +919,18 @@ counters! {
         /// Times the slot did not read back as a state.
         refused_state_fields / set_refused_state_fields,
         /// Injections this build could not carry out: an operation it does not
-        /// know, or one naming servos it does not know.
+        /// know, one naming servos it does not know, or a register write a
+        /// control table refused.
         refused_injections / set_refused_injections,
+        /// Plant readings that never reached a control table, the angles a
+        /// non-finite modelled world produced.
+        refused_readings / set_refused_readings,
+        /// Host datagrams the driver turned away as asks it could not act on:
+        /// one asking nothing, or a transaction offered while another was
+        /// pending.
+        aux_refused / set_aux_refused,
+        /// Host datagrams this build could not read at all: a schema-version
+        /// mismatch at the boundary rather than an ask the driver refused.
+        undecodable_inbound / set_undecodable_inbound,
     }
 }

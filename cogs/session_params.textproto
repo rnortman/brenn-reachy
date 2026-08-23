@@ -1,0 +1,39 @@
+# The session's timing, loaded once at process setup.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.SessionParams`, which the
+# compiler generates from the `SessionParams` schema in `config.clk`. Read as it
+# is: the box binds it by path, and the casing converts it to the message the
+# dial hands the cog.
+
+# How long one transaction has to be answered: 200 ms, ten driver cycles. A
+# transaction the driver takes up is answered on the cycle it takes it up, so
+# this is slack by an order of magnitude and is sized for the loss the command
+# channel will suffer when it is a socket.
+aux_timeout_ns: 200000000
+
+# Three re-issues before the transaction is handed to the sequencer as a
+# silence. The same datagram under the same correlation number each time, so
+# what this buys is delivery and never a second ask.
+aux_retries: 3
+
+# Five nominal periods -- 100 ms -- with no fresh sample before the bus is
+# declared failed. The driver publishes one per 20 ms cycle whether or not it
+# read anything, so five missing in a row is a driver that has stopped rather
+# than a bus that is having trouble.
+sample_stale_after: 5
+
+# Two seconds for the first sample. A process comes up with its cogs in an order
+# nothing here fixes, and the driver's first cycle waits on its own execution
+# condition; the machine is limp and uncommanded throughout, so the grace costs
+# nothing but the delay in noticing a driver that never started.
+startup_grace_ns: 2000000000
+
+# Four seconds for a wind-down's one clock. Long enough for the configured stow
+# move plus the settle it needs at the end of it, and short enough that a stow
+# the machine is not completing is a conclusion rather than a wait.
+stow_budget_ns: 4000000000
+
+# Half a second for a commanded torque-off to be confirmed. The driver reads one
+# row back per cycle, so a nine-row pass costs 180 ms; past this budget the
+# session says so and keeps commanding, because nothing gates de-torquing.
+torque_off_confirm_budget_ns: 500000000

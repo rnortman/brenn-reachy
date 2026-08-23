@@ -20,22 +20,27 @@ use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage};
 use std::path::Path;
 
 use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
+use brenn_reachy__cogs__script_clk_rs::ScriptWire;
+use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdWire;
 use brenn_reachy__cogs__sim_state_clk_rs::SimCmdWire;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::DriverEventWire;
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
+use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 use log_read::{Complaints, Logged, binding, typed};
 
 use crate::{
-    CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL,
-    SIM_CMD_CHANNEL,
+    CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL,
+    SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL, SIM_CMD_CHANNEL,
 };
 
 /// Everything one run put in the log.
 #[derive(Default)]
 pub struct Run {
-    /// What the session asked for, replayed from the input log.
+    /// What was asked of the machine, replayed from the input log.
+    pub scripts: Vec<Logged<ScriptWire>>,
+    /// What the session published: the schedule it accepted, once per change.
     pub schedules: Vec<Logged<SessionScheduleWire>>,
     /// What the scenario did to the plant, replayed from the input log.
     pub injections: Vec<Logged<SimCmdWire>>,
@@ -47,6 +52,10 @@ pub struct Run {
     pub events: Vec<Logged<DriverEventWire>>,
     /// What the decision tick raised.
     pub faults: Vec<Logged<TickFaultWire>>,
+    /// What the session said about all of it.
+    pub reports: Vec<Logged<TimelineEntryWire>>,
+    /// What the session asked the driver for.
+    pub datagrams: Vec<Logged<SessionCmdWire>>,
     /// Where the head was.
     pub estimates: Vec<Logged<PoseEstimateWire>>,
     /// Every channel the log carries, in the order the reader reports them.
@@ -79,7 +88,12 @@ struct Bound {
 /// The signal report groups are deliberately absent: nothing binds a Rust type
 /// to a group's generated schema, so they are observable through
 /// [`Run::channel_names`] and not decoded.
-const CHANNELS: [Bound; 7] = [
+const CHANNELS: [Bound; 10] = [
+    Bound {
+        name: SCRIPT_CHANNEL,
+        check: binding::<ScriptWire>,
+        route: |run, message| typed(message, &mut run.scripts, &mut run.complaints),
+    },
     Bound {
         name: SCHEDULE_CHANNEL,
         check: binding::<SessionScheduleWire>,
@@ -94,6 +108,16 @@ const CHANNELS: [Bound; 7] = [
         name: FAULT_CHANNEL,
         check: binding::<TickFaultWire>,
         route: |run, message| typed(message, &mut run.faults, &mut run.complaints),
+    },
+    Bound {
+        name: REPORT_CHANNEL,
+        check: binding::<TimelineEntryWire>,
+        route: |run, message| typed(message, &mut run.reports, &mut run.complaints),
+    },
+    Bound {
+        name: SESSION_CMD_CHANNEL,
+        check: binding::<SessionCmdWire>,
+        route: |run, message| typed(message, &mut run.datagrams, &mut run.complaints),
     },
     Bound {
         name: ESTIMATE_CHANNEL,

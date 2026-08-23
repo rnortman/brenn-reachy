@@ -39,18 +39,23 @@ enum ReportKind
 
         // A phase was entered: `a` the phase entered, `b` the one left.
         #1 phase_changed { underlying_value: 1; }
-        // A script passed the screen: `a` its id, `b` its step count.
+        // A script passed the screen: `a` its id, `b` its step count, `detail`
+        // the epoch the schedule it became was written under.
         #2 script_accepted { underlying_value: 2; }
         // A script was refused whole: `a` its id, `b` the refusal reason.
         #3 script_refused { underlying_value: 3; }
-        // A fault was recorded: `a` the fault kind, `b` the bus row it names,
-        // `detail` the magnitude it was raised on.
+        // A fault was recorded: `a` the fault kind, `b` the servo it names as
+        // the joint vocabulary numbers it -- zero where it names no single one,
+        // which no bus row can say -- and `detail` the magnitude it was raised
+        // on.
         #4 fault_recorded { underlying_value: 4; }
         // A response was selected: `a` the response, `b` the fault kind that
         // called for it.
         #5 response_taken { underlying_value: 5; }
         // A wind-down concluded: `a` the outcome, `b` non-zero for a park-class
-        // disposition, `detail` the seconds it took.
+        // disposition, `detail` the seconds of its one clock that were left
+        // when it ended -- negative for a maneuver that ran past its deadline
+        // instead of reaching the pose.
         #6 winddown_outcome { underlying_value: 6; }
         // Every row confirmed torque off. No numbers.
         #7 torque_off_confirmed { underlying_value: 7; }
@@ -60,13 +65,20 @@ enum ReportKind
         // The bus was declared failed: `a` the evidence's own detail, `detail`
         // the seconds since the last fresh sample.
         #9 bus_failure_declared { underlying_value: 9; }
-        // The session ended at rest: `a` the script id it ended.
+        // The session ended at rest: `a` the script id it ended, `b` the joints
+        // the release looked at and could not read, `detail` how far the joint
+        // furthest from its stow angle was, radians. A machine found folded and
+        // fully measured reads as an empty `b` and a deviation inside the
+        // configured tolerance.
         #10 session_ended { underlying_value: 10; }
         // An aux transaction exhausted its retries: `a` its correlation number,
         // `b` the servo id, `detail` the seconds it waited.
         #11 aux_gave_up { underlying_value: 11; }
         // A schedule was published: `a` its epoch, `b` its step count.
         #12 schedule_published { underlying_value: 12; }
+        // A group-scoped de-torque finished writing: `a` the response that
+        // called for it, `b` the rows released.
+        #13 degrade_released { underlying_value: 13; }
     }
 }
 
@@ -98,8 +110,10 @@ enum RefusalReason
         // Times that are not a timeline: an offset that goes backwards, or a
         // duration that is not positive.
         #5 bad_times { underlying_value: 5; }
-        // A clip id no library could hold.
-        #6 unknown_clip { underlying_value: 6; }
+        // A motion index no library could hold. Whether this library holds one
+        // is the mover's question at play time; this is the index that could
+        // name no motion anywhere.
+        #6 unknown_motion { underlying_value: 6; }
         // The datagram was not a script at all.
         #7 undecodable { underlying_value: 7; }
     }

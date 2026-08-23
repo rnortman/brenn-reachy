@@ -686,6 +686,21 @@ fn find(library: &ClipLibraryConfig, clip_id: usize) -> Result<&ClipConfig, Clip
         })
 }
 
+/// How much of a library an establishing pass reads.
+///
+/// The difference between the two constructors below, as a value rather than a
+/// flag: the structural checks are the same code either way, and which of the
+/// two a caller took is the whole of what distinguishes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    /// Every frame of every clip, which is what establishes the per-frame
+    /// invariants a player relies on.
+    EveryFrame,
+    /// The clips and the segments alone, for a library whose frames a previous
+    /// pass over the same immutable message already walked.
+    Structure,
+}
+
 /// A library whose every clip has been walked and found playable.
 ///
 /// The tick path's handle, and the only thing [`Self::playable`] hangs off: the
@@ -711,9 +726,9 @@ impl<'a> ValidatedLibrary<'a> {
     /// out of.
     ///
     /// The handle borrows the message, so a host whose memory between
-    /// executions is a state slot cannot carry it across them: as it stands a
-    /// control period that wants one pays the whole walk again.
-    /// TODO(library-walk-per-execution)
+    /// executions is a state slot cannot carry it across them. What such a host
+    /// carries instead is the fact that the walk happened, and comes back
+    /// through [`Self::resumed`].
     ///
     /// # Errors
     ///
@@ -721,14 +736,43 @@ impl<'a> ValidatedLibrary<'a> {
     /// refuses with, and which one it was — the frame or segment index alone
     /// does not say that.
     pub fn of(library: &'a ClipLibraryConfig) -> Result<Self, UnplayableAsset> {
-        for clip_id in 0..library.clips.len() {
-            clip_at(library, clip_id)
-                .map_err(|source| UnplayableAsset::Clip { clip_id, source })?;
-        }
+        Self::checked(library, Walk::EveryFrame)
+    }
+
+    /// The same handle, over a library whose frames a previous walk already
+    /// established.
+    ///
+    /// Every structural check [`Self::of`] makes is made again — every clip's
+    /// mask, frame grid, frame count and ceiling; every motion's segments,
+    /// their clips, their speeds against each clip's ceiling — and only the
+    /// per-frame walk is skipped, so this costs the clips and the segments
+    /// rather than the frames.
+    ///
+    /// Sound for one reason and stated as it: the library is a configuration
+    /// binding, immutable for the life of the process, so the frames this would
+    /// re-walk are the bytes the first walk walked. A host that has not walked
+    /// them calls [`Self::of`], and a fresh process walks them again.
+    ///
+    /// # Errors
+    ///
+    /// [`UnplayableAsset`], for the same structural facts [`Self::of`] refuses.
+    pub fn resumed(library: &'a ClipLibraryConfig) -> Result<Self, UnplayableAsset> {
+        Self::checked(library, Walk::Structure)
+    }
+
+    /// Establish the library, walking as much of it as `walk` says.
+    fn checked(library: &'a ClipLibraryConfig, walk: Walk) -> Result<Self, UnplayableAsset> {
         // The clips first, because a motion's own checks read its segments'
         // clips: what the segment spends of a clip's ceiling means nothing
         // until the clip is one.
         let checked = Self { library };
+        for clip_id in 0..library.clips.len() {
+            match walk {
+                Walk::EveryFrame => clip_at(library, clip_id).map(|_| ()),
+                Walk::Structure => checked.playable(clip_id).map(|_| ()),
+            }
+            .map_err(|source| UnplayableAsset::Clip { clip_id, source })?;
+        }
         for motion_id in 0..library.motions.len() {
             checked
                 .playable_motion(motion_id)
@@ -1561,6 +1605,96 @@ mod tests {
                 assert_eq!(taken.frame(frame), checked.frame(frame));
             }
         }
+    }
+
+    /// The walk is a fact about bytes that do not change, so a host that
+    /// recorded it takes the library up again without re-reading a frame — and
+    /// gets a handle that answers exactly what the walk's own answers.
+    #[test]
+    fn a_resumed_library_answers_what_the_walk_established() {
+        let message = composed_message();
+        let library = valid_library(&message);
+        let walked = ValidatedLibrary::of(library).expect("the composed library plays");
+        let resumed = ValidatedLibrary::resumed(library).expect("the same library resumes");
+        assert_eq!(resumed.clips(), walked.clips());
+        assert_eq!(resumed.motions(), walked.motions());
+        assert!(
+            walked.clips() > 0 && walked.motions() > 0,
+            "an empty fixture"
+        );
+
+        for clip_id in 0..walked.clips() {
+            let taken = walked.playable(clip_id).expect("playable");
+            let again = resumed.playable(clip_id).expect("playable");
+            assert_eq!(track_fingerprint(&again), track_fingerprint(&taken));
+            assert_eq!(again.frames(), taken.frames());
+            for frame in 0..taken.frames() {
+                assert_eq!(again.frame(frame), taken.frame(frame), "clip {clip_id}");
+            }
+        }
+        for motion_id in 0..walked.motions() {
+            let taken = walked.playable_motion(motion_id).expect("playable");
+            let again = resumed.playable_motion(motion_id).expect("playable");
+            assert_eq!(again.segments(), taken.segments());
+            assert_eq!(again.duration_s(), taken.duration_s());
+            assert_eq!(again.max_speed(), taken.max_speed());
+            assert_eq!(again.mask(), taken.mask());
+            assert_eq!(again.blend_in_ms(), taken.blend_in_ms());
+            assert_eq!(again.blend_out_ms(), taken.blend_out_ms());
+        }
+    }
+
+    /// The structural refusals are the same refusals, and the frames are the
+    /// only thing taken on trust: what a resumed pass does not read is exactly
+    /// what a previous pass over the same immutable message already read.
+    #[test]
+    fn a_resumed_library_refuses_the_structure_and_trusts_the_frames() {
+        // A clip on a frame grid this stack does not run. A clip-level fact, so
+        // both passes read it and both refuse it the same way.
+        let mut message = composed_message();
+        message
+            .validate_mut()
+            .expect("a written library validates")
+            .clips
+            .get_mut(1)
+            .expect("the library has two clips")
+            .frame_rate_hz = 25.0;
+        let refusal =
+            ValidatedLibrary::of(valid_library(&message)).expect_err("a foreign frame grid");
+        assert_eq!(
+            refusal,
+            UnplayableAsset::Clip {
+                clip_id: 1,
+                source: ClipViewError::FrameRate {
+                    frame_rate_hz: 25.0
+                }
+            }
+        );
+        assert_eq!(
+            ValidatedLibrary::resumed(valid_library(&message))
+                .expect_err("a resumed pass reads the clip too"),
+            refusal
+        );
+
+        // A frame carrying what is not a number: the one thing the walk reads
+        // and a resumed pass does not.
+        let mut message = composed_message();
+        message
+            .validate_mut()
+            .expect("a written library validates")
+            .clips
+            .get_mut(0)
+            .expect("the library has two clips")
+            .frames
+            .get_mut(1)
+            .expect("the clip has frames")
+            .antenna_right_d = f64::NAN;
+        let library = valid_library(&message);
+        assert!(
+            ValidatedLibrary::of(library).is_err(),
+            "the walk reads every frame"
+        );
+        ValidatedLibrary::resumed(library).expect("a resumed pass takes the frames as walked");
     }
 
     /// Validating a library names the clip that will not play: a frame index on

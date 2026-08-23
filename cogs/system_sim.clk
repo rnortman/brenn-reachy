@@ -8,30 +8,32 @@
 // process description and per-domain configs the runner reads.
 //
 // What a scenario needs from this file is the two per-domain configs: the
-// channel publisher config that makes the schedule and injection channels come
-// out of an input log, and the event logger config that puts every channel
-// worth asserting on into the output log.
+// channel publisher config that makes two channels come out of an input log --
+// the scripts and the injections -- and the event logger config that puts every
+// channel worth asserting on into the output log.
 //
 // The policies live here rather than beside the channels they bind because
 // `channel_policy` generates nothing, and a module that generates C++ may not
 // import one that generates no targets.
 //
 // Everything a scenario checker reads is below. `DriverPose` is the machine's
-// heartbeat, `DriverCmd` what it was asked for, `DriverEvt` what the gate did
-// about it, `TickFaults` what the decision tick had to say and `Estimates`
-// where the head was. The two log-fed channels are logged as well, so a run's
-// inputs and its outputs are in one file and a failure can be read without the
-// scenario's source in hand.
+// heartbeat, `DriverCmd` what it was asked for, `SessionCmdChan` what the
+// session asked of the driver, `DriverEvt` what the gate did about it,
+// `TickFaults` what the decision tick had to say, `ReportsOut` what the session
+// said about all of it, `ScheduleChan` what the session made of a script and
+// `Estimates` where the head was. The two log-fed channels are logged as well,
+// so a run's inputs and its outputs are in one file and a failure can be read
+// without the scenario's source in hand.
 
 use cogs::sim;
 use cogs::motion;
 use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy,
     LogReaderPolicy, LogType};
 
-// What makes the runner publish these two channels from the input log. Neither
+// What makes the runner publish these two channels from the input log. No
 // policy carries a `source_name`, so the source is the channel's own name,
 // which is what the scenario author writes.
-policy LogReaderPolicy for motion::ScheduleChan
+policy LogReaderPolicy for motion::ScriptsIn
 {
 }
 
@@ -39,13 +41,20 @@ policy LogReaderPolicy for sim::SimCmdChan
 {
 }
 
-// What the run is asked to do, kept beside what it did.
+// What the session made of a script: the schedule the mover streams, whole and
+// once per change.
 policy ChannelLoggingPolicy for motion::ScheduleChan
 {
     log_type = LogType::event;
 }
 
+// What the run is asked to do, kept beside what it did.
 policy ChannelLoggingPolicy for sim::SimCmdChan
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for motion::ScriptsIn
 {
     log_type = LogType::event;
 }
@@ -63,13 +72,36 @@ policy ChannelLoggingPolicy for motion::DriverCmd
 }
 
 // What the gate did that the sample stream does not show.
-policy ChannelLoggingPolicy for sim::DriverEvt
+policy ChannelLoggingPolicy for motion::DriverEvt
+{
+    log_type = LogType::event;
+}
+
+// What the session asked the driver for, and what came back: the answer to one
+// transaction, and the rotating read of the status registers.
+policy ChannelLoggingPolicy for motion::SessionCmdChan
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for motion::DriverAuxOut
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for motion::DriverHealth
 {
     log_type = LogType::event;
 }
 
 // What the decision tick raised.
 policy ChannelLoggingPolicy for motion::TickFaults
+{
+    log_type = LogType::event;
+}
+
+// What the session said about the session: one report per wake, oldest first.
+policy ChannelLoggingPolicy for motion::ReportsOut
 {
     log_type = LogType::event;
 }

@@ -1,10 +1,19 @@
-// The control-rate cogs: what runs on every sample the driver publishes.
+// The host cogs: the two that run on every sample the driver publishes, and the
+// session that decides what the machine is doing at all.
 //
 // The driver publishes one pose sample per cycle, and that stream is the clock
-// everything in this file runs on. Nothing here is time-triggered: a cog woken
-// by a timer would drift against the bus cycle it is supposed to answer, and a
-// cog woken by the sample cannot. The cogs are sized to see every sample rather
-// than the latest one, because a pose series with a hole in it is not a series.
+// the control-rate cogs here run on. Neither of them is time-triggered: a cog
+// woken by a timer would drift against the bus cycle it is supposed to answer,
+// and a cog woken by the sample cannot. Both are sized to see every sample
+// rather than the latest one, because a pose series with a hole in it is not a
+// series.
+//
+// The session is the exception, and for the opposite reason: it decides at
+// human rates -- a script arrives, a sequence steps, a watchdog expires -- and
+// running it on the sample stream would wake it fifty times a second to answer
+// nothing. So it is woken by the message classes it acts on and by a lapse that
+// floors its rate, and it reads the sample stream without being triggered by
+// it.
 //
 // Every signal below is `multi_instance`, here and in `sim.clk`. That marker
 // says an offboard consumer should expect more than one reporter of the
@@ -16,6 +25,12 @@
 // whatever the marker says, so a consumer aggregating one of these counters
 // across "instances" is asking a question with a wrong answer available.
 // TODO(clockwork-single-instance-signal)
+//
+// Two modules are imported under aliases because a cog here carries a member of
+// the same name: the session's script input is called `script` and its state
+// slot `sess`, and a member name shadows a module name in the enclosing scope,
+// which the compiler refuses as a redefinition.
+// (A comment may not sit directly above a `use`, which is why this one is here.)
 //
 // Every channel here declares the schema it carries. A cog cannot tell a
 // socket-fed channel from a simulator-fed one either way: what crosses a socket
@@ -29,9 +44,14 @@ use cogs::config;
 use cogs::mover;
 use cogs::pose_state;
 use cogs::schedule;
+use cogs::script as script_vocab;
+use cogs::session as session_vocab;
+use cogs::session_cmd;
 use driver::goal as goal_vocab;
+use driver::health;
 use driver::pose;
 use motion::faults;
+use motion::timeline;
 use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
     ReportGroupLogType};
 
@@ -68,9 +88,8 @@ channel Estimates
 // because silence on this channel is what the driver's dead-man measures.
 //
 // One publisher is not a preference: an input fed by a channel two cogs publish
-// to needs a dial the composer will not load a system holding, so the session
-// cog's own traffic to the driver cannot come down this channel.
-// TODO(cogs-session-channel)
+// to needs a dial the composer will not load a system holding. The session's own
+// traffic to the driver therefore has a channel of its own, `SessionCmdChan`.
 channel DriverCmd
 {
     message_type: Tachyon<goal_vocab::GoalSetpoint>;
@@ -78,8 +97,8 @@ channel DriverCmd
 }
 
 // What the session has asked for, republished whole on every change. One
-// publisher: in this system the log reader, standing in for the session cog
-// that does not exist yet.
+// publisher, which is the session cog: an engagement beginning, a session
+// ending, and every other change to what the machine is under command to do.
 //
 // Four deep against a view of one. A schedule is state rather than an event --
 // the newest message is the whole of what a consumer needs -- so a subscriber
@@ -93,13 +112,95 @@ channel ScheduleChan
 // What the tick had to say about a cycle: one message per raise, never a
 // repetition of a standing condition. One publisher -- the decision tick.
 //
-// Eight deep against no view at all: nothing subscribes, the log does. Reports
-// are events rather than cycles, so the depth is slack for a burst of them and
-// not a rate.
+// Eight deep against a view of four, which is the session's: the raises are its
+// fault evidence as well as the log's. Reports are events rather than cycles, so
+// the depth is slack for a burst of them and not a rate.
 channel TickFaults
 {
     message_type: Tachyon<faults::TickFault>;
     max_num_messages: 8;
+}
+
+// The scripts somebody asks the machine to run. One publisher: whatever stands
+// at the edge -- the input log in this system, a bridge process online.
+//
+// Eight deep against a view of four. Scripts are sparse: one arrives, the
+// session runs it for a minute, another arrives. The depth is slack for a
+// sender that queued a few at once, and nothing here is a rate.
+channel ScriptsIn
+{
+    message_type: Tachyon<script_vocab::Script>;
+    max_num_messages: 8;
+}
+
+// What the session says happened, one report per wake. One publisher -- the
+// session.
+//
+// The channel carries the session's own timeline row rather than a message
+// shaped for the wire: the row is the report, and a second form of it would be
+// something to hold in step for nothing.
+//
+// Nothing in this system reads it: a report is logged and a checker reads it out
+// of the log. Thirty-two deep, which is the session's own ring: a reader lapped
+// on this channel has lost exactly what the ring would have dropped.
+channel ReportsOut
+{
+    message_type: Tachyon<timeline::TimelineEntry>;
+    max_num_messages: 32;
+}
+
+// The one thing the session says to the driver: keep the dead-man fed, take
+// torque off now, or run this transaction. One publisher -- the session.
+//
+// Sixteen deep against a view of eight. The session publishes at most one of
+// these per wake and wakes at most ten times a second, so the depth is slack by
+// two orders of magnitude and is sized for the loss this channel will suffer
+// when it is a socket rather than for the rate it carries.
+channel SessionCmdChan
+{
+    message_type: Tachyon<session_cmd::SessionCmd>;
+    max_num_messages: 16;
+}
+
+// How one aux transaction turned out. One publisher -- the driver.
+//
+// Eight deep against a view of four. The host that issues these is serial by
+// construction, so there is at most one outstanding request and at most one
+// answer per driver cycle; the depth carries a burst of refusals a host that is
+// not serial would provoke.
+channel DriverAuxOut
+{
+    message_type: Tachyon<health::AuxOutcome>;
+    max_num_messages: 8;
+}
+
+// What the driver's rotating read of the status registers saw, one report per
+// servo visited. One publisher -- the driver.
+//
+// Sixteen deep against a view of eight. A report every 120 ms is one every six
+// bus cycles, so a consumer woken at the session's own floor sees two of them a
+// wake and the depth is slack for the burst a stalled consumer comes back to.
+channel DriverHealth
+{
+    message_type: Tachyon<health::HealthReport>;
+    max_num_messages: 16;
+}
+
+// What the driver did that the sample stream does not show: the edges. One
+// publisher -- the driver.
+//
+// Declared here rather than beside the simulated driver because it is driver
+// contract and not a fact about the simulator: the session reads it as evidence
+// about the machine in this composition and in the online one, and the real
+// driver publishes the same records.
+//
+// Sixteen deep against a view of eight: events mark boundaries, not cycles, and
+// a driver emitting one per cycle is a driver reporting a standing condition at
+// poll rate.
+channel DriverEvt
+{
+    message_type: Tachyon<health::DriverEvent>;
+    max_num_messages: 16;
 }
 
 // Forward kinematics, once per sample.
@@ -336,6 +437,58 @@ cog Mover
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
+
+        // How many overlay windows this cog would not play: the screen's
+        // refusals, counted once per schedule, plus each composed setpoint an
+        // overlay rode that the tick refused. An overlay is presence, never
+        // safety, so a rise is a run that played less than it was asked to and
+        // never a run that moved somewhere it should not have.
+        overlays_refused: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many overlay rows in this cog's own slot would not read back as a
+        // player of the motion their window names. The window plays on from a
+        // fresh join, so a rise is a seam in a motion rather than a lost one.
+        players_refused: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many base plans this cog could not make or could not read back.
+        // The base stands where it stands, so a rise says the machine stopped
+        // going where the schedule asked while still holding a setpoint.
+        refused_base: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many base plans the motion library adjusted for a reason that is
+        // not routine: a clock that could not carry its own span inside the
+        // per-tick step bounds, or an antenna pair it could not part. The
+        // configured clocks are policy for every span they carry; a rise says
+        // they are being asked to cover spans they were not sized for, or that
+        // a pair is crossing nearer than the geometry allows.
+        base_stretched: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many base plans were adjusted only to part the antenna pair at
+        // their crossing. Expected nonzero on any machine that stands up or
+        // folds: the pair sweeps mirrored between the stow and the working
+        // posture, and the later side's clock is lengthened until their tips
+        // clear each other.
+        base_dephased: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
     }
 
     inputs
@@ -389,6 +542,269 @@ cog Mover
 // moves, and every observation is an absolute total, so the first report of a
 // fresh window carries the run's count and not the window's.
 policy ReportGroupPolicy for Mover.stats
+{
+    reporting_strategy = ReportingStrategy::post_aggregated;
+    log_type = ReportGroupLogType::event;
+    max_observations = 1000;
+}
+
+// The session: what the machine is doing at all, and what it says about it.
+//
+// This cog is the machine's own account of a session -- which phase it is in,
+// what script it accepted, what it has said. It decides at human rates and not
+// at the bus cycle's, which is why it is woken by the message classes it acts on
+// and by a lapse rather than by the sample stream: fifty wakes a second to
+// answer nothing is what making that stream a condition would cost. The lapse is
+// a floor rather than a period -- what it guarantees is that a wake happens even
+// when nothing arrives, which is what a decision about time having passed needs.
+//
+// Script intake is all-or-nothing: what arrives is screened whole against the
+// phase and its own numbers, and either becomes the schedule this session runs
+// or is refused with one reason. A refusal is a report and never a fault --
+// nothing about the machine is wrong when it declines a script it cannot run.
+//
+// Reports leave at one per execution, oldest first, out of the ring the state
+// slot holds. That ring is what carries a burst across the executions that drain
+// it, and it is bounded: a story lost to overflow is narration, because the
+// classification that mattered already travelled on the channel that raised it.
+//
+// The counters below are the run's totals, held in the state slot and reported
+// on the signal group only on the executions where one of them moves. Kept in
+// the group's own fold instead they would restart every time the group reported.
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take, which is the offset between the wake and the log time of the report it
+// publishes. (Neither a block header nor a field inside one may carry a comment
+// of its own, which is why this is here.)
+cog Session
+{
+    configs
+    {
+        // The aux timeout and its retry budget, the two watchdog windows, and
+        // the two budgets a response runs on.
+        params: Tappy<config::SessionParams>;
+    }
+
+    states
+    {
+        // The phase, the schedule the session accepted, the run's totals and
+        // the report ring the narration leaves through.
+        sess: Tappy<session_vocab::SessionState>
+        {
+            mutable: true;
+        }
+    }
+
+    signals stats
+    {
+        // How many scripts passed the screen, all run.
+        scripts_accepted: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many were refused whole. Every refusal is also a report naming its
+        // reason; this is the total a reader compares those against.
+        scripts_refused: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many faults were recorded, out of all three kinds of evidence: the
+        // decision tick's raises, the edges the driver reported, and the error
+        // bits a health reading carried. A raise that asks for no response is
+        // not one of these: it is a remark about a command, already on the
+        // channel that carried it, and narrating it again would make the
+        // timeline a second copy of that channel.
+        faults_recorded: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many reports went out.
+        reports_published: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many reports were dropped from the ring before they could be
+        // published. A rise says narration was lost, never a record.
+        reports_dropped: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many responses were selected. Fewer than the faults recorded: a
+        // fault arriving while the response it calls for is already being
+        // carried out is answered by the standing one rather than by a second.
+        responses_taken: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many inbound datagrams the codec refused -- scripts, fault raises,
+        // driver events, aux outcomes, health readings and samples together. A
+        // sender built against a newer vocabulary than this binary would
+        // otherwise read as a sender that never spoke.
+        undecodable_inbound: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many times this cog's own slot did not read back as a session.
+        // This cog is the only writer, so a rise means memory nobody wrote was
+        // read as a session.
+        refused_state: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many datagrams were re-issued because nothing answered the first
+        // one inside the configured window. Delivery retry: the same datagram
+        // under the same correlation number, so a rise is a lossy link or a
+        // driver that is late, never a second ask.
+        aux_retries: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many transactions were given up on with the retry budget spent.
+        // Each one is handed to the sequencer as a silence, which is what fails
+        // the sequence and hands the phase machine a refusal.
+        aux_failures: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many answers named a number nothing was waiting on, and were
+        // dropped.
+        aux_strays: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+    }
+
+    inputs
+    {
+        // The scripts, sized to see every one rather than the latest: a script
+        // is a request and a request superseded before it was read is a request
+        // nobody answered.
+        script: Tappy<script_vocab::Script>
+        {
+            max_msgs: 4;
+        }
+
+        // What the decision tick raised, sized to see every raise for the same
+        // reason: a raise is evidence about the machine, and evidence
+        // superseded before it was read is evidence nobody weighed.
+        fault: Tappy<faults::TickFault>
+        {
+            max_msgs: 4;
+        }
+
+        // The driver's answers to the transactions this cog issued. One request
+        // is outstanding at a time, so the window only ever holds a late
+        // duplicate beside the answer being waited on -- and both are read,
+        // because the correlation number is what tells them apart.
+        aux_out: Tappy<health::AuxOutcome>
+        {
+            max_msgs: 4;
+        }
+
+        // What the driver did that the pose stream does not show: a de-torquing
+        // it latched, a confirmation it read back, a bus it declared gone. Every
+        // one of them, because each is an edge and an edge nobody read is an
+        // edge that did not happen as far as this cog is concerned.
+        evt: Tappy<health::DriverEvent>
+        {
+            max_msgs: 8;
+        }
+
+        // What the driver's rotating read saw, one servo at a time. Sized to
+        // hold a whole sweep of the bus: the error bits a reading carries are
+        // evidence about that servo alone, so a reading dropped is a servo this
+        // cog never heard about. Named for the readings rather than for the
+        // health they are about, because a member named `health` shadows the
+        // module of that name and the compiler refuses it.
+        readings: Tappy<health::HealthReport>
+        {
+            max_msgs: 8;
+        }
+
+        // The driver's sample stream, read and never triggering: it arrives at
+        // the bus rate and this cog runs at the rate of the decisions it makes,
+        // so what a wake wants from it is the freshest instant rather than every
+        // one of them. Which is also all it is read for -- whether the driver is
+        // still alive.
+        sample: Tappy<pose::PoseSample>;
+    }
+
+    outputs
+    {
+        // What the driver is asked for: one datagram per execution at most,
+        // which is what makes a keep-alive unable to displace a transaction.
+        cmd: Tappy<session_cmd::SessionCmd>;
+
+        // What the machine is under command to do, whole: published when the
+        // engagement takes hold and when what it was engaged for is over, and
+        // never between changes. A consumer reads the latest and needs no
+        // history, so one message per change is the whole contract.
+        sched: Tappy<schedule::SessionSchedule>;
+
+        report: Tappy<timeline::TimelineEntry>;
+    }
+
+    execution
+    {
+        // Every script, no skips: the bound equals the view's size, so the count
+        // is the window's length and never a clamp of it.
+        condition got_script: new_message(script, max=4);
+
+        // Every raise, likewise.
+        condition got_fault: new_message(fault, max=4);
+
+        // Every answer. A sequence advances one transaction per answer, so this
+        // is what paces a commission: the wake floor below is a deadline for
+        // the answer that never came, not the rate the bus is driven at.
+        condition got_aux: new_message(aux_out, max=4);
+
+        // Every edge the driver reported, and every reading its rotation took.
+        // Both are fault evidence, and evidence waits for no floor: a servo that
+        // has just reported a hardware error is answered on the wake its reading
+        // causes.
+        condition got_evt: new_message(evt, max=8);
+        condition got_readings: new_message(readings, max=8);
+
+        // The floor. A wake owes the machine a decision about time having
+        // passed, and this is what guarantees one happens even when nothing
+        // arrives.
+        condition lapse: time_since_last_exec(100ms);
+
+        execute when: got_script or got_fault or got_aux or got_evt or got_readings or lapse;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}
+
+// The window a post-aggregated group folds over before it reports. It bounds
+// observations, not time: these counters are written only when one of them
+// moves, and every observation is an absolute total, so the first report of a
+// fresh window carries the run's count and not the window's.
+policy ReportGroupPolicy for Session.stats
 {
     reporting_strategy = ReportingStrategy::post_aggregated;
     log_type = ReportGroupLogType::event;

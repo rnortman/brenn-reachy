@@ -1,10 +1,17 @@
 // What the session cog is, between one execution and the next: which phase the
-// machine is in, and the state it wakes up into.
+// machine is in, the state it wakes up into, and the one aux transaction it is
+// waiting on.
 //
 // The state sits in a module of its own, apart from the cog that keeps it. That
 // is forced rather than stylistic: a cog member's type is an interface
 // instantiation, and the compiler resolves one only against a module the cog's
 // module imports.
+//
+// The aux bookkeeping sits here rather than in a module beside it because every
+// consumer of one is a consumer of the other: the session host writes the
+// pending transaction as part of the same slot it reads its phase back from.
+// The vocabulary the driver answers with -- how a transaction ended -- is the
+// driver's own, in `driver/health.clk`.
 //
 // One convention holds throughout, and it is worth stating because a reader
 // coming from the wire format will expect otherwise: time is `SyncTime` and
@@ -36,10 +43,12 @@
 #![cpp(namespace=brenn_reachy::motion)]
 
 use cogs::schedule as schedule_vocab;
-use cogs::session_aux;
+use hardware::dynamixel::registers;
+use motion::bus_txn;
 use motion::commission as commission_vocab;
 use motion::disarm as disarm_vocab;
 use motion::engage as engage_vocab;
+use motion::joints;
 use motion::poll as poll_vocab;
 use motion::seq;
 use motion::timeline as timeline_vocab;
@@ -78,6 +87,65 @@ enum SessionPhase
     }
 }
 
+// The one aux transaction the session is waiting on, or that it is waiting on
+// none.
+//
+// One and not a queue: the session is strictly serial by construction -- a
+// sequencer hands out one transaction at a time and is stepped again when the
+// answer comes back -- and the driver refuses a second outstanding request
+// loudly rather than buffering it. So the slot holds exactly what a re-issue
+// needs: the datagram's own fields, when it went out, and how many times it has.
+//
+// The request is held field for field rather than as encoded bytes. A re-issue
+// must be the same datagram, correlation number included, and rebuilding it from
+// the fields is the same encode the first one went through -- where a stored
+// datagram would be a second representation able to disagree with the fields
+// beside it.
+schema AuxPending
+{
+    uuid: 5b9d7fc8-9da7-4d0e-aece-9a2751d14357;
+    fields
+    {
+        // Whether a transaction is outstanding. Every field below means nothing
+        // when this is false, and the zero operation is what a slot nothing
+        // wrote holds.
+        #0 active: Bool;
+
+        // The correlation number the request went out with, and the only thing
+        // that matches an outcome to it. A re-issue keeps it, so a late
+        // duplicate of an answered request is recognisable as one.
+        #1 corr: UInt32;
+
+        // Which transaction it is.
+        #2 op: bus_txn::AuxOpKind;
+
+        // Which servo, as its bus id.
+        #3 id: UInt8;
+
+        // Which register, or `none` where the transaction concerns none. Not a
+        // servo address: the address table lives below the wire line, in the
+        // driver's bus layer.
+        #4 reg: registers::RegId;
+
+        // What shape the value below is.
+        #5 value_kind: registers::ValueShape;
+
+        // The value, as the eight bytes the wire carries it in read as one
+        // little-endian number. Bits rather than a number of anything: what they
+        // mean is `value_kind`, and an angle crosses here as its own IEEE-754
+        // pattern.
+        #6 value: UInt64;
+
+        // When the request was last put on the wire. What the timeout is
+        // measured from, so a re-issue restarts it.
+        #7 issued: SyncTime;
+
+        // How many times it has been re-issued. The budget is configured; past
+        // it, the sequencer is handed a silence and fails the sequence itself.
+        #8 retries: UInt32;
+    }
+}
+
 // Everything the session is, between one execution and the next.
 //
 // The session cog is woken by five message classes and by a lapse, so it runs at
@@ -85,8 +153,8 @@ enum SessionPhase
 // is therefore everything that is not handed to it read-only: which phase it is
 // in, the schedule it published, the sequence it is driving and where that
 // sequence stands, the transaction it is waiting on, the maneuver it may be
-// running, the two watchdog anchors, the report timeline, the wire sequence
-// numbers, and the run's totals.
+// running, the rows a degrade still owes a torque-off write, the two watchdog
+// anchors, the report timeline, and the run's totals.
 //
 // The four sequencer snapshots are four fixed slots rather than one, because
 // there is no union in this language: `seq_kind` names
@@ -99,6 +167,8 @@ enum SessionPhase
 // and this cog is its only publisher, so the copy here is the authority on what
 // was asked for: a republish on any change is written from this field, and
 // nothing else reads the channel back.
+//
+// Numbering is append-only; #20 and #21 are retired and will not be reused.
 schema SessionState
 {
     uuid: 5e79f353-ae2a-4fde-a452-989a253ef1a8;
@@ -138,10 +208,8 @@ schema SessionState
         // is what guarantees there is one.
         #8 wait_deadline: SyncTime;
 
-        // The aux transaction outstanding, or that none is. No crossing test
-        // yet: the correlation-number and retry bookkeeping it carries has no
-        // reader in this build. TODO(session-aux-crossing)
-        #9 aux: session_aux::AuxPending;
+        // The aux transaction outstanding, or that none is.
+        #9 aux: AuxPending;
 
         // The wind-down running, or that none is.
         #10 winddown: timeline_vocab::WindDownSnap;
@@ -192,15 +260,6 @@ schema SessionState
         // that never existed.
         #19 timeline_published: UInt8;
 
-        // The wire sequence number the next `SessionCmd` datagram carries. Held
-        // here rather than read back off the channel: nothing in a published
-        // command is read again, so a self-subscription would buy a second way
-        // for the number to be wrong.
-        #20 cmd_seq: UInt32;
-
-        // The wire sequence number the next report datagram carries, likewise.
-        #21 report_seq: UInt32;
-
         // The correlation number the next aux request carries. Monotonic, so a
         // late duplicate of a request already answered is recognisable as one.
         #22 next_corr: UInt32;
@@ -248,5 +307,41 @@ schema SessionState
         // run. This cog is the only writer, so a rise means memory nobody wrote
         // was read as a session.
         #32 refused_state: UInt64;
+
+        // The rows a degrade response still owes a verified torque-off write.
+        // Empty when nothing is owed. The doctrine's one group-scoped response
+        // is drained one row per wake: a row leaves the set when the driver
+        // reports its write verified, and the whole set is dropped when the
+        // machine is commanded fully limp instead, which owes no group write.
+        #33 degrade_release: joints::JointFlags;
+
+        // How many answers named a number nothing was waiting on. A late
+        // duplicate of a request already settled -- what a re-issue produces
+        // when the first datagram was answered after all -- dropped as it is
+        // read. A rise says the link lost answers, not that anything went wrong
+        // with the machine.
+        #34 aux_strays: UInt64;
+
+        // The rows whose health reading has already been recorded as a fault. A
+        // servo's hardware-error byte latches in the servo, so the driver's
+        // rotation carries it on every pass for the rest of the session; this is
+        // what makes the condition news once. Nothing clears it -- nothing
+        // clears the servo's own byte either, and there is no automatic recovery
+        // from a fault.
+        #35 health_faulted: joints::JointFlags;
+
+        // When the standing torque-off was commanded. What an unconfirmed report
+        // states as the time spent trying: the deadline above re-arms every time
+        // the session says so, and the instant here does not, so a machine that
+        // never acknowledges a release is reported as unconfirmed for longer and
+        // longer rather than for one budget over and over.
+        #36 torque_off_commanded: SyncTime;
+
+        // Whether the transaction the aux record above is waiting on is the
+        // degrade's own torque-off write rather than a sequence's ask. One
+        // transaction is outstanding at a time and one record describes it, so
+        // this is what says whose answer an outcome is: the drain settles its
+        // own write, and a sequence is stepped by no wake that is draining.
+        #37 degrade_pending: Bool;
     }
 }

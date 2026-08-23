@@ -23,10 +23,13 @@
 //! surveillance: it has a cadence, not a deadline, and a lap that takes a few
 //! cycles longer than nominal is not a fact anybody acts on.
 
-use brenn_reachy__motion__bus_txn_clk_rs::BusTxnWire;
+use brenn_reachy__driver__aux_clk_rs::{AuxSlotState, AuxSlotStateWire};
+use brenn_reachy__motion__bus_txn_clk_rs::BusTxn;
+use clockwork_rs::SyncTime;
 
 use crate::JOINT_COUNT;
 use crate::state::DriverStateError;
+use crate::torque::BelievedTorqued;
 
 /// What the host should spend this cycle's one aux transaction on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,7 +41,7 @@ pub enum AuxTask {
     /// Execute the transaction [`AuxSlot::taken`] hands back for this `corr`
     /// and answer it with an outcome carrying the same number.
     ///
-    /// The transaction itself stays in the slot rather than riding here: it is
+    /// The transaction itself stays in the state rather than riding here: it is
     /// the vocabulary's own record, which is a buffer of bytes and not a value
     /// a task arm can carry without copying it.
     Host {
@@ -74,59 +77,66 @@ pub enum AuxOffer {
     RefusedBusy,
 }
 
-/// The slot: one pending host request, and the rotation's place in its lap.
-#[derive(Clone, Debug)]
-pub struct AuxSlot {
-    /// The pending transaction, as the vocabulary declares one. Meaningful only
-    /// when `has_pending`.
-    pub pending: BusTxnWire,
-    /// The correlation number the pending transaction was offered under.
-    /// Meaningful only when `has_pending`.
-    pub corr: u32,
-    /// Whether a host request is pending.
-    pub has_pending: bool,
-    /// The bus row the health rotation will read next.
-    pub next_row: u8,
-    /// When the last health report was scheduled. Meaningful only when
-    /// `has_reported`.
-    pub last_report_ns: i64,
-    /// Whether the rotation has ever been scheduled. Until it has, it is due:
-    /// a driver that has just started has nothing to say about its servos yet,
-    /// and the first thing worth knowing is whether they are complaining.
-    pub has_reported: bool,
+/// The slot: one pending host request, the rotation's place in its lap, and the
+/// torque belief the answers move — decided over the state they live in.
+///
+/// Borrows the state for as long as a decision is being made and holds nothing
+/// of its own, so a host keeps its state wherever it keeps state — a cog's slot
+/// or a process's memory — and every read a host wants is a field of that state
+/// rather than something to ask for here.
+pub struct AuxSlot<'a> {
+    /// The state being decided over.
+    state: &'a mut AuxSlotState,
 }
 
-impl Default for AuxSlot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AuxSlot {
-    /// An empty slot with the rotation at row 0 and due.
-    #[must_use]
-    pub fn new() -> Self {
+impl<'a> AuxSlot<'a> {
+    /// Take up a slot as a driver that has been told nothing.
+    ///
+    /// The producer's route: the state is cleared, which is no request pending,
+    /// the rotation at row 0 and due, and nothing believed torqued.
+    pub fn start(slot: &'a mut AuxSlotStateWire) -> Self {
         Self {
-            // A record nothing has written: every field at the value the schema
-            // declares for it, which for the operation is "no transaction".
-            pending: BusTxnWire::new(),
-            corr: 0,
-            has_pending: false,
-            next_row: 0,
-            last_report_ns: 0,
-            has_reported: false,
+            state: slot.clear_valid(),
         }
     }
 
+    /// Decide over the state a previous cycle left.
+    pub fn over(state: &'a mut AuxSlotState) -> Self {
+        Self { state }
+    }
+
+    /// The state being decided over.
+    #[must_use]
+    pub fn state(&self) -> &AuxSlotState {
+        self.state
+    }
+
+    /// The torque belief this state carries, for one decision.
+    ///
+    /// The belief lives here because the answers that move it are this slot's:
+    /// a verified write to a torque-enable register is one of the transactions
+    /// the slot hands out.
+    pub fn belief(&mut self) -> BelievedTorqued<'_> {
+        BelievedTorqued::over(&mut self.state.believed_torqued)
+    }
+
     /// Whether this describes a slot a driver can be in.
+    ///
+    /// What the schema cannot say: which values of a row cursor name a bus row.
+    /// Everything else about these bytes — that the pending record is a
+    /// transaction at all, that the belief names servos this bus has — is said
+    /// by the host's one validation at the boundary, because every one of those
+    /// fields is typed as what it means.
     ///
     /// # Errors
     ///
     /// [`DriverStateError::HealthCursorOutOfRange`] for a rotation cursor past
     /// the bus.
-    pub fn validate(&self) -> Result<(), DriverStateError> {
-        if usize::from(self.next_row) >= JOINT_COUNT {
-            return Err(DriverStateError::HealthCursorOutOfRange { row: self.next_row });
+    pub fn validate(state: &AuxSlotState) -> Result<(), DriverStateError> {
+        if usize::from(state.next_row) >= JOINT_COUNT {
+            return Err(DriverStateError::HealthCursorOutOfRange {
+                row: state.next_row,
+            });
         }
         Ok(())
     }
@@ -138,8 +148,8 @@ impl AuxSlot {
     /// [`Self::validate`] gets a rotation that rotates rather than a panic in
     /// the process whose other job is to de-torque the machine.
     fn rotation_row(&self) -> u8 {
-        if usize::from(self.next_row) < JOINT_COUNT {
-            self.next_row
+        if usize::from(self.state.next_row) < JOINT_COUNT {
+            self.state.next_row
         } else {
             0
         }
@@ -147,15 +157,15 @@ impl AuxSlot {
 
     /// Offer a host request to the slot, under the host's correlation number.
     ///
-    /// The record is copied in rather than borrowed: the slot outlives the
+    /// The record is copied in rather than borrowed: the state outlives the
     /// cycle that offered it, and a re-issue must be the same transaction.
-    pub fn offer(&mut self, corr: u32, request: &BusTxnWire) -> AuxOffer {
-        if self.has_pending {
+    pub fn offer(&mut self, corr: u32, request: &BusTxn) -> AuxOffer {
+        if self.state.has_pending.get() {
             return AuxOffer::RefusedBusy;
         }
-        self.pending = request.clone();
-        self.corr = corr;
-        self.has_pending = true;
+        crate::copy_whole(&mut self.state.pending, request);
+        self.state.corr = corr;
+        self.state.has_pending = true.into();
         AuxOffer::Accepted
     }
 
@@ -169,8 +179,25 @@ impl AuxSlot {
     /// transaction after a later offer landed gets nothing rather than the
     /// other host's transaction answered under its number.
     #[must_use]
-    pub fn taken(&self, corr: u32) -> Option<&BusTxnWire> {
-        (self.corr == corr).then_some(&self.pending)
+    pub fn taken(&self, corr: u32) -> Option<&BusTxn> {
+        (self.state.corr == corr).then_some(&self.state.pending)
+    }
+
+    /// Drop the pending host request, if one is held, and say whether there was
+    /// one.
+    ///
+    /// What a commanded de-torquing does to the queue. A release commanded after
+    /// a request was offered outranks it: a pending verified torque-enable write
+    /// run after the latch stands would energise the row again and stand the
+    /// confirmation pass down, so the machine a host asked to let go would be
+    /// holding torque until the host's next release datagram. Nothing goes back
+    /// to the host for it — the transaction never reached the bus, which is the
+    /// silence its own delivery timeout is for, and the release it was overtaken
+    /// by is the answer to whatever the sequence was doing.
+    pub fn abandon(&mut self) -> bool {
+        let held = self.state.has_pending.get();
+        self.state.has_pending = false.into();
+        held
     }
 
     /// Whether the health rotation is due at `now_ns`.
@@ -182,9 +209,10 @@ impl AuxSlot {
     /// rotation's cadence.
     #[must_use]
     pub fn health_due(&self, now_ns: i64, health_period_ns: i64) -> bool {
-        !self.has_reported
-            || self.last_report_ns > now_ns
-            || now_ns.saturating_sub(self.last_report_ns) >= health_period_ns
+        let last = self.state.last_report.as_nanos();
+        !self.state.has_reported.get()
+            || last > now_ns
+            || now_ns.saturating_sub(last) >= health_period_ns
     }
 
     /// Name this cycle's one transaction.
@@ -204,18 +232,20 @@ impl AuxSlot {
     /// re-stamped only on a successful reply would poll a silent servo every
     /// cycle.
     pub fn take(&mut self, now_ns: i64, health_period_ns: i64, confirm_row: Option<u8>) -> AuxTask {
-        if self.has_pending {
-            self.has_pending = false;
-            return AuxTask::Host { corr: self.corr };
+        if self.state.has_pending.get() {
+            self.state.has_pending = false.into();
+            return AuxTask::Host {
+                corr: self.state.corr,
+            };
         }
         if let Some(row) = confirm_row {
             return AuxTask::ConfirmTorqueOff { row };
         }
         if self.health_due(now_ns, health_period_ns) {
             let row = self.rotation_row();
-            self.next_row = (row + 1) % JOINT_COUNT as u8;
-            self.last_report_ns = now_ns;
-            self.has_reported = true;
+            self.state.next_row = (row + 1) % JOINT_COUNT as u8;
+            self.state.last_report = SyncTime::from_nanos(now_ns);
+            self.state.has_reported = true.into();
             return AuxTask::Health { row };
         }
         AuxTask::Nothing
@@ -225,13 +255,40 @@ impl AuxSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brenn_reachy__driver__aux_clk_rs::{AuxSlotStateWire, TorqueConfirmStateWire};
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
-    use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKind;
-    use clockwork_rs::blob_as_bytes;
+    use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
+    use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+    use clockwork_rs::{as_raw, blob_as_bytes};
 
     const T0: i64 = 1_700_000_000_000_000_000;
     const PERIOD: i64 = 20_000_000;
     const HEALTH_PERIOD: i64 = 120_000_000;
+
+    /// A slot's state and the record it lives in, so a case can hold one value
+    /// and still hand out the borrow every decision takes.
+    struct Fixture {
+        /// The state the slot decides over.
+        held: AuxSlotStateWire,
+    }
+
+    impl Fixture {
+        /// A driver that has been told nothing.
+        fn new() -> Self {
+            let mut held = AuxSlotStateWire::new();
+            AuxSlot::start(&mut held);
+            Self { held }
+        }
+
+        /// The slot, for as long as a case needs it.
+        fn slot(&mut self) -> AuxSlot<'_> {
+            AuxSlot::over(
+                self.held
+                    .validate_mut()
+                    .expect("a slot leaves a slot in its state"),
+            )
+        }
+    }
 
     fn read_request(id: u8) -> BusTxnWire {
         let mut txn = BusTxnWire::new();
@@ -243,25 +300,59 @@ mod tests {
         txn
     }
 
+    /// A request as the slot takes one: validated, since the state it is copied
+    /// into is.
+    fn as_txn(txn: &BusTxnWire) -> &BusTxn {
+        txn.validate().expect("a request is a transaction")
+    }
+
     /// Two records are the same transaction when they are the same bytes.
-    fn same_txn(held: Option<&BusTxnWire>, expected: &BusTxnWire) -> bool {
-        held.map(blob_as_bytes) == Some(blob_as_bytes(expected))
+    fn same_txn(held: Option<&BusTxn>, expected: &BusTxnWire) -> bool {
+        held.map(|txn| blob_as_bytes(as_raw(txn))) == Some(blob_as_bytes(expected))
     }
 
     #[test]
     fn a_fresh_slot_is_a_slot_and_the_rotation_is_due() {
-        let slot = AuxSlot::new();
-        slot.validate().expect("a fresh slot is a slot");
-        assert!(!slot.has_pending);
+        let mut fixture = Fixture::new();
+        let slot = fixture.slot();
+        AuxSlot::validate(slot.state).expect("a fresh slot is a slot");
+        assert!(!slot.state.has_pending.get());
         assert!(slot.health_due(T0, HEALTH_PERIOD));
         assert_eq!(slot.rotation_row(), 0);
     }
 
+    /// A pending request abandoned is one the next `take` does not name -- and
+    /// abandoning nothing says so.
+    ///
+    /// What a commanded de-torquing does to the queue. The transaction being
+    /// dropped is the point: a torque-enable write run out of the slot after the
+    /// latch stands would energise the row the release exists to let go of.
+    #[test]
+    fn an_abandoned_request_is_not_taken() {
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
+        let request = read_request(3);
+        assert_eq!(slot.offer(7, as_txn(&request)), AuxOffer::Accepted);
+        assert!(slot.abandon(), "there was one to abandon");
+        assert!(!slot.abandon(), "and now there is not");
+        assert_eq!(
+            slot.take(T0, HEALTH_PERIOD, None),
+            AuxTask::Health { row: 0 },
+            "the cycle spends its transaction on what is left to want it"
+        );
+        assert_eq!(
+            slot.offer(8, as_txn(&request)),
+            AuxOffer::Accepted,
+            "and the slot is free for the request the host issues next"
+        );
+    }
+
     #[test]
     fn a_pending_host_request_outranks_the_rotation() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         let request = read_request(3);
-        assert_eq!(slot.offer(7, &request), AuxOffer::Accepted);
+        assert_eq!(slot.offer(7, as_txn(&request)), AuxOffer::Accepted);
         assert_eq!(
             slot.take(T0, HEALTH_PERIOD, None),
             AuxTask::Host { corr: 7 },
@@ -279,9 +370,10 @@ mod tests {
 
     #[test]
     fn a_pending_host_request_outranks_the_confirmation_by_one_cycle() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         let request = read_request(1);
-        slot.offer(1, &request);
+        slot.offer(1, as_txn(&request));
         assert_eq!(
             slot.take(T0, HEALTH_PERIOD, Some(4)),
             AuxTask::Host { corr: 1 }
@@ -295,7 +387,8 @@ mod tests {
 
     #[test]
     fn the_confirmation_outranks_the_rotation_for_as_long_as_it_runs() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         let mut now = T0;
         for row in 0..JOINT_COUNT as u8 {
             assert_eq!(
@@ -317,8 +410,8 @@ mod tests {
     /// A slot whose rotation has already been served, so what it names next is
     /// only ever a request or a confirmation. The rotation is due on a fresh
     /// slot, which would otherwise answer every quiet cycle.
-    fn rotated(now_ns: i64) -> AuxSlot {
-        let mut slot = AuxSlot::new();
+    fn rotated(fixture: &mut Fixture, now_ns: i64) -> AuxSlot<'_> {
+        let mut slot = fixture.slot();
         assert_eq!(
             slot.take(now_ns, i64::MAX, None),
             AuxTask::Health { row: 0 },
@@ -329,9 +422,10 @@ mod tests {
 
     #[test]
     fn one_request_is_taken_once() {
-        let mut slot = rotated(T0);
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
         let request = read_request(2);
-        slot.offer(9, &request);
+        slot.offer(9, as_txn(&request));
         assert_eq!(
             slot.take(T0 + PERIOD, i64::MAX, None),
             AuxTask::Host { corr: 9 }
@@ -345,14 +439,15 @@ mod tests {
     /// number would put a register write nobody asked for on the bus.
     #[test]
     fn a_transaction_asked_for_under_a_spent_correlation_is_not_handed_over() {
-        let mut slot = rotated(T0);
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
         let first = read_request(1);
-        slot.offer(7, &first);
+        slot.offer(7, as_txn(&first));
         assert_eq!(
             slot.take(T0 + PERIOD, i64::MAX, None),
             AuxTask::Host { corr: 7 }
         );
-        assert_eq!(slot.offer(8, &read_request(2)), AuxOffer::Accepted);
+        assert_eq!(slot.offer(8, as_txn(&read_request(2))), AuxOffer::Accepted);
         assert_eq!(
             slot.taken(7),
             None,
@@ -367,9 +462,13 @@ mod tests {
 
     #[test]
     fn a_second_request_while_one_is_pending_is_refused() {
-        let mut slot = rotated(T0);
-        assert_eq!(slot.offer(1, &read_request(1)), AuxOffer::Accepted);
-        assert_eq!(slot.offer(2, &read_request(2)), AuxOffer::RefusedBusy);
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
+        assert_eq!(slot.offer(1, as_txn(&read_request(1))), AuxOffer::Accepted);
+        assert_eq!(
+            slot.offer(2, as_txn(&read_request(2))),
+            AuxOffer::RefusedBusy
+        );
         assert_eq!(
             slot.take(T0 + PERIOD, i64::MAX, None),
             AuxTask::Host { corr: 1 },
@@ -379,12 +478,13 @@ mod tests {
             same_txn(slot.taken(1), &read_request(1)),
             "and it is the first request's transaction, not the second's"
         );
-        assert_eq!(slot.offer(2, &read_request(2)), AuxOffer::Accepted);
+        assert_eq!(slot.offer(2, as_txn(&read_request(2))), AuxOffer::Accepted);
     }
 
     #[test]
     fn a_request_carrying_a_value_crosses_the_slot_unchanged() {
-        let mut slot = rotated(T0);
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
         let mut request = BusTxnWire::new();
         let held = request.clear_valid();
         held.active = true.into();
@@ -393,7 +493,7 @@ mod tests {
         held.reg = RegId::GoalPosition;
         held.value_kind = ValueShape::Radians;
         held.value = 0.5f64.to_bits();
-        slot.offer(42, &request);
+        slot.offer(42, as_txn(&request));
         assert_eq!(
             slot.take(T0 + PERIOD, i64::MAX, None),
             AuxTask::Host { corr: 42 }
@@ -406,7 +506,8 @@ mod tests {
 
     #[test]
     fn the_rotation_walks_every_row_once_per_lap_and_wraps() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         let mut now = T0;
         let mut rows = Vec::new();
         for _ in 0..2 * JOINT_COUNT {
@@ -423,7 +524,8 @@ mod tests {
 
     #[test]
     fn the_rotation_is_not_due_again_until_a_whole_period_has_passed() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         assert_eq!(
             slot.take(T0, HEALTH_PERIOD, None),
             AuxTask::Health { row: 0 }
@@ -447,7 +549,8 @@ mod tests {
     fn a_lap_is_a_row_count_of_report_periods() {
         // One report per period, one row per report: the last row of the first
         // lap comes eight periods after the first.
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
         let mut now = T0;
         loop {
             if let AuxTask::Health { row } = slot.take(now, HEALTH_PERIOD, None)
@@ -470,13 +573,20 @@ mod tests {
     /// names is a row the slot can ask for.
     #[test]
     fn a_confirmation_with_a_cursor_past_the_bus_reads_from_row_zero() {
-        let mut confirm = crate::TorqueOffConfirm::new();
-        confirm.begin(T0);
-        confirm.cursor = JOINT_COUNT as u8 + 3;
+        let mut held = TorqueConfirmStateWire::new();
+        held.set_active(true);
+        held.set_started(SyncTime::from_nanos(T0));
+        held.set_cursor(JOINT_COUNT as u8 + 3);
+        let confirm = crate::TorqueOffConfirm::over(
+            held.validate_mut()
+                .expect("a cursor is a number either way"),
+        );
         assert_eq!(confirm.waiting_on(), Some(0), "the pass starts over");
-        let mut slot = rotated(T0);
+        let confirm_row = confirm.waiting_on();
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
         assert_eq!(
-            slot.take(T0 + PERIOD, i64::MAX, confirm.waiting_on()),
+            slot.take(T0 + PERIOD, i64::MAX, confirm_row),
             AuxTask::ConfirmTorqueOff { row: 0 },
             "the confirmation outranks a rotation that is not due"
         );
@@ -488,15 +598,20 @@ mod tests {
     /// the surveillance would stop in silence.
     #[test]
     fn a_report_stamp_from_the_future_is_due_now() {
-        let mut slot = AuxSlot::new();
-        slot.last_report_ns = T0 + 10 * HEALTH_PERIOD;
-        slot.has_reported = true;
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
+        slot.state.last_report = SyncTime::from_nanos(T0 + 10 * HEALTH_PERIOD);
+        slot.state.has_reported = true.into();
         assert!(slot.health_due(T0, HEALTH_PERIOD));
         assert_eq!(
             slot.take(T0, HEALTH_PERIOD, None),
             AuxTask::Health { row: 0 }
         );
-        assert_eq!(slot.last_report_ns, T0, "the ask stamps this clock's now");
+        assert_eq!(
+            slot.state.last_report.as_nanos(),
+            T0,
+            "the ask stamps this clock's now"
+        );
         assert!(
             !slot.health_due(T0 + PERIOD, HEALTH_PERIOD),
             "and the cadence runs from it"
@@ -505,10 +620,11 @@ mod tests {
 
     #[test]
     fn a_rotation_cursor_past_the_bus_is_refused_and_reads_as_row_zero() {
-        let mut slot = AuxSlot::new();
-        slot.next_row = JOINT_COUNT as u8 + 3;
+        let mut fixture = Fixture::new();
+        let mut slot = fixture.slot();
+        slot.state.next_row = JOINT_COUNT as u8 + 3;
         assert_eq!(
-            slot.validate(),
+            AuxSlot::validate(slot.state),
             Err(DriverStateError::HealthCursorOutOfRange {
                 row: JOINT_COUNT as u8 + 3
             })
@@ -518,24 +634,49 @@ mod tests {
             slot.take(T0, HEALTH_PERIOD, None),
             AuxTask::Health { row: 0 }
         );
-        slot.validate()
-            .expect("taking a task re-establishes the cursor");
+        AuxSlot::validate(slot.state).expect("taking a task re-establishes the cursor");
+    }
+
+    /// A belief naming a servo the bus does not have is refused where the state
+    /// is validated, by the schema itself: the field is the joint vocabulary's
+    /// set, so a stray bit is not a value it can carry, and a host has one call
+    /// to make at its boundary either way.
+    #[test]
+    fn a_belief_in_servos_the_bus_does_not_have_is_not_a_state_at_all() {
+        let mut fixture = Fixture::new();
+        fixture
+            .held
+            .set_believed_torqued(JointFlagsWire::from(crate::every_row()));
+        assert!(
+            fixture.held.validate().is_ok(),
+            "the bus's own rows are a belief a driver can hold",
+        );
+
+        fixture.held.set_believed_torqued(JointFlagsWire(
+            u16::from(crate::every_row()) | 1 << JOINT_COUNT,
+        ));
+        assert!(
+            fixture.held.validate().is_err(),
+            "a tenth servo is not a servo, and the record is not a driver's",
+        );
     }
 
     #[test]
     fn a_slot_crossing_carries_the_lap_and_the_cadence() {
-        let mut slot = AuxSlot::new();
+        let mut fixture = Fixture::new();
         assert_eq!(
-            slot.take(T0, HEALTH_PERIOD, None),
+            fixture.slot().take(T0, HEALTH_PERIOD, None),
             AuxTask::Health { row: 0 }
         );
         // What a state slot holds, byte for byte, is what the next execution
-        // restores: a clone is the whole state and there is no other.
-        let mut restored = slot.clone();
+        // restores: the record is the whole state and there is no other.
+        let mut crossed = Fixture {
+            held: fixture.held.clone(),
+        };
         assert_eq!(
-            restored.take(T0 + HEALTH_PERIOD, HEALTH_PERIOD, None),
+            crossed.slot().take(T0 + HEALTH_PERIOD, HEALTH_PERIOD, None),
             AuxTask::Health { row: 1 }
         );
-        assert_eq!(slot.next_row, 1);
+        assert_eq!(fixture.slot().state.next_row, 1);
     }
 }

@@ -25,16 +25,18 @@
 //! writing the rows above the disagreement, so the row count is read off the
 //! vocabulary rather than restated here.
 //!
-//! The gate's cross-cycle state is a schema, `driver/gate.clk`, and this crate
-//! decides over it in place: a host validates the slot once at its boundary and
-//! hands the view down, so the simulated driver's state slot and the driver
-//! process's own memory hold one description of a queue rather than two. There
-//! is no second form and nothing to restore: a queue's length is the array's
-//! own, so no number can claim more goals than there are, and a set of servos
-//! that is not a set of servos is refused by the host's one validation rather
-//! than met halfway down here. The rest of the crate is public data with no
-//! heap allocation, for the same reason: a cog's cross-tick state lives in a
-//! declared slot.
+//! Every cross-cycle state here is a schema — `driver/gate.clk` for the gate,
+//! `driver/aux.clk` for the aux slot, the torque belief and the confirmation
+//! pass — and this crate decides over them in place: a host validates the slot
+//! once at its boundary and hands the view down, so the simulated driver's
+//! state slots and the driver process's own memory hold one description of a
+//! queue, a belief and a pass rather than two. There is no second form and
+//! nothing to restore: a queue's length is the array's own, so no number can
+//! claim more goals than there are, and a record that is not a transaction is
+//! refused by the host's one validation rather than met halfway down here. What
+//! the schemas cannot say — which cursor values name a bus row, which
+//! combinations of a cursor and a report a run produces — the machines refuse
+//! themselves, as typed errors over the state they were handed.
 //!
 //! What the gate guarantees to whoever hosts it:
 //!
@@ -62,7 +64,7 @@
 
 use brenn_reachy__driver__gate_clk_rs::{GateState, GateStateWire};
 use brenn_reachy__driver__goal_clk_rs::{GoalSetpoint, GoalSetpointWire};
-use brenn_reachy__motion__joints_clk_rs::JointRef;
+use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRef};
 use clockwork_rs::SyncTime;
 
 pub mod aux_slot;
@@ -72,8 +74,7 @@ pub mod torque;
 pub use aux_slot::{AuxOffer, AuxSlot, AuxTask};
 pub use state::DriverStateError;
 pub use torque::{
-    BeliefWrite, BelievedTorqued, ConfirmCredit, ConfirmReport, ConfirmStep, TORQUE_BITS_ALL,
-    TorqueOffConfirm,
+    BeliefWrite, BelievedTorqued, ConfirmCredit, ConfirmReport, ConfirmStep, TorqueOffConfirm,
 };
 
 /// Servo rows on the bus, and so the length of every position array here.
@@ -88,6 +89,22 @@ pub const JOINT_COUNT: usize = JointRef::VARIANTS.len() - 1;
 /// Bit `n` is bus row `n`, which is what the vocabulary's `JointFlags`
 /// declares; `every_joint_is_a_bit_of_the_mask` holds the two together.
 pub const JOINT_MASK_ALL: u16 = (1 << JOINT_COUNT) - 1;
+
+/// Every servo on the bus, as a set.
+///
+/// The driver layer's one spelling of "all of them", so a belief, a goal mask
+/// and a test fixture cannot each build the set a different way and disagree
+/// when a row is added. Folded over the vocabulary's own declared values rather
+/// than converted from [`JOINT_MASK_ALL`]: nothing here can fail, which the
+/// process that de-torques the machine cannot afford, and a tenth servo declared
+/// there is in this set without an edit. A function and not a constant because
+/// the vocabulary's union operator is not a `const fn`.
+#[must_use]
+pub fn every_row() -> JointFlags {
+    JointFlags::VARIANTS
+        .into_iter()
+        .fold(JointFlags::NONE, |set, row| set | row)
+}
 
 /// What became of a goal offered to the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,7 +219,7 @@ impl<'a> GoalGate<'a> {
         let Some(slot) = self.state.queue.try_grow() else {
             return AcceptOutcome::DroppedQueueFull;
         };
-        copy_setpoint(slot, goal);
+        copy_whole(slot, goal);
         self.note_liveness(now_ns);
         if stale || out_of_order {
             AcceptOutcome::AcceptedStaleOrOutOfOrder
@@ -356,19 +373,24 @@ impl<'a> GoalGate<'a> {
     }
 }
 
-/// Copy a setpoint into the place `dst` names, whole.
+/// Copy a validated record into the place `dst` names, whole.
 ///
-/// One statement of what a setpoint is worth copying: all of it. Copying field
-/// by field is where a queue entry ends up carrying one goal's instant and
-/// another's angles, and the bytes are a validated message either way.
-fn copy_setpoint(dst: &mut GoalSetpoint, src: &GoalSetpoint) {
+/// One statement of what a record is worth copying: all of it. Copying field by
+/// field is where a queue entry ends up carrying one goal's instant and
+/// another's angles, or a slot one request's register and another's value, and
+/// the bytes are a validated message either way.
+pub(crate) fn copy_whole<V>(dst: &mut V, src: &V)
+where
+    V: clockwork_rs::ValidView,
+    V::Raw: Clone,
+{
     *clockwork_rs::into_raw(dst) = clockwork_rs::as_raw(src).clone();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
+    use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
     use clockwork_rs::blob_as_bytes;
 
     const PERIOD: i64 = 20_000_000;
@@ -436,7 +458,7 @@ mod tests {
         let mut wire = GoalSetpointWire::new();
         let goal = wire.clear_valid();
         goal.execute_at = SyncTime::from_nanos(execute_at_ns);
-        goal.mask = every_joint();
+        goal.mask = crate::every_row();
         for row in [
             &mut goal.targets.body_yaw,
             &mut goal.targets.leg_0,
@@ -451,13 +473,6 @@ mod tests {
             *row = value;
         }
         wire
-    }
-
-    /// Every servo on the bus, as a set.
-    fn every_joint() -> JointFlags {
-        JointFlagsWire(JOINT_MASK_ALL)
-            .to_known()
-            .expect("every bus row is a bus row")
     }
 
     /// A made setpoint, read the way a host hands one to the gate.
@@ -1175,8 +1190,6 @@ mod tests {
     /// exactly the declared servos -- a tenth servo widens both or fails here.
     #[test]
     fn every_joint_is_a_bit_of_the_mask() {
-        use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
-
         let mut every = 0u16;
         for flag in JointFlags::VARIANTS {
             let bits = JointFlagsWire::from(flag).0;
@@ -1189,6 +1202,11 @@ mod tests {
         }
         assert_eq!(every, JOINT_MASK_ALL, "the mask is the declared servos");
         assert_eq!(usize::from(JOINT_MASK_ALL.count_ones() as u16), JOINT_COUNT);
+        assert_eq!(
+            u16::from(every_row()),
+            JOINT_MASK_ALL,
+            "the set and the mask are the same servos said two ways"
+        );
     }
 
     /// A decision is made on the state itself, not on a copy of it.

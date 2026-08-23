@@ -1,14 +1,19 @@
 //! What a driver-state slot can hold that no driver ever wrote.
 //!
-//! The machines here that are still public data mirrored field for field into
-//! a Clockwork state schema — the belief, the confirmation — are restorable out
-//! of a slot that something else wrote: a slot never initialised, or one
-//! written by a version that disagreed about a field's meaning. Both refuse
-//! through this one type, so a host restoring them has one error to handle
-//! rather than one per machine: they answer the same shape of question, which
-//! is a cursor or a bit set naming something the bus does not have. The gate is
-//! not among them, and needs no entry: its state is a schema, and what a slot
-//! nothing wrote holds is a gate that has been told nothing.
+//! Every machine's state is a Clockwork schema, and validating one says the
+//! bytes are the shape they claim: the enumerations are declared values, the
+//! nested transaction record is a transaction, the torque belief names servos
+//! this bus has. What it cannot say is which plain numbers name a bus row, and
+//! which combinations of a cursor and a report a run of the machine produces —
+//! so a slot never written by a driver, or written by a version that disagreed
+//! about a field's meaning, can hold a rotation cursor past the last servo or a
+//! pass claiming a confirmation it did not read back. The aux slot and the
+//! confirmation refuse those through this one type, so a host checking them has
+//! one error to handle rather than one per machine: they answer the same shape
+//! of question. A field typed as what it means needs no entry here, which is
+//! why the belief has none.
+//! The gate is not among them, and needs no entry: nothing about a queue of
+//! setpoints is beyond what its schema already says.
 //!
 //! Nothing here panics on a state that fails validation. The process this runs
 //! in is the one that de-torques the machine, and it does not get to crash over
@@ -20,11 +25,6 @@ use crate::JOINT_COUNT;
 /// A driver-cycle machine restored from a slot holding something impossible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverStateError {
-    /// Torque bits set for rows the bus does not have.
-    TorqueBitsOutOfRange {
-        /// What the slot said.
-        bits: u16,
-    },
     /// The health rotation's cursor names a row past the end of the bus.
     HealthCursorOutOfRange {
         /// What the slot said.
@@ -56,10 +56,6 @@ pub enum DriverStateError {
 impl core::fmt::Display for DriverStateError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::TorqueBitsOutOfRange { bits } => write!(
-                f,
-                "torque bits {bits:#06x} reach past the {JOINT_COUNT} bus rows"
-            ),
             Self::HealthCursorOutOfRange { row } => write!(
                 f,
                 "health rotation cursor {row} is past the {JOINT_COUNT} bus rows"

@@ -1274,10 +1274,16 @@ impl fmt::Display for TickEvent {
             }
             Self::Stretched(stretch) => {
                 if stretch.requested != stretch.effective {
-                    let why = if stretch.dephased {
-                        "to fit the span and de-phase the antennas"
-                    } else {
-                        "to fit the span"
+                    // Every arm spelled out, including the one nothing produces
+                    // today: a clock that moved for a reason this build has no
+                    // flag for is narrated as unexplained rather than as an
+                    // antenna parting that did not happen, and an operator
+                    // watching the tips cross is the reader of this line.
+                    let why = match (stretch.span_stretched, stretch.dephased) {
+                        (true, true) => "to fit the span and de-phase the antennas",
+                        (true, false) => "to fit the span",
+                        (false, true) => "to de-phase the antennas",
+                        (false, false) => "for a reason this build does not name",
                     };
                     write!(
                         f,
@@ -5674,6 +5680,7 @@ mod tests {
                     separation: None,
                     separation_required: shipped_separation(),
                     dephased: false,
+                    span_stretched: true,
                 }),
                 "clock stretched",
             ),
@@ -5707,13 +5714,15 @@ mod tests {
         );
     }
 
-    /// The three things the clock line can say, said in the operator's words:
-    /// a clock lengthened for its span, a pair parted at its crossing, and a
-    /// pair nothing could part.
+    /// The things the clock line can say, said in the operator's words: a clock
+    /// lengthened for its span, a pair parted at its crossing on clocks that
+    /// carried their own spans, and a pair nothing could part.
     ///
-    /// The last of them changes no clock at all, so the line is the whole
-    /// report: a move that runs with its tips converging says so or says
-    /// nothing.
+    /// The two reasons a clock moves are named separately, because they are
+    /// different news: a span stretch says the configured clock does not cover
+    /// the path, and a de-phasing says the pair's geometry asked for the delay.
+    /// The last case changes no clock at all, so the line is the whole report:
+    /// a move that runs with its tips converging says so or says nothing.
     #[test]
     fn the_clock_line_says_which_of_the_two_it_did() {
         let requested = MoveDurations::uniform(Duration::from_millis(800));
@@ -5738,6 +5747,7 @@ mod tests {
             separation: None,
             separation_required: shipped_separation(),
             dephased: false,
+            span_stretched: true,
         })
         .to_string();
         assert!(
@@ -5751,10 +5761,11 @@ mod tests {
             separation: Some(parted),
             separation_required: shipped_separation(),
             dephased: true,
+            span_stretched: false,
         })
         .to_string();
         assert!(
-            phase.contains("to fit the span and de-phase the antennas")
+            phase.contains("to de-phase the antennas")
                 && phase.contains("right antenna 0.800 s to 0.970 s")
                 && phase.contains("the antennas cross 0.61 rad apart")
                 && !phase.contains("under the"),
@@ -5767,11 +5778,31 @@ mod tests {
             separation: Some(converging),
             separation_required: shipped_separation(),
             dephased: false,
+            span_stretched: false,
         })
         .to_string();
         assert_eq!(
             unmet,
             "the antennas cross 0.09 rad apart, under the 0.60 rad that keeps their tips clear"
+        );
+
+        // A clock this build has no flag for is narrated as unexplained and
+        // still names the clocks it moved. Nothing produces this today, which is
+        // exactly why the line is pinned: the arm's whole value is being right
+        // the first time a future flag fires it.
+        let unnamed = TickEvent::Stretched(ClockStretch {
+            requested,
+            effective: stretched,
+            separation: None,
+            separation_required: shipped_separation(),
+            dephased: false,
+            span_stretched: false,
+        })
+        .to_string();
+        assert!(
+            unnamed.contains("for a reason this build does not name")
+                && unnamed.contains("right antenna 0.800 s to 0.970 s"),
+            "{unnamed}"
         );
 
         // The figure it says the pair fell short of is the one the pass was
@@ -5783,6 +5814,7 @@ mod tests {
             separation: Some(parted),
             separation_required: 0.9,
             dephased: false,
+            span_stretched: false,
         })
         .to_string();
         assert_eq!(

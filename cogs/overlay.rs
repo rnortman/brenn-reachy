@@ -539,12 +539,13 @@ impl<'a> Overlays<'a> {
     /// has already run is in those units, while the gain applies afresh every
     /// execution and is never held.
     ///
-    /// TODO(overlay-fade-continuity): a row vacates on the first execution its
-    /// window does not cover, so a window that closes while its player is still
-    /// carrying weight drops the whole weighted delta in one control period.
-    /// The invariant owed is that a playing clip's contribution reaches zero
-    /// before its row vacates; which layer enforces it is the session design's,
-    /// since it owns both the schedule author and this layer's contract.
+    /// A row vacates on the first execution its window does not cover, so a
+    /// window that closes while its player is still carrying weight takes the
+    /// whole weighted delta out of the layer at once. Keeping the commanded
+    /// stream continuous across that is the host's, not this layer's: it
+    /// re-anchors the base at the composed setpoint it last commanded less what
+    /// still rides it, which absorbs the vacated contribution into the base's
+    /// own starting point and decays it as a planned, step-bounded move.
     pub fn take_up(
         rows: &'a mut [ClipPlayerSnapWire],
         windows: &Windows<'a>,

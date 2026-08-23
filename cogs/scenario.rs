@@ -56,9 +56,9 @@ pub const SLEW_LEGS_RAD: f64 = 0.15;
 /// that could not say they differ could not run one where they do.
 pub const SLEW_BODY_YAW_RAD: f64 = 0.15;
 
-/// Whether the modelled machine starts energised. Every scenario so far starts
-/// it cold and torques it on with an injection, which is what an arming
-/// sequencer does on the real machine.
+/// Whether the modelled machine starts energised. Every scenario starts it cold:
+/// the session's own engagement is what energises it, over the bus, which is the
+/// arming path a real machine has.
 pub const START_TORQUED: bool = false;
 
 /// How far an antenna moves in one cycle, radians.
@@ -70,6 +70,82 @@ pub const SLEW_ANTENNAS_RAD: f64 = 0.65;
 /// reports, so a scenario counting reports over a stretch divides by this and a
 /// scenario waiting for a full lap of the nine multiplies it by nine.
 pub const HEALTH_POLL_PERIOD_NS: i64 = 120_000_000;
+
+/// The hardware-error bits a scenario writes into a servo to make the library
+/// classify it as a fault.
+///
+/// Anything but the input-voltage bit: that one latches on a supply dip the
+/// servo rode out and is reported rather than acted on, so a run asserting a
+/// response would be asserting it against evidence the library classifies as
+/// nothing. Written against the library's own name for that bit, which is what
+/// the assertion below can check; a bit that stops being acted on for any other
+/// reason is not something this expression can notice, so a change to what the
+/// classifier ignores is a change the health-evidence scenarios have to be
+/// re-read against.
+pub const ACTED_ON_ERROR_BITS: u8 = 0x20 & !reachy_motion::joints::ServoHealth::INPUT_VOLTAGE;
+
+// The one case the expression above can defend itself against: the informational
+// bit moving onto the one this constant names would leave every health-evidence
+// scenario asserting a response against evidence the classifier discards.
+const _: () = assert!(ACTED_ON_ERROR_BITS != 0);
+
+/// How many cycles in a row the modelled bus may answer nothing before the
+/// driver declares its bus gone.
+///
+/// The driver's own threshold, restated here so a scenario's expectation and the
+/// number the driver is built with are two statements rather than one:
+/// `check_params` fails the run when they disagree, which is what makes an
+/// assertion that the bus failure lands *on time* an assertion at all.
+pub const BLIND_CYCLES_BEFORE_BUS_FAILURE: u32 = 25;
+
+/// How long the simulated driver gives its own read-back pass to confirm a
+/// commanded de-torquing, nanoseconds.
+///
+/// The driver's budget, restated here for the same reason and pinned the same
+/// way. Shorter than the session's below: the pass reads one row a cycle, so a
+/// clean sweep of the nine is well inside it, and the host's longer budget is
+/// what decides when a de-torquing is *said* to be unconfirmed.
+pub const DRIVER_CONFIRM_BUDGET_NS: i64 = 300_000_000;
+
+/// How long the session gives a transaction to be answered before the same
+/// datagram goes out again, nanoseconds.
+///
+/// Ten driver cycles. A driver that took a transaction up answers it on the
+/// cycle it took it up, so a re-issue in one of these runs means the request or
+/// its answer was lost -- which in this system, where every channel is memory,
+/// means a scenario that arranged for it.
+pub const AUX_TIMEOUT_NS: i64 = 200_000_000;
+
+/// How many times the session re-issues a datagram nothing answered before it
+/// hands the sequence a silence.
+pub const AUX_RETRIES: i64 = 3;
+
+/// How many nominal periods may pass with no fresh sample before the session
+/// declares the bus failed.
+pub const SAMPLE_STALE_AFTER: i64 = 5;
+
+/// How long after start-up the session allows the first sample, nanoseconds.
+pub const STARTUP_GRACE_NS: i64 = 2_000_000_000;
+
+/// How long a wind-down's one clock runs, nanoseconds.
+pub const STOW_BUDGET_NS: i64 = 4_000_000_000;
+
+/// How long the session gives a commanded torque-off to be confirmed,
+/// nanoseconds.
+///
+/// The session's budget and not the driver's: the driver runs its own, shorter
+/// one over the pass it reads back, and this is how long the host waits before
+/// saying the de-torquing went unconfirmed. It keeps commanding either way.
+pub const SESSION_CONFIRM_BUDGET_NS: i64 = 500_000_000;
+
+/// How long the session may go without executing: the floor its wake condition
+/// puts under a run where nothing arrives, nanoseconds.
+///
+/// Declared in `cogs/motion.clk` as the session's `time_since_last_exec`
+/// condition rather than configured, so there is no file to check it against.
+/// What it bounds for a scenario is how long a decision about time having passed
+/// can wait -- the session ending because its schedule ran out, most of all.
+pub const SESSION_WAKE_FLOOR_NS: i64 = 100_000_000;
 
 /// How long an execution is modelled to take, which is the gap between the
 /// instant a cog runs at and the log time of what it published.
@@ -96,7 +172,10 @@ pub const EXECUTION_DURATION_NS: i64 = 1_000_000;
 /// publish.
 pub const CONTROL_DELAY_NS: i64 = 2 * EXECUTION_DURATION_NS;
 
-/// The channel the session's schedule arrives on, fed from the input log.
+/// The channel the scripts arrive on, fed from the input log.
+pub const SCRIPT_CHANNEL: &str = "ScriptsIn";
+
+/// The channel the session publishes what it accepted on.
 pub const SCHEDULE_CHANNEL: &str = "ScheduleChan";
 
 /// The channel the scenario's injections arrive on, fed from the input log.
@@ -114,6 +193,12 @@ pub const EVENT_CHANNEL: &str = "DriverEvt";
 /// What the decision tick raised.
 pub const FAULT_CHANNEL: &str = "TickFaults";
 
+/// What the session asks of the driver: one datagram per wake at most.
+pub const SESSION_CMD_CHANNEL: &str = "SessionCmdChan";
+
+/// What the session said about the session: one report per wake, oldest first.
+pub const REPORT_CHANNEL: &str = "ReportsOut";
+
 /// Where the head was.
 pub const ESTIMATE_CHANNEL: &str = "Estimates";
 
@@ -129,7 +214,7 @@ pub const REPORT_GROUP_PREFIX: &str = "/_clockwork/report-groups/";
 pub const REPORT_GROUP: &str = "stats";
 
 /// The cogs of this system, each of which owns one report group.
-pub const COGS: [&str; 3] = ["Mover", "Pose", "MotorSim"];
+pub const COGS: [&str; 4] = ["Mover", "Pose", "MotorSim", "Session"];
 
 /// The cycle the simulated driver first executes on.
 ///
@@ -150,6 +235,224 @@ pub const FIRST_CYCLE: i64 = 1;
 #[must_use]
 pub fn cycles_for(duration_ns: i64) -> i64 {
     (duration_ns + PERIOD_NS - 1) / PERIOD_NS
+}
+
+/// How many cycles a move to the upright posture is given, rounded up.
+///
+/// The configured clock, which is the head group's: both postures sweep the
+/// antenna pair mirrored, so the later side's clock is lengthened to part their
+/// tips before the move is commanded, and that side arrives later than this. It
+/// is what a scenario places a fault or an injection against, since that is the
+/// number it wrote down; what a step span has to cover is every group, which is
+/// [`up_clocks`].
+#[must_use]
+pub fn up_cycles() -> i64 {
+    cycles_for(UP_DURATION_NS)
+}
+
+/// How many cycles a move to stow is given, rounded up. The head group's clock,
+/// on the same terms as [`up_cycles`].
+#[must_use]
+pub fn stow_cycles() -> i64 {
+    cycles_for(STOW_DURATION_NS)
+}
+
+/// The clocks one posture move actually runs on, group by group.
+///
+/// The head's is the configured duration; each antenna's is what the mover's own
+/// floor made of it, which on a move that sweeps the pair mirrored is longer, by
+/// as much as parting their tips at the crossing takes. Derived rather than
+/// stated so that a scenario's arithmetic and the shaping the cog performs are
+/// one number: a configuration change that lengthens the parting moves both at
+/// once.
+pub struct MoveClocks {
+    /// The head group's clock, nanoseconds.
+    pub head_ns: i64,
+    /// Each antenna's own floored clock, nanoseconds, right then left.
+    pub antennas_ns: [i64; 2],
+}
+
+impl MoveClocks {
+    /// The whole move, in cycles: the longest clock any group runs on.
+    #[must_use]
+    pub fn cycles(&self) -> i64 {
+        cycles_for(
+            self.head_ns
+                .max(self.antennas_ns[0])
+                .max(self.antennas_ns[1]),
+        )
+    }
+
+    /// Which group the longest clock belongs to, for a failure that says what is
+    /// short.
+    #[must_use]
+    pub fn longest_group(&self) -> &'static str {
+        if self.head_ns >= self.antennas_ns[0].max(self.antennas_ns[1]) {
+            "the head group"
+        } else {
+            "the later antenna"
+        }
+    }
+
+    /// The fewest cycles apart the two antennas may be seen to stop moving on
+    /// this move.
+    ///
+    /// The pair's own clocks part by a figure the geometry decides, and what a
+    /// checker measures is not that figure: the detector calls a side stopped
+    /// once its per-cycle travel falls under a threshold, and a min-jerk tail
+    /// crosses that threshold before its clock runs out -- by a little more on
+    /// the longer clock than on the shorter, since the longer one travels
+    /// slower. So the parting is derived and an allowance for the two tails is
+    /// subtracted, which is the one fudge in the figure. At least one cycle: two
+    /// clocks that part at all part visibly on this grid, and a derivation that
+    /// came back with no parting at all is itself the regression the floor is
+    /// counted on to prevent -- so the answer stays a demand rather than
+    /// becoming "nothing to assert".
+    ///
+    /// Which is the precondition: this is a figure about a move whose geometry
+    /// parts the pair, the mirrored sweeps between the fold and the working
+    /// posture. Asked about a move nothing de-phases -- one antenna alone, an
+    /// unmirrored pair -- it answers one cycle and the check it feeds demands a
+    /// parting that correctly never happens.
+    #[must_use]
+    pub fn parting_least(&self) -> i64 {
+        let parted = (self.antennas_ns[0] - self.antennas_ns[1]).abs() / PERIOD_NS;
+        (parted - PAIR_TAIL_ALLOWANCE_CYCLES).max(1)
+    }
+}
+
+/// How many cycles of a min-jerk tail the de-phasing detector may not see, on
+/// each side of a pair.
+///
+/// Not derived: it is the gap between "the clock ran out" and "the travel this
+/// cycle fell under the detector's threshold", which depends on the threshold
+/// and on the arc. Small, because the tail of a min-jerk profile is short, and
+/// stated once so a pin that failed by a cycle is read as this number being
+/// wrong rather than as the parting having gone.
+const PAIR_TAIL_ALLOWANCE_CYCLES: i64 = 3;
+
+/// The clocks the move to the upright posture runs on. Planned from the stow, in
+/// which every scenario's machine starts.
+#[must_use]
+pub fn up_clocks() -> MoveClocks {
+    posture_clocks(
+        &reachy_motion::postures::stow_pose_targets(),
+        &reachy_motion::postures::neutral_targets(),
+        UP_DURATION_NS,
+    )
+}
+
+/// The clocks the fold runs on: the same move back, on its own duration.
+#[must_use]
+pub fn stow_clocks() -> MoveClocks {
+    posture_clocks(
+        &reachy_motion::postures::neutral_targets(),
+        &reachy_motion::postures::stow_pose_targets(),
+        STOW_DURATION_NS,
+    )
+}
+
+/// One posture move's clocks, floored by the same pass the mover floors its own
+/// base moves with.
+///
+/// Two premises, stated because they are what makes the figure the cog's own
+/// number rather than a second guess at it. The shaping config is the library's
+/// defaults, which is what the mover runs on -- it has no configured
+/// `MotionConfig`, only the durations `check_params` pins -- and the move is
+/// planned from the canonical posture, which is where every engagement in this
+/// suite starts settled. A scenario that measured a move begun off-posture would
+/// get clocks for a different move, and nothing here would say so.
+fn posture_clocks(
+    from: &reachy_motion::joints::JointTargets,
+    to: &reachy_motion::joints::JointTargets,
+    duration_ns: i64,
+) -> MoveClocks {
+    let floored = motion_cogs::floored_clocks(
+        reachy_motion::tick::default_motion_config(),
+        from,
+        motion_cogs::Goal {
+            target: *to,
+            durations: reachy_motion::traj::MoveDurations::uniform(
+                core::time::Duration::from_nanos(
+                    u64::try_from(duration_ns).expect("a configured duration is a duration"),
+                ),
+            ),
+        },
+        1e9 / PERIOD_NS as f64,
+    );
+    MoveClocks {
+        head_ns: nanos(floored.head),
+        antennas_ns: [nanos(floored.antennas[0]), nanos(floored.antennas[1])],
+    }
+}
+
+/// A duration as the count of nanoseconds every figure here is in.
+fn nanos(duration: core::time::Duration) -> i64 {
+    i64::try_from(duration.as_nanos()).expect("a move's clock is a count of nanoseconds")
+}
+
+/// How long a whole lap of the driver's rotating read takes, in cycles.
+///
+/// One row per report at the configured cadence, over every row of the bus. The
+/// outer bound on how long a standing condition can go unread: the rotation is
+/// somewhere in its lap when a servo's error byte is written, so the faulted row
+/// is read within one lap of that.
+#[must_use]
+pub fn health_lap_cycles() -> i64 {
+    reachy_motion::joints::ROW_COUNT as i64 * cycles_for(HEALTH_POLL_PERIOD_NS)
+}
+
+/// The cycle the session must have answered a condition written on
+/// `fault_cycle` by.
+///
+/// The read that carries it, plus the wake the report causes. An outer bound and
+/// not an expectation: which cycle the rotation reaches the faulted row on is a
+/// fact about the run, so what a checker asserts against the narration is that
+/// the answer landed inside this, and everything a scenario places afterwards is
+/// placed from here.
+#[must_use]
+pub fn answered_within(fault_cycle: i64) -> i64 {
+    fault_cycle + health_lap_cycles() + 1
+}
+
+/// The committed name-to-number sidecar the clip-config emitter writes.
+const CLIP_LIBRARY_NAMES: &str = include_str!("clip_library.names.json");
+
+/// The number the committed clip library gives the motion called `name`.
+///
+/// The numbering is generated and positional -- an asset inserted in the middle
+/// renumbers every one after it -- so a scenario that names a motion reads its
+/// number out of the same sidecar the emitter writes rather than restating it. A
+/// renumber then moves the scenario with it, and a motion nobody committed fails
+/// the run naming the motion instead of failing an assertion about where the
+/// antennas ended up.
+///
+/// # Panics
+///
+/// If the sidecar is not the emitter's JSON, or carries no motion of that name.
+#[must_use]
+pub fn motion_id(name: &str) -> u16 {
+    let sidecar: serde_json::Value =
+        serde_json::from_str(CLIP_LIBRARY_NAMES).expect("the committed sidecar is the emitter's");
+    let motions = sidecar["motions"]
+        .as_array()
+        .expect("the committed sidecar names its motions");
+    let found = motions
+        .iter()
+        .find(|motion| motion["name"].as_str() == Some(name));
+    let Some(found) = found else {
+        let carried: Vec<&str> = motions
+            .iter()
+            .filter_map(|motion| motion["name"].as_str())
+            .collect();
+        panic!("the committed clip library carries no motion named {name}, only {carried:?}");
+    };
+    u16::try_from(
+        found["motion_id"]
+            .as_u64()
+            .expect("a motion's number is a number"),
+    )
+    .expect("a motion number the vocabulary can hold")
 }
 
 /// How many cycles the goal stream may be silent before the gate de-torques.
@@ -180,6 +483,149 @@ pub fn dead_man_latch_cycle(window_opened_at: i64) -> i64 {
 #[must_use]
 pub fn silence_ns(from_cycle: i64, to_cycle: i64) -> i64 {
     (to_cycle - from_cycle).max(0) * PERIOD_NS
+}
+
+/// The cycle whose interval contains `at_ns`.
+///
+/// For the instants that are not on the grid: the session runs when a message
+/// reaches it rather than on the bus cycle, so what it stamps a report with sits
+/// wherever in a cycle the message that woke it landed. A cycle number is still
+/// what a scenario reasons in, and this is the cycle the machine was in.
+#[must_use]
+pub fn cycle_within(at_ns: i64) -> i64 {
+    (at_ns - T0_NS).div_euclid(PERIOD_NS)
+}
+
+/// The cycle a message logged at `at_ns` is first visible to the driver on.
+///
+/// The driver runs once per cycle and sees what was published before it started,
+/// so a datagram published inside a cycle is drained by the next one. The first
+/// cycle at or after the instant, which is the same arithmetic an injection's
+/// drain cycle is.
+#[must_use]
+pub fn drain_cycle(at_ns: i64) -> i64 {
+    cycles_for(at_ns - T0_NS)
+}
+
+/// How many transactions the start-up survey spends.
+///
+/// Derived from the sweeps the sequence walks rather than measured: a ping and a
+/// model read per servo, the cells the host's provisioning table asks to be read
+/// (the rest of the grid is skipped without a transaction), a supply reading per
+/// servo, an error byte per servo, and the gains and profile writes. A register
+/// added to any of those sweeps, or a cell added to the table, widens this with
+/// it.
+///
+/// An expectation and not an allowance: a survey that spent more than this
+/// re-issued something, which in a system whose channels are memory is a
+/// regression in the host's own delivery timing.
+#[must_use]
+pub fn commission_transactions() -> i64 {
+    let rows = reachy_motion::joints::ROW_COUNT as i64;
+    let provision = motion_cogs::session_bus::provision_table().reads() as i64;
+    let gains = reachy_motion::resume::GAINS_PROFILE_WRITES as i64;
+    4 * rows + provision + gains
+}
+
+/// How long a run must allow for the start-up survey, in cycles.
+///
+/// An allowance and not an expectation. One transaction costs a publish, the
+/// driver cycle that runs it, and the wake its answer causes -- two cycles where
+/// nothing else is in the way -- and this allows three, which covers the supply
+/// gate's spacing and the cycles the aux slot spends on its own health rotation.
+/// A scenario that wants to know the survey *finished* asserts that, rather than
+/// counting on this.
+#[must_use]
+pub fn commission_allowance_cycles() -> i64 {
+    3 * commission_transactions()
+}
+
+/// How many transactions taking hold of the machine spends.
+///
+/// Three sweeps of the bus for the watch -- the positions, the supply and the
+/// error bits, which are what the two torque-on gates judge -- and three for the
+/// engagement, which writes every goal, enables every servo and reads all nine
+/// back. Derived from the machine's own row count, so a bus that grew a servo
+/// widens this with it.
+#[must_use]
+pub fn engage_transactions() -> i64 {
+    6 * reachy_motion::joints::ROW_COUNT as i64
+}
+
+/// How many cycles a run must allow for taking hold of the machine.
+///
+/// An allowance and not an expectation, on [`commission_allowance_cycles`]'s
+/// arithmetic and for its reasons. A scenario that wants to know the arming
+/// *finished* asserts the phase it ended in, and every instant derived from this
+/// is an outer bound on when the machine can be under command.
+#[must_use]
+pub fn engage_allowance_cycles() -> i64 {
+    3 * engage_transactions()
+}
+
+/// How many cycles a run must allow for the orderly release.
+///
+/// The settle first -- the release waits under held torque with nothing
+/// streaming, which the keep-alive rule is what carries -- and then two sweeps
+/// of the bus: every joint measured against the stow pose, and then torque
+/// written off one servo at a time with each write read back. An allowance, on
+/// the same arithmetic as the two above.
+#[must_use]
+pub fn release_allowance_cycles() -> i64 {
+    let dwell = i64::try_from(reachy_motion::disarm::DEFAULT_STOW_DWELL.as_nanos())
+        .expect("a dwell this clock can hold");
+    cycles_for(dwell) + 6 * reachy_motion::joints::ROW_COUNT as i64
+}
+
+/// The cycle a scenario may first expect a script to be taken.
+///
+/// The session commissions the machine before it will take one, so the first
+/// instant a script is answered with anything but a refusal is past the survey's
+/// allowance. Every scenario that sends a script sends it here, so what the run
+/// is about begins from one number.
+#[must_use]
+pub fn script_cycle() -> i64 {
+    commission_allowance_cycles()
+}
+
+/// The cycle a scenario's run begins on: the epoch itself, which is where the
+/// world the scenario states is stated.
+///
+/// The driver's first cycle is one period in, because its timer fires a period
+/// after the run starts -- [`FIRST_CYCLE`] is that one.
+pub const START_CYCLE: i64 = 0;
+
+/// How long a run continues past the release concluding, in cycles.
+///
+/// Long enough for the driver's dead-man to have fired if the machine had merely
+/// been left alone: the goal stream stops when the session lets go and so do the
+/// keep-alives, so a tail this long is what makes "no event at all" an assertion
+/// about the release having taken torque off rather than about the run ending
+/// before the timeout could.
+pub const TAIL_CYCLES: i64 = 20;
+
+/// The cycle a machine whose script was taken is armed and holding by.
+///
+/// A whole arming allowance after the script, so what a scenario's first step
+/// opens on is a cycle it named rather than whichever cycle the arming happened
+/// to finish on -- which is what makes every instant placed relative to that
+/// step exact. What the machine does in between is nothing: it is armed and
+/// holding where it stood, and the goal stream has not started because no step
+/// covers those instants yet.
+#[must_use]
+pub fn armed_cycle() -> i64 {
+    script_cycle() + engage_allowance_cycles()
+}
+
+/// The last cycle of a run whose session let go at `disengage`.
+///
+/// The release after the schedule -- the settle under held torque, every joint
+/// measured against the stow pose, then torque written off one servo at a time
+/// -- and then the tail. The shape of an ordinary run's ending, stated once:
+/// when an allowance changes shape, every scenario's end moves with it.
+#[must_use]
+pub fn run_end_cycle(disengage: i64) -> i64 {
+    disengage + release_allowance_cycles() + TAIL_CYCLES
 }
 
 /// The cycle `nominal` sits on, counted from the epoch.
@@ -231,7 +677,11 @@ pub fn cycle_at(n: i64) -> i64 {
 ///
 /// One line per number the file states differently, or per number it does not
 /// state at all, or the reason the file could not be read.
-pub fn check_params(mover_textproto: &str, sim_textproto: &str) -> Vec<String> {
+pub fn check_params(
+    mover_textproto: &str,
+    session_textproto: &str,
+    sim_textproto: &str,
+) -> Vec<String> {
     let mut failures = Vec::new();
     expect(
         mover_textproto,
@@ -240,6 +690,21 @@ pub fn check_params(mover_textproto: &str, sim_textproto: &str) -> Vec<String> {
             ("period_ns", Value::Int(PERIOD_NS)),
             ("up_duration_ns", Value::Int(UP_DURATION_NS)),
             ("stow_duration_ns", Value::Int(STOW_DURATION_NS)),
+        ],
+        &mut failures,
+    );
+    expect(
+        session_textproto,
+        &[
+            ("aux_timeout_ns", Value::Int(AUX_TIMEOUT_NS)),
+            ("aux_retries", Value::Int(AUX_RETRIES)),
+            ("sample_stale_after", Value::Int(SAMPLE_STALE_AFTER)),
+            ("startup_grace_ns", Value::Int(STARTUP_GRACE_NS)),
+            ("stow_budget_ns", Value::Int(STOW_BUDGET_NS)),
+            (
+                "torque_off_confirm_budget_ns",
+                Value::Int(SESSION_CONFIRM_BUDGET_NS),
+            ),
         ],
         &mut failures,
     );
@@ -256,6 +721,36 @@ pub fn check_params(mover_textproto: &str, sim_textproto: &str) -> Vec<String> {
         ],
         &mut failures,
     );
+    // The session's staleness window is a count of nominal periods and its
+    // configuration carries no period, so the host holds one as a constant. This
+    // is what keeps that constant and the cycle the simulated driver is actually
+    // built with from drifting apart -- a session watching a 20 ms stream
+    // against a 10 ms assumption would declare a healthy driver dead.
+    if motion_cogs::session_ladder::NOMINAL_PERIOD_NS != PERIOD_NS {
+        failures.push(format!(
+            "the session's assumed bus cycle is {}ns and the driver is built for {PERIOD_NS}ns",
+            motion_cogs::session_ladder::NOMINAL_PERIOD_NS
+        ));
+    }
+    // The two driver thresholds a scenario perturbs and then asserts about. They
+    // are constants of the cog rather than configuration, so what keeps a
+    // scenario's expectation from moving with the number it is checking is this
+    // pair of comparisons: a threshold changed on one side alone fails the run
+    // instead of quietly rewriting what S4' claims.
+    if sim_cogs::BLIND_CYCLES_BEFORE_BUS_FAILURE != BLIND_CYCLES_BEFORE_BUS_FAILURE {
+        failures.push(format!(
+            "the driver declares its bus gone after {} blind cycles and the scenarios expect \
+             {BLIND_CYCLES_BEFORE_BUS_FAILURE}",
+            sim_cogs::BLIND_CYCLES_BEFORE_BUS_FAILURE
+        ));
+    }
+    if sim_cogs::TORQUE_OFF_CONFIRM_BUDGET_NS != DRIVER_CONFIRM_BUDGET_NS {
+        failures.push(format!(
+            "the driver's confirmation budget is {}ns and the scenarios expect \
+             {DRIVER_CONFIRM_BUDGET_NS}ns",
+            sim_cogs::TORQUE_OFF_CONFIRM_BUDGET_NS
+        ));
+    }
     failures
 }
 

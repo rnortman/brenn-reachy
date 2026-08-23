@@ -11,6 +11,10 @@
     {
       "clip_id": 2,
       "name": "bench/sway"
+    },
+    {
+      "clip_id": 3,
+      "name": "bench/tip"
     }
   ],
   "motions": [
@@ -25,6 +29,14 @@
     {
       "motion_id": 2,
       "name": "bench/sway"
+    },
+    {
+      "motion_id": 3,
+      "name": "bench/tip"
+    },
+    {
+      "motion_id": 4,
+      "name": "bench/tour"
     }
   ]
 }

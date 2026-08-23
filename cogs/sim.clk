@@ -17,12 +17,14 @@
 // servo fidelity. When the real driver exists, logs captured from it supersede
 // this model rather than argue with it.
 //
-// The scenario's hand reaches the plant through `SimCmdChan`, which is fed from
-// an input log. Those injections stand in for the physical world and for the
-// arming sequencer, neither of which exists in this system.
+// The scenario's hand reaches the plant through `SimCmdChan`, the one channel
+// declared here: everything else the driver publishes or consumes is driver
+// contract and lives in `motion.clk` beside the hosts that read it. It is fed
+// from an input log, and those injections stand in for the physical world and
+// for the arming sequencer, neither of which exists in this system.
 //
 // The foot of this file is the composition: the box that closes the loop around
-// all three cogs, and the process that hosts it. They are here rather than in
+// all four cogs, and the process that hosts it. They are here rather than in
 // the system module next door because the grammar admits a `system_target` only
 // in a module that generates nothing, and a process needs a module that
 // generates an executable.
@@ -32,10 +34,10 @@
 // about the machine, which carries one of each cog.
 // TODO(clockwork-single-instance-signal)
 //
-// Four modules are imported under aliases because the box or a cog carries a
+// Five modules are imported under aliases because the box or a cog carries a
 // member of the same name: the modelled driver's output slot is called `pose`,
-// the box's motion cog `mover`, and its two state slots `sim_state` and
-// `pose_state`. A member name shadows a module name in the enclosing scope,
+// the box's motion cog `mover`, its session cog `session`, and its three state
+// slots `sim_state`, `pose_state` and `session_state`. A member name shadows a module name in the enclosing scope,
 // which the compiler refuses as a redefinition.
 // (A comment may not sit directly above a `use`, which is why this one is
 // here.)
@@ -47,25 +49,14 @@ use [cpp, proto, proto_conv] cogs::config;
 use cogs::motion;
 use cogs::mover as mover_vocab;
 use cogs::pose_state as pose_state_vocab;
+use cogs::session as session_vocab;
+use cogs::session_cmd;
 use cogs::sim_state as sim_state_vocab;
 use driver::goal;
 use driver::health;
 use driver::pose as pose_vocab;
 use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
     ReportGroupLogType};
-
-// What the driver did that the sample stream does not show: the edges. One
-// publisher -- the driver -- as every channel in this repo's systems has.
-//
-// Nothing in this system reads it: an event is logged and a checker reads it
-// out of the log. Sized sixteen deep, which is more slack than the rate needs:
-// events mark boundaries, not cycles, and a driver emitting one per cycle is a
-// driver reporting a standing condition at poll rate.
-channel DriverEvt
-{
-    message_type: Tachyon<health::DriverEvent>;
-    max_num_messages: 16;
-}
 
 // The scenario's injections, read from the input log. One publisher -- the log
 // reader.
@@ -185,10 +176,41 @@ cog MotorSim
         }
 
         // How many of the scenario's injections this build could not carry out:
-        // an operation it does not know, or one naming servos it does not know.
-        // A scenario authored against a newer vocabulary than this binary would
-        // otherwise read as a machine nobody ever touched.
+        // an operation it does not know, one naming servos it does not know, or
+        // a register write a control table refused. A scenario authored against
+        // a newer vocabulary than this binary would otherwise read as a machine
+        // nobody ever touched.
         refused_injections: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many of the host's datagrams the driver turned away as asks it
+        // could not act on: one asking nothing, or a transaction offered while
+        // another was still pending. The host that fills that slot is serial by
+        // construction, so the second of those says the host is not what it
+        // claims to be.
+        aux_refused: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many of the host's datagrams this build could not read at all: a
+        // schema-version mismatch at the boundary, which is a different
+        // diagnosis from an ask the driver would not run.
+        undecodable_inbound: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many of the plant's own readings this build would not put in a
+        // control table: an angle the modelled world made non-finite, which the
+        // cell has no carriage for. A run reporting any of these is a run whose
+        // present positions stopped tracking the plant.
+        refused_readings: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
@@ -213,6 +235,14 @@ cog MotorSim
             max_msgs: 8;
         }
 
+        // What the session asks of the driver, sized to see every datagram
+        // rather than the latest: each one is liveness as well as a request, and
+        // a request superseded before it was read is a request nobody answered.
+        session_cmds: Tappy<session_cmd::SessionCmd>
+        {
+            max_msgs: 8;
+        }
+
         // This cog's own sample channel, at the default view of 1: the last
         // sample it published, or an empty view before it ever has. Read back
         // rather than kept in a state field. Deliberately not a condition -- a
@@ -224,6 +254,8 @@ cog MotorSim
     {
         pose: Tappy<pose_vocab::PoseSample>;
         evt: Tappy<health::DriverEvent>;
+        aux_out: Tappy<health::AuxOutcome>;
+        health_out: Tappy<health::HealthReport>;
     }
 
     execution
@@ -254,15 +286,19 @@ policy ReportGroupPolicy for MotorSim.stats
     max_observations = 1000;
 }
 
-// The control loop, closed: the simulated driver, the decision tick and the
-// estimator, with the driver's sample stream as the clock all three run on.
+// The control loop, closed: the simulated driver, the decision tick, the
+// estimator and the session, with the driver's sample stream as the clock the
+// control-rate three run on.
 //
-// The topology is the one the real system will have, with two of the three
-// publishers replaced. `motor_sim` stands in for the driver process, and the
-// input log stands in for the session cog on `ScheduleChan` and for the
-// physical world on `SimCmdChan`. Nothing the cogs do distinguishes those from
-// the real thing: a cog reads channels, and a channel does not say what filled
-// it.
+// The topology is the one the real system will have, with two publishers
+// replaced. `motor_sim` stands in for the driver process, and the input log
+// stands in for the edge that sends scripts on `ScriptsIn` and for the physical
+// world on `SimCmdChan`. Nothing the cogs do distinguishes those from the real
+// thing: a cog reads channels, and a channel does not say what filled it.
+//
+// The schedule is the session's own. A script is screened into the schedule it
+// holds in its slot, and that schedule is published when the engagement takes
+// hold and again when what it was engaged for is over.
 //
 // Every channel has exactly one publisher. The two self-loops -- the decision
 // tick reading its own goal channel, the driver reading its own sample and
@@ -273,6 +309,7 @@ box SimBox
     new motor_sim: MotorSim;
     new mover: motion::Mover;
     new pose: motion::Pose;
+    new session: motion::Session;
 
     // Each cog's own slot, written by nothing else. No `init=`, so each is
     // default-constructed into a buffer the compiler synthesizes.
@@ -285,7 +322,10 @@ box SimBox
     new pose_state: State(representation=Tachyon<pose_state_vocab::PoseState>);
     connect pose_state to pose.est;
 
-    // The two configs, read from checked-in protobuf text before the first
+    new session_state: State(representation=Tachyon<session_vocab::SessionState>);
+    connect session_state to session.sess;
+
+    // The three configs, read from checked-in protobuf text before the first
     // execution. The paths resolve against the runfiles of whatever runs the
     // process, which is why the files are data dependencies of the executable.
     new sim_params: SerializedDataFile(
@@ -298,8 +338,13 @@ box SimBox
         path="cogs/mover_params.textproto");
     connect mover_params to mover.params;
 
+    new session_params: SerializedDataFile(
+        representation=Protobuf<config::SessionParams>,
+        path="cogs/session_params.textproto");
+    connect session_params to session.params;
+
     // The clips an overlay can name. Emitted from the documents under
-    // `cogs/clips/` rather than authored, and read the same way the two
+    // `cogs/clips/` rather than authored, and read the same way the three
     // parameter files are.
     new clip_library: SerializedDataFile(
         representation=Protobuf<config::ClipLibraryConfig>,
@@ -308,11 +353,14 @@ box SimBox
 
     // The sample stream: the driver publishes it, both control-rate cogs run on
     // it, and the driver reads its own last one back for the wire sequence
-    // number.
+    // number. The session reads it too, and for one thing only -- whether the
+    // driver is still publishing at all, which a driver cannot report about
+    // itself -- so it takes the freshest instant and is never woken by one.
     connect motor_sim.pose to motion::DriverPose;
     connect motion::DriverPose to mover.sample;
     connect motion::DriverPose to pose.sample;
     connect motion::DriverPose to motor_sim.own_pose;
+    connect motion::DriverPose to session.sample;
 
     // The goal stream, and the loop it closes: the tick commands, the driver's
     // gate decides what is due, and the tick reads back what it last sent.
@@ -321,14 +369,41 @@ box SimBox
     connect motion::DriverCmd to mover.own_cmd;
 
     // What the run is asked to do, and what the world does to it. Both come
-    // from the input log.
-    connect motion::ScheduleChan to mover.sched;
+    // from the input log: the scripts the session screens, and the injections
+    // that stand in for the physical world.
+    connect motion::ScriptsIn to session.script;
     connect SimCmdChan to motor_sim.cmds;
 
-    // Logged only: nothing in this system consumes any of the three.
-    connect motor_sim.evt to DriverEvt;
+    // What the session accepted, reaching the cog that carries it out. The
+    // session is the channel's one publisher, so the schedule the mover streams
+    // is the schedule a script was screened into.
+    connect session.sched to motion::ScheduleChan;
+    connect motion::ScheduleChan to mover.sched;
+
+    // What the tick raised: the log's record of it, and the session's evidence
+    // about the machine.
     connect mover.fault to motion::TickFaults;
+    connect motion::TickFaults to session.fault;
+
+    // What the session asks of the driver, and what the driver answers. The
+    // request channel's one publisher is the session, so the sequences it drives
+    // reach the modelled bus the way they will reach a real one.
+    connect motor_sim.aux_out to motion::DriverAuxOut;
+    connect session.cmd to motion::SessionCmdChan;
+    connect motion::SessionCmdChan to motor_sim.session_cmds;
+    connect motion::DriverAuxOut to session.aux_out;
+
+    // What the driver says about itself, and the session weighing it: an edge
+    // the driver reported and a servo's error bits are the two kinds of fault
+    // evidence the decision tick cannot see.
+    connect motor_sim.evt to motion::DriverEvt;
+    connect motion::DriverEvt to session.evt;
+    connect motor_sim.health_out to motion::DriverHealth;
+    connect motion::DriverHealth to session.readings;
+
+    // Logged only: nothing in this system consumes either.
     connect pose.estimate to motion::Estimates;
+    connect session.report to motion::ReportsOut;
 }
 
 // The machine the whole loop runs on. One domain: this system is one process by

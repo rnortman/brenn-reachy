@@ -80,12 +80,15 @@ schema WindDownSnap
         // When the one clock is spent.
         #2 deadline: SyncTime;
 
-        // The `epoch` of the schedule the stow was last commanded with. What
-        // tells a stow already asked for from one still to be published.
-        //
-        // TODO(winddown-commanded-epoch): nothing writes or reads this yet --
-        // the host that publishes a stow is what compares epochs, and the
-        // wind-down core it is declared beside never sees one.
+        // The `epoch` of the schedule the stow was last commanded with. The
+        // whole of what tells a stow already asked for from one still to be
+        // published: the host writes it as it publishes a stow, and a wake
+        // whose schedule is still under that epoch asks for nothing. A
+        // maneuver that owes a stow -- one just opened, or one a condition
+        // re-ranked -- records the epoch before the schedule's, so the two
+        // cannot read as agreeing. The core that runs the maneuver never reads
+        // it: what to command is its answer, and whether the command has
+        // already gone out is the host's bookkeeping.
         #3 commanded_epoch: UInt32;
     }
 }

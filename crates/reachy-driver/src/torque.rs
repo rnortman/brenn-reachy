@@ -23,18 +23,34 @@
 //! written, it can only ever say whether the sweep took, and a pass that never
 //! comes clean keeps reading rather than concluding anything.
 
+use brenn_reachy__driver__aux_clk_rs::{TorqueConfirmState, TorqueConfirmStateWire};
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
+use clockwork_rs::SyncTime;
+
+use crate::JOINT_COUNT;
 use crate::state::DriverStateError;
-use crate::{JOINT_COUNT, JOINT_MASK_ALL};
 
-/// Every bus row, as torque bits. One definition with the goal masks, because a
-/// torque belief covering a different row set is a machine believed idle while
-/// holding.
-pub const TORQUE_BITS_ALL: u16 = JOINT_MASK_ALL;
-
-/// Which servos the driver believes are holding torque.
+/// One set per bus row, in bus order: the single-servo set row `n` names.
 ///
-/// One bit per bus row, in the same order and with the same convention as a
-/// goal's mask. The bits move only on evidence the driver has itself:
+/// The vocabulary declares the empty set first and then one value per row, so
+/// row `n` is variant `n + 1`; a tenth servo declared there is a tenth row here
+/// with no edit. This is the only place in the crate that turns a row number
+/// into a set, so nothing else has a masking convention to get wrong.
+const ROW_FLAGS: [JointFlags; JOINT_COUNT] = {
+    let mut rows = [JointFlags::NONE; JOINT_COUNT];
+    let mut row = 0;
+    while row < JOINT_COUNT {
+        rows[row] = JointFlags::VARIANTS[row + 1];
+        row += 1;
+    }
+    rows
+};
+
+/// Which servos the driver believes are holding torque, decided over the bits
+/// the aux state carries.
+///
+/// The same servos a goal's mask names, in the joint vocabulary's own set. The
+/// set moves only on evidence the driver has itself:
 ///
 /// - a **verified nonzero** write to a row's torque-enable register sets it,
 /// - a **verified zero** write clears it,
@@ -46,58 +62,47 @@ pub const TORQUE_BITS_ALL: u16 = JOINT_MASK_ALL;
 /// thing in both directions — a machine believed torqued that is not gets
 /// de-torqued for nothing, and a machine believed idle that is holding is a
 /// machine the dead-man will not save.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BelievedTorqued {
-    /// The bits, one per bus row.
-    pub bits: u16,
+///
+/// Borrows the set rather than holding it, so the belief a host reads and the
+/// belief a decision moves are the same field of the same state — there is no
+/// second copy for a cycle boundary to disagree with. The set is the joint
+/// vocabulary's inside and out: what is stored, what the arithmetic here is done
+/// in, and what a consumer reads are one type, so a bit no servo answers to is
+/// refused where the state is validated and no reader has a masking convention
+/// of its own to keep in step.
+pub struct BelievedTorqued<'a> {
+    /// The servos believed to be holding.
+    bits: &'a mut JointFlags,
 }
 
-impl BelievedTorqued {
-    /// Nothing believed torqued: what a driver starts up believing.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { bits: 0 }
+impl<'a> BelievedTorqued<'a> {
+    /// Decide over the set a state carries — [`crate::AuxSlot::belief`] is the
+    /// route from the state itself.
+    pub fn over(bits: &'a mut JointFlags) -> Self {
+        Self { bits }
     }
 
-    /// Every row believed torqued.
-    #[must_use]
-    pub const fn all() -> Self {
-        Self {
-            bits: TORQUE_BITS_ALL,
-        }
-    }
-
-    /// Whether this describes a belief a driver can hold.
+    /// The rows believed to be holding, as the set they are.
     ///
-    /// # Errors
-    ///
-    /// [`DriverStateError::TorqueBitsOutOfRange`] for bits above the bus.
-    pub fn validate(&self) -> Result<(), DriverStateError> {
-        if self.bits & !TORQUE_BITS_ALL != 0 {
-            return Err(DriverStateError::TorqueBitsOutOfRange { bits: self.bits });
-        }
-        Ok(())
-    }
-
-    /// The bits that name real rows: what every read here goes through, so a
-    /// slot carrying a stray bit cannot make the driver believe in a tenth
-    /// servo.
+    /// Every read here goes through it, and the answer is the joint vocabulary's
+    /// own set: a consumer reads which servos are named rather than re-deriving
+    /// a masking convention from bits.
     #[must_use]
-    pub const fn rows(&self) -> u16 {
-        self.bits & TORQUE_BITS_ALL
+    pub fn rows(&self) -> JointFlags {
+        *self.bits
     }
 
     /// Whether any row is believed torqued: what [`crate::GoalGate::tick`]'s
     /// `believed_torqued` argument is.
     #[must_use]
-    pub const fn any(&self) -> bool {
-        self.rows() != 0
+    pub fn any(&self) -> bool {
+        self.rows() != JointFlags::NONE
     }
 
     /// Whether one row is believed torqued. A row past the bus is not.
     #[must_use]
     pub fn row(&self, row: u8) -> bool {
-        usize::from(row) < JOINT_COUNT && self.rows() & (1 << row) != 0
+        usize::from(row) < JOINT_COUNT && self.rows().contains(ROW_FLAGS[usize::from(row)])
     }
 
     /// Record a verified write to one row's torque-enable register.
@@ -112,11 +117,15 @@ impl BelievedTorqued {
         if usize::from(row) >= JOINT_COUNT {
             return BeliefWrite::RowNotOnBus;
         }
-        let bit = 1 << row;
+        let bit = ROW_FLAGS[usize::from(row)];
         if enabled {
-            self.bits = self.rows() | bit;
-        } else {
-            self.bits = self.rows() & !bit;
+            *self.bits |= bit;
+        } else if self.bits.contains(bit) {
+            // Cleared by toggling the one bit that is set, because the
+            // vocabulary's sets have no complement operator: the alternative is
+            // an inverted mask, which is the bit arithmetic this type exists to
+            // keep out of the driver.
+            *self.bits ^= bit;
         }
         BeliefWrite::Recorded
     }
@@ -128,7 +137,7 @@ impl BelievedTorqued {
     /// which is what keeps the dead-man running over a machine that may still
     /// be holding.
     pub fn confirmed_off(&mut self) {
-        self.bits = 0;
+        *self.bits = JointFlags::NONE;
     }
 }
 
@@ -187,43 +196,67 @@ pub struct ConfirmStep {
     pub report: ConfirmReport,
 }
 
-/// The torque-off confirmation machine: one read-back per cycle, a whole clean
-/// pass is the confirmation.
+/// A whole confirmation pass, as one value: what [`TorqueOffConfirm`] writes
+/// when it opens or forgets one.
+///
+/// The fields are the state's own, named at the call site so that a pass being
+/// opened cannot be read as one being forgotten.
+struct Pass {
+    /// Whether a pass is running.
+    active: bool,
+    /// When it opened, which is what its budget is measured from.
+    started: SyncTime,
+    /// How far up the bus it has read back clean.
+    cursor: u8,
+    /// Whether it has already said it confirmed.
+    said_confirmed: bool,
+    /// Whether it has already said it did not.
+    said_unconfirmed: bool,
+}
+
+/// The torque-off confirmation machine — one read-back per cycle, a whole clean
+/// pass is the confirmation — decided over the state the pass lives in.
 ///
 /// The pass is a consecutive run of clean read-backs from row 0 up. A row that
 /// reads back still torqued sends the pass back to the start rather than
 /// leaving a hole: what is being confirmed is that the machine is off *now*,
 /// and a row read clean before another row was found holding is a reading from
 /// before whatever is still writing torque was accounted for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TorqueOffConfirm {
-    /// Whether a pass is running.
-    pub active: bool,
-    /// When the running pass opened. Meaningful only while `active`.
-    pub started_ns: i64,
-    /// How many rows from row 0 have read back clean in a row. Equal to
-    /// [`JOINT_COUNT`] once the pass is complete.
-    pub cursor: u8,
-    /// Whether [`ConfirmReport::Confirmed`] has been said for this pass.
-    pub said_confirmed: bool,
-    /// Whether [`ConfirmReport::Unconfirmed`] has been said for this pass.
-    pub said_unconfirmed: bool,
+///
+/// Borrows the state for as long as a decision is being made and holds nothing
+/// of its own, so how far a pass has got survives a cycle boundary as a field
+/// of the host's own state.
+pub struct TorqueOffConfirm<'a> {
+    /// The state being decided over.
+    state: &'a mut TorqueConfirmState,
 }
 
-impl TorqueOffConfirm {
-    /// A machine that is not running.
-    #[must_use]
-    pub const fn new() -> Self {
+impl<'a> TorqueOffConfirm<'a> {
+    /// Take up a slot as a machine that is not running.
+    ///
+    /// The producer's route: the state is cleared, which asks for no read-back
+    /// and reports nothing until it is begun.
+    pub fn start(slot: &'a mut TorqueConfirmStateWire) -> Self {
         Self {
-            active: false,
-            started_ns: 0,
-            cursor: 0,
-            said_confirmed: false,
-            said_unconfirmed: false,
+            state: slot.clear_valid(),
         }
     }
 
+    /// Decide over the state a previous cycle left.
+    pub fn over(state: &'a mut TorqueConfirmState) -> Self {
+        Self { state }
+    }
+
+    /// The state being decided over.
+    #[must_use]
+    pub fn state(&self) -> &TorqueConfirmState {
+        self.state
+    }
+
     /// Whether this describes a state a confirmation can be in.
+    ///
+    /// What the schema cannot say: which cursor values a pass can hold, and
+    /// which combinations of a cursor and a report a run produces.
     ///
     /// # Errors
     ///
@@ -232,19 +265,18 @@ impl TorqueOffConfirm {
     /// machine that is not running while carrying a pass's work, or
     /// [`DriverStateError::ConfirmedWithIncompletePass`] for one claiming a
     /// confirmation its cursor did not earn.
-    pub fn validate(&self) -> Result<(), DriverStateError> {
-        if usize::from(self.cursor) > JOINT_COUNT {
-            return Err(DriverStateError::ConfirmCursorOutOfRange { row: self.cursor });
+    pub fn validate(state: &TorqueConfirmState) -> Result<(), DriverStateError> {
+        let cursor = state.cursor;
+        if usize::from(cursor) > JOINT_COUNT {
+            return Err(DriverStateError::ConfirmCursorOutOfRange { row: cursor });
         }
-        if !self.active && (self.cursor != 0 || self.said_confirmed || self.said_unconfirmed) {
-            return Err(DriverStateError::IdleConfirmWithProgress {
-                cursor: self.cursor,
-            });
+        if !state.active.get()
+            && (cursor != 0 || state.said_confirmed.get() || state.said_unconfirmed.get())
+        {
+            return Err(DriverStateError::IdleConfirmWithProgress { cursor });
         }
-        if self.said_confirmed && usize::from(self.cursor) < JOINT_COUNT {
-            return Err(DriverStateError::ConfirmedWithIncompletePass {
-                cursor: self.cursor,
-            });
+        if state.said_confirmed.get() && usize::from(cursor) < JOINT_COUNT {
+            return Err(DriverStateError::ConfirmedWithIncompletePass { cursor });
         }
         Ok(())
     }
@@ -257,16 +289,16 @@ impl TorqueOffConfirm {
     /// naming a later instant would extend it. This is the one-clock rule the
     /// wind-down maneuver holds to, in the small.
     pub fn begin(&mut self, now_ns: i64) {
-        if self.active {
+        if self.state.active.get() {
             return;
         }
-        *self = Self {
+        self.write(Pass {
             active: true,
-            started_ns: now_ns,
+            started: SyncTime::from_nanos(now_ns),
             cursor: 0,
             said_confirmed: false,
             said_unconfirmed: false,
-        };
+        });
     }
 
     /// Stop confirming, and forget the pass.
@@ -276,7 +308,26 @@ impl TorqueOffConfirm {
     /// anything failing. A stood-down machine reports nothing and asks for
     /// nothing until it is begun again.
     pub fn stand_down(&mut self) {
-        *self = Self::new();
+        self.write(Pass {
+            active: false,
+            started: SyncTime::from_nanos(0),
+            cursor: 0,
+            said_confirmed: false,
+            said_unconfirmed: false,
+        });
+    }
+
+    /// Write the whole state at once, so no arm can leave half a pass.
+    ///
+    /// One named value rather than a row of arguments: three of the fields are
+    /// booleans, and which pass a call describes has to be readable where the
+    /// call is written.
+    fn write(&mut self, pass: Pass) {
+        self.state.active = pass.active.into();
+        self.state.started = pass.started;
+        self.state.cursor = pass.cursor;
+        self.state.said_confirmed = pass.said_confirmed.into();
+        self.state.said_unconfirmed = pass.said_unconfirmed.into();
     }
 
     /// Record a read-back of one row's torque-enable register.
@@ -293,12 +344,12 @@ impl TorqueOffConfirm {
             return ConfirmCredit::Ignored;
         }
         if torqued {
-            self.cursor = 0;
+            self.state.cursor = 0;
             ConfirmCredit::Restarted
         } else {
             // `row` is the clamped cursor, so this cannot climb past a complete
             // pass however the cursor arrived.
-            self.cursor = row + 1;
+            self.state.cursor = row + 1;
             ConfirmCredit::Credited
         }
     }
@@ -314,10 +365,10 @@ impl TorqueOffConfirm {
     /// nothing yet credited, which costs one more lap of reads and cannot
     /// mislead.
     fn pass_cursor(&self) -> u8 {
-        if usize::from(self.cursor) > JOINT_COUNT {
+        if usize::from(self.state.cursor) > JOINT_COUNT {
             0
         } else {
-            self.cursor
+            self.state.cursor
         }
     }
 
@@ -325,7 +376,7 @@ impl TorqueOffConfirm {
     #[must_use]
     pub fn waiting_on(&self) -> Option<u8> {
         let cursor = self.pass_cursor();
-        if self.active && usize::from(cursor) < JOINT_COUNT {
+        if self.state.active.get() && usize::from(cursor) < JOINT_COUNT {
             Some(cursor)
         } else {
             None
@@ -341,14 +392,14 @@ impl TorqueOffConfirm {
     /// de-torquing that cannot be confirmed is the operator's problem and
     /// nothing here is allowed to gate on it.
     pub fn step(&mut self, now_ns: i64, budget_ns: i64) -> ConfirmStep {
-        if !self.active {
+        if !self.state.active.get() {
             return ConfirmStep::default();
         }
         let Some(row) = self.waiting_on() else {
-            let report = if self.said_confirmed {
+            let report = if self.state.said_confirmed.get() {
                 ConfirmReport::Nothing
             } else {
-                self.said_confirmed = true;
+                self.state.said_confirmed = true.into();
                 ConfirmReport::Confirmed
             };
             return ConfirmStep {
@@ -356,9 +407,9 @@ impl TorqueOffConfirm {
                 report,
             };
         };
-        let overdue = now_ns.saturating_sub(self.started_ns) > budget_ns;
-        let report = if overdue && !self.said_unconfirmed {
-            self.said_unconfirmed = true;
+        let overdue = now_ns.saturating_sub(self.state.started.as_nanos()) > budget_ns;
+        let report = if overdue && !self.state.said_unconfirmed.get() {
+            self.state.said_unconfirmed = true.into();
             ConfirmReport::Unconfirmed
         } else {
             ConfirmReport::Nothing
@@ -374,25 +425,82 @@ impl TorqueOffConfirm {
 mod tests {
     use super::*;
 
+    use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+
     const T0: i64 = 1_700_000_000_000_000_000;
     const PERIOD: i64 = 20_000_000;
     const BUDGET: i64 = 500_000_000;
 
+    /// A confirmation's state and the record it lives in, so a case can hold
+    /// one value and still hand out the borrow every decision takes.
+    struct Fixture {
+        /// The state the machine decides over.
+        held: TorqueConfirmStateWire,
+    }
+
+    impl Fixture {
+        /// A machine that is not running.
+        fn new() -> Self {
+            let mut held = TorqueConfirmStateWire::new();
+            TorqueOffConfirm::start(&mut held);
+            Self { held }
+        }
+
+        /// A machine in the state a case names, whatever a run would produce:
+        /// the states only a slot nothing here wrote can hold are what the
+        /// typed refusals are about.
+        fn holding(
+            active: bool,
+            started_ns: i64,
+            cursor: u8,
+            said_confirmed: bool,
+            said_unconfirmed: bool,
+        ) -> Self {
+            let mut held = TorqueConfirmStateWire::new();
+            held.set_active(active);
+            held.set_started(SyncTime::from_nanos(started_ns));
+            held.set_cursor(cursor);
+            held.set_said_confirmed(said_confirmed);
+            held.set_said_unconfirmed(said_unconfirmed);
+            Self { held }
+        }
+
+        /// The machine, for as long as a case needs it.
+        fn confirm(&mut self) -> TorqueOffConfirm<'_> {
+            TorqueOffConfirm::over(self.state_mut())
+        }
+
+        /// The state itself: what a case asserts about, and what the typed
+        /// refusals are asked about.
+        fn state_mut(&mut self) -> &mut TorqueConfirmState {
+            self.held
+                .validate_mut()
+                .expect("a confirmation's fields are a confirmation's fields")
+        }
+    }
+
+    /// A belief over a set a case owns.
+    fn belief(bits: &mut JointFlags) -> BelievedTorqued<'_> {
+        BelievedTorqued::over(bits)
+    }
+
     #[test]
     fn a_fresh_belief_holds_nothing() {
-        let believed = BelievedTorqued::new();
+        let mut bits = JointFlags::NONE;
+        let believed = belief(&mut bits);
         assert!(!believed.any());
-        assert_eq!(believed.rows(), 0);
+        assert_eq!(believed.rows(), JointFlags::NONE);
         for row in 0..JOINT_COUNT as u8 {
             assert!(!believed.row(row));
         }
-        believed.validate().expect("a fresh belief is a belief");
+        assert_eq!(*believed.bits, JointFlags::NONE, "and the set says so");
     }
 
     #[test]
     fn every_row_is_its_own_bit() {
         for row in 0..JOINT_COUNT as u8 {
-            let mut believed = BelievedTorqued::new();
+            let mut bits = JointFlags::NONE;
+            let mut believed = belief(&mut bits);
             believed.verified_write(row, true);
             assert!(believed.any());
             for other in 0..JOINT_COUNT as u8 {
@@ -403,8 +511,9 @@ mod tests {
 
     #[test]
     fn a_verified_zero_write_clears_one_row_and_leaves_the_rest() {
-        let mut believed = BelievedTorqued::all();
-        assert_eq!(believed.rows(), TORQUE_BITS_ALL);
+        let mut bits = crate::every_row();
+        let mut believed = belief(&mut bits);
+        assert_eq!(believed.rows(), crate::every_row());
         believed.verified_write(3, false);
         assert!(!believed.row(3));
         assert!(believed.any());
@@ -413,9 +522,56 @@ mod tests {
         }
     }
 
+    /// A row set is a bit set, and row `n` is the bit a goal mask spells
+    /// `1 << n`.
+    ///
+    /// The one convention this crate turns a row number into a set with, pinned
+    /// against the numbering every other reader of that set uses: the goal
+    /// mask, the confirm sweep's cursor and the sim's plant all speak row
+    /// numbers, and `ROW_FLAGS` is derived from the order the vocabulary
+    /// declares its values in. A value inserted mid-list would keep the
+    /// disjoint-and-covering test in `lib.rs` green while moving every row past
+    /// it onto a different servo's bit, which is a belief about servos that are
+    /// not the ones holding.
+    #[test]
+    fn every_row_is_the_bit_the_goal_mask_spells() {
+        for (row, flag) in ROW_FLAGS.iter().enumerate() {
+            assert_eq!(
+                JointFlagsWire::from(*flag).0,
+                1u16 << row,
+                "row {row} is not the bit a mask names it with"
+            );
+        }
+    }
+
+    /// Clearing a row nothing believed holds nothing, and clearing a row twice
+    /// leaves it clear.
+    ///
+    /// The clear is a toggle behind a membership test, so what a case has to say
+    /// is that it only ever clears: a write that set a belief the driver has no
+    /// evidence for would be a de-torqued servo the dead-man thinks is holding,
+    /// and every other case here clears rows that were set.
+    #[test]
+    fn a_verified_zero_write_to_a_row_nobody_believed_sets_nothing() {
+        let mut bits = JointFlags::NONE;
+        let mut believed = belief(&mut bits);
+        for row in [0, 3, JOINT_COUNT as u8 - 1] {
+            assert_eq!(believed.verified_write(row, false), BeliefWrite::Recorded);
+        }
+        assert!(!believed.any());
+        assert_eq!(believed.rows(), JointFlags::NONE);
+
+        believed.verified_write(4, true);
+        believed.verified_write(4, false);
+        believed.verified_write(4, false);
+        assert!(!believed.row(4), "a second clear does not put the row back");
+        assert!(!believed.any());
+    }
+
     #[test]
     fn clearing_every_row_one_at_a_time_ends_the_belief() {
-        let mut believed = BelievedTorqued::all();
+        let mut bits = crate::every_row();
+        let mut believed = belief(&mut bits);
         for row in 0..JOINT_COUNT as u8 {
             assert!(believed.any(), "still torqued before clearing row {row}");
             believed.verified_write(row, false);
@@ -425,14 +581,16 @@ mod tests {
 
     #[test]
     fn a_confirmed_sweep_clears_the_whole_belief_at_once() {
-        let mut believed = BelievedTorqued::all();
+        let mut bits = crate::every_row();
+        let mut believed = belief(&mut bits);
         believed.confirmed_off();
         assert!(!believed.any());
     }
 
     #[test]
     fn a_write_to_a_row_the_bus_does_not_have_is_ignored_and_says_so() {
-        let mut believed = BelievedTorqued::new();
+        let mut bits = JointFlags::NONE;
+        let mut believed = belief(&mut bits);
         for row in [JOINT_COUNT as u8, 200] {
             assert_eq!(
                 believed.verified_write(row, true),
@@ -446,25 +604,15 @@ mod tests {
         assert!(!believed.row(JOINT_COUNT as u8));
     }
 
-    #[test]
-    fn a_belief_with_bits_above_the_bus_is_refused_and_reads_as_the_bus() {
-        let stray = BelievedTorqued {
-            bits: TORQUE_BITS_ALL | 1 << JOINT_COUNT,
-        };
-        assert_eq!(
-            stray.validate(),
-            Err(DriverStateError::TorqueBitsOutOfRange { bits: stray.bits })
-        );
-        assert_eq!(stray.rows(), TORQUE_BITS_ALL);
-        assert!(!stray.row(JOINT_COUNT as u8));
-    }
-
     /// Walk a running pass to completion, answering every read clean.
     ///
     /// `begin` on every cycle, because that is the call pattern the driver has:
     /// the latch stands, so the cycle opens by beginning the pass it is already
     /// running.
-    fn confirm_clean(confirm: &mut TorqueOffConfirm, mut now: i64) -> (i64, Vec<ConfirmReport>) {
+    fn confirm_clean(
+        confirm: &mut TorqueOffConfirm<'_>,
+        mut now: i64,
+    ) -> (i64, Vec<ConfirmReport>) {
         let mut reports = Vec::new();
         for _ in 0..2 * JOINT_COUNT + 2 {
             confirm.begin(now);
@@ -474,7 +622,7 @@ mod tests {
                 confirm.observed(row, false);
             }
             now += PERIOD;
-            if confirm.said_confirmed {
+            if confirm.state.said_confirmed.get() {
                 break;
             }
         }
@@ -483,15 +631,17 @@ mod tests {
 
     #[test]
     fn an_idle_confirmation_asks_for_nothing_and_says_nothing() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         assert_eq!(confirm.step(T0, BUDGET), ConfirmStep::default());
         assert_eq!(confirm.waiting_on(), None);
-        confirm.validate().expect("a fresh confirmation is a state");
+        TorqueOffConfirm::validate(confirm.state).expect("a fresh confirmation is a state");
     }
 
     #[test]
     fn a_clean_pass_reads_every_row_in_order_and_confirms_once() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         let mut now = T0;
         let mut read = Vec::new();
@@ -526,7 +676,8 @@ mod tests {
 
     #[test]
     fn a_row_still_torqued_sends_the_pass_back_to_the_start() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         let mut now = T0;
         for row in 0..4u8 {
@@ -538,12 +689,13 @@ mod tests {
         assert_eq!(confirm.observed(4, true), ConfirmCredit::Restarted);
         now += PERIOD;
         assert_eq!(confirm.step(now, BUDGET).read_row, Some(0));
-        assert!(!confirm.said_confirmed);
+        assert!(!confirm.state.said_confirmed.get());
     }
 
     #[test]
     fn an_answer_for_a_row_the_pass_is_not_waiting_on_does_not_advance_it() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         assert_eq!(confirm.observed(5, false), ConfirmCredit::Ignored);
         assert_eq!(confirm.waiting_on(), Some(0));
@@ -556,23 +708,25 @@ mod tests {
 
     #[test]
     fn a_read_back_of_a_row_the_bus_does_not_have_is_ignored() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
-        confirm.cursor = JOINT_COUNT as u8;
+        confirm.state.cursor = JOINT_COUNT as u8;
         assert_eq!(
             confirm.observed(JOINT_COUNT as u8, false),
             ConfirmCredit::Ignored
         );
-        assert_eq!(confirm.cursor, JOINT_COUNT as u8);
+        assert_eq!(confirm.state.cursor, JOINT_COUNT as u8);
     }
 
     #[test]
     fn the_budget_runs_from_the_first_begin_and_a_second_does_not_extend_it() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         for step in 1..6 {
             confirm.begin(T0 + step * PERIOD);
-            assert_eq!(confirm.started_ns, T0);
+            assert_eq!(confirm.state.started.as_nanos(), T0);
         }
     }
 
@@ -582,7 +736,8 @@ mod tests {
     /// the life of the process.
     #[test]
     fn a_begin_part_way_through_a_pass_disturbs_none_of_it() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         let mut now = T0;
         for _ in 0..4 {
@@ -590,7 +745,7 @@ mod tests {
             confirm.observed(step.read_row.expect("still reading"), false);
             now += PERIOD;
         }
-        assert_eq!(confirm.cursor, 4, "four rows read back clean");
+        assert_eq!(confirm.state.cursor, 4, "four rows read back clean");
         // Past the budget, so the pass has said its piece as well.
         let overdue = T0 + BUDGET + PERIOD;
         assert_eq!(
@@ -598,16 +753,20 @@ mod tests {
             ConfirmReport::Unconfirmed
         );
         confirm.begin(overdue + PERIOD);
-        assert_eq!(confirm.cursor, 4, "a begin restarted the pass");
-        assert_eq!(confirm.started_ns, T0);
-        assert!(confirm.said_unconfirmed, "a begin unsaid the report");
-        assert!(!confirm.said_confirmed);
+        assert_eq!(confirm.state.cursor, 4, "a begin restarted the pass");
+        assert_eq!(confirm.state.started.as_nanos(), T0);
+        assert!(
+            confirm.state.said_unconfirmed.get(),
+            "a begin unsaid the report"
+        );
+        assert!(!confirm.state.said_confirmed.get());
         assert_eq!(confirm.waiting_on(), Some(4));
     }
 
     #[test]
     fn an_overdue_pass_says_so_once_and_keeps_reading() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         // Begun every cycle, as the driver begins it while the latch stands.
         let mut now = T0;
         while now <= T0 + BUDGET {
@@ -634,39 +793,35 @@ mod tests {
 
     #[test]
     fn a_pass_that_comes_clean_after_saying_unconfirmed_still_confirms() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         let mut now = T0 + BUDGET + PERIOD;
         assert_eq!(confirm.step(now, BUDGET).report, ConfirmReport::Unconfirmed);
         now += PERIOD;
         let (_, reports) = confirm_clean(&mut confirm, now);
         assert!(reports.contains(&ConfirmReport::Confirmed));
-        assert!(confirm.said_unconfirmed);
+        assert!(confirm.state.said_unconfirmed.get());
     }
 
     #[test]
     fn standing_down_forgets_the_pass_and_a_later_begin_starts_over() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         confirm.observed(0, false);
         confirm.stand_down();
-        assert_eq!(confirm, TorqueOffConfirm::new());
+        assert_eq!(*confirm.state, *Fixture::new().state_mut());
         confirm.begin(T0 + 10 * PERIOD);
-        assert_eq!(confirm.started_ns, T0 + 10 * PERIOD);
+        assert_eq!(confirm.state.started.as_nanos(), T0 + 10 * PERIOD);
         assert_eq!(confirm.waiting_on(), Some(0));
     }
 
     #[test]
     fn a_cursor_past_a_complete_pass_is_refused() {
-        let confirm = TorqueOffConfirm {
-            active: true,
-            started_ns: T0,
-            cursor: JOINT_COUNT as u8 + 1,
-            said_confirmed: false,
-            said_unconfirmed: false,
-        };
+        let mut fixture = Fixture::holding(true, T0, JOINT_COUNT as u8 + 1, false, false);
         assert_eq!(
-            confirm.validate(),
+            TorqueOffConfirm::validate(fixture.state_mut()),
             Err(DriverStateError::ConfirmCursorOutOfRange {
                 row: JOINT_COUNT as u8 + 1
             })
@@ -680,18 +835,19 @@ mod tests {
     /// It reads as a pass with nothing credited instead.
     #[test]
     fn a_cursor_past_the_bus_does_not_read_as_a_completed_pass() {
-        let mut confirm = TorqueOffConfirm::new();
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
-        confirm.cursor = JOINT_COUNT as u8 + 3;
+        confirm.state.cursor = JOINT_COUNT as u8 + 3;
         assert_eq!(confirm.waiting_on(), Some(0), "the pass reads from row 0");
         let step = confirm.step(T0 + PERIOD, BUDGET);
         assert_eq!(step.read_row, Some(0));
         assert_eq!(step.report, ConfirmReport::Nothing, "nothing was read back");
-        assert!(!confirm.said_confirmed);
+        assert!(!confirm.state.said_confirmed.get());
         // And it walks a whole clean lap from there, as any pass does.
         assert_eq!(confirm.observed(0, false), ConfirmCredit::Credited);
         assert_eq!(
-            confirm.cursor, 1,
+            confirm.state.cursor, 1,
             "a credit climbed from the clamped cursor"
         );
         let (_, reports) = confirm_clean(&mut confirm, T0 + 2 * PERIOD);
@@ -700,14 +856,8 @@ mod tests {
 
     #[test]
     fn a_complete_pass_is_not_a_cursor_out_of_range() {
-        let confirm = TorqueOffConfirm {
-            active: true,
-            started_ns: T0,
-            cursor: JOINT_COUNT as u8,
-            said_confirmed: true,
-            said_unconfirmed: false,
-        };
-        confirm.validate().expect("a complete pass is a state");
+        let mut fixture = Fixture::holding(true, T0, JOINT_COUNT as u8, true, false);
+        TorqueOffConfirm::validate(fixture.state_mut()).expect("a complete pass is a state");
     }
 
     /// Progress no run produces, and a slot can hold: a report said over a pass
@@ -717,57 +867,37 @@ mod tests {
     /// took reads as unconfirmed for the rest of the process.
     #[test]
     fn a_confirmation_said_over_an_incomplete_pass_is_refused() {
-        let confirm = TorqueOffConfirm {
-            active: true,
-            started_ns: T0,
-            cursor: 3,
-            said_confirmed: true,
-            said_unconfirmed: false,
-        };
+        let mut said = Fixture::holding(true, T0, 3, true, false);
         assert_eq!(
-            confirm.validate(),
+            TorqueOffConfirm::validate(said.state_mut()),
             Err(DriverStateError::ConfirmedWithIncompletePass { cursor: 3 })
         );
         // Unconfirmed is a different matter: an overdue pass says so with rows
         // still to read, which is the state it is meant to be said in.
-        let overdue = TorqueOffConfirm {
-            said_confirmed: false,
-            said_unconfirmed: true,
-            ..confirm
-        };
-        overdue.validate().expect("an overdue pass is a state");
+        let mut overdue = Fixture::holding(true, T0, 3, false, true);
+        TorqueOffConfirm::validate(overdue.state_mut()).expect("an overdue pass is a state");
     }
 
     #[test]
     fn a_stood_down_machine_carrying_a_pass_is_refused() {
-        let mid = TorqueOffConfirm {
-            active: false,
-            started_ns: T0,
-            cursor: 3,
-            said_confirmed: false,
-            said_unconfirmed: false,
-        };
+        let mut mid = Fixture::holding(false, T0, 3, false, false);
         assert_eq!(
-            mid.validate(),
+            TorqueOffConfirm::validate(mid.state_mut()),
             Err(DriverStateError::IdleConfirmWithProgress { cursor: 3 })
         );
-        let said = TorqueOffConfirm {
-            active: false,
-            started_ns: T0,
-            cursor: 0,
-            said_confirmed: true,
-            said_unconfirmed: false,
-        };
+        let mut said = Fixture::holding(false, T0, 0, true, false);
         assert_eq!(
-            said.validate(),
+            TorqueOffConfirm::validate(said.state_mut()),
             Err(DriverStateError::IdleConfirmWithProgress { cursor: 0 })
         );
     }
 
     #[test]
     fn a_confirmation_is_what_clears_a_belief_and_the_command_is_not() {
-        let mut believed = BelievedTorqued::all();
-        let mut confirm = TorqueOffConfirm::new();
+        let mut bits = crate::every_row();
+        let mut believed = belief(&mut bits);
+        let mut fixture = Fixture::new();
+        let mut confirm = fixture.confirm();
         confirm.begin(T0);
         // Commanded, not yet confirmed: the belief stands, so the dead-man
         // still has a machine to watch.
@@ -781,10 +911,6 @@ mod tests {
     #[test]
     fn every_state_error_prints_the_number_it_is_about() {
         let cases = [
-            (
-                DriverStateError::TorqueBitsOutOfRange { bits: 0x0400 },
-                "0x0400",
-            ),
             (DriverStateError::HealthCursorOutOfRange { row: 12 }, "12"),
             (DriverStateError::ConfirmCursorOutOfRange { row: 12 }, "12"),
             (DriverStateError::IdleConfirmWithProgress { cursor: 3 }, "3"),

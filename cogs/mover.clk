@@ -127,5 +127,69 @@ schema MoverState
         // as long as it is open, which is what lets a player be picked up again
         // on the next execution rather than restarted every period.
         #13 players: FixedArray<player::ClipPlayerSnap, 4>;
+
+        // Whether the configured clip library has been walked frame by frame.
+        // The library is a configuration binding, immutable for the process's
+        // life, so the walk is a fact about bytes that do not change: the first
+        // execution that needs the library pays it and records it here, and
+        // every later one takes it up without re-reading a frame.
+        #14 library_walked: Bool;
+
+        // Whether this cog has stopped playing the schedule named by
+        // `latch_epoch`, because a composed setpoint carrying an overlay was
+        // refused or because the clip library would not establish. While it
+        // stands, no window is taken up and the base streams alone: the same
+        // clip over the same base composes the same setpoint and the same
+        // library refuses the same way, so a layer that took its windows up
+        // again would repeat a refused ask once a period.
+        #15 overlay_latch: Bool;
+
+        // The `epoch` of the schedule the overlay layer last screened.
+        // `overlay_latch` belongs to that schedule: a schedule arriving with a
+        // different epoch is a fresh set of windows, so the latch is cleared
+        // and the screen's refusals are counted again.
+        #16 latch_epoch: UInt32;
+
+        // How many overlay windows this cog would not play, all run. The
+        // screen's refusals -- a window naming no motion, asking for a gain or
+        // a speed that is not one, spanning no time -- counted once per
+        // schedule rather than once per period, plus one for each composed
+        // setpoint an overlay rode that the tick refused. An overlay is
+        // presence, never safety: every one of these costs the run an overlay
+        // and nothing else.
+        #17 overlays_refused: UInt64;
+
+        // How many overlay rows would not read back as a player of the motion
+        // their window names, all run. The window plays on from a fresh join at
+        // its own offset, which is what a window opening does anyway.
+        #18 players_refused: UInt64;
+
+        // How many base plans this cog could not make or could not read back,
+        // all run: a plan the machine refused -- a target outside the envelope,
+        // an antenna direction no count reaches, a move nothing can shape --
+        // and a base record in this slot that was not one. Both leave the base
+        // standing where it stands, which is why they share a total.
+        #19 refused_base: UInt64;
+
+        // How many base plans the motion library had to adjust for a reason
+        // that is not routine, all run: a clock lengthened to carry its own
+        // span inside the per-tick step bounds, or an antenna pair the pass
+        // could not part to the separation that keeps their tips clear. A
+        // duration is configuration, sized for the spans an ordinary command
+        // covers; where the machine physically stands is not, so a plan over a
+        // span the configured clock cannot carry is lengthened rather than
+        // refused. Zero on a healthy machine is the invariant this field exists
+        // to make legible; the de-phasing every posture move asks for is
+        // routine and is counted next door, in `base_dephased`.
+        #20 base_stretched: UInt64;
+
+        // How many base plans were adjusted only to de-phase the antenna pair,
+        // all run: the configured separation reached by lengthening the later
+        // side's clock, on clocks that each carried their own span. Two
+        // antennas sweeping between the stow and the working posture arrive
+        // mirrored, which is where their tips meet, so this is expected nonzero
+        // on any machine that stands up or folds -- it is the evidence the
+        // pair-phase guard is working, not a fault signal.
+        #21 base_dephased: UInt64;
     }
 }

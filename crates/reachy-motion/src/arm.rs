@@ -61,8 +61,8 @@ use core::time::Duration;
 
 use nalgebra::Isometry3;
 use reachy_kin::{
-    FkError, FkOptions, HeadGeometry, LegAngles, below_limit, forward_kinematics, min_margin,
-    neutral_head_pose, pose_margins, rest_head_pose, stow_head_pose,
+    EnvelopeConfig, FkError, FkOptions, HeadGeometry, LegAngles, below_limit, forward_kinematics,
+    min_margin, neutral_head_pose, pose_margins, rest_head_pose, stow_head_pose,
 };
 
 use crate::joints::{
@@ -439,6 +439,71 @@ impl ArmConfig {
     #[must_use]
     pub fn id_for(&self, joint: JointRef) -> Option<u8> {
         row(joint).and_then(|row| self.ids.get(row).copied())
+    }
+}
+
+/// Which bus row answers at `id`, or `None` where nothing on this bus does.
+///
+/// The reverse of [`ArmConfig::id_for`], over [`SERVO_IDS`]: a host reading an id
+/// off a bus message needs the row to index its nine-slot arrays with, and the
+/// ids are the platform's own numbering rather than a table a host may restate.
+#[must_use]
+pub fn row_of_id(id: u8) -> Option<usize> {
+    SERVO_IDS.iter().position(|configured| *configured == id)
+}
+
+/// How far inside the host envelope's crank windows the servo-side fence sits,
+/// degrees.
+///
+/// A hair, and its direction is the whole point: the servo refuses a goal past
+/// its own window, so a fence *outside* the host's would let a pin command an
+/// angle the servo declines, and a fence far inside it would refuse poses the
+/// envelope allows. The provisioned windows this platform's units answered with
+/// sit between 0.012° and 0.039° inside the corresponding envelope bound, and
+/// the tightest of them is the one worth modelling.
+pub const WINDOW_INSET_DEG: f64 = 0.012;
+
+/// The servo-side travel windows `env`'s own windows imply: those windows, drawn
+/// in by [`WINDOW_INSET_DEG`].
+#[must_use]
+pub fn leg_windows(env: &EnvelopeConfig) -> [(f64, f64); 6] {
+    let inset = WINDOW_INSET_DEG.to_radians();
+    let mut windows = env.crank_windows;
+    for (low, high) in &mut windows {
+        *low += inset;
+        *high -= inset;
+    }
+    windows
+}
+
+/// Arming's configuration over this platform's hardware facts.
+///
+/// One record of which fields a host fills and where each comes from: the nine
+/// ids, the supply floor and its polling, the gains and the servo-side fences
+/// are facts this crate states once, and two copies of any of them would let one
+/// host commission a machine against fences another host's tests never see.
+///
+/// The two arguments are the two things that are not hardware facts. `expected`
+/// is the provisioning grid — what this deployment bakes an expectation for, and
+/// empty where a caller checks nothing. `profile` is the servo-side
+/// velocity/acceleration backstop, which this crate deliberately has no default
+/// for: what it should be is a property of the machine a host drives and of the
+/// shaping that host does, not of the motion arithmetic here.
+#[must_use]
+pub fn arm_config(
+    env: &EnvelopeConfig,
+    expected: ProvisionTable,
+    profile: ProfileConfig,
+) -> ArmConfig {
+    ArmConfig {
+        ids: SERVO_IDS,
+        expected,
+        min_arm_voltage: DEFAULT_MIN_ARM_VOLTAGE,
+        voltage_poll_period: DEFAULT_VOLTAGE_POLL_PERIOD,
+        voltage_budget: DEFAULT_VOLTAGE_BUDGET,
+        gains: DEFAULT_GAINS,
+        profile,
+        leg_windows: leg_windows(env),
     }
 }
 

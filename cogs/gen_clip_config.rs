@@ -488,12 +488,14 @@ mod tests {
     use brenn_reachy__cogs__config_clk_rs::ClipFrameWire;
     use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS};
 
-    /// The three checked-in documents, embedded rather than read: a case that
+    /// The checked-in documents, embedded rather than read: a case that
     /// compiles against the asset needs no runfiles and no working directory.
-    const DOCUMENTS: [(&str, &str); 3] = [
+    const DOCUMENTS: [(&str, &str); 5] = [
         ("cogs/clips/nod.json", include_str!("clips/nod.json")),
         ("cogs/clips/perk.json", include_str!("clips/perk.json")),
         ("cogs/clips/sway.json", include_str!("clips/sway.json")),
+        ("cogs/clips/tip.json", include_str!("clips/tip.json")),
+        ("cogs/clips/tour.json", include_str!("clips/tour.json")),
     ];
 
     /// The asset those documents emit, as committed.
@@ -690,23 +692,23 @@ mod tests {
         ));
         let emitted = emit(&with_sequence).expect("a sequence emits");
 
-        // Three clips, four motions: one per clip, then the sequence.
-        assert_eq!(emitted.clips.len(), 3);
+        // The committed documents, and then this one: the numbering is the read
+        // order, so the sequence written last is the last motion.
         let names: Vec<&str> = emitted
             .motions
             .entries
             .iter()
             .map(|motion| motion.name.as_str())
             .collect();
-        assert_eq!(
-            names,
-            ["bench/nod", "bench/perk", "bench/sway", "bench/greeting"]
-        );
+        let motion_id = names.len() - 1;
+        assert_eq!(names.last(), Some(&"bench/greeting"), "{names:?}");
 
         // Two clips strung together, with the leading gap held apart from them.
-        assert_eq!(emitted.motions.entries[3].parts, 2);
+        assert_eq!(emitted.motions.entries[motion_id].parts, 2);
         assert!(
-            emitted.textproto.contains("#   3  bench/greeting"),
+            emitted
+                .textproto
+                .contains(&format!("#   {motion_id}  bench/greeting")),
             "{}",
             emitted.textproto
         );
@@ -729,12 +731,22 @@ mod tests {
 
     /// A one-segment motion stands for every clip, so a schedule names motions
     /// only and invoking a bare clip costs nothing.
+    ///
+    /// By name rather than by position, because the motions are every asset that
+    /// plays and the clips are those of them a clip document authored: the
+    /// committed set has a sequence in it, so the two numberings agree on the
+    /// clips and the motions carry more.
     #[test]
     fn every_clip_is_also_a_motion_of_one_segment() {
         let emitted = emit(&texts()).expect("the checked-in documents emit");
-        assert_eq!(emitted.clips.len(), emitted.motions.len());
-        for (clip, motion) in emitted.clips.entries.iter().zip(&emitted.motions.entries) {
-            assert_eq!(clip.name, motion.name);
+        assert!(emitted.motions.len() >= emitted.clips.len());
+        for clip in &emitted.clips.entries {
+            let motion = emitted
+                .motions
+                .entries
+                .iter()
+                .find(|motion| motion.name == clip.name)
+                .unwrap_or_else(|| panic!("{} plays as a motion", clip.name));
             assert_eq!(motion.parts, 1);
         }
     }
@@ -957,7 +969,7 @@ mod tests {
         assert!(
             said.last()
                 .expect("a closing line")
-                .contains("3 clip(s) and 3 motion(s)"),
+                .contains("4 clip(s) and 5 motion(s)"),
             "{said:?}"
         );
         std::fs::remove_dir_all(&dir).expect("the temporary directory goes away");

@@ -3,13 +3,14 @@ load("@clockwork//jewels/simplelaunch:rules.bzl", "merge_simplelaunch_config")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:clk_naming.bzl", "VALIDATED_NAMING")
-load("//bazel:clk_schema.bzl", "clk_module_deps")
+load("//bazel:clk_schema.bzl", "clk_module_deps", "clk_schema_module")
 load("//bazel:rust_clk.bzl", "rust_clk_module")
 load("//bazel:scenario_suite.bzl", "scenario_suite")
 
 # The motion cog system: the schemas everything here speaks, the cogs that run
-# on the driver's sample stream, the simulated driver that produces it, and the
-# process that hosts all three.
+# on the driver's sample stream, the session that says what the machine is doing,
+# the simulated driver that produces the stream, and the process that hosts all
+# four.
 #
 # Framework integration (compiling `.clk`, VarPacket round-trips, driving the
 # deterministic runner from a Rust-authored log) is proved by `proof/`; not
@@ -44,6 +45,7 @@ SIM_LOGGER_CONFIG = ":system_sim.motion_sim.MotionCpu_event_logger_config.tachyo
 # in the executable's own runfiles, and no checker has anything to say about it.
 SIM_CONFIGS = [
     "mover_params.textproto",
+    "session_params.textproto",
     "sim_params.textproto",
 ]
 
@@ -52,23 +54,20 @@ SIM_CONFIGS = [
 # it in -- the C++ library, the `.clk` compile, the generator's import path and
 # the Rust crate. Each list is what its module imports plus what those imports
 # reach, which is the import graph. The cog modules ride the mover chain:
-# `motion` over `mover`, and `sim` over `motion` plus the plant. `msgs` is the
-# session vocabulary over `session_aux`, and no cog module imports it -- the slot
-# library is its only consumer -- though `session_aux` itself reaches the sim box
-# anyway, under `//driver:health`'s aux report. The two state modules
-# stand outside both -- the estimator's seed and the simulated plant are each
-# imported by one cog module and nothing else -- so each names what it reaches on
-# its own.
-SESSION_AUX_MODULES = [
-    "//hardware/dynamixel:registers",
-    "//motion:bus_txn",
-]
-
-MSGS_MODULES = SESSION_AUX_MODULES + [
+# `motion` over `mover`, and `sim` over `motion` plus the plant. `session` is
+# what the session keeps between executions, over the four sequencers and the
+# narration; `script` is what arrives from outside and `session_cmd` the one
+# datagram that goes to the driver, each deliberately narrow so that the driver
+# side importing the command shape does not import the session's blast radius.
+# The two state modules stand outside all of it -- the estimator's seed and the
+# simulated plant are each imported by one cog module and nothing else -- so each
+# names what it reaches on its own.
+SESSION_MODULES = [
     "schedule",
-    "session_aux",
     "//geometry:primitives",
+    "//hardware/dynamixel:registers",
     "//motion:arm_record",
+    "//motion:bus_txn",
     "//motion:commission",
     "//motion:disarm",
     "//motion:engage",
@@ -80,6 +79,13 @@ MSGS_MODULES = SESSION_AUX_MODULES + [
     "//motion:seq",
     "//motion:servo_health",
     "//motion:timeline",
+]
+
+SCRIPT_MODULES = ["schedule"]
+
+SESSION_CMD_MODULES = [
+    "//hardware/dynamixel:registers",
+    "//motion:bus_txn",
 ]
 
 # The mover's own chain, which meets the one above only at the cog module: what
@@ -99,42 +105,49 @@ MOVER_MODULES = [
 POSE_STATE_MODULES = ["//geometry:primitives"]
 
 SIM_STATE_MODULES = [
+    "//driver:aux",
     "//driver:gate",
     "//driver:goal",
+    "//hardware/dynamixel:registers",
+    "//motion:bus_txn",
     "//motion:joints",
 ]
 
 MOTION_MODULES = MOVER_MODULES + [
+    module
+    for module in SESSION_MODULES
+    if module not in MOVER_MODULES
+] + [
     "config",
     "mover",
     "pose_state",
+    "script",
+    "session",
+    "session_cmd",
     "//driver:goal",
+    "//driver:health",
     "//driver:pose",
 ]
 
 SIM_MODULES = MOTION_MODULES + [
     module
-    for module in SIM_STATE_MODULES + SESSION_AUX_MODULES
+    for module in SIM_STATE_MODULES + ["//hardware/dynamixel:registers"]
     if module not in MOTION_MODULES
 ] + [
     "motion",
-    "session_aux",
     "sim_state",
-    "//driver:health",
 ]
 
 exports_files([
     "config.clk",
     "motion.clk",
     "mover.clk",
-    "msgs.clk",
     "pose_state.clk",
     # The three-phase driver every scenario's `sh_test` runs, including the
     # harness proof's next door: one invocation of the deterministic runner for
     # the whole repo.
     "scenario_test.sh",
     "schedule.clk",
-    "session_aux.clk",
     "sim.clk",
     "sim_state.clk",
     "system_sim.clk",
@@ -278,13 +291,25 @@ rust_test(
         ":config_clk_rs",
         ":motion_clk_rs_test",
         ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        ":session_slots",
+        "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:commission_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:seq_clk_rs",
         "//motion:tick_state_clk_rs",
+        "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -292,20 +317,43 @@ rust_test(
 
 rust_library(
     name = "motion_cogs",
-    srcs = ["motion_cogs.rs"],
+    srcs = [
+        "motion_cogs.rs",
+        "mover_overlay.rs",
+        "session_bus.rs",
+        "session_cog.rs",
+        "session_ladder.rs",
+        "session_stow.rs",
+    ],
     edition = "2024",
     deps = [
         ":config_clk_rs",
         ":motion_clk_rs",
         ":motion_slots",
         ":mover_clk_rs",
+        ":overlay",
         ":pose_state_clk_rs",
         ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        ":session_slots",
+        "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:commission_clk_rs",
+        "//motion:engage_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:poll_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:seq_clk_rs",
+        "//motion:tick_state_clk_rs",
+        "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -402,31 +450,6 @@ rust_clk_module(
     deps = clk_module_deps(MOVER_MODULES).rs,
 )
 
-# A module of its own because a cog member's type is an interface instantiation
-# and the compiler resolves one only against a module the cog's module imports.
-clk(
-    name = "msgs_clk",
-    srcs = ["msgs.clk"],
-    outs = [
-        "msgs_clk_cc.cc",
-        "msgs_clk_cc.hh",
-        "msgs_clk_cc.inl",
-    ],
-    cpp_deps = clk_module_deps(MSGS_MODULES).cpp,
-    generate = ["cpp"],
-    visibility = ["//visibility:public"],
-    deps = clk_module_deps(MSGS_MODULES).clk,
-)
-
-# No `cog_impl`: the module declares no cogs.
-rust_clk_module(
-    name = "msgs_clk_rs",
-    src = "msgs.clk",
-    imports = clk_module_deps(MSGS_MODULES).imports,
-    validated_naming = VALIDATED_NAMING,
-    deps = clk_module_deps(MSGS_MODULES).rs,
-)
-
 # The overlay layer of the decision tick: the window screen, the players, and the
 # base a composed setpoint rides on. Its own crate rather than a module of the cog
 # bodies, because the cog and its cases read the same player rows and must read
@@ -502,6 +525,7 @@ scenario_suite(
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
         "//crates/reachy-motion:reachy_motion",
+        "//motion:reports_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
@@ -509,6 +533,61 @@ scenario_suite(
     process_description = SIM_PROCESS,
     scenario_deps = [
         ":schedule_clk_rs",
+        "//motion:joints_clk_rs",
+    ],
+)
+
+# S10, a bus that never comes back: the same four cogs S1 runs on, with an
+# outage that outlasts the run and a release nothing ever acknowledges.
+scenario_suite(
+    name = "s10",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+    ],
+)
+
+# S11, an antenna pair let go of: the same four cogs S1 runs on, with one
+# antenna made to complain about itself and a session that answers it by letting
+# the pair go and carrying on.
+scenario_suite(
+    name = "s11",
+    author_deps = [
+        "//motion:joints_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":motion_cogs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
     ],
 )
@@ -523,10 +602,16 @@ scenario_suite(
     ],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
+        ":schedule_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
         ":sim_state_clk_rs",
-        "//motion:faults_clk_rs",
         "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
@@ -554,7 +639,7 @@ scenario_suite(
     scenario_deps = [],
 )
 
-# S4, feedback loss: the same three cogs S1 runs on, with the bus made to stop
+# S4, feedback loss: the same four cogs S1 runs on, with the bus made to stop
 # answering once the machine is upright and holding.
 scenario_suite(
     name = "s4",
@@ -562,6 +647,7 @@ scenario_suite(
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
         ":motion_slots",
+        ":session_clk_rs",
         ":sim_state_clk_rs",
         "//motion:faults_clk_rs",
         "//crates/reachy-motion:reachy_motion",
@@ -574,6 +660,7 @@ scenario_suite(
     process_description = SIM_PROCESS,
     scenario_deps = [
         ":schedule_clk_rs",
+        ":sim_cogs",
         "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
     ],
@@ -589,6 +676,7 @@ scenario_suite(
     checker_deps = [
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//motion:reports_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
     ],
     configs = SIM_CONFIGS,
@@ -597,6 +685,83 @@ scenario_suite(
     process_description = SIM_PROCESS,
     scenario_deps = [
         ":schedule_clk_rs",
+        "//motion:joints_clk_rs",
+    ],
+)
+
+# S6, a composed motion: the same four cogs S1 runs on, with the script asking
+# for a motion to be played over the posture it commands and for the window to
+# close while that motion is still playing.
+scenario_suite(
+    name = "s6",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":session_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+    ],
+)
+
+# S8, a head servo in trouble: the same four cogs S1 runs on, with one head
+# servo made to complain about itself and the cranks held while the head is
+# being carried down.
+scenario_suite(
+    name = "s8",
+    author_deps = [
+        "//motion:joints_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":motion_cogs",
+        ":session_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)
+
+# S9, a servo that is not there: the same four cogs S1 runs on, with one crank
+# off the bus from the start and a survey that refuses the machine over it.
+scenario_suite(
+    name = "s9",
+    author_deps = [
+        "//motion:joints_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:bus_txn_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
     ],
 )
@@ -613,21 +778,34 @@ rust_library(
         "scenario/check.rs",
         "scenario/read.rs",
     ],
+    # The generated name-to-number sidecar is embedded, so a scenario naming a
+    # motion resolves it out of the committed asset rather than restating an
+    # index the emitter may renumber.
+    compile_data = ["clip_library.names.json"],
     crate_root = "scenario.rs",
     edition = "2024",
     deps = [
         ":log_read",
+        ":motion_cogs",
         ":motion_slots",
         ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        ":sim_cogs",
         ":sim_state_clk_rs",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:serde_json",
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -656,30 +834,34 @@ rust_clk_module(
     validated_naming = VALIDATED_NAMING,
 )
 
-# The session's own aux bookkeeping, in a module of its own: what a transaction
-# is and what shape a register's value has are the packages below this one, and
-# the session host is what writes the record.
-clk(
-    name = "session_aux_clk",
-    srcs = ["session_aux.clk"],
-    outs = [
-        "session_aux_clk_cc.cc",
-        "session_aux_clk_cc.hh",
-        "session_aux_clk_cc.inl",
-    ],
-    cpp_deps = clk_module_deps(SESSION_AUX_MODULES).cpp,
-    generate = ["cpp"],
-    visibility = ["//visibility:public"],
-    deps = clk_module_deps(SESSION_AUX_MODULES).clk,
+# What arrives from outside: a script, as a request measured in offsets from the
+# instant its sender stamped. It reaches only the schedule's own step and posture
+# vocabulary, because what a step asks for is the same question either side of
+# the screen.
+# No `cog_impl`: the module declares no cogs.
+clk_schema_module(
+    name = "script",
+    imports = SCRIPT_MODULES,
 )
 
+# What the session keeps between one execution and the next, in a module of its
+# own because a cog member's type is an interface instantiation and the compiler
+# resolves one only against a module the cog's module imports. It reaches the
+# four sequencers, the narration and the schedule, which is why the driver side
+# imports the command module next door instead.
 # No `cog_impl`: the module declares no cogs.
-rust_clk_module(
-    name = "session_aux_clk_rs",
-    src = "session_aux.clk",
-    imports = clk_module_deps(SESSION_AUX_MODULES).imports,
-    validated_naming = VALIDATED_NAMING,
-    deps = clk_module_deps(SESSION_AUX_MODULES).rs,
+clk_schema_module(
+    name = "session",
+    imports = SESSION_MODULES,
+)
+
+# The one datagram the session sends the driver. Narrow on purpose: the driver
+# consumes it and must not rebuild when a sequencer snapshot or the timeline
+# changes shape.
+# No `cog_impl`: the module declares no cogs.
+clk_schema_module(
+    name = "session_cmd",
+    imports = SESSION_CMD_MODULES,
 )
 
 rust_test(
@@ -688,14 +870,13 @@ rust_test(
     srcs = ["session_slot_test.rs"],
     edition = "2024",
     deps = [
-        ":msgs_clk_rs",
-        ":session_aux_clk_rs",
+        ":session_clk_rs",
         ":session_slots",
         "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
         "//motion:bus_txn_clk_rs",
         "//motion:faults_clk_rs",
-        "//motion:fk_clk_rs",
         "//motion:joints_clk_rs",
         "//motion:reports_clk_rs",
         "//motion:seq_clk_rs",
@@ -713,11 +894,10 @@ rust_library(
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
-        ":msgs_clk_rs",
+        ":session_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//motion:faults_clk_rs",
         "//motion:reports_clk_rs",
-        "//motion:seq_clk_rs",
         "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:thiserror",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
@@ -763,6 +943,7 @@ clk(
     data = [
         "clip_library.textproto",
         "mover_params.textproto",
+        "session_params.textproto",
         "sim_params.textproto",
     ],
     generate = [
@@ -806,7 +987,9 @@ rust_test(
     edition = "2024",
     deps = [
         ":config_clk_rs",
+        ":session_cmd_clk_rs",
         ":sim_clk_rs_test",
+        ":sim_cogs",
         ":sim_state_clk_rs",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
@@ -815,6 +998,8 @@ rust_test(
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
         "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -822,13 +1007,19 @@ rust_test(
 
 rust_library(
     name = "sim_cogs",
-    srcs = ["sim_cogs.rs"],
+    srcs = [
+        "sim_aux.rs",
+        "sim_cogs.rs",
+        "sim_regs.rs",
+    ],
     edition = "2024",
     deps = [
         ":config_clk_rs",
         ":motion_slots",
+        ":session_cmd_clk_rs",
         ":sim_clk_rs",
         ":sim_state_clk_rs",
+        "//crates/reachy-bus:reachy_bus",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
@@ -836,6 +1027,8 @@ rust_library(
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
         "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],

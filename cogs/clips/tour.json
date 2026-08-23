@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "sequence",
+  "name": "bench/tour",
+  "description": "antennas up, a beat holding them there, then one body sway",
+  "entries": [
+    {"ref": "bench/tip"},
+    {"gap_ms": 400},
+    {"ref": "bench/sway"}
+  ]
+}

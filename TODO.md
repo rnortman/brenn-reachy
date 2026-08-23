@@ -200,53 +200,21 @@ the next release. Marked in the header of each of those files, in
 `crates/reachy-bench/src/lib.rs`, and beside the explicit `srcs` list in
 `crates/reachy-bench/BUILD.bazel`.
 
-## `session-aux-crossing`
+## `session-hold-timeout-evidence`
 
-Give `SessionState.aux` a reader, or drop the field: the session cog's aux path
-is what writes and reads the outstanding transaction's correlation number,
-`issued` count and retries, and it needs a crossing test pinning that a re-issue
-is the same datagram, correlation number included.
+Decide what the session does about the driver's `hold_timeout_torque_off` event.
+It reads it and does nothing, and the fault vocabulary has no value for the
+condition it reports.
 
-Deferral context: the aux twin the field crossed through
-(`session_slots`'s `Pending`, `write_aux_pending`, `read_aux_pending`) was
-deleted with the rest of the aux conversion layer, and its round-trip tests went
-with it. The field itself stays because the session cog will hold exactly this
-state, and the schema is the state under the new doctrine — but until that cog
-lands, the slot carries retry bookkeeping with no reader and no test, and
-nothing marks that the re-issue property is unestablished. Whether the field is
-declared now or when its reader arrives is the follow-on design's call. Marked at
-`SessionState`'s `aux` field in `cogs/msgs.clk`.
-
-## `degrade-maneuver-narration`
-
-Name the antenna torque-off in the report that narrates a degrade, or drop the
-maneuver it would be named by.
-
-Deferral context: `Maneuver::AntennaTorqueOff` is the one fault response the
-doctrine scopes to a group — the antenna pair goes limp and the head keeps its
-presence — and nothing in the build constructs it. The bench host that used to
-report under it is out of the build, and a degrade now travels in the tick's
-report, which carries the fault kind and the newly masked joints but no maneuver
-name. Which host names the maneuver, and whether the outbound report carries one
-at all, is the follow-on session design's call, since that design draws the
-report the session publishes. Until then the variant stays: a degrade's maneuver
-is classified in one place rather than spelled afresh by each host that needs it.
-Marked at the variant in `crates/reachy-motion/src/winddown.rs`.
-
-## `winddown-commanded-epoch`
-
-Give `WindDownSnap.commanded_epoch` a writer and a reader, or drop the field.
-
-Deferral context: the field says which schedule epoch the stow was last
-commanded with, which is what tells a stow already asked for from one still to be
-published. Its previous carrier was the wind-down crossing in the session slot
-mapping, deleted with the rest of the crossings, and the wind-down core never
-picked it up: the maneuver's own decision turns on no epoch, and the host that
-publishes the stow is what compares them — the session cog the follow-on design
-builds. So the field is declared, zero, and unread, and `WindDown::begin` clears
-it along with the rest of the slot, which means a writer arriving later starts
-from a blank at every open. Whether it is declared now or when its writer arrives
-is that design's call. Marked at the field in `motion/timeline.clk`.
+Deferral context: the event says the goal stream went quiet for longer than the
+driver waits and the machine was de-torqued because of it. That is evidence about
+this host's own liveness rather than about the servos, and `FaultKind` names no
+such condition -- so there is nothing to record it as and no response to
+classify. The keep-alive rule is what makes the event unreachable in a healthy
+run, so the decision belongs with that rule: either the session answers a hold
+timeout as a condition (which wants a vocabulary value, and the numbering is the
+log contract), or it is ruled a report about a bug and left to the driver's own
+channel. Marked at `fault_of_event` in `cogs/session_ladder.rs`.
 
 ## `override-regen`
 
@@ -405,30 +373,13 @@ that any value reaches the output log). Reading
 one takes a Rust type bound to a group's generated schema, which
 `rust_clk_module` is not established to emit; whether the emptiness is the
 policy's reporting window, the run's length, or a drop limitation is the first
-question. Done when a scenario checker reads a
+question. One statement is waiting on it by name: S6 is meant to show
+`base_stretched` counting through the whole stack when a base plan stretched, and
+a signal total is the only place that count appears -- so the stretch has cog-level
+coverage and no end-to-end pin. Done when a scenario checker reads a
 group's totals and asserts them against its own arithmetic. Marked at
 `signal_groups` in `cogs/scenario/check.rs`, which every scenario of the motion
 system calls.
-
-## `refusal-classification-reported`
-
-Report *which* refusal a cog made, not only how many. `motion_cogs`' mover
-counts a state it cannot read, a state that describes no tick, and a sample that
-does not validate as three totals; `sim_cogs` counts a refused goal the same
-way. Every one of those calls returns a typed error naming the cause --
-`StateError` alone has seven variants, each carrying its own source -- and every
-one is dropped at the call site.
-
-Deferral context: after an incident the count is the only trace, and
-"refused_state: 1" cannot tell a quaternion that is not a rotation from a mode
-byte this build does not know from a publisher writing bytes the schema does not
-declare -- three problems with three different owners. What it takes is a
-decision this slice cannot make on its own: the fault channel carries
-`TickFault` and `FaultKind`, which is raise-time fault vocabulary, and a refused
-slot is not a fault in the ladder, so naming the cause means either a new
-report vocabulary or a signal carrying the discriminant -- a schema and a
-channel change, and a question for the design that plans the session's
-reporting. Marked at the state refusal in `cogs/motion_cogs.rs`.
 
 ## `resume-hands-back-the-path`
 
@@ -450,43 +401,6 @@ schema also holds, kept in step at every site that writes the seed, which is
 the arrangement the schema-resident state rules out by design and a change to
 two public entry points. Marked at `resume` in
 `crates/reachy-motion/src/tick.rs`.
-
-## `cogs-session-channel`
-
-Give the session cog its own channel to the driver. It will need to send the
-driver traffic of its own — a torque-off control datagram, and the aux
-transactions an arming or disarming sequence is made of — and `DriverCmd`, the
-goal stream, is not where that can go.
-
-Deferral context: every Clockwork channel at this drop has exactly one
-publisher. An input fed by a channel two cogs publish to needs `no_dial`, and no
-system holding a `no_dial` input loads at all, so the shape the parent design
-sketched — the decision tick and the session cog both publishing goals and
-controls on one channel — is not implementable. Nothing is lost yet: this slice
-has no session cog, and the decision tick is `DriverCmd`'s only publisher. The
-decision is which shape the session slice takes — a second channel into the
-driver, or a multi-publisher channel if the framework grows one — and it is that
-slice's to make, with the aux path's requirements in hand. Marked at the
-`DriverCmd` declaration in `cogs/motion.clk`.
-
-## `follow-on-line-budget`
-
-Set a normative end-state line budget for the animation logic from measurement,
-in the design that finishes the remaining functionality — the mover overlay
-tick, the driver process's own half, the session composition and the scenarios
-past S5.
-
-Deferral context: the budget of record was priced on the assumption that the
-hand-written translation code simply disappears when a schema becomes the
-state. Measured, roughly half of it comes back one layer down as read and write
-modules over the same schemas, so the target it produced is not a number the
-remaining work can meet, and restating it lower would be adopting a fiction.
-The replacement has to start from a per-module accounting of the code as it
-then stands — with `tick.rs` accounted by functional region, since it is the
-largest single remainder and it is envelope discipline and fault handling
-rather than translation — and propose an end state the owner approves against
-that accounting. Unmarked in code: the site is the follow-on design, which does
-not exist yet.
 
 ## `clip-schemas-config-home`
 
@@ -522,41 +436,6 @@ crate with its own package and visibility boundary rather than a target-level
 edit, which is a packaging decision the frozen design does not make, and the
 cost grows each time the authoring side gains a format. Marked in the header of
 `crates/reachy-clips/src/lib.rs`.
-
-## `library-walk-per-execution`
-
-Decide what a cog does with `ValidatedLibrary` between executions, and make the
-per-frame walk something a control period does not repeat: either a fact the
-mover's own state records once, or per-frame checks moved to the two frames a
-tick actually samples.
-
-Deferral context: `ValidatedLibrary::of` walks every frame of every clip — up to
-16 clips of 512 frames, ten field reads and a quaternion norm apiece — and
-exists so that walk is paid once rather than per use. But the handle borrows the
-configuration message, and a cog's only memory between executions is its state
-slot, so the intended caller cannot carry it across executions: as it stands the
-overlay tick re-walks the library every control period to obtain what `take_up`
-requires. Nothing calls it on the control path yet — the mover overlay tick is
-the follow-on design's work — and which answer is right depends on the state
-that design gives the mover, so it is decided there rather than guessed here.
-Marked at `ValidatedLibrary::of` in `crates/reachy-clips/src/config.rs`.
-
-## `overlay-fade-continuity`
-
-Keep a closing overlay window from dropping its player's weighted delta in one
-control period: a playing clip's contribution reaches zero before its row
-vacates.
-
-Deferral context: `take_up` vacates a row on the first execution its window does
-not cover, so a window that closes while its player still carries weight takes
-the whole delta out at once — the composed-setpoint discontinuity a clip's exit
-ramp exists to prevent, arriving by a different door. The invariant above is
-settled; the mechanism is not, and it cannot be settled here: either the
-schedule's windows are authored fade-inclusive and the window screen enforces
-it, or this layer holds a fading player past its window's end. Both answers
-belong to whoever owns the schedule author and this layer's contract at once,
-which is the session design. Nothing reaches it today — `take_up` has no
-control-path caller. Marked at `take_up` in `cogs/overlay.rs`.
 
 ## `bazel-device-config-gate`
 
@@ -601,3 +480,140 @@ own, against a per-run save of a multi-gigabyte archive and the 10 GB per-repo
 budget it competes for. Nothing about it is a correctness question — both stores
 are content-addressed, so any cache state produces the same build. Marked at
 the cache step in `.github/workflows/ci.yml`.
+
+## `sim-refused-readings-asserted`
+
+Assert in the scenario checkers' standing set that the simulated driver left no
+plant reading out of its register file, so a reading that stopped being a number
+is loud at the scenario level rather than only in the cog's own cases.
+
+Deferral context: a non-finite plant angle is counted and its cell keeps the last
+finite value it held, so the published sample carries a plausible stale angle and
+the count is the only evidence anything went wrong. That count is a state total
+reported through the cog's signal group, and nothing in this repo can read the
+value a signal carries — no Rust type binds to a generated report group
+(`cogs-signal-report-contents`) and state slots do not reach the output log — so
+a checker has no way to ask. The assertion is one line per checker once a signal's
+contents are readable. Marked at `read_registers` in `cogs/sim_cogs.rs`.
+
+## `session-servo-profile`
+
+Give the servo-side velocity/acceleration profile the commissioning sweep writes
+a measured value and a home in configuration, rather than a constant in the
+session cog.
+
+Deferral context: the pair in the tree (20 / 50 register units) is a modest
+backstop chosen for a host that streams one step-bounded setpoint per period, and
+nothing has run it on hardware. It is an order of magnitude below the figures the
+bench carries in its own configuration, which are sized for a host that commands
+whole moves outright, so the two cannot both be right for the same machine and
+neither has a measurement behind it. What decides it is a hardware session — too
+tight and the servos rate-limit a correctly shaped stream, which surfaces as
+growing tracking error rather than as a refusal — and where the number then
+lives is a policy question: the bench treats it as required configuration with no
+default, and the online session has no configuration for it yet. Both halves of
+that are outside what the deterministic runner can answer. Marked at `PROFILE` in
+`cogs/session_bus.rs`.
+
+## `aux-pending-carries-bustxn`
+
+Let the session's pending-transaction record carry a transaction record whole,
+rather than restating its fields, so the compiler owns the completeness of every
+crossing a transaction makes.
+
+Deferral context: the record a sequencer waits on is a schema of its own and the
+session's pending record restates its five payload fields beside the correlation
+number, the send instant and the re-issue count. A validated view is a reference
+into the message it validated, so there is no value form of one to assign across
+those crossings: each is field by field, and a field added to the transaction
+schema would be dropped between the sequencer's record, the datagram and the
+modelled bus in silence. Tests carry a fully distinct record through each
+crossing and a tripwire fails when the record grows, which is what stands in for
+the compiler today. The fix is a schema shape — the pending record holding the
+transaction as a field, the way the driver's own slot state already does, which
+makes every copy a whole-message one — and that is a change to a declaration this
+arc's design froze. Marked at `Txn` in `cogs/session_bus.rs`.
+
+## `session-mask-view`
+
+Give the session a view of which joints the decision tick is still commanding,
+so a wind-down can tell a head with nothing left to drive it from one that is
+still being carried down.
+
+Deferral context: the wind-down core asks its host two questions, and the session
+can answer only one of them. Whether the machine reached the fold it reads off
+the driver's pose stream; whether every joint that carries the head has been
+taken out of service is a fact about the tick's mask, and nothing published
+carries it. So the session answers `false` always, which is the conservative
+reading — the stow keeps being commanded until the maneuver's own clock ends it,
+where a wrong `true` would let go of a head that could still have been carried
+down. What it costs is the record: a maneuver that ran out of joints is written
+down as one that ran out of clock. The set could be assembled from the raises the
+session already sees, and was not, because the tick also masks at the engage-time
+health gate without raising, so an assembled set can disagree with the tick's own
+— and disagreeing in the direction of `true` is the direction that drops a head.
+The fix is the tick publishing what it is commanding, which is a channel and a
+schema this arc's design does not name. The scenario suite feels it too: S8's
+masked stow to park is asserted with the strict goal stream, because no joint
+ever leaves service in that run -- so the "masked" half of the rung's name has no
+end-to-end statement, and the day the mask reaches the goal stream that assertion
+is where the run has to say which joint left. Marked at the evidence the maneuver
+is stepped with in `cogs/session_stow.rs`, and at the goal stream S8 asserts in
+`cogs/s8_checker.rs`.
+
+## `commission-verdict-narration`
+
+Give the timeline a row that says *why* the commissioning survey refused the
+machine, so an operator reading the report stream learns which servo the sweep
+did not find rather than only that the machine is parked.
+
+Deferral context: a failed survey leaves the session parked without ever writing
+torque, and what the record carries for it is a phase row from starting to parked
+and nothing else. The verdict -- which rows answered, which register read what --
+stands in the survey's own snapshot, which is a state slot and does not reach the
+output log, so the report stream says "parked" and no more. The condition is not a
+fault: nothing about a machine that is not the one this process was configured for
+is broken, so it is not on the fault path, and the report vocabulary has no kind
+for it. The fix is a report kind and a decision about which of the survey's
+findings a reader is owed -- an addition to the log contract in
+`motion/reports.clk` rather than a code change -- and it is the same decision
+`engagement-declined-narration` is waiting on, so the two want taking together.
+Marked where the survey's endings are read in `cogs/session_bus.rs`, and at the
+narration S9 pins as it stands in `cogs/s9_checker.rs`.
+
+## `engagement-declined-narration`
+
+Give the timeline a row that says *why* an engagement was declined without ever
+writing torque, so a sender that had its script accepted can tell a supply gate
+that refused from a sweep that never completed.
+
+Deferral context: an engagement that stops before its first enable write leaves
+the machine limp and the session at rest, and what the record carries for it is a
+phase row from engaging back to resting and nothing else. The condition itself is
+not a fault — nothing about the machine is wrong when it declines to be armed on
+the supply it has — so it is not on the fault path, and the report vocabulary has
+no kind for it: the reasons live inside the sequencers as their own classified
+failures. The fix is a report kind and a decision about which of those failures a
+reader is owed, which is an addition to the log contract in
+`motion/reports.clk` rather than a code change. Marked where the endings are read
+in `cogs/session_bus.rs`.
+
+## `tick-feedback-latch-composed`
+
+Cover the decision tick's own feedback-lost latch end to end again: an outage
+where the tick's tolerance for missed reads runs out before the driver declares
+the bus failed, with the raise reaching the session, the session answering it,
+and the goal stream ending because the tick gave up rather than because the
+session let go.
+
+Deferral context: S4 used to carry this, and the session taking hold of the
+machine moved the scenario's subject — the driver's own bus-failure declaration
+now reaches the session and parks the machine long before the tick runs out of
+tolerance, which is the correct ordering and is what the scenario now asserts.
+The composed statement that the two halves agree about a machine nobody can see
+went with it, and it is not a statement a cog test can make: which of the two
+notices first is arithmetic over two configured tolerances, which is what a
+scenario is for. Arranging the other order needs either a way to suppress the
+driver's declaration for a window, which is a new injection, or different
+tolerances, which are motion-guard bounds this arc's design does not edit. Marked
+where the deleted assertion stood in `cogs/s4_checker.rs`.

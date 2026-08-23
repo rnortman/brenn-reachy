@@ -42,7 +42,7 @@
 use reachy_kin::FkError;
 use thiserror::Error;
 
-use crate::joints::JointRef;
+use crate::joints::{self, JointGroup, JointRef, ServoHealth, group_of};
 use crate::snap::{BusSourceKind, FkFieldError, fk_cause, fk_fields};
 use crate::tick::{BusFailureSource, Fault, ResponseKind};
 use crate::vocab::known_nonzero;
@@ -241,6 +241,39 @@ pub fn latches(kind: FaultKind) -> bool {
     )
 }
 
+/// The condition a servo's hardware-error byte is evidence of, or `None` where
+/// it is evidence of nothing.
+///
+/// The judgement the decision tick makes over its own health poll, at one site
+/// so that a host reading the same bytes off a driver's rotating read reaches
+/// the same verdict. Two things decide it and nothing else does: whether the
+/// byte carries anything but the input-voltage bit, and which group the row
+/// belongs to — an antenna's trouble is its own, and a head servo's is the
+/// head's.
+///
+/// `None` for a clear byte, for the input-voltage bit alone — expected on this
+/// platform, reported rather than acted on — and for a row the bus does not
+/// have, which is evidence about no servo at all. Masking is the caller's: a
+/// masked joint keeps flagging for the rest of the session, and what to do about
+/// a condition already answered is a question about the machine's state rather
+/// than about these bits.
+#[must_use]
+pub fn fault_of_health(row: usize, bits: u8) -> Option<FaultKind> {
+    let joint = joints::joint_ref(row)?;
+    // The reading's own judgement of its bits, asked through the type that owns
+    // the rule rather than restated here. The bus id is not part of it: what
+    // names the servo in the report is the row the caller read.
+    if (ServoHealth { id: 0, bits }).healthy_or_voltage_only() {
+        return None;
+    }
+    match group_of(joint) {
+        Some(JointGroup::Antennas) => Some(FaultKind::AntennaServoFault),
+        // The yaw and the six cranks all hold the head up, so any of them
+        // reporting a hardware error is the head's condition.
+        Some(JointGroup::BodyYaw | JointGroup::Legs) | None => Some(FaultKind::HeadServoFault),
+    }
+}
+
 /// Write `fault` into the fields a slot holds a standing fault in.
 ///
 /// Total: every field is assigned, the blanks included, so a slot carrying an
@@ -387,6 +420,7 @@ fn bus_source(slot: &FaultSnap) -> Result<BusFailureSource, FaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joints::ROWS;
     use crate::seq::{RegId, SeqError, SeqFailureKind, SeqStepKind, StepContext};
     use crate::snap::FkFailureKind;
     use crate::testutil::{every_fault, every_sequencer_failure};
@@ -428,6 +462,46 @@ mod tests {
         let mut covered: Vec<FaultKind> = every_fault().iter().map(kind).collect();
         covered.sort_unstable();
         assert_eq!(covered, standing());
+    }
+
+    /// Every byte, every row: which condition a health reading is evidence of.
+    ///
+    /// Swept over all 256 bytes rather than a handful, because what the rule
+    /// says is that *one* bit is forgiven and every other one is not, and a
+    /// case naming two or three bytes would pass over a build that forgave a
+    /// second bit. The expectation is written from the group rather than from
+    /// `fault_of_health`'s own answer, so the two are separate statements.
+    #[test]
+    fn a_health_reading_is_evidence_about_the_group_its_row_belongs_to() {
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            let antenna = group_of(joint) == Some(JointGroup::Antennas);
+            for bits in 0..=u8::MAX {
+                let forgiven = bits & !ServoHealth::INPUT_VOLTAGE == 0;
+                let expected = match (forgiven, antenna) {
+                    (true, _) => None,
+                    (false, true) => Some(FaultKind::AntennaServoFault),
+                    (false, false) => Some(FaultKind::HeadServoFault),
+                };
+                assert_eq!(
+                    fault_of_health(row, bits),
+                    expected,
+                    "row {row} ({joint}) reading {bits:#010b}"
+                );
+            }
+        }
+    }
+
+    /// A row the bus does not have is evidence about no servo.
+    ///
+    /// The one arm that is not about the bits: a reading filed under a row past
+    /// the ninth came from somewhere this build cannot place, and a verdict
+    /// about it would name a servo nobody read.
+    #[test]
+    fn a_reading_from_no_row_this_bus_has_is_evidence_of_nothing() {
+        for bits in [0x00, ServoHealth::INPUT_VOLTAGE, 0x20, 0xff] {
+            assert_eq!(fault_of_health(ROWS.len(), bits), None);
+            assert_eq!(fault_of_health(usize::MAX, bits), None);
+        }
     }
 
     #[test]

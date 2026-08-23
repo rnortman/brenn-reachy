@@ -8,24 +8,18 @@
 //! have in common -- the report kinds and the session phases -- which nothing in
 //! either language holds still on its own.
 
-use brenn_reachy__cogs__msgs_clk_rs::{SessionPhaseWire, SessionStateWire};
-use brenn_reachy__cogs__session_aux_clk_rs::{AuxStatus, AuxStatusWire as AuxStatusSlot};
-use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegIdWire, ValueShape, ValueShapeWire};
+use brenn_reachy__cogs__session_clk_rs::{SessionPhaseWire, SessionStateWire};
+use brenn_reachy__driver__health_clk_rs::{AuxStatus, AuxStatusWire as AuxStatusSlot};
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::{ValueShape, ValueShapeWire};
 use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, AuxOpKindWire};
-use brenn_reachy__motion__fk_clk_rs::FkFailureKindWire;
-use brenn_reachy__motion__joints_clk_rs::JointRefWire;
+use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
 use brenn_reachy__motion__reports_clk_rs::{ReportKind, ReportKindWire as ReportKindSlot};
-use brenn_reachy__motion__seq_clk_rs::{
-    AnswerShapeWire, SeqFailureKindWire, SeqFailureSnapWire, SeqKindWire, SeqStepKindWire,
-};
+use brenn_reachy__motion__seq_clk_rs::SeqKindWire;
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 use clockwork_rs::SyncTime;
-use reachy_motion::seq::{AnswerShape, RegId, SeqError, SeqStepKind, StepContext};
-use reachy_motion::value;
 use session_slots::{
     SessionSlotError, TIMELINE_LEN, clear_timeline, clear_timeline_entry, mark_published,
-    oldest_unpublished, push_report, read_opt_seq_failure, unpublished_reports,
-    write_opt_seq_failure,
+    oldest_unpublished, push_report, unpublished_reports,
 };
 
 /// An instant far from zero, so a dropped or defaulted timestamp reads as
@@ -114,7 +108,7 @@ reachy_motion::vocab_numbering! {
     /// inserted among these renarrates every story already on disk. Nothing in
     /// either language says so, which is why it is said here.
     the_report_numbering_is_the_one_written_down:
-        ReportKind as ReportKindSlot, past the end 13 {
+        ReportKind as ReportKindSlot, past the end 14 {
         ReportKind::None => 0,
         ReportKind::PhaseChanged => 1,
         ReportKind::ScriptAccepted => 2,
@@ -128,6 +122,7 @@ reachy_motion::vocab_numbering! {
         ReportKind::SessionEnded => 10,
         ReportKind::AuxGaveUp => 11,
         ReportKind::SchedulePublished => 12,
+        ReportKind::DegradeReleased => 13,
     }
 }
 
@@ -152,12 +147,14 @@ reachy_motion::vocab_numbering! {
     /// pins one of these numbers; the rest are pinned here. The zero is `ok`,
     /// which is a number like any other.
     the_aux_status_numbering_is_the_one_written_down:
-        AuxStatus as AuxStatusSlot, past the end 5 {
+        AuxStatus as AuxStatusSlot, past the end 7 {
         AuxStatus::Ok => 0,
         AuxStatus::Timeout => 1,
         AuxStatus::DecodeError => 2,
         AuxStatus::WireError => 3,
         AuxStatus::Refused => 4,
+        AuxStatus::ServoError => 5,
+        AuxStatus::VerifyMismatch => 6,
     }
 }
 
@@ -177,82 +174,6 @@ reachy_motion::vocab_numbering! {
         ValueShape::Radians => 5,
         ValueShape::Volts => 6,
         ValueShape::Gains => 7,
-    }
-}
-
-/// A slot nothing wrote holds no verdict, which is also what a snapshot in a
-/// running phase holds. The zero kind is a value the vocabulary names, so it
-/// validates and reads as the absence of a verdict, never as the first failure
-/// in the list: a verdict invented from zeroes reports a servo silent that
-/// answered.
-#[test]
-fn a_slot_nobody_wrote_holds_no_verdict() {
-    assert_eq!(read_opt_seq_failure(&SeqFailureSnapWire::new()), Ok(None));
-}
-
-/// A verdict, then the same slot written with a running sequence's absence of
-/// one: the whole record goes, so nothing of the first is read as evidence
-/// afterwards.
-#[test]
-fn a_verdict_and_then_none_leaves_the_slot_holding_none() {
-    let verdict = SeqError::VerifyMismatch {
-        context: StepContext::reg(SeqStepKind::GainsProfiles, 41, RegId::VelocityLimit),
-        expected: value::u8(1),
-        read_back: value::u8(0),
-    };
-    let mut slot = SeqFailureSnapWire::new();
-    write_opt_seq_failure(&mut slot, Some(&verdict)).expect("a verdict crosses");
-    assert_eq!(read_opt_seq_failure(&slot), Ok(Some(verdict)));
-    write_opt_seq_failure(&mut slot, None).expect("and so does none");
-    assert_eq!(read_opt_seq_failure(&slot), Ok(None));
-    assert_eq!(slot.reg(), RegIdWire::NONE);
-}
-
-/// Bytes the schema does not declare, in each enumeration field of a verdict.
-/// The crossing is one validation, so every one of them is the same refusal at
-/// the boundary rather than a variant per field, and the offset names which
-/// field it was.
-#[test]
-fn a_verdict_field_this_build_does_not_declare_is_refused_at_the_boundary() {
-    let written = || {
-        let mut slot = SeqFailureSnapWire::new();
-        write_opt_seq_failure(
-            &mut slot,
-            Some(&SeqError::WrongAnswer {
-                context: StepContext::reg(SeqStepKind::GainsProfiles, 41, RegId::VelocityLimit),
-                expected: AnswerShape::Written,
-                observed: AnswerShape::Mismatched,
-            }),
-        )
-        .expect("a verdict crosses");
-        slot
-    };
-
-    let mut probe = written();
-    probe.set_kind(SeqFailureKindWire(200));
-    assert!(matches!(
-        read_opt_seq_failure(&probe),
-        Err(SessionSlotError::Invalid(_))
-    ));
-
-    for spoil in [
-        |slot: &mut SeqFailureSnapWire| slot.set_step(SeqStepKindWire(200)),
-        |slot: &mut SeqFailureSnapWire| slot.set_reg(RegIdWire(4_000)),
-        |slot: &mut SeqFailureSnapWire| slot.set_expected_answer(AnswerShapeWire(200)),
-        |slot: &mut SeqFailureSnapWire| slot.set_observed_answer(AnswerShapeWire(201)),
-        |slot: &mut SeqFailureSnapWire| slot.set_expected_kind(ValueShapeWire(200)),
-        |slot: &mut SeqFailureSnapWire| slot.set_joint(JointRefWire(200)),
-        |slot: &mut SeqFailureSnapWire| slot.set_fk_code(FkFailureKindWire(200)),
-    ] {
-        let mut probe = written();
-        spoil(&mut probe);
-        assert!(
-            matches!(
-                read_opt_seq_failure(&probe),
-                Err(SessionSlotError::Invalid(_))
-            ),
-            "a number no vocabulary names is refused where the slot is validated"
-        );
     }
 }
 
@@ -284,7 +205,7 @@ fn numbered(row: &TimelineEntryWire) -> u32 {
 
 /// The number of the oldest unpublished report, or `None` where none is waiting.
 fn oldest_number(state: &SessionStateWire) -> Result<Option<u32>, SessionSlotError> {
-    Ok(oldest_unpublished(state)?.map(numbered))
+    Ok(oldest_unpublished(state)?.map(|(row, _)| numbered(row)))
 }
 
 #[test]
@@ -537,9 +458,12 @@ fn a_session_slot_nobody_wrote_is_a_session_that_has_not_begun() {
     assert_eq!(state.schedule().overlays().len(), 0);
 
     assert_eq!(unpublished_reports(&state), Ok(0));
-    assert_eq!(state.cmd_seq(), 0);
-    assert_eq!(state.report_seq(), 0);
     assert_eq!(state.next_corr(), 0);
+    assert_eq!(
+        state.degrade_release(),
+        JointFlagsWire::NONE,
+        "and no row is owed a torque-off write"
+    );
 
     for total in [
         state.scripts_accepted(),

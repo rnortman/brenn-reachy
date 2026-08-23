@@ -2,11 +2,17 @@
 // what its rotating read of the status registers saw, and how one aux
 // transaction turned out.
 //
-// Three records, one module: all three are the driver's diagnostic voice, none
-// of them is per-cycle, and a consumer of one is a consumer of all three -- an
-// operator report, a session's bookkeeping, a bench. The per-cycle pose stream
-// is `driver/pose.clk` and stays out, so a change to a health record does not
+// Three records and the status vocabulary one of them speaks, in one module:
+// all of it is the driver's diagnostic voice, none of it is per-cycle, and a
+// consumer of one record is a consumer of all three -- an operator report, a
+// session's bookkeeping, a bench. The per-cycle pose stream is
+// `driver/pose.clk` and stays out, so a change to a health record does not
 // rebuild the control path.
+//
+// The status an aux transaction ended with is declared here because the driver
+// is what writes one: a producer owns the vocabulary its reports are read in,
+// and a host that consumes an outcome imports the driver rather than the driver
+// importing the host.
 //
 // Two conventions hold, and both are worth stating because a reader coming from
 // the datagram layout will expect otherwise: an interval is a `Duration` and an
@@ -16,7 +22,6 @@
 #![generate(cpp)]
 #![cpp(namespace=brenn_reachy::driver)]
 
-use cogs::session_aux;
 use hardware::dynamixel::registers;
 use motion::joints;
 
@@ -134,6 +139,43 @@ schema HealthReport
     }
 }
 
+// How an aux transaction ended.
+//
+// Zero is `ok`, against the habit of leaving zero for "nothing wrote this": the
+// transaction that ran without incident is the honest thing for a driver's
+// freshly zeroed outcome to say it did. So a field of this type is only ever
+// about a transaction some other field says happened.
+//
+// The numbering is append-only: it is what a recorded log and a running build
+// have in common.
+enum AuxStatus
+{
+    uuid: 3bea97c4-f9c1-4867-9e8a-0dcc18154d48;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // The servo answered, and the answer is in the payload.
+        #0 ok default { underlying_value: 0; }
+        // Nothing came back inside the driver's own window.
+        #1 timeout { underlying_value: 1; }
+        // Something came back and was not a reply.
+        #2 decode_error { underlying_value: 2; }
+        // The bus itself failed the transaction.
+        #3 wire_error { underlying_value: 3; }
+        // The driver declined to run it, so nothing reached the bus.
+        #4 refused { underlying_value: 4; }
+        // The servo answered with an error of its own. The code it gave is in
+        // `value`.
+        #5 servo_error { underlying_value: 5; }
+        // A verified write read back as something else. What it read back is in
+        // `value_kind` and `value`.
+        #6 verify_mismatch { underlying_value: 6; }
+    }
+}
+
 // The driver's answer to exactly one aux transaction.
 //
 // `corr` is the join: a host matches an outcome to the request it issued and
@@ -147,17 +189,28 @@ schema AuxOutcome
         // The correlation number of the request this answers.
         #0 corr: UInt32;
 
-        // How it went. Only `ok` carries an answer below.
-        #1 status: session_aux::AuxStatus;
+        // How it went. `ok` carries whatever answer the transaction had; the two
+        // failures that carry evidence say so on their own values.
+        #1 status: AuxStatus;
 
         // What shape the value below is, and `none` where the transaction
-        // answered no value -- a ping, a plain write, or any failure.
+        // answered no register value -- a ping, a plain write, or a failure with
+        // nothing to read back.
         #2 value_kind: registers::ValueShape;
 
         // The answer, as the eight bytes a register value is carried in read as
         // one little-endian number. Bits rather than a number of anything: what
         // they mean is `value_kind`, and an angle crosses here as its own
-        // IEEE-754 pattern.
+        // IEEE-754 pattern. Under `servo_error` it is the code the servo gave
+        // instead, which is a number and not a register value, so `value_kind`
+        // is `none`.
         #3 value: UInt64;
+
+        // The model number a ping answered with, and zero for every other
+        // transaction. Its own field rather than the value above because a ping
+        // names no register, so there is no shape for the value to be tagged
+        // with: what a ping proves is that something at this id answers, and
+        // what it says about itself is this number.
+        #4 model: UInt16;
     }
 }

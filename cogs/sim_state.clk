@@ -8,11 +8,13 @@
 // on it.
 //
 // The joint vocabulary -- which servo, which set, one number per servo -- is
-// `motion/joints.clk`. The goal gate's own state is `driver/gate.clk`,
-// imported under an alias because `SimState` carries a field called `gate` and
-// a field name shadows a module name in the schema's scope, which the compiler
-// refuses as a redefinition. Angles are radians about the model datum, the
-// units `reachy-motion` uses, so nothing here converts.
+// `motion/joints.clk`. The goal gate's own state is `driver/gate.clk` and the
+// aux slot's, the torque belief's and the confirmation pass's is
+// `driver/aux.clk` -- both imported under an alias because `SimState` carries
+// fields called `gate` and `aux`, and a field name shadows a module name in the
+// schema's scope, which the compiler refuses as a redefinition. Angles are
+// radians about the model datum, the units `reachy-motion` uses, so nothing
+// here converts.
 //
 // The totals are all-run counts, kept in the slot rather than in a signal
 // group's own fold: a post-aggregated group folds over a bounded window and
@@ -22,7 +24,9 @@
 #![generate(cpp)]
 #![cpp(namespace=brenn_reachy::cogs)]
 
+use driver::aux as aux_vocab;
 use driver::gate as gate_vocab;
+use hardware::dynamixel::registers;
 use motion::joints;
 
 // What a scenario does to the simulated machine.
@@ -55,6 +59,24 @@ enum SimOp
         #5 release_obstruction { underlying_value: 5; }
         // Lose the next `count` cycles of position replies.
         #6 drop_replies { underlying_value: 6; }
+        // Write `value` into the masked rows' `reg` register, as a hand on the
+        // machine would: a servo whose rail sagged, whose error byte latched, or
+        // whose provisioning is wrong. Refused for the registers the plant
+        // owns -- where a servo is, what it is holding, whether it is energised
+        // -- which are reached by moving the modelled machine instead.
+        #7 set_register { underlying_value: 7; }
+        // Swallow the next `count` out-of-band transactions the host asks for:
+        // the request never reaches the modelled bus and no outcome comes back,
+        // which is the world a host's own delivery timeout exists for. Values 8
+        // and 9 are absent: writing a servo's error byte or its rail is
+        // `set_register` naming that register, and a second name for it would be
+        // a second way to say the same thing.
+        #10 refuse_aux { underlying_value: 10; }
+        // Stop the masked rows answering at all, as a servo off the bus does:
+        // nothing comes back from a ping, a read or a write to one, and its
+        // torque cannot be confirmed. The mask replaces the set, so an injection
+        // naming nothing puts every servo back on the bus.
+        #11 absent_servo { underlying_value: 11; }
     }
 }
 
@@ -73,8 +95,19 @@ schema SimCmd
         // The positions `set_positions` teleports to, radians.
         #2 positions: joints::Joints;
 
-        // How many cycles of replies `drop_replies` loses.
+        // How many cycles of replies `drop_replies` loses, or how many of the
+        // host's transactions `refuse_aux` swallows.
         #3 count: UInt32;
+
+        // Which register `set_register` writes.
+        #4 reg: registers::RegId;
+
+        // What `set_register` writes, as the eight bytes a register value is
+        // carried in read as one little-endian number. Bits rather than a number
+        // of anything: what they mean is the register's own engineering shape,
+        // which the bus table names, so an angle crosses here as its own
+        // IEEE-754 pattern.
+        #5 value: UInt64;
     }
 }
 
@@ -92,6 +125,11 @@ schema SimCmd
 // stays a slot rather than a read-back of the published samples, because during
 // a reply-drop window the published sample deliberately misreports and the
 // machine underneath it keeps moving.
+//
+// The register file is the modelled servos' control tables, which is what a real
+// driver reaches over the wire and the only thing a transaction ever addresses.
+// Its live cells are a view of the plant above, refreshed every cycle; the rest
+// is how the unit is provisioned.
 //
 // The counters are the run's totals, kept here for the same reason the
 // estimator's are: a post-aggregated signal group folds over a bounded window
@@ -164,9 +202,88 @@ schema SimState
         #13 refused_state_fields: UInt64;
 
         // How many injections this build could not carry out, all run: an
-        // operation it does not know, or one naming servos it does not know.
-        // A scenario written against a newer vocabulary than the binary running
-        // it would otherwise have its hand on the machine discarded in silence.
+        // operation it does not know, one naming servos it does not know, or a
+        // register write a control table refused -- counted per row for that
+        // one, since a table refuses per servo. A scenario written against a
+        // newer vocabulary than the binary running it would otherwise have its
+        // hand on the machine discarded in silence.
         #14 refused_injections: UInt64;
+
+        // The nine modelled control tables: one cell per register per bus row,
+        // row-major, twenty-two registers to a row -- every register the
+        // vocabulary names except its no-register zero, which names no cell.
+        //
+        // A cell holds the register's engineering-unit value in the same
+        // shape-tagged eight-byte carriage a transaction uses, never a servo
+        // count: counts are the bus layer's and nothing above it converts. Which
+        // shape a given cell is read in is the bus table's answer, not a field
+        // here.
+        //
+        // The live cells -- present position, goal position, torque enable --
+        // are brought up to date from the plant above every cycle. The rest is
+        // provisioning: what a healthy, correctly provisioned unit holds, so a
+        // commissioning sequence verifies here against the numbers it verifies
+        // against on hardware.
+        #15 regs: FixedArray<UInt64, 198>;
+
+        // How many plant readings never reached a control table, all run: an
+        // angle the modelled world made non-finite has no eight-byte carriage,
+        // so the cell keeps the last number it held and the reading is counted
+        // here. Every finite-shaped cell is therefore finite, and a plant that
+        // went non-finite says so as a total rather than as a plausible angle
+        // in the sample.
+        #16 refused_readings: UInt64;
+
+        // Which out-of-band transaction the driver is holding for the host, how
+        // far its health rotation has walked, and which servos it believes are
+        // energised. The aux slot decides over it directly; there is no second
+        // form of it anywhere, the same way the gate's state above is carried
+        // whole.
+        #17 aux: aux_vocab::AuxSlotState;
+
+        // How far the confirmation pass has read a commanded de-torquing back,
+        // and what it has already said about it. Carried whole for the same
+        // reason: the pass that runs here is the pass the real driver runs.
+        #18 confirm: aux_vocab::TorqueConfirmState;
+
+        // How many of the host's datagrams the driver turned away as asks it
+        // could not act on, all run: one asking nothing at all, or a transaction
+        // offered while another was still pending. The host that fills that slot
+        // is serial by construction -- it issues one transaction and waits for
+        // its outcome -- so the second of those says the host is not what it
+        // claims to be, and it goes back as an outcome against the turned-away
+        // request's own correlation number as well as being counted here. A
+        // datagram this build could not read at all is a different diagnosis and
+        // has its own total. Neither is liveness: a datagram the driver could
+        // not act on is not evidence that the host is alive.
+        #19 aux_refused: UInt64;
+
+        // How many cycles in a row the bus has answered for no row at all. Zero
+        // again on the first cycle that reads something. A run of them long
+        // enough to mean something is the driver's own evidence that its bus is
+        // gone -- the one fault a driver can raise about itself, since a process
+        // that cannot read the machine cannot see what is wrong with it.
+        #20 blind_cycles: UInt32;
+
+        // How many more of the host's out-of-band transactions are swallowed
+        // before they reach the modelled bus. While this is non-zero a request
+        // the slot handed out is dropped whole: nothing about the machine
+        // changes and no outcome goes back, so what the host meets is the
+        // silence its own delivery timeout is for.
+        #21 aux_unanswered_left: UInt32;
+
+        // Which servos are off the bus. A row in this set answers nothing at
+        // all -- no ping, no read, no write -- and its torque can therefore
+        // never be confirmed off, which is the reading a de-torquing that cannot
+        // be verified must have.
+        #22 absent: joints::JointFlags;
+
+        // How many of the host's datagrams this build could not read at all, all
+        // run. A schema-version mismatch at the boundary rather than anything
+        // about the machine or about what the host asked for: the bytes describe
+        // no datagram, so there is no ask to refuse and nothing to answer
+        // against. Kept apart from the asks the driver turned away because the
+        // two send a reader to different places.
+        #23 undecodable_inbound: UInt64;
     }
 }

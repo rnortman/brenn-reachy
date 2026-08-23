@@ -1,0 +1,80 @@
+// The one thing the session says to the driver.
+//
+// A single datagram shape for all of it: keep the dead-man fed, take torque off
+// now, or run this transaction. One shape because the session publishes at most
+// one of these per wake and the driver drains them in arrival order, so a second
+// channel would be a second ordering to reason about for no gain.
+//
+// A module of its own rather than part of `cogs/session.clk`, and that is
+// deliberate: the driver consumes this and must not import what the session
+// keeps between executions. `SessionState` reaches the four sequencer snapshots,
+// the timeline and the schedule; nothing on the driver side has any business
+// rebuilding when one of those changes.
+//
+// Nothing here is a header. There is no sequence number, no length and no
+// checksum: a typed in-process channel carries none, and the socket edge stamps
+// its own at the socket.
+
+#![generate(cpp)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+use motion::bus_txn;
+
+// What the datagram asks for.
+//
+// `keep_alive` is a real ask and not a filler: the driver's dead-man measures
+// silence, so a wake that owes the driver nothing else still owes it evidence
+// that the session is alive. Every accepted datagram counts as that evidence,
+// whichever kind it is, so a wake with a transaction to send never sends a
+// keep-alive as well.
+enum SessionCmdKind
+{
+    uuid: 0838c8ca-0ab4-40c8-bb6b-da69878d5a26;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Nothing is asked. What a slot nothing wrote holds, and not a datagram
+        // the session ever publishes.
+        #0 none default { underlying_value: 0; }
+
+        // Liveness and nothing else.
+        #1 keep_alive { underlying_value: 1; }
+
+        // Take torque off every row, now. Idempotent, and republished every wake
+        // until the driver says every row confirmed it: nothing gates
+        // de-torquing, so this is never withheld pending anything.
+        #2 torque_off_now { underlying_value: 2; }
+
+        // Run the transaction below, and answer with its outcome.
+        #3 aux { underlying_value: 3; }
+    }
+}
+
+// One datagram from the session to the driver.
+//
+// The transaction and the correlation number mean nothing except under `aux`.
+// They are carried in the fields rather than in a separate message so that a
+// re-issue is a byte-for-byte repeat of what went out before, which is what
+// makes delivery retry safe on a lossy link.
+schema SessionCmd
+{
+    uuid: fb58027d-3a27-4b04-9ce8-ebe4a2185077;
+    fields
+    {
+        // What is asked.
+        #0 kind: SessionCmdKind;
+
+        // The correlation number the answer will carry back, under `aux`. The
+        // join between a request and its outcome, and the only thing that tells
+        // a late duplicate of an answered request from a fresh one.
+        #1 corr: UInt32;
+
+        // The transaction to run, under `aux`. Built by the sequencer that asked
+        // for it and copied here verbatim: the session decides when a
+        // transaction goes out, never what it says.
+        #2 txn: bus_txn::BusTxn;
+    }
+}
