@@ -49,6 +49,10 @@ fn main() -> ExitCode {
             check::stream_starts_with_session(&stream, engaged.taken, failures);
             check::stream_stops_with_release(&stream, engaged.released, failures);
         }
+        // The profile the process was configured with, as the nine servos were
+        // told it. S1's alone among the scenarios: the sweep is the same sweep
+        // in every run, and this is the run in which nothing perturbs it.
+        check::commissioned_profile(run, failures);
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
         check_arrival(run, failures);

@@ -26,9 +26,10 @@
 // across "instances" is asking a question with a wrong answer available.
 // TODO(clockwork-single-instance-signal)
 //
-// Two modules are imported under aliases because a cog here carries a member of
-// the same name: the session's script input is called `script` and its state
-// slot `sess`, and a member name shadows a module name in the enclosing scope,
+// Five modules are imported under aliases because a cog or the box below
+// carries a member of the same name: the session's script input is called
+// `script` and its state slot `sess`, and the box's members are `mover`, `pose`
+// and `pose_state`. A member name shadows a module name in the enclosing scope,
 // which the compiler refuses as a redefinition.
 // (A comment may not sit directly above a `use`, which is why this one is here.)
 //
@@ -40,16 +41,16 @@
 #![generate(cpp, cpp_cog, cpp_test_cog)]
 #![cpp(namespace=brenn_reachy::motion)]
 
-use cogs::config;
-use cogs::mover;
-use cogs::pose_state;
+use [cpp, proto, proto_conv] cogs::config;
+use cogs::mover as mover_vocab;
+use cogs::pose_state as pose_state_vocab;
 use cogs::schedule;
 use cogs::script as script_vocab;
 use cogs::session as session_vocab;
 use cogs::session_cmd;
 use driver::goal as goal_vocab;
 use driver::health;
-use driver::pose;
+use driver::pose as pose_vocab;
 use motion::faults;
 use motion::timeline;
 use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
@@ -65,14 +66,14 @@ use @clockwork::std::signals::{ReportGroupPolicy, ReportingStrategy,
 // machine long before that.
 channel DriverPose
 {
-    message_type: Tachyon<pose::PoseSample>;
+    message_type: Tachyon<pose_vocab::PoseSample>;
     max_num_messages: 16;
 }
 
 // Where the head is, one message per sample.
 channel Estimates
 {
-    message_type: Tachyon<pose::PoseEstimate>;
+    message_type: Tachyon<pose_vocab::PoseEstimate>;
     max_num_messages: 16;
 }
 
@@ -122,7 +123,8 @@ channel TickFaults
 }
 
 // The scripts somebody asks the machine to run. One publisher: whatever stands
-// at the edge -- the input log in this system, a bridge process online.
+// at the edge -- the input log in the simulated system, the wake cog online
+// until the intent bridge that replaces it lands.
 //
 // Eight deep against a view of four. Scripts are sparse: one arrives, the
 // session runs it for a minute, another arrives. The depth is slack for a
@@ -231,7 +233,7 @@ cog Pose
     states
     {
         // The solver's seed, and the run's totals for the three signals below.
-        est: Tappy<pose_state::PoseState>
+        est: Tappy<pose_state_vocab::PoseState>
         {
             mutable: true;
         }
@@ -275,7 +277,7 @@ cog Pose
     {
         // The sample stream, sized to see every message rather than the latest
         // one.
-        sample: Tappy<pose::PoseSample>
+        sample: Tappy<pose_vocab::PoseSample>
         {
             max_msgs: 8;
         }
@@ -283,7 +285,7 @@ cog Pose
 
     outputs
     {
-        estimate: Tappy<pose::PoseEstimate>;
+        estimate: Tappy<pose_vocab::PoseEstimate>;
     }
 
     execution
@@ -366,7 +368,7 @@ cog Mover
     {
         // The tick's own state, and what this cog knows about the schedule it
         // is following.
-        ctrl: Tappy<mover::MoverState>
+        ctrl: Tappy<mover_vocab::MoverState>
         {
             mutable: true;
         }
@@ -496,7 +498,7 @@ cog Mover
         // The driver's sample stream, sized to see every message rather than
         // the latest one: a sample missed is a control cycle that never
         // happened, and this cog's whole clock is that stream.
-        sample: Tappy<pose::PoseSample>
+        sample: Tappy<pose_vocab::PoseSample>
         {
             max_msgs: 8;
         }
@@ -747,7 +749,7 @@ cog Session
         // so what a wake wants from it is the freshest instant rather than every
         // one of them. Which is also all it is read for -- whether the driver is
         // still alive.
-        sample: Tappy<pose::PoseSample>;
+        sample: Tappy<pose_vocab::PoseSample>;
     }
 
     outputs
@@ -809,4 +811,103 @@ policy ReportGroupPolicy for Session.stats
     reporting_strategy = ReportingStrategy::post_aggregated;
     log_type = ReportGroupLogType::event;
     max_observations = 1000;
+}
+
+// The control loop without its driver: the decision tick, the estimator, the
+// session, their state, their configuration, and every edge between a channel
+// above and one of the three.
+//
+// It is a box rather than three `new` lines in each system because the two
+// systems differ in exactly one thing -- what stands at the driver's end of the
+// wire. The simulated system puts a cog there; the one that runs on a machine
+// puts sockets to a driver process there. Everything else is the same topology,
+// and a topology stated twice is a topology that drifts. So the core is stated
+// here and the driver's half is drawn in whichever composition encloses it: this
+// box deliberately leaves the driver-side ends of `DriverPose`, `DriverCmd`,
+// `SessionCmdChan`, `DriverEvt`, `DriverAuxOut` and `DriverHealth` unconnected,
+// and an enclosing box that does not fill them is a system with no driver.
+//
+// Channels are module-scope and identified globally, so an edge drawn here and
+// an edge drawn in an outer box are edges on the same channel.
+box MotionCore
+{
+    new mover: Mover;
+    new pose: Pose;
+    new session: Session;
+
+    // Each cog's own slot, written by nothing else. No `init=`, so each is
+    // default-constructed into a buffer the compiler synthesizes.
+    new mover_state: State(representation=Tachyon<mover_vocab::MoverState>);
+    connect mover_state to mover.ctrl;
+
+    new pose_state: State(representation=Tachyon<pose_state_vocab::PoseState>);
+    connect pose_state to pose.est;
+
+    new session_state: State(representation=Tachyon<session_vocab::SessionState>);
+    connect session_state to session.sess;
+
+    // The configs, read from checked-in protobuf text before the first
+    // execution. The paths resolve against the runfiles of whatever runs the
+    // process, which is why the files are data dependencies of the executable.
+    new mover_params: SerializedDataFile(
+        representation=Protobuf<config::MoverParams>,
+        path="cogs/mover_params.textproto");
+    connect mover_params to mover.params;
+
+    new session_params: SerializedDataFile(
+        representation=Protobuf<config::SessionParams>,
+        path="cogs/session_params.textproto");
+    connect session_params to session.params;
+
+    // The clips an overlay can name. Emitted from the documents under
+    // `cogs/clips/` rather than authored, and read the same way the two
+    // parameter files are.
+    new clip_library: SerializedDataFile(
+        representation=Protobuf<config::ClipLibraryConfig>,
+        path="cogs/clip_library.textproto");
+    connect clip_library to mover.clips;
+
+    // The sample stream: whatever is at the driver's end publishes it, both
+    // control-rate cogs run on it, and the session reads it for one thing only
+    // -- whether the driver is still publishing at all, which a driver cannot
+    // report about itself -- so it takes the freshest instant and is never woken
+    // by one.
+    connect DriverPose to mover.sample;
+    connect DriverPose to pose.sample;
+    connect DriverPose to session.sample;
+
+    // The goal stream, and the loop it closes: the tick commands, the driver's
+    // gate decides what is due, and the tick reads back what it last sent.
+    connect mover.goal to DriverCmd;
+    connect DriverCmd to mover.own_cmd;
+
+    // What the run is asked to do. The publisher is outside this box: an input
+    // log in the simulated system, an intent source on a machine.
+    connect ScriptsIn to session.script;
+
+    // What the session accepted, reaching the cog that carries it out. The
+    // session is the channel's one publisher, so the schedule the mover streams
+    // is the schedule a script was screened into.
+    connect session.sched to ScheduleChan;
+    connect ScheduleChan to mover.sched;
+
+    // What the tick raised: the log's record of it, and the session's evidence
+    // about the machine.
+    connect mover.fault to TickFaults;
+    connect TickFaults to session.fault;
+
+    // What the session asks of the driver, and what the driver answers. The
+    // request channel's one publisher is the session.
+    connect session.cmd to SessionCmdChan;
+    connect DriverAuxOut to session.aux_out;
+
+    // What the driver says about itself, and the session weighing it: an edge
+    // the driver reported and a servo's error bits are the two kinds of fault
+    // evidence the decision tick cannot see.
+    connect DriverEvt to session.evt;
+    connect DriverHealth to session.readings;
+
+    // Logged only: nothing in either system consumes either.
+    connect pose.estimate to Estimates;
+    connect session.report to ReportsOut;
 }

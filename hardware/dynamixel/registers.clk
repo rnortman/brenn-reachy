@@ -83,6 +83,8 @@ enum RegId
         #21 present_input_voltage { underlying_value: 21; }
         // What kind of servo this is.
         #22 model_number { underlying_value: 22; }
+        // The measured temperature at the servo, degrees Celsius.
+        #23 present_temperature { underlying_value: 23; }
     }
 }
 

@@ -19,7 +19,7 @@ use dxl_proto::frame::{
     INST_WRITE,
 };
 use dxl_proto::{Reg, crc16, rad_to_counts};
-use reachy_bus::{BusPort, ServoMap, named_reg};
+use reachy_bus::{BusPort, BusTiming, ServoMap, named_reg};
 use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, rest_head_pose, stow_head_pose};
 use reachy_motion::reg;
 use reachy_motion::{EXPECTED_MODELS, ProvisionExpect, ProvisionTable, RegId};
@@ -29,6 +29,10 @@ use crate::config::BenchConfig;
 
 /// A rail comfortably over the arm floor, in the register's tenths of a volt.
 const HEALTHY_RAIL: u16 = 118;
+
+/// A resting temperature, whole degrees Celsius, inside the band the registry's
+/// temperature case asserts.
+const RESTING_TEMP_C: u8 = 28;
 
 /// A scripted machine: nine servos with a register file, answering pings, reads
 /// and writes over the port seam.
@@ -537,16 +541,36 @@ pub(crate) fn datumed_config() -> BenchConfig {
     cfg
 }
 
-/// The resolved configuration of a reviewed unit, with the bus timing wound
-/// down so a test that waits on a deadline does not wait in real time.
+/// What a command needs off a configuration — the servo map and the bus timing —
+/// with the timing wound down so a test that waits on a deadline does not wait
+/// in real time.
 ///
 /// One definition, because a knob wound down in one test module and not another
 /// leaves that module either spending real retry time or testing different
 /// timing than the rest, and each copy looks locally complete.
-pub(crate) fn resolved() -> crate::config::Resolved {
+pub(crate) struct Configured {
+    /// Joints, IDs, registers and counts.
+    pub(crate) map: ServoMap,
+    /// Deadline and retry policy.
+    pub(crate) timing: BusTiming,
+}
+
+/// What a command consumes off `file`.
+///
+/// The one place the struct is assembled, so a case that wants a knob at another
+/// value changes the knob in its `BenchConfig` and comes back through here.
+pub(crate) fn configured(file: &BenchConfig) -> Configured {
+    Configured {
+        map: ServoMap::new(file.servo_ids().expect("the roster is nine servos")),
+        timing: file.bus_timing().expect("the timing resolves"),
+    }
+}
+
+/// The configuration of a reviewed unit as a command consumes it.
+pub(crate) fn resolved() -> Configured {
     let mut cfg = datumed_config();
     wind_down_bus(&mut cfg);
-    cfg.resolve().expect("a datumed example resolves")
+    configured(&cfg)
 }
 
 /// Wind `cfg`'s bus timing down to the shortest waits the transaction layer
@@ -577,6 +601,7 @@ pub(crate) fn machine_at(cfg: &BenchConfig, legs: &[f64; 6]) -> FakeMachine {
             &HEALTHY_RAIL.to_le_bytes(),
         );
         machine.set(*id, named_reg(RegId::HardwareErrorStatus), &[0]);
+        machine.set(*id, named_reg(RegId::PresentTemperature), &[RESTING_TEMP_C]);
         let angle = match row {
             0 => 0.0,
             1..=6 => legs[row - 1],

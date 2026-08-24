@@ -24,7 +24,7 @@ use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, RegIdWire, Valu
 use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKindWire, BusTxnWire};
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointsWire};
 use clockwork_rs::SyncTime;
-use reachy_driver::{JOINT_COUNT, JOINT_MASK_ALL};
+use reachy_driver::{BLIND_CYCLES_BEFORE_BUS_FAILURE, JOINT_COUNT, JOINT_MASK_ALL};
 use reachy_kin::default_geometry;
 use reachy_motion::arm::{
     DEFAULT_GAINS, DEFAULT_MIN_ARM_VOLTAGE, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
@@ -35,7 +35,7 @@ use reachy_motion::joints::{
     self, JointRef, ServoHealth, flags, rows_of, write_rows, write_vector,
 };
 use reachy_motion::value;
-use sim_cogs::{BLIND_CYCLES_BEFORE_BUS_FAILURE, sim_regs};
+use sim_cogs::{sim_aux, sim_regs};
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -54,10 +54,12 @@ const SLEW_LEGS: f64 = 0.15;
 const HEALTH_PERIOD: i64 = 120_000_000;
 
 /// How long a commanded de-torquing may go unconfirmed before the driver says
-/// so, which is the cog's own `TORQUE_OFF_CONFIRM_BUDGET_NS` -- a private
-/// constant of a crate this test drives through its wrapper, so it is restated
-/// here and asserted against.
+/// so. Restated rather than read: a case that took the number from the driver
+/// could not notice it changing, and the assert below is what holds the two
+/// together.
 const TORQUE_OFF_CONFIRM_BUDGET: i64 = 300_000_000;
+
+const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET == reachy_driver::TORQUE_OFF_CONFIRM_BUDGET_NS);
 
 /// Per-cycle slew of the antennas, radians.
 const SLEW_ANTENNAS: f64 = 0.65;
@@ -120,6 +122,8 @@ struct Health {
     bits: u8,
     /// Its rail, volts.
     volts: f64,
+    /// Its temperature, degrees Celsius.
+    temp_c: i8,
     /// When the reading was taken.
     sample_time_ns: i64,
 }
@@ -315,6 +319,7 @@ impl Sim {
                 id: report.id,
                 bits: report.bits,
                 volts: report.volts,
+                temp_c: report.temp_c,
                 sample_time_ns: report.sample_time.as_nanos(),
             }
         });
@@ -1978,6 +1983,41 @@ fn the_health_rotation_walks_the_bus_at_its_cadence() {
     }
     let next = sim.step().health.expect("the cadence came round");
     assert_eq!(next.id, 11, "and the rotation advanced one row");
+}
+
+/// The temperature a report carries and the temperature that register holds are
+/// one number.
+///
+/// This plant models nothing thermal, so the figure is a constant either way --
+/// and a constant in the report with a zero in the cell would be a machine that
+/// answers two ways about one servo, which is the thing a hardware log and a
+/// scenario log being one record rules out. Both halves are read here, so
+/// dropping either side is red.
+#[test]
+fn a_report_and_the_temperature_cell_answer_the_same_degrees() {
+    let mut sim = Sim::new();
+    let report = sim
+        .step()
+        .health
+        .expect("a fresh driver owes its first report");
+    assert_eq!(report.temp_c, sim_aux::SIM_TEMP_C);
+
+    sim.transact(
+        3,
+        &transaction(
+            AuxOpKindWire::READ_REG,
+            report.id,
+            RegIdWire::PRESENT_TEMPERATURE,
+            None,
+        ),
+    );
+    let outcome = sim.step().outcome.expect("the read was answered");
+    assert_eq!(outcome.status, AuxStatus::Ok);
+    assert_eq!(
+        outcome.value,
+        value::u8(sim_aux::SIM_TEMP_C.cast_unsigned()).bits(),
+        "the cell the same servo's report was written from",
+    );
 }
 
 /// A servo whose error byte latched is what the rotation reports about it: the

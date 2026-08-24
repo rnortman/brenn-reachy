@@ -12,6 +12,14 @@
 //! ([`AuxSlot`]). Those decisions are this crate, and nothing else is: no
 //! register addresses, no wire, no clock of its own.
 //!
+//! Beside them sit the two policy numbers every host answers to — how long a
+//! commanded de-torquing may go unconfirmed before the driver says so
+//! ([`TORQUE_OFF_CONFIRM_BUDGET_NS`]), and how many blind cycles in a row are a
+//! bus that is gone ([`BLIND_CYCLES_BEFORE_BUS_FAILURE`]) — here for the same
+//! reason the decisions are: a simulated driver and a real one disagreeing
+//! about either would be two machines, and the fault one of them raised would
+//! not mean what the other's did.
+//!
 //! It exists separately because the same decision has to run in three places
 //! and be the same decision in all of them: the real driver process, the
 //! simulated driver that the control loop is tested against, and the unit
@@ -19,9 +27,15 @@
 //! timer is a second set of conditions under which a machine does not
 //! de-torque.
 //!
-//! What it links is the joint vocabulary and the transaction vocabulary: the
-//! set of servos this machine has, and the record of one bus transaction. A
-//! gate whose idea of the bus disagreed with its host's would silently stop
+//! Beside the decisions sits the little that a host does with one: [`report`]
+//! holds the event a cycle raises, the ranking between two of them and the
+//! blind-cycle run counter, because two hosts choosing differently which edge
+//! to publish out of one cycle would report differently about the same machine.
+//!
+//! What it links is the joint vocabulary, the transaction vocabulary and the
+//! event vocabulary: the set of servos this machine has, the record of one bus
+//! transaction, and what a cycle says it did. A gate whose idea of the bus
+//! disagreed with its host's would silently stop
 //! writing the rows above the disagreement, so the row count is read off the
 //! vocabulary rather than restated here.
 //!
@@ -68,10 +82,12 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRef};
 use clockwork_rs::SyncTime;
 
 pub mod aux_slot;
+pub mod report;
 pub mod state;
 pub mod torque;
 
 pub use aux_slot::{AuxOffer, AuxSlot, AuxTask};
+pub use report::Event;
 pub use state::DriverStateError;
 pub use torque::{
     BeliefWrite, BelievedTorqued, ConfirmCredit, ConfirmReport, ConfirmStep, TorqueOffConfirm,
@@ -105,6 +121,47 @@ pub fn every_row() -> JointFlags {
         .into_iter()
         .fold(JointFlags::NONE, |set, row| set | row)
 }
+
+/// The bus cycle every host of these decisions runs, nanoseconds.
+///
+/// Not the cycle a host is configured with -- each one reads that from its own
+/// configuration and refuses a mismatch -- but the number the budgets below are
+/// sized against, stated once so the sizing argument can be checked at compile
+/// time. A machine built to run a different grid changes this and re-reads
+/// those arguments.
+pub const NOMINAL_CYCLE_NS: i64 = 20_000_000;
+
+/// How long a commanded de-torquing may go unconfirmed before the driver says
+/// so, nanoseconds.
+///
+/// The driver's own budget and not the host's: the confirmation pass reads one
+/// row back per cycle, so a clean pass over the nine takes nine cycles, and a
+/// budget that did not clear that would report a de-torquing as unconfirmed
+/// while it was still being read. The room above that is for the host requests
+/// that outrank the pass: each one costs it a cycle, and a de-torquing reported
+/// as unconfirmed because a sequencer was talking would be a report about the
+/// traffic rather than about the machine. Running out of it changes nothing
+/// about what the driver does -- the sweep is still written every cycle and the
+/// pass keeps reading -- it only makes the silence visible.
+pub const TORQUE_OFF_CONFIRM_BUDGET_NS: i64 = 300_000_000;
+
+const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > JOINT_COUNT as i64 * NOMINAL_CYCLE_NS);
+
+/// How many cycles in a row the bus may answer nothing before the driver says
+/// its bus is gone.
+///
+/// The one fault a driver raises about itself. Long enough that a burst of lost
+/// replies is not it -- the decision tick tolerates a run of blind reads and
+/// keeps commanding through them, and a driver crying failure inside that
+/// window would be reporting the same outage twice from two places. Short
+/// enough that half a second of a machine nobody can see is not left to the
+/// dead-man alone: the host takes a bus failure straight to the minimum-risk
+/// condition, where the dead-man would first wait out its own silence.
+///
+/// Raised once per outage, on the cycle the run reaches this length: the
+/// standing condition is not news, and a host that has been told once has
+/// already stopped trusting the bus.
+pub const BLIND_CYCLES_BEFORE_BUS_FAILURE: u32 = 25;
 
 /// What became of a goal offered to the gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

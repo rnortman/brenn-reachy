@@ -3428,6 +3428,32 @@ mod tests {
         // Gains, then every profile register, per servo — the same count the
         // cursor bound derives, so the sweep and the bound cannot disagree.
         assert_eq!(count(SeqStepKind::GainsProfiles), GAINS_PROFILE_WRITES);
+        // And the two profile registers carry the configured pair, on every
+        // row: the profile is the one number in this record a deployment
+        // chooses, so a sweep writing anything else — a swapped pair, a
+        // dropped field, a zero — is a machine running a limiter nobody asked
+        // for.
+        for (reg, wanted) in [
+            (
+                RegId::ProfileAcceleration,
+                value::u32(cfg.profile.acceleration),
+            ),
+            (RegId::ProfileVelocity, value::u32(cfg.profile.velocity)),
+        ] {
+            let written: Vec<(u8, Value)> = machine
+                .log
+                .iter()
+                .filter(|(step, request)| {
+                    *step == SeqStepKind::GainsProfiles && request.reg() == Some(reg)
+                })
+                .map(|(_, request)| (request.id(), request.value))
+                .collect();
+            assert_eq!(
+                written,
+                cfg.ids.map(|id| (id, wanted)).to_vec(),
+                "{reg:?} over the nine rows",
+            );
+        }
         // The resting sweep: nine positions and nothing else.
         assert_eq!(count(SeqStepKind::PoseAndDatum), ROW_COUNT);
         // A pin, an enable and a read-back, per servo. Twenty-seven

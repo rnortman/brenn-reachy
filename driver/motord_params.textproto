@@ -1,0 +1,42 @@
+# The motor driver process's configuration, loaded once at startup.
+#
+# One message of `brenn_reachy.driver.motord_config_clk_proto.MotordParams`,
+# which the compiler generates from the `MotordParams` schema in
+# `motord_config.clk`. Read as it is: the driver is handed the path and parses
+# the text into the message.
+#
+# Written in the protobuf text format, which is what the driver parses it as: the
+# generated message's descriptor is compiled into the binary and every
+# configuration is parsed against it, so an unknown name or a name set twice is
+# the parser's refusal. What `crates/reachy-motord/src/params.rs` adds on top is
+# this machine's own rules -- every field required, durations positive, and the
+# relations between them.
+
+# The bus cycle: 20 ms. The same grid the cogs are built with -- `period_ns` in
+# `cogs/mover_params.textproto` and `cogs/sim_params.textproto` are this number,
+# and a goal dated in cycles of a different length lands at the wrong instant.
+# The driver refuses any other value here: its confirm budget and blind-cycle
+# count are arguments about a grid of this length.
+period_ns: 20000000
+
+# 200 ms of silence de-torques the machine. Ten cycles: long enough that a
+# commander which merely missed a wake-up is not treated as one that stopped,
+# short enough that nobody stands next to a torqued machine no process is
+# commanding. The same dead-man the simulated driver runs
+# (`cogs/sim_params.textproto`), because a scenario's evidence about when a
+# machine goes limp is only evidence if the real driver waits as long.
+hold_timeout_ns: 200000000
+
+# A health read offered every 500 ms. The slot runs at most one transaction per
+# cycle and a host request outranks it, so this is the spacing when nothing else
+# is asking rather than a promise.
+health_poll_period_ns: 500000000
+
+# Two seconds from start to the first goal or session command, or the driver
+# de-torques what it found. A restarted driver fails safe.
+startup_window_ns: 2000000000
+
+# The servo bus node on the Reachy Mini's board, and the rate the servos are
+# configured for.
+bus_device: "/dev/ttyAMA3"
+bus_baud: 1000000

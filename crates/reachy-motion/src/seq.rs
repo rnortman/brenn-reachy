@@ -82,6 +82,7 @@ pub mod reg {
             RegId::HardwareErrorStatus => "hardware error status",
             RegId::PresentInputVoltage => "present input voltage",
             RegId::ModelNumber => "model number",
+            RegId::PresentTemperature => "present temperature",
         }
     }
 
@@ -1138,7 +1139,7 @@ mod tests {
         /// register inserted among these turns a goal write into a shutdown
         /// write in a peer built at the other revision.
         the_register_numbering_is_the_one_written_down:
-            RegId as RegIdWire, past the end 23 {
+            RegId as RegIdWire, past the end 24 {
             RegId::None => 0,
             RegId::TorqueEnable => 1,
             RegId::GoalPosition => 2,
@@ -1162,6 +1163,7 @@ mod tests {
             RegId::HardwareErrorStatus => 20,
             RegId::PresentInputVoltage => 21,
             RegId::ModelNumber => 22,
+            RegId::PresentTemperature => 23,
         }
     }
 }

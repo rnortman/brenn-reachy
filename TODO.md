@@ -16,12 +16,21 @@ Decide whether the servos' Bus Watchdog register is armed, and with what
 timeout. It stays at its factory-disabled value of 0 for now.
 
 Deferral context: the watchdog stops a servo holding its goal when the host goes
-quiet, which on this linkage means the head falls, and a latched watchdog then
-answers writes with the same Data Range error an out-of-range goal produces —
-two failures that would be indistinguishable at the bus layer. Arming it is only
-worth considering once the command loop's real timing has been measured on
-hardware, so the timeout can be set from data rather than guessed. Marked at the
-register definition in `crates/dxl-proto/src/regs.rs`.
+quiet, which on this linkage means the head falls. The timing question this
+entry used to wait on is answered: the command loop was measured on hardware on
+2026-08-06 — 101 periods, zero overruns, 0.1 ms worst jitter — so a timeout
+could be set from data today.
+
+What is still unanswered is hardware behaviour, twice over. Whether a latched
+watchdog *de-torques* the servo or merely stops updating its goal is vendor
+semantics nobody here has verified, and the two differ by whether arming the
+register is a safety measure or a way to drop the head. And a latched watchdog
+answers writes with the same Data Range error an out-of-range goal produces, so
+how the bus layer classifies that error decides whether the two are
+distinguishable at all. Both are hardware questions, so per the bring-up rule
+they are answered by a self-test that asserts the expected behaviour and is let
+to fail, once a unit is available. Marked at the register definition in
+`crates/dxl-proto/src/regs.rs`.
 
 ## `clip-doc-faithful-blends`
 
@@ -76,9 +85,18 @@ overheat, but a fault here holds torque and ends a session, and how often a
 sweep really falls short on this bus is unmeasured — the first supervised runs
 with torque on are what say whether the answer is a budget, a config key beside
 `read_loss_ticks`, or a documented decision that a health gap never faults.
-Marked at `read_health` in `crates/reachy-bench/src/pump.rs` — out of the build
-and deleted at the cutover under `bench-motion-delete`, so the marker moves to
-whatever hosts the health sweep then.
+
+The host that had a health sweep is deleted. The marker sits at the rotation
+that reads a servo's status registers, `crates/reachy-motord/src/aux.rs`'s
+`health`, which is the path a driver's health reading now runs on: what it does
+with a read nothing answered is publish no report and count the miss, and what a
+run of them means is the undecided half.
+
+The rotation is three reads per servo now, not two — the error byte, the supply
+voltage and the present temperature — so a row that answers two of them and not
+the third costs a report the same way a row that answers none does. That widens
+the surface this decision is about without changing it, and the cycle budget the
+three reads are charged against is `CycleBounds::of` beside the marker.
 
 ## `provisioning-repair`
 
@@ -122,51 +140,37 @@ than in this function: it decides whether an eighth condition gains a
 qualification, a ninth condition is named, or a park-class ending is sanctioned
 to carry no slug. None of the six is reachable from the move loop's own
 transactions today — each would take a register-table or encoder defect to
-produce — which is why it waits. Marked at the `Unsendable` arm of
-`wire_failure` in `crates/reachy-bench/src/pump.rs` — out of the build and
-deleted at the cutover under `bench-motion-delete`, so the marker moves to
-whatever drives the bus then.
+produce — which is why it waits.
+
+The host that classified them is deleted, and the vocabulary value they were
+collapsed to survives as `WireFailure::Unsendable` in `motion/faults.clk`. The
+marker now sits on that arm: `crates/reachy-motord/src/tick.rs`, at the read
+whose transaction the port refused. Until the word is decided, the arm claims
+the least it can — the rows are missing from the cycle's sample and the write
+that frame would have carried is unconfirmed.
 
 ## `reachy-pod-motion-integration`
 
-Host these crates from the cog compositions rather than from the bench binary,
-and decide how motion intents reach the loop.
+Bridge the pod's motion intents into the cog system, and settle who owns the
+servo port while two things want it.
 
-Deferral context: the four libraries own no loop and no I/O by construction, so
-whoever hosts them supplies the port, the clock and the loop. The bench binary
-was that host, and it is one no longer: its motion layer is out of the build, so
-nothing in this tree drives a coordinated move on hardware today. The cog path
-is the host being built, and the questions this entry waits on are the cutover
-slice's: what carries an intent, what happens to a fault when there is no
-operator watching, and who owns the port when two things want it. None of it
-changes the libraries. Marked at the pod seam in
-`crates/reachy-bench/src/pump.rs`, which is out of the build and goes at the
-cutover under `bench-motion-delete`; the marker moves to the cog path where the
-integration actually happens, and this entry is what carries it across.
+Deferral context: the first half of this entry is answered — the four libraries
+are hosted from the cog compositions, and the bench binary that used to host
+them moves nothing. What remains is the edge. Nothing publishes on `ScriptsIn`
+from outside the composition, so the machine has no way to be asked for a
+gesture by the payload that has the reason to ask; the schema names a bridge
+process as the eventual producer and there is none. Beside it sit the two
+questions the bridge cannot avoid: who owns the bus and the ports when
+`reachy-motiond` is also deployed on the unit, and what an intent is on the wire
+— a `Script`, or something the bridge compiles into one.
 
-## `bench-motion-delete`
-
-Delete the bench's retired motion layer from disk.
-
-Deferral context: `crates/reachy-bench/src/{commands.rs,pump.rs,trace.rs,
-trace/metrics.rs,replay.rs}` are out of the build and no longer compile — and
-will not against any version of the crates they name, since the vocabulary and
-player types they import have since been deleted, so they are prose about the
-machine rather than code anything revives. They are kept on disk as the record
-of how this machine was actually driven — the sequencer call order, the fixed-rate loop, the settle policy, and
-the hardware-trace replay that sizes the motion guards — which is the reference
-the cog path is read against while it grows. They go when the cog path
-demonstrably drives hardware, at the cutover; the trace recordings under
-`crates/reachy-bench/fixtures/traces` outlive them and want re-pointing at
-whatever replays them then. Precondition, and it binds before the cutover: while
-`replay.rs` is out of the build nothing replays those recordings against the
-`[motion]` guards they sized, so an edit to any of those bounds — step limits,
-the tracking threshold, the gains, the antenna clocks — re-points the replay
-suite at whatever hosts the loop first, and does not land on the strength of
-`config.rs`'s range checks alone. A measurement nothing replays is folklore by
-the next release. Marked in the header of each of those files, in
-`crates/reachy-bench/src/lib.rs`, and beside the explicit `srcs` list in
-`crates/reachy-bench/BUILD.bazel`.
+When that bridge lands, the wake-gesture cog that stands in for it is deleted
+rather than kept: it exists only so the box has a closed-loop intent source for
+bring-up, and two intent sources is one too many. Deleting it is `cogs/wake.clk`,
+`cogs/wake_cogs.rs`, `cogs/wake_state.clk`, `cogs/wake_params.textproto`,
+`WakeParams` in `cogs/config.clk`, and the three members it contributes to
+`RobotBox`. Marked at the `ScriptsIn` connect in `cogs/robot.clk`, which is the
+edge the bridge takes over.
 
 ## `session-hold-timeout-evidence`
 
@@ -348,25 +352,6 @@ edit, which is a packaging decision the frozen design does not make, and the
 cost grows each time the authoring side gains a format. Marked in the header of
 `crates/reachy-clips/src/lib.rs`.
 
-## `bazel-device-config-gate`
-
-Cover the device configuration in a gate. The deployable is
-`//crates/reachy-bench:reachy_bench` built with
-`--platforms=//bazel/platform:reachy-device`, and nothing in `make check` or in
-CI builds it: a `platform_transition_filegroup` (or a transitioned alias) beside
-the platform definition would put it inside `bazel build //...`.
-
-Deferral context: the shape is cheap; the cost is not. CI runs on an uncached
-runner by design, so a second full aarch64 Rust build roughly doubles the
-job — the decision is whether that goes into CI, into the local gate only, or
-into a separate scheduled job, and it is a cost decision rather than a coding
-one. What breaks silently until then: a dependency whose
-`target_compatible_with` lacks aarch64, a `select()` a future dependency
-introduces, or a drop upgrade that stops registering the aarch64 clang
-toolchain — all of them discovered at `make bench-build` in front of a
-powered-up unit. Marked at the `reachy-device` platform in
-`bazel/platform/BUILD.bazel`.
-
 ## `ci-cache-refresh`
 
 Decide whether CI's Bazel cache archive should refresh on every green run
@@ -410,21 +395,21 @@ contents are readable. Marked at `read_registers` in `cogs/sim_cogs.rs`.
 ## `session-servo-profile`
 
 Give the servo-side velocity/acceleration profile the commissioning sweep writes
-a measured value and a home in configuration, rather than a constant in the
-session cog.
+a measured value.
 
-Deferral context: the pair in the tree (20 / 50 register units) is a modest
-backstop chosen for a host that streams one step-bounded setpoint per period, and
-nothing has run it on hardware. It is an order of magnitude below the figures the
-bench carries in its own configuration, which are sized for a host that commands
-whole moves outright, so the two cannot both be right for the same machine and
-neither has a measurement behind it. What decides it is a hardware session — too
-tight and the servos rate-limit a correctly shaped stream, which surfaces as
-growing tracking error rather than as a refusal — and where the number then
-lives is a policy question: the bench treats it as required configuration with no
-default, and the online session has no configuration for it yet. Both halves of
-that are outside what the deterministic runner can answer. Marked at `PROFILE` in
-`cogs/session_bus.rs`.
+Deferral context: the configuration half is done — `profile_acceleration` and
+`profile_velocity` are `SessionParams` fields, shipped as 20 / 50 register units
+in `cogs/session_params.textproto`, and `check::commissioned_profile` pins the
+file's values to the writes that reach all nine servos. What remains is the
+measurement. The shipped pair is a modest backstop chosen for a host that streams
+one step-bounded setpoint per period and nothing has run it on hardware; it is an
+order of magnitude below the figures the bench ran (400 / 600, trial-validated,
+including an 855°/s antenna sweep), which were sized for a host commanding whole
+moves outright, so the two cannot both be right for the same machine. What
+decides it is a hardware session — too tight and the servos rate-limit a
+correctly shaped stream, which surfaces as growing tracking error rather than as
+a refusal — which is outside what the deterministic runner can answer. Marked at
+the profile fields in `cogs/config.clk`.
 
 ## `aux-pending-carries-bustxn`
 
@@ -546,3 +531,122 @@ so where the lane lives (a `bazel test` target versus a `make check` step) and
 how it reads a Starlark constant and a `module()` call without a parser is a
 gate-design decision rather than a patch. Marked on `REPO` in
 `bazel/rust_clk.bzl`.
+
+## `motord-seam-trust-boundary`
+
+Give the seam between the control process and the driver an access boundary, in
+both directions.
+
+Deferral context: the seam is UDP on `127.0.0.1`, six ports (marked at
+`crates/reachy-motord/src/ports.rs` for the driver's two and at `PoseIn` in
+`cogs/robot.clk` for the control box's four). Loopback restricts hosts and
+nothing else, and it costs something different at each end.
+
+Driver-side: any local process under any user can send a session command that
+arms the machine and setpoints that move it, and those setpoints do not pass the
+envelope check -- that check runs in the mover, upstream of the goal port. So
+this is the one command path on the machine whose only guard against a violating
+pose is that no untrusted code runs locally.
+
+Control-side: a well-formed datagram on 7402-7405 from any local process is
+indistinguishable from the driver's, so machine state can be spoofed (a stall
+masked, a latch faked, the session's staleness watchdog fed while the real driver
+is dead) and fault evidence fabricated or suppressed. The driver's hold-timeout
+dead-man does not answer this: it fires on silence, and a sender's whole effect
+is to prevent silence.
+
+Ruled: the fix is a transport with a permission boundary — a unix-domain
+datagram socket or equivalent, once the framework's socket layer can speak one.
+The driver does not grow a second envelope check, and no token rides these
+datagrams.
+
+Why not the driver enforcing travel windows itself: the mover stays the sole
+envelope authority. A second owner needs the kinematics the driver deliberately
+lacks, and two copies of one rule diverge. And it would not close the hole
+anyway — a local process that can reach these ports can still arm the machine
+and command in-envelope motion no session asked for, so only an access boundary
+answers the finding. A per-boot token in the schemas that cross the seam is out
+for a second reason: it is a wire-format change on both ends, against the
+framing decision that this seam carries the bare schema bytes.
+
+Deferred, not declined: the transport is bigger than a patch and waits on the
+socket layer.
+
+## `shared-servo-fixture`
+
+One scripted servo model behind the port seam, shared by every crate that tests
+against one.
+
+Deferral context: `crates/reachy-bench/src/testutil.rs`'s `FakeMachine`/`Spy` and
+the `Machine`/`Shared` fixture in `crates/reachy-motord/src/tick.rs`'s test module
+are two scripted nine-servo machines, and the bench one's own header says why it
+exists — so the two copies cannot disagree about what a servo does with a write.
+They already differ: the bench's answers a servo error byte, the driver's answers
+a ping the bench's does not, and each crate's cases therefore cover a slightly
+different machine. Promotion is not a change inside either module: it means a new
+test-only library target that neither crate owns, deciding what of the bench's
+`BenchConfig`/`Clock` coupling stays behind, and deciding whether the simulated
+driver's plant — which is shipped code and not a fixture — folds into it or stays
+separate. Marked at the driver's fixture.
+
+## `driver-host-sample-glue`
+
+Put the last of the two driver hosts' shared glue in one place: the
+first-answer-wins rule for a cycle's outcome slot, and the gate-derived fields of
+a pose sample.
+
+Deferral context: the event a cycle raises, the ranking between two of them and
+the blind-cycle counter now live in `reachy-driver`'s `report` module, and both
+hosts read them from there. What is still written twice is smaller and harder to
+move: `note_answer` in `crates/reachy-motord/src/tick.rs` and `Report::answer` in
+`cogs/sim_cogs.rs` hold the same rule over two different answer types, one of
+which is built over the bus layer, and the two `write_sample` bodies share only
+their gate-derived half. Lifting either takes the transaction and pose
+vocabularies into `reachy-driver` — and, for the answer, the bus dependency the
+design deliberately keeps out of it — so what belongs there is a decision about
+that crate's boundary rather than a move. Marked at `note_answer`.
+
+## `online-host-logger`
+
+Compose the logger box on a second `cpu_domain` — the dev host — and measure it,
+so an online run's records land on real disk instead of on the unit's tmpfs.
+
+Deferral context: the logger runs beside the control process on the unit today,
+writing `.olog` files to `/run/brenn-app/logs/motion`, and the run's records are
+pulled off with `rsync` after the run. That works and it keeps the deployment
+doctrine — nothing pushed to a unit touches its flash — but it has two costs: a
+step between the run and the record, and a dependency on tmpfs accepting the
+`O_DIRECT | O_DSYNC` the framework's writer opens every file with. The writer
+has no way to be told otherwise, direct I/O on tmpfs is a kernel-version
+capability, and the unit's kernel is not the one this was verified on. The other
+shape needs neither: the same box on the host domain, channels carried by the
+framework's own TCP bridge once both domains sit in one `ethernet` block. What
+it drags in is multi-node launch machinery — per-domain config generation, a
+bridge process per domain, two process descriptions to start in the right order
+— which is why it is not the shape the first hardware run uses. Marked at the
+`RobotLogger` box in `cogs/robot.clk`.
+
+## `online-run-log-proof`
+
+Run the online system on the dev host — the logger process and the control
+process, against a `--pinion-dir` of their own — and read the `.olog` it wrote
+with `first_motion_report`.
+
+Deferral context: the framework's writer taking `O_DIRECT | O_DSYNC` on tmpfs is
+verified, by running the writer's own test against a log directory on `/dev/shm`.
+What is not is the whole path: no target starts `robot_clk_exe`, so nothing has
+written an `.olog` in this tree, and the analyzer is proven only over the `.slog`
+a deterministic run produces. The two go through one facade in
+`clockwork-logs`, which is why the S1 test is worth what it is — but the format a
+hardware run will produce is read by no test, and a writer that refuses the
+directory, or a log the reader refuses, would be met by an operator at a unit
+instead of in CI.
+
+What it needs before it can be written is a decision, not a patch. The control
+box's producers are live sockets, so a run that logs anything needs something on
+the driver's side of the seam — a fake `reachy-motord`, or `reachy-motord` itself
+against a scripted port — plus launch machinery for two processes and a shared
+shared-memory namespace, in a test that has to be robust about a wall-clock run's
+duration. That is a host integration harness this repo does not have, and what it
+covers overlaps the runbook procedure a human follows for the first hardware run.
+Marked beside `first_motion_report_over_s1_test` in `cogs/BUILD.bazel`.

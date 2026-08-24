@@ -11,11 +11,6 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 # the binary's root — it is a separate crate.
 rust_library(
     name = "reachy_bench_lib",
-    # An explicit list rather than a glob: `commands.rs`, `pump.rs`, `trace.rs`,
-    # `trace/metrics.rs` and `replay.rs` sit beside these files and are not in
-    # the build. They are the retired bench motion layer, kept on disk as the
-    # record of how this machine was driven, and a glob would pull them back in.
-    # TODO(bench-motion-delete)
     srcs = [
         "src/bare.rs",
         "src/config.rs",
@@ -38,12 +33,6 @@ rust_library(
 
 # The example configuration comes in through `include_str!`, which is resolved
 # by the compiler against its declared inputs, so it is `compile_data`.
-#
-# The hardware trace recordings under `fixtures/traces` reach no test in this
-# build: the suite that replayed them is `src/replay.rs`, which is out of the
-# build with the trace reader it used. The recordings stay checked in — they are
-# the measurements this machine's guards are sized against.
-# TODO(bench-motion-delete)
 rust_test(
     name = "reachy_bench_lib_test",
     size = "medium",
@@ -53,9 +42,14 @@ rust_test(
 
 # The entry point: argument parsing, the configuration file it reads off disk,
 # and the dispatch into the library's commands and registry.
+#
+# Public because it is a device deployable, and the deployables are named in one
+# place (`//bazel/platform:device_deployables`) so the gate cannot cover a
+# different set than a deploy ships.
 rust_binary(
     name = "reachy_bench",
     srcs = ["src/main.rs"],
+    visibility = ["//visibility:public"],
     deps = [
         ":reachy_bench_lib",
         "//crates/reachy-bus:reachy_bus",

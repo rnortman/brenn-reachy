@@ -19,6 +19,7 @@ SHELL := /bin/bash
 help:
 	@echo "Repo-root targets:"
 	@echo "  make check         what a commit must pass: shellcheck, script tests, bazel test"
+	@echo "  make check-device  the other half of the gate: the device binaries cross-compile"
 	@echo "  make fix           auto-fix what the gate can fix (rustfmt)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
@@ -26,25 +27,35 @@ help:
 	@echo ""
 	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
 	@echo "REACHY_HOST naming a reachable unit:"
-	@echo "  make bench-build     the aarch64 binary, cross-compiled by bazel"
+	@echo "  make bench-build     the aarch64 bench binary, cross-compiled by bazel"
 	@echo "  make bench-config    push the bench's configuration into the unit's RAM"
 	@echo "  make bench-run       build, push, run the bench on the unit (ARGS=...)"
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
 	@echo "  make bench-fetch     bring a run's state file back, timestamped"
+	@echo "  make motion-build    the aarch64 motion payload: driver, cog executable, configs"
+	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
+	@echo "  make motion-commands print the three commands that start a run on the unit"
+	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
 
-# The shell half of the gate. The tracked scripts push binaries and
-# configuration onto real hardware and drop privileges there, and they already
-# carry `# shellcheck source=` directives, which mean nothing unless something
-# runs them.
+# The shell half of the gate. These scripts push binaries and configuration onto
+# real hardware and drop privileges there, and they already carry
+# `# shellcheck source=` directives, which mean nothing unless something runs
+# them.
 #
-# The file set is every tracked `.sh` plus the two extensionless git hooks,
-# which have no suffix to be found by. The flags are load-bearing: -x follows
-# the sourced files, and -P SCRIPTDIR resolves a `source=` directive against the
-# directory of the script carrying it rather than the working directory — which
-# is what the directives assume, and without which a clean tree reports SC1091
-# and SC2154 findings that are artifacts of the invocation.
+# The file set is every `.sh` in the working tree — tracked, plus the ones not
+# added yet, with the ignore rules honoured — plus the two extensionless git
+# hooks, which have no suffix to be found by. Tracked-plus-untracked because
+# "the gate is green" has to be a statement about the tree in front of you: a
+# script written and not yet staged is a script the next commit carries, and a
+# walk of the index alone reports green without ever having read it.
 #
-# The tracked set arrives NUL-separated through xargs rather than as an unquoted
+# The flags are load-bearing: -x follows the sourced files, and -P SCRIPTDIR
+# resolves a `source=` directive against the directory of the script carrying it
+# rather than the working directory — which is what the directives assume, and
+# without which a clean tree reports SC1091 and SC2154 findings that are
+# artifacts of the invocation.
+#
+# The set arrives NUL-separated through xargs rather than as an unquoted
 # substitution: a path carrying a space would otherwise split into arguments
 # naming nothing, and one starting with a dash would be read as a flag. `--`
 # ends the options on both invocations for the same reason.
@@ -60,7 +71,8 @@ check-scripts:
 	    echo "https://github.com/koalaman/shellcheck#installing." >&2; \
 	    exit 1; \
 	}
-	git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -x -P SCRIPTDIR --
+	git ls-files -z --cached --others --exclude-standard '*.sh' | \
+	    xargs -0 --no-run-if-empty shellcheck -x -P SCRIPTDIR --
 	shellcheck -x -P SCRIPTDIR -- .githooks/pre-commit .githooks/pre-push
 
 # The scripts' own self-checks: a `*.test.sh` beside the script it exercises,
@@ -72,15 +84,45 @@ check-scripts:
 # that stops working is a refusal nobody notices until a bench night is spent
 # on the run it should have stopped.
 #
-# The set arrives NUL-separated for the reason the shellcheck sweep's does, and
+# The set is the shellcheck sweep's, narrowed to the self-checks: every
+# `*.test.sh` in the working tree, tracked or not, with the ignore rules
+# honoured. A self-check that runs only once it is staged is a self-check whose
+# first green run says nothing about the gate that will carry it.
+#
+# The trade that buys, stated because it is a trade and not an oversight: this
+# lane *runs* what it finds, so the gate executes files nobody staged. A commit
+# attempt is enough to run a `*.test.sh` that arrived in the tree by some other
+# route — an archive unpacked in place, a tool writing outside the ignored
+# paths. Every build output this repo produces lands in an ignored directory, so
+# in practice the set is what the developer wrote; a tree with a file in it
+# nobody wrote is a compromised tree either way.
+#
+# It arrives NUL-separated for the reason the shellcheck sweep's does, and
 # through a loop rather than xargs because each script is a program to run
 # rather than an argument to one.
+#
+# Two refusals by name before the run, because both conditions otherwise fail as
+# something else. A tracked script deleted from the working tree but not yet
+# `git rm`-ed is still in the index, so the walk names a path that is not
+# there. And a just-written script routinely carries no mode bit, where
+# `Permission denied` on a program nobody asked to run reads like a broken gate
+# rather than like one `chmod` away from green.
 .PHONY: test-scripts
 test-scripts:
 	@while IFS= read -r -d '' script; do \
 	    echo "$$script"; \
+	    [ -f "$$script" ] || { \
+	        echo "$$script is tracked but missing from the working tree:" >&2; \
+	        echo "    git rm $$script, or restore it" >&2; \
+	        exit 1; \
+	    }; \
+	    [ -x "$$script" ] || { \
+	        echo "$$script is not executable — the gate runs it as a program:" >&2; \
+	        echo "    chmod +x $$script" >&2; \
+	        exit 1; \
+	    }; \
 	    "./$$script"; \
-	done < <(git ls-files -z '*.test.sh')
+	done < <(git ls-files -z --cached --others --exclude-standard '*.test.sh')
 
 # The whole gate, one lane: the shell scripts' own checks, then every Bazel
 # target in the tree — the eight Rust crates with their tests, the `.clk` schema
@@ -126,6 +168,28 @@ check:
 	@$(MAKE) check-scripts
 	@$(MAKE) test-scripts
 	bazel test --config=lint $(BAZEL_FLAGS) //...
+
+# The other half of the gate: everything a unit runs, built for the device. A
+# build and not a run — nothing here needs a device, and nothing here executes
+# an aarch64 binary.
+#
+# Separate from `check` because it is a separate configuration of the whole
+# dependency graph, and a commit hook that paid for both would be a hook people
+# route around. CI runs the two side by side and blocks on both, so a break
+# lands on a pull request rather than at `make motion-build` in front of a
+# powered-up unit: a dependency without aarch64 in its
+# `target_compatible_with`, a `select()` a new dependency introduces, a drop
+# upgrade that stops registering the aarch64 clang toolchain.
+#
+# The deployables are named once, in `//bazel/platform:device_deployables`, and
+# `tools/build-motion.sh` builds a subset of that same list — so the gate cannot
+# cover a different set than a deploy ships. One invocation, so one analysis
+# phase serves them all: the cog executable's own C++ graph is most of the work,
+# and the bench and the driver ride along on it.
+.PHONY: check-device
+check-device: require-bazel
+	bazel build --config=device $(BAZEL_FLAGS) -- \
+	    //bazel/platform:device_deployables
 
 # Auto-fix, which means formatting: rules_rust's rustfmt runner formats every
 # Rust target in the tree with the pinned toolchain's rustfmt, which is the same
@@ -211,8 +275,8 @@ BENCH_RECORDS ?= .local/records
 # Refuse before doing anything rather than ssh to nowhere. A prerequisite of
 # every target that talks to a device, listed first so the refusal comes before
 # a build.
-.PHONY: bench-host
-bench-host:
+.PHONY: device-host
+device-host:
 	@[ -n "$(REACHY_HOST)" ] || { \
 	    echo "REACHY_HOST is not set, so there is no device to talk to." >&2; \
 	    echo "Name the unit for this invocation:" >&2; \
@@ -239,7 +303,7 @@ bench-build:
 # the prose version. Use this one when the bench file is the only thing that
 # changed.
 .PHONY: bench-config
-bench-config: bench-host
+bench-config: device-host
 	tools/deploy-bench.sh $(REACHY_HOST) --config $(BENCH_CONFIG)
 
 # Build, push, and run the bench on the unit. ARGS is the command and its
@@ -252,7 +316,7 @@ bench-config: bench-host
 # binary older than the newest commit, and this target is why that refusal
 # should never fire.
 .PHONY: bench-run
-bench-run: bench-host bench-build
+bench-run: device-host bench-build
 	tools/deploy-bench.sh $(REACHY_HOST) --run $(ARGS)
 
 # Build, push, and run the read-only self-test registry on the unit. ARGS is
@@ -262,12 +326,54 @@ bench-run: bench-host bench-build
 # configuration. A --record elsewhere writes to RAM that no target brings
 # back and a reboot clears.
 .PHONY: bench-selftest
-bench-selftest: bench-host bench-build
+bench-selftest: device-host bench-build
 	tools/deploy-bench.sh $(REACHY_HOST) --run selftest $(ARGS)
 
 # Bring a run's state file back. Each fetch lands under its own timestamped
 # name, so the several runs a session calls for accumulate rather than
 # overwrite each other.
 .PHONY: bench-fetch
-bench-fetch: bench-host
+bench-fetch: device-host
 	tools/deploy-bench.sh $(REACHY_HOST) --fetch $(BENCH_RECORDS)
+
+# ---------------------------------------------------------------------------
+# The motion test: the cog system and its driver, on the unit.
+#
+# Not a variant of the bench path. A bench command is one invocation that ends;
+# a motion run is three long-lived processes started in an order that matters on
+# a machine that can move, so there is no `motion-run`. These targets build the
+# payload, push it, say what to start, and bring the records back;
+# `docs/bench-runbook.md` is the procedure, and the starting is a person's.
+
+# Where fetched run logs accumulate. One directory per fetch, named for its
+# fetch time.
+MOTION_RECORDS ?= .local/motion-logs
+
+# The aarch64 payload: both binaries plus every configuration file the three
+# processes read, laid out the way their relative paths expect. Needs bazel;
+# needs no device.
+.PHONY: motion-build
+motion-build:
+	tools/build-motion.sh
+
+# Push the payload into the unit's RAM and make the directory the logger writes
+# into. The build is a prerequisite rather than a step to remember, which is what
+# makes this the entry point that cannot go stale — deploy-motion.sh refuses a
+# payload older than the newest commit, and this target is why that refusal
+# should never fire.
+.PHONY: motion-deploy
+motion-deploy: device-host motion-build
+	tools/deploy-motion.sh $(REACHY_HOST) --push
+
+# The three commands that start a run, with the flags read out of the shipped
+# logger configuration rather than retyped. Reaches no device, so it answers
+# with a unit powered off.
+.PHONY: motion-commands
+motion-commands: device-host
+	tools/deploy-motion.sh $(REACHY_HOST) --commands
+
+# Bring a run's records back. Each fetch lands under its own timestamped
+# directory, so a session's runs accumulate rather than overwrite.
+.PHONY: motion-fetch
+motion-fetch: device-host
+	tools/deploy-motion.sh $(REACHY_HOST) --fetch $(MOTION_RECORDS)

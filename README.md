@@ -8,8 +8,8 @@ motion shaping, as libraries a real-time host can call.
 The Reachy Mini carries a six-legged parallel platform for the head, a rotating
 base, and two antennae, all driven by Dynamixel X-series servos on one serial
 bus. This repository is the control stack for that mechanism: the wire protocol,
-the kinematics, the motion shaping, the bus layer, and a bench binary that drives
-a real unit.
+the kinematics, the motion shaping, the bus layer, the Clockwork cog system that
+hosts them, and a bench binary that talks to a real unit's hardware.
 
 ## Building it
 
@@ -73,11 +73,16 @@ The response is uniform and deliberate:
 | `dxl-proto` | Dynamixel Protocol 2.0 frame codec, X-series register table, unit conversions. No I/O. |
 | `reachy-kin` | Head kinematics for the parallel platform: inverse and forward solutions, travel envelope, clearance margins. Pure math. |
 | `reachy-motion` | Trajectory shaping, the per-tick control step, and the arm/disarm sequences. Sans-I/O. |
+| `reachy-clips` | Recorded motions as masked per-channel deltas, and how they layer over live motion. Sans-I/O. |
+| `reachy-driver` | A motor driver's decisions with no motors attached: the goal gate and its dead-man, the auxiliary-transaction slot, the torque-off confirmation. Sans-I/O. |
 | `reachy-bus` | The one I/O layer: serial port, transactions, error taxonomy, and the joint-to-servo map. |
-| `reachy-bench` | Bench binary: a read-only self-test registry, and the supervised bring-up commands. |
+| `reachy-bench` | Bench binary: a read-only self-test registry and the bare-bus commands. It moves nothing. |
+| `reachy-motord` | The driver process: a 20 ms grid on the real clock, the serial port, and `reachy-driver`'s decisions, meeting the cogs over UDP. |
+| `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session`, `MotorSim` and `Wake` cogs, their schemas, the deterministic scenario suite, the online composition, and the log analyzer. |
 
 The edges run one way: `reachy-kin` under `reachy-motion`, and both of those
-plus `dxl-proto` under `reachy-bus`, with `reachy-bench` on top. `reachy-bus`
+plus `dxl-proto` under `reachy-bus`, with `reachy-bench`, `reachy-motord` and
+the cog compositions on top. `reachy-bus`
 depends on `reachy-motion` because the joint-to-servo map is what joins the two
 vocabularies — a joint and a register name on one side, an address and a count
 on the other — and it is typed against both. The property that matters survives
@@ -119,11 +124,30 @@ change to a sequencer's state does not rebuild the clip player.
 
 ## Status
 
-Implemented through the bench milestone: all five crates are functional and
-tested, and the read-only self-test registry has run green against a real unit.
+The read-only self-test registry has run green against a real unit, and the
+arming sequence has enabled torque on hardware. No commanded motion has run on
+hardware yet.
 
-Supervised motion bring-up is in progress. The arming sequence has enabled
-torque on hardware, and no commanded motion has run yet.
+Motion lives in the cog system. The four motion crates run as the `Mover`,
+`Pose`, `Session` and `MotorSim` cogs against a simulated plant under the
+deterministic scenario runner, which is where the whole engage-to-rest lifecycle
+— commission, engage, tracking and health faults, the fault ladder's stow and
+de-torque responses — is pinned. The bench binary's own motion layer, which was
+the host for supervised bring-up, is deleted: the bench validates that we can
+talk to the hardware and nothing else.
+
+The host that puts the cog system on a real bus is built and has never been
+run on one. `reachy-motord` is the driver process — a 20 ms grid on the real
+clock, the serial port, and `reachy-driver`'s decisions — and it meets the cogs
+over six UDP sockets on loopback, filling the slots the simulated plant fills in
+the scenario suite. The online composition is that seam plus the control core, a
+logger process, and a wake gesture that asks the machine to raise and stow once.
+`make check-device` cross-compiles every device deployable — the motion
+payload's two binaries and the composition it is staged from, plus the bench
+binary, named once as `//bazel/platform:device_deployables` — and CI blocks on
+it;
+`docs/bench-runbook.md` is the procedure for the first run, and
+`//cogs:first_motion_report` is what reads its log.
 
 ## Attribution
 

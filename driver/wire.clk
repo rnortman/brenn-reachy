@@ -1,10 +1,15 @@
-// The datagram header: what sits in front of a schema's bytes on a socket.
+// The datagram header: what sits in front of a schema's bytes on a foreign
+// socket.
 //
-// A datagram this machine sends is a schema's own blob bytes -- fixed size,
-// little-endian, laid out by the generator -- with this header in front. Only
-// the socket edge needs it: a Clockwork channel carries the schema itself and
-// names its type in the channel declaration, so nothing prefixes a header
-// there.
+// A datagram carrying one of these is a schema's own blob bytes -- fixed size,
+// little-endian, laid out by the generator -- with this header in front. Where
+// it rides is narrower than a socket: a Clockwork channel carries the schema
+// itself and names its type in its declaration, and a Clockwork *socket* is the
+// same, reading and writing the bare schema bytes and requiring the datagram to
+// be exactly that size. So the ends of the motor driver's own seam prefix
+// nothing, and what the header is for is an edge whose far end is not a
+// Clockwork socket -- the intent bridge to the pod being the one such edge this
+// machine will have.
 //
 // What the payload is, is the socket's own business: one schema per socket, so
 // the header says nothing about which. What it does say is the three things a

@@ -1,9 +1,15 @@
-# Bench runbook — running `reachy-bench` against a real unit
+# Bench runbook — running this repo's binaries against a real unit
 
 Everything needed to take this repo from a clean checkout to a measured run on
 the hardware, and back again with the numbers. Written because the procedure
 used to exist only in Makefiles and shell scripts, and a session spent
 reconstructing it is a session not spent measuring anything.
+
+Two runs live here, and they are different things. `reachy-bench` validates that
+we can talk to the hardware — reads, provisioning, releasing torque; it moves
+nothing. The motion test runs the cog system and its driver, and it is the run
+that moves the machine. Everything up to **The motion test** below is the bench;
+that section and `Where things live` cover both.
 
 What this does **not** cover: how the device is provisioned, imaged or brought
 back after a reboot. That is brenn-pod's
@@ -36,9 +42,9 @@ Before anything that arms, moves or de-torques, the binding rules are in
   `crates/reachy-bench/reachy-bench.example.toml`, which is every key at its
   shipped default with the reasoning beside it, and fill in the two things an
   example cannot know: the serial node under `[bus]`, and the `[datum]` table,
-  which is commented out and whose absence refuses every command that moves
-  something. A person reads a self-test record and writes that table; it is
-  not copied from anywhere.
+  which is commented out. A person reads a self-test record and writes that
+  table; it is not copied from anywhere. Nothing in that file configures
+  motion — the bench moves nothing.
 
 ## Where things live
 
@@ -48,17 +54,21 @@ Before anything that arms, moves or de-torques, the binding rules are in
 | `.local/reachy-bench.toml` | the unit's bench configuration. Gitignored: it holds a serial node and one machine's reviewed datum |
 | `.local/records/` | fetched self-test records, and wherever you park retrieved traces |
 | `target/bench-arm64/release/reachy-bench` | the device binary `bench-build` produces |
-| `crates/reachy-bench/fixtures/traces/` | recorded runs kept as test data |
+| `target/motion-arm64/release/` | the motion payload `motion-build` stages: both binaries and every configuration file the three processes read, laid out the way their relative paths expect |
+| `.local/motion-logs/` | fetched run logs, one directory per fetch |
+| `crates/reachy-motion/fixtures/traces/` | recorded runs kept as test data |
 
-On the device, and both in RAM — nothing a dev cycle pushes touches the eMMC:
+On the device, and all in RAM — nothing a dev cycle pushes touches the eMMC:
 
 | | |
 |---|---|
-| `/run/brenn-app/releases/bench/reachy-bench` | the binary. A tmpfs submount, mounted exec where `/run` itself is not. A reboot clears it |
-| `/var/lib/brenn-app/` | the `app` account's home, mode 0700: the bench's configuration, the self-test state file, and anywhere you point `--trace` |
+| `/run/brenn-app/releases/bench/reachy-bench` | the bench binary. A tmpfs submount, mounted exec where `/run` itself is not. A reboot clears it |
+| `/run/brenn-app/releases/motion/` | the motion payload, and the working directory its three processes are started from |
+| `/run/brenn-app/logs/motion/` | where the logger writes a run's `.olog` files, one directory per run |
+| `/var/lib/brenn-app/` | the `app` account's home, mode 0700: the bench's configuration and the self-test state file |
 
-Traces and records belong under `/var/lib/brenn-app`. `/run/reachy-trace.csv`
-is not writable by the account the run drops to.
+Records belong under `/var/lib/brenn-app`: it is the one directory the account
+the run drops to can write.
 
 ## Clearing the bus
 
@@ -72,6 +82,13 @@ wants it to itself:
 on a device is the operator's to decide. Its refusal names the service and the
 command, and its exit codes distinguish the two (3 for `brenn-app`, 4 for
 `reachy-motiond`) from ssh failing (255) and from the bench's own verdict.
+`deploy-motion.sh --push` asks the same question before it pushes anything — a
+motion run wants the bus as much as a bench run does — and it is literally the
+same question: the probe, the codes and the refusals live in `tools/lib.sh`, so
+the contract described here is one thing rather than two that agree today. For
+the bench that question gates the run, because the probe and the run share one
+ssh invocation; for the motion deploy it is advisory, because the push is a
+second connection and the run is started by hand afterwards.
 
     ssh root@"$REACHY_HOST" systemctl stop reachy-motiond.service
     # ... the session ...
@@ -97,8 +114,15 @@ same chain for the read-only registry.
 have, the bench prints its usage, which lists them all. The ones worth knowing
 before the first session:
 
-- `selftest` — read-only. Presence, registers, voltage, health, the resting
-  pose, the antennas' fold. Writes a state file that `bench-fetch` retrieves.
+- `selftest` — read-only. Presence, registers, the legs' travel fences, voltage,
+  temperature, health, the resting pose, the antennas' fold. Writes a state file
+  that `bench-fetch` retrieves. The temperature case has never been run against a
+  unit: the register is untried here, so a reading outside `5..=55 °C` is a
+  person's to review before the band moves. The `leg-fence` case reads each leg
+  servo's own travel window back and compares it against the motion envelope the
+  cog system commands through — a disagreement in either direction names the leg
+  and prints both windows in counts and degrees, and is a mis-provisioned unit
+  rather than something to widen the tolerance for.
   A diagnostic and a regression guard; it gates nothing.
 - `provision` — writes the antennas' operating mode. Torque must be off on
   both; it moves nothing.
@@ -109,13 +133,14 @@ before the first session:
   The head settles as it goes, so take its weight if it is up.
 - `reboot [id]` — see below.
 
-**There is no command here that moves the machine.** The supervised motion
-commands — `arm`, `up`, `hold`, `stow`, `yaw`, `antennas`, `demo`, `play` — are
-gone from the build; the bench is a read-only registry plus the three writes
-above. Coordinated motion is the cog path's, and until it drives hardware,
-nothing in this tree commands a move on a unit. What still works on hardware is
-every read-only check, provisioning, `reboot`, and `off` — so the machine can
-always be read and always be released.
+**There is no command here that moves the machine, and there will not be
+one.** This tool validates that we can talk to the hardware: the read-only
+registry, provisioning, `reboot`, and `off` — so the machine can always be read
+and always be released. The supervised motion commands — `arm`, `up`, `hold`,
+`stow`, `yaw`, `antennas`, `demo`, `play` — and everything under them, the
+fixed-rate pump and the trace writer included, are deleted rather than parked.
+Coordinated motion is the cog system's, and a motion test on a unit is a run of
+that system, not of this binary.
 
 ## Binary freshness
 
@@ -185,8 +210,8 @@ What a restart does, and how it compares with cutting power:
 | health byte immediately after | `0x00` observed, and asserted: a bit that survives fails the command | the chronic `0x01` observed |
 | how long | seconds, from the workstation | a walk to the switch |
 
-Arming writes the gains and the motion profile at every arm, so neither path
-can leave a session running on stale ones.
+Whatever arms this machine writes the gains and the motion profile at every
+arm, so neither path can leave a session running on stale ones.
 
 The antennas turn freely and are in extended-position mode, so their reported
 angle can accumulate past a turn while the machine runs. Both paths fold that
@@ -194,100 +219,144 @@ count back into a single turn; the self-test's `antenna-fold` case is what
 asserts it, and a reading outside one turn is a finding for a person, never a
 bound to widen. See the open observations at the end.
 
-## Traces, and what to do with one
+## The motion test
 
-No command writes a trace today: `--trace` belonged to the motion commands, and
-they are out of the build. The recordings already taken are checked in under
-`crates/reachy-bench/fixtures/traces` and stay the measurements this machine's
-guards are sized against. What follows describes the format they are in, and the
-workflow whatever records the next one has to fit.
+The run that moves the machine. Not a bench command and never will be: motion
+lives in the cog system, so a motion test on a unit is a run of that system.
 
-A trace is one CSV row per control period: every joint's measured angle against
-the goal it was being held to, which is the move's velocity profile at the rate
-it was sampled. Each run of an invocation appends, and the run number is derived
-from the file's own last row, so several invocations against one path accumulate
-rather than overwrite. Bringing one back off a unit:
+**Nothing here has been run on hardware yet.** Every Reachy ADR since
+2026-08-14 records no unit available, so what follows is the procedure and the
+gates, written before the first run rather than after it. The first person to do
+it is discovering things; the bring-up rule applies — an unexpected reading goes
+to a person before anything is changed to accommodate it.
 
-    ssh root@"$REACHY_HOST" cat /var/lib/brenn-app/reachy-trace.csv \
-        > .local/records/trace-$(date -u +%Y%m%dT%H%M%SZ).csv
+### What runs
 
-A released joint's goal cells are blank from the period after it went out of
-service; its measured cells keep recording. That is the diagnostic of record
-for a degraded run.
+Three OS processes, two binaries:
 
-**Reading one back.** `crates/reachy-bench/src/trace/metrics.rs` is the
-measurement half of the old scratch analyzer, in Rust — out of the build with
-the motion layer it served, and kept on disk under `TODO(bench-motion-delete)`
-until the cog path replaces it: `Trace::read` parses a
-file into runs and periods, and the per-run and per-joint measurements are
-span, peak measured and goal speed, peak goal step, worst lag, arrival,
-residual, settle gap, longest stall, and the antenna pair's phase separation.
-There is no CLI over it — its consumer was the replay suite now parked in
-`crates/reachy-bench/src/replay.rs`, which drove the four fixtures against the
-shipped guards. The
-plotting half stays scratch in `.local/`, with its own throwaway venv; a
-plotting aid is bench-session tooling, not product.
+| | |
+|---|---|
+| `reachy_motord` | the servo bus. Not a cog: it owns the serial port, a 20 ms grid on the real clock, and the driver decisions. Talks to the cogs over six UDP sockets on loopback |
+| `robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
+| `robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose`, `Session`, and the wake gesture that asks for the one thing this system does unprompted |
 
-Two cautions the module states at its source and that matter when you read a
-number off an old file. A goal column is what the loop *commanded*, and
-recordings made before the per-period move clock carry whatever the scheduler
-did that night inflated into their step sizes — no guard is ever sized against
-a recorded step. A measured column is the servo's own encoder at the rate the
-loop read it, so velocities from it are averages over a period.
+One executable, two processes: which one it becomes is the process description
+it is started with. Both need the same `--pinion-dir` and `--pinion-ns` — the
+logger finds the control process's channels through that namespace, and a
+mismatch is silent in the worst direction: the logger comes up, finds nothing,
+and writes an empty log while the gesture runs perfectly. Both values are stated
+once in `cogs/robot_logger.textproto` and `make motion-commands` reads them from
+there.
+
+### The loop
+
+    make motion-build       # the aarch64 payload: both binaries and every config they read
+    make motion-deploy      # push it into the unit's RAM, and make the log directory
+    make motion-commands    # print the three commands, in the order to start them
+    # ... the run ...
+    make motion-fetch       # bring the .olog directories back, timestamped
+    bazel run //cogs:first_motion_report -- .local/motion-logs/<fetch>/<run>
+
+`motion-deploy` has `motion-build` as a prerequisite, so the blessed entry point
+cannot push a payload older than your tree. It refuses while `brenn-app.service`
+or `reachy-motiond.service` is running — either of them holds the servo bus —
+and the refusal names the service and the command, exactly as the bench's does.
+That question is advisory here, which it is not for the bench: a push starts
+nothing, and the run itself is three commands a person types later. What keeps
+two claimants off the bus at that point is the driver's exclusive open of the
+port, so clear the bus before you start the run and not merely before you push.
+
+The payload lands at `/run/brenn-app/releases/motion` — tmpfs, cleared by a
+reboot, and the working directory all three processes are started from, because
+every configuration file in the payload is named by a path relative to it. The
+records land under `/run/brenn-app/logs/motion`, also RAM: pull them off with
+the run.
+
+### Starting and stopping
+
+`make motion-commands` prints them; the order is the driver, then the logger,
+then the control loop, and stopping is the reverse. Start the driver first
+because it fails safe: with nothing talking to it, it reaches the minimum risk
+condition on its own inside its startup window and reports having done so.
+
+**Any stop order is safe.** A driver that outlives the cogs de-torques on its
+own dead-man — silence is what makes it let go — and a driver stopped first
+leaves a machine already at rest. There is no ordering in which the machine
+stays energised with nobody commanding it.
+
+### What a good run looks like
+
+The wake gesture, once, and then nothing: commission, engage, raise, hold, stow,
+verified release, `resting`. The machine ends de-torqued and the session ends
+rest-class, which is not a fault — a rest-class ending is the machine at the
+minimum risk condition, and the next wake is a fresh session rather than a
+recovery. The gesture is `cogs/wake_params.textproto`; it is the same gesture
+the S1 scenario runs, so every phase of it is already pinned by a test.
+
+Watch for it with your eyes on the machine and your verdict from the log.
+`first_motion_report` over the fetched records is the verdict: the phase
+sequence in order, zero tick faults, no `bus_failure` and no `cycle_skipped`, a
+release with evidence, and the measured half printed either way — per-cycle
+jitter, read losses, tracking lags beside the replay suite's pinned headroom,
+the health rotation's readings, and a per-channel census. It prints the
+measurements whether it passes or fails, because a first run that fails is
+exactly the run whose numbers somebody needs. Its own test runs it over the S1
+scenario's deterministic log, so the analyzer was proved before any hardware log
+existed.
+
+File the report and the log with the run record. Three things to check on the
+unit the first time, none of which any test here can answer: that the log
+directory's filesystem accepts direct I/O on that kernel — the writer opens
+every file `O_DIRECT | O_DSYNC` and a refusal is a failed open at the first file
+— that the aarch64 binaries run at all, which `make check-device` says nothing
+about because it builds and never executes them, and that the unit's time daemon
+is configured to slew rather than step while a session runs. A backwards step of
+`CLOCK_REALTIME` is loss of the driver's time base: every timer that can
+de-torque the machine is a difference against the clock that just moved, so the
+driver answers a step by latching torque off, and nothing clears that latch but
+the control process arming again. The session ends at the minimum risk
+condition, by design, with the head wherever it was. That is the correct
+response and a wasted run, so it is worth the check beforehand.
+
+## The recorded traces
+
+No command in this tree writes a trace: `--trace` belonged to the motion
+commands, which are gone. The four recordings already taken are checked in
+under `crates/reachy-motion/fixtures/traces` and are what that crate's bounds
+are sized against; `//crates/reachy-motion:replay_test` replays them against
+the figures the cog path actually runs on. The directory's `README.md` says
+what each one records.
+
+The format, which whatever records the next one has to fit: one CSV row per
+control period, every joint's measured angle against the goal it was being held
+to, which is the move's velocity profile at the rate it was sampled. A released
+joint's goal cells are blank from the period after it went out of service and
+its measured cells keep recording — that is the diagnostic of record for a
+degraded run.
+
+Two cautions that matter when reading a number off one of these files. A goal
+column is what the loop *commanded*, and recordings made before the per-period
+move clock carry whatever the scheduler did that night inflated into their step
+sizes — no guard is ever sized against a recorded step. A measured column is the
+servo's own encoder at the rate the loop read it, so velocities off it are
+averages over a period.
 
 **Keeping one.** A recording that settled a question becomes a fixture:
-`crates/reachy-bench/fixtures/traces/`, a row in that directory's `README.md`
-saying what it records, and a test asserting the property that qualified it —
-which needs the replay suite re-pointed at whatever hosts the loop by then, the
-cutover slice's work. The four already there are what the shipped step bounds,
-tracking threshold, gains and antenna clocks are sized against — a measurement
-nothing replays is folklore by the next release. `*.csv` is gitignored
+`crates/reachy-motion/fixtures/traces/`, a row in that directory's `README.md`
+saying what it records, and a guard in `replay_test` asserting the property that
+qualified it. A measurement nothing replays is folklore by the next release, and
+a re-derived figure landing outside a pinned tolerance is a finding for a person
+— never a tolerance widened to make the suite green. `*.csv` is gitignored
 repo-wide and that directory is negated back in, so a new fixture lands with
 `git add` like anything else.
 
-## The 50-cycle soak
-
-The acceptance gate before the machine goes back to unattended service, and
-the empirical check on the antenna phase-separation margin. No bench command
-exists for it; it is a loop over the ordinary gesture commands with a trace.
-
-Preconditions: the unit's configuration rebuilt from the current example (the
-soak runs at **shipped defaults**, not at a trial configuration), motiond and
-`brenn-app` stopped, the machine limp and stowed, a fresh binary, and nothing
-on or around the head.
-
-    . .local/reachy.conf
-    make bench-build
-    trace=/var/lib/brenn-app/soak.csv
-    for i in $(seq 50); do
-        tools/deploy-bench.sh "$REACHY_HOST" --run up   --trace "$trace" || break
-        tools/deploy-bench.sh "$REACHY_HOST" --run stow --trace "$trace" || break
-    done 2>&1 | tee .local/records/soak-$(date -u +%Y%m%dT%H%M%SZ).log
-    tools/deploy-bench.sh "$REACHY_HOST" --run off
-
-It passes on all four of:
-
-1. **Zero faults.** No run prints a fault or an `incident:` line; the loop
-   never breaks.
-2. **Zero latched error bits afterwards.** `make bench-selftest` then
-   `make bench-fetch`, and the `health` case passes — nothing beyond the
-   chronic input-voltage bit noted below.
-3. **Settle within tolerance every run.** Every move printed the arrival form
-   of its settle line ("measurably at the goal ... later"), never the form
-   naming a joint that was still out when the window ran out.
-4. **The ears check.** Listen at the head while it holds between cycles. The
-   antennas ship with a derivative term they have not been listened to at
-   length with; an audible buzz at hold is a finding, and the answer is a
-   smaller antenna D gain and another soak.
-
-Retrieve `soak.csv` afterwards as above — 100 runs in one file — and keep it
-if anything in it is worth arguing about later.
-
-A tip contact during the soak is that margin's verdict, and the margin is
-configuration: `antenna_phase_separation_rad` in `[motion]`, with
-`antenna_contact_band_rad` beside it. Try a wider figure on the bench, re-run
-the soak, and propose the value with the recording that argues for it —
-promoted to a fixture, it is what the replay tests re-derive against.
+The antenna phase-separation margin is the figure a recording most often argues
+about. It lives in `AntennaPhaseConfig` in `reachy-motion`, is shipped by
+`MotionConfig::default()`, and `ANTENNA_PHASE_SEPARATION_RAD` beside it is what
+the replay suite's separation guards re-derive against: the clean pair and the
+one recorded clash, either side of the bound. Proposing a wider figure means the
+recording that argues for it, promoted to a fixture, and the guard moved with it
+in the same commit.
 
 ## Open observations
 

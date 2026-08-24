@@ -1,17 +1,17 @@
 # Recorded runs
 
-Per-period traces written by `reachy-bench --trace` against the unit, kept as
-test data. Each file holds one bench session's runs, appended in the order they
+Per-period traces written against the unit by the bench loop of the day, kept
+as test data. Each file holds one bench session's runs, appended in the order they
 were commanded; a run is a move, and the files here predate per-file run
 numbering, so every run in them is numbered `0` and they are told apart by the
 period counter starting again.
 
-They are here because the guards this repo ships — step bounds, the tracking
-threshold, the servo gains, the antenna clocks — are sized against what this
-machine actually did, and a measurement nothing replays is folklore by the next
-release. `trace::metrics` reads them; the tests in that module say what each
-file is kept for and assert it, so a fixture cannot quietly rot into a file
-nobody checks.
+They are here because the guards this crate ships — step bounds, the tracking
+threshold, the antennas' separation — are sized against what this machine
+actually did, and a measurement nothing replays is folklore by the next release.
+`tests/replay_test.rs` replays them against the values the cog path runs on;
+one test per file says what that file is kept for and asserts it, so a fixture
+cannot quietly rot into a file nobody checks.
 
 | file | runs | what it records |
 |---|---|---|

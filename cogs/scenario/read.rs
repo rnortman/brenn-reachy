@@ -5,18 +5,15 @@
 //! the whole run before asserting anything. A failure then reports what the log
 //! held rather than stopping at the first surprise.
 //!
-//! Nothing here asserts. What each stream should contain is the scenario's
-//! business; this module's job is to say which channel of this system carries
-//! what, once. The table below is that statement: the same row drives the
-//! binding check and the decode, so a channel cannot be checked and left
+//! Nothing here asserts, and nothing here reads. What each stream should contain
+//! is the scenario's business; the pass itself -- open, check every binding,
+//! dispatch, census -- is `log_read::read_with`'s, shared with every other
+//! reader in the repo. This module's job is to say which channel of this system
+//! carries what, once. The table below is that statement: the same row drives
+//! the binding check and the decode, so a channel cannot be checked and left
 //! unread, or read and left unchecked.
-//!
-//! The reading itself -- the borrowed message to an owned value, the carrier to
-//! a datagram, the complaint when either refuses -- is `log_read`'s, shared with
-//! every other checker in the repo.
 
-use clockwork_logs::offboard::OffboardReader;
-use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage};
+use clockwork_logs::LogError;
 use std::path::Path;
 
 use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
@@ -28,9 +25,8 @@ use brenn_reachy__driver__health_clk_rs::DriverEventWire;
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
-use log_read::{Complaints, Logged, binding, typed};
-
-use crate::{
+use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
+use motion_channels::{
     CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL,
     SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL, SIM_CMD_CHANNEL,
 };
@@ -58,37 +54,32 @@ pub struct Run {
     pub datagrams: Vec<Logged<SessionCmdWire>>,
     /// Where the head was.
     pub estimates: Vec<Logged<PoseEstimateWire>>,
-    /// Every channel the log carries, in the order the reader reports them.
-    /// A checker uses this to say something about the channels it does not
-    /// otherwise read -- the signal report groups, for one.
-    pub channel_names: Vec<String>,
-    /// How many messages each of those channels carried, in the same order. A
-    /// checker with no Rust type bound to a channel can still say whether it
-    /// carried anything, which is the difference between a report group that
-    /// reported and one that only exists.
-    pub channel_message_counts: Vec<usize>,
+    /// Every channel the log carries and how many messages each held. A checker
+    /// uses this to say something about the channels it does not otherwise read
+    /// -- the signal report groups, for one.
+    pub census: Census,
     /// Anything that went wrong reading the log itself: a channel carrying a
     /// schema this build does not know, a payload that did not decode, a
     /// counter the reader kept. Every one of these is a failure of the run.
     pub complaints: Complaints,
 }
 
-/// One channel of this system, and the two things done with it.
-struct Bound {
-    /// The channel's name in the log, which is the name the system declares.
-    name: &'static str,
-    /// Assert the log records the schema this build is about to decode.
-    check: fn(&[ChannelMetadata], &str, &mut Complaints),
-    /// Decode one message of it into the stream it belongs to.
-    route: fn(&mut Run, &LoggedMessage<'_>),
+impl Streams for Run {
+    fn census(&mut self) -> &mut Census {
+        &mut self.census
+    }
+
+    fn complaints(&mut self) -> &mut Complaints {
+        &mut self.complaints
+    }
 }
 
 /// Every channel a checker of this system reads.
 ///
 /// The signal report groups are deliberately absent: nothing binds a Rust type
 /// to a group's generated schema, so they are observable through
-/// [`Run::channel_names`] and not decoded.
-const CHANNELS: [Bound; 10] = [
+/// [`Run::census`] and not decoded.
+const CHANNELS: [Bound<Run>; 10] = [
     Bound {
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
@@ -146,42 +137,10 @@ impl Run {
     ///
     /// # Errors
     ///
-    /// Whatever the reader refuses about the log as a whole. A message the
+    /// Whatever the shared pass refuses about the log as a whole. A message the
     /// reader yielded but this build could not make sense of is a complaint
     /// rather than an error: the point is to report all of them.
     pub fn read(dir: &Path) -> Result<Self, LogError> {
-        let mut reader = OffboardReader::open(dir)?;
-        let mut run = Self::default();
-
-        for metadata in reader.channels() {
-            run.channel_names.push(metadata.channel_name.clone());
-        }
-        run.channel_message_counts = vec![0; run.channel_names.len()];
-        // Before a single message is decoded: a payload that matches in size is
-        // not necessarily the right schema.
-        let channels: Vec<ChannelMetadata> = reader.channels().to_vec();
-        for bound in &CHANNELS {
-            (bound.check)(&channels, bound.name, &mut run.complaints);
-        }
-
-        while let Some(message) = reader.read_next()? {
-            let name = message.metadata.channel_name.as_str();
-            if let Some(index) = run.channel_names.iter().position(|known| known == name)
-                && let Some(count) = run.channel_message_counts.get_mut(index)
-            {
-                *count += 1;
-            }
-            if let Some(bound) = CHANNELS.iter().find(|bound| bound.name == name) {
-                (bound.route)(&mut run, &message);
-            }
-        }
-
-        if !reader.error_counters().is_clean() {
-            run.complaints.push(format!(
-                "the reader recorded errors over the output log: {:?}",
-                reader.error_counters()
-            ));
-        }
-        Ok(run)
+        read_with(dir, &CHANNELS)
     }
 }

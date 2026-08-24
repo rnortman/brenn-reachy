@@ -55,8 +55,8 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
 use clockwork_rs::SyncTime;
-use motion_slots::{configured, counters};
-use reachy_motion::arm::row_of_id;
+use motion_slots::{MS_NS, configured, counters};
+use reachy_motion::arm::{ProfileConfig, row_of_id};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{self, JointRef};
 use reachy_motion::seq::BusResult;
@@ -64,11 +64,6 @@ use reachy_motion::tick::ResponseKind;
 use reachy_motion::value;
 use reachy_motion::winddown::Disposition;
 use session_slots::{clear_timeline, mark_published, oldest_unpublished, push_report};
-
-/// How many nanoseconds a millisecond is. A script's offsets are milliseconds
-/// and everything downstream of the screen is nanoseconds, and this is the only
-/// place the two meet.
-const MS_NS: i64 = 1_000_000;
 
 /// How many motions a library can hold: `cogs/config.clk`'s capacity for them,
 /// which is what an overlay's motion id indexes.
@@ -169,6 +164,15 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
         aux_timeout_ns: params.aux_timeout_ns,
         aux_retries: params.aux_retries,
     };
+    // The commissioned record, taken from configuration on the first wake and
+    // shared from then on. The profile is the one part of it this deployment
+    // chooses; everything else in it is a hardware fact the motion library
+    // states once. Delivered by initialising the record rather than by carrying
+    // it: the machinery that needs it reaches the one copy.
+    session_bus::init_arm_config(ProfileConfig {
+        acceleration: params.profile_acceleration,
+        velocity: params.profile_velocity,
+    });
 
     // The slot is this cog's own memory and nothing else writes it, so bytes it
     // cannot read are memory gone wrong rather than another writer's opinion.

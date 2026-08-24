@@ -194,6 +194,10 @@ impl<'a> Regs<'a> {
     /// Only the cells named below are written. Every other cell stays at zero,
     /// which reads back as its register's own shape carrying zero, and the live
     /// cells are [`Self::refresh`]'s.
+    ///
+    /// The temperature cell carries the same constant the health report does, so
+    /// a host reading that register over the seam and a host reading the report
+    /// get one answer about one servo.
     pub fn init(&mut self) {
         for (row, joint) in ROWS.into_iter().enumerate() {
             let gains = DEFAULT_GAINS.for_joint(joint);
@@ -207,6 +211,10 @@ impl<'a> Regs<'a> {
                 (RegId::PositionGains, gains.value()),
                 (RegId::PresentInputVoltage, value::volts(NOMINAL_VOLTS)),
                 (RegId::HardwareErrorStatus, value::u8(0)),
+                (
+                    RegId::PresentTemperature,
+                    value::u8(crate::sim_aux::SIM_TEMP_C.cast_unsigned()),
+                ),
             ] {
                 self.put(row, reg, held);
             }

@@ -28,11 +28,6 @@
 //! The binary is a thin entry point over this library, so everything the bench
 //! decides — configuration and the registry's verdicts — is reachable from tests
 //! that need no port and no machine.
-//!
-//! `commands.rs`, `pump.rs`, `trace.rs` and `trace/metrics.rs` sit beside these
-//! files but are not in the build: they are the bench's retired motion layer,
-//! kept on disk as the executable record of how this machine was driven.
-//! TODO(bench-motion-delete)
 
 #![forbid(unsafe_code)]
 

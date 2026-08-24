@@ -759,9 +759,10 @@ mod tests {
     use dxl_proto::frame::{INST_REBOOT, INST_WRITE};
 
     use super::*;
-    use crate::config::Resolved;
+
     use crate::testutil::{
-        FakeMachine, Spy, TestClock, datumed_config, machine_at, resolved, stow_legs, wind_down_bus,
+        Configured, FakeMachine, Spy, TestClock, configured, datumed_config, machine_at, resolved,
+        stow_legs, wind_down_bus,
     };
 
     /// What a command left behind: the registers it ended on, every instruction
@@ -793,7 +794,7 @@ mod tests {
 
         /// Every servo's goal register is untouched: nothing here pinned or
         /// commanded anything.
-        fn commanded_nothing(&self, cfg: &Resolved) {
+        fn commanded_nothing(&self, cfg: &Configured) {
             let machine = self.registers.borrow();
             for id in cfg.map.ids() {
                 assert!(
@@ -838,7 +839,7 @@ mod tests {
     }
 
     /// What each servo's Torque Enable register holds after a run.
-    fn torque(cfg: &Resolved, run: &Run) -> Vec<u8> {
+    fn torque(cfg: &Configured, run: &Run) -> Vec<u8> {
         let machine = run.registers.borrow();
         cfg.map
             .ids()
@@ -930,7 +931,7 @@ mod tests {
     }
     /// A machine as the vendor provisions it: every servo in single-turn
     /// position mode, torque off.
-    fn unprovisioned(cfg: &Resolved) -> FakeMachine {
+    fn unprovisioned(cfg: &Configured) -> FakeMachine {
         let mut machine = machine_at(&datumed_config(), &stow_legs());
         for id in [cfg.map.ids()[7], cfg.map.ids()[8]] {
             machine.set(id, named_reg(RegId::OperatingMode), &[3]);
@@ -939,7 +940,7 @@ mod tests {
     }
 
     /// What each servo's Operating Mode register holds after a run.
-    fn modes(cfg: &Resolved, run: &Run) -> Vec<u8> {
+    fn modes(cfg: &Configured, run: &Run) -> Vec<u8> {
         let machine = run.registers.borrow();
         cfg.map
             .ids()
@@ -1066,7 +1067,7 @@ mod tests {
 
     /// A machine holding torque on all nine, with one servo carrying a latched
     /// overload — the state an operator reaches for `reboot` in.
-    fn overloaded(cfg: &Resolved) -> FakeMachine {
+    fn overloaded(cfg: &Configured) -> FakeMachine {
         let mut machine = machine_at(&datumed_config(), &stow_legs());
         for id in cfg.map.ids() {
             machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
@@ -1551,7 +1552,7 @@ mod tests {
         let mut file = datumed_config();
         wind_down_bus(&mut file);
         file.bus.retry_spacing_ms = 250;
-        let cfg = file.resolve().expect("a datumed example resolves");
+        let cfg = configured(&file);
         let spacing = cfg.timing.retry_spacing;
 
         let (early, late) = (cfg.map.ids()[1], cfg.map.ids()[5]);

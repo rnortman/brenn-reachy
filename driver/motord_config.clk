@@ -1,0 +1,60 @@
+// What the motor driver process is built with: the grid it runs on, the budgets
+// it spends, and where its bus is.
+//
+// A module of its own for the same reason the cogs' configs are: a config is
+// authored as protobuf text, so its schema has to cross the Protobuf backend as
+// well as the C++ one, and generation is declared per module. Nothing else the
+// driver publishes can cross that backend, so nothing else lives here.
+//
+// The driver process is not Clockwork-hosted -- it is a plain process holding a
+// serial port -- and it is configured this way anyway: one vocabulary for
+// numbers a machine is built with, whichever process reads them. The binary
+// parses the text against the message this schema generates.
+
+#![generate(cpp, proto, proto_conv)]
+#![cpp(namespace=brenn_reachy::driver)]
+
+// The driver process's whole configuration.
+schema MotordParams
+{
+    uuid: 3a1e6c07-2f5a-4d18-9b6c-2c5f0a7d41e2;
+    fields
+    {
+        // The bus cycle, nanoseconds: the spacing of the grid the driver wakes
+        // on and the period every sample it publishes is stamped for. The same
+        // number the cogs are built with -- a driver running a cycle of a
+        // length the decision tick does not expect executes goals at the wrong
+        // instant. Stated here and refused when it disagrees with the cycle the
+        // driver's own budgets are sized against, so the field is a declaration
+        // of which machine this is rather than a knob.
+        #0 period_ns: Int64;
+
+        // How long the goal stream may go quiet before the dead-man de-torques
+        // the machine, nanoseconds. The last thing between a stalled commander
+        // and a machine holding torque with nobody watching it.
+        #1 hold_timeout_ns: Int64;
+
+        // How often the aux slot offers a health read, nanoseconds. The slot
+        // spends at most one transaction per cycle and the host's requests
+        // outrank this one, so it is a floor on the spacing rather than a
+        // schedule.
+        #2 health_poll_period_ns: Int64;
+
+        // How long after start the driver waits for its first goal or session
+        // command before de-torquing the machine, nanoseconds. A driver that
+        // came up next to a machine nobody is commanding -- a restart, a
+        // half-started system -- reaches the minimum risk condition on its own
+        // rather than leaving whatever the servos were doing in place.
+        #3 startup_window_ns: Int64;
+
+        // The serial device the servo bus is on. A path rather than an index:
+        // the node is fixed by the board, and a driver that guessed which port
+        // it had would be a driver that can address the wrong machine.
+        #4 bus_device: VarString<256>;
+
+        // The bus baud rate. Both ends of a serial link have to have been told
+        // the same number and neither can discover it, so it is configuration
+        // and not a probe.
+        #5 bus_baud: UInt32;
+    }
+}

@@ -37,3 +37,16 @@ stow_budget_ns: 4000000000
 # row back per cycle, so a nine-row pass costs 180 ms; past this budget the
 # session says so and keeps commanding, because nothing gates de-torquing.
 torque_off_confirm_budget_ns: 500000000
+
+# The servo-side motion profile the commission sequencer writes, in the
+# registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
+# acceleration). Nothing has run this pair on hardware.
+#
+# The bench's trial-validated figures (400/600, including an 855°/s antenna sweep
+# and the 0.8 s presence gesture) were sized for a host commanding whole moves,
+# where the profile is
+# only the backstop under host-side shaping and a tight one throttles the shaped
+# motion itself. The session streams step-bounded setpoints instead, one per
+# cycle, which is what the low pair is for.
+profile_acceleration: 20
+profile_velocity: 50

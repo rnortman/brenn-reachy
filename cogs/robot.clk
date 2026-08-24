@@ -1,0 +1,318 @@
+// The system that runs on a machine: the control core, the seam to the driver
+// process, and the one thing in the box that asks the machine to do anything.
+//
+// The same three cogs as the simulated system, over the same channels, with one
+// difference: what stands at the driver's end of the wire. There a cog models
+// the plant; here six UDP sockets carry the driver contract across a process
+// boundary to `reachy-motord`, which owns the serial port and the bus cycle.
+// The core is `motion::MotionCore` in both, stated once, so the two systems
+// cannot drift apart in topology.
+//
+// Why the driver is a process and not a cog: it must hold a serial port across
+// executions and block on multi-millisecond bus transactions. A Rust cog's only
+// cross-execution state is schema-resident, so nothing sanctioned can hold the
+// port; the online runner has two cog worker threads and no preemption, so
+// blocking bus work in an execute body spends half the pool; and an input
+// overrun on a slow cog ends the whole process. So the driver is an OS process
+// that is no Clockwork process, composed in no box, and this file's business
+// with it is the six sockets below.
+//
+// A socket occupies exactly the slot a cog does: it publishes to a channel or
+// subscribes to one, and a channel does not say what filled it. So each
+// incoming socket is its channel's single publisher here, where the modelled
+// driver is in `SimBox`, and the channel graph is untouched.
+//
+// The datagram on each socket is the schema's bytes and nothing else -- the
+// socket layer reads and writes the `message_type`'s Tachyon representation as
+// the packet's binary format, at exactly that size. There is no header on this
+// seam and no room for one; `driver/wire.clk`'s header belongs to an edge whose
+// far end is not a Clockwork socket.
+//
+// The wake gesture the box carries is `wake.clk`, a module of its own: the Rust
+// generator refuses a `udp_socket` declaration by name, so a module holding the
+// seam's sockets cannot also hold a cog written in Rust.
+//
+// The foot of this file is the composition: the box that closes the loop around
+// the core with sockets, the logger box that records the run, and the two
+// processes that host them. They are here rather than in the system module next
+// door because the grammar admits a `system_target` only in a module that
+// generates nothing, and a process needs a module that generates an executable.
+//
+// Two modules are imported under aliases because a box member below carries a
+// name of its own: the wake cog's instance is `wake` and its slot is
+// `wake_state`. A member name shadows a module name in the enclosing scope,
+// which the compiler refuses as a redefinition. The logger box's members go the
+// other way round -- they are named for what they hold rather than for the
+// module the type comes from -- for the same rule.
+// (A comment may not sit directly above a `use`, which is why this one is
+// here.)
+
+#![generate(cpp, cpp_exe)]
+#![cpp(namespace=brenn_reachy::robot)]
+
+use [cpp, proto, proto_conv] cogs::config;
+use cogs::motion;
+use cogs::session_cmd;
+use cogs::wake as wake_cog;
+use cogs::wake_state as wake_state_vocab;
+use driver::goal;
+use driver::health;
+use driver::pose;
+use @clockwork::clockwork::logging::log_writer_config;
+use [cpp, proto, proto_conv] @clockwork::clockwork::logging::writers::channel_message_rates_config;
+use @clockwork::clockwork::logging::writers::logger;
+use [] @clockwork::clockwork::logging::writers::logger_channels;
+use [cpp, proto, proto_conv] @clockwork::clockwork::logging::writers::logger_config;
+use @clockwork::clockwork::logging::writers::logger_status;
+
+// The driver's sample stream, arriving. Bound on the loopback: the driver sends
+// each cycle's sample here, and this socket is `DriverPose`'s one publisher in
+// this composition.
+//
+// The loopback bind is the whole of what these four incoming sockets trust.
+// Nothing off the machine can reach them and a datagram of the wrong size kills
+// this process, but a datagram of the right size from any other process on the
+// unit is indistinguishable from the driver's: machine state, fault evidence and
+// a torque-off confirmation can all be fabricated by a local sender, and the
+// driver's dead-man does not answer it, because that fail-safe fires on silence
+// and a sender's whole effect is to prevent silence. The same holds in reverse
+// for the two ports `reachy-motord` binds. Accepted for now -- every process on
+// this unit is ours -- and what would end it is a peer check the seam has no
+// room for yet: TODO(motord-seam-trust-boundary)
+udp_socket PoseIn
+{
+    address: 127.0.0.1;
+    port: 7402;
+    direction: incoming;
+    message_type: Tachyon<pose::PoseSample>;
+}
+
+// The edges the driver reported: a de-torquing it latched, a confirmation it
+// read back, a bus it declared gone.
+udp_socket EvtIn
+{
+    address: 127.0.0.1;
+    port: 7403;
+    direction: incoming;
+    message_type: Tachyon<health::DriverEvent>;
+}
+
+// How one out-of-band transaction turned out.
+udp_socket AuxOutIn
+{
+    address: 127.0.0.1;
+    port: 7404;
+    direction: incoming;
+    message_type: Tachyon<health::AuxOutcome>;
+}
+
+// What the driver's rotating read of the status registers saw, one report per
+// servo visited.
+udp_socket HealthIn
+{
+    address: 127.0.0.1;
+    port: 7405;
+    direction: incoming;
+    message_type: Tachyon<health::HealthReport>;
+}
+
+// The goal stream, leaving. `port` on an outgoing socket is the destination --
+// the compiler admits `remote_port` only on a bidirectional socket, and the
+// emitter hands this number to the send -- so 7401 is the port
+// `reachy-motord` binds, not one this process holds.
+udp_socket GoalOut
+{
+    address: 127.0.0.1;
+    port: 7401;
+    direction: outgoing;
+    message_type: Tachyon<goal::GoalSetpoint>;
+}
+
+// What the session asks of the driver: keep the dead-man fed, take torque off
+// now, or run this transaction. Its own destination port, because one datagram
+// type per port is what tells the driver's reader what it is holding -- with no
+// header on this seam, the arrival port is the discriminator.
+udp_socket SessionOut
+{
+    address: 127.0.0.1;
+    port: 7406;
+    direction: outgoing;
+    message_type: Tachyon<session_cmd::SessionCmd>;
+}
+
+// The control loop as it runs on a machine: the core three cogs, six sockets in
+// place of the modelled driver, and the wake gesture that starts a session.
+//
+// The topology is `SimBox`'s with two publishers replaced. Where that box puts
+// a cog at the driver's end and reads its scripts out of an input log, this one
+// puts sockets to a process at that end and carries its own intent source.
+// Nothing the core does distinguishes them: a cog reads channels, and a channel
+// does not say what filled it.
+//
+// Every channel has exactly one publisher here too. The core's own self-loop --
+// the decision tick reading back the goal channel it publishes -- adds a
+// subscriber and no publisher, and the outgoing socket on that same channel is
+// one more subscriber beside it.
+box RobotBox
+{
+    new core: motion::MotionCore;
+
+    new wake: wake_cog::Wake;
+
+    // The wake cog's own slot, written by nothing else. No `init=`, so it is
+    // default-constructed into a buffer the compiler synthesizes.
+    new wake_state: State(representation=Tachyon<wake_state_vocab::WakeState>);
+    connect wake_state to wake.sent;
+
+    // The lead and the gesture, read from checked-in protobuf text before the
+    // first execution. The path resolves against the runfiles of whatever runs
+    // the process, which is why the file is a data dependency of the
+    // executable.
+    new wake_params: SerializedDataFile(
+        representation=Protobuf<config::WakeParams>,
+        path="cogs/wake_params.textproto");
+    connect wake_params to wake.params;
+
+    // What the session said, reaching the only thing in this box that acts on
+    // it. The core publishes this channel and consumes none of it.
+    connect motion::ReportsOut to wake.reports;
+
+    // The intent edge. One publisher on this channel, and for now it is
+    // scaffolding: the pod-side bridge that replaces it -- what carries an
+    // intent across it, which end owns the bus and the ports against
+    // `reachy-motiond`, and deleting this cog when it lands -- is
+    // TODO(reachy-pod-motion-integration).
+    connect wake.script to motion::ScriptsIn;
+
+    // The sample stream, arriving from the driver process. The core's two
+    // control-rate cogs run on it and the session reads it for one thing only:
+    // whether the driver is still publishing at all.
+    new pose_in: PoseIn;
+    connect pose_in to motion::DriverPose;
+
+    // The goal stream, leaving for the driver's gate. The tick's own read-back
+    // of this channel is the core's, drawn there.
+    new goal_out: GoalOut;
+    connect motion::DriverCmd to goal_out;
+
+    // What the session asks of the driver, and what the driver answers.
+    new session_out: SessionOut;
+    connect motion::SessionCmdChan to session_out;
+
+    new aux_out_in: AuxOutIn;
+    connect aux_out_in to motion::DriverAuxOut;
+
+    // What the driver says about itself: an edge it reported and a servo's
+    // error bits are the two kinds of fault evidence the decision tick cannot
+    // see.
+    new evt_in: EvtIn;
+    connect evt_in to motion::DriverEvt;
+
+    new health_in: HealthIn;
+    connect health_in to motion::DriverHealth;
+}
+
+// What writes the run down: the framework's two writer cogs, in a process of
+// their own.
+//
+// The wall-clock runner does no logging itself -- its output-log plumbing
+// belongs to the deterministic path -- so an online run is recorded by a logger
+// process reading the logged channels out of the control process's shared
+// memory. Which channels is not decided here: it is the `LogWriterConfig` the
+// compiler generates from the `ChannelLoggingPolicy` set next door, and this box
+// binds that generated file.
+//
+// Logging is observation only. No channel flows out of this box into the control
+// loop, so a logger that died, or whose writes fail, costs the run its records
+// and nothing else -- logging never gates motion and never gates de-torquing.
+//
+// The whole box is one `cpu_domain` away from being the production shape
+// instead: the same two cogs on a second domain -- the dev host -- with the
+// built-in TCP bridge carrying the channels, which puts the log on real disk
+// with no step that pulls it off a unit. TODO(online-host-logger)
+box RobotLogger
+{
+    new init_cog: logger::LoggerInitCog;
+    new status_publisher_cog: logger::LoggerStatusPublisherCog;
+
+    // The writer's arena: its buffer pool plus what it keeps about the channels
+    // and schemas it is writing. The pool is one second of the configured write
+    // rate plus the 8 MiB schema reserve, in 256 KiB buffers, so 4 MiB/s asks
+    // for 12 MiB of it; the rest is headroom for the per-channel bookkeeping.
+    // Not the framework example's 300 MB, which is sized for a vehicle's worth
+    // of video and lidar.
+    new memory: HeapMemory(max_size=33'554'432);
+
+    // Which channels are written, and everything the writer needs to write them
+    // without asking anybody: slot counts, message sizes and each schema's own
+    // definition. Generated from the logging policies next door, so the set is
+    // stated once and in the same vocabulary the simulated system logs.
+    new logged_channels: SerializedDataFile(
+        representation=Tachyon<log_writer_config::LogWriterConfig<>>,
+        path="cogs/system_robot.motion_robot.RobotCpu_event_logger_config.tachyon");
+    connect logged_channels to init_cog.log_writer_config;
+
+    // Where the records go and where the channels are read from.
+    new logger_params: SerializedDataFile(
+        representation=Protobuf<logger_config::LoggerConfig>,
+        path="cogs/robot_logger.textproto");
+    connect logger_params to init_cog.logger_config;
+
+    // What counts as a channel gone quiet, for the status message only.
+    new rate_floors: SerializedDataFile(
+        representation=Protobuf<channel_message_rates_config::ChannelMessageRatesConfig>,
+        path="cogs/robot_logger_rates.textproto");
+    connect rate_floors to init_cog.channel_rates_config;
+
+    // The writer itself, built on the first execution and kept from then on. It
+    // holds a file descriptor and an io_uring across executions, which is why it
+    // is an extern type in a state slot rather than anything schema-resident.
+    new state: State(
+        representation=logger::LoggerCogState,
+        memory_resource=memory,
+        init=init_cog.logger_state);
+    connect state to status_publisher_cog.logger_state;
+
+    // What the logger says about itself: the configuration it came up with, its
+    // state, and the rate it is seeing on each channel. Logged like anything
+    // else, so a run's records say whether the thing writing them was healthy.
+    connect init_cog.logger_config_out to logger_channels::LoggerConfigChannel;
+    connect status_publisher_cog.logger_status to logger_channels::LoggerStatusChannel;
+    connect status_publisher_cog.channel_rates to logger_channels::LoggerMessageRatesChannel;
+}
+
+// The machine the control loop runs on: the unit's own CPU.
+cpu_domain RobotCpu;
+
+// Two processes on one machine over one executable, wall-clock: the control
+// loop, and the logger that watches it. `robot_clk_exe` is the executable the
+// compiler synthesizes for this file under `cpp_exe`, named for the file stem
+// and therefore the name `Process(executable=...)` spells; each process is
+// started from it with its own process description, which is what makes one
+// binary two processes.
+//
+// It links `online_main` rather than the offline main: the same `main`, whose
+// `run_deterministic` is a refusing stub -- the right failure mode for a binary
+// composed over live sockets, where a deterministic run would have nothing to
+// read.
+//
+// Separate processes and not separate boxes in one, because the logger reads
+// channel buffers out of shared memory while a cog worker thread is publishing
+// into them, and a writer stalled on a filesystem must not block the two threads
+// that command a machine.
+box System
+{
+    new box: RobotBox;
+
+    new proc: Process(executable=robot_clk_exe);
+
+    apply HostProcess(process=proc) in box;
+    apply HostCpuDomain(cpu_domain=RobotCpu) to proc;
+
+    new logger_box: RobotLogger;
+
+    new logger_proc: Process(executable=robot_clk_exe);
+
+    apply HostProcess(process=logger_proc) in logger_box;
+    apply HostCpuDomain(cpu_domain=RobotCpu) to logger_proc;
+}

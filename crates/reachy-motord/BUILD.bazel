@@ -1,0 +1,111 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+# The process that holds the servo bus: its configuration, its schedule, and the
+# reading half of the loopback seam it meets the control process over. What it
+# decides is `//crates/reachy-driver`, hosted here exactly as the simulated
+# driver cog hosts it -- this crate is the parts a simulation does not have.
+#
+# `crate_name` rather than the derived name: `src/main.rs` says
+# `reachy_motord::`, and the target name is taken by the binary below. The
+# crate name is the process's name underscored, because `reachy-motord` is not a
+# Rust identifier.
+#
+# `src/main.rs` is excluded from the library's sources for the same reason it is
+# the binary's root -- it is a separate crate.
+#
+# The generated Protobuf rendering of the driver's configuration schema is a
+# compile-time input: `params.rs` embeds it and parses every configuration
+# against a descriptor compiled from it, so the schema the binary enforces is
+# the schema it was built with. `$(execpath)` is enough here: rules_rust renders
+# it absolute at the rustc invocation, which is what `include_str!` needs -- it
+# resolves a relative path against the invoking source file's directory, and
+# that is not where a cross-package generated file sits.
+rust_library(
+    name = "reachy_motord_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = ["//driver:motord_config_clk_proto.proto"],
+    crate_name = "reachy_motord",
+    edition = "2024",
+    rustc_env = {
+        "MOTORD_PARAMS_PROTO": "$(execpath //driver:motord_config_clk_proto.proto)",
+    },
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cogs:session_cmd_clk_rs",
+        "//crates/dxl-proto:dxl_proto",
+        "//crates/reachy-bus:reachy_bus",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:aux_clk_rs",
+        "//driver:gate_clk_rs",
+        "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
+        "//driver:motord_config_clk_rs",
+        "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:joints_clk_rs",
+        "@brenn_reachy_crates//:prost-reflect",
+        "@brenn_reachy_crates//:protox",
+        "@brenn_reachy_crates//:thiserror",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The deployable: the process that holds the servo bus. Cross-compiled for the
+# device with `--platforms=//bazel/platform:reachy-device`. Its configuration
+# travels with it as a runfile, which is the path the binary defaults to.
+rust_binary(
+    name = "reachy_motord",
+    srcs = ["src/main.rs"],
+    data = ["//driver:motord_params.textproto"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":reachy_motord_lib",
+        "//crates/reachy-bus:reachy_bus",
+        "//crates/reachy-driver:reachy_driver",
+    ],
+)
+
+# A binary's root is its own crate, so the library's test target never sees the
+# argument grammar this file owns. These cases parse invocations and touch no
+# file, no port and no bus.
+rust_test(
+    name = "reachy_motord_bin_test",
+    size = "small",
+    crate = ":reachy_motord",
+)
+
+# The schedule's arithmetic and the configuration parse are pure. The seam's
+# cases do bind loopback ports and send to them, and the two about a socket in a
+# permanent error state set a read timeout and let it expire, so a few of these
+# spend a second or so waiting on real time.
+rust_test(
+    name = "reachy_motord_test",
+    size = "small",
+    crate = ":reachy_motord_lib",
+)
+
+# The shipped configuration, read by the parser that will read it on the device.
+# A separate crate from the library's own tests because it reads a file: it
+# arrives through runfiles, and the environment variable names it beside the
+# `data` attribute that supplies it. Nothing here needs the schema — the parser
+# carries its own copy, embedded at compile time.
+rust_test(
+    name = "shipped_params_test",
+    size = "small",
+    srcs = ["tests/shipped_params.rs"],
+    data = ["//driver:motord_params.textproto"],
+    edition = "2024",
+    env = {
+        "MOTORD_PARAMS": "driver/motord_params.textproto",
+    },
+    deps = [
+        ":reachy_motord_lib",
+        "//crates/reachy-driver:reachy_driver",
+    ],
+)

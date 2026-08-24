@@ -8,8 +8,9 @@ load("//bazel:scenario_suite.bzl", "scenario_suite")
 
 # The motion cog system: the schemas everything here speaks, the cogs that run
 # on the driver's sample stream, the session that says what the machine is doing,
-# the simulated driver that produces the stream, and the process that hosts all
-# four.
+# the simulated driver that produces the stream, and the two processes that host
+# them -- the deterministic one a scenario runs, and the wall-clock one a machine
+# runs with sockets where that simulated driver is.
 #
 # Framework integration (compiling `.clk`, VarPacket round-trips, driving the
 # deterministic runner from a Rust-authored log) is proved by `proof/`; not
@@ -19,12 +20,14 @@ load("//bazel:scenario_suite.bzl", "scenario_suite")
 # The rules below are in the order and the shape the drop's own BUILD updater
 # renders, because a `clk()` over a system module brings a gate test that holds
 # this file to exactly that. So they are alphabetical by target name rather than
-# in dependency order, and the two rules the tool writes -- `system_sim_clk` and
-# the `motioncpu.textproto` launcher config it derives -- carry no comments,
-# because it strips them. That launcher config is used by nothing here: it
+# in dependency order, and the four rules the tool writes -- `system_sim_clk`
+# and `system_robot_clk`, and the `motioncpu.textproto` and
+# `robotcpu.textproto` launcher configs it derives -- carry no comments,
+# because it strips them. Those launcher configs are used by nothing here: one
 # redirects a child's console into files, which is not what a deterministic run
-# wants. It earns its place when a system spans processes. Until then a wildcard
-# build builds it and the TCP bridge it names for nothing, and the updater
+# wants, and the runbook starts the online processes by hand. They earn their
+# place when a system spans processes. Until then a wildcard build builds them
+# and the TCP bridges they name for nothing, and the updater
 # refuses the `tags = ["manual"]` that would stop that as surely as it refuses a
 # comment. TODO(clockwork-build-updater-strips-annotations)
 
@@ -128,6 +131,44 @@ MOTION_MODULES = MOVER_MODULES + [
     "//driver:pose",
 ]
 
+# What the wake cog's module reaches: the request it publishes, the narration it
+# reads, its own slot and its config.
+WAKE_MODULES = [
+    "config",
+    "schedule",
+    "script",
+    "wake_state",
+    "//geometry:primitives",
+    "//motion:faults",
+    "//motion:fk",
+    "//motion:joints",
+    "//motion:reports",
+    "//motion:timeline",
+]
+
+# What the framework's logger box reaches: the two writer cogs, their extern
+# state, the configuration they read and the status they publish. Named as
+# modules so the four spellings come out of one list like everything else. The
+# channels module is not among them because it generates nothing -- there is no
+# `_clk_cc` for it -- so the `robot_clk` rule names it in `deps` alone.
+LOGGER_MODULES = [
+    "@clockwork//clockwork/logging:log_writer_config",
+    "@clockwork//clockwork/logging/writers:channel_message_rates",
+    "@clockwork//clockwork/logging/writers:channel_message_rates_config",
+    "@clockwork//clockwork/logging/writers:logger",
+    "@clockwork//clockwork/logging/writers:logger_config",
+    "@clockwork//clockwork/logging/writers:logger_status",
+]
+
+# What the online composition reaches: the control core's whole chain, the two
+# modules the wake gesture adds, and the logger box's own. No plant -- the
+# driver's end of the wire is a process, not a modelled machine.
+ROBOT_MODULES = MOTION_MODULES + LOGGER_MODULES + [
+    "motion",
+    "wake",
+    "wake_state",
+]
+
 SIM_MODULES = MOTION_MODULES + [
     module
     for module in SIM_STATE_MODULES + ["//hardware/dynamixel:registers"]
@@ -142,6 +183,7 @@ exports_files([
     "motion.clk",
     "mover.clk",
     "pose_state.clk",
+    "robot.clk",
     # The three-phase driver every scenario's `sh_test` runs, including the
     # harness proof's next door: one invocation of the deterministic runner for
     # the whole repo.
@@ -149,7 +191,10 @@ exports_files([
     "schedule.clk",
     "sim.clk",
     "sim_state.clk",
+    "system_robot.clk",
     "system_sim.clk",
+    "wake.clk",
+    "wake_state.clk",
 ])
 
 # The configs, in a module of their own because they are the only schemas that
@@ -181,6 +226,93 @@ clk(
 rust_clk_module(
     name = "config_clk_rs",
     src = "config.clk",
+)
+
+# What one run of the motion system did, read off its log: the operator's tool
+# for the first hardware run. Run as
+# `bazel run //cogs:first_motion_report -- <log-dir>`, or over a log pulled off
+# a unit.
+#
+# It reads the channel set both systems declare, which is what lets the test
+# below prove it against a deterministic run before any hardware log exists.
+rust_binary(
+    name = "first_motion_report",
+    srcs = ["first_motion_report.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":motion_slots",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:goal_clk_rs",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@brenn_reachy_crates//:nalgebra",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The analyzer over a real run of the system it is written for: S1's own three
+# phases, with this binary in the checker's position. S1 performs the wake
+# gesture the report is about -- commission, engage, raise, hold, stow, release
+# -- so a green run here is the analyzer proven end to end against a log the
+# system actually wrote, which is the only way to prove it before a unit is
+# available.
+#
+# The harness script's own invocation, not a second one: the analyzer takes a log
+# directory and nothing else, so it fits the checker slot with no extra
+# arguments.
+#
+# What this cannot prove is the other format: a deterministic run writes `.slog`,
+# and the online logger writes `.olog` through a writer that opens every file
+# with direct I/O. Nothing in the tree starts the online processes, so the format
+# a hardware run will actually produce is read by no test:
+# TODO(online-run-log-proof)
+sh_test(
+    name = "first_motion_report_over_s1_test",
+    size = "small",
+    srcs = ["scenario_test.sh"],
+    args = ["first_motion_report"] + [
+        "$(rootpath %s)" % label
+        for label in [
+            ":s1_author",
+            SIM_EXE,
+            SIM_PROCESS,
+            SIM_PUBLISHER_CONFIG,
+            SIM_LOGGER_CONFIG,
+            ":first_motion_report",
+        ]
+    ],
+    data = [
+        ":first_motion_report",
+        ":s1_author",
+        SIM_EXE,
+        SIM_LOGGER_CONFIG,
+        SIM_PROCESS,
+        SIM_PUBLISHER_CONFIG,
+    ],
+)
+
+# A binary's root is its own crate, so the library targets never see the
+# reading, the checks or the printer.
+rust_test(
+    name = "first_motion_report_test",
+    size = "small",
+    crate = ":first_motion_report",
 )
 
 # The clip library asset's emitter, run as
@@ -227,6 +359,18 @@ rust_library(
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
+)
+
+# What this system's channels are called, and nothing else. Its own crate because
+# the operator's report and the scenario harness both name the same channels and
+# must not reach each other's crates to do it: a rename that lands in one Rust
+# spelling and not the other is a channel reported missing at the top of a
+# report.
+rust_library(
+    name = "motion_channels",
+    srcs = ["motion_channels.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
 )
 
 # `cpp_cog` makes the generated `_cc` library depend on `:motion_clk_cc_impl`.
@@ -509,6 +653,107 @@ rust_clk_module(
     deps = clk_module_deps(POSE_STATE_MODULES).rs,
 )
 
+# The online composition: the six sockets to the driver process, the box that
+# closes the loop around the control core with them, the logger box that watches
+# it, and the two processes that host them. No `cpp_cog` -- the module declares
+# no cogs, because the Rust generator refuses a `udp_socket` and so the wake cog
+# lives in `wake.clk`, and the logger's two cogs are the framework's own.
+# `cpp_exe` synthesizes the one process executable both processes are started
+# from, whose name is derived from the file stem and is therefore the name
+# `robot.clk`'s `Process(executable=...)` spells.
+#
+# `online_main` rather than the offline main: the same `main`, whose
+# `run_deterministic` is a refusing stub -- the right failure mode for a binary
+# composed over live sockets.
+#
+# The generated `LogWriterConfig` the logger box binds is not among the `data`
+# below and cannot be: it comes out of the system target, which depends on this
+# rule. It is a deploy-time artifact, which is the framework's own arrangement
+# for it too.
+clk(
+    name = "robot_clk",
+    srcs = ["robot.clk"],
+    outs = [
+        "robot_clk_cc.cc",
+        "robot_clk_cc.hh",
+        "robot_clk_cc.inl",
+        "robot_clk_exe.cc",
+        "robot_clk_exe.hh",
+        "robot_clk_exe.inl",
+    ],
+    cpp_deps = clk_module_deps(ROBOT_MODULES).cpp + [
+        # The writer cogs' state is an extern type, so the executable needs the
+        # header that declares it as well as the generated cog library.
+        "@clockwork//clockwork/logging/writers:logger_cog_state",
+    ],
+    cpp_exe_deps = [
+        # The configs arrive as protobuf text, so the executable carries the
+        # generated protobuf messages and the conversions into the messages the
+        # dials hand the cogs. Two of them are the framework's, read by the
+        # logger box.
+        ":config_clk_proto_cc_library",
+        ":config_clk_proto_conv",
+        "@clockwork//clockwork/logging/writers:channel_message_rates_config_clk_proto_cc_library",
+        "@clockwork//clockwork/logging/writers:channel_message_rates_config_clk_proto_conv",
+        "@clockwork//clockwork/logging/writers:logger_config_clk_proto_cc_library",
+        "@clockwork//clockwork/logging/writers:logger_config_clk_proto_conv",
+        "@clockwork//clockwork/scaffolding:online_main",
+    ],
+    # Read by path at process setup, relative to the runfiles of whatever runs
+    # the executable. Named as a filegroup so the device payload stages the same
+    # set.
+    data = [":robot_config_files"],
+    generate = [
+        "cpp",
+        "cpp_exe",
+    ],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(ROBOT_MODULES).clk + [
+        # Generates nothing, so it has no other spelling: the channels the
+        # logger publishes its own status on.
+        "@clockwork//clockwork/logging/writers:logger_channels_clk",
+    ],
+)
+
+# The configuration the online composition's processes read by path at setup,
+# named once. `robot_clk` carries it as `data`, so a host-side `bazel run` finds
+# it in the runfiles, and `tools/build-motion.sh` cqueries this same target to
+# know what to stage into the device payload -- a config file added here reaches
+# both, and there is nowhere else to add it.
+filegroup(
+    name = "robot_config_files",
+    srcs = [
+        "clip_library.textproto",
+        "mover_params.textproto",
+        "robot_logger.textproto",
+        "robot_logger_rates.textproto",
+        "session_params.textproto",
+        "wake_params.textproto",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+merge_simplelaunch_config(
+    name = "robotcpu.textproto",
+    srcs = [
+        "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
+        "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
+    ],
+    data = [
+        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
+        "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
+        "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
+        "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_event_logger_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_metrics_channel_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_signal_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_telemetry_logger_config.tachyon",
+        "system_robot.motion_robot.diagnostics_database_config.tachyon",
+        ":robot_clk_exe",
+        "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+)
+
 # S1, raise-hold-stow, over the real system: three cogs, seven channels, two
 # configs read from text. What is under test is the loop, not the harness -- the
 # harness's own proof points live in `proof/` and are not re-proved here.
@@ -781,6 +1026,7 @@ rust_library(
     edition = "2024",
     deps = [
         ":log_read",
+        ":motion_channels",
         ":motion_cogs",
         ":motion_slots",
         ":schedule_clk_rs",
@@ -789,12 +1035,14 @@ rust_library(
         ":session_cmd_clk_rs",
         ":sim_cogs",
         ":sim_state_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
         "//motion:reports_clk_rs",
@@ -1069,6 +1317,31 @@ rust_clk_module(
 )
 
 clk(
+    name = "system_robot_clk",
+    srcs = ["system_robot.clk"],
+    outs = [
+        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
+        "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
+        "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
+        "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_event_logger_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_metrics_channel_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_signal_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
+        "system_robot.motion_robot.RobotCpu_telemetry_logger_config.tachyon",
+        "system_robot.motion_robot.diagnostics_database_config.tachyon",
+        "system_robot.motion_robot.logged_channel_metadata.pbbin",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":motion_clk",
+        ":robot_clk",
+        "@clockwork//clockwork/logging:channel_policy_clk",
+        "@clockwork//clockwork/logging/writers:logger_channel_policies_clk",
+    ],
+)
+
+clk(
     name = "system_sim_clk",
     srcs = ["system_sim.clk"],
     outs = [
@@ -1090,4 +1363,121 @@ clk(
         ":sim_clk",
         "@clockwork//clockwork/logging:channel_policy_clk",
     ],
+)
+
+# The wake gesture's cog, in a module of its own because the composition module
+# next door declares sockets and the Rust generator refuses those. `cpp_cog`
+# makes the generated `_cc` library depend on `:wake_clk_cc_impl`. No `cpp_exe`:
+# the module that declares the process is `robot.clk`.
+clk(
+    name = "wake_clk",
+    srcs = ["wake.clk"],
+    outs = [
+        "wake_clk_cc.cc",
+        "wake_clk_cc.hh",
+        "wake_clk_cc.inl",
+        "wake_clk_cc_dial.cc",
+        "wake_clk_cc_dial.hh",
+        "wake_clk_cc_dial.inl",
+        "wake_clk_cc_test.cc",
+        "wake_clk_cc_test.hh",
+        "wake_clk_cc_test.inl",
+    ],
+    cpp_deps = clk_module_deps(WAKE_MODULES).cpp,
+    generate = [
+        "cpp",
+        "cpp_cog",
+        "cpp_test_cog",
+    ],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(WAKE_MODULES).clk,
+)
+
+# Must be named `wake_clk_cc_impl`: the generated `_cc` library depends on
+# `:<clk target>_cc_impl`.
+cc_library(
+    name = "wake_clk_cc_impl",
+    srcs = ["wake_clk_cc_impl.cc"],
+    deps = [
+        ":wake_clk_cc_dial",
+        ":wake_clk_rs_entry",
+        "@clockwork//clockwork/dial:msg_input",
+        "@clockwork//clockwork/pinion:publishable",
+        "@clockwork//jewels/container:circular_buffer",
+    ],
+)
+
+rust_clk_module(
+    name = "wake_clk_rs",
+    src = "wake.clk",
+    cog_impl = ":wake_cogs",
+    imports = clk_module_deps(WAKE_MODULES).imports,
+    test_wrappers = True,
+    deps = clk_module_deps(WAKE_MODULES).rs,
+)
+
+rust_test(
+    name = "wake_cog_test",
+    size = "small",
+    srcs = ["wake_cog_test.rs"],
+    edition = "2024",
+    deps = [
+        ":config_clk_rs",
+        ":motion_slots",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":wake_clk_rs_test",
+        ":wake_state_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The wake cog's body, hand-written.
+rust_library(
+    name = "wake_cogs",
+    srcs = ["wake_cogs.rs"],
+    edition = "2024",
+    deps = [
+        ":config_clk_rs",
+        ":motion_slots",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":session_clk_rs",
+        ":wake_clk_rs",
+        ":wake_state_clk_rs",
+        "//motion:reports_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The crate's own cases: the `counters!` round-trip the macro emits beside the
+# totals it declares, which only exists in a test build of the crate the totals
+# are declared in.
+rust_test(
+    name = "wake_cogs_test",
+    size = "small",
+    crate = ":wake_cogs",
+)
+
+# What the wake cog keeps between executions, in a module of its own. Nothing
+# outside that cog imports it.
+clk(
+    name = "wake_state_clk",
+    srcs = ["wake_state.clk"],
+    outs = [
+        "wake_state_clk_cc.cc",
+        "wake_state_clk_cc.hh",
+        "wake_state_clk_cc.inl",
+    ],
+    generate = ["cpp"],
+    visibility = ["//visibility:public"],
+)
+
+# No `cog_impl`: the module declares no cogs.
+rust_clk_module(
+    name = "wake_state_clk_rs",
+    src = "wake_state.clk",
 )

@@ -4,11 +4,15 @@
 # here is at its default, so deleting one changes nothing and the file doubles as
 # the documentation of what omitting it means. The exception is `[datum]`: it has
 # no default, it is commented out below, and a human writes it in from a
-# self-test record before any command that moves something will run.
+# self-test record.
 #
-# Angles are degrees, clearances are millimetres, and rates are hertz — the units
-# a person reasons in. The libraries take radians and metres and the conversion
-# happens on load.
+# The bench talks to hardware and moves nothing. There is no motion, envelope or
+# settle table here: coordinated motion runs in the cog system, configured by its
+# own schema-typed parameter files. A key with no consumer in this binary would
+# read as a bound something enforces, so this file carries none.
+#
+# Angles are degrees and rates are hertz — the units a person reasons in. The
+# libraries take radians and the conversion happens on load.
 
 [bus]
 # The serial node the nine servos share. The platform's own documentation names
@@ -29,237 +33,16 @@ retry_spacing_ms = 20
 # array in this file is in this order.
 servo_ids = [10, 11, 12, 13, 14, 15, 16, 17, 18]
 
-[envelope]
-# Per-leg crank travel, from the vendor's simulation model, which agrees with all
-# three of its robot descriptions. Asymmetric per leg and not interchangeable:
-# the bottom of vertical travel rests on four of the six legs, and a symmetric
-# window copied from the other two would drive those four straight past it.
-#
-# Deliberately not taken from the geometry file the linkage transforms come from:
-# that file carries a per-leg limit field of ±180° on all six, a generator
-# artifact, and ±180° windows are no protection at all in this mechanism.
-crank_windows_deg = [
-    [-48.0, 80.0],
-    [-80.0, 70.0],
-    [-48.0, 80.0],
-    [-80.0, 48.0],
-    [-70.0, 80.0],
-    [-80.0, 48.0],
-]
-# Well inside the ±160° mechanical figure. The cable routing at large yaw has
-# not been checked.
-body_yaw_limit_deg = 60.0
-# The vendor's two solvers disagree at 55° and 65°, neither states a derivation,
-# and nothing in the geometry binds near either. The tighter one stands until the
-# axis is measured.
-relative_yaw_limit_deg = 55.0
-head_cone_limit_deg = 35.0
-# Floor on the per-pose clearance from the linkage's singular configurations.
-# Comfortably above the millimetre the crank stops leave at the top of vertical
-# travel, so this floor is what binds there rather than the stops. A pose below
-# it is admissible only while it is strictly increasing clearance.
-min_toggle_margin_mm = 3.0
-# The antennas are not here. They are free rotors turning a full circle with no
-# hard stop and nothing behind them for a bound to guard, so the only thing asked
-# of a commanded antenna angle is that a servo count represents it.
-
-[motion]
-tick_hz = 50
-# The servos update their hardware-error byte far slower than they update
-# position; once a second catches a latch and costs nothing in the tick budget.
-health_poll_hz = 1
-# Per-tick step bounds. What they bound is the plan: a goal past one of them
-# abandons the move where it stands and is never clamped and sent. The machine
-# keeps its torque — a step this wide is a planner defect, not a motor that
-# stopped answering. A shaped move's peak rate is 1.875 times its average, and
-# the loop advances a move by at most one period of its clock however late it
-# wakes, so what a bound has to admit is the plan's own peak and nothing on top
-# of it.
-#
-# Measured: the validated 0.8 s presence gesture plans 0.067 rad per leg per
-# 50 Hz period, and this is better than twice that.
-max_step_legs_rad = 0.15
-# Analogy rather than measurement — no yaw speed trial has been run. The body
-# yaw is the legs' servo model, unloaded and moving linearly in its own
-# coordinate, so it carries their figure until a supervised fold measures its
-# own.
-max_step_body_yaw_rad = 0.15
-# The fastest sweep on record — an antenna crossing 3.22 rad in 0.3 s, 855°/s —
-# plans a peak of 0.403 rad per period at 50 Hz; this is better than half as
-# much again. An antenna sweeps the way round that misses its own outboard
-# sideways point, so the longest sweep it can be asked for is just under a full
-# turn — 6.28 rad, which needs 0.36 s to stay inside this bound. Shorter sweeps
-# need less: the stow-to-neutral presence arc is 3.23 rad (0.19 s), and
-# re-stowing an antenna left just inboard of sideways is 4.80 rad (0.28 s).
-# Whatever the antenna durations below resolve to has to clear the floor for the
-# sweep being asked for, or the clock is stretched to fit before the move goes
-# out.
-max_step_antennas_rad = 0.65
-# The tracking fault, in three numbers. A joint further than the threshold from
-# its goal is examined; over a window of that many ticks it must close at least
-# the progress minimum on where its goal lies, or the tick faults and stops
-# commanding. Distance alone says nothing: what the gains below close is a
-# standing error and not a moving one, so a joint chasing a streamed goal sits
-# behind it in proportion to commanded speed — 0.43 rad on an antenna moving at
-# 4.91 rad/s, while following it perfectly. Closing is what separates that from
-# a stall.
-#
-# The threshold is measured: 28.6° of crank is better than twice the worst lag
-# any head joint ran at on a healthy recorded gesture, 0.245 rad on a loaded leg
-# whose goal was moving at 3.3 rad/s. The window stays sized rather than
-# measured. The threshold is independent of the step bounds above and may be set
-# anywhere without regard to them: progress is measured from where a joint stood
-# when its lag began, and a goal that moves to the far side of that point
-# restarts the measurement there rather than reading a following joint as one
-# running away. The progress minimum is about 6.5 of
-# the servos' 0.088° counts: over ten ticks at 50 Hz it asks a lagging joint for
-# 0.05 rad/s of closing speed, an order of magnitude under the fastest leg
-# motion this bench commands.
-tracking_threshold_rad = 0.5
-tracking_progress_min_rad = 0.01
-tracking_ticks = 10
-# The antennas' tip crossing, in two numbers. The two rods sweep in planes a
-# little either side of the skull's centre line and their arcs cross over the
-# head; a pair arriving there together meets tip to tip instead of passing,
-# which stalls both servos until an overload latches. The resolver measures
-# every commanded pair where their arcs cross and lengthens the later side
-# until they are far enough apart in phase — see the antenna clocks below.
-#
-# The band is how near vertical a tip has to be for the two to be able to touch
-# at all: 60° either side, the crossing itself with a margin around the four
-# degrees of spread the recorded stalls covered (every one sat between 52° and
-# 56°). The separation is how far from mirrored the pair has to stand when the
-# second of them reaches that edge, and it bounds the *plan* rather than the
-# tips: 0.60 rad is 34° of commanded angle, measured off the two recorded
-# pairs — the clocks that clashed (0.8 s against 0.7 s) plan an offset that
-# never exceeds 0.44 rad anywhere on the sweep, and the clocks that swept clean
-# (0.7 s against 0.3 s) plan 0.88 rad at the edge. The tips' own separation is
-# smaller than the plan's, because the servos lag.
-#
-# Both are the geometry of one machine, measured on one machine: a different
-# rod length or rotor spacing moves them, and a re-measurement after a soak is
-# a line here rather than a library change.
-antenna_contact_band_rad = 1.0471975511965976
-antenna_phase_separation_rad = 0.6
-# Consecutive ticks with no position read before the read-loss fault. Omit for
-# one second at the tick rate.
-read_loss_ticks = 50
-# FLOORS. The three durations below govern the head group — the head pose and
-# the body yaw, which the six legs follow. They are a nominal policy rather
-# than a promise: a move whose span will not fit inside the per-tick step
-# bounds at the duration named here runs on a clock stretched to fit, and says
-# so on the way in. The path is unchanged; it is traversed more slowly. So a
-# duration set too low costs a slower move and a line of output, never a fault
-# mid-travel.
-#
-# The clock a move actually runs on is whichever is longer of the one asked for
-# here and the floor for the span it covers. There is no band between the two
-# where a move is quietly slowed, and nothing at all is added for how late the
-# loop runs: a period that starts late advances the move by one period like any
-# other, so lateness delays the arrival and cannot enlarge a step. A run's
-# summary line reports the slip that cost.
-#
-# What the effective clock does carry is a small sampling allowance. A floor is
-# found by walking the planned path finer than the control rate and taking the
-# worst travel of any one period at any phase the loop could wake on — the walk
-# carrying on a period past the move's end, where the machine holds the target,
-# so the step that lands the move is measured like any other. What is left over
-# is the phase falling between two of those fine samples, which is second order
-# in their spacing and under a percent of the clock at any length an ordinary
-# command produces. So the phases the walk did not visit cannot trip the guard
-# either, and the allowance is derived from the sampling grid rather than chosen.
-#
-# What the floors are still for is knowing when that happens. The head group's
-# is 0.36 s: below that a stow-to-neutral move steps a leg further in one 50 Hz
-# period than `max_step_legs_rad` allows. Derived by walking the move through
-# the IK on that fine grid, and pinned by a reachy-motion unit test, so it moves
-# only when the geometry, the tick rate or that bound does. A configuration test
-# checks the three values here against it, so the shipped durations are the ones
-# no ordinary command has to be stretched out of.
-#
-# The *yaw* has a floor of its own, and it is the one that moves: the body turns
-# through whatever angle is asked, against `max_step_body_yaw_rad`, so the floor
-# is 1.875 × the sweep in radians ÷ (`max_step_body_yaw_rad` × 50) — written out
-# rather than reduced to one number, because that number moves with the bound
-# and a stale one is worse than the arithmetic. It is the whole sweep that counts —
-# not the head group's usual travel. Stowing from the 60° cap this file sets
-# needs 0.26 s, and the widest sweep a command can lawfully ask for — cap to
-# cap — needs 0.52 s, which the configuration test checks these durations
-# against. Where the machine physically *stands* is not capped, though: stowing
-# from a body a hand spun to the half turn while the machine lay limp needs
-# 0.79 s. The calm stow below carries that outright; a quicker gesture's clock
-# would not, and the stretch is what turns it into a slower fold rather than a
-# move abandoned partway round.
-stow_duration_s = 2.0
-# The validated presence gesture: measured on the machine, arriving with no
-# settling period after the last goal went out. The lift is the one motion that
-# starts from a configuration close to a singular one, so it is the one worth
-# measuring rather than guessing at — and measured, the head is physically up in
-# 0.6 s, with shaped motion costing only the difference.
-up_duration_s = 0.8
-# A yaw or an antenna command moves joints that carry no load and pass through
-# no near-singular configuration, so the length is a matter of what is
-# comfortable to watch rather than of mechanics.
-move_duration_s = 3.0
-# What the antennas take on any move. Omit — as this file does — to give them
-# whichever head-group duration the move is running on. Set it when the head
-# should be quick and the antennas should not: they are mechanically
-# independent, and the
-# antennas sweep three times as far as the head does on the same move. The floor
-# is the sweep being commanded against `max_step_antennas_rad` above, and the
-# `antennas` command here can be asked for anything up to a full turn, so a
-# bench that sets this at all wants at least 0.36 s to avoid being stretched
-# there on the wide sweeps.
-# antenna_duration_s = 1.5
-# One clock per antenna, overriding `antenna_duration_s` for that side alone;
-# omit a side to leave it on whatever the line above resolves to. Each side
-# resolves independently: its own key, else `antenna_duration_s`, else the
-# head-group duration of the move.
-#
-# What they are for is staggering the pair. The two antennas sweep inboard over
-# the head, and their arcs cross; on one clock both tips reach that crossing at
-# the same instant and meet there instead of sliding past, which stalls both
-# servos and latches an overload — the one collision on record, and it recurred
-# about one inboard sweep in three. What separates the tips is a large ratio
-# between the two clocks rather than a fixed offset between them: the pair
-# commented out below is the one that swept clean, and the pair that clashed was
-# 0.8 against 0.7. Each side still has to clear the floor for its own sweep
-# against `max_step_antennas_rad`, and each is stretched on its own if it does
-# not, so a stagger set too tight survives as a stagger.
-#
-# Setting them is not what makes the pair safe. The separation is enforced: a
-# move that carries both antennas across the edge of the contact band is
-# measured there, and a pair too near in phase has its later side lengthened
-# until it is not — on whatever clocks the command resolved to, after any
-# floor stretch, and it says which of the two it did. So the shipped
-# configuration leaves these omitted, the pair rides the head clock, and the
-# resolver parts it; a mirrored 0.8 s gesture costs one antenna a clock near
-# a second, and nothing else. Set them when a particular stagger is wanted,
-# not to avoid the collision.
-#
-# What the enforcement does not cover is a sweep with no band edge to measure
-# at: both tips already inside the band and staying there, or one parked inside
-# it while the other sweeps through — where delaying the moving side cannot
-# change a stationary tip's angle. Those fall to the servos' own overload
-# protection, the degrade that takes the pair out of service without disturbing
-# the head, and `reachy-bench reboot` to clear the latch.
-# antenna_duration_right_s = 0.7
-# antenna_duration_left_s = 0.3
-# How long `hold` watches the machine before returning: long enough for a
-# tracking fault or a health latch to appear in, short enough that a supervised
-# operator is not left waiting on a command that does nothing by design.
-hold_duration_s = 2.0
-
 [arm]
-# The supply floor arming refuses to proceed below. Provisional: a round number
+# Two thresholds a reading is judged against, named for the arm gate they were
+# sized for. Neither gates anything here: the registry reports the case and
+# writes the verdict into its record.
+#
+# The supply floor a rail reading is judged against. Provisional: a round number
 # above the servos' own minimum-voltage alarm and below anything a healthy supply
 # should sag to, chosen with a margin rather than measured. What matters is the
 # sag while nine servos take up the head's weight, which nobody has recorded.
 min_arm_voltage = 6.0
-# The servos refresh their own voltage reading about ten times a second, so
-# polling faster returns the same number twice.
-voltage_poll_period_ms = 100
-voltage_budget_s = 30.0
 # How far a limp servo's goal register may sit from its measured position. With
 # torque off these servos report their goal as their present position, and the
 # self-test's goal-shadow case is what checks that they do. A diagnostic, not a
@@ -267,76 +50,11 @@ voltage_budget_s = 30.0
 # read wobble the register was observed to have.
 goal_shadow_tolerance_deg = 2.0
 
-# Position gains, written fresh at every arm because they live in RAM and
-# power-on clears them.
-#
-# Tuned on the bench against recorded step responses, except the yaw, which
-# carries the value the vendor's own stack writes at startup: nothing has ever
-# implicated it. A proportional term alone cannot hold the head's weight up this
-# linkage — at the vendor's P-only 300 the two most loaded cranks park 3.9–4.3°
-# short of their goal and stay there. The integral term is what closes that
-# (measured: inside 1.3°) and the derivative term is what stops it hunting. The
-# antennas hold nothing up, so they have no standing error to integrate away;
-# what they need is enough stiffness to carry a 0.3 s sweep.
-#
-# One machine's measurement. A second unit's linkage friction and antenna
-# balance are its own, and these are the numbers to re-derive first if it
-# behaves differently.
-leg_gains = { p = 800, i = 100, d = 300 }
-yaw_gains = { p = 200, i = 0, d = 0 }
-antenna_gains = { p = 500, i = 0, d = 100 }
-
-# The servo-side motion profile, the backstop under host-side shaping. No
-# default: host-side interpolation is what makes motion gentle, and this is what
-# bounds a goal step the host got wrong, so it has to be sized against the moves
-# this bench actually makes rather than invented.
-#
-# Trial-validated: the values the bench ran its speed trials at, including the
-# 855°/s antenna sweep and the 0.8 s gesture. Sized generously on purpose. A
-# profile tight enough to be a meaningful second bound on a host-side step is
-# also tight enough to throttle the shaped motion itself, and a gesture the
-# servos are quietly slewing rather than following is one whose recorded timing
-# says nothing about the plan. Velocity is in units of 0.229 rev/min and
-# acceleration in units of 214.577 rev/min².
-profile_acceleration = 400
-profile_velocity = 600
-
-[disarm]
-# How far a joint may be from its stow angle and still count as being at stow.
-# Deliberately tighter than the tracking threshold, because the two ask different
-# questions: tracking asks whether the position loop is keeping up with a moving
-# goal, this asks where the head physically is before the thing holding it up is
-# switched off. Measured: at the leg gains above, the most loaded cranks settle
-# 1.0–1.3° short of where they were sent, so this leaves them room and not much
-# more.
-tolerance_deg = 2.0
-# How long the platform is left to settle before it is measured against stow.
-# The settle runs first, so the check judges where the head came to rest rather
-# than where it was the instant the stow trajectory ended — a joint still
-# closing the lag its position loop runs is not a joint away from stow.
-dwell_s = 2.0
-
-[settle]
-# How a move decides the machine has actually got where it was sent. A finished
-# trajectory means the last goal has gone out, not that the servos are there yet:
-# a move commanded over a hundredth of a second reports its commanding over in a
-# twentieth, with the head still rising. The loop keeps reading — commanding
-# nothing — until every joint is this close to the goal it was left on, and the
-# report carries both instants so the gap is visible.
-#
-# The same figure as the disarm tolerance, for the same reason: it is the
-# distance at which this machine counts as being where it was told to be.
-tolerance_deg = 2.0
-# How long that is waited for. A joint that never arrives ends the move with
-# which joint and how far out it was — a report, not a fault: nothing here gates
-# or delays releasing torque.
-timeout_s = 2.0
-
 [provision]
 # What the servos must already hold for this project to command them at all.
 # Register contents as a data sheet states them, not engineering units: integers
-# a person compares against how the unit was set up. Arming verifies these before
-# it writes anything and repairs none of them.
+# a person compares against how the unit was set up. The sweep verifies these and
+# repairs none of them.
 return_delay_time = 0
 # The operating mode is deliberately not a key here. It differs per servo — the
 # body and the legs in single-turn position mode, the two antennas in extended
@@ -358,9 +76,9 @@ min_voltage_limit = 35
 # configuration writes a current limit, so what the servos hold is what they
 # shipped with.
 current_limit = [1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
-# The profile registers are deliberately not keys here. Arming writes them from
-# [arm] at every arm and verifies its own write, and they live in RAM that holds
-# until power comes off — so the only value a key here could state is the
+# The profile registers are deliberately not keys here. Whatever arms this machine
+# writes them at every arm and verifies its own write, and they live in RAM that
+# holds until power comes off — so the only value a key here could state is the
 # power-on one, which stops being true as soon as this machine has armed once.
 # They are read and reported by the sweep instead: a nonzero reading says the
 # machine has not been power-cycled since its last arm.
@@ -373,12 +91,9 @@ current_limit = [1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750, 1750]
 # repaired with the vendor's tool.
 #
 # The per-leg window the servo itself refuses to be commanded past, counts, legs
-# 1..=6. Mapped through the servo map these must be the envelope's crank windows
-# above, to within one count: the servos and the host envelope have to be
-# guarding one region, and this is the only place that is ever established. A leg
-# that disagrees refuses the whole configuration by name, because which of the
-# two records is wrong — these limits or those windows — is not something code
-# should pick.
+# 1..=6. The servo-side fence: whatever commands this machine holds a per-leg
+# crank window of its own, and the two have to be guarding one region. Mapped
+# through the servo map, these are that window to within one count.
 leg_position_limits = [
     [1502, 2958],
     [1138, 2844],
@@ -388,17 +103,17 @@ leg_position_limits = [
     [1138, 2594],
 ]
 
-# [datum] — absent from a fresh configuration, and no command that moves anything
-# runs without it. That a converted count is the model's crank angle rests on
-# every servo carrying its provisioned homing offset: the self-test's datum case
-# reads all nine back and compares them, and the arm sequence re-verifies them
-# before it enables anything. This table is not that check — it is the record
+# [datum] — absent from a fresh configuration, and nothing converts a count to a
+# model angle without it. That a converted count is the model's crank angle rests
+# on every servo carrying its provisioned homing offset: the self-test's datum case
+# reads all nine back and compares them, and whatever arms this machine
+# re-verifies them before it enables anything. This table is not that check — it is the record
 # that a person read a run and stands behind what it says.
 #
-# It is commented out rather than filled in, and as shipped this file therefore
-# refuses every command that moves something. That is the intended state: an
-# example cannot have read your unit's run, and a value copied from here would be
-# a review nobody performed standing where the review is supposed to be.
+# It is commented out rather than filled in, so as shipped this file has no datum
+# to hand a host that asks for one. That is the intended state: an example cannot
+# have read your unit's run, and a value copied from here would be a review
+# nobody performed standing where the review is supposed to be.
 # Uncomment both lines and write your own note.
 #
 # [datum]

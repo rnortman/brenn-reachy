@@ -16,11 +16,22 @@
 //! names, and a cog writing that bookkeeping out by hand is a cog where a
 //! counter can be added to the struct and forgotten in the change guard.
 //!
+//! [`MS_NS`] is the one number: the millisecond a configuration states a
+//! duration in, in the nanoseconds everything past that boundary counts in.
+//!
 //! Nothing here holds state or allocates, and none of it looks at a clock.
 
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
 use clockwork_rs::{ValidView, validate};
 use thiserror::Error;
+
+/// How many nanoseconds a millisecond is.
+///
+/// Configurations state a duration in milliseconds because that is the unit a
+/// human writes a gesture in; everything past the boundary that reads one is
+/// nanoseconds. Stated once, here, so a second config-in-milliseconds field is
+/// a conversion taken rather than a conversion written again.
+pub const MS_NS: i64 = 1_000_000;
 
 /// Why a slot's joint vocabulary names no joint.
 ///

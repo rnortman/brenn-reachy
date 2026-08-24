@@ -147,6 +147,24 @@ use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__tick_state_clk_rs::{TrackingStreakSnap, TrackingStreakSnapWire};
 use clockwork_rs::Duration as SlotDuration;
 
+/// The worst lag any head joint ran at on a healthy recorded gesture, radians —
+/// a loaded leg 0.245 rad behind a goal moving near 3.3 rad/s.
+///
+/// A hardware measurement and the headroom record the tracking screen below is
+/// sized against. It is pinned against the recordings themselves by the replay
+/// suite beside this crate (`tests/replay_test.rs`, over the recordings in
+/// `fixtures/traces`), and a report over a live run prints its own worst lag
+/// beside it, so both readers of the figure read one number.
+pub const RECORDED_WORST_HEAD_LAG_RAD: f64 = 0.245;
+
+/// The worst lag an antenna ran at on the fastest recorded sweep, radians —
+/// 1.38 rad behind an 855°/s command, while following perfectly.
+///
+/// Pinned and read the same way as [`RECORDED_WORST_HEAD_LAG_RAD`]. Well past
+/// the screen below, which is the point: distance alone does not separate a
+/// chase from a stall.
+pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
+
 /// When a joint is far enough from its goal, for long enough, without closing
 /// on it, to conclude the servo is not tracking it.
 ///
@@ -193,11 +211,10 @@ impl Default for TrackingFaultConfig {
     /// measured.
     fn default() -> Self {
         Self {
-            // 28.6° of crank, better than twice the worst lag any head joint
-            // ran at on a healthy recorded gesture (0.245 rad on a loaded leg
-            // at 3.3 rad/s of commanded speed). Only a screen for which joints
+            // 28.6° of crank, better than twice
+            // `RECORDED_WORST_HEAD_LAG_RAD`. Only a screen for which joints
             // are worth examining, not a verdict: the antennas cross it while
-            // following perfectly — 1.38 rad behind an 855°/s sweep — and
+            // following perfectly — `RECORDED_WORST_ANTENNA_LAG_RAD` — and
             // re-anchor rather than fault, because what decides a stall is
             // whether the joint is closing.
             threshold_rad: 0.5,

@@ -9,6 +9,13 @@
 # Everything here is read by the scripts that source this file, so "appears
 # unused" is the expected shape of every definition in it.
 # shellcheck disable=SC2034
+#
+# It also reads three variables the sourcing script owns and it cannot assign
+# itself: `bazel` (which bazel to run, REACHY_BAZEL's value), `build_flags` (the
+# array naming the configuration a build and its cqueries share) and `host` (the
+# device being deployed to, the script's first argument). Each is named in the
+# doc of every function that reads it.
+# shellcheck disable=SC2154
 
 # The name a script reports itself as in its own messages. Sourcing does not
 # change $0, so this is the outer script's path.
@@ -72,4 +79,200 @@ die() {
 		echo "    ${line}" >&2
 	done
 	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# The device build
+# ---------------------------------------------------------------------------
+
+# ELF e_machine for AArch64. A platform flag that failed to take effect produces
+# an x86_64 binary that runs perfectly on the workstation and not at all on the
+# device.
+elf_machine_aarch64=183
+
+# Refuse unless the bazel the caller named ($bazel, REACHY_BAZEL's value) is
+# there. Deliberately says what the Makefile's require-bazel target says: these
+# scripts run outside make, and REACHY_BAZEL has no Makefile equivalent. The
+# argument names what would have been built.
+require_bazel() {
+	local noun=$1
+	command -v -- "$bazel" >/dev/null 2>&1 ||
+		die "the ${noun} is built by bazel and ${bazel} is not installed." \
+			"Install bazelisk; .bazelversion pins the Bazel release it fetches." \
+			"Or point REACHY_BAZEL at the bazel to use."
+}
+
+# Refuse a binary that is not an aarch64 ELF. Run on Bazel's outputs before
+# anything reaches a contract path, so the age a deploy script reads is never
+# that of an artefact no check passed.
+verify_aarch64() {
+	local out=$1
+
+	# e_machine — bytes 18 and 19 of the ELF header, little-endian. Read with
+	# od so the check costs no tooling a workstation might not carry.
+	local machine
+	machine=$(od -An -tu1 -j18 -N2 -- "$out" | awk '{print $1 + $2 * 256}')
+	[ "$machine" = "$elf_machine_aarch64" ] || die \
+		"$(basename -- "$out") is an ELF for machine ${machine}, not AArch64 (${elf_machine_aarch64})." \
+		"The platform flag did not take effect; the device cannot execute this."
+}
+
+# Where Bazel put what it built, as a listing of workspace-relative paths.
+# cquery rather than the bazel-bin symlink: that symlink points at whatever
+# configuration ran last, and a plain `bazel test //...` afterwards repoints it
+# at the host one.
+#
+# The argument is a target or a cquery set expression, so one question can name
+# a whole payload's worth of outputs. Callers pass $bazel and $build_flags: the
+# cquery has to describe the configuration the build used, or it names files from
+# some other one.
+#
+# An empty answer is a refusal rather than an empty listing a caller has to
+# notice: every caller here asked because it wants to install something.
+bazel_files() {
+	local expr=$1 out
+	out=$("$bazel" cquery "${build_flags[@]}" --output=files \
+		--ui_event_filters=-info --noshow_progress -- "$expr") ||
+		die "bazel cannot name the outputs of ${expr}, so there is nothing to install."
+	[ -n "$out" ] ||
+		die "bazel named no output file for ${expr}."
+	echo "$out"
+}
+
+# A workspace-relative path from `bazel_files` as an absolute one, refusing if
+# nothing is there.
+#
+# The listing's paths resolve through the bazel-out convenience symlink. That
+# symlink is the one assumption these scripts make about the output tree, and
+# .bazelrc.user can rename it (--symlink_prefix) or switch it off
+# (--noexperimental_convenience_symlinks), so the refusal names both flags: the
+# build succeeding and the path not resolving is that setting, not a build that
+# produced nothing.
+bazel_resolve() {
+	local out=$1
+	[ -f "${repo_root}/${out}" ] ||
+		die "the build named ${out} and no file is there." \
+			"If the build itself succeeded, the bazel-out convenience symlink is renamed" \
+			"or disabled — check .bazelrc.user for --symlink_prefix or" \
+			"--noexperimental_convenience_symlinks."
+	echo "${repo_root}/${out}"
+}
+
+# One file out of a `bazel_files` listing, chosen by exact basename and resolved.
+#
+#   bazel_named_in <listing> <basename>
+#
+# Exact rather than a substring match: a listing carries the sources of what was
+# built as well as its outputs, so a looser match can name a file nobody asked
+# for. A basename the listing does not carry is a refusal — the compiler's output
+# names changed, or something was renamed upstream.
+bazel_named_in() {
+	local listing=$1 want=$2 line out=
+	while IFS= read -r line; do
+		[ "$(basename -- "$line")" = "$want" ] || continue
+		out=$line
+		break
+	done <<<"$listing"
+	[ -n "$out" ] ||
+		die "the build emits no ${want}." \
+			"The compiler's output names changed, or the system's cpu domain was renamed."
+	bazel_resolve "$out"
+}
+
+# ---------------------------------------------------------------------------
+# The device deploy
+# ---------------------------------------------------------------------------
+
+# The two services on a unit that open the servo bus. brenn-app is the payload's
+# own; reachy-motiond is the brenn-pod motion monolith. Either one holding the
+# port turns a deploy into a run that meets a held bus, so both are refused, and
+# both deploy scripts refuse them in the same words.
+service=brenn-app.service
+motiond_service=reachy-motiond.service
+
+# The remote probe: two questions and this repo's two exit codes. Written once
+# because the codes are a contract — docs/bench-runbook.md documents them as one
+# thing — and because a caller appends its own work to this string so the
+# question and the work are one ssh invocation. Asked separately, a service can
+# start in between and the deploy lands beside it anyway.
+bus_probe() {
+	printf '%s; %s' \
+		"systemctl is-active --quiet ${service} && exit 3" \
+		"systemctl is-active --quiet ${motiond_service} && exit 4"
+}
+
+# Turn the probe's exit code into the refusal. 3 and 4 are bus_probe's own
+# answers and nothing else produces them; 255 is ssh itself, which is why the
+# probe does not signal by nonzero exit alone — that reads an unreachable host
+# as a service being down. Every other code, 0 included, returns: what it means
+# is the caller's, because the caller chose what it appended to the probe.
+#
+#   bus_refusal <rc> <what a run of this is> <what did not happen> [detail...]
+#
+# Callers set $host, as they do for ssh_root.
+bus_refusal() {
+	local rc=$1 run=$2 aftermath=$3
+	shift 3
+	case "$rc" in
+	3)
+		die "${service} is running on ${host}, and ${run} will not share the servo bus with it." \
+			"Stop it, run the test, and start it again when you are done:" \
+			"    ssh root@${host} systemctl stop ${service}"
+		;;
+	4)
+		die "${motiond_service} is running on ${host}, and it holds the servo bus." \
+			"Stop it, run the test, and start it again when you are done:" \
+			"    ssh root@${host} systemctl stop ${motiond_service}" \
+			"    ssh root@${host} systemctl start ${motiond_service}" \
+			"(The port's own flock refuses either way; this is the message that says which process has it.)"
+		;;
+	255)
+		die "ssh to root@${host} failed; ${aftermath}." "$@"
+		;;
+	esac
+}
+
+# ssh as root to the host the caller is deploying to. $host is the script's
+# first argument, parsed before any call to this.
+ssh_root() {
+	ssh -o BatchMode=yes "root@${host}" "$@"
+}
+
+# Refuse an artefact built before the newest commit that touched the paths it is
+# built out of.
+#
+#   refuse_if_stale <artefact> <noun> <rebuild cmd> <deliberately> <stale-ok cmd> <path>...
+#
+# The trap this closes cost a bench night: a build step was taken for a
+# once-per-session one, and a run whose findings looked like the machine's was
+# reading a binary several commits old. Commit time against file time catches
+# exactly that — it does not catch uncommitted edits, which is why the make
+# targets build first and are the entry points to prefer.
+#
+# The rebuild it prescribes is what clears it, always: both build scripts stamp
+# every file they stage, because Bazel hands back an output it did not have to
+# relink untouched and a commit that changes no linked code would otherwise
+# leave a current artefact refused with no way through but the escape hatch.
+#
+# A tree with no history for those paths (a tarball, a shallow clone that
+# excluded them) is not evidence of staleness, so it says what it could not
+# decide and proceeds.
+refuse_if_stale() {
+	local artefact=$1 noun=$2 rebuild=$3 deliberately=$4 stale_ok=$5
+	shift 5
+	local commit built
+	commit=$(git -C "$repo_root" log -1 --format=%ct -- "$@" 2>/dev/null) || commit=
+	if [ -z "$commit" ]; then
+		echo "${prog}: no commit history for the workspace here, so the ${noun}'s age is unknown" >&2
+		return 0
+	fi
+	built=$(stat -c %Y -- "$artefact") ||
+		die "cannot read the age of ${artefact}"
+	[ "$built" -lt "$commit" ] || return 0
+	die "the ${noun} is older than the newest commit to the workspace, so a run of it is not a run of this tree." \
+		"Built $(date -d "@${built}" '+%Y-%m-%d %H:%M:%S'), newest commit $(date -d "@${commit}" '+%Y-%m-%d %H:%M:%S')." \
+		"Rebuild it:" \
+		"    ${rebuild}" \
+		"or, to ${deliberately}:" \
+		"    ${stale_ok}"
 }

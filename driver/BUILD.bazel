@@ -15,8 +15,10 @@
 # Nothing here depends on anything but `clockwork_rs` and sibling schema
 # modules. No cogs, no runtime, no I/O.
 
+load("@clockwork//clockwork:rules.bzl", "clk")
 load("@rules_rust//rust:defs.bzl", "rust_test")
 load("//bazel:clk_schema.bzl", "clk_schema_module")
+load("//bazel:rust_clk.bzl", "rust_clk_module")
 
 # The import lists are transitive and minimal: a module names every module
 # reachable from it, and no more.
@@ -31,6 +33,39 @@ clk_schema_module(
 # The process edge's own header, which no channel carries: a datagram is a
 # schema's blob bytes with this in front.
 clk_schema_module(name = "wire")
+
+# The driver process's configuration, spelled out rather than through
+# `clk_schema_module`, because it is the one module here that crosses the
+# Protobuf backend -- which is what lets the numbers be authored as text -- and
+# generation is declared per module.
+clk(
+    name = "motord_config_clk",
+    srcs = ["motord_config.clk"],
+    outs = [
+        "motord_config_clk_cc.cc",
+        "motord_config_clk_cc.hh",
+        "motord_config_clk_cc.inl",
+        "motord_config_clk_proto.proto",
+        "motord_config_clk_proto_conv.cc",
+        "motord_config_clk_proto_conv.hh",
+        "motord_config_clk_proto_conv.inl",
+    ],
+    generate = [
+        "cpp",
+        "proto",
+        "proto_conv",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_clk_module(
+    name = "motord_config_clk_rs",
+    src = "motord_config.clk",
+)
+
+# The numbers the driver ships with, read by the driver at startup and by the
+# test that holds this file to the schema.
+exports_files(["motord_params.textproto"])
 
 clk_schema_module(
     name = "goal",

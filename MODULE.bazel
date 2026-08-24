@@ -148,11 +148,30 @@ crate.spec(
     version = "1",
 )
 
-# The bench binary's configuration file format: bus device, envelope caps,
-# motion parameters, arm thresholds, and the resolved crank datum.
+# The bench binary's configuration file format: the bus port and its baud, the
+# arm thresholds the self-test registry reads, the register values provisioning
+# writes, and the resolved crank datum.
 crate.spec(
     package = "toml",
     version = "1",
+)
+
+# Dynamic Protobuf messages and the Protobuf text format, so the driver's
+# configuration is parsed against the schema that generated it. `text-format`
+# because that is the format the file is authored in; `prost` alone does not
+# carry it. reachy-motord.
+crate.spec(
+    features = ["text-format"],
+    package = "prost-reflect",
+    version = "0.16",
+)
+
+# Pure-Rust Protobuf compilation: turns the generated `.proto` the driver embeds
+# into the descriptor prost-reflect parses against. No protoc, no build-time
+# native step, so the device cross-build needs nothing new. reachy-motord.
+crate.spec(
+    package = "protox",
+    version = "0.9",
 )
 
 crate.from_specs(name = "brenn_reachy_crates")

@@ -23,61 +23,12 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-passes=0
-failures=0
-
-pass() {
-	echo "PASS: $1"
-	passes=$((passes + 1))
-}
-
-fail() {
-	echo "FAIL: $1" >&2
-	failures=$((failures + 1))
-	shift
-	local line
-	for line in "$@"; do
-		printf '    %s\n' "$line" >&2
-	done
-}
-
-contains() {
-	printf '%s' "$1" | grep -qF -- "$2"
-}
-
-assert_contains() {
-	local label=$1 haystack=$2 needle=$3
-	if contains "$haystack" "$needle"; then
-		pass "$label"
-	else
-		fail "$label" "expected to find: ${needle}" "in:" "$haystack"
-	fi
-}
-
-assert_lacks() {
-	local label=$1 haystack=$2 needle=$3
-	if contains "$haystack" "$needle"; then
-		fail "$label" "expected NOT to find: ${needle}" "in:" "$haystack"
-	else
-		pass "$label"
-	fi
-}
-
-assert_status() {
-	local label=$1 want=$2 got=$3
-	if [ "$want" = "$got" ]; then
-		pass "$label"
-	else
-		fail "$label" "expected exit ${want}, got ${got}"
-	fi
-}
+# shellcheck source=test-lib.sh
+. "${script_dir}/test-lib.sh"
 
 # ---------------------------------------------------------------------------
 # The tree the subject runs out of, and what it finds around it.
 # ---------------------------------------------------------------------------
-
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
 
 repo="${work}/repo"
 mkdir -p -- "${repo}/tools"
@@ -153,8 +104,6 @@ build() {
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
-output_of() { sed '$d' <<<"$1"; }
-status_of() { sed -n '$s/^---status //p' <<<"$1"; }
 
 mtime_of() { stat -c %Y -- "$1"; }
 
@@ -174,14 +123,14 @@ else
 	fail "the artifact is executable"
 fi
 
-# What makes the output a device binary: the platform, the compilation mode, and
-# the target. None of them is implied by anything else in this suite.
+# What makes the output a device binary: the device configuration, and the
+# target. The configuration is .bazelrc's `device` — named, not spelled, so this
+# build, the motion build and `make check-device` cannot describe different ones
+# — and what is in it is that file's business, asserted there.
 asked_build_flags=$(flags_of build)
 asked_cquery_flags=$(flags_of cquery)
-assert_contains "the build asks for the device platform" "$asked_build_flags" \
-	"--platforms=//bazel/platform:reachy-device"
-assert_contains "the build asks for an opt compile" "$asked_build_flags" \
-	"--compilation_mode=opt"
+assert_contains "the build asks for the device configuration" "$asked_build_flags" \
+	"--config=device"
 assert_contains "the build names the bench target" "$(calls_of build)" \
 	"-- //crates/reachy-bench:reachy_bench"
 assert_contains "the cquery asks about the same target" "$(calls_of cquery)" \
@@ -267,14 +216,13 @@ else
 fi
 STUB_BUILD_STATUS=0
 
-# A cquery that fails: the build worked, so the refusal has to say that the
-# problem is naming the output rather than producing it.
+# The three ways Bazel can answer badly. The refusals themselves are lib.sh's
+# and their wording is pinned once, in tools/lib.test.sh; what this suite owns is
+# that the script stops on each of them and stamps nothing.
 touch -d "@${stale}" -- "$binary"
 STUB_CQUERY_STATUS=1
 result=$(build)
 assert_status "a cquery that fails refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal says bazel could not name it" "$(output_of "$result")" \
-	"cannot name"
 if [ "$(mtime_of "$binary")" -eq "$stale" ]; then
 	pass "a build whose output cannot be named stamps nothing"
 else
@@ -287,28 +235,45 @@ touch -d "@${stale}" -- "$binary"
 STUB_CQUERY_OUTPUT=$'\n'
 result=$(build)
 assert_status "an empty cquery answer refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal says no file was named" "$(output_of "$result")" \
-	"named no output file"
 if [ "$(mtime_of "$binary")" -eq "$stale" ]; then
 	pass "an empty cquery answer stamps nothing"
 else
 	fail "an empty cquery answer stamped the artifact anyway"
 fi
 
-# A cquery that names a path nothing is at: the convenience symlink is renamed or
-# switched off, and naming that flag is the whole value of this refusal.
+# A cquery answer that does not carry the file this script asked for. What the
+# script owns here is the basename it wants: the target's own output name, not
+# the contract path's.
 touch -d "@${stale}" -- "$binary"
 STUB_CQUERY_OUTPUT=bazel-out/stub/bin/crates/reachy-bench/not-there
 result=$(build)
+assert_status "a listing without the binary in it refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names what it wanted" "$(output_of "$result")" "reachy_bench"
+if [ "$(mtime_of "$binary")" -eq "$stale" ]; then
+	pass "a listing without the binary stamps nothing"
+else
+	fail "a listing without the binary stamped the artifact anyway"
+fi
+
+# A listing that carries the name at a path nothing is at.
+touch -d "@${stale}" -- "$binary"
+STUB_CQUERY_OUTPUT=bazel-out/stub/bin/elsewhere/reachy_bench
+result=$(build)
 assert_status "an unresolvable cquery answer refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal names the missing path" "$(output_of "$result")" "not-there"
-assert_contains "the refusal names the symlink flag" "$(output_of "$result")" \
-	"--symlink_prefix"
 if [ "$(mtime_of "$binary")" -eq "$stale" ]; then
 	pass "an unresolvable cquery answer stamps nothing"
 else
 	fail "an unresolvable cquery answer stamped the artifact anyway"
 fi
+
+# A target with more than one output: the day the bench binary gains a data dep
+# or a debug artefact, the listing is two lines and the wanted one is still
+# named. Taking the listing itself as the answer is what this pins against.
+STUB_CQUERY_OUTPUT="bazel-out/stub/bin/crates/reachy-bench/reachy_bench.data
+${STUB_OUTPUT}"
+result=$(build)
+assert_status "a listing with a second output still builds" 0 "$(status_of "$result")"
+assert_contains "and installs the binary" "$(output_of "$result")" "device binary"
 STUB_CQUERY_OUTPUT=
 
 # ---------------------------------------------------------------------------
@@ -321,5 +286,4 @@ assert_contains "the refusal says how to get one" "$(output_of "$result")" "baze
 
 # ---------------------------------------------------------------------------
 
-echo "${passes} passed, ${failures} failed"
-[ "$failures" -eq 0 ]
+tally

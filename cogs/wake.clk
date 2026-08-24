@@ -1,0 +1,111 @@
+// The first intent source, in a module of its own.
+//
+// Apart from the composition next door because a `.clk` module the Rust
+// generator reads may not also declare a `udp_socket` -- the generator refuses
+// one by name -- and `robot.clk` is where the seam's six sockets are. So this
+// file is the cog and nothing else, and that file is the box, the sockets and
+// the process.
+//
+// Scaffolding: when the intent bridge lands, this module, its host, `WakeParams`
+// and `wake_state.clk` go with it, and the machine's scripts come from whatever
+// asked for them. TODO(reachy-pod-motion-integration)
+//
+// It declares no signal group, and that is forced rather than a choice about
+// what is worth counting: a module that imports two cog modules each importing
+// the standard signal vocabulary is refused by the compiler for a conflicting
+// serialization of a type both brought in, and `robot.clk` imports this module
+// beside `motion`. So the two totals live in the state slot alone, where a
+// reader of the slot finds them.
+//
+// Two modules are imported under aliases because a cog member below carries a
+// name of its own: the output is called `script`, and the state slot's own
+// module is `wake_state`, which the box that hosts this cog names a member for.
+// A member name shadows a module name in the enclosing scope, which the
+// compiler refuses as a redefinition.
+// (A comment may not sit directly above a `use`, which is why this one is
+// here.)
+
+#![generate(cpp, cpp_cog, cpp_test_cog)]
+#![cpp(namespace=brenn_reachy::cogs)]
+
+use [cpp, proto, proto_conv] cogs::config;
+use cogs::script as script_vocab;
+use cogs::wake_state as wake_state_vocab;
+use motion::timeline;
+
+// The first intent source: one script, once, when the machine says it is
+// commissioned.
+//
+// The session engages only on a script accepted in `resting`, and nothing on a
+// machine publishes one -- the intent bridge is somebody else's work. So this
+// box carries a minimal closed-loop source of its own: it watches the session's
+// own narration for the transition into `resting`, publishes the configured
+// gesture, and is finished.
+//
+// Woken by the reports rather than by a timer. Per-message waking keeps the gap
+// between commissioning and the greeting at one scheduling hop -- which is the
+// window `lead_ms` is sized against -- and means a view of eight over a
+// thirty-two deep channel cannot be lapped between one publication and the read
+// that follows it.
+//
+// Scaffolding: when the intent bridge lands, this cog and its configuration go
+// with it. TODO(reachy-pod-motion-integration)
+//
+// The `simulation_options` at the foot say how long an execution is modelled to
+// take. Nothing simulates this cog: its own input is the session's narration,
+// published in the same box, but the box it lives in is composed over live
+// sockets and carries no scenario target of its own. The figure is stated
+// rather than defaulted anyway, so a value read anywhere has a statement behind
+// it. (Neither a block header nor a field inside one may carry
+// a comment, which is why this is here.)
+cog Wake
+{
+    configs
+    {
+        // The lead the script is dated by, and the gesture itself.
+        params: Tappy<config::WakeParams>;
+    }
+
+    states
+    {
+        // Whether the one script has gone out. Named for what it holds rather
+        // than for the cog: a state member whose name matches its cog's
+        // generates a C++ class nested inside one of the same name, which does
+        // not compile.
+        sent: Tappy<wake_state_vocab::WakeState>
+        {
+            mutable: true;
+        }
+    }
+
+    inputs
+    {
+        // The session's narration. Sized to see every report rather than the
+        // latest one: the transition this cog waits for is one row among a
+        // burst of them, and a row superseded before it was read is a
+        // commissioning nobody heard about.
+        reports: Tappy<timeline::TimelineEntry>
+        {
+            max_msgs: 8;
+        }
+    }
+
+    outputs
+    {
+        script: Tappy<script_vocab::Script>;
+    }
+
+    execution
+    {
+        // Every report, no skips: the bound equals the view's size, so the
+        // count is the window's length and never a clamp of it.
+        condition got: new_message(reports, max=8);
+
+        execute when: got;
+    }
+
+    simulation_options
+    {
+        execution_duration: 1ms;
+    }
+}

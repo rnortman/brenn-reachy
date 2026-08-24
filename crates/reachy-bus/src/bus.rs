@@ -45,6 +45,25 @@ const STATUS_OVERHEAD: usize = PREAMBLE_LEN + 1 + 1 + CRC_LEN;
 /// Parameters in a ping reply: model number (2) and firmware version (1).
 const PING_PARAMS: usize = 3;
 
+/// Parameters of a grouped request before its per-servo entries: the address
+/// and the width, two bytes each.
+const SYNC_ADDR_PARAMS: usize = 4;
+
+/// Bytes an instruction frame carrying `params` parameter bytes occupies:
+/// header, ID, length field, instruction, the parameters and the CRC. A bound
+/// rather than the encoder's own answer — a frame whose parameters need byte
+/// stuffing is longer, and no request this bus builds carries the byte pattern
+/// that triggers it.
+const fn instr_frame_bytes(params: usize) -> usize {
+    PREAMBLE_LEN + 1 + params + CRC_LEN
+}
+
+/// Bytes a grouped read's replies occupy: one status frame per servo asked,
+/// each carrying the register.
+const fn sync_read_rx(ids: usize, width: usize) -> usize {
+    ids * (STATUS_OVERHEAD + width)
+}
+
 /// Bits on the wire per byte at 8N1: a start bit, eight data bits, a stop bit.
 const BITS_PER_BYTE: u64 = 10;
 
@@ -96,7 +115,65 @@ impl BusTiming {
     /// When an exchange sending `tx` bytes and expecting `rx` back gives up.
     #[must_use]
     pub fn deadline(&self, from: Instant, tx: usize, rx: usize) -> Instant {
-        from + self.host_allowance + self.wire_time(tx + rx)
+        from + self.worst_exchange(tx, rx)
+    }
+
+    /// How long an exchange sending `tx` bytes and expecting `rx` back may take.
+    ///
+    /// The deadline every exchange in this crate runs under, as a duration
+    /// rather than an instant: [`Self::deadline`] is this measured from a start,
+    /// and a caller budgeting a cycle's bus work asks for the same number
+    /// without having started anything. One expression, so a host's budget and
+    /// the deadline it is spent against cannot drift apart.
+    #[must_use]
+    pub fn worst_exchange(&self, tx: usize, rx: usize) -> Duration {
+        self.host_allowance + self.wire_time(tx + rx)
+    }
+
+    /// How long a grouped read of `width`-byte registers over `ids` servos may
+    /// take.
+    ///
+    /// The exchange [`Bus::sync_read`] runs: one instruction frame naming every
+    /// servo, and one status frame back per servo asked. The reply traffic is
+    /// what makes this the most expensive exchange of a cycle, and charging it
+    /// as a single register exchange understates it by eight status frames.
+    #[must_use]
+    pub fn sync_read_bound(&self, ids: usize, width: usize) -> Duration {
+        self.worst_exchange(
+            instr_frame_bytes(SYNC_ADDR_PARAMS + ids),
+            sync_read_rx(ids, width),
+        )
+    }
+
+    /// How long a grouped write of `width`-byte registers over `ids` servos may
+    /// take.
+    ///
+    /// One instruction frame and no replies at all: the protocol acknowledges a
+    /// grouped write with nothing, which is why a driver that needs to know a
+    /// write took writes it one servo at a time and reads it back.
+    #[must_use]
+    pub fn sync_write_bound(&self, ids: usize, width: usize) -> Duration {
+        self.worst_exchange(instr_frame_bytes(SYNC_ADDR_PARAMS + ids * (1 + width)), 0)
+    }
+
+    /// How long a unicast read of one `width`-byte register may take.
+    #[must_use]
+    pub fn read_reg_bound(&self, width: usize) -> Duration {
+        self.worst_exchange(instr_frame_bytes(4), STATUS_OVERHEAD + width)
+    }
+
+    /// How long a unicast write of one `width`-byte register may take, with no
+    /// read-back.
+    #[must_use]
+    pub fn write_reg_bound(&self, width: usize) -> Duration {
+        self.worst_exchange(instr_frame_bytes(2 + width), STATUS_OVERHEAD)
+    }
+
+    /// How long the write-then-read-back of [`Bus::write_reg_verified`] may
+    /// take: the two exchanges it is.
+    #[must_use]
+    pub fn verified_write_bound(&self, width: usize) -> Duration {
+        self.write_reg_bound(width) + self.read_reg_bound(width)
     }
 }
 
@@ -460,8 +537,7 @@ impl<P: BusPort> Bus<P> {
             ..
         } = self;
 
-        let expected_rx = out.len() * (STATUS_OVERHEAD + width);
-        let deadline = timing.deadline(Instant::now(), tx_len, expected_rx);
+        let deadline = timing.deadline(Instant::now(), tx_len, sync_read_rx(out.len(), width));
         let mut chunk = [0u8; MAX_FRAME_BUF];
         let mut answered = 0;
         while answered < out.len() {
@@ -804,6 +880,9 @@ mod tests {
         fail_write: Option<io::ErrorKind>,
         fail_read: Option<io::ErrorKind>,
         fail_discard: Option<io::ErrorKind>,
+        /// Every deadline an exchange handed to a read, so a case can compare
+        /// the deadline the bus enforced against the bound a caller budgeted.
+        deadlines: Vec<Instant>,
     }
 
     impl FakePort {
@@ -817,6 +896,7 @@ mod tests {
                 fail_write: None,
                 fail_read: None,
                 fail_discard: None,
+                deadlines: Vec::new(),
             }
         }
 
@@ -864,7 +944,8 @@ mod tests {
             Ok(())
         }
 
-        fn read_some(&mut self, buf: &mut [u8], _deadline: Instant) -> io::Result<usize> {
+        fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+            self.deadlines.push(deadline);
             if let Some(kind) = self.fail_read.take() {
                 return Err(io::Error::from(kind));
             }
@@ -1401,6 +1482,87 @@ mod tests {
             .expect_err("the port is gone");
         assert!(matches!(failure, XactError::Io { .. }));
         assert_eq!(failure.id(), BROADCAST_ID);
+    }
+
+    #[test]
+    fn every_bound_charges_for_the_bytes_its_exchange_actually_encodes() {
+        // The claim the budget rests on: a bound is the same bytes the exchange
+        // puts on the wire, so a change to the framing, the status overhead or
+        // the servo count moves the budget and the enforced deadline together.
+        // Asserted against the encoders themselves rather than restated.
+        let timing = BusTiming::default();
+        let ids: Vec<u8> = (1..=MAX_SYNC_IDS as u8).collect();
+        let width = usize::from(PRESENT_POSITION.len);
+        let mut buffer = [0u8; 256];
+
+        let tx = encode_sync_read(&ids, PRESENT_POSITION.addr, width as u16, &mut buffer)
+            .expect("nine ids fit one frame");
+        assert_eq!(
+            tx,
+            instr_frame_bytes(SYNC_ADDR_PARAMS + ids.len()),
+            "the grouped read's request",
+        );
+        // One status frame per servo asked: the reply traffic that makes this the
+        // dearest exchange of a cycle.
+        assert_eq!(
+            status(1, 0, &[0; 4]).len(),
+            STATUS_OVERHEAD + width,
+            "a status frame carrying one register",
+        );
+        assert_eq!(
+            timing.sync_read_bound(ids.len(), width),
+            timing.worst_exchange(tx, ids.len() * status(1, 0, &[0; 4]).len()),
+        );
+
+        let entries: Vec<(u8, &[u8])> = ids.iter().map(|id| (*id, &[0u8; 4][..])).collect();
+        let tx = encode_sync_write(GOAL_POSITION.addr, width as u16, &entries, &mut buffer)
+            .expect("nine entries fit one frame");
+        assert_eq!(
+            tx,
+            instr_frame_bytes(SYNC_ADDR_PARAMS + ids.len() * (1 + width)),
+            "the grouped write's request",
+        );
+        assert_eq!(
+            timing.sync_write_bound(ids.len(), width),
+            timing.worst_exchange(tx, 0)
+        );
+
+        let tx = encode_read(1, PRESENT_POSITION.addr, width as u16, &mut buffer)
+            .expect("a unicast read");
+        assert_eq!(
+            timing.read_reg_bound(width),
+            timing.worst_exchange(tx, STATUS_OVERHEAD + width),
+        );
+
+        let tx =
+            encode_write(1, GOAL_POSITION.addr, &[0; 4], &mut buffer).expect("a unicast write");
+        assert_eq!(
+            timing.write_reg_bound(width),
+            // A write is acknowledged with a status frame carrying nothing.
+            timing.worst_exchange(tx, status(1, 0, &[]).len()),
+        );
+    }
+
+    #[test]
+    fn a_grouped_read_runs_under_the_deadline_its_bound_names() {
+        let ids: Vec<u8> = (1..=MAX_SYNC_IDS as u8).collect();
+        let width = usize::from(PRESENT_POSITION.len);
+        let mut bus = bus_over(&[]);
+        let mut outcome = SyncReadOutcome::new();
+
+        let before = Instant::now();
+        let _ = bus.sync_read(&ids, PRESENT_POSITION, &mut outcome);
+        let after = Instant::now();
+
+        // The deadline the exchange enforced, against the bound a caller
+        // budgeting a cycle asks for: the same number, measured from an instant
+        // inside the call.
+        let bound = bus.timing().sync_read_bound(ids.len(), width);
+        let enforced = *bus.port.deadlines.first().expect("the read had a deadline");
+        assert!(
+            enforced >= before + bound && enforced <= after + bound,
+            "the enforced deadline is the budgeted bound from the same instant",
+        );
     }
 
     #[test]

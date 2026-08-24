@@ -1,0 +1,45 @@
+# The wake gesture, loaded once at process setup.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.WakeParams`, generated
+# from the `WakeParams` schema in `config.clk`.
+#
+# The gesture is S1's, the scenario the deterministic suite pins end to end:
+# commission, engage, raise, hold, stow, verified release, rest. So the first
+# thing a machine does under this system is a sequence every assertion in that
+# scenario already covers, and the run ends with the machine de-torqued at the
+# minimum risk condition rather than holding a posture.
+
+# Any number. What it buys is that the acceptance the session narrates names the
+# request this cog made.
+script_id: 1
+
+# The room the session gets between this script arriving and its first step
+# opening: four seconds. Taking hold of the machine is six transactions per
+# servo, one per wake, which is 162 bus cycles -- 3.24 s -- and the first step
+# has to open after that or it opens on a machine that is not yet armed. The
+# slack past it is a fifth of the allowance, not a margin measured on hardware:
+# nothing has run this on a unit.
+lead_ms: 4000
+
+# Up, and hold there. Two seconds against the 800 ms the move is given, so most
+# of the step is the machine holding the posture -- which is the point: a goal
+# stream that stopped on arrival would trip the driver's dead-man, and a step
+# this long is one that would.
+steps
+{
+    after_ms: 0
+    duration_ms: 2000
+    kind: base_posture
+    posture: up
+}
+
+# Then stow, and hold there until the schedule runs out -- which is what ends
+# the session. Three seconds against the 2 s the longer move is given, on the
+# same terms as the step above.
+steps
+{
+    after_ms: 2000
+    duration_ms: 3000
+    kind: base_posture
+    posture: stow
+}

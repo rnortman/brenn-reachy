@@ -23,6 +23,8 @@ use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::EventKind;
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
+use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
@@ -38,9 +40,10 @@ use reachy_motion::record;
 use crate::read::Run;
 use crate::{
     COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS, FIRST_CYCLE, LAG_K,
-    MoveClocks, PERIOD_NS, REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS,
-    SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD, SLEW_LEGS_RAD, commission_transactions, cycle_at,
-    cycle_of, cycle_within, cycles_for, drain_cycle,
+    MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY, REPORT_GROUP,
+    REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS, SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD,
+    SLEW_LEGS_RAD, commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for,
+    drain_cycle,
 };
 
 /// How far the plant may be from the posture it was sent to, in metres and in
@@ -1398,6 +1401,56 @@ pub fn last_datagram(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
     last
 }
 
+/// The configured servo profile, as it reached the servos.
+///
+/// The two writes the commissioning sweep makes out of
+/// [`SessionParams`](crate::PROFILE_ACCELERATION)'s profile fields, found in the
+/// run's own datagrams and compared against what the file said. `check_params`
+/// pins the file to the constants; this pins the constants to the wire, so the
+/// pair together is the whole path from the text a deployment edits to the
+/// register a servo holds.
+///
+/// Every commissioned row is checked, because the sweep writes the profile to
+/// all nine and a machine provisioned with one servo left at whatever it held is
+/// a machine whose motion is not the motion anybody configured.
+pub fn commissioned_profile(run: &Run, failures: &mut Vec<String>) {
+    let mut written = 0_usize;
+    for datagram in &run.datagrams {
+        let txn = datagram.message.txn();
+        if datagram.message.kind() != SessionCmdKindWire::AUX
+            || txn.op() != AuxOpKindWire::WRITE_REG_VERIFIED
+        {
+            continue;
+        }
+        let expected = match txn.reg() {
+            RegIdWire::PROFILE_ACCELERATION => PROFILE_ACCELERATION,
+            RegIdWire::PROFILE_VELOCITY => PROFILE_VELOCITY,
+            _ => continue,
+        };
+        written += 1;
+        let value = i64::try_from(txn.value()).unwrap_or(i64::MAX);
+        if value != expected {
+            failures.push(format!(
+                "the session wrote {value} to servo {}'s {:?} at {} and the configuration says \
+                 {expected}",
+                txn.id(),
+                txn.reg(),
+                datagram.at_ns
+            ));
+        }
+    }
+    // Two registers on each of the nine rows, and the sweep runs once per
+    // process: a run that wrote fewer of them commissioned a machine this check
+    // has no evidence about.
+    let expected_writes = 2 * ROW_COUNT;
+    if written != expected_writes {
+        failures.push(format!(
+            "the commissioning sweep wrote the profile {written} times and there are \
+             {expected_writes} of those writes in a commissioned machine"
+        ));
+    }
+}
+
 /// The cycle the driver drained the first release the session published.
 ///
 /// The confirmation is a bus-row count of cycles after the command reaches the
@@ -1880,15 +1933,11 @@ pub fn latch_from(run: &Run, fired: Option<i64>, failures: &mut Vec<String>) {
 pub fn signal_groups(run: &Run, failures: &mut Vec<String>) {
     for cog in COGS {
         let wanted = format!("{REPORT_GROUP_PREFIX}{cog}/{REPORT_GROUP}/");
-        if !run
-            .channel_names
-            .iter()
-            .any(|name| name.starts_with(&wanted))
-        {
+        if !run.census.iter().any(|(name, _)| name.starts_with(&wanted)) {
+            let carried: Vec<&str> = run.census.iter().map(|(name, _)| name.as_str()).collect();
             failures.push(format!(
                 "the log carries no channel named {wanted}*, so {cog}'s {REPORT_GROUP} group did \
-                 not reach it; the channels it does carry are {:?}",
-                run.channel_names
+                 not reach it; the channels it does carry are {carried:?}"
             ));
         }
     }

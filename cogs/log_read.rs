@@ -17,9 +17,95 @@
 //!
 //! Every complaint is collected rather than thrown. A checker that stopped at
 //! the first surprise costs a whole build per finding.
+//!
+//! The pass itself is here too: [`read_with`] opens the log, checks every
+//! binding in a consumer's table before decoding anything, dispatches each
+//! message to the stream its channel names, and keeps the census of what every
+//! channel carried. A consumer declares only its own streams and its own table.
 
-use clockwork_logs::{ChannelMetadata, LoggedMessage};
+use std::path::Path;
+
+use clockwork_logs::offboard::OffboardReader;
+use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage};
 use clockwork_rs::{Blob, SchemaMeta};
+
+/// Every channel the log carries, in the order the reader reports them, and how
+/// many messages each held.
+///
+/// A consumer with no Rust type bound to a channel can still say whether
+/// anything travelled on it, which is the difference between a report group that
+/// reported and one that only exists.
+pub type Census = Vec<(String, usize)>;
+
+/// One channel of a system, and the two things done with it: the binding check
+/// before anything is decoded, and the decode into the stream it belongs to.
+///
+/// The same row drives both, so a channel cannot be checked and left unread, or
+/// read and left unchecked.
+pub struct Bound<R> {
+    /// The channel's name in the log, which is the name the system declares.
+    pub name: &'static str,
+    /// Assert the log records the schema this build is about to decode.
+    pub check: fn(&[ChannelMetadata], &str, &mut Complaints),
+    /// Decode one message of it into the stream it belongs to.
+    pub route: fn(&mut R, &LoggedMessage<'_>),
+}
+
+/// What [`read_with`] fills in besides a consumer's own streams.
+///
+/// A consumer holds the census and the complaints itself rather than receiving
+/// them alongside, because everything a checker or a report says about a run is
+/// said about one value.
+pub trait Streams: Default {
+    /// Where the channel census goes.
+    fn census(&mut self) -> &mut Census;
+    /// Where a decode nobody could make sense of goes.
+    fn complaints(&mut self) -> &mut Complaints;
+}
+
+/// Read the log under `dir` into `R`, one pass, through `table`.
+///
+/// The order is the safety order for a reader: the census is opened over every
+/// channel the log declares, every binding in the table is checked before a
+/// single payload is decoded, and only then are the messages walked. The
+/// reader's own error counters are a complaint at the end -- a log the framework
+/// had trouble with is not a log anything should be asserted about.
+///
+/// # Errors
+///
+/// Whatever the reader refuses about the log as a whole. A message the reader
+/// yielded and this build could not make sense of is a complaint rather than an
+/// error: the point is to report all of them at once.
+pub fn read_with<R: Streams>(dir: &Path, table: &[Bound<R>]) -> Result<R, LogError> {
+    let mut reader = OffboardReader::open(dir)?;
+    let mut run = R::default();
+
+    let channels: Vec<ChannelMetadata> = reader.channels().to_vec();
+    for metadata in &channels {
+        run.census().push((metadata.channel_name.clone(), 0));
+    }
+    for bound in table {
+        (bound.check)(&channels, bound.name, run.complaints());
+    }
+
+    while let Some(message) = reader.read_next()? {
+        let name = message.metadata.channel_name.as_str();
+        if let Some(entry) = run.census().iter_mut().find(|(known, _)| known == name) {
+            entry.1 += 1;
+        }
+        if let Some(bound) = table.iter().find(|bound| bound.name == name) {
+            (bound.route)(&mut run, &message);
+        }
+    }
+
+    if !reader.error_counters().is_clean() {
+        let counters = format!("{:?}", reader.error_counters());
+        run.complaints().push(format!(
+            "the reader recorded errors over the log: {counters}"
+        ));
+    }
+    Ok(run)
+}
 
 /// What went wrong reading a log: a channel bound to a schema this build does
 /// not know, a payload that did not decode. Every one of these is a failure of

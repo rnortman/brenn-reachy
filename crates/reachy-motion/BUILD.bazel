@@ -40,3 +40,25 @@ rust_test(
     size = "small",
     crate = ":reachy_motion",
 )
+
+# The hardware recordings replayed against the bounds they sized. A separate
+# crate from the library's own tests because it reads files: the recordings
+# arrive through runfiles, and `REACHY_MOTION_TRACE_FIXTURES` names the
+# directory beside the `data` attribute that supplies it, so the two halves of
+# that arrangement sit in one place. The path is relative to the runfiles root,
+# which is a test's working directory.
+rust_test(
+    name = "replay_test",
+    size = "small",
+    srcs = [
+        "tests/replay_test.rs",
+        "tests/replay_trace.rs",
+    ],
+    crate_root = "tests/replay_test.rs",
+    data = glob(["fixtures/traces/*.csv"]),
+    env = {"REACHY_MOTION_TRACE_FIXTURES": "crates/reachy-motion/fixtures/traces"},
+    deps = [
+        ":reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)

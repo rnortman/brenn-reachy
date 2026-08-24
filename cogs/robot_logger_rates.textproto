@@ -1,0 +1,23 @@
+# What the logger calls a channel gone quiet, loaded once at process setup.
+#
+# Protobuf text of
+# `clockwork_logging.channel_message_rates_config_clk_proto.ChannelMessageRatesConfig`.
+# The rates here are reported, never enforced: a channel under its floor is
+# named in the logger's status message and its records are written exactly the
+# same. A channel this file does not name has a floor of zero, which is the
+# right answer for every channel in this system that is quiet by design -- a
+# goal stream with nothing commanded, a fault channel in a healthy run.
+#
+# So one channel is named. The sample stream is the machine's heartbeat and the
+# only thing here that publishes on every cycle whatever else is happening, so
+# it is the one channel whose silence means something on its own.
+
+# The driver's samples: 50 per second, one per 20 ms cycle. The floor is a tenth
+# under, which is loss and jitter tolerance rather than a rate anybody expects
+# to see.
+channel_message_rates { channel_name: "DriverPose", min_msg_rate_hz: 45.0 }
+
+# How long a rate is averaged over. Long enough that the arithmetic is not
+# reporting one late cycle, short enough that a driver that stopped is named
+# within a few status messages of stopping.
+window_size_sec: 5

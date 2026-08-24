@@ -9,7 +9,11 @@
 // enum with a negative member (`TrackingSideKind::below` -- a side is a
 // direction, so one of the two is below), and the Protobuf emitter refuses a
 // negative enumerator outright. So the schemas that must be authored as text
-// live here, where every field is a plain non-negative scalar.
+// live here, and they are held to what that backend will carry: scalars and
+// `VarString`, never the motion vocabulary. Not because a config field has to be
+// a bare number -- `driver/motord_config.clk` names a device path -- but because
+// a config reaching for one of this system's own types drags a module across the
+// Protobuf backend that cannot cross it.
 //
 // The nanosecond counts below are the one place in this system bare numbers
 // stand in for time. The Protobuf path carries integers rather than the
@@ -100,6 +104,22 @@ schema SessionParams
         // de-torquing, and a de-torque nobody can confirm is the operator's
         // problem, not a reason to stop asking.
         #5 torque_off_confirm_budget_ns: Int64;
+
+        // The servo-side profile acceleration the commissioning sweep writes,
+        // in the register's own units. A backstop under host-side shaping and
+        // not the thing that shapes a move: the session streams one
+        // step-bounded setpoint per cycle, so a machine reaching this limiter
+        // is a stream that asked for more than a step. Zero is refused by the
+        // host before it commissions anything -- a servo reads it as no limit
+        // at all, which is what a file that lost this line would ask for. The
+        // shipped pair has never run on hardware:
+        // TODO(session-servo-profile)
+        #6 profile_acceleration: UInt32;
+
+        // The servo-side profile velocity the sweep writes, register units.
+        // Sized with the acceleration above, refused at zero for the same
+        // reason, and for the same purpose.
+        #7 profile_velocity: UInt32;
     }
 }
 
@@ -146,6 +166,106 @@ schema SimParams
         // transaction a cycle has with the host's own requests, and a rotation
         // that took every cycle it could would leave none.
         #6 health_poll_period_ns: Int64;
+    }
+}
+
+// What a step of the wake gesture asks the base for, mirroring `StepKind`.
+//
+// Declared here rather than imported: this backend carries an enum of its own
+// fine, and what it cannot carry is the schedule module -- one enum there
+// numbers a side below the origin, which the Protobuf emitter refuses, and
+// importing the vocabulary would drag that module across with it. So the two
+// enumerators are restated and the host crosses them, which is a match the
+// compiler checks rather than a number a comment explains.
+enum WakeStepKind
+{
+    uuid: 4f1ba7d3-9c86-4e52-bf0d-71a3e5c94d28;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Hold the posture already commanded.
+        #0 base_keep default { underlying_value: 0; }
+        // Move the base to the posture this step names.
+        #1 base_posture { underlying_value: 1; }
+    }
+}
+
+// Which posture a step of the wake gesture names, mirroring `Posture`.
+enum WakePosture
+{
+    uuid: 2d7c94f1-58ae-4b36-8c02-6f5b1a9e37d4;
+    options
+    {
+        underlying_type: UInt8;
+    }
+    values
+    {
+        // Low, off-centre, pitched up: where the machine rests.
+        #0 stow default { underlying_value: 0; }
+        // The neutral working posture.
+        #1 up { underlying_value: 1; }
+    }
+}
+
+// One step of the wake gesture: an offset from the script's arrival, how long
+// it lasts, and what it asks the base for.
+//
+// The fields mirror `ScriptStep`'s, in the vocabulary this backend carries: the
+// two enums above stand in for the schedule's own, and the host crosses each to
+// its counterpart. Not a reuse of the script module's types -- that vocabulary
+// cannot cross the Protobuf backend, and importing it here would drag the whole
+// schedule graph across with it.
+schema WakeStep
+{
+    uuid: 0b4c6f2d-8a17-4e93-9f5a-3c7d21e4b806;
+    fields
+    {
+        // How long after the script's arrival instant the step begins,
+        // milliseconds. Non-decreasing across the steps, which the session's
+        // own screen checks.
+        #0 after_ms: UInt32;
+
+        // How long the step lasts, milliseconds. Positive, likewise.
+        #1 duration_ms: UInt32;
+
+        // What the step asks for: hold what is already commanded, or move the
+        // base to the posture below.
+        #2 kind: WakeStepKind;
+
+        // Which posture. Meaningful only when `kind` names a posture move.
+        #3 posture: WakePosture;
+    }
+}
+
+// What the wake cog is built with: how far ahead it dates its script, and the
+// gesture the script asks for.
+//
+// A config rather than constants in the body for the reason every config here
+// is one: the lead has to cover the arming the session drives before the first
+// step opens, and a number nobody wrote down is a gesture whose first move is
+// commanded at whatever instant the arming happened to finish on.
+schema WakeParams
+{
+    uuid: 3f8ea5c1-6d24-4b70-8e19-a2c5b93f7d64;
+    fields
+    {
+        // The script's number, carried through to the reports about the session
+        // it opens so a reader can tell which request a report is about.
+        #0 script_id: UInt32;
+
+        // How far ahead of publication the script's arrival instant is dated,
+        // milliseconds. Every step's offset is measured from that instant, so
+        // this is the whole of the room the session has to commission nothing
+        // and take hold of the machine before the first step opens.
+        #1 lead_ms: UInt32;
+
+        // The steps, in time order. Bounded exactly as `Script` is: a gesture
+        // that would not fit the request it becomes is a gesture refused at the
+        // screen.
+        #2 steps: VarArray<WakeStep, 16>;
     }
 }
 

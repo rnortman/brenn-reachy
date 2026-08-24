@@ -19,63 +19,12 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-passes=0
-failures=0
-
-pass() {
-	echo "PASS: $1"
-	passes=$((passes + 1))
-}
-
-fail() {
-	echo "FAIL: $1" >&2
-	failures=$((failures + 1))
-	shift
-	local line
-	for line in "$@"; do
-		printf '    %s\n' "$line" >&2
-	done
-}
-
-# Fixed strings throughout: every needle here is a message, and a message with
-# a bracket or a dot in it is not a pattern.
-contains() {
-	printf '%s' "$1" | grep -qF -- "$2"
-}
-
-assert_contains() {
-	local label=$1 haystack=$2 needle=$3
-	if contains "$haystack" "$needle"; then
-		pass "$label"
-	else
-		fail "$label" "expected to find: ${needle}" "in:" "$haystack"
-	fi
-}
-
-assert_lacks() {
-	local label=$1 haystack=$2 needle=$3
-	if contains "$haystack" "$needle"; then
-		fail "$label" "expected NOT to find: ${needle}" "in:" "$haystack"
-	else
-		pass "$label"
-	fi
-}
-
-assert_status() {
-	local label=$1 want=$2 got=$3
-	if [ "$want" = "$got" ]; then
-		pass "$label"
-	else
-		fail "$label" "expected exit ${want}, got ${got}"
-	fi
-}
+# shellcheck source=test-lib.sh
+. "${script_dir}/test-lib.sh"
 
 # ---------------------------------------------------------------------------
 # The tree the subject runs out of, and the stubs it finds on PATH.
 # ---------------------------------------------------------------------------
-
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
 
 repo="${work}/repo"
 mkdir -p -- "${repo}/tools" "${repo}/target/bench-arm64/release"
@@ -144,8 +93,6 @@ deploy() {
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
-output_of() { sed '$d' <<<"$1"; }
-status_of() { sed -n '$s/^---status //p' <<<"$1"; }
 
 calls() { cat -- "$CALLS"; }
 
@@ -166,7 +113,7 @@ assert_status "a binary newer than the newest commit runs" 0 "$(status_of "$resu
 assert_contains "the run reaches the device" "$(calls)" "reachy-bench"
 
 assert_contains "the freshness question is asked of the workspace paths" "$(calls)" \
-	"git -C ${repo} log -1 --format=%ct -- crates bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion tools/build-bench.sh"
+	"git -C ${repo} log -1 --format=%ct -- crates bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion tools/build-bench.sh tools/lib.sh"
 
 build_binary_at "$before"
 result=$(deploy unit --run selftest)
@@ -191,7 +138,7 @@ build_binary_at "$before"
 result=$(deploy unit --run selftest)
 assert_status "no history means no verdict, and the run proceeds" 0 "$(status_of "$result")"
 assert_contains "an undecidable age is said out loud" "$(output_of "$result")" \
-	"the binary's age is unknown"
+	"the device binary's age is unknown"
 GIT_COMMIT_TIME=$commit_at
 
 # The check runs after the binary itself is accounted for, so a missing build
@@ -242,5 +189,4 @@ SSH_RUN_STATUS=0
 
 # ---------------------------------------------------------------------------
 
-echo "${passes} passed, ${failures} failed"
-[ "$failures" -eq 0 ]
+tally

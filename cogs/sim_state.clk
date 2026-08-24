@@ -210,7 +210,7 @@ schema SimState
         #14 refused_injections: UInt64;
 
         // The nine modelled control tables: one cell per register per bus row,
-        // row-major, twenty-two registers to a row -- every register the
+        // row-major, twenty-three registers to a row -- every register the
         // vocabulary names except its no-register zero, which names no cell.
         //
         // A cell holds the register's engineering-unit value in the same
@@ -224,7 +224,7 @@ schema SimState
         // provisioning: what a healthy, correctly provisioned unit holds, so a
         // commissioning sequence verifies here against the numbers it verifies
         // against on hardware.
-        #15 regs: FixedArray<UInt64, 198>;
+        #15 regs: FixedArray<UInt64, 207>;
 
         // How many plant readings never reached a control table, all run: an
         // angle the modelled world made non-finite has no eight-byte carriage,

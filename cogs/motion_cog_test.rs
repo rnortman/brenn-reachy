@@ -2884,6 +2884,18 @@ const AUX_RETRIES: u32 = 3;
 /// which clock it was cut from.
 const STOW_BUDGET_NS: i64 = 4_000_000_000;
 
+/// The servo-side profile the commissioning sweep writes, register units: the
+/// pair `cogs/session_params.textproto` ships.
+///
+/// Restated here for a different reason from the three above it. Zero in either
+/// register is a servo running unlimited, which is what a configuration missing
+/// the lines parses to and what the session refuses to commission on, so a case
+/// running on any other pair would be a case running a machine no deployment
+/// ships. The scenario harness is what checks these two numbers against the
+/// file.
+const PROFILE_ACCELERATION: u32 = 20;
+const PROFILE_VELOCITY: u32 = 50;
+
 /// The session's timing, as the config slot carries it.
 fn session_params() -> SessionParamsWire {
     let mut params = SessionParamsWire::new();
@@ -2893,6 +2905,8 @@ fn session_params() -> SessionParamsWire {
     params.set_startup_grace_ns(2_000_000_000);
     params.set_stow_budget_ns(STOW_BUDGET_NS);
     params.set_torque_off_confirm_budget_ns(500_000_000);
+    params.set_profile_acceleration(PROFILE_ACCELERATION);
+    params.set_profile_velocity(PROFILE_VELOCITY);
     params
 }
 
@@ -3874,6 +3888,24 @@ fn a_timeline_this_build_cannot_read_publishes_nothing() {
     let state = cog.state_sess();
     assert_eq!(state.reports_published(), 1);
     assert_eq!(state.refused_state(), 1, "the damage was found once");
+}
+
+/// A servo profile of zero is refused before anything is commissioned.
+///
+/// The pair lives in two configuration fields whose absence parses to zeros.
+/// Zero in those two
+/// registers is a servo with no rate limit at all -- the opposite of the
+/// backstop the pair is written for -- so the session stops the process at its
+/// first execution, with the machine de-torqued and nothing commanded, rather
+/// than commissioning a machine whose one host-independent limiter is off.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_servo_profile_of_zero_is_not_a_machine_this_session_commissions() {
+    let mut cog = session();
+    let mut params = session_params();
+    params.set_profile_velocity(0);
+    cog.set_config_params(&params);
+    drive(&mut cog, FIRST_WAKE);
 }
 
 // The session's bus half. Every case here drives the start-up survey, which is

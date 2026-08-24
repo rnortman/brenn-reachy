@@ -141,6 +141,7 @@ pub fn reg_for(reg: RegId) -> Result<Reg, MapError> {
         RegId::HardwareErrorStatus => regs::HARDWARE_ERROR_STATUS,
         RegId::PresentInputVoltage => regs::PRESENT_INPUT_VOLTAGE,
         RegId::ModelNumber => regs::MODEL_NUMBER,
+        RegId::PresentTemperature => regs::PRESENT_TEMPERATURE,
     };
     Ok(entry)
 }
@@ -188,7 +189,8 @@ pub fn value_kind(reg: RegId) -> Result<ValueShape, MapError> {
         | RegId::DriveMode
         | RegId::TemperatureLimit
         | RegId::BusWatchdog
-        | RegId::HardwareErrorStatus => ValueShape::U8,
+        | RegId::HardwareErrorStatus
+        | RegId::PresentTemperature => ValueShape::U8,
         RegId::MaxVoltageLimit
         | RegId::MinVoltageLimit
         | RegId::CurrentLimit
@@ -553,6 +555,7 @@ mod tests {
             (RegId::HardwareErrorStatus, 70, 1),
             (RegId::PresentInputVoltage, 144, 2),
             (RegId::ModelNumber, 0, 2),
+            (RegId::PresentTemperature, 146, 1),
         ];
         assert_eq!(
             table.len(),

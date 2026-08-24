@@ -88,6 +88,15 @@ build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//
 build:lint --output_groups=+clippy_checks,+rustfmt_checks
 build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
 
+# The device configuration: the Reachy Mini's platform, optimised. Named here
+# rather than spelled at each call site, because there are three — `make
+# check-device`, tools/build-bench.sh, tools/build-motion.sh — and a gate that
+# builds a different configuration from the one a deploy ships is a gate testing
+# something nobody runs. Anything that changes how a device binary is compiled
+# goes on this config and reaches all three.
+build:device --compilation_mode=opt
+build:device --platforms=//bazel/platform:reachy-device
+
 # CI's caches, behind a config so a local build neither reads nor writes them.
 # Both stores are content-addressed — a missing entry is a cache miss and an
 # extraneous one is dead weight, so restoring them from a CI cache archive

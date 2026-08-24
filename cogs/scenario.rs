@@ -138,6 +138,19 @@ pub const STOW_BUDGET_NS: i64 = 4_000_000_000;
 /// saying the de-torquing went unconfirmed. It keeps commanding either way.
 pub const SESSION_CONFIRM_BUDGET_NS: i64 = 500_000_000;
 
+/// The servo-side profile acceleration the commissioning sweep writes, in the
+/// register's own units.
+///
+/// Mirrors the deployed `SessionParams.profile_acceleration`; a scenario
+/// asserting this pair is asserting about the file the process read. What makes
+/// the claim reach the wire is
+/// [`check::commissioned_profile`](crate::check::commissioned_profile), which
+/// finds the two writes in the run's own datagrams.
+pub const PROFILE_ACCELERATION: i64 = 20;
+
+/// The servo-side profile velocity the sweep writes, register units.
+pub const PROFILE_VELOCITY: i64 = 50;
+
 /// How long the session may go without executing: the floor its wake condition
 /// puts under a run where nothing arrives, nanoseconds.
 ///
@@ -171,36 +184,6 @@ pub const EXECUTION_DURATION_NS: i64 = 1_000_000;
 /// `time_of_validity` -- are arithmetic off the cycle rather than off any
 /// publish.
 pub const CONTROL_DELAY_NS: i64 = 2 * EXECUTION_DURATION_NS;
-
-/// The channel the scripts arrive on, fed from the input log.
-pub const SCRIPT_CHANNEL: &str = "ScriptsIn";
-
-/// The channel the session publishes what it accepted on.
-pub const SCHEDULE_CHANNEL: &str = "ScheduleChan";
-
-/// The channel the scenario's injections arrive on, fed from the input log.
-pub const SIM_CMD_CHANNEL: &str = "SimCmdChan";
-
-/// The driver's sample stream.
-pub const POSE_CHANNEL: &str = "DriverPose";
-
-/// The goal stream.
-pub const CMD_CHANNEL: &str = "DriverCmd";
-
-/// The driver's events.
-pub const EVENT_CHANNEL: &str = "DriverEvt";
-
-/// What the decision tick raised.
-pub const FAULT_CHANNEL: &str = "TickFaults";
-
-/// What the session asks of the driver: one datagram per wake at most.
-pub const SESSION_CMD_CHANNEL: &str = "SessionCmdChan";
-
-/// What the session said about the session: one report per wake, oldest first.
-pub const REPORT_CHANNEL: &str = "ReportsOut";
-
-/// Where the head was.
-pub const ESTIMATE_CHANNEL: &str = "Estimates";
 
 /// What a signal report group's channel is called, up to the cog that owns it.
 ///
@@ -705,6 +688,8 @@ pub fn check_params(
                 "torque_off_confirm_budget_ns",
                 Value::Int(SESSION_CONFIRM_BUDGET_NS),
             ),
+            ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
+            ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
         ],
         &mut failures,
     );
@@ -733,22 +718,22 @@ pub fn check_params(
         ));
     }
     // The two driver thresholds a scenario perturbs and then asserts about. They
-    // are constants of the cog rather than configuration, so what keeps a
-    // scenario's expectation from moving with the number it is checking is this
-    // pair of comparisons: a threshold changed on one side alone fails the run
-    // instead of quietly rewriting what S4' claims.
-    if sim_cogs::BLIND_CYCLES_BEFORE_BUS_FAILURE != BLIND_CYCLES_BEFORE_BUS_FAILURE {
+    // are constants of the driver layer every host shares rather than
+    // configuration, so what keeps a scenario's expectation from moving with the
+    // number it is checking is this pair of comparisons: a threshold changed on
+    // one side alone fails the run instead of quietly rewriting what S4' claims.
+    if reachy_driver::BLIND_CYCLES_BEFORE_BUS_FAILURE != BLIND_CYCLES_BEFORE_BUS_FAILURE {
         failures.push(format!(
             "the driver declares its bus gone after {} blind cycles and the scenarios expect \
              {BLIND_CYCLES_BEFORE_BUS_FAILURE}",
-            sim_cogs::BLIND_CYCLES_BEFORE_BUS_FAILURE
+            reachy_driver::BLIND_CYCLES_BEFORE_BUS_FAILURE
         ));
     }
-    if sim_cogs::TORQUE_OFF_CONFIRM_BUDGET_NS != DRIVER_CONFIRM_BUDGET_NS {
+    if reachy_driver::TORQUE_OFF_CONFIRM_BUDGET_NS != DRIVER_CONFIRM_BUDGET_NS {
         failures.push(format!(
             "the driver's confirmation budget is {}ns and the scenarios expect \
              {DRIVER_CONFIRM_BUDGET_NS}ns",
-            sim_cogs::TORQUE_OFF_CONFIRM_BUDGET_NS
+            reachy_driver::TORQUE_OFF_CONFIRM_BUDGET_NS
         ));
     }
     failures

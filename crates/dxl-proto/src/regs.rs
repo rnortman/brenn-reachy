@@ -132,6 +132,8 @@ pub const PRESENT_CURRENT: Reg = Reg::new(126, 2);
 pub const PRESENT_POSITION: Reg = Reg::new(132, 4);
 /// Measured supply voltage, in 0.1 V units.
 pub const PRESENT_INPUT_VOLTAGE: Reg = Reg::new(144, 2);
+/// Measured temperature at the servo, whole degrees Celsius.
+pub const PRESENT_TEMPERATURE: Reg = Reg::new(146, 1);
 
 #[cfg(test)]
 mod tests {
@@ -169,6 +171,7 @@ mod tests {
         ("present_current", PRESENT_CURRENT),
         ("present_position", PRESENT_POSITION),
         ("present_input_voltage", PRESENT_INPUT_VOLTAGE),
+        ("present_temperature", PRESENT_TEMPERATURE),
     ];
 
     #[test]

@@ -140,6 +140,82 @@ jobs:
             --launcher-home "${BAZELISK_HOME:-}" \
             --store "$BAZEL_LAUNCHER_CACHE"
 
+  # The other half of the gate, and blocking: the three binaries a unit runs,
+  # built for the device. The host lane above says the tree is correct; this one
+  # says it can be shipped. Both have to be green for a change to land, because
+  # the alternative — discovering that the aarch64 configuration stopped
+  # resolving — happens at `make motion-build` in front of a powered-up unit.
+  #
+  # A build and not a test: nothing here executes an aarch64 binary. What it
+  # catches is configuration, which is where the breaks are: a dependency without
+  # aarch64 in its `target_compatible_with`, a `select()` a new dependency
+  # introduces, a drop upgrade that stops registering the aarch64 clang
+  # toolchain.
+  #
+  # Its own job rather than a step in `check`, so the two lanes run in parallel
+  # and a failure says which configuration broke without reading a log. It pays
+  # for its own dependency fetch and shares nothing with the lane above: the two
+  # caches are keyed separately because the archives hold different action
+  # results, and a shared key would have the two jobs racing to write it.
+  check-device:
+    name: check-device (aarch64 cross-build)
+    runs-on: ubuntu-latest
+
+    env:
+      BAZEL_DISK_CACHE: ~/.cache/bazel-disk
+      BAZEL_REPO_CACHE: ~/.cache/bazel-repo
+      BAZEL_LAUNCHER_CACHE: ~/.cache/bazelisk
+      GATE_BAZEL_FLAGS: --config=ci --lockfile_mode=error
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The `device-` prefix is what keeps this out of the host lane's archive:
+      # same paths, same fingerprint inputs, different configuration of every
+      # action in them.
+      - name: Restore Bazel caches
+        id: bazel-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BAZEL_DISK_CACHE }}
+            ${{ env.BAZEL_REPO_CACHE }}
+            ${{ env.BAZEL_LAUNCHER_CACHE }}
+          key: bazel-device-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion', '.github/workflows/ci.yml') }}
+
+      - name: Install bazelisk
+        env:
+          BAZELISK_VERSION: 1.29.0
+          BAZELISK_SHA256: 5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-amd64"
+          echo "${BAZELISK_SHA256}  $RUNNER_TEMP/bazel" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bazel"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          . tools/lib.sh
+          echo "BAZELISK_HOME=$(expand_home "$BAZEL_LAUNCHER_CACHE")" >> "$GITHUB_ENV"
+
+      # The contents live in the root `check-device` target: reproducible locally
+      # on a fresh clone, one definition.
+      - run: make check-device BAZEL_FLAGS="$GATE_BAZEL_FLAGS"
+
+      # The same assertion the host lane runs, for the same reason and more of
+      # it: this lane's whole cost case is that the archive absorbs the aarch64
+      # cross toolchain, and an unobserved cache lane is green and just slower.
+      # The stores are this job's own — the `device-` key prefix keeps them out
+      # of the host lane's archive — so the wiring is checked separately even
+      # though the paths and the flags are spelled the same.
+      - name: Assert and report the Bazel caches
+        run: |
+          echo "cache-hit=${{ steps.bazel-cache.outputs.cache-hit }}"
+          tools/ci-assert-bazel-caches.sh \
+            --gate-flags "$GATE_BAZEL_FLAGS" \
+            --disk-cache "$BAZEL_DISK_CACHE" \
+            --repository-cache "$BAZEL_REPO_CACHE" \
+            --launcher-home "${BAZELISK_HOME:-}" \
+            --store "$BAZEL_LAUNCHER_CACHE"
+
   scrub:
     name: scrub
     runs-on: ubuntu-latest

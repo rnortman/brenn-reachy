@@ -34,9 +34,11 @@ use dxl_proto::conv::COUNTS_PER_REV;
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
 use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, with_retry};
 use reachy_kin::{
-    FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose, stow_head_pose,
+    EnvelopeConfig, FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose,
+    stow_head_pose,
 };
-use reachy_motion::joints::{ROW_COUNT, ROWS, group_of};
+use reachy_motion::arm::{WINDOW_INSET_DEG, leg_windows};
+use reachy_motion::joints::{LEG_COUNT, ROW_COUNT, ROWS, group_of, leg_index};
 use reachy_motion::reg::{self, Name as RegName};
 use reachy_motion::{
     ArmRecord, EXPECTED_MODELS, JointGroup, JointVector, ProvisionExpect, ProvisionTable, RegId,
@@ -98,8 +100,14 @@ pub enum Case {
     Identity,
     /// The provisioned setup registers hold what the configuration says.
     ProvisionSweep,
+    /// Each leg servo's own travel fence agrees with the motion envelope the
+    /// commanding host runs.
+    LegFence,
     /// The supply rail is up on all nine servos.
     Voltage,
+    /// Every servo's temperature reads inside the band a resting machine sits
+    /// in.
+    Temperature,
     /// Nothing is latched in a hardware error status byte.
     Health,
     /// Where the platform is resting, recorded.
@@ -119,12 +127,14 @@ pub enum Case {
 
 impl Case {
     /// Every case, in run order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::PortOpen,
         Self::Presence,
         Self::Identity,
         Self::ProvisionSweep,
+        Self::LegFence,
         Self::Voltage,
+        Self::Temperature,
         Self::Health,
         Self::RestPose,
         Self::GoalShadow,
@@ -141,7 +151,9 @@ impl Case {
             Self::Presence => "presence",
             Self::Identity => "identity",
             Self::ProvisionSweep => "provision-sweep",
+            Self::LegFence => "leg-fence",
             Self::Voltage => "voltage",
+            Self::Temperature => "temperature",
             Self::Health => "health",
             Self::RestPose => "rest-pose",
             Self::GoalShadow => "goal-shadow",
@@ -467,6 +479,69 @@ impl SelftestRecord {
     }
 }
 
+/// The band a resting servo's present temperature has to read inside, degrees
+/// Celsius.
+///
+/// Not a thermal limit — the servo's own temperature-limit register is that, and
+/// this platform provisions it. This is the band that makes the temperature case
+/// an assertion rather than a printout: a machine at rest in a room is inside
+/// it, a servo that has been working hard is at the top of it, and a byte that is
+/// not degrees at all — a zero from a register nothing answered, a raw tick count
+/// — is outside it.
+///
+/// Wide on purpose: an unexpected value gets a person's review before this range
+/// moves (bring-up rule, `CLAUDE.md`).
+const RESTING_TEMP_BAND_C: core::ops::RangeInclusive<u8> = 5..=55;
+
+/// The slack every leg-fence bound is allowed, counts.
+///
+/// One count of rounding, and one only. The servo's window and the host's are
+/// two descriptions of one physical limit reached by different arithmetic — a
+/// provisioning tool wrote the counts, and this crate converts radians to counts
+/// by rounding to nearest — so a bound landing a count either side of where the
+/// conversion places it is agreement. Anything wider is two mechanisms guarding
+/// different regions.
+const FENCE_SLACK_COUNTS: i32 = 1;
+
+/// The legs' travel fences as the provision sweep read them: per leg, the lower
+/// bound then the upper, absent for a bound the sweep did not reach.
+///
+/// Carried from the sweep rather than read again. The sweep already reads both
+/// limit registers off every servo, and a bus is serial and half-duplex: a
+/// second read costs twelve round trips on the pass an operator runs
+/// repeatedly, and — worse — two readings of one cell in one run can disagree,
+/// which would put a passing sweep line and a failing fence line about the same
+/// register in one report with nothing saying which is the truth.
+type LegFences = [[Option<Value>; 2]; LEG_COUNT];
+
+/// Which bound of a [`LegFences`] row a register is, if it is one.
+const fn fence_bound_index(reg: RegId) -> Option<usize> {
+    match reg {
+        RegId::MinPositionLimit => Some(0),
+        RegId::MaxPositionLimit => Some(1),
+        _ => None,
+    }
+}
+
+/// A travel window, lower then upper, in both units.
+///
+/// Both, because the two records this case compares are written in different
+/// ones: a provisioning table is counts and an envelope is radians, and a
+/// person reading a disagreement needs the pair.
+struct Window([i32; 2]);
+
+impl fmt::Display for Window {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [lower, upper] = self.0;
+        write!(
+            f,
+            "[{lower} {upper}] counts / [{:.3} {:.3}]°",
+            counts_to_rad(lower).to_degrees(),
+            counts_to_rad(upper).to_degrees()
+        )
+    }
+}
+
 /// The clearance the resting pose has to leave from the linkage's singular
 /// configurations, metres.
 ///
@@ -517,11 +592,10 @@ pub fn margin_verdict(min_margin: f64, floor: Option<f64>, detail: &str) -> Case
 
 /// Everything the read-only registry needs that is not the machine.
 ///
-/// Built from the configuration file *before* it resolves, because resolving
-/// refuses a file with no reviewed `[datum]` record and this registry is what
-/// produces the evidence that record is written from. Nothing here is a value
-/// the registry could send: the only wire traffic it produces is pings and
-/// register reads.
+/// Built from a configuration file with no reviewed `[datum]` record in it,
+/// because this registry is what produces the evidence that record is written
+/// from. Nothing here is a value the registry could send: the only wire traffic
+/// it produces is pings and register reads.
 #[derive(Clone, Debug)]
 pub struct Registry {
     device: String,
@@ -531,6 +605,7 @@ pub struct Registry {
     expected: ProvisionTable,
     geom: HeadGeometry,
     fk: FkOptions,
+    env: EnvelopeConfig,
     min_arm_voltage: f64,
     goal_shadow_tolerance: f64,
 }
@@ -551,11 +626,17 @@ impl Registry {
             expected: cfg.provision_table(),
             geom: HeadGeometry::default(),
             fk: FkOptions::default(),
-            // Checked here rather than inherited: resolving the configuration is
-            // what normally runs this gate, and the registry deliberately does
-            // not resolve — it must run before the datum record exists. Without
-            // it a non-positive floor would let the voltage case pass a dead
-            // rail and write that pass into the record a person reviews.
+            // The defaults and not a table in this file: the fence case compares
+            // the servos against the envelope the commanding host actually runs,
+            // and the commanding host is the cog system, which builds its arm
+            // configuration over `EnvelopeConfig::default()`. A copy here would
+            // let the bench agree with itself about a machine nothing else
+            // agrees with.
+            env: EnvelopeConfig::default(),
+            // Checked here rather than inherited: this is the only consumer of
+            // the figure, so nothing upstream of it runs the gate. Without it a
+            // non-positive floor would let the voltage case pass a dead rail
+            // and write that pass into the record a person reviews.
             min_arm_voltage: positive("arm.min_arm_voltage", cfg.arm.min_arm_voltage)?,
             // Checked here for the same reason and against the same risk: an
             // infinite or non-finite tolerance would pass a machine whose goal
@@ -602,8 +683,10 @@ impl Registry {
             return;
         }
         self.identity(&mut bus, report);
-        self.provision(&mut bus, report);
+        let fences = self.provision(&mut bus, report);
+        self.leg_fence(&fences, report);
         self.voltage(&mut bus, report);
+        self.temperature(&mut bus, report);
         self.health(&mut bus, report);
         let Some(counts) = self.rest_pose(&mut bus, report) else {
             return;
@@ -688,11 +771,17 @@ impl Registry {
     /// Registers walked outer, servos inner, so a register's nine readings print
     /// side by side — which is the shape a person reads a provisioning
     /// disagreement out of.
-    fn provision<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
+    ///
+    /// The legs' two position limits are handed back as well as reported: they
+    /// are what [`Registry::leg_fence`] judges, and this is the pass that reads
+    /// them. A sweep that stopped early hands back what it got to that point,
+    /// and the fence case names the bound it was left without.
+    fn provision<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) -> LegFences {
         let mut checked = 0usize;
         let mut recorded = 0usize;
         let mut wrong = Vec::new();
         let mut readings = Vec::new();
+        let mut fences: LegFences = [[None; 2]; LEG_COUNT];
 
         for reg in reg::named() {
             let Some(column) = ProvisionTable::column(reg) else {
@@ -710,10 +799,16 @@ impl Registry {
                     Ok(value) => value,
                     Err(detail) => {
                         report.push(CaseResult::fail(Case::ProvisionSweep, detail));
-                        return;
+                        return fences;
                     }
                 };
                 read_any = true;
+                if let (Some(bound), Some(leg)) = (
+                    fence_bound_index(reg),
+                    leg_index(ROWS[row]).map(usize::from),
+                ) {
+                    fences[leg][bound] = Some(value);
+                }
                 row_values.push(Shown(value).to_string());
                 match expect {
                     ProvisionExpect::Check(expected) => {
@@ -748,6 +843,170 @@ impl Registry {
                 format!("{}; {summary}", wrong.join("; ")),
             ));
         }
+        fences
+    }
+
+    /// Each leg servo's own travel fence, against the envelope the commanding
+    /// host runs.
+    ///
+    /// Two-sided, because the two records bracket one physical limit from
+    /// opposite directions. The fence has to *contain* the window
+    /// [`leg_windows`] derives — that window sits [`WINDOW_INSET_DEG`] inside
+    /// the envelope, so exact equality is impossible by construction and
+    /// containment is the right lower check — and it must not reach *past* the
+    /// envelope's own window. A fence wider than the envelope is the same
+    /// provisioning error in the direction that silently weakens the
+    /// servo-side backstop, which is the one refusal left on the far side of
+    /// the driver's seam, so it fails as loudly as a narrow one.
+    ///
+    /// Judged against the servos' actual limits, not the file's: a
+    /// mis-provisioned unit is exactly what this catches. It gates nothing.
+    ///
+    /// The readings come from the provision sweep, which read the same two
+    /// registers a moment earlier. Nothing here touches the bus: one read of a
+    /// cell per pass, so a disagreement between two readings of it cannot be
+    /// what a report is about.
+    fn leg_fence(&self, fences: &LegFences, report: &mut Report) {
+        let host = leg_windows(&self.env);
+        let mut readings = Vec::with_capacity(LEG_COUNT);
+        let mut wrong = Vec::new();
+
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            let Some(leg) = leg_index(joint).map(usize::from) else {
+                continue;
+            };
+            let fence = match self.fence_at(row, &fences[leg]) {
+                Ok(fence) => fence,
+                Err(detail) => {
+                    report.push(CaseResult::fail(Case::LegFence, detail));
+                    return;
+                }
+            };
+            let (env_lower, env_upper) = self.env.crank_windows[leg];
+            let (host_lower, host_upper) = host[leg];
+            let placed = [
+                self.counts_at(row, env_lower),
+                self.counts_at(row, env_upper),
+                self.counts_at(row, host_lower),
+                self.counts_at(row, host_upper),
+            ];
+            let [env_low, env_high, host_low, host_high] = match placed {
+                [Ok(a), Ok(b), Ok(c), Ok(d)] => [a, b, c, d],
+                _ => {
+                    let detail = placed
+                        .into_iter()
+                        .filter_map(Result::err)
+                        .collect::<Vec<String>>()
+                        .join("; ");
+                    report.push(CaseResult::fail(Case::LegFence, detail));
+                    return;
+                }
+            };
+            let envelope = [env_low, env_high];
+            readings.push(format!(
+                "leg {leg}: servo {} against envelope {}",
+                Window(fence),
+                Window(envelope)
+            ));
+
+            // Four bounds and not two: each end of the fence is checked against
+            // the window it must contain and against the window it must not
+            // leave, and the two answers are different failures.
+            let bounds = [
+                (
+                    "lower",
+                    fence[0] <= host_low + FENCE_SLACK_COUNTS,
+                    "starts inside the window the host commands in",
+                ),
+                (
+                    "lower",
+                    fence[0] >= env_low - FENCE_SLACK_COUNTS,
+                    "starts below the envelope's own window",
+                ),
+                (
+                    "upper",
+                    fence[1] >= host_high - FENCE_SLACK_COUNTS,
+                    "ends inside the window the host commands in",
+                ),
+                (
+                    "upper",
+                    fence[1] <= env_high + FENCE_SLACK_COUNTS,
+                    "ends above the envelope's own window",
+                ),
+            ];
+            for (bound, holds, complaint) in bounds {
+                if !holds {
+                    wrong.push(format!(
+                        "leg {leg} {bound} bound {complaint}: servo {}, envelope {}",
+                        Window(fence),
+                        Window(envelope)
+                    ));
+                }
+            }
+        }
+
+        let detail = format!(
+            "{}; slack {FENCE_SLACK_COUNTS} count, host window inset \
+             {WINDOW_INSET_DEG}°",
+            readings.join("; ")
+        );
+        if wrong.is_empty() {
+            report.push(CaseResult::pass(Case::LegFence, detail));
+        } else {
+            report.push(CaseResult::fail(
+                Case::LegFence,
+                format!("{}; {detail}", wrong.join("; ")),
+            ));
+        }
+    }
+
+    /// One leg servo's provisioned travel window, counts, lower then upper.
+    fn fence_at(&self, row: usize, read: &[Option<Value>; 2]) -> Result<[i32; 2], String> {
+        Ok([
+            self.fence_bound(row, RegId::MinPositionLimit, read[0])?,
+            self.fence_bound(row, RegId::MaxPositionLimit, read[1])?,
+        ])
+    }
+
+    /// One bound of one servo's travel window, as the signed count the
+    /// conversions take.
+    ///
+    /// One refusal for the reading and one for the number, and no third answer
+    /// to "what width is this register": the sweep read it through the named
+    /// vocabulary, so a value that is not the register's own shape or not a
+    /// count this comparison can take is one thing to say — the register holds
+    /// something no fence can be judged from.
+    fn fence_bound(&self, row: usize, reg: RegId, read: Option<Value>) -> Result<i32, String> {
+        let value = read.ok_or_else(|| {
+            format!(
+                "servo {} {}: the provisioned registers sweep did not read it, so there is no \
+                 fence to judge",
+                self.ids[row],
+                RegName(reg)
+            )
+        })?;
+        value
+            .as_u32()
+            .and_then(|counts| i32::try_from(counts).ok())
+            .ok_or_else(|| {
+                format!(
+                    "servo {} {}: {} is no count this comparison takes",
+                    self.ids[row],
+                    RegName(reg),
+                    Shown(value)
+                )
+            })
+    }
+
+    /// A crank angle as the count a fence bound is compared against.
+    fn counts_at(&self, row: usize, rad: f64) -> Result<i32, String> {
+        self.map.goal_counts(row, rad).map_err(|error| {
+            format!(
+                "servo {}: {:.3}° is no count ({error})",
+                self.ids[row],
+                rad.to_degrees()
+            )
+        })
     }
 
     /// The supply rail on all nine servos, against the floor arming refuses to
@@ -778,6 +1037,45 @@ impl Registry {
             report.push(CaseResult::fail(
                 Case::Voltage,
                 format!("below the floor: {}; {detail}", low.join(", ")),
+            ));
+        }
+    }
+
+    /// Every servo's present temperature, against the band a resting machine
+    /// reads in.
+    ///
+    /// The band is what makes the assertion worth anything: a room-temperature
+    /// machine is comfortably inside it, and a byte that is not degrees at all
+    /// reads outside it. A reading outside the band gets a person before it gets
+    /// a wider band, per the bring-up rule (`CLAUDE.md`). Nothing gates on this
+    /// case: it is a diagnostic and a regression guard, like the rest of the
+    /// registry.
+    fn temperature<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
+        let degrees = match self.sweep_u8(bus, RegId::PresentTemperature) {
+            Ok(degrees) => degrees,
+            Err(detail) => {
+                report.push(CaseResult::fail(Case::Temperature, detail));
+                return;
+            }
+        };
+        let outside: Vec<String> = self
+            .ids
+            .iter()
+            .zip(degrees.iter())
+            .filter(|(_, reading)| !RESTING_TEMP_BAND_C.contains(reading))
+            .map(|(id, reading)| format!("{id} at {reading} C"))
+            .collect();
+        let detail = format!(
+            "{degrees:?} C against {}..={} C",
+            RESTING_TEMP_BAND_C.start(),
+            RESTING_TEMP_BAND_C.end()
+        );
+        if outside.is_empty() {
+            report.push(CaseResult::pass(Case::Temperature, detail));
+        } else {
+            report.push(CaseResult::fail(
+                Case::Temperature,
+                format!("outside the band: {}; {detail}", outside.join(", ")),
             ));
         }
     }
@@ -1173,7 +1471,7 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod runner_tests {
     use dxl_proto::frame::{INST_PING, INST_READ};
-    use reachy_motion::joints::{Name, leg_index};
+    use reachy_motion::joints::Name;
 
     use super::*;
     use reachy_bus::named_reg;
@@ -1205,6 +1503,20 @@ mod runner_tests {
         let instructions = log.borrow().clone();
         let asked = reads.borrow().clone();
         (report, instructions, asked)
+    }
+
+    /// What one case said about itself.
+    ///
+    /// A case's own detail and not the printed report: several cases read the
+    /// same registers, so an assertion against the whole report can be satisfied
+    /// by a neighbour's line while the case under test says nothing at all.
+    fn detail_of(report: &Report, case: Case) -> String {
+        report
+            .results()
+            .iter()
+            .find(|result| result.case == case)
+            .map(|result| result.detail.clone())
+            .unwrap_or_else(|| panic!("{case:?} left no result in {report}"))
     }
 
     /// A machine holding what it should, resting at the stow pose, passes every
@@ -1273,9 +1585,8 @@ mod runner_tests {
     /// A clearance floor the configuration cannot stand behind refuses before
     /// the registry is built, rather than being carried into the voltage case.
     ///
-    /// The registry does not resolve the configuration — it has to run before a
-    /// datum exists — so the positivity gate every other consumer gets from
-    /// `resolve` has to be run here too. Without it a negative floor passes a
+    /// Nothing upstream of the registry judges this figure, so the positivity
+    /// gate is run where it is consumed. Without it a negative floor passes a
     /// dead rail and writes that pass into the record a person reviews.
     #[test]
     fn an_arming_floor_that_is_not_a_voltage_refuses_the_registry() {
@@ -1415,6 +1726,291 @@ mod runner_tests {
         let printed = report.to_string();
         assert!(printed.contains("15 at 4.5 V"), "{printed}");
         assert!(printed.contains("11.8"), "{printed}");
+    }
+
+    /// A temperature outside the resting band fails and names the servo, in both
+    /// directions.
+    ///
+    /// Both, because the two ends catch different things: the top is a servo
+    /// getting hot, and the bottom is a reading that is not degrees Celsius at
+    /// all.
+    #[test]
+    fn a_temperature_outside_the_resting_band_fails_and_says_which_servo() {
+        let cfg = undatumed_config();
+        let legs = stow_legs();
+
+        let mut hot = machine_at(&cfg, &legs);
+        hot.set(13, named_reg(RegId::PresentTemperature), &[90]);
+        let (report, _) = run(&cfg, hot);
+        assert_eq!(report.outcome(Case::Temperature), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("13 at 90 C"), "{printed}");
+        assert!(
+            printed.contains("5..=55 C"),
+            "the band is printed: {printed}"
+        );
+
+        let mut cold = machine_at(&cfg, &legs);
+        cold.set(13, named_reg(RegId::PresentTemperature), &[0]);
+        let (report, _) = run(&cfg, cold);
+        assert_eq!(report.outcome(Case::Temperature), Outcome::Fail);
+        assert!(
+            report.to_string().contains("13 at 0 C"),
+            "the servo is named"
+        );
+
+        // And the fixture as this platform reads passes, so the cases above are
+        // the reading and not the case.
+        let (report, _) = run(&cfg, machine_at(&cfg, &legs));
+        assert_eq!(report.outcome(Case::Temperature), Outcome::Pass);
+    }
+
+    /// The fences this platform provisions agree with the envelope the cog
+    /// system commands through, and the reading is printed either way.
+    ///
+    /// The pass is the load-bearing half: the provisioned counts and
+    /// `EnvelopeConfig::default()` are edited in different files by different
+    /// people, and this is the only thing in the tree that compares them.
+    #[test]
+    fn the_provisioned_leg_fences_agree_with_the_envelope() {
+        let cfg = undatumed_config();
+        let (report, _) = run(&cfg, machine_at(&cfg, &stow_legs()));
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Pass);
+        let printed = report.to_string();
+        assert!(
+            printed.contains("leg 0: servo [1502 2958] counts"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("leg 5: servo [1138 2594] counts"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("slack 1 count"),
+            "the slack is printed: {printed}"
+        );
+    }
+
+    /// A fence narrower than the window the host commands in fails, naming the
+    /// leg, the bound and both windows in both units.
+    #[test]
+    fn a_fence_inside_the_host_window_fails_and_says_which_bound() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        // Leg 0 is servo 11, a hundred counts up from where it is provisioned:
+        // a window the host would command straight through the bottom of.
+        machine.set(
+            11,
+            named_reg(RegId::MinPositionLimit),
+            &1602u32.to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(
+            printed.contains("leg 0 lower bound starts inside the window the host commands in"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("servo [1602 2958] counts / [-39.199 79.980]°"),
+            "the servo's window in both units: {printed}"
+        );
+        assert!(
+            printed.contains("envelope [1502 2958] counts / [-47.988 79.980]°"),
+            "the envelope's window in both units: {printed}"
+        );
+    }
+
+    /// A fence wider than the envelope fails too — the direction that silently
+    /// weakens the servo-side backstop rather than the one that refuses a
+    /// commanded pose.
+    #[test]
+    fn a_fence_past_the_envelope_fails_and_says_which_bound() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(
+            11,
+            named_reg(RegId::MaxPositionLimit),
+            &3058u32.to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(
+            printed.contains("leg 0 upper bound ends above the envelope's own window"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("servo [1502 3058] counts"),
+            "the servo's window: {printed}"
+        );
+    }
+
+    /// One count either side of where the conversion places a bound is
+    /// agreement, on both ends and in both directions.
+    ///
+    /// The tolerance is the case's whole tuning, and a polarity error in it
+    /// would either refuse every unit or accept any fence at all. Both bounds
+    /// are moved in both directions in one run.
+    #[test]
+    fn one_count_of_rounding_on_a_bound_is_agreement() {
+        let cfg = undatumed_config();
+        for (lower, upper) in [(1501u32, 2959u32), (1503u32, 2957u32)] {
+            let mut machine = machine_at(&cfg, &stow_legs());
+            machine.set(11, named_reg(RegId::MinPositionLimit), &lower.to_le_bytes());
+            machine.set(11, named_reg(RegId::MaxPositionLimit), &upper.to_le_bytes());
+            let (report, _) = run(&cfg, machine);
+
+            assert_eq!(
+                report.outcome(Case::LegFence),
+                Outcome::Pass,
+                "[{lower} {upper}] is one count of rounding: {report}"
+            );
+        }
+
+        // And two counts is not, in the direction the slack is widest.
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(
+            11,
+            named_reg(RegId::MinPositionLimit),
+            &1500u32.to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Fail);
+        assert!(
+            report
+                .to_string()
+                .contains("leg 0 lower bound starts below the envelope's own window"),
+            "{report}"
+        );
+    }
+
+    /// A leg whose fence register answers nothing fails the case naming the
+    /// servo and the register, rather than reading as a window of zero.
+    ///
+    /// Asserted on this case's own detail rather than on the printed report:
+    /// muting a provisioned register fails the sweep as well, and the sweep's
+    /// line names the same servo and the same register — so a check against the
+    /// whole report would pass with this case's detail empty, which is the one
+    /// condition where the detail is all an operator has.
+    #[test]
+    fn a_fence_register_nothing_answers_fails_by_name() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine
+            .mute
+            .insert((13, named_reg(RegId::MaxPositionLimit).addr), u32::MAX);
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Fail);
+        let said = detail_of(&report, Case::LegFence);
+        assert!(
+            said.contains("servo 13 maximum position limit"),
+            "the servo and the register: {said}"
+        );
+        assert!(
+            said.contains("no fence to judge"),
+            "and what that leaves the case with: {said}"
+        );
+    }
+
+    /// A fence bound holding a number no count can be taken from fails by name
+    /// rather than being wrapped into a plausible-looking window.
+    ///
+    /// The registers decode as unsigned and the comparison is signed, so a cell
+    /// at or above 2^31 is a real reading this case cannot judge. Wrapping it
+    /// instead would put a large negative bound against a real window and read
+    /// as agreement — a mis-provisioned unit passing.
+    #[test]
+    fn a_fence_bound_no_count_can_take_fails_by_name() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(
+            11,
+            named_reg(RegId::MinPositionLimit),
+            &0x8000_0000u32.to_le_bytes(),
+        );
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Fail);
+        let said = detail_of(&report, Case::LegFence);
+        assert!(
+            said.contains("servo 11 minimum position limit"),
+            "the servo and the register: {said}"
+        );
+        assert!(
+            said.contains("is no count this comparison takes"),
+            "and why the case cannot judge it: {said}"
+        );
+    }
+
+    /// A servo that will not answer the temperature cell fails the temperature
+    /// case, not some other case and not a case that never ran.
+    ///
+    /// The sweep's refusal is shared with every other register swept, so what is
+    /// pinned here is which case it lands on: `NotRun` and `Fail` are different
+    /// stories to an operator triaging a bus.
+    #[test]
+    fn a_temperature_nothing_answers_fails_that_case_by_name() {
+        let cfg = undatumed_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine
+            .mute
+            .insert((13, named_reg(RegId::PresentTemperature).addr), u32::MAX);
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::Temperature), Outcome::Fail);
+        let said = detail_of(&report, Case::Temperature);
+        assert!(said.contains("13"), "the servo is named: {said}");
+        assert!(
+            said.contains("present temperature"),
+            "the register is named: {said}"
+        );
+    }
+
+    /// Every cell this registry reads, it reads once per pass.
+    ///
+    /// Asserted off the wire for the fence case in particular: it judges the
+    /// limit registers the provision sweep already read, and a refactor that had
+    /// it ask the bus itself would leave every other case in this file green
+    /// while costing twelve round trips on the pass an operator runs repeatedly
+    /// — and putting two readings of one cell in one report, with nothing saying
+    /// which of them the verdict is about.
+    #[test]
+    fn the_fence_and_temperature_cells_are_read_once_each() {
+        let cfg = undatumed_config();
+        let machine = machine_at(&cfg, &stow_legs());
+        let (report, _, reads) = run_watched(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::LegFence), Outcome::Pass);
+        assert_eq!(report.outcome(Case::Temperature), Outcome::Pass);
+        for (row, id) in cfg
+            .servo_ids()
+            .expect("the roster is nine servos")
+            .into_iter()
+            .enumerate()
+        {
+            let asked = |reg: RegId| {
+                reads
+                    .iter()
+                    .filter(|(servo, addr)| *servo == id && *addr == named_reg(reg).addr)
+                    .count()
+            };
+            assert_eq!(
+                asked(RegId::PresentTemperature),
+                1,
+                "servo {id} temperature reads"
+            );
+            // The bounds the fence case judges, on the rows it judges: the sweep
+            // reads them, and the fence case reads nothing.
+            if leg_index(ROWS[row]).is_some() {
+                assert_eq!(asked(RegId::MinPositionLimit), 1, "servo {id} lower");
+                assert_eq!(asked(RegId::MaxPositionLimit), 1, "servo {id} upper");
+            }
+        }
     }
 
     /// A latched bit beyond input voltage fails; input voltage on its own passes
@@ -1762,9 +2358,9 @@ mod runner_tests {
     /// before the registry is built.
     ///
     /// An infinite tolerance passes a machine whose goal registers say anything
-    /// at all, and writes that pass into the record the arm gate reads. The
-    /// registry does not resolve the configuration, so the gate `resolve` gives
-    /// every other consumer has to be run here too.
+    /// at all, and writes that pass into the record a person reviews. Nothing
+    /// upstream of the registry judges the figure, so the gate is run where it
+    /// is consumed.
     #[test]
     fn a_shadow_tolerance_that_is_not_an_angle_refuses_the_registry() {
         for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {

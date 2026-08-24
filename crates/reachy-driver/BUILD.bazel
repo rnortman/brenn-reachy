@@ -16,6 +16,7 @@ rust_library(
     deps = [
         "//driver:aux_clk_rs",
         "//driver:gate_clk_rs",
+        "//driver:health_clk_rs",
         "//driver:goal_clk_rs",
         "//motion:bus_txn_clk_rs",
         "//motion:joints_clk_rs",

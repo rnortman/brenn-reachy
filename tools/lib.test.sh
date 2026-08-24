@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# tools/lib.test.sh — self-check for the shared prelude's expand_home.
+# tools/lib.test.sh — self-check for the shared prelude: expand_home, and the
+# three helpers that read where Bazel put what it built.
 #
 # expand_home decides two things nothing else re-checks: the value the CI
 # workflow writes into BAZELISK_HOME, and whether two spellings of one directory
@@ -10,7 +11,9 @@
 # someone tidying up. These cases are direct, so such an edit is red here.
 #
 # HOME is redirected to a fixed string, so the expectations are exact and no case
-# depends on the machine. Nothing here touches the filesystem or a network.
+# depends on the machine. The Bazel helpers run against a stub bazel in this
+# run's own directory and resolve paths against this checkout, which they only
+# ever read; nothing here builds anything or reaches a network.
 #
 # Run as a plain program; exits 0 on pass, non-zero on failure.
 
@@ -18,37 +21,19 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-passes=0
-failures=0
+# shellcheck source=test-lib.sh
+. "${script_dir}/test-lib.sh"
 
-pass() {
-	echo "PASS: $1"
-	passes=$((passes + 1))
-}
-
-fail() {
-	echo "FAIL: $1" >&2
-	failures=$((failures + 1))
-	shift
-	local line
-	for line in "$@"; do
-		printf '    %s\n' "$line" >&2
-	done
-}
-
-assert_eq() {
-	local label=$1 want=$2 got=$3
-	if [ "$want" = "$got" ]; then
-		pass "$label"
-	else
-		fail "$label" "expected: ${want}" "got:      ${got}"
-	fi
-}
 
 # The subject, sourced into this shell. `prog` and `repo_root` come with it and
 # are what its own die() reports; nothing here depends on their values.
 # shellcheck source=lib.sh
 . "${script_dir}/lib.sh"
+
+# The prelude's own path, taken before the tilde cases re-source lib.sh in a
+# subshell: after that, the linter reads every mention of `repo_root` as one that
+# might have been changed in there.
+lib_path="${repo_root}/tools/lib.sh"
 
 HOME=/home/tester
 export HOME
@@ -105,5 +90,84 @@ result=$(refusal /var/lib/brenn-app)
 assert_eq "an unset HOME does not affect an absolute path" "0" \
 	"$(sed -n '$s/^---status //p' <<<"$result")"
 
-echo "${passes} passed, ${failures} failed"
-[ "$failures" -eq 0 ]
+# ---------------------------------------------------------------------------
+# The Bazel output helpers
+# ---------------------------------------------------------------------------
+#
+# Both device build scripts read where Bazel put things through these three, and
+# the three refusals are the deliverable: they are what an operator reads in the
+# middle of a hardware session, and each names the thing to go and look at. Both
+# scripts' own suites see them through a subject that also builds a payload;
+# these cases drive them directly, so an edit to the prose or to the exact-match
+# rule is red here whichever script is being worked on.
+#
+# `bazel` and `build_flags` are the sourcing script's to set, so this file sets
+# them, as build-bench.sh and build-motion.sh do.
+stub="${work}/bazel"
+cat >"$stub" <<'STUB'
+#!/usr/bin/env bash
+[ -z "${STUB_STATUS:-}" ] || exit "$STUB_STATUS"
+printf '%s' "${STUB_OUTPUT:-}"
+STUB
+chmod 0755 -- "$stub"
+
+bazel=$stub
+build_flags=(--config=device)
+
+# One helper's run, output and status as one string, so a case can assert on
+# both: each of them refuses by calling die, whose exit this subshell contains.
+attempt() {
+	local out status=0
+	out=$("$@" 2>&1) || status=$?
+	printf '%s\n---status %s\n' "$out" "$status"
+}
+
+STUB_OUTPUT=$'bazel-out/bin/one\nbazel-out/bin/two\n'
+export STUB_OUTPUT STUB_STATUS=
+result=$(attempt bazel_files //some:target)
+assert_status "a cquery that answers is passed through" 0 "$(status_of "$result")"
+assert_eq "and the whole listing comes back" $'bazel-out/bin/one\nbazel-out/bin/two' \
+	"$(output_of "$result")"
+
+STUB_STATUS=1
+result=$(attempt bazel_files //some:target)
+assert_status "a cquery that fails refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names the expression" "$(output_of "$result")" \
+	"bazel cannot name the outputs of //some:target"
+STUB_STATUS=
+
+STUB_OUTPUT=""
+result=$(attempt bazel_files //some:target)
+assert_status "a cquery that answers nothing refuses" 1 "$(status_of "$result")"
+assert_contains "and says no output was named" "$(output_of "$result")" \
+	"bazel named no output file for //some:target"
+
+# Resolution is against the real checkout, since `repo_root` is where lib.sh
+# lives: a path Bazel could plausibly have named and a path nothing is at.
+result=$(attempt bazel_resolve tools/lib.sh)
+assert_status "a path the tree has resolves" 0 "$(status_of "$result")"
+assert_eq "and comes back absolute" "$lib_path" "$(output_of "$result")"
+
+result=$(attempt bazel_resolve bazel-out/bin/not-there)
+assert_status "a path nothing is at refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the path" "$(output_of "$result")" \
+	"the build named bazel-out/bin/not-there and no file is there"
+assert_contains "and both flags that explain it" "$(output_of "$result")" "--symlink_prefix"
+assert_contains "and the other one" "$(output_of "$result")" \
+	"--noexperimental_convenience_symlinks"
+
+# The exact-basename rule, with a decoy whose name contains the wanted one: a
+# listing carries the sources of what was built as well as its outputs, so a
+# substring match stages a file nobody asked for.
+listing=$'tools/xlib.sh\ntools/lib.sh\ntools/test-lib.sh'
+result=$(attempt bazel_named_in "$listing" lib.sh)
+assert_status "a basename the listing carries resolves" 0 "$(status_of "$result")"
+assert_eq "and it is the exact match, not the one containing it" \
+	"$lib_path" "$(output_of "$result")"
+
+result=$(attempt bazel_named_in "$listing" nothing.tachyon)
+assert_status "a basename the listing does not carry refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names it" "$(output_of "$result")" \
+	"the build emits no nothing.tachyon"
+
+tally

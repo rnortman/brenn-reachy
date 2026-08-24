@@ -69,7 +69,9 @@ enum EventKind
         // arrived, and nothing for one that is merely out of order.
         #7 goal_stale_or_out_of_order { underlying_value: 7; }
 
-        // The bus itself failed. `id` is the failing servo's bus id.
+        // The bus itself failed: a run of cycles where nothing answered at
+        // all. `count` is that run, in cycles. `id` names no servo -- a bus
+        // that answers nothing has no single failing one to name.
         #8 bus_failure { underlying_value: 8; }
     }
 }
@@ -131,7 +133,10 @@ schema HealthReport
         // this stack is written in, so nothing downstream scales it.
         #2 volts: Float64;
 
-        // Servo temperature, degrees Celsius.
+        // Servo temperature, degrees Celsius. The hardware driver writes the
+        // servo's own present-temperature cell as read, and publishes no report
+        // at all when that read does not come back; the simulated driver models
+        // nothing thermal and writes a constant of its model.
         #3 temp_c: Int8;
 
         // When the reading was taken.

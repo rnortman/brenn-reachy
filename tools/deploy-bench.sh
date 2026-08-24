@@ -46,70 +46,25 @@ binary="${repo_root}/target/bench-arm64/release/reachy-bench"
 # prunes the store either; rsync --delete is what makes reuse idempotent.
 release="${store_mount}/releases/bench"
 
-service=brenn-app.service
-
-# The other long-lived process on that unit, and the only other thing on it that
-# opens the servo bus. It is deployed from brenn-pod and runs as a service, so a
-# bench run at the wrong moment meets a held port rather than a free one.
-motiond_service=reachy-motiond.service
-
 # What the device binary is built out of: the sources, and everything that
 # decides how they are compiled — the build files, the module and its lockfile,
-# the flags, the Bazel release, and the build script that names the platform and
-# the compilation mode. cogs/ is not an input to the bench and stays out.
+# the flags, the Bazel release, and the two scripts that decide what a built
+# binary is: the one that names the platform and the compilation mode, and the
+# shared prelude it takes its ELF verification from. cogs/ is not an input to the
+# bench and stays out.
 workspace_paths=(
 	crates bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion
-	tools/build-bench.sh
+	tools/build-bench.sh tools/lib.sh
 )
 
 usage() {
 	die "usage: ${prog} <host> --config <file>|--run [--stale-ok] [args...]|--fetch <dir>"
 }
 
-# Refuse a device binary built before the newest commit that touched the
-# workspace.
-#
-# The trap this closes cost a bench night: `bench-build` was taken for a
-# once-per-session step, and a run whose findings looked like the machine's was
-# reading a binary several commits old. Commit time against file time catches
-# exactly that — it does not catch uncommitted edits, which is why `make
-# bench-run` builds first and is the entry point to prefer.
-#
-# The rebuild this prescribes is what clears it, always: build-bench.sh stamps
-# the artifact once it has verified it, because a build system hands back an
-# output it did not have to relink untouched and a commit that changes no linked
-# code would otherwise leave a current binary refused with no way through but
-# --stale-ok.
-#
-# A tree with no history for those paths (a tarball, a shallow clone that
-# excluded them) is not evidence of staleness, so it says what it could not
-# decide and runs.
-freshness() {
-	local commit built
-	commit=$(git -C "$repo_root" log -1 --format=%ct -- "${workspace_paths[@]}" 2>/dev/null) || commit=
-	if [ -z "$commit" ]; then
-		echo "${prog}: no commit history for the workspace here, so the binary's age is unknown" >&2
-		return 0
-	fi
-	built=$(stat -c %Y -- "$binary") ||
-		die "cannot read the age of ${binary}"
-	[ "$built" -lt "$commit" ] || return 0
-	die "the device binary is older than the newest commit to the workspace, so a run of it is not a run of this tree." \
-		"Built $(date -d "@${built}" '+%Y-%m-%d %H:%M:%S'), newest commit $(date -d "@${commit}" '+%Y-%m-%d %H:%M:%S')." \
-		"Rebuild it:" \
-		"    make bench-build" \
-		"or, to run the old binary deliberately:" \
-		"    ${prog} ${host} --run --stale-ok ..."
-}
-
 host=${1:-}
 mode=${2:-}
 [ -n "$host" ] || usage
 shift 2 || usage
-
-ssh_root() {
-	ssh -o BatchMode=yes "root@${host}" "$@"
-}
 
 case "$mode" in
 	--config)
@@ -156,7 +111,11 @@ case "$mode" in
 			shift
 			echo "${prog}: --stale-ok: the binary's age is not being checked" >&2
 		else
-			freshness
+			refuse_if_stale "$binary" "device binary" \
+				"make bench-build" \
+				"run the old binary deliberately" \
+				"${prog} ${host} --run --stale-ok ..." \
+				"${workspace_paths[@]}"
 		fi
 
 		echo "${prog}: pushing ${binary} to ${host}:${release}/" >&2
@@ -168,12 +127,11 @@ case "$mode" in
 		# silently stopped: what is running on a device is the operator's to
 		# decide.
 		#
-		# The refusal and the run are one remote invocation. Asked separately,
-		# the service can start in between and the run lands beside it anyway;
-		# and a check whose only signal is a nonzero exit reads ssh's own
-		# failures (unreachable host, host-key refusal under BatchMode) as the
-		# service being down. Exit 3 is this script's answer for "it is
-		# running", and nothing else produces it.
+		# The question and the run are one remote invocation: asked
+		# separately, the service can start in between and the run lands
+		# beside it anyway. The question, its exit codes and the refusals
+		# they turn into are lib.sh's, shared with the motion deploy —
+		# they are one contract and the runbook documents them once.
 		#
 		# --init-groups is what puts the run in the dialout group, which is
 		# what grants the serial node. Without it the drop would leave a run
@@ -182,8 +140,7 @@ case "$mode" in
 		#
 		# The working directory is the account's home, because that is where
 		# the bench reads its configuration and writes its state.
-		remote="systemctl is-active --quiet ${service} && exit 3"
-		remote="${remote}; systemctl is-active --quiet ${motiond_service} && exit 4"
+		remote="$(bus_probe)"
 		remote="${remote}; cd ${app_home} || exit 1"
 		remote="${remote}; exec setpriv --reuid ${app_user} --regid ${app_user}"
 		remote="${remote} --init-groups ${release}/reachy-bench"
@@ -194,24 +151,8 @@ case "$mode" in
 		rc=0
 		# A pty: the run prints as it goes and a ^C at the bench reaches it.
 		ssh -t -o BatchMode=yes "root@${host}" "$remote" || rc=$?
-		case "$rc" in
-			3)
-				die "${service} is running on ${host}, and a bench run will not share the servo bus with it." \
-					"Stop it, run the bench, and start it again when you are done:" \
-					"    ssh root@${host} systemctl stop ${service}"
-				;;
-			4)
-				die "${motiond_service} is running on ${host}, and it holds the servo bus." \
-					"Stop it, run the bench, and start it again when you are done:" \
-					"    ssh root@${host} systemctl stop ${motiond_service}" \
-					"    ssh root@${host} systemctl start ${motiond_service}" \
-					"(The port's own flock refuses either way; this is the message that says which process has it.)"
-				;;
-			255)
-				die "ssh to root@${host} failed; the bench did not run." \
-					"Its own error is above. A run that never reached the board is not a hardware reading."
-				;;
-		esac
+		bus_refusal "$rc" "a bench run" "the bench did not run" \
+			"Its own error is above. A run that never reached the board is not a hardware reading."
 		# The bench's own verdict is this script's.
 		exit "$rc"
 		;;

@@ -71,9 +71,9 @@ diagnostic and a regression guard; it does **not** gate arming or commanding.
 Gating routine operation on self-test records was bring-up caution, retired by
 `docs/fault-management.md`.
 
-Getting the bench onto a real unit — the build and deploy path, which services
-hold the servo bus, the trace workflow, the soak, and the anomalies nobody has
-explained yet — is `docs/bench-runbook.md`.
+Getting the bench and the motion system onto a real unit — the build and deploy
+path, which services hold the servo bus, the first-motion-run procedure, and the
+anomalies nobody has explained yet — is `docs/bench-runbook.md`.
 
 ## Device deployment doctrine (dev cycles)
 

@@ -170,6 +170,7 @@ provision_cells! {
         GoalPosition,
         PresentPosition,
         PresentInputVoltage,
+        PresentTemperature,
         HardwareErrorStatus,
         PositionGains,
 }

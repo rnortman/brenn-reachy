@@ -7,24 +7,51 @@ platform(
     parents = ["@platforms//host"],
 )
 
-# The Reachy Mini itself: 64-bit ARM Linux. Named by `--platforms` when the
-# bench is built for the device, which is the only cross-compile here.
+# The Reachy Mini itself: 64-bit ARM Linux. Named by `--platforms` whenever
+# anything is built for the device — the bench, the motion payload's two
+# binaries — which is the only cross-compile here.
 #
 # Deliberately without host-clang's `@bazel_tools//tools/cpp:clang` constraint:
 # nothing in the fetched Clockwork drop selects on it, and the drop's own
 # toolchains declare os and cpu only, so on a target platform it would be dead
 # weight.
 #
-# No gate builds anything in this configuration. `make check` and CI are the host
-# configuration only, so a break here — a dependency without aarch64 in its
+# `make check-device` builds `:device_deployables` in this configuration and CI
+# blocks on it, so a break here — a dependency without aarch64 in its
 # `target_compatible_with`, a drop upgrade that stops registering the aarch64
-# clang toolchain — surfaces at `make bench-build` in front of a powered-up unit.
-# TODO(bazel-device-config-gate)
+# clang toolchain — is a red pull request rather than a discovery in front of a
+# powered-up unit.
 platform(
     name = "reachy-device",
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# What a motion run on a unit is built out of: the driver binary, the executable
+# both cog processes start from, and the system target that emits their process
+# descriptions and the writer's channel set. tools/build-motion.sh builds this,
+# so the payload it stages and the set the gate covers are one set.
+filegroup(
+    name = "motion_payload",
+    srcs = [
+        "//cogs:robot_clk_exe",
+        "//cogs:system_robot_clk",
+        "//crates/reachy-motord:reachy_motord",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Everything a unit runs, named once. `make check-device` builds exactly this,
+# so no deployable can be outside the gate: adding one here is what puts it in
+# CI, and there is nowhere else to add it.
+filegroup(
+    name = "device_deployables",
+    srcs = [
+        ":motion_payload",
+        "//crates/reachy-bench:reachy_bench",
     ],
     visibility = ["//visibility:public"],
 )

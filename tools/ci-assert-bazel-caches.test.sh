@@ -20,52 +20,13 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-passes=0
-failures=0
+# shellcheck source=test-lib.sh
+. "${script_dir}/test-lib.sh"
 
-pass() {
-	echo "PASS: $1"
-	passes=$((passes + 1))
-}
-
-fail() {
-	echo "FAIL: $1" >&2
-	failures=$((failures + 1))
-	shift
-	local line
-	for line in "$@"; do
-		printf '    %s\n' "$line" >&2
-	done
-}
-
-contains() {
-	printf '%s' "$1" | grep -qF -- "$2"
-}
-
-assert_contains() {
-	local label=$1 haystack=$2 needle=$3
-	if contains "$haystack" "$needle"; then
-		pass "$label"
-	else
-		fail "$label" "expected to find: ${needle}" "in:" "$haystack"
-	fi
-}
-
-assert_status() {
-	local label=$1 want=$2 got=$3
-	if [ "$want" = "$got" ]; then
-		pass "$label"
-	else
-		fail "$label" "expected exit ${want}, got ${got}"
-	fi
-}
 
 # ---------------------------------------------------------------------------
 # The tree the subject runs out of
 # ---------------------------------------------------------------------------
-
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
 
 repo="${work}/repo"
 mkdir -p -- "${repo}/tools"
@@ -124,8 +85,6 @@ run_subject() {
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
-output_of() { sed '$d' <<<"$1"; }
-status_of() { sed -n '$s/^---status //p' <<<"$1"; }
 
 # What the run above passes, and what each case overrides one of. The tilde stays
 # unexpanded, as it does when a shell passes the workflow's environment variable
@@ -341,5 +300,4 @@ assert_status "an unknown argument refuses" 1 "$status"
 
 # ---------------------------------------------------------------------------
 
-echo "${passes} passed, ${failures} failed"
-[ "$failures" -eq 0 ]
+tally

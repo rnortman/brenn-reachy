@@ -24,7 +24,7 @@ use brenn_reachy__cogs__sim_state_clk_rs::{SimCmdWire, SimOpWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointsWire};
 
-use crate::{SCRIPT_CHANNEL, SIM_CMD_CHANNEL};
+use motion_channels::{SCRIPT_CHANNEL, SIM_CMD_CHANNEL};
 
 /// Every servo on the bus, as the schema's flags.
 ///

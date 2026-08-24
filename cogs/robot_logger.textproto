@@ -1,0 +1,47 @@
+# Where the online run's records go, loaded once at process setup.
+#
+# Protobuf text of `clockwork_logging.logger_config_clk_proto.LoggerConfig`,
+# which the framework generates from its own `LoggerConfig` schema. Read as it
+# is: the logger box binds it by path, and the casing converts it to the message
+# the dial hands the writer cogs.
+
+# The run's `.olog` files, under a directory the writer names for the instant it
+# opened. On tmpfs, because nothing this repo pushes to a unit touches its
+# flash: a run's log is pulled off with the run and the machine keeps no state.
+#
+# This directory has to exist before the logger starts -- the writer creates the
+# run's own subdirectory under it, not the root -- so whatever starts these
+# processes makes it, and reads the path from this file rather than retyping it.
+#
+# The filesystem must accept direct I/O: the writer opens every file with
+# `O_DIRECT | O_DSYNC` unconditionally. tmpfs does on a current kernel; a
+# kernel that refuses it fails at the first open, which costs the run its
+# records and nothing else.
+log_root_dir: "/run/brenn-app/logs/motion"
+
+# Where the control process's channel buffers are. The logger reads the logged
+# channels straight out of them, so this is the same directory the control
+# process is started with -- its `--pinion-dir`.
+pinion_shm_root: "/dev/shm"
+
+# The socket namespace, which both processes have to name identically: the
+# logger finds the control process's channels through it. This is the value the
+# control process's `--pinion-ns` must carry, taken from here rather than typed
+# again, because a mismatch is silent in the worst direction -- the logger comes
+# up, finds no channels under its namespace, and writes an empty log while the
+# gesture runs perfectly. Empty is a namespace too, and the one a process started
+# with no `--pinion-ns` uses.
+pinion_namespace: "motion"
+
+# The write rate the buffer pool is sized against, MiB per second. The pool is
+# one second of it plus an 8 MiB schema reserve, in 256 KiB buffers -- 12 MiB at
+# this figure, which is what the box's arena is sized to hold. Everything logged
+# here together is under 200 KiB/s, so this is an order of magnitude of
+# headroom rather than a limit anything approaches.
+max_write_mib_per_sec: 4
+
+# How long one file covers before the writer opens the next. A bring-up run is
+# seconds long and lands in one file; the split matters to a soak, and five
+# minutes keeps a file small enough to copy off while the next one is being
+# written.
+max_log_file_duration_sec: 300

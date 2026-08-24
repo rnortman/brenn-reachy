@@ -71,29 +71,7 @@ use reachy_motion::snap::{duration_from_nanos, duration_nanos};
 use reachy_motion::tick::default_motion_config;
 use reachy_motion::{txn, value};
 
-/// The servo-side profile the gains sweep writes, register units.
-///
-/// The host's own numbers rather than the library's: the library states plainly
-/// that it has no default for these, because what they should be is a property
-/// of the machine a host drives rather than of the motion arithmetic. The pair
-/// here is a deliberately modest backstop under host-side shaping -- an order of
-/// magnitude below the figures the bench carries in its own configuration, which
-/// are sized for a bench that commands whole moves outright. What this session
-/// streams is one
-/// step-bounded setpoint per period, so the servo-side limiter should never be
-/// the thing shaping a move; sizing it low is what makes a host stream that
-/// somehow asked for more than a step get rate-limited rather than obeyed.
-///
-/// Nothing has run this pair on hardware. It is a modelled machine's figure
-/// until a real one is measured behind it, and where the number should live once
-/// it is measured is host configuration rather than a constant here.
-// TODO(session-servo-profile)
-const PROFILE: ProfileConfig = ProfileConfig {
-    acceleration: 20,
-    velocity: 50,
-};
-
-/// The machine this session commissions.
+/// Build the record of the machine this session commissions, if nothing has.
 ///
 /// Built once and shared, the arrangement [`reachy_motion::tick::
 /// default_motion_config`] makes for the tick's configuration and for the same
@@ -106,12 +84,66 @@ const PROFILE: ProfileConfig = ProfileConfig {
 /// copy of any of them somewhere a deployment could edit is two records able to
 /// render two verdicts on one truth. So the record itself is the library's
 /// [`arm::arm_config`], and what this host supplies is the two things that are
-/// not hardware facts: the provisioning grid below, and the profile above.
-fn arm_config() -> &'static ArmConfig {
-    static CONFIGURED: std::sync::OnceLock<ArmConfig> = std::sync::OnceLock::new();
-    CONFIGURED
-        .get_or_init(|| arm::arm_config(&EnvelopeConfig::default(), provision_table(), PROFILE))
+/// not hardware facts: the provisioning grid below, and `profile`.
+///
+/// The profile is the caller's because it is the one part of this record a
+/// deployment chooses: the library states plainly that it has no default for
+/// it, since what it should be is a property of the machine a host drives
+/// rather than of the motion arithmetic. It arrives from the session's own
+/// configuration and is taken on the first call, which is the wake that first
+/// needs the record -- built once for the same reason the rest of it is, and
+/// therefore fixed for the life of the process at the value the process started
+/// with.
+///
+/// A profile handed in after the first call is ignored rather than refused. The
+/// record is process-wide for the life of the binary, tests included: the first
+/// call any test case makes fixes the profile for every case after it in the
+/// same test binary, so a case that seeded a different pair would be measuring
+/// the first one. In a deployment there is only ever one pair to seed -- a cog's
+/// config is read from a file before the first execution and nothing writes it
+/// afterwards.
+///
+/// Called at the top of the cog body, which is the whole of how the record is
+/// delivered: everything below reaches [`arm_config`] rather than being handed
+/// a copy.
+///
+/// # Panics
+///
+/// For a profile whose acceleration or velocity is zero. Zero in those two
+/// registers is what a servo reads as *no limit*, which is the opposite of the
+/// backstop the pair exists to be, and it is what a configuration that lost the
+/// two lines parses to. Refusing here stops the process at start-up with the
+/// machine de-torqued and nothing commanded, rather than commissioning a
+/// machine whose servo-side rate limit is off with nothing said about it.
+pub fn init_arm_config(profile: ProfileConfig) {
+    assert!(
+        profile.acceleration > 0 && profile.velocity > 0,
+        "the servo profile is {profile:?}, and zero in either register is a servo running \
+         unlimited rather than the backstop the pair is for",
+    );
+    let _ = CONFIGURED
+        .get_or_init(|| arm::arm_config(&EnvelopeConfig::default(), provision_table(), profile));
 }
+
+/// The record, for the machinery below.
+///
+/// The one way this module's own functions reach it: the record is a
+/// process-lifetime value, so a copy of it threaded through every private
+/// function beside the per-execution context would be a second delivery
+/// mechanism for one value.
+///
+/// # Panics
+///
+/// If nothing initialised it. Unreachable: the cog body's first act is
+/// [`init_arm_config`], before a single byte of the slot is read.
+fn arm_config() -> &'static ArmConfig {
+    CONFIGURED
+        .get()
+        .expect("the commissioned record, taken from configuration at the top of the execution")
+}
+
+/// The record itself, built once for the life of the process.
+static CONFIGURED: std::sync::OnceLock<ArmConfig> = std::sync::OnceLock::new();
 
 /// The release this session runs, and what it judges the machine against.
 ///

@@ -29,20 +29,20 @@ use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKind;
 use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSignals};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
-use brenn_reachy__driver__health_clk_rs::{DriverEvent, EventKind};
+use brenn_reachy__driver__health_clk_rs::EventKind;
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
-use clockwork_rs::{Duration, SyncTime};
+use clockwork_rs::SyncTime;
 use motion_slots::{configured, counters};
+use reachy_driver::report::{self, Event};
 use reachy_driver::{
     AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, GateAction, GoalGate,
-    TorqueOffConfirm,
+    TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm,
 };
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
-    JointGroup, ROW_COUNT, angle_of, flags, group_of, row, rows_of, set_angle, write_rows,
-    write_vector,
+    JointGroup, angle_of, flags, group_of, row, rows_of, set_angle, write_rows, write_vector,
 };
 
 pub mod sim_aux;
@@ -61,38 +61,6 @@ use sim_regs::Regs;
 /// was asked, which is the truthful reading of a driver that missed its cycles.
 const MAX_CATCHUP_CYCLES: i64 = 8;
 
-/// How long a commanded de-torquing may go unconfirmed before the driver says
-/// so, nanoseconds.
-///
-/// The driver's own budget and not the host's: the confirmation pass reads one
-/// row back per cycle, so a clean pass over the nine takes nine cycles, and a
-/// budget that did not clear that would report a de-torquing as unconfirmed
-/// while it was still being read. The room above that is for the host requests
-/// that outrank the pass: each one costs it a cycle, and a de-torquing reported
-/// as unconfirmed because a sequencer was talking would be a report about the
-/// traffic rather than about the machine. Running out of it changes nothing
-/// about what the driver does -- the sweep is still written every cycle and the
-/// pass keeps reading -- it only makes the silence visible.
-pub const TORQUE_OFF_CONFIRM_BUDGET_NS: i64 = 300_000_000;
-
-const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > ROW_COUNT as i64 * TIMER_PERIOD_NS);
-
-/// How many cycles in a row the bus may answer nothing before the driver says
-/// its bus is gone.
-///
-/// The one fault a driver raises about itself. Long enough that a burst of lost
-/// replies is not it -- the decision tick tolerates a run of blind reads and
-/// keeps commanding through them, and a driver crying failure inside that
-/// window would be reporting the same outage twice from two places. Short
-/// enough that half a second of a machine nobody can see is not left to the
-/// dead-man alone: the host takes a bus failure straight to the minimum-risk
-/// condition, where the dead-man would first wait out its own silence.
-///
-/// Raised once per outage, on the cycle the run reaches this length: the
-/// standing condition is not news, and a host that has been told once has
-/// already stopped trusting the bus.
-pub const BLIND_CYCLES_BEFORE_BUS_FAILURE: u32 = 25;
-
 /// The cycle this cog's execution condition waits for, nanoseconds.
 ///
 /// Stated here because the timer is a literal in the declaration and the cycle
@@ -100,6 +68,15 @@ pub const BLIND_CYCLES_BEFORE_BUS_FAILURE: u32 = 25;
 /// first execution refuses a scenario that made them different rather than
 /// modelling a bus running at a rate nobody asked for.
 const TIMER_PERIOD_NS: i64 = 20_000_000;
+
+/// The simulated grid is the one the driver layer's budgets are sized against.
+///
+/// The constants both hosts share are counts of cycles — a confirm budget, a
+/// blind-cycle limit — so they only mean the same duration in both while the
+/// two grids are the same number. The real driver refuses a configured period
+/// that is not the nominal one; this is the same refusal for the sim, made at
+/// compile time.
+const _: () = assert!(TIMER_PERIOD_NS == reachy_driver::NOMINAL_CYCLE_NS);
 
 /// One cycle of the simulated driver.
 pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
@@ -366,41 +343,6 @@ struct Report {
     health_row: Option<u8>,
 }
 
-/// One edge the cycle hit, before it reaches the output slot.
-///
-/// Held as ordinary Rust because a cycle can raise more than one and the slot
-/// carries one: the ranking is a decision made here rather than a sequence of
-/// writes into the slot.
-#[derive(Clone, Copy)]
-struct Event {
-    kind: EventKind,
-    time_ns: i64,
-    /// The silence or the lateness, where the kind names one.
-    silence_ns: i64,
-    /// The servos the kind names, where it names a set of them.
-    rows: JointFlags,
-    /// How many of whatever the kind counts.
-    count: u32,
-    /// The one servo the kind names, as its bus id.
-    id: u8,
-}
-
-impl Event {
-    /// An event at `time_ns` with no evidence yet: a raiser fills in the fields
-    /// its own kind names and leaves the rest, which is what the schema says a
-    /// kind that does not name a field carries.
-    fn at(time_ns: i64) -> Self {
-        Self {
-            kind: EventKind::None,
-            time_ns,
-            silence_ns: 0,
-            rows: JointFlags::NONE,
-            count: 0,
-            id: 0,
-        }
-    }
-}
-
 impl Report {
     /// Offer an answer for this cycle's one outcome slot.
     fn answer(&mut self, answer: Answer) {
@@ -410,16 +352,11 @@ impl Report {
     }
 
     /// Offer an event for this cycle's one slot, counting the one it displaces.
+    ///
+    /// The ranking is the driver layer's, so this host and the real driver
+    /// publish the same one out of a cycle that hit two.
     fn raise(&mut self, dropped: &mut u64, event: Event) {
-        match self.event {
-            None => self.event = Some(event),
-            Some(held) => {
-                *dropped += 1;
-                if event.kind == EventKind::HoldTimeoutTorqueOff && held.kind != event.kind {
-                    self.event = Some(event);
-                }
-            }
-        }
+        report::raise(&mut self.event, dropped, event);
     }
 }
 
@@ -528,31 +465,12 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
 /// Count how long the bus has been answering nothing, and say so once the run
 /// is long enough to mean the bus is gone.
 ///
-/// The one fault a driver raises about itself, and the run of blind cycles is
-/// all the evidence there is: a cycle that read no row read nothing about what
-/// is wrong with it either. The count goes back to zero on the first cycle that
-/// reads something, and the event is raised on the cycle the run reaches its
-/// length and not again while it continues -- a standing outage is not news, and
-/// a host told once has already stopped trusting the bus.
+/// The counting and the once-only rule are the driver layer's, over the run this
+/// state slot carries: the fault a driver raises about itself has to mean the
+/// same thing from either host.
 fn count_blind(state: &mut SimState, blind: bool, nominal: i64, report: &mut Report) {
-    if !blind {
-        state.blind_cycles = 0;
-        return;
-    }
-    state.blind_cycles = state.blind_cycles.saturating_add(1);
-    let run = state.blind_cycles;
-    if run == BLIND_CYCLES_BEFORE_BUS_FAILURE {
-        report.raise(
-            &mut state.events_dropped,
-            Event {
-                kind: EventKind::BusFailure,
-                // How many cycles went unanswered, which is what says whether
-                // the report is about the threshold or about a bus that has
-                // been gone far longer.
-                count: run,
-                ..Event::at(nominal)
-            },
-        );
+    if let Some(event) = report::count_blind(&mut state.blind_cycles, blind, nominal) {
+        report.raise(&mut state.events_dropped, event);
     }
 }
 
@@ -856,7 +774,7 @@ fn publish(
 
     if let Some(event) = report.event.as_ref() {
         let out = &mut outputs.evt;
-        write_event(out.msg_mut().clear_valid(), event);
+        event.write(out.msg_mut().clear_valid());
         out.mark_for_publish();
     }
 
@@ -876,15 +794,6 @@ fn publish(
         );
         out.mark_for_publish();
     }
-}
-
-fn write_event(out: &mut DriverEvent, event: &Event) {
-    out.kind = event.kind;
-    out.time = SyncTime::from_nanos(event.time_ns);
-    out.silence = Duration::from_nanos(event.silence_ns);
-    out.rows = event.rows;
-    out.count = event.count;
-    out.id = event.id;
 }
 
 counters! {

@@ -43,6 +43,14 @@ use reachy_motion::value::{self, Value};
 
 use crate::sim_regs::{self, Regs};
 
+/// The temperature every simulated health report carries, degrees Celsius.
+///
+/// A constant of the model and not a reading: this plant has no thermal state to
+/// read one from. A plausible resting figure, so a scenario's report reads like
+/// a machine at room temperature rather than like a servo at freezing point, and
+/// a checker comparing it against a band gets an answer that means something.
+pub const SIM_TEMP_C: i8 = 25;
+
 /// One transaction, copied out of the record the slot holds.
 ///
 /// Copied rather than borrowed because running it writes the state the record
@@ -303,8 +311,10 @@ fn enable_write(state: &mut SimState, nominal: i64, row: usize, joint: JointRef,
 ///
 /// Every field is a cell of the row's own control table, so what a report says
 /// is what a host reading those registers itself would find. The temperature is
-/// the exception and reads zero: the register vocabulary names a temperature
-/// limit and no present temperature, so there is no cell to read one from.
+/// [`SIM_TEMP_C`] — a constant of the model rather than a measurement of
+/// anything, this plant having nothing thermal to measure — and the temperature
+/// cell of every control table is provisioned with that same constant, so the
+/// two ways of asking agree.
 pub fn health(state: &SimState, nominal: i64, row: usize, out: &mut HealthReport) {
     out.id = SERVO_IDS.get(row).copied().unwrap_or(0);
     out.bits = sim_regs::read(&state.regs, row, RegId::HardwareErrorStatus)
@@ -315,7 +325,7 @@ pub fn health(state: &SimState, nominal: i64, row: usize, out: &mut HealthReport
         .ok()
         .and_then(Value::as_volts)
         .unwrap_or(0.0);
-    out.temp_c = 0;
+    out.temp_c = SIM_TEMP_C;
     out.sample_time = SyncTime::from_nanos(nominal);
 }
 

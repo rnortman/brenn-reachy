@@ -48,7 +48,8 @@ pub const ANTENNA_CONTACT_BAND_RAD: f64 = core::f64::consts::PI / 3.0;
 /// the sweep, so nothing phased like that can pass; the clocks that swept clean,
 /// 0.7 s against 0.3 s, plan 0.88 rad at the edge and pass with room. It sits
 /// 1.35× above the first and 0.68× of the second, and both ends are asserted
-/// against the recorded runs.
+/// against the recorded runs by the replay suite beside this crate
+/// (`tests/replay_test.rs`, over the recordings in `fixtures/traces`).
 ///
 /// The tips' own separation is smaller than the plan's — the servos lag, and a
 /// pair crossing early in a sweep lags nearly together — which is why the figure

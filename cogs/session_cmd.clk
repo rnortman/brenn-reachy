@@ -12,8 +12,9 @@
 // rebuilding when one of those changes.
 //
 // Nothing here is a header. There is no sequence number, no length and no
-// checksum: a typed in-process channel carries none, and the socket edge stamps
-// its own at the socket.
+// checksum, and nothing adds one downstream: a typed channel carries none, and
+// so does the socket this crosses to reach the driver -- a datagram there is
+// exactly these bytes and a receiver checks the size against the schema's own.
 
 #![generate(cpp)]
 #![cpp(namespace=brenn_reachy::cogs)]
