@@ -170,4 +170,24 @@ assert_status "a basename the listing does not carry refuses" 1 "$(status_of "$r
 assert_contains "and the refusal names it" "$(output_of "$result")" \
 	"the build emits no nothing.tachyon"
 
+# The pinion agreement over the files that actually ship it. The checker's own
+# behaviour on drift is pinned in build-motion.test.sh against a synthesized
+# file in a temporary tree; what is asserted here is the claim that matters at a
+# bench — that the two logger configurations in *this* checkout state the
+# flagless defaults. The device path runs this check from build-motion.sh and the
+# host path from host-motion-run.sh, and neither is a target `make check` runs,
+# so without these two cases an edit to either file is green in CI and refused
+# only in front of a powered unit.
+for shipped in cogs/robot_logger.textproto cogs/host_logger.textproto; do
+	result=$(attempt check_pinion_defaults "$shipped")
+	assert_status "${shipped} states the flagless pinion defaults" 0 \
+		"$(status_of "$result")"
+done
+
+result=$(attempt check_pinion_defaults cogs/no_such_logger.textproto)
+assert_status "a logger configuration the tree does not have refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and the refusal names the file it wanted" "$(output_of "$result")" \
+	"cogs/no_such_logger.textproto"
+
 tally

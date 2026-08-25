@@ -115,11 +115,20 @@ use reachy_motion::{txn, value};
 /// two lines parses to. Refusing here stops the process at start-up with the
 /// machine de-torqued and nothing commanded, rather than commissioning a
 /// machine whose servo-side rate limit is off with nothing said about it.
+///
+/// And for a zero bus watchdog, which is the register disabled: armed is the
+/// policy, so a file that says nothing about it is a session that would command
+/// servos with nothing at all watching for a dead driver.
 pub fn init_arm_config(profile: ProfileConfig) {
     assert!(
         profile.acceleration > 0 && profile.velocity > 0,
         "the servo profile is {profile:?}, and zero in either register is a servo running \
          unlimited rather than the backstop the pair is for",
+    );
+    assert!(
+        profile.bus_watchdog > 0,
+        "the servo profile is {profile:?}, and zero in the watchdog register is a machine that \
+         keeps holding its pose after the driver commanding it has died",
     );
     let _ = CONFIGURED
         .get_or_init(|| arm::arm_config(&EnvelopeConfig::default(), provision_table(), profile));
@@ -1193,7 +1202,7 @@ mod tests {
     //! field the schema declares: a field this module does not carry is a
     //! mismatch here rather than a register written wrong on a bus.
 
-    use super::{Txn, record_pending};
+    use super::{ProfileConfig, Txn, init_arm_config, record_pending};
     use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
@@ -1244,5 +1253,56 @@ mod tests {
         Txn::of_pending(slot.aux()).write(again.clear_valid());
         assert_eq!(again, wire);
         assert_eq!(slot.aux().corr(), 7, "under the number it was issued as");
+    }
+
+    /// The shipped profile, for the cases about what is refused.
+    ///
+    /// Every field non-zero, so a case that zeroes one is a case about that one
+    /// field. The numbers are not the deployed ones and do not need to be: what
+    /// is under test is which values are refused, and the refusal is about zero.
+    fn profile() -> ProfileConfig {
+        ProfileConfig {
+            acceleration: 20,
+            velocity: 50,
+            bus_watchdog: 10,
+        }
+    }
+
+    /// A profile a configuration that lost its watchdog line parses to.
+    ///
+    /// The realistic drift: a textproto omitting the field parses to zero, which
+    /// is the register disabled -- a machine that keeps holding its pose after
+    /// the driver commanding it has died. Refusing it here is the whole of what
+    /// stands between that file and a commissioned machine, so it is asserted
+    /// rather than assumed.
+    #[test]
+    #[should_panic(expected = "zero in the watchdog register")]
+    fn a_session_with_the_watchdog_disabled_is_refused_before_anything_is_armed() {
+        init_arm_config(ProfileConfig {
+            bus_watchdog: 0,
+            ..profile()
+        });
+    }
+
+    /// And its older sibling: zero acceleration is a servo running unlimited
+    /// rather than the backstop the pair exists to be.
+    #[test]
+    #[should_panic(expected = "zero in either register")]
+    fn a_session_whose_servo_profile_is_unlimited_is_refused_the_same_way() {
+        init_arm_config(ProfileConfig {
+            acceleration: 0,
+            ..profile()
+        });
+    }
+
+    /// The same for velocity, which the assert covers with one condition and so
+    /// could lose without a case to say so.
+    #[test]
+    #[should_panic(expected = "zero in either register")]
+    fn a_session_whose_servo_velocity_is_unlimited_is_refused_the_same_way() {
+        init_arm_config(ProfileConfig {
+            velocity: 0,
+            ..profile()
+        });
     }
 }

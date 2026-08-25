@@ -13,6 +13,7 @@
 //! reports all of them: a scenario that stopped at the first surprise costs a
 //! whole build per finding.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -39,9 +40,9 @@ use reachy_motion::record;
 
 use crate::read::Run;
 use crate::{
-    COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS, FIRST_CYCLE, LAG_K,
-    MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY, REPORT_GROUP,
-    REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS, SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD,
+    BUS_WATCHDOG, COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS,
+    FIRST_CYCLE, LAG_K, MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY,
+    REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS, SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD,
     SLEW_LEGS_RAD, commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for,
     drain_cycle,
 };
@@ -1401,20 +1402,25 @@ pub fn last_datagram(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
     last
 }
 
-/// The configured servo profile, as it reached the servos.
+/// The configured servo profile and watchdog, as they reached the servos.
 ///
-/// The two writes the commissioning sweep makes out of
+/// The writes the commissioning sweep makes out of
 /// [`SessionParams`](crate::PROFILE_ACCELERATION)'s profile fields, found in the
 /// run's own datagrams and compared against what the file said. `check_params`
 /// pins the file to the constants; this pins the constants to the wire, so the
 /// pair together is the whole path from the text a deployment edits to the
 /// register a servo holds.
 ///
-/// Every commissioned row is checked, because the sweep writes the profile to
-/// all nine and a machine provisioned with one servo left at whatever it held is
-/// a machine whose motion is not the motion anybody configured.
+/// Every commissioned row is checked, because the sweep writes to all nine and a
+/// machine provisioned with one servo left at whatever it held is a machine
+/// whose motion is not the motion anybody configured.
+///
+/// The watchdog is checked as a sequence rather than a value: a latched register
+/// refuses the arming write, so the clear has to come first, and the *order* is
+/// the part a single-value check would miss.
 pub fn commissioned_profile(run: &Run, failures: &mut Vec<String>) {
     let mut written = 0_usize;
+    let mut watchdog: BTreeMap<u8, Vec<i64>> = BTreeMap::new();
     for datagram in &run.datagrams {
         let txn = datagram.message.txn();
         if datagram.message.kind() != SessionCmdKindWire::AUX
@@ -1422,13 +1428,17 @@ pub fn commissioned_profile(run: &Run, failures: &mut Vec<String>) {
         {
             continue;
         }
+        let value = i64::try_from(txn.value()).unwrap_or(i64::MAX);
         let expected = match txn.reg() {
             RegIdWire::PROFILE_ACCELERATION => PROFILE_ACCELERATION,
             RegIdWire::PROFILE_VELOCITY => PROFILE_VELOCITY,
+            RegIdWire::BUS_WATCHDOG => {
+                watchdog.entry(txn.id()).or_default().push(value);
+                continue;
+            }
             _ => continue,
         };
         written += 1;
-        let value = i64::try_from(txn.value()).unwrap_or(i64::MAX);
         if value != expected {
             failures.push(format!(
                 "the session wrote {value} to servo {}'s {:?} at {} and the configuration says \
@@ -1448,6 +1458,21 @@ pub fn commissioned_profile(run: &Run, failures: &mut Vec<String>) {
             "the commissioning sweep wrote the profile {written} times and there are \
              {expected_writes} of those writes in a commissioned machine"
         ));
+    }
+    if watchdog.len() != ROW_COUNT {
+        failures.push(format!(
+            "the commissioning sweep armed the watchdog on {} servos and a commissioned machine \
+             has all {ROW_COUNT} of them watched",
+            watchdog.len()
+        ));
+    }
+    for (id, values) in &watchdog {
+        if values.as_slice() != [0, BUS_WATCHDOG] {
+            failures.push(format!(
+                "the session wrote {values:?} to servo {id}'s watchdog and arming it is a clear \
+                 then the configured [0, {BUS_WATCHDOG}]"
+            ));
+        }
     }
 }
 

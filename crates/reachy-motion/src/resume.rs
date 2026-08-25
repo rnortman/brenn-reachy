@@ -138,10 +138,10 @@ macro_rules! phase_state {
 pub const PROVISION_CELLS: usize = crate::arm::PROVISION_REGS.len() * ROW_COUNT;
 
 /// How many writes the gains-and-profiles sweep makes: one position-gains write
-/// per servo, then one write per servo per motion-profile register.
+/// per servo, then one write per servo per entry in the sweep's register table.
 ///
-/// Derived from the sweep's own register list rather than restated, so a profile
-/// register added there widens this bound with it.
+/// Derived from the sweep's own table rather than restated, so an entry added
+/// there widens this bound with it.
 pub const GAINS_PROFILE_WRITES: usize = (1 + crate::arm::PROFILE_REGS.len()) * ROW_COUNT;
 
 /// A snapshot whose numbers name a state no sequence of steps reaches.
@@ -409,7 +409,7 @@ mod tests {
             PROVISION_CELLS,
             crate::arm::PROVISION_REGS.len() * ROW_COUNT
         );
-        assert_eq!(GAINS_PROFILE_WRITES, 27);
+        assert_eq!(GAINS_PROFILE_WRITES, 45);
     }
 
     /// A cursor at the end of its sweep indexes nothing: the last element hands

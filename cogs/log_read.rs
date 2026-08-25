@@ -18,6 +18,12 @@
 //! Every complaint is collected rather than thrown. A checker that stopped at
 //! the first surprise costs a whole build per finding.
 //!
+//! Either of Clockwork's two log formats is read: a deterministic run writes
+//! offboard `.slog` files and the online logger writes onboard `.olog` ones, and
+//! the same checker reads either. Which is not a detail -- the analyzer a
+//! hardware run is judged by would otherwise be proven over a format no machine
+//! produces.
+//!
 //! The pass itself is here too: [`read_with`] opens the log, checks every
 //! binding in a consumer's table before decoding anything, dispatches each
 //! message to the stream its channel names, and keeps the census of what every
@@ -25,8 +31,7 @@
 
 use std::path::Path;
 
-use clockwork_logs::offboard::OffboardReader;
-use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage};
+use clockwork_logs::{ChannelMetadata, LogError, LogFormat, LogReader, LoggedMessage};
 use clockwork_rs::{Blob, SchemaMeta};
 
 /// Every channel the log carries, in the order the reader reports them, and how
@@ -71,23 +76,40 @@ pub trait Streams: Default {
 /// reader's own error counters are a complaint at the end -- a log the framework
 /// had trouble with is not a log anything should be asserted about.
 ///
+/// Either format is read. What differs is what a channel's absence means, which
+/// is a property of the formats and not of a run: see the comment on the check
+/// loop.
+///
 /// # Errors
 ///
 /// Whatever the reader refuses about the log as a whole. A message the reader
 /// yielded and this build could not make sense of is a complaint rather than an
 /// error: the point is to report all of them at once.
 pub fn read_with<R: Streams>(dir: &Path, table: &[Bound<R>]) -> Result<R, LogError> {
-    let mut reader = OffboardReader::open(dir)?;
+    let (format, channels) = channels_of(dir)?;
     let mut run = R::default();
 
-    let channels: Vec<ChannelMetadata> = reader.channels().to_vec();
     for metadata in &channels {
         run.census().push((metadata.channel_name.clone(), 0));
     }
     for bound in table {
+        // A channel an onboard log never carried a message on is a channel that
+        // log does not declare: the writer declares one when it first writes to
+        // it. So absence there says the channel was silent, not that the system
+        // was misconfigured, and there is nothing to check -- no payload of it
+        // will be decoded. An offboard log declares its whole channel set
+        // whatever travelled on it, so absence there is a real finding.
+        if format == LogFormat::Onboard
+            && !channels
+                .iter()
+                .any(|metadata| metadata.channel_name == bound.name)
+        {
+            continue;
+        }
         (bound.check)(&channels, bound.name, run.complaints());
     }
 
+    let mut reader = LogReader::open(dir)?;
     while let Some(message) = reader.read_next()? {
         let name = message.metadata.channel_name.as_str();
         if let Some(entry) = run.census().iter_mut().find(|(known, _)| known == name) {
@@ -98,13 +120,62 @@ pub fn read_with<R: Streams>(dir: &Path, table: &[Bound<R>]) -> Result<R, LogErr
         }
     }
 
-    if !reader.error_counters().is_clean() {
-        let counters = format!("{:?}", reader.error_counters());
+    let damage =
+        match &reader {
+            LogReader::Onboard(reader) => (!reader.error_counters().is_clean())
+                .then(|| format!("{:?}", reader.error_counters())),
+            LogReader::Offboard(reader) => (!reader.error_counters().is_clean())
+                .then(|| format!("{:?}", reader.error_counters())),
+            // The compiler's arm; `channels_of` has already refused any
+            // format that would reach it.
+            _ => None,
+        };
+    if let Some(counters) = damage {
         run.complaints().push(format!(
             "the reader recorded errors over the log: {counters}"
         ));
     }
     Ok(run)
+}
+
+/// Which format a log is in, and every channel it declares.
+///
+/// The two formats say what they carry at different times, and neither answer is
+/// the other's. An offboard log declares its channel set in the trailers the
+/// reader reads when it opens, so the set is known before a record is. An onboard
+/// log declares a channel in a record of its own, by an id local to the file it
+/// is in, and the reader's own table of them is about the file it is currently
+/// reading -- so the way to know what a whole onboard log carries is to walk it
+/// and keep each message's own metadata.
+///
+/// That walk is a pass of its own, before the caller's. It costs a second read of
+/// a file a run of this system writes a megabyte of, and it buys the same safety
+/// order for both formats: every binding in a table checked before a single
+/// payload is decoded. Nothing here decodes one -- a message's metadata is read
+/// and its payload is left alone.
+fn channels_of(dir: &Path) -> Result<(LogFormat, Vec<ChannelMetadata>), LogError> {
+    match LogReader::open(dir)? {
+        LogReader::Offboard(reader) => Ok((LogFormat::Offboard, reader.channels().to_vec())),
+        LogReader::Onboard(mut reader) => {
+            let mut seen: Vec<ChannelMetadata> = Vec::new();
+            while let Some(message) = reader.read_next()? {
+                if !seen
+                    .iter()
+                    .any(|known| known.channel_name == message.metadata.channel_name)
+                {
+                    seen.push(message.metadata.clone());
+                }
+            }
+            Ok((LogFormat::Onboard, seen))
+        }
+        // `LogReader` is non-exhaustive, so this arm is the compiler's. A format
+        // this build does not know is refused rather than read as an empty
+        // onboard log: an empty channel set would skip every binding check and
+        // decode payloads unexamined.
+        _ => Err(LogError::UnknownLogFormat {
+            path: dir.to_path_buf(),
+        }),
+    }
 }
 
 /// What went wrong reading a log: a channel bound to a schema this build does
@@ -174,4 +245,221 @@ fn complaint(message: &LoggedMessage<'_>, wanted: &str, why: &dyn core::fmt::Dis
         message.metadata.channel_name,
         message.message_time.as_nanos(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! What the format dispatch decides, over logs written here.
+    //!
+    //! The rule this exists for is the onboard skip: a channel an onboard log
+    //! does not declare is not checked, because that format declares a channel
+    //! only when it first carries a message. It is the one place where "no
+    //! finding" and "not checked" meet, so a drift in how channel names are
+    //! compared would skip every binding in a table and decode nothing while
+    //! reporting nothing -- over a hardware log, which is the only kind the
+    //! onboard path ever reads. So the skip is asserted in both directions and
+    //! against the offboard format, where the same absence is a real finding.
+    //!
+    //! The logs are written by the framework's own writers into a scratch
+    //! directory. Nothing here is a fixture of a log's bytes: a hand-built file
+    //! would be this module's idea of the format rather than the format.
+
+    use super::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
+    use clockwork_logs::offboard::{OffboardWriter, OffboardWriterConfig};
+    use clockwork_logs::onboard::OnboardWriter;
+    use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage, MessageEncoding};
+    use clockwork_rs::{Blob, SchemaMeta, SyncTime, blob_as_bytes, blob_type};
+    use std::path::{Path, PathBuf};
+
+    blob_type! {
+        /// Stands in for a generated message a channel is bound to.
+        struct Sample, size = 8, align = 8
+    }
+
+    impl SchemaMeta for Sample {
+        const SCHEMA_NAME: &str = "@brenn_reachy::cogs::log_read::Sample";
+        const SCHEMA_DEFINITION: &[u8] = b"\x0a\x06Sample";
+    }
+
+    blob_type! {
+        /// Another schema of the same size, which is what makes a size check no
+        /// check at all.
+        struct Other, size = 8, align = 8
+    }
+
+    impl SchemaMeta for Other {
+        const SCHEMA_NAME: &str = "@brenn_reachy::cogs::log_read::Other";
+        const SCHEMA_DEFINITION: &[u8] = b"\x0a\x05Other";
+    }
+
+    /// The two channels a case binds: one it writes and one it does not.
+    const SPOKEN: &str = "spoken";
+    const SILENT: &str = "silent";
+
+    /// A consumer of both channels.
+    #[derive(Default)]
+    struct Read {
+        samples: Vec<Logged<Sample>>,
+        census: Census,
+        complaints: Complaints,
+    }
+
+    impl Streams for Read {
+        fn census(&mut self) -> &mut Census {
+            &mut self.census
+        }
+
+        fn complaints(&mut self) -> &mut Complaints {
+            &mut self.complaints
+        }
+    }
+
+    /// The table: both channels bound to `Sample`, both checked and both routed.
+    fn table() -> Vec<Bound<Read>> {
+        fn check(channels: &[ChannelMetadata], name: &str, complaints: &mut Complaints) {
+            binding::<Sample>(channels, name, complaints);
+        }
+        fn route(run: &mut Read, message: &LoggedMessage<'_>) {
+            typed::<Sample>(message, &mut run.samples, &mut run.complaints);
+        }
+        vec![
+            Bound {
+                name: SPOKEN,
+                check,
+                route,
+            },
+            Bound {
+                name: SILENT,
+                check,
+                route,
+            },
+        ]
+    }
+
+    fn scratch(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "log-read-{what}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn payload() -> [u8; Sample::SIZE] {
+        [1, 2, 3, 4, 5, 6, 7, 8]
+    }
+
+    /// An onboard log carrying one message on `SPOKEN`, under the metadata
+    /// `carries` is given.
+    fn onboard_log(dir: &Path, metadata: &ChannelMetadata) {
+        let mut writer = OnboardWriter::create(dir, "run_").expect("an onboard log");
+        let channel = writer.add_channel(metadata).expect("a channel");
+        writer
+            .log_message(
+                channel,
+                0,
+                SyncTime::from_nanos(1_000),
+                SyncTime::from_nanos(1_000),
+                &[],
+                &payload(),
+            )
+            .expect("a message");
+        writer.close().expect("a closed log");
+    }
+
+    #[test]
+    fn a_channel_an_onboard_log_never_declared_is_silence_rather_than_a_finding() {
+        let dir = scratch("onboard-absent");
+        onboard_log(&dir, &ChannelMetadata::for_schema::<Sample>(SPOKEN));
+
+        let run = read_with::<Read>(&dir, &table()).expect("an onboard log reads");
+
+        assert!(
+            run.complaints.is_empty(),
+            "an onboard log declares a channel when it first carries a message, so a channel \
+             it never declared is a channel nothing was published on: {:?}",
+            run.complaints
+        );
+        assert_eq!(
+            run.samples.len(),
+            1,
+            "the channel that did carry was decoded"
+        );
+        assert_eq!(blob_as_bytes(&run.samples[0].message), payload());
+        assert_eq!(
+            run.census,
+            vec![(SPOKEN.to_string(), 1)],
+            "the census names what the log declared and counts what it carried, once"
+        );
+    }
+
+    #[test]
+    fn a_channel_an_onboard_log_declares_under_another_schema_is_still_a_finding() {
+        let dir = scratch("onboard-mismatch");
+        let mut metadata = ChannelMetadata::for_schema::<Other>(SPOKEN);
+        metadata.message_encoding = MessageEncoding::Tachyon;
+        onboard_log(&dir, &metadata);
+
+        let run = read_with::<Read>(&dir, &table()).expect("an onboard log reads");
+
+        assert_eq!(
+            run.complaints.len(),
+            1,
+            "the declared channel is checked and the undeclared one is not: {:?}",
+            run.complaints
+        );
+        assert!(
+            run.complaints[0].contains(SPOKEN) && run.complaints[0].contains("Other"),
+            "the complaint names the channel and what it actually carries: {:?}",
+            run.complaints
+        );
+    }
+
+    #[test]
+    fn the_same_absence_over_an_offboard_log_is_a_finding() {
+        let dir = scratch("offboard-absent");
+        let mut writer =
+            OffboardWriter::create(&dir, OffboardWriterConfig::default()).expect("an offboard log");
+        let channel = writer
+            .create_channel_typed::<Sample>(SPOKEN)
+            .expect("a channel");
+        writer
+            .write(
+                channel,
+                0,
+                SyncTime::from_nanos(1_000),
+                SyncTime::from_nanos(1_000),
+                &[],
+                &payload(),
+            )
+            .expect("a message");
+        writer.close().expect("a closed log");
+
+        let run = read_with::<Read>(&dir, &table()).expect("an offboard log reads");
+
+        assert_eq!(
+            run.complaints,
+            vec![format!("no channel named {SILENT} in the log")],
+            "an offboard log declares its whole channel set, so a channel missing from it is a \
+             system that did not compose the way the table says"
+        );
+        assert_eq!(run.samples.len(), 1);
+    }
+
+    #[test]
+    fn a_directory_with_no_log_in_it_is_refused_rather_than_read_as_empty() {
+        let dir = scratch("empty");
+
+        let refused = read_with::<Read>(&dir, &table());
+
+        assert!(
+            matches!(refused, Err(LogError::UnknownLogFormat { .. })),
+            "a log whose format nothing here knows is refused: an empty channel set would skip \
+             every binding check and decode payloads unexamined"
+        );
+    }
 }

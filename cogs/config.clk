@@ -120,6 +120,17 @@ schema SessionParams
         // Sized with the acceleration above, refused at zero for the same
         // reason, and for the same purpose.
         #7 profile_velocity: UInt32;
+
+        // The servos' Bus Watchdog timeout the sweep writes, in the register's
+        // own 20 ms units. What stops a servo holding its goal when the host
+        // has gone quiet: the driver's dead-man answers a control process that
+        // stopped, and this answers a driver that stopped. Zero disables the
+        // register and is refused by the host before it commissions anything --
+        // armed is the policy, and a build that wants it off changes the policy
+        // rather than the number. One byte wide because the register is: a count
+        // no servo could hold is a file this cannot parse rather than a number
+        // narrowed somewhere downstream.
+        #8 bus_watchdog: UInt8;
     }
 }
 

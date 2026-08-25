@@ -1,0 +1,48 @@
+# Where a host smoke run's records go, loaded once at process setup.
+#
+# Protobuf text of `clockwork_logging.logger_config_clk_proto.LoggerConfig`, read
+# as it is: the host logger box binds it by path, and the casing converts it to
+# the message the dial hands the writer cogs.
+#
+# The device's copy of this file is `robot_logger.textproto`. The two are separate
+# files rather than one parameterized box because both are bound by literal path,
+# and a host run pointed at a device's log root -- or a unit pointed at a
+# workstation's -- is exactly the class of configuration lie the host run exists
+# to catch.
+
+# The run's `.olog` files, under a directory the writer names for the instant it
+# opened.
+#
+# `tools/host-motion-run.sh` rewrites this line in its staged copy to a directory
+# under the scratch tree it owns, and creates it -- the writer creates the run's
+# own subdirectory, not the root. The value here is what a run started by hand
+# from a staged tree uses, so it names a place a workstation always has and no
+# repository state lives in.
+#
+# The filesystem must accept direct I/O: the writer opens every file with
+# `O_DIRECT | O_DSYNC` unconditionally. A filesystem that refuses it fails at the
+# first open, which is one of the configuration facts a host run is here to find
+# out about a workstation before a unit is asked the same question.
+log_root_dir: "/tmp/brenn-reachy-host-run/logs"
+
+# Where the control process's channel buffers are, and the namespace the logger
+# finds them under. The same two values the device's copy states, and for the same
+# reason: the launcher config a composition renders carries nothing but a process
+# description as a generated app's args, so every process a run starts is
+# flagless and uses the compiled-in defaults -- `/dev/shm` for `--pinion-dir`,
+# and the empty string for `--pinion-ns`, which is a namespace like any other and
+# selects `<root>/clockwork/pinion/pub`.
+#
+# A mismatch here is silent in the worst direction -- the logger comes up, finds
+# no channels, and writes an empty log while the gesture runs perfectly -- which
+# is the failure this run reproduces on a workstation in seconds instead of on a
+# unit at a bench.
+pinion_shm_root: "/dev/shm"
+pinion_namespace: ""
+
+# The write rate the buffer pool is sized against, MiB per second, and how long
+# one file covers before the writer opens the next. Both the device's figures:
+# the run is the device's run, and a host run that sized its writer differently
+# would be exercising a writer nobody ships.
+max_write_mib_per_sec: 4
+max_log_file_duration_sec: 300

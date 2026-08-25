@@ -7,7 +7,7 @@
 //! owns time, sockets and counters, which is the whole of what a simulation of
 //! this driver does not need.
 //!
-//! Three things the loop answers for that a cycle cannot see:
+//! Four things the loop answers for that a cycle cannot see:
 //!
 //! - **A cycle that did not run.** [`Grid::next_after`] skips rather than
 //!   catches up, and the count it hands back is published as `cycle_skipped`.
@@ -25,6 +25,12 @@
 //!   every cycle for as long as the port has no reader: a wire failure is not
 //!   recovered from, so nothing arriving on the port that still has a reader
 //!   may leave the state it forces.
+//! - **A stop nobody on the bus asked for.** A signal sets a flag the loop
+//!   reads once per cycle; the loop then writes the torque-off sweep, keeps
+//!   cycling until the confirmation pass says what it read back, and returns.
+//!   An operator's stop is the one case where control is still trusted while
+//!   the process is ending, so the release is commanded rather than left to the
+//!   servos' own watchdog — which is what covers every stop this cannot answer.
 //!
 //! And one thing the clock does that the grid cannot express: a
 //! `CLOCK_REALTIME` step backwards. The grid is drawn on that clock, so a step
@@ -48,17 +54,104 @@ use std::fmt::Write as _;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKind};
 use clockwork_rs::{Blob, blob_as_bytes};
 use reachy_bus::BusPort;
-use reachy_driver::Event;
+use reachy_driver::{ConfirmReport, Event, TORQUE_OFF_CONFIRM_BUDGET_NS};
 
 use crate::grid::{Cycle, Grid};
 use crate::inbound::{Counts, Inbound, Inbox};
 use crate::ports::{AUX_OUT_PORT, EVENT_PORT, HEALTH_PORT, LOOPBACK, POSE_PORT};
 use crate::tick::{CycleReport, Tick, TickCounts, now_ns};
+
+/// Whether somebody has asked this process to stop.
+///
+/// A trait rather than the flag itself so that the loop's stop rules are stated
+/// over something a case can set at a chosen cycle. The driver runs it over an
+/// `AtomicBool` a signal handler stores into; a signal handler doing nothing but
+/// a store is what lets every consequence of a stop run on the loop thread,
+/// which is the only thread here allowed to write a torque-off sweep.
+pub trait Stop {
+    /// Whether the stop has been asked for.
+    fn asked(&self) -> bool;
+}
+
+impl Stop for AtomicBool {
+    fn asked(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
+
+/// Nothing ever asks: the loop runs its cycles out.
+impl Stop for () {
+    fn asked(&self) -> bool {
+        false
+    }
+}
+
+/// What one turn of a loop over the grid did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stepped {
+    /// The cycle ran and the grid advanced past it.
+    Advanced,
+    /// The clock stepped backwards, so the grid was re-drawn and no cycle ran.
+    Reanchored,
+}
+
+/// How a bounded run of cycles ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ran {
+    /// Every cycle asked for ran, and nobody asked the process to stop.
+    Cycles,
+    /// A stop was asked for and the wind-down below it has finished. The loop is
+    /// done: the caller's next act is to say what happened and exit.
+    WoundDown(WoundDown),
+}
+
+/// What a wind-down found and what it managed to establish.
+///
+/// The whole of the vocabulary, because the event schema has none for it: a
+/// wind-down is a thing an operator's stop gesture does, and what a stopping
+/// driver has to say about torque it says in the line it prints on the way out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WoundDown {
+    /// Nothing was believed torqued and no de-torquing was outstanding, so the
+    /// stop cost no bus work.
+    ///
+    /// A belief and not a reading: a process that has just started believes
+    /// nothing because it has asked the machine nothing, so this says what this
+    /// driver commanded rather than what a servo answered.
+    AlreadyReleased,
+    /// A torque-off sweep went out and a whole pass read every row back
+    /// released.
+    Confirmed,
+    /// A torque-off sweep went out and the confirmation budget ran out without a
+    /// clean pass. The sweep was written on every cycle of it regardless — this
+    /// says what was read back, not what was commanded.
+    Unconfirmed,
+}
+
+impl WoundDown {
+    /// What to print about it.
+    #[must_use]
+    pub fn line(self) -> &'static str {
+        match self {
+            Self::AlreadyReleased => {
+                "stopping: nothing believed torqued and nothing outstanding, so no torque-off was \
+                 written and nothing was read back; the servos' own bus watchdog is what covers a \
+                 machine this process never commanded"
+            }
+            Self::Confirmed => "stopping: torque off, read back released on every row",
+            Self::Unconfirmed => {
+                "stopping: torque off written on every cycle of the confirmation budget and not \
+                 read back released; the servos' own bus watchdog is the layer that answers this"
+            }
+        }
+    }
+}
 
 /// The longest a single sleep runs before the clock is read again.
 ///
@@ -380,15 +473,82 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
     /// more has run four hundred cycles of one grid, not two grids of two
     /// hundred.
     pub fn run_cycles(&mut self, cycles: u64) {
+        let _ = self.run_until(cycles, &());
+    }
+
+    /// Run `cycles` grid cycles, or wind the machine down if `stop` is asked for.
+    ///
+    /// The flag is read once per cycle, on this thread. Nothing about a stop
+    /// happens anywhere else: a handler stores, and every consequence — the
+    /// sweep, the confirmation, the reading of what came back — runs here,
+    /// because this is the only thread in this process that may write to the
+    /// bus.
+    ///
+    /// It is read before the cycle rather than after, so a stop asked for during
+    /// a sleep is answered without the intervening cycle publishing a sample
+    /// nobody will read.
+    pub fn run_until(&mut self, cycles: u64, stop: &impl Stop) -> Ran {
         for _ in 0..cycles {
-            let cycle = self.next;
-            if self.schedule.sleep_until(cycle.nominal_ns) == Waited::ClockSteppedBack {
-                self.reanchor();
+            if stop.asked() {
+                return Ran::WoundDown(self.wind_down());
+            }
+            self.cycle_once();
+        }
+        Ran::Cycles
+    }
+
+    /// Sleep to the next grid point and run the cycle there, or re-draw the grid
+    /// if the clock stepped backwards instead.
+    ///
+    /// Both `run_until` and `wind_down` run this; the wind-down path is the one
+    /// that writes the torque-off sweep.
+    fn cycle_once(&mut self) -> Stepped {
+        let cycle = self.next;
+        if self.schedule.sleep_until(cycle.nominal_ns) == Waited::ClockSteppedBack {
+            self.reanchor();
+            return Stepped::Reanchored;
+        }
+        self.step(cycle);
+        self.next = self.grid.next_after(&cycle, self.schedule.now_ns());
+        Stepped::Advanced
+    }
+
+    /// De-torque the machine, read it back, and hand the loop over.
+    ///
+    /// What an operator's stop gesture deserves: control is still trusted, so
+    /// the release is a commanded one and the driver stays on the bus long
+    /// enough to see it take. Nothing here gates the sweep — the write goes out
+    /// on the first cycle of the wind-down and on every cycle after it — and
+    /// nothing recovers anything: a wind-down that cannot confirm says so and
+    /// ends, leaving the servos' own bus watchdog as the layer that answers a
+    /// machine this process can no longer reach.
+    ///
+    /// The bound is the confirmation's own budget plus a cycle of margin, so a
+    /// wind-down ends in about four hundred milliseconds at worst — well inside
+    /// the escalation any supervisor gives a process it has asked to stop.
+    fn wind_down(&mut self) -> WoundDown {
+        if !self.tick.torque_outstanding() {
+            return WoundDown::AlreadyReleased;
+        }
+        let cycle = self.next;
+        self.tick.request_torque_off(cycle.nominal_ns);
+        let period_ns = self.grid.period_ns().max(1);
+        let bound = TORQUE_OFF_CONFIRM_BUDGET_NS / period_ns + 2;
+        for _ in 0..bound {
+            if self.cycle_once() == Stepped::Reanchored {
                 continue;
             }
-            self.step(cycle);
-            self.next = self.grid.next_after(&cycle, self.schedule.now_ns());
+            match self.tick.confirm_said() {
+                Some(ConfirmReport::Confirmed) => return WoundDown::Confirmed,
+                Some(ConfirmReport::Unconfirmed) => return WoundDown::Unconfirmed,
+                _ => {}
+            }
         }
+        // The pass reports as soon as it is overdue, so the bound is reached
+        // only by a clock that stepped often enough to keep re-opening it. A
+        // machine whose time base is being lost is not one this process can say
+        // anything confirmed about.
+        WoundDown::Unconfirmed
     }
 
     /// Re-draw the grid from where the clock now says it is.
@@ -594,7 +754,8 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Destinations, Driver, LoopCounts, Outbound, SLEEP_CHUNK_NS, Schedule, Waited, chunk_to,
+        AtomicBool, Destinations, Driver, LoopCounts, Outbound, Ran, SLEEP_CHUNK_NS, Schedule,
+        Stop, TORQUE_OFF_CONFIRM_BUDGET_NS, Waited, WoundDown, chunk_to,
     };
     use crate::grid::Grid;
     use crate::inbound::{Counts, Inbox};
@@ -605,10 +766,20 @@ mod tests {
         AuxOutcomeWire, DriverEventWire, EventKind, HealthReportWire,
     };
     use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
+    use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegId;
+    use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKind;
     use brenn_reachy__motion__joints_clk_rs::JointFlags;
     use clockwork_rs::{Blob, SyncTime, blob_as_bytes, blob_from_bytes};
+    use dxl_proto::crc16;
+    use dxl_proto::frame::{
+        HEADER, INST_READ, INST_STATUS, INST_SYNC_READ, INST_SYNC_WRITE, INST_WRITE,
+    };
+    use dxl_proto::regs::TORQUE_ENABLE;
     use reachy_bus::{Bus, BusPort, DEFAULT_BAUD};
-    use std::cell::Cell;
+    use reachy_motion::joints::ROW_COUNT;
+    use reachy_motion::value;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, VecDeque};
     use std::io;
     use std::net::UdpSocket;
     use std::rc::Rc;
@@ -648,6 +819,140 @@ mod tests {
         }
     }
 
+    /// A bus with a control table: a write is stored and a read answers what is
+    /// stored, zero for anything never written.
+    ///
+    /// The little a wind-down needs of a machine. Reads of a register nothing
+    /// wrote come back zero, which is a de-torqued machine, so a confirmation
+    /// pass over an untouched table completes; and a verified torque-enable
+    /// write reads back what it wrote, which is how a case gets the driver to
+    /// believe a row is holding. The table is shared with the case that built it
+    /// — the driver owns the port — so what reached the machine is readable
+    /// after a run.
+    ///
+    /// TODO(shared-servo-fixture): the third scripted servo model in this tree,
+    /// and the two others can disagree with it about what a write does.
+    /// One servo's registers, by address.
+    type Table = HashMap<u16, Vec<u8>>;
+
+    /// One write as it reached a control table: the servo, the address, the
+    /// bytes.
+    type Wrote = (u8, u16, Vec<u8>);
+
+    #[derive(Clone, Default)]
+    struct Limp {
+        out: VecDeque<u8>,
+        /// The control tables, by servo.
+        regs: Rc<RefCell<HashMap<u8, Table>>>,
+        /// Every write that reached one, in order.
+        wrote: Rc<RefCell<Vec<Wrote>>>,
+    }
+
+    impl Limp {
+        /// How many writes of `byte` to `reg` this machine has taken.
+        fn writes_of(&self, reg: dxl_proto::Reg, byte: u8) -> usize {
+            self.wrote
+                .borrow()
+                .iter()
+                .filter(|(_, addr, bytes)| *addr == reg.addr && bytes.as_slice() == [byte])
+                .count()
+        }
+
+        /// Store one write, both in the table and on the record of what arrived.
+        fn store(&mut self, id: u8, addr: u16, bytes: &[u8]) {
+            self.wrote.borrow_mut().push((id, addr, bytes.to_vec()));
+            self.regs
+                .borrow_mut()
+                .entry(id)
+                .or_default()
+                .insert(addr, bytes.to_vec());
+        }
+
+        /// What a read of one register answers: what is stored, zero-extended,
+        /// or zeros for a register nothing has written.
+        fn stored(&self, id: u8, addr: u16, width: usize) -> Vec<u8> {
+            let mut value = self
+                .regs
+                .borrow()
+                .get(&id)
+                .and_then(|table| table.get(&addr))
+                .cloned()
+                .unwrap_or_default();
+            value.resize(width, 0);
+            value
+        }
+
+        /// A status frame carrying `params`, as a servo puts one on the wire.
+        fn reply(&mut self, id: u8, params: &[u8]) {
+            let mut frame = Vec::from(HEADER);
+            frame.push(id);
+            let len = u16::try_from(params.len() + 4).expect("a fixture reply is short");
+            frame.extend_from_slice(&len.to_le_bytes());
+            frame.push(INST_STATUS);
+            frame.push(0);
+            frame.extend_from_slice(params);
+            frame.extend_from_slice(&crc16(&frame).to_le_bytes());
+            self.out.extend(frame);
+        }
+    }
+
+    impl BusPort for Limp {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            let id = buf[4];
+            let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
+            let instruction = buf[7];
+            let params = &buf[8..8 + len - 3];
+            let addr = u16::from_le_bytes([params[0], params[1]]);
+            match instruction {
+                INST_READ => {
+                    let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
+                    let value = self.stored(id, addr, width);
+                    self.reply(id, &value);
+                }
+                INST_SYNC_READ => {
+                    let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
+                    for asked in params[4..].iter().copied() {
+                        let value = self.stored(asked, addr, width);
+                        self.reply(asked, &value);
+                    }
+                }
+                // A unicast write is acknowledged with no parameters; a grouped
+                // one is acknowledged by nothing at all.
+                INST_WRITE => {
+                    self.store(id, addr, &params[2..]);
+                    self.reply(id, &[]);
+                }
+                INST_SYNC_WRITE => {
+                    let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
+                    for entry in params[4..].chunks_exact(1 + width) {
+                        self.store(entry[0], addr, &entry[1..]);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn read_some(&mut self, buf: &mut [u8], _deadline: Instant) -> io::Result<usize> {
+            let mut taken = 0;
+            while taken < buf.len() {
+                match self.out.pop_front() {
+                    Some(byte) => {
+                        buf[taken] = byte;
+                        taken += 1;
+                    }
+                    None => break,
+                }
+            }
+            Ok(taken)
+        }
+
+        fn discard_input(&mut self) -> io::Result<()> {
+            self.out.clear();
+            Ok(())
+        }
+    }
+
     /// A clock a case advances: a sleep arrives exactly on its target, plus
     /// however long the case says a cycle overran by.
     #[derive(Clone)]
@@ -656,6 +961,9 @@ mod tests {
         overrun_ns: Rc<Cell<i64>>,
         /// How far the clock goes backwards on the next wait, once.
         step_back_ns: Rc<Cell<Option<i64>>>,
+        /// How far it goes backwards on every wait, for as long as it is set:
+        /// a time base that keeps being lost rather than one that slipped once.
+        back_every_ns: Rc<Cell<Option<i64>>>,
     }
 
     impl Fake {
@@ -664,6 +972,7 @@ mod tests {
                 now: Rc::new(Cell::new(now)),
                 overrun_ns: Rc::new(Cell::new(0)),
                 step_back_ns: Rc::new(Cell::new(None)),
+                back_every_ns: Rc::new(Cell::new(None)),
             }
         }
     }
@@ -674,7 +983,11 @@ mod tests {
         }
 
         fn sleep_until(&mut self, target_ns: i64) -> Waited {
-            if let Some(back_ns) = self.step_back_ns.take() {
+            if let Some(back_ns) = self
+                .step_back_ns
+                .take()
+                .or_else(|| self.back_every_ns.get())
+            {
                 // What the shipped schedule answers when the clock it reads goes
                 // backwards while it is waiting.
                 self.now.set(self.now.get() - back_ns);
@@ -748,6 +1061,16 @@ mod tests {
     /// it, and the seam's layout is [`crate::ports`]'s claim rather than this
     /// module's.
     fn driver(start_ns: i64, now_ns: i64) -> (Driver<Silent, Fake>, Seam, Fake) {
+        driver_over(Silent, start_ns, now_ns)
+    }
+
+    /// As [`driver`], over a bus a case names — for the cases about what the loop
+    /// concludes from what came back.
+    fn driver_over<P: BusPort>(
+        port: P,
+        start_ns: i64,
+        now_ns: i64,
+    ) -> (Driver<P, Fake>, Seam, Fake) {
         let (pose, pose_port) = listener();
         let (event, event_port) = listener();
         let (aux_out, aux_out_port) = listener();
@@ -769,7 +1092,7 @@ mod tests {
         let inbox = Inbox::from_sockets(goals, sessions);
 
         let tick = Tick::new(
-            Bus::new(Silent, cycle_timing(DEFAULT_BAUD)),
+            Bus::new(port, cycle_timing(DEFAULT_BAUD)),
             TickConfig {
                 period_ns: PERIOD,
                 hold_timeout_ns: 10 * PERIOD,
@@ -1213,6 +1536,307 @@ mod tests {
         assert!(
             last < T0 - hour_ns + 2 * 1_000_000_000,
             "the cycles after the step are stamped on the re-drawn grid,              within a second of where the clock now is: {last}"
+        );
+    }
+
+    /// A stop that has already been asked for.
+    fn asked() -> AtomicBool {
+        AtomicBool::new(true)
+    }
+
+    /// A stop asked for part way through a run: false for the first `after`
+    /// readings and true from then on.
+    ///
+    /// Models a signal arriving mid-run — the loop reads the flag once per
+    /// cycle, so `after` is the cycle count at which the stop lands.
+    struct AskedAfter {
+        reads: Cell<u64>,
+        after: u64,
+    }
+
+    impl AskedAfter {
+        fn cycles(after: u64) -> Self {
+            Self {
+                reads: Cell::new(0),
+                after,
+            }
+        }
+    }
+
+    impl Stop for AskedAfter {
+        fn asked(&self) -> bool {
+            let read = self.reads.get();
+            self.reads.set(read + 1);
+            read >= self.after
+        }
+    }
+
+    /// Every event kind published on `socket`, in order.
+    fn event_kinds(socket: &UdpSocket) -> Vec<EventKind> {
+        published(socket)
+            .iter()
+            .map(|datagram| {
+                as_event(datagram)
+                    .validate()
+                    .expect("a published event validates")
+                    .kind
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_asked_for_with_nothing_torqued_costs_no_bus_work_at_all() {
+        let (mut driver, seam, _clock) = driver(T0, T0);
+
+        let ran = driver.run_until(4, &asked());
+
+        assert_eq!(ran, Ran::WoundDown(WoundDown::AlreadyReleased));
+        assert_eq!(
+            driver.counts().cycles,
+            0,
+            "the flag is read before the cycle, so a stop asked for during a sleep does not \
+             buy one more cycle of bus traffic"
+        );
+        assert!(
+            published(&seam.pose).is_empty(),
+            "a machine already at the minimum risk condition is one a stop has nothing to do about"
+        );
+    }
+
+    #[test]
+    fn a_stop_asked_for_part_way_through_is_answered_at_the_next_cycle_boundary() {
+        let (mut driver, seam, _clock) = driver(T0, T0);
+
+        let ran = driver.run_until(20, &AskedAfter::cycles(3));
+
+        assert_eq!(
+            ran,
+            Ran::WoundDown(WoundDown::AlreadyReleased),
+            "the run ends in a wind-down rather than running the cycles out"
+        );
+        assert_eq!(
+            driver.counts().cycles,
+            3,
+            "the cycles before the stop ran and the ones after it did not"
+        );
+        assert_eq!(
+            published(&seam.pose).len(),
+            3,
+            "the wind-down starts on a cycle boundary: no cycle is cut in half \
+             and none is published twice"
+        );
+    }
+
+    #[test]
+    fn a_stop_with_a_de_torquing_outstanding_sweeps_until_the_budget_says_it_cannot_confirm() {
+        let (mut driver, seam, _clock) = driver(T0, T0);
+
+        // Past the startup window with nothing having arrived: the loop has
+        // written the release and opened a confirmation pass, and this bus
+        // answers nothing, so no row is ever read back.
+        driver.run_cycles(6);
+        assert_eq!(driver.counts().startup_mrc, 1);
+        let before = driver.counts().cycles;
+
+        let ran = driver.run_until(1, &asked());
+
+        assert_eq!(
+            ran,
+            Ran::WoundDown(WoundDown::Unconfirmed),
+            "a de-torquing nobody read back is reported as one, not waited on further"
+        );
+        let spent = driver.counts().cycles - before;
+        let budget_cycles = TORQUE_OFF_CONFIRM_BUDGET_NS / PERIOD;
+        assert!(
+            (budget_cycles..=budget_cycles + 3).contains(&i64::try_from(spent).expect("cycles")),
+            "the wind-down ran {spent} cycles and the confirmation budget is {budget_cycles} \
+             of them plus a cycle of margin"
+        );
+        assert!(
+            latched_in_last_sample(&seam.pose),
+            "the sweep is written on every cycle of the wind-down, budget or no budget"
+        );
+        assert!(
+            event_kinds(&seam.event).contains(&EventKind::TorqueOffUnconfirmed),
+            "what a wind-down could not establish goes on the record it is establishing it on"
+        );
+    }
+
+    #[test]
+    fn a_stop_ends_when_every_row_has_been_read_back_released() {
+        let (mut driver, seam, _clock) = driver_over(Limp::default(), T0, T0);
+
+        // The same startup release, over a machine whose registers answer: the
+        // confirmation pass has rows to credit, one per cycle.
+        driver.run_cycles(6);
+        assert_eq!(driver.counts().startup_mrc, 1);
+        let before = driver.counts().cycles;
+
+        let ran = driver.run_until(1, &asked());
+
+        assert_eq!(ran, Ran::WoundDown(WoundDown::Confirmed));
+        let spent = driver.counts().cycles - before;
+        assert!(
+            (ROW_COUNT as u64..=ROW_COUNT as u64 + 2).contains(&spent),
+            "a pass reads one row back per cycle, so nine rows cost {ROW_COUNT} cycles and \
+             this spent {spent}"
+        );
+        assert!(
+            event_kinds(&seam.event).contains(&EventKind::TorqueOffConfirmed),
+            "a wind-down that read the machine back released says so"
+        );
+    }
+
+    /// Arm one row: the verified torque-enable write a session runs, as the
+    /// datagram it arrives in.
+    ///
+    /// The one transaction a host can run that moves what the driver believes
+    /// about torque, which is what a wind-down over a live gesture reads.
+    fn arming(corr: u32, id: u8) -> SessionCmdWire {
+        let mut message = SessionCmdWire::new();
+        let cmd = message.clear_valid();
+        cmd.kind = SessionCmdKind::Aux;
+        cmd.corr = corr;
+        cmd.txn.active = true.into();
+        cmd.txn.op = AuxOpKind::WriteRegVerified;
+        cmd.txn.id = id;
+        cmd.txn.reg = RegId::TorqueEnable;
+        cmd.txn.value_kind = value::u8(1).shape();
+        cmd.txn.value = value::u8(1).bits();
+        message
+    }
+
+    /// A driver over a control table with one row believed torqued, and the
+    /// table it is holding.
+    ///
+    /// The state a stop mid-gesture arrives in: a verified torque-enable write
+    /// was run and read back, so the belief is not empty. Nothing about the
+    /// startup window is in play — a datagram arrived, so the window is not what
+    /// de-torques anything here, and no startup sweep has been written.
+    fn armed_driver() -> (Driver<Limp, Fake>, Seam, Limp, Fake) {
+        let machine = Limp::default();
+        let (mut driver, seam, clock) = driver_over(machine.clone(), T0, T0);
+        command(
+            &driver.inbound_counts(),
+            seam.session_port,
+            blob_as_bytes(&arming(1, reachy_motion::arm::SERVO_IDS[0])),
+        );
+        driver.run_cycles(3);
+        assert_eq!(
+            machine.writes_of(TORQUE_ENABLE, 1),
+            1,
+            "the case rests on the machine having been armed"
+        );
+        assert_eq!(
+            driver.counts().startup_mrc,
+            0,
+            "something talked to this driver, so nothing here is the startup default"
+        );
+        assert!(
+            !latched_in_last_sample(&seam.pose),
+            "a machine believed to be holding is what this case is about"
+        );
+        (driver, seam, machine, clock)
+    }
+
+    #[test]
+    fn a_stop_while_the_machine_is_believed_torqued_sweeps_it_and_reads_it_back() {
+        let (mut driver, seam, machine, _clock) = armed_driver();
+        let swept_before = machine.writes_of(TORQUE_ENABLE, 0);
+        assert_eq!(
+            swept_before, 0,
+            "nothing has released this machine yet: the sweep below is the wind-down's own"
+        );
+
+        let ran = driver.run_until(1, &asked());
+
+        assert_eq!(
+            ran,
+            Ran::WoundDown(WoundDown::Confirmed),
+            "a stop over a machine this driver believes is holding has work to do, and this \
+             machine answers the read-back"
+        );
+        assert!(
+            machine.writes_of(TORQUE_ENABLE, 0) >= ROW_COUNT,
+            "every row was written released, in the wind-down's own cycles: {} writes",
+            machine.writes_of(TORQUE_ENABLE, 0)
+        );
+        assert!(
+            latched_in_last_sample(&seam.pose),
+            "and the samples say the machine has been let go"
+        );
+        assert!(
+            event_kinds(&seam.event).contains(&EventKind::TorqueOffConfirmed),
+            "a wind-down that read every row back released says so on the record"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_inside_a_wind_down_keeps_writing_the_release() {
+        let (mut driver, seam, machine, clock) = armed_driver();
+        // The step lands on the wind-down's first wait, so the cycle that would
+        // have written the sweep does not run and the grid is re-drawn instead.
+        clock.step_back_ns.set(Some(3_600 * 1_000_000_000));
+
+        let ran = driver.run_until(1, &asked());
+
+        assert_eq!(
+            driver.counts().clock_steps,
+            1,
+            "the step is what this case is about"
+        );
+        assert_eq!(
+            ran,
+            Ran::WoundDown(WoundDown::Confirmed),
+            "a re-drawn grid costs the wind-down an iteration and not its verdict"
+        );
+        assert!(
+            machine.writes_of(TORQUE_ENABLE, 0) >= ROW_COUNT,
+            "the release was written on the cycles after the step: {} writes",
+            machine.writes_of(TORQUE_ENABLE, 0)
+        );
+        assert!(
+            event_kinds(&seam.event).contains(&EventKind::TorqueOffConfirmed),
+            "and it was read back"
+        );
+    }
+
+    #[test]
+    fn a_wind_down_whose_clock_keeps_stepping_back_ends_on_its_bound_unconfirmed() {
+        let (mut driver, _seam, machine, clock) = armed_driver();
+        // Every wait from here is a backwards step, so no cycle of the wind-down
+        // ever runs and the confirmation pass is never fed.
+        clock.back_every_ns.set(Some(1_000_000_000));
+        let cycles_before = driver.counts().cycles;
+
+        let ran = driver.run_until(1, &asked());
+
+        assert_eq!(
+            ran,
+            Ran::WoundDown(WoundDown::Unconfirmed),
+            "a wind-down that ran out of iterations says it could not confirm rather than \
+             looping on a clock it cannot trust"
+        );
+        assert_eq!(
+            driver.counts().cycles,
+            cycles_before,
+            "no cycle ran: every iteration of the bound was a re-drawn grid"
+        );
+        let bound = TORQUE_OFF_CONFIRM_BUDGET_NS / PERIOD + 2;
+        assert_eq!(
+            i64::try_from(driver.counts().clock_steps).expect("steps"),
+            bound,
+            "one step per iteration of the bound, and then the loop gave up"
+        );
+        // And what a wind-down that ran no cycle did *not* do: a re-anchoring
+        // asks the cycle for the release rather than writing it, so a grid that
+        // was re-drawn on every iteration leaves nothing on the wire. The
+        // machine this driver can no longer schedule against is the servos' own
+        // bus watchdog's case, which is what the verdict's line names.
+        assert_eq!(
+            machine.writes_of(TORQUE_ENABLE, 0),
+            0,
+            "no cycle ran, so nothing reached the bus"
         );
     }
 

@@ -108,12 +108,15 @@ pub const POSITION_GAINS: Reg = Reg::new(80, 6);
 
 /// Bus inactivity timeout, in 20 ms units. 0 disables it.
 ///
-/// It stays at the factory-disabled 0: with the watchdog armed, a host that
-/// stops talking makes the servos stop holding, which on this linkage is a head
-/// drop, and a latched watchdog then answers writes with a Data Range error
-/// that looks exactly like an out-of-range goal.
-// TODO(bus-watchdog-policy): decide whether to arm the watchdog, and on what
-// timeout, once the pump's real timing is measured.
+/// Armed, per session, at the value the session's configuration carries: a servo
+/// whose bus has been silent that long stops holding its goal, which is what
+/// answers a driver that was killed, crashed or unplugged while the machine was
+/// under torque. The register lives in RAM and resets to 0 at power-on, so the
+/// arming write is part of every commissioning sweep.
+///
+/// Written as a pair, clear then arm: a latched watchdog answers ordinary writes
+/// with a Data Range error -- the same status a servo sends for an out-of-range
+/// goal -- and 0 is the vendor's documented clear.
 pub const BUS_WATCHDOG: Reg = Reg::new(98, 1);
 /// Goal current, in raw register units. Meaningful only outside position mode.
 pub const GOAL_CURRENT: Reg = Reg::new(102, 2);

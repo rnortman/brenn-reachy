@@ -163,6 +163,7 @@ pub(crate) fn every_fault() -> Vec<Fault> {
 const TEST_PROFILE: ProfileConfig = ProfileConfig {
     acceleration: 20,
     velocity: 50,
+    bus_watchdog: 10,
 };
 
 /// The torque-on path's configuration against the fences `env` implies.

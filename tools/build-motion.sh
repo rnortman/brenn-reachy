@@ -11,12 +11,21 @@
 # not a binary but a directory laid out the way those paths expect:
 #
 #   target/motion-arm64/release/
+#     simplelaunch                                      the launcher, started by hand
+#     robotcpu.textproto                                the three apps it starts
+#     clockwork/launch/clockwork_prelaunch.sh            what it runs before them
 #     reachy_motord                                     the driver process
-#     robot_clk_exe                                     the logger and the control loop
+#     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
 #     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
+#
+# The three launcher paths are not this script's choice: the rendered launcher
+# config spells every executable and argument as a path relative to the
+# launcher's working directory, which is the payload root, so where a file goes
+# is what that config already says. `robot_clk_exe` lives under `cogs/` for that
+# reason and no other.
 #
 # Everything under it is copied out of Bazel's outputs rather than symlinked:
 # the freshness contract deploy-motion.sh enforces is about the age of files
@@ -61,6 +70,9 @@ build_target=//bazel/platform:motion_payload
 motord_target=//crates/reachy-motord:reachy_motord
 exe_target=//cogs:robot_clk_exe
 system_target=//cogs:system_robot_clk
+launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
+launch_config_target=//cogs:robotcpu.textproto
+prelaunch_target=//cogs:clockwork_prelaunch_sh
 
 # The configuration each process reads by a relative path, named by Bazel rather
 # than by a list here. `//cogs:robot_config_files` is the same target
@@ -81,16 +93,62 @@ payload="${repo_root}/target/motion-arm64/release"
 
 # The generated files a process reads, by basename: two process descriptions and
 # the writer's channel set. Everything else the system target emits is for the
-# launcher, the channel spy or the diagnostics database, none of which this
-# payload starts.
+# channel spy or the diagnostics database, neither of which this payload starts;
+# the launcher's own config is not in this list because it is not staged under
+# `cogs/` -- the launcher is started from the payload root and its config is
+# named there.
 generated_files=(
 	brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon
 	brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon
 	system_robot.motion_robot.RobotCpu_event_logger_config.tachyon
 )
 
+# The one file in the payload whose *contents* this script has an opinion about:
+# the logger's, checked against the flagless pinion defaults by lib.sh's
+# `check_pinion_defaults` before anything is built or staged. The printed start
+# commands that used to interpolate these values are gone, so the agreement is
+# asserted here and a drifted value is a refused build rather than a wasted bench
+# night.
+logger_config=cogs/robot_logger.textproto
+
+# The apps the rendered launcher config is expected to name, sorted.
+#
+# The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
+# `deploy-motion.sh --commands` prints a `tail -f` per app by name. Those names
+# are the compositions' -- `proc` and `logger_proc` from the `Process` names, and
+# `motord` from the app merged in through `simplelaunch_src` -- so a rename in a
+# `.clk` file would leave the printed commands naming files that never appear.
+# This is the join: the names are pinned here against the config actually built,
+# and a rename is a refused build with the two lists side by side.
+launcher_apps=(logger_proc motord proc)
+
 compile() {
 	"$bazel" build "${build_flags[@]}" -- "$build_target"
+}
+
+# The app names in the rendered launcher config, against the list above.
+#
+# Read out of the config that was just built, not out of a composition: what the
+# launcher will do is what this file says. Sorted comparison, because merge order
+# is the renderer's business and spawn order is hash order regardless.
+check_launcher_apps() {
+	local config=$1 named
+	named=$(awk '
+		/^[[:space:]]*app[[:space:]]*\{/ { inside = 1 }
+		inside && match($0, /name:[[:space:]]*"[^"]*"/) {
+			field = substr($0, RSTART, RLENGTH)
+			gsub(/^name:[[:space:]]*"|"$/, "", field)
+			print field
+			inside = 0
+		}
+		/^[[:space:]]*\}/ { inside = 0 }
+	' "$config" | sort | tr '\n' ' ')
+	named=${named% }
+	[ "$named" = "${launcher_apps[*]}" ] || die \
+		"the rendered launcher config names the apps '${named:-nothing}' and the run needs '${launcher_apps[*]}'." \
+		"Those names are what the launcher calls each process's log file, and" \
+		"deploy-motion.sh --commands prints a tail command per name. A process renamed in" \
+		"a composition, or an app merged in under another name, has to be renamed there too."
 }
 
 # Everything Bazel knows about where the payload's files are, in two questions
@@ -102,17 +160,6 @@ compile() {
 # split is by kind of answer -- the built targets' outputs, whose members are
 # told apart by basename, and the configuration targets' files, every one of
 # which is wanted -- so neither question needs a pattern to guess with.
-
-# Several targets as one cquery set expression.
-union() {
-	local expr=$1
-	shift
-	local target
-	for target in "$@"; do
-		expr="${expr} + ${target}"
-	done
-	echo "$expr"
-}
 
 # Every file the payload will carry, as `<absolute source>\t<path under the
 # payload root>`, resolved before a byte of the previous payload is touched.
@@ -168,12 +215,17 @@ plan() {
 # than a payload with half its files deleted, which it cannot tell from a whole
 # one.
 stage() {
-	local motord=$1 exe=$2 entry staging="${payload}.new" previous="${payload}.old"
+	local motord=$1 exe=$2 launcher=$3 launch_config=$4 prelaunch=$5
+	local entry staging="${payload}.new" previous="${payload}.old"
 	rm -rf -- "$staging" "$previous"
 	mkdir -p -- "$staging"
 
 	install -m 0755 -D -- "$motord" "${staging}/reachy_motord"
-	install -m 0755 -D -- "$exe" "${staging}/robot_clk_exe"
+	install -m 0755 -D -- "$exe" "${staging}/cogs/robot_clk_exe"
+	install -m 0755 -D -- "$launcher" "${staging}/simplelaunch"
+	install -m 0644 -D -- "$launch_config" "${staging}/robotcpu.textproto"
+	install -m 0755 -D -- "$prelaunch" \
+		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 
 	for entry in "${plan_files[@]}"; do
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
@@ -191,19 +243,26 @@ report() {
 	size=$(du -sh -- "$payload" | cut -f1)
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
-	for file in reachy_motord robot_clk_exe; do
+	for file in reachy_motord cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
 }
 
 require_bazel "device payload"
+check_pinion_defaults "$logger_config"
 compile
-built=$(bazel_files "$(union "$motord_target" "$exe_target" "$system_target")")
+built=$(bazel_files "$(union "$motord_target" "$exe_target" "$system_target" \
+	"$launcher_target" "$launch_config_target" "$prelaunch_target")")
 configs=$(bazel_files "$(union "${config_targets[@]}")")
 motord_out=$(bazel_named_in "$built" reachy_motord)
 exe_out=$(bazel_named_in "$built" robot_clk_exe)
+launcher_out=$(bazel_named_in "$built" simplelaunch)
+launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
+prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
+check_launcher_apps "$launch_config_out"
 verify_aarch64 "$motord_out"
 verify_aarch64 "$exe_out"
+verify_aarch64 "$launcher_out"
 plan "$built" "$configs"
-stage "$motord_out" "$exe_out"
+stage "$motord_out" "$exe_out" "$launcher_out" "$launch_config_out" "$prelaunch_out"
 report

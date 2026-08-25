@@ -172,6 +172,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     session_bus::init_arm_config(ProfileConfig {
         acceleration: params.profile_acceleration,
         velocity: params.profile_velocity,
+        bus_watchdog: params.bus_watchdog,
     });
 
     // The slot is this cog's own memory and nothing else writes it, so bytes it

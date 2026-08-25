@@ -68,6 +68,7 @@ rust_binary(
         ":reachy_motord_lib",
         "//crates/reachy-bus:reachy_bus",
         "//crates/reachy-driver:reachy_driver",
+        "@brenn_reachy_crates//:signal-hook",
     ],
 )
 

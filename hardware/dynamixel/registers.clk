@@ -67,8 +67,9 @@ enum RegId
         // The temperature ceiling.
         #15 temperature_limit { underlying_value: 15; }
         // The timeout after which the servo stops holding its goal because the
-        // host went quiet. Disabled on this platform: on this linkage a servo
-        // that stops holding drops the head.
+        // host went quiet. Armed at the session's configured value: a head held
+        // by a driver that has died is held by nobody, and going limp is the
+        // answer this machine's fault doctrine gives that state.
         #16 bus_watchdog { underlying_value: 16; }
         // The acceleration limit of the servo's own profile, the backstop under
         // host-side shaping.

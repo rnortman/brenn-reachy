@@ -24,6 +24,7 @@ help:
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
 	@echo "  make clip-config   regenerate the clip library asset from cogs/clips/"
+	@echo "  make motion-host-run  run the online system here, against the simulated plant"
 	@echo ""
 	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
 	@echo "REACHY_HOST naming a reachable unit:"
@@ -32,9 +33,9 @@ help:
 	@echo "  make bench-run       build, push, run the bench on the unit (ARGS=...)"
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
 	@echo "  make bench-fetch     bring a run's state file back, timestamped"
-	@echo "  make motion-build    the aarch64 motion payload: driver, cog executable, configs"
+	@echo "  make motion-build    the aarch64 motion payload: launcher, binaries, configs"
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
-	@echo "  make motion-commands print the three commands that start a run on the unit"
+	@echo "  make motion-commands print the commands that start, watch and stop a run"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
 
 # The shell half of the gate. These scripts push binaries and configuration onto
@@ -245,6 +246,22 @@ clip-config: require-bazel
 	    --out $(CURDIR)/cogs/clip_library.textproto \
 	    --names $(CURDIR)/cogs/clip_library.names.json
 
+# The online system, on this machine: the real control loop and the real logger,
+# with the simulated plant behind the real UDP seam, all three under the launcher
+# a unit uses. Twenty-five seconds of wall clock, then `first_motion_report` over
+# the log the run wrote, and the target's verdict is the report's.
+#
+# What it is for is configuration, not physics: the composition, the process
+# descriptions, the shared-memory namespace, the launcher config, the seam's wire
+# contract and the log format are all otherwise first exercised at a powered
+# unit. Not part of the gate — it is wall-clock-long and its flake envelope is
+# unmeasured. The script's header says what a green run does and does not mean.
+#
+# Needs bazel; needs no device, and reaches none.
+.PHONY: motion-host-run
+motion-host-run: require-bazel
+	tools/host-motion-run.sh
+
 # ---------------------------------------------------------------------------
 # The device path: building the bench for the Reachy Mini and running it there.
 #
@@ -339,19 +356,20 @@ bench-fetch: device-host
 # ---------------------------------------------------------------------------
 # The motion test: the cog system and its driver, on the unit.
 #
-# Not a variant of the bench path. A bench command is one invocation that ends;
-# a motion run is three long-lived processes started in an order that matters on
-# a machine that can move, so there is no `motion-run`. These targets build the
-# payload, push it, say what to start, and bring the records back;
-# `docs/bench-runbook.md` is the procedure, and the starting is a person's.
+# Not a variant of the bench path. A bench command is one invocation that ends; a
+# motion run is three long-lived processes under a supervisor, on a machine that
+# can move, so there is no `motion-run`. These targets build the payload, push it,
+# say what to start, and bring the records back; `docs/bench-runbook.md` is the
+# procedure, and the starting is a person's.
 
 # Where fetched run logs accumulate. One directory per fetch, named for its
 # fetch time.
 MOTION_RECORDS ?= .local/motion-logs
 
-# The aarch64 payload: both binaries plus every configuration file the three
-# processes read, laid out the way their relative paths expect. Needs bazel;
-# needs no device.
+# The aarch64 payload: the launcher, both binaries, the launcher config and every
+# configuration file the three processes read, laid out the way the launcher
+# config and those processes' relative paths expect. Needs bazel; needs no
+# device.
 .PHONY: motion-build
 motion-build:
 	tools/build-motion.sh
@@ -365,9 +383,9 @@ motion-build:
 motion-deploy: device-host motion-build
 	tools/deploy-motion.sh $(REACHY_HOST) --push
 
-# The three commands that start a run, with the flags read out of the shipped
-# logger configuration rather than retyped. Reaches no device, so it answers
-# with a unit powered off.
+# What a run is started, watched and stopped with, and the log root read out of
+# the shipped logger configuration rather than retyped. Reaches no device, so it
+# answers with a unit powered off.
 .PHONY: motion-commands
 motion-commands: device-host
 	tools/deploy-motion.sh $(REACHY_HOST) --commands

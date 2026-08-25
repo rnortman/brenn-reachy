@@ -50,3 +50,13 @@ torque_off_confirm_budget_ns: 500000000
 # cycle, which is what the low pair is for.
 profile_acceleration: 20
 profile_velocity: 50
+
+# The servos' own Bus Watchdog timeout, in the register's 20 ms units: ten of
+# them, 200 ms. A servo whose bus has been silent that long stops holding its
+# goal, which is the only thing that answers a driver killed, crashed or
+# unplugged mid-gesture -- no code of ours runs in that machine state. Ten
+# consecutive lost cycles is far past the measured jitter of a loop that writes
+# a goal and reads a position every 20 ms while anything is held. The same
+# 200 ms as the driver's own `hold_timeout_ns`, which is the same judgment about
+# the same silence made one layer up.
+bus_watchdog: 10

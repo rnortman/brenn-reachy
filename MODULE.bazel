@@ -131,6 +131,17 @@ crate.spec(
     version = "1",
 )
 
+# Signal handling for the driver's stop gesture: SIGINT and SIGTERM set one
+# atomic flag the loop thread reads, which is all the handler does. Taken as a
+# dependency rather than written here because installing a handler is an `unsafe`
+# syscall and every crate in this tree forbids unsafe code; `signal_hook::flag`
+# is a safe wrapper over exactly that. reachy-motord.
+crate.spec(
+    default_features = False,
+    package = "signal-hook",
+    version = "0.3",
+)
+
 # Platform constants -- the two open(2) flags and the one errno the bus layer's
 # contention probe reads. reachy-bus only, and constants only: every crate here
 # forbids unsafe code, so nothing calls into it.

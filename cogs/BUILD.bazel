@@ -23,13 +23,16 @@ load("//bazel:scenario_suite.bzl", "scenario_suite")
 # in dependency order, and the four rules the tool writes -- `system_sim_clk`
 # and `system_robot_clk`, and the `motioncpu.textproto` and
 # `robotcpu.textproto` launcher configs it derives -- carry no comments,
-# because it strips them. Those launcher configs are used by nothing here: one
+# because it strips them.
+#
+# `robotcpu.textproto` is the online run's launcher config, shipped in the device
+# payload and consumed exactly as rendered: three apps -- the two cog processes
+# and the driver, merged in through `RobotCpu`'s `simplelaunch_src` -- and
+# upstream's prelaunch. `motioncpu.textproto` is used by nothing: it
 # redirects a child's console into files, which is not what a deterministic run
-# wants, and the runbook starts the online processes by hand. They earn their
-# place when a system spans processes. Until then a wildcard build builds them
-# and the TCP bridges they name for nothing, and the updater
-# refuses the `tags = ["manual"]` that would stop that as surely as it refuses a
-# comment. TODO(clockwork-build-updater-strips-annotations)
+# wants. A wildcard build builds it and the TCP bridge it names for nothing, and
+# the updater refuses the `tags = ["manual"]` that would stop that as surely as
+# it refuses a comment. TODO(clockwork-build-updater-strips-annotations)
 
 # The one system every scenario below runs on, and the generated artifacts the
 # harness script needs on disk to run it. Named once so that a rename in the
@@ -169,6 +172,20 @@ ROBOT_MODULES = MOTION_MODULES + LOGGER_MODULES + [
     "wake_state",
 ]
 
+# What the host smoke composition reaches: everything the online one does, the
+# online composition itself -- it nests the real `RobotBox` -- and the simulated
+# plant's own chain, because on a workstation the far end of the seam is that
+# plant rather than a process holding a serial port.
+ROBOT_HOST_MODULES = ROBOT_MODULES + [
+    module
+    for module in SIM_STATE_MODULES + ["//hardware/dynamixel:registers"]
+    if module not in ROBOT_MODULES
+] + [
+    "robot",
+    "sim",
+    "sim_state",
+]
+
 SIM_MODULES = MOTION_MODULES + [
     module
     for module in SIM_STATE_MODULES + ["//hardware/dynamixel:registers"]
@@ -184,6 +201,7 @@ exports_files([
     "mover.clk",
     "pose_state.clk",
     "robot.clk",
+    "robot_host.clk",
     # The three-phase driver every scenario's `sh_test` runs, including the
     # harness proof's next door: one invocation of the deterministic runner for
     # the whole repo.
@@ -191,11 +209,30 @@ exports_files([
     "schedule.clk",
     "sim.clk",
     "sim_state.clk",
+    "system_host.clk",
     "system_robot.clk",
     "system_sim.clk",
     "wake.clk",
     "wake_state.clk",
 ])
+
+# The prelaunch script the rendered launcher config names, as an output of this
+# package rather than as the external source file it is. The launcher runs it
+# before the apps and resolves it against its working directory, so the device
+# payload has to carry a copy at the path the config spells -- and a payload file
+# has to be a path under `bazel-out` for the build script to find it, which an
+# external source is not.
+#
+# What it does is `rm -rf /dev/shm/clockwork/pinion/pub/*`: the empty-namespace
+# buffer layout every process in this system uses, so the hardcoded path is the
+# right one here.
+genrule(
+    name = "clockwork_prelaunch_sh",
+    srcs = ["@clockwork//clockwork/launch:clockwork_prelaunch.sh"],
+    outs = ["clockwork_prelaunch.sh"],
+    cmd = "cp -- $< $@",
+    visibility = ["//visibility:public"],
+)
 
 # The configs, in a module of their own because they are the only schemas that
 # cross the Protobuf backend -- which is what lets a box bind one to a file of
@@ -277,11 +314,11 @@ rust_binary(
 # directory and nothing else, so it fits the checker slot with no extra
 # arguments.
 #
-# What this cannot prove is the other format: a deterministic run writes `.slog`,
-# and the online logger writes `.olog` through a writer that opens every file
-# with direct I/O. Nothing in the tree starts the online processes, so the format
-# a hardware run will actually produce is read by no test:
-# TODO(online-run-log-proof)
+# This proves the analyzer over one of the two log formats: a deterministic run
+# writes offboard `.slog` files, and the online logger writes onboard `.olog`
+# ones. The other format is exercised by `make motion-host-run`, which starts the
+# online system on this machine and runs this same binary over what its writer
+# wrote -- a manual target, and the only place the onboard path is read.
 sh_test(
     name = "first_motion_report_over_s1_test",
     size = "small",
@@ -346,6 +383,51 @@ rust_test(
     crate = ":gen_clip_config",
 )
 
+# The configuration the host composition's three processes read by path at setup,
+# named once. `robot_host_clk` carries it as `data`, so a `bazel run` finds it in
+# the runfiles, and `tools/host-motion-run.sh` cqueries this same target to know
+# what to stage into its scratch tree.
+#
+# It is the device set with two substitutions: the plant reads the scenarios'
+# `sim_params.textproto`, and the logger reads a host log root instead of a
+# device one. Everything else is the file a unit runs on, which is the whole
+# point of the exercise.
+filegroup(
+    name = "host_config_files",
+    srcs = [
+        "clip_library.textproto",
+        "host_logger.textproto",
+        "mover_params.textproto",
+        "robot_logger_rates.textproto",
+        "session_params.textproto",
+        "sim_params.textproto",
+        "wake_params.textproto",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+merge_simplelaunch_config(
+    name = "hostcpu.textproto",
+    srcs = [
+        "system_host.motion_host.HostCpu_simplelaunch_config.textproto",
+        "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
+    ],
+    data = [
+        "brenn_reachy.cogs.system_host.motion_host.logger_proc.tachyon",
+        "brenn_reachy.cogs.system_host.motion_host.plant_proc.tachyon",
+        "brenn_reachy.cogs.system_host.motion_host.proc.tachyon",
+        "system_host.motion_host.HostCpu_channel_allocations.csv",
+        "system_host.motion_host.HostCpu_channel_spy_config.tachyon",
+        "system_host.motion_host.HostCpu_event_logger_config.tachyon",
+        "system_host.motion_host.HostCpu_metrics_channel_metadata_config.tachyon",
+        "system_host.motion_host.HostCpu_signal_metadata_config.tachyon",
+        "system_host.motion_host.HostCpu_telemetry_logger_config.tachyon",
+        "system_host.motion_host.diagnostics_database_config.tachyon",
+        ":robot_host_clk_exe",
+        "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+)
+
 # Taking an output log apart, for whatever system wrote it: the binding check and
 # a message to an owned value. Its own crate rather than a module of `scenario`,
 # because the harness proof next door reads its logs the same way and must not
@@ -359,6 +441,16 @@ rust_library(
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
+)
+
+# The format dispatch's own cases: the onboard skip in both directions, the same
+# absence over an offboard log, and a directory holding no log at all. The logs
+# are written by the framework's own writers into a scratch directory, because a
+# hand-built file would be this repo's idea of the format rather than the format.
+rust_test(
+    name = "log_read_test",
+    size = "small",
+    crate = ":log_read",
 )
 
 # What this system's channels are called, and nothing else. Its own crate because
@@ -733,10 +825,68 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The host smoke composition: the real control box, the simulated plant behind
+# the real seam, a logger of its own, and the three processes that host them. No
+# `cpp_cog` -- every cog in it belongs to another module -- and no Rust module at
+# all, because the Rust generator refuses a `udp_socket` declaration and this
+# module is mostly sockets. `cpp_exe` synthesizes the one executable all three
+# processes are started from.
+#
+# `online_main` rather than the offline main, as the device composition does: the
+# sockets are live, and a deterministic run over them would have nothing to read.
+#
+# The generated `LogWriterConfig` the host logger box binds is not among the
+# `data` and cannot be: it comes out of the system target, which depends on this
+# rule.
+clk(
+    name = "robot_host_clk",
+    srcs = ["robot_host.clk"],
+    outs = [
+        "robot_host_clk_cc.cc",
+        "robot_host_clk_cc.hh",
+        "robot_host_clk_cc.inl",
+        "robot_host_clk_exe.cc",
+        "robot_host_clk_exe.hh",
+        "robot_host_clk_exe.inl",
+    ],
+    cpp_deps = clk_module_deps(ROBOT_HOST_MODULES).cpp + [
+        # The writer cogs' state is an extern type, so the executable needs the
+        # header that declares it as well as the generated cog library.
+        "@clockwork//clockwork/logging/writers:logger_cog_state",
+    ],
+    cpp_exe_deps = [
+        # The configs arrive as protobuf text, so the executable carries the
+        # generated protobuf messages and the conversions into the messages the
+        # dials hand the cogs. Two of them are the framework's, read by the
+        # logger box.
+        ":config_clk_proto_cc_library",
+        ":config_clk_proto_conv",
+        "@clockwork//clockwork/logging/writers:channel_message_rates_config_clk_proto_cc_library",
+        "@clockwork//clockwork/logging/writers:channel_message_rates_config_clk_proto_conv",
+        "@clockwork//clockwork/logging/writers:logger_config_clk_proto_cc_library",
+        "@clockwork//clockwork/logging/writers:logger_config_clk_proto_conv",
+        "@clockwork//clockwork/scaffolding:online_main",
+    ],
+    # Read by path at process setup, relative to the runfiles of whatever runs
+    # the executable.
+    data = [":host_config_files"],
+    generate = [
+        "cpp",
+        "cpp_exe",
+    ],
+    visibility = ["//visibility:public"],
+    deps = clk_module_deps(ROBOT_HOST_MODULES).clk + [
+        # Generates nothing, so it has no other spelling: the channels the
+        # logger publishes its own status on.
+        "@clockwork//clockwork/logging/writers:logger_channels_clk",
+    ],
+)
+
 merge_simplelaunch_config(
     name = "robotcpu.textproto",
     srcs = [
         "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
+        "//driver:motord_launch.textproto",
         "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
     ],
     data = [
@@ -752,6 +902,7 @@ merge_simplelaunch_config(
         ":robot_clk_exe",
         "@clockwork//clockwork/pinion:tcp_bridge_main",
     ],
+    visibility = ["//visibility:public"],
 )
 
 # S1, raise-hold-stow, over the real system: three cogs, seven channels, two
@@ -1020,8 +1171,12 @@ rust_library(
     ],
     # The generated name-to-number sidecar is embedded, so a scenario naming a
     # motion resolves it out of the committed asset rather than restating an
-    # index the emitter may renumber.
-    compile_data = ["clip_library.names.json"],
+    # index the emitter may renumber. The shipped wake gesture rides in the same
+    # way, for the one case that puts its lead to the survey it has to cover.
+    compile_data = [
+        "clip_library.names.json",
+        "wake_params.textproto",
+    ],
     crate_root = "scenario.rs",
     edition = "2024",
     deps = [
@@ -1052,6 +1207,16 @@ rust_library(
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
+)
+
+# The scenario library's own case: the shipped wake gesture's lead against the
+# survey the derivation in its comment is written from. Every scenario runs as a
+# binary the harness invokes, so nothing else in this crate is reachable from a
+# test target.
+rust_test(
+    name = "scenario_test",
+    size = "small",
+    crate = ":scenario",
 )
 
 # What a session plans -- the steps it intends and the overlays it plays over
@@ -1314,6 +1479,32 @@ rust_clk_module(
     src = "sim_state.clk",
     imports = clk_module_deps(SIM_STATE_MODULES).imports,
     deps = clk_module_deps(SIM_STATE_MODULES).rs,
+)
+
+clk(
+    name = "system_host_clk",
+    srcs = ["system_host.clk"],
+    outs = [
+        "brenn_reachy.cogs.system_host.motion_host.logger_proc.tachyon",
+        "brenn_reachy.cogs.system_host.motion_host.plant_proc.tachyon",
+        "brenn_reachy.cogs.system_host.motion_host.proc.tachyon",
+        "system_host.motion_host.HostCpu_channel_allocations.csv",
+        "system_host.motion_host.HostCpu_channel_spy_config.tachyon",
+        "system_host.motion_host.HostCpu_event_logger_config.tachyon",
+        "system_host.motion_host.HostCpu_metrics_channel_metadata_config.tachyon",
+        "system_host.motion_host.HostCpu_signal_metadata_config.tachyon",
+        "system_host.motion_host.HostCpu_simplelaunch_config.textproto",
+        "system_host.motion_host.HostCpu_telemetry_logger_config.tachyon",
+        "system_host.motion_host.diagnostics_database_config.tachyon",
+        "system_host.motion_host.logged_channel_metadata.pbbin",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":motion_clk",
+        ":robot_host_clk",
+        "@clockwork//clockwork/logging:channel_policy_clk",
+        "@clockwork//clockwork/logging/writers:logger_channel_policies_clk",
+    ],
 )
 
 clk(

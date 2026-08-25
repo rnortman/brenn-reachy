@@ -40,7 +40,9 @@ fail() {
 }
 
 # The last line of every self-check. Its own status is the run's verdict, so
-# calling it last makes the script exit non-zero on any failure.
+# calling it last makes the script exit non-zero on any failure. The tree the run
+# staged is named by the cleanup below, which is the only place that knows
+# whether it survived.
 tally() {
 	echo "${passes} passed, ${failures} failed"
 	[ "$failures" -eq 0 ]
@@ -115,10 +117,23 @@ assert_no_file() {
 # ---------------------------------------------------------------------------
 
 # Every self-check builds a tree the subject runs out of, so the directory and
-# its cleanup are here rather than in each of them. Removed on exit however the
-# run ends, including a failure part-way through a case.
+# its cleanup are here rather than in each of them. Removed on exit — except
+# when the run ends badly: a failed case, a non-zero exit, or
+# `REACHY_TEST_KEEP` set. The staged tree is every input to a failure (the
+# stubs, the forced mtimes, the payload layout), and deleting it leaves a
+# diagnosis nothing but the message.
+#
+# The path is announced from the trap rather than from `tally`, so it is printed
+# however the run ended: a suite that dies mid-case under `set -e` never reaches
+# `tally`, and that abort is the failure shape whose tree is least reproducible.
+# To stderr, so a run's verdict on stdout reads without it.
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+keep_work() { [ "${1:-0}" -ne 0 ] || [ "$failures" -ne 0 ] || [ -n "${REACHY_TEST_KEEP:-}" ]; }
+trap 'if keep_work "$?"; then
+	echo "the tree this run staged is at ${work}" >&2
+else
+	rm -rf -- "$work"
+fi' EXIT
 
 # The two halves of a subject's run, which the self-checks capture as one string
 # ending in a status line so a case can assert on both. The encoding is the

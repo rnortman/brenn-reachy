@@ -260,6 +260,11 @@ pub struct ProfileConfig {
     pub acceleration: u32,
     /// Profile velocity, register units.
     pub velocity: u32,
+    /// Bus Watchdog timeout, in the register's 20 ms units. Armed: a host that
+    /// has gone quiet is a machine nobody is holding, and de-torque is what
+    /// that state calls for. The register is RAM-resident and resets at
+    /// power-on, which is why it is written per session.
+    pub bus_watchdog: u8,
 }
 
 /// The registers arming verifies before it writes anything, in read order.
@@ -287,14 +292,34 @@ pub const PROVISION_REGS: [RegId; 15] = [
     RegId::ProfileVelocity,
 ];
 
-/// The motion-profile registers the gains-and-profiles sweep writes per servo,
-/// after the one position-gains write.
+/// One entry of the gains-and-profiles sweep's write table: a register, and the
+/// value the configured profile gives it.
+///
+/// A function rather than a value so one register can appear twice with
+/// different contents, which is what the watchdog's clear-then-arm pair needs.
+pub type ProfileWrite = (RegId, fn(&ProfileConfig) -> Value);
+
+/// The registers the gains-and-profiles sweep writes per servo, in write order,
+/// each paired with where its value comes from.
+///
+/// After the one position-gains write. The Bus Watchdog appears twice: zero
+/// first, then the configured timeout. Zero is the vendor's documented clear for
+/// a latched watchdog, which otherwise answers ordinary writes with a Data Range
+/// error, so the pair arms the register from either state a fresh engagement can
+/// find it in.
 ///
 /// The sweep's arithmetic and the cursor bound
 /// [`GAINS_PROFILE_WRITES`](crate::resume::GAINS_PROFILE_WRITES) both derive
-/// from this list, so a register added here widens both rather than leaving a
+/// from this list, so an entry added here widens both rather than leaving a
 /// snapshot refused at cursors the sweep legitimately reaches.
-pub const PROFILE_REGS: [RegId; 2] = [RegId::ProfileAcceleration, RegId::ProfileVelocity];
+pub const PROFILE_REGS: [ProfileWrite; 4] = [
+    (RegId::BusWatchdog, |_| value::u8(0)),
+    (RegId::BusWatchdog, |cfg| value::u8(cfg.bus_watchdog)),
+    (RegId::ProfileAcceleration, |cfg| {
+        value::u32(cfg.acceleration)
+    }),
+    (RegId::ProfileVelocity, |cfg| value::u32(cfg.velocity)),
+];
 
 /// What arming does about one servo's one provisioned register.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1231,14 +1256,12 @@ impl<'a> CommissionSequencer<'a> {
                     self.write(cursor, RegId::PositionGains, gains.value());
                 } else {
                     // The profile registers walk servo-major after the gains:
-                    // one row per servo, one column per register.
+                    // one row per servo, one column per table entry, in the
+                    // table's order — which is what makes the watchdog's clear
+                    // land before its arm.
                     let index = cursor - ROW_COUNT;
-                    let reg = PROFILE_REGS[index % PROFILE_REGS.len()];
-                    let value = match reg {
-                        RegId::ProfileAcceleration => value::u32(self.cfg.profile.acceleration),
-                        RegId::ProfileVelocity => value::u32(self.cfg.profile.velocity),
-                        other => unreachable!("{other:?} is not a profile register"),
-                    };
+                    let (reg, value_of) = PROFILE_REGS[index % PROFILE_REGS.len()];
+                    let value = value_of(&self.cfg.profile);
                     self.write(index / PROFILE_REGS.len(), reg, value);
                 }
             }
@@ -3428,6 +3451,28 @@ mod tests {
         // Gains, then every profile register, per servo — the same count the
         // cursor bound derives, so the sweep and the bound cannot disagree.
         assert_eq!(count(SeqStepKind::GainsProfiles), GAINS_PROFILE_WRITES);
+        // The watchdog is written twice per servo, clear then arm, in that
+        // order: a latched register refuses the arming write on its own, and an
+        // arm the clear followed would leave the servo unwatched.
+        let watchdog: Vec<(u8, Value)> = machine
+            .log
+            .iter()
+            .filter(|(step, request)| {
+                *step == SeqStepKind::GainsProfiles && request.reg() == Some(RegId::BusWatchdog)
+            })
+            .map(|(_, request)| (request.id(), request.value))
+            .collect();
+        assert_eq!(
+            watchdog,
+            cfg.ids
+                .iter()
+                .flat_map(|id| [
+                    (*id, value::u8(0)),
+                    (*id, value::u8(cfg.profile.bus_watchdog)),
+                ])
+                .collect::<Vec<_>>(),
+            "the watchdog cleared then armed, over the nine rows",
+        );
         // And the two profile registers carry the configured pair, on every
         // row: the profile is the one number in this record a deployment
         // chooses, so a sweep writing anything else — a swapped pair, a
@@ -4683,6 +4728,24 @@ mod tests {
             error,
             SeqError::WireCorrupt {
                 context: StepContext::reg(SeqStepKind::GainsProfiles, 12, RegId::PositionGains),
+            }
+        );
+        assert_eq!(machine.enabled(), [false; ROW_COUNT]);
+
+        // A servo refusing the watchdog write — the Data Range refusal, alert
+        // bit set, that a latched watchdog answers ordinary writes with — stops
+        // the sweep naming that servo and that register, rather than being read
+        // as an out-of-range goal somewhere else.
+        let mut machine = Machine {
+            fail_write: Some((13, RegId::BusWatchdog, BusResult::ServoError { code: 0x84 })),
+            ..bus()
+        };
+        let error = drive(&cfg, &mut machine).expect_err("servo 13 refuses the watchdog write");
+        assert_eq!(
+            error,
+            SeqError::Refused {
+                context: StepContext::reg(SeqStepKind::GainsProfiles, 13, RegId::BusWatchdog),
+                code: 0x84,
             }
         );
         assert_eq!(machine.enabled(), [false; ROW_COUNT]);

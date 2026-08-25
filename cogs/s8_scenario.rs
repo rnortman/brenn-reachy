@@ -11,13 +11,25 @@
 //! operator.
 //!
 //! It is also the run where a condition arriving *during* the maneuver is
-//! answered. The head cranks are jammed while the fold is under way, so the
-//! decision tick raises about a machine that has stopped closing on the stow it
-//! was commanded to; the session re-ranks the maneuver it is already running
-//! rather than beginning a second one, and re-commands the stow on what is left
-//! of the one clock it was opened with. The hand comes off in time for the
-//! machine to reach the fold, so the maneuver is measured there -- and the park
-//! is what the *first* condition decided, not the jam.
+//! answered, and the jam is the case that owns that in this suite. The head
+//! cranks are jammed while the fold is under way, so the decision tick raises
+//! about a machine that has stopped closing on the stow it was commanded to; the
+//! session re-ranks the maneuver it is already running rather than beginning a
+//! second one, and re-commands the stow on what is left of the one clock it was
+//! opened with. The hand comes off in time for the machine to reach the fold, so
+//! the maneuver is measured there -- and the park is what the *first* condition
+//! decided, not the jam. What pins it as a mid-maneuver arrival is the checker's
+//! pair of assertions: the jam lands strictly inside the maneuver's span, and
+//! the run carries more than one stow, which only a fold re-commanded while it
+//! was running produces.
+//!
+//! The condition the jam raises is the decision tick's own. A condition read
+//! *off the bus* -- a servo's error byte -- arriving mid-maneuver is covered by
+//! no scenario in this suite, for the reason the servo fault below is written
+//! from a settled posture: which cycle of the rotation's lap carries the byte is
+//! a fact about the run, so a byte written mid-move is answered from wherever
+//! the machine happened to have got to.
+//! TODO(mid-move-servo-condition)
 //!
 //! A second script arrives once all of that is over, and is refused: a parked
 //! machine takes nothing until an operator has been, which is the whole of what
@@ -32,7 +44,7 @@ use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointGroup, JointRef, ROW_COUNT, flags};
 use scenario::author::Step;
-use scenario::{STOW_BUDGET_NS, TAIL_CYCLES, answered_within, cycle_at, cycles_for};
+use scenario::{STOW_BUDGET_NS, TAIL_CYCLES, answered_within, cycle_at, cycles_for, up_clocks};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
 // begins, the cycle a script may first be taken on, and the cycle the machine
@@ -49,23 +61,29 @@ pub const REFUSED_SCRIPT_ID: u32 = 108;
 // a fault rather than as an informational reading.
 pub use scenario::ACTED_ON_ERROR_BITS as ERROR_BITS;
 
-/// How many cycles into the raise the servo starts complaining.
+/// How many cycles after the raise has arrived the servo starts complaining.
 ///
-/// Part way in rather than at its start, so the machine is under command when
-/// the condition arrives: a stow is a schedule the decision tick carries out,
-/// and what the ladder does with a response it cannot run is a different arm and
-/// a different run. Whether the head has arrived by the time the rotation
-/// carries the byte is not fixed -- the read lands anywhere inside a lap -- and
-/// nothing here depends on which.
-pub const FAULT_AFTER: i64 = 10;
+/// After the arrival rather than part way into the move, and that is what makes
+/// the rest of this scenario exact: the read that carries the byte lands
+/// anywhere inside a lap of the rotation, so a fault written mid-raise is
+/// answered by a fold from wherever the head had got to by the cycle the read
+/// happened to land on -- a whole trip down or a few degrees of one, depending
+/// on nothing the scenario states. Written from the upright pose instead, the
+/// fold is the whole way down whichever cycle carries the byte, which is what
+/// makes the jam below land inside a maneuver that is still moving.
+///
+/// A settle rather than the arrival itself, so the machine is holding a posture
+/// it reached and not finishing a move when the condition arrives.
+pub const FAULT_AFTER: i64 = 5;
 
 /// How long the upright step lasts, in cycles.
 ///
 /// Nothing reaches its end -- the maneuver that answers the servo ends the
-/// session first -- and it is long enough that the run would still have been
-/// under command had the rotation taken a whole lap of the bus to reach the
-/// faulted row.
-pub const UP_CYCLES: i64 = 200;
+/// session first -- so it covers the raise, the lap the rotation may take to
+/// carry the byte, and the whole fold that answers it, with room past that: a
+/// schedule running out is a second way to end a session and this run is about
+/// the first.
+pub const UP_CYCLES: i64 = 400;
 
 /// How many cycles after the fault must have been read the cranks are jammed.
 ///
@@ -112,7 +130,7 @@ pub fn faulted_rows() -> JointFlags {
 /// The cycle the servo's error byte is written.
 #[must_use]
 pub fn fault_cycle() -> i64 {
-    up_start_cycle() + FAULT_AFTER
+    up_start_cycle() + up_clocks().cycles() + FAULT_AFTER
 }
 
 /// The cycle the session must have answered the condition by.

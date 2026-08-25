@@ -63,9 +63,14 @@ return_delay_time = 0
 # modes are baked into the library and checked on every servo before anything is
 # written or enabled. `reachy-bench provision` is what writes the antennas'.
 drive_mode = 0
-# Disabled. On this linkage a servo that stops holding its goal drops the head,
-# and a latched watchdog answers writes with the same error an out-of-range goal
-# produces, so the two failures would be indistinguishable at the bus layer.
+# Zero, which is the register disabled -- and the provisioned baseline rather
+# than what a running machine holds. A motion session arms it at its configured
+# timeout on every commissioning sweep; the register lives in RAM and resets to 0
+# at power-on, so this expectation is exact after a power cycle and only then.
+# Hence the read-only sweep's power-cycle precondition: a sweep taken after a
+# motion session without one reads the session's timeout here and fails, and that
+# failure means the precondition was skipped, not that the unit is provisioned
+# wrong.
 bus_watchdog = 0
 temperature_limit = 70
 # Tenths of a volt.

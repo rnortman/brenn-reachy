@@ -2896,6 +2896,11 @@ const STOW_BUDGET_NS: i64 = 4_000_000_000;
 const PROFILE_ACCELERATION: u32 = 20;
 const PROFILE_VELOCITY: u32 = 50;
 
+/// The watchdog timeout the sweep arms, in the register's 20 ms units, and for
+/// the same reason as the pair above: zero is the register disabled, which the
+/// session refuses to commission on.
+const BUS_WATCHDOG: u32 = 10;
+
 /// The session's timing, as the config slot carries it.
 fn session_params() -> SessionParamsWire {
     let mut params = SessionParamsWire::new();
@@ -2907,6 +2912,7 @@ fn session_params() -> SessionParamsWire {
     params.set_torque_off_confirm_budget_ns(500_000_000);
     params.set_profile_acceleration(PROFILE_ACCELERATION);
     params.set_profile_velocity(PROFILE_VELOCITY);
+    params.set_bus_watchdog(u8::try_from(BUS_WATCHDOG).expect("the watchdog count is one byte"));
     params
 }
 

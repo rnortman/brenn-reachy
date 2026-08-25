@@ -14,12 +14,23 @@
 script_id: 1
 
 # The room the session gets between this script arriving and its first step
-# opening: four seconds. Taking hold of the machine is six transactions per
-# servo, one per wake, which is 162 bus cycles -- 3.24 s -- and the first step
-# has to open after that or it opens on a machine that is not yet armed. The
-# slack past it is a fifth of the allowance, not a margin measured on hardware:
-# nothing has run this on a unit.
-lead_ms: 4000
+# opening: eight seconds. The whole start-up survey has to fit in it, and the
+# survey is 99 transactions (a ping, a model read, a supply reading and an error
+# byte per servo, the two provisioning cells per servo the table checks, and the
+# 45 gains and profile writes), each allowed three bus cycles where two is what
+# a transaction costs with nothing in its way -- so the allowance carries about
+# two seconds of padding of its own. That is 297 cycles, 5.94 s, and eight
+# seconds adds about two seconds on top of it, for the retries a noisy bus costs
+# beyond the per-transaction allowance on a path nothing has measured on
+# hardware. An overrun is not a hazard: the mover commands nothing until the
+# machine is armed, so a survey that outruns the lead costs the gesture its
+# window -- a late, truncated or skipped first step -- never a command to an
+# unarmed machine. What it buys is worth two seconds of stillness once per
+# session. `//cogs:scenario_test` asserts the product against this number, so a
+# register added to any of those sweeps fails there, and
+# `commission_allowance_cycles` beside that assertion is where the three-cycle
+# allowance is derived.
+lead_ms: 8000
 
 # Up, and hold there. Two seconds against the 800 ms the move is given, so most
 # of the step is the machine holding the posture -- which is the point: a goal

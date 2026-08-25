@@ -10,28 +10,6 @@ a real TODO. You would reference it in code with a `TODO(example-placeholder)`
 comment. That is the whole design: an entry here with a slug, joined to code
 comments by that slug. Add real TODOs below this one, in this format.
 
-## `bus-watchdog-policy`
-
-Decide whether the servos' Bus Watchdog register is armed, and with what
-timeout. It stays at its factory-disabled value of 0 for now.
-
-Deferral context: the watchdog stops a servo holding its goal when the host goes
-quiet, which on this linkage means the head falls. The timing question this
-entry used to wait on is answered: the command loop was measured on hardware on
-2026-08-06 — 101 periods, zero overruns, 0.1 ms worst jitter — so a timeout
-could be set from data today.
-
-What is still unanswered is hardware behaviour, twice over. Whether a latched
-watchdog *de-torques* the servo or merely stops updating its goal is vendor
-semantics nobody here has verified, and the two differ by whether arming the
-register is a safety measure or a way to drop the head. And a latched watchdog
-answers writes with the same Data Range error an out-of-range goal produces, so
-how the bus layer classifies that error decides whether the two are
-distinguishable at all. Both are hardware questions, so per the bring-up rule
-they are answered by a self-test that asserts the expected behaviour and is let
-to fail, once a unit is available. Marked at the register definition in
-`crates/dxl-proto/src/regs.rs`.
-
 ## `clip-doc-faithful-blends`
 
 Let a written clip document state the ramps it actually plays. `Clip::to_doc`
@@ -626,27 +604,65 @@ bridge process per domain, two process descriptions to start in the right order
 — which is why it is not the shape the first hardware run uses. Marked at the
 `RobotLogger` box in `cogs/robot.clk`.
 
-## `online-run-log-proof`
+## `host-run-in-ci`
 
-Run the online system on the dev host — the logger process and the control
-process, against a `--pinion-dir` of their own — and read the `.olog` it wrote
-with `first_motion_report`.
+Promote the host online run from a manual make target to a gated test.
 
-Deferral context: the framework's writer taking `O_DIRECT | O_DSYNC` on tmpfs is
-verified, by running the writer's own test against a log directory on `/dev/shm`.
-What is not is the whole path: no target starts `robot_clk_exe`, so nothing has
-written an `.olog` in this tree, and the analyzer is proven only over the `.slog`
-a deterministic run produces. The two go through one facade in
-`clockwork-logs`, which is why the S1 test is worth what it is — but the format a
-hardware run will produce is read by no test, and a writer that refuses the
-directory, or a log the reader refuses, would be met by an operator at a unit
-instead of in CI.
+Deferral context: `make motion-host-run` starts the whole online system on a
+workstation — the real control process, the plant behind the real UDP seam, the
+real logger — and judges the log it wrote with `first_motion_report`. It is
+exactly the coverage the gate wants over the composition, the configs, the
+launcher and the log format, and none of it exists in `make check` today.
 
-What it needs before it can be written is a decision, not a patch. The control
-box's producers are live sockets, so a run that logs anything needs something on
-the driver's side of the seam — a fake `reachy-motord`, or `reachy-motord` itself
-against a scripted port — plus launch machinery for two processes and a shared
-shared-memory namespace, in a test that has to be robust about a wall-clock run's
-duration. That is a host integration harness this repo does not have, and what it
-covers overlaps the runbook procedure a human follows for the first hardware run.
-Marked beside `first_motion_report_over_s1_test` in `cogs/BUILD.bazel`.
+What holds it back is measurement rather than design. One run is roughly half a
+minute of wall clock (the budget is `run_seconds` in the harness), three
+processes start in no order, and the spawn race is
+absorbed by a delivery budget nobody has watched fail; the flake rate under a
+loaded CI machine is unknown, and so is what a run costs there. It also binds six
+fixed loopback ports and the empty-namespace shared-memory layout, so two runs
+cannot share a machine — a gate has to say what happens when one is already
+running. A handful of runs measures all of that; until then a green `make check`
+should not depend on it. Marked at the header of `tools/host-motion-run.sh`.
+
+## `mid-move-servo-condition`
+
+A deterministic scenario in which a servo's error byte is read off the bus while
+a maneuver is in flight.
+
+Deferral context: S8 used to write the byte part way into the raise, and that
+made the run's own arithmetic unstable — the driver's rotating read reaches the
+faulted row somewhere inside a lap, so how far the head had risen when the fold
+answering it opened depended on nothing the scenario stated. S8 now writes the
+byte at a settled posture, and the suite's mid-maneuver arrival is the jam it
+raises later, which is the decision tick's own evidence rather than a reading
+taken off the bus. So the path where a *bus-read* condition schedules a response
+over a maneuver already running has no scenario.
+
+What it needs is a way to make the lap deterministic — placing the byte at a
+cycle chosen from the rotation's phase, or an injection that lands on the faulted
+row's own read — and an assertion written against a fold begun from somewhere
+short of upright rather than from a fixed pose. Marked at the header of
+`cogs/s8_scenario.rs`.
+
+## `build-motion-test-flake`
+
+Root-cause a single unexplained failure of `tools/build-motion.test.sh`.
+
+Deferral context: on 2026-08-24 one full `make check` reported `87 passed, 1
+failed` in this suite, and it has not reproduced since — four further full `make
+check` runs and twelve direct runs of the suite, six of those concurrent with
+each other. One failure in seventeen runs. The harness names the failing case
+and the difference it saw on stderr, but the observer kept only the tally line,
+so what survives of that run is the tally.
+The suite is believed deterministic: fixed strings, forced mtimes, a stubbed
+`bazel`, and an isolated temporary tree per case. So either that belief is wrong
+somewhere — a leaked path, a clock read, an ordering between concurrent cases —
+or the sighting was environmental.
+
+What it needs is a second sighting, which is the reproduction nobody has. Until
+one occurs there is nothing to bisect; when one occurs, investigate from it
+rather than from scratch. The forensic half is now built rather than wished for:
+`tools/test-lib.sh` keeps the staged tree of a run that failed and prints its
+path, so a second sighting leaves the stubs, the mtimes and the payload layout
+that produced it. This entry exists so that a second sighting starts from that
+instead of from zero. Marked at the header of `tools/build-motion.test.sh`.

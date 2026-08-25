@@ -1,11 +1,13 @@
 //! The driver process's entry point: configuration, the port, and the loop.
 //!
-//! Four steps, in this order and for a reason. Read the configuration, because
+//! Five steps, in this order and for a reason. Read the configuration, because
 //! everything below is a number out of it. Bind the two inbound ports, because
 //! a second driver already reading them is the one failure that must stop this
 //! one before it touches the bus. Open the serial port exclusively, because
-//! that is what makes this process the machine's only speaker. Then run the
-//! grid, forever.
+//! that is what makes this process the machine's only speaker. Install the stop
+//! flag, because the grid below it is what de-torques the machine on the way out
+//! and a signal arriving before the flag exists is a signal that kills the
+//! process outright. Then run the grid, until a stop is asked for.
 //!
 //! Every one of those failures is an exit and none of them is retried: a
 //! configuration that does not parse, a port somebody else holds, a device that
@@ -32,13 +34,18 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread;
+
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
 
 use reachy_bus::{Bus, SerialBusPort};
 use reachy_motord::grid::Grid;
 use reachy_motord::inbound::Inbox;
-use reachy_motord::loop_ctl::{Destinations, Driver, Outbound, RealTime};
+use reachy_motord::loop_ctl::{Destinations, Driver, Outbound, Ran, RealTime, WoundDown};
 use reachy_motord::params;
 use reachy_motord::tick::{Tick, TickConfig, cycle_timing, now_ns};
 
@@ -52,11 +59,9 @@ const DEFAULT_CONFIG: &str = "driver/motord_params.textproto";
 /// How many cycles between report lines: five seconds of a 20 ms grid.
 ///
 /// Long enough that the log is readable by a human watching a run, short enough
-/// that a run cut short by a signal has still said what it counted. A process
-/// killed between two lines prints nothing more — there is no handler here,
-/// because installing one needs a syscall this tree has no way to make, and
-/// because a driver stopped last in the shutdown order is a driver whose
-/// machine is already at rest.
+/// that a run cut short says what it counted before the interval it was in.
+/// SIGINT and SIGTERM print a line of their own on the way out, so the interval
+/// bounds what an unhandled end — a SIGKILL, a crash — loses.
 const REPORT_CYCLES: u64 = 250;
 
 /// Lines the printing thread may be behind by before they are dropped.
@@ -119,6 +124,10 @@ fn usage() -> String {
          device that is not there are each an exit. A driver nobody talks to de-torques the\n\
          machine and keeps running.\n\
          \n\
+         SIGINT or SIGTERM de-torques the machine, reads back what it can, says so and exits.\n\
+         A stop it cannot answer -- SIGKILL, a crash, a cut cable -- is answered by the servos'\n\
+         own bus watchdog instead.\n\
+         \n\
          Configuration defaults to {DEFAULT_CONFIG}, relative to the working directory."
     )
 }
@@ -164,8 +173,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
 
 /// Build the driver out of `config` and run it.
 ///
-/// Never returns of its own accord: the loop is endless, and this process ends
-/// by being stopped or by one of the failures above.
+/// Returns two ways: one of the failures above, or a stop that was asked for —
+/// SIGINT or SIGTERM, after which the loop has de-torqued the machine and read
+/// back what it could.
 fn run(config: &Path) -> Result<(), String> {
     let message = params::load(config).map_err(|error| error.to_string())?;
     let params = message
@@ -206,6 +216,7 @@ fn run(config: &Path) -> Result<(), String> {
     let grid = Grid::new(Grid::top_of_second_at(now_ns()), params.period_ns)
         .map_err(|error| error.to_string())?;
     let mut driver = Driver::new(tick, inbox, out, grid, RealTime, params.startup_window_ns);
+    let stop = stop_flag()?;
     let reporting = Reporting::start();
     reporting.say(format!(
         "{device} at {} baud, {}ms cycle, grid starts at {}",
@@ -214,16 +225,58 @@ fn run(config: &Path) -> Result<(), String> {
         grid.instant(0)
     ));
     loop {
-        driver.run_cycles(REPORT_CYCLES);
-        reporting.say(driver.report());
+        match driver.run_until(REPORT_CYCLES, stop.as_ref()) {
+            Ran::Cycles => {
+                reporting.say(driver.report());
+            }
+            Ran::WoundDown(how) => {
+                // Printed from here rather than handed to the printing thread:
+                // the loop has stopped touching the bus, so a write that blocks
+                // on a reader that is not reading can no longer be a machine
+                // holding torque — and these two lines are the ones an operator
+                // who just stopped a run actually needs to see.
+                println!("{}", stop_report(&driver.report(), how));
+                return Ok(());
+            }
+        }
     }
+}
+
+/// What a stopping driver says on its way out: the run's numbers, then what it
+/// established about torque.
+///
+/// A value rather than two `println!`s so that what an operator reads at the end
+/// of a run is something a case can read too. Both lines carry the process name,
+/// because they land in a launcher's log file beside every other process's
+/// output.
+fn stop_report(report: &str, how: WoundDown) -> String {
+    format!("reachy-motord: {report}\nreachy-motord: {}", how.line())
+}
+
+/// The flag SIGINT and SIGTERM set, installed before the loop starts.
+///
+/// Both signals mean the same thing here — somebody wants this process gone —
+/// and the handler does nothing but the store, so what the signal actually
+/// causes runs on the loop thread. A second signal sets the same flag: an
+/// impatient operator does not make the machine hold torque any longer, and a
+/// supervisor's SIGTERM after its SIGINT lands on a process already winding
+/// down.
+fn stop_flag() -> Result<Arc<AtomicBool>, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM] {
+        flag::register(signal, Arc::clone(&stop))
+            .map_err(|error| format!("installing the handler for signal {signal}: {error}"))?;
+    }
+    Ok(stop)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG, REPORT_BACKLOG, REPORT_CYCLES, Reporting, parse, sync_channel, usage,
+        DEFAULT_CONFIG, REPORT_BACKLOG, REPORT_CYCLES, Reporting, parse, stop_report, sync_channel,
+        usage,
     };
+    use reachy_motord::loop_ctl::WoundDown;
     use std::path::PathBuf;
 
     fn invoked(words: &[&str]) -> Result<PathBuf, String> {
@@ -260,11 +313,65 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_that_was_asked_for_says_what_it_did_about_torque() {
+        // The two lines a stop prints, as the operator gets them: the run's own
+        // numbers and then what the wind-down established about torque. Asserted
+        // over the function the wind-down arm calls, so a `Ran::WoundDown` that
+        // stopped saying either half fails here.
+        let report = "cycle=7 nominal=1700000000000000000 cycles=7";
+        for how in [
+            WoundDown::AlreadyReleased,
+            WoundDown::Confirmed,
+            WoundDown::Unconfirmed,
+        ] {
+            let said = stop_report(report, how);
+            let lines: Vec<&str> = said.lines().collect();
+            assert_eq!(
+                lines.len(),
+                2,
+                "{how:?} says the numbers and then the torque"
+            );
+            assert_eq!(
+                lines[0],
+                format!("reachy-motord: {report}"),
+                "the run's own numbers, whole and named"
+            );
+            assert_eq!(
+                lines[1],
+                format!("reachy-motord: {}", how.line()),
+                "and what the wind-down found, named the same way"
+            );
+        }
+
+        // And what each one is allowed to claim. A stop that wrote nothing has
+        // read nothing back, so it may not report the machine as at rest; the
+        // one that could not confirm names the layer that covers what it could
+        // not establish.
+        let nothing = WoundDown::AlreadyReleased.line();
+        assert!(
+            nothing.contains("believed") && nothing.contains("nothing was read back"),
+            "a stop that did no bus work states a belief and not a reading: `{nothing}`"
+        );
+        assert!(
+            !nothing.contains("at rest"),
+            "nothing here established that the machine is at rest: `{nothing}`"
+        );
+        assert!(
+            WoundDown::Confirmed.line().contains("read back released"),
+            "the one verdict that rests on a reading says which reading"
+        );
+        assert!(
+            WoundDown::Unconfirmed.line().contains("bus watchdog"),
+            "a de-torquing nobody read back names the layer that answers it anyway"
+        );
+    }
+
+    #[test]
     fn the_usage_says_what_the_reporting_interval_costs_nobody() {
-        // A driver stopped by a signal prints no final line, so the interval is
-        // the only thing that ever prints: five seconds of the shipped grid,
+        // What an unhandled end loses: five seconds of the shipped grid,
         // measured against the cycle the grid is built on rather than a restated
-        // twenty.
+        // twenty. A stop that was asked for prints its own final line, so the
+        // interval bounds only what a SIGKILL or a crash takes with it.
         let interval_ns = REPORT_CYCLES as i64 * reachy_driver::NOMINAL_CYCLE_NS;
         assert_eq!(interval_ns, 5_000_000_000, "nanoseconds between lines");
         assert!(usage().contains(DEFAULT_CONFIG));

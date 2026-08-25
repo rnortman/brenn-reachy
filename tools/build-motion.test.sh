@@ -9,14 +9,28 @@
 # this test made. Nothing here builds anything, reaches a network, or touches
 # this checkout.
 #
-# What is worth pinning is the payload's layout and its freshness. Three
-# processes read their configuration by paths relative to where they were
-# started, so a payload with a file in the wrong place is a process that exits at
-# setup on a powered unit; and deploy-motion.sh refuses a payload older than the
-# newest commit, whose only answer is a rebuild, so every successful build has to
-# stamp what it stages.
+# What is worth pinning is the payload's layout, the one file whose contents this
+# script has an opinion about, and its freshness. The layout is not this script's
+# choice: the launcher resolves every executable and argument in its config
+# against its working directory, and the three processes read their configuration
+# by paths relative to the same place, so a payload with a file in the wrong place
+# is a launcher that starts nothing or a process that exits at setup on a powered
+# unit. The contents are the two pinion values: nothing a run starts carries a
+# pinion flag, so the logger's configuration has to restate the compiled-in
+# defaults or the logger writes an empty log while the gesture runs perfectly, and
+# that is a refused build here. The launcher config's app names are pinned for the
+# same kind of reason: they are what the launcher calls each process's log file and
+# deploy-motion.sh retypes them, so a rename in a composition has to be a refused
+# build rather than three tail commands naming files that never appear. And
+# deploy-motion.sh refuses a payload older than
+# the newest commit, whose only answer is a rebuild, so every successful build has
+# to stamp what it stages.
 #
 # Run as a plain program; exits 0 on pass, non-zero on failure.
+#
+# TODO(build-motion-test-flake): this suite failed once, in one of seventeen
+# runs, and has never reproduced; if it fails again, keep the staged tree the
+# harness now retains and diagnose from that before re-running anything.
 
 set -euo pipefail
 
@@ -54,6 +68,22 @@ for file in "${config_files[@]}"; do
 	echo "# ${file}" >"${repo}/${file}"
 done
 
+# One of them is read rather than merely staged: the subject refuses a logger
+# configuration that does not restate the pinion defaults every flagless process
+# uses. Written the way the real one is, with a decoy in a comment and one field
+# indented, so the subject's line-oriented read has something to get wrong.
+logger_config="${repo}/cogs/robot_logger.textproto"
+
+stage_logger_config() {
+	cat >"$logger_config" <<'CONFIG'
+# a decoy in a comment: pinion_namespace: "motion"
+log_root_dir: "/run/brenn-app/logs/motion"
+  pinion_shm_root: "/dev/shm"
+pinion_namespace: ""
+CONFIG
+}
+stage_logger_config
+
 # What the stub's cquery answers for the configuration targets. Exported as one
 # string because that is all a stub needs; the cases that add and remove a file
 # reassign it.
@@ -82,7 +112,13 @@ done
 # plausible enough for that read to be unambiguous and nothing more.
 export MOTORD_MACHINE=183
 export EXE_MACHINE=183
+export LAUNCHER_MACHINE=183
 export DROP_LOGGER_CONFIG=""
+
+# What the rendered launcher config calls the control process. The subject pins
+# the three app names because deploy-motion.sh prints a tail command per name;
+# this is how a case renames one.
+export APP_CONTROL=""
 export CALLS="${work}/calls"
 
 # The knobs for the three ways Bazel can answer badly: cquery failing outright,
@@ -134,6 +170,26 @@ case "$sub" in
 			chmod 0755 -- "$1"
 		}
 		elf bazel-out/bin/reachy_motord "$MOTORD_MACHINE"
+		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
+		cat >bazel-out/bin/robotcpu.textproto <<CONFIG
+app {
+  name: "${APP_CONTROL:-proc}"
+  executable: "cogs/robot_clk_exe"
+}
+app {
+  name: "logger_proc"
+  executable: "cogs/robot_clk_exe"
+}
+app {
+  name: "motord"
+  executable: "reachy_motord"
+}
+pre_launch {
+  name: "clockwork_prelaunch"
+  executable: "clockwork/launch/clockwork_prelaunch.sh"
+}
+CONFIG
+		printf '#!/bin/bash\n' >bazel-out/bin/clockwork_prelaunch.sh
 		if [ -n "${DROP_EXE_FILE:-}" ]; then
 			rm -f -- bazel-out/bin/robot_clk_exe
 		else
@@ -152,6 +208,9 @@ case "$sub" in
 			*system_robot_clk*)
 				echo bazel-out/bin/reachy_motord
 				echo bazel-out/bin/robot_clk_exe
+				echo bazel-out/bin/simplelaunch
+				echo bazel-out/bin/robotcpu.textproto
+				echo bazel-out/bin/clockwork_prelaunch.sh
 				echo cogs/robot.clk
 				echo cogs/system_robot.clk
 				for f in bazel-out/bin/*.tachyon bazel-out/bin/*.csv; do
@@ -211,7 +270,25 @@ result=$(build)
 assert_status "a clean build succeeds" 0 "$(status_of "$result")"
 
 assert_file "the driver is in the payload" "${payload}/reachy_motord"
-assert_file "the executable is in the payload" "${payload}/robot_clk_exe"
+assert_file "the launcher is in the payload" "${payload}/simplelaunch"
+assert_file "its config is beside it, where it is started from" \
+	"${payload}/robotcpu.textproto"
+
+# The three paths the launcher config spells, and the only reason they are these
+# paths: the executable under `cogs/`, the prelaunch script under the directory
+# upstream's own AppConfig names, and the launcher's own config at the root it is
+# started from.
+assert_file "the executable is where the config's apps name it" \
+	"${payload}/cogs/robot_clk_exe"
+assert_no_file "and not at the payload root any more" "${payload}/robot_clk_exe"
+assert_file "the prelaunch script is where the config names it" \
+	"${payload}/clockwork/launch/clockwork_prelaunch.sh"
+
+if [ -x "${payload}/clockwork/launch/clockwork_prelaunch.sh" ]; then
+	pass "and the launcher can execute it"
+else
+	fail "and the launcher can execute it" "it is staged without a mode bit"
+fi
 for file in "${config_files[@]}"; do
 	assert_file "the payload carries ${file} at that path" "${payload}/${file}"
 done
@@ -242,7 +319,7 @@ assert_lacks "the configuration is not spelled out here" "$(calls)" \
 assert_contains "the build builds the deployables the gate names" "$(calls)" \
 	"build --config=device -- //bazel/platform:motion_payload"
 assert_contains "one cquery names every built output" "$(calls)" \
-	"//crates/reachy-motord:reachy_motord + //cogs:robot_clk_exe + //cogs:system_robot_clk"
+	"//crates/reachy-motord:reachy_motord + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
 	"//cogs:robot_config_files + //driver:motord_params.textproto"
 assert_eq "and there are two cqueries, not one per target" 2 \
@@ -270,11 +347,12 @@ rm -f -- "${repo}/cogs/late_params.textproto"
 # ---------------------------------------------------------------------------
 
 old=1600000000
-touch -d "@${old}" -- "${payload}/robot_clk_exe" "${payload}/reachy_motord" \
+touch -d "@${old}" -- "${payload}/cogs/robot_clk_exe" "${payload}/reachy_motord" \
 	"${payload}/cogs/session_params.textproto"
 result=$(build)
 assert_status "a second build succeeds" 0 "$(status_of "$result")"
-for file in robot_clk_exe reachy_motord cogs/session_params.textproto; do
+for file in cogs/robot_clk_exe reachy_motord simplelaunch \
+	cogs/session_params.textproto; do
 	stamped=$(stat -c %Y -- "${payload}/${file}")
 	if [ "$stamped" -gt "$old" ]; then
 		pass "the build stamped ${file}"
@@ -336,6 +414,69 @@ assert_contains "the refusal names the file this script asked for" "$(output_of 
 	"system_robot.motion_robot.RobotCpu_event_logger_config.tachyon"
 assert_unstaged "a missing generated file stages nothing"
 DROP_LOGGER_CONFIG=""
+
+# The pinion agreement. The shipped values pass — every case above built with
+# them — and a drift in either field is a refused build that stages nothing,
+# because nothing at run time can notice a logger looking in the wrong place.
+
+mark_payload
+sed -i 's|^pinion_namespace: .*|pinion_namespace: "motion"|' -- "$logger_config"
+result=$(build)
+assert_status "a logger configuration with a namespace refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal quotes what the file says" "$(output_of "$result")" \
+	"states 'pinion_namespace: \"motion\"'"
+assert_contains "and what the payload needs" "$(output_of "$result")" \
+	"needs 'pinion_namespace: \"\"'"
+assert_contains "and says why there is no choice about it" "$(output_of "$result")" \
+	"flagless"
+assert_unstaged "a drifted namespace stages nothing"
+assert_lacks "and nothing was built either" "$(calls)" "bazel build"
+stage_logger_config
+
+mark_payload
+sed -i 's|^  pinion_shm_root: .*|  pinion_shm_root: "/dev/shm/motion"|' -- "$logger_config"
+result=$(build)
+assert_status "a logger configuration with another shm root refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names that field" "$(output_of "$result")" \
+	"needs 'pinion_shm_root: \"/dev/shm\"'"
+assert_unstaged "a drifted shm root stages nothing"
+stage_logger_config
+
+mark_payload
+sed -i '/pinion_shm_root/d' -- "$logger_config"
+result=$(build)
+assert_status "a logger configuration that lost the field refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the file states nothing" "$(output_of "$result")" \
+	"states 'nothing'"
+assert_unstaged "a missing field stages nothing"
+stage_logger_config
+
+result=$(build)
+assert_status "and the shipped values build" 0 "$(status_of "$result")"
+
+# The launcher's app names, which are the names of the log files an operator
+# tails. They come out of the compositions and `deploy-motion.sh --commands`
+# retypes them, so this assertion is the join between the two: a process renamed
+# in a `.clk` file is a refused build here rather than three tail commands at a
+# bench naming files that never appear.
+
+mark_payload
+APP_CONTROL=control_proc
+result=$(build)
+assert_status "a launcher config that renamed a process refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal lists what the config names" "$(output_of "$result")" \
+	"names the apps 'control_proc logger_proc motord'"
+assert_contains "and what the run needs" "$(output_of "$result")" \
+	"needs 'logger_proc motord proc'"
+assert_contains "and says why the names matter" "$(output_of "$result")" \
+	"tail command per name"
+assert_unstaged "a renamed process stages nothing"
+APP_CONTROL=""
+
+result=$(build)
+assert_status "and the rendered names build" 0 "$(status_of "$result")"
 
 mark_payload
 rm -f -- "${repo}/cogs/wake_params.textproto"
@@ -421,20 +562,21 @@ assert_eq "and the payload is the layout again" "$staged_before" \
 real_repo=$(cd -- "${script_dir}/.." && pwd)
 
 # The labels inside one filegroup's srcs, sorted. The `name = "..."` line's own
-# string is not a label and does not match, because a label starts with `//` or
-# `:`; the visibility list's labels do match and are skipped by attribute name.
+# string is not a label and does not match, because a label starts with `//`, `:`
+# or `@`; the visibility list's labels do match and are skipped by attribute
+# name.
 labels_of() {
 	awk -v want="$1" '
 		index($0, "name = \"" want "\"") { inside = 1 }
 		inside && /^\)/ { inside = 0 }
 		inside && /visibility/ { next }
-		inside && match($0, /"(\/\/|:)[^"]*"/) {
+		inside && match($0, /"(\/\/|:|@)[^"]*"/) {
 			print substr($0, RSTART + 1, RLENGTH - 2)
 		}
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|exe_target|system_target)=' \
+script_labels=$(grep -E '^(motord_target|exe_target|system_target|launcher_target|launch_config_target|prelaunch_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
 assert_eq "the payload's members are exactly the labels this script cqueries" \

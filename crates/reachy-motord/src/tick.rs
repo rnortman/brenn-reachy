@@ -319,6 +319,37 @@ impl<P: BusPort> Tick<P> {
         self.counts
     }
 
+    /// Whether anything about torque is still outstanding: a row believed
+    /// torqued, or a commanded de-torquing whose confirmation pass is still
+    /// running.
+    ///
+    /// What a stop gesture asks before deciding whether it has work to do. An
+    /// unconcluded pass counts as well as the belief because a de-torquing
+    /// nobody has read back is not one anything here may call done — the belief
+    /// being empty says a verified write said so, not that a servo answered a
+    /// register read. A pass that has read every row back released is the one
+    /// state where there is nothing outstanding to do.
+    pub fn torque_outstanding(&mut self) -> bool {
+        let believed = {
+            let (_, slot) = self.state.decide();
+            AuxSlot::over(slot).belief().any()
+        };
+        let confirming = {
+            let pass = self.state.confirming();
+            let state = pass.state();
+            state.active.get() && !state.said_confirmed.get()
+        };
+        believed || confirming
+    }
+
+    /// What the running confirmation pass has said, if it has said anything.
+    ///
+    /// Each verdict goes out once; a caller that missed the cycle it went out
+    /// on would wait for a second one that never comes.
+    pub fn confirm_said(&mut self) -> Option<ConfirmReport> {
+        self.state.confirming().said()
+    }
+
     /// Offer a setpoint that arrived over the seam to the gate.
     ///
     /// Accepting one is liveness: it is the evidence that whatever is supposed

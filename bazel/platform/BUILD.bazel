@@ -31,15 +31,23 @@ platform(
 )
 
 # What a motion run on a unit is built out of: the driver binary, the executable
-# both cog processes start from, and the system target that emits their process
-# descriptions and the writer's channel set. tools/build-motion.sh builds this,
-# so the payload it stages and the set the gate covers are one set.
+# both cog processes start from, the system target that emits their process
+# descriptions and the writer's channel set, the launcher that starts all three
+# processes, and the launcher config naming them. tools/build-motion.sh builds
+# this, so the payload it stages and the set the gate covers are one set.
+#
+# The launcher is C++ from the drop rather than anything of ours, so it is also
+# what makes `make check-device` gate a cross-build of boost, protobuf and
+# abseil for the device.
 filegroup(
     name = "motion_payload",
     srcs = [
+        "//cogs:clockwork_prelaunch_sh",
         "//cogs:robot_clk_exe",
+        "//cogs:robotcpu.textproto",
         "//cogs:system_robot_clk",
         "//crates/reachy-motord:reachy_motord",
+        "@clockwork//jewels/simplelaunch:simplelaunch",
     ],
     visibility = ["//visibility:public"],
 )

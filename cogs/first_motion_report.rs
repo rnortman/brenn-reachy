@@ -66,17 +66,25 @@ use reachy_motion::tick::{
 /// head's own weight, and a real leg sits wherever its load leaves it. A
 /// scenario asserts a thousand times tighter than this because its plant is
 /// arithmetic; asserting that here would fail every hardware run on physics.
+///
+/// Nobody has measured this machine. This figure and the two below were sized
+/// from the mechanism on paper, so what they are is a guess of the right order
+/// -- the first hardware runs are what turn them into knowledge, and until then
+/// a verdict that turns on one of them is a verdict about a number an agent
+/// chose. The runbook's first-run checks say to confirm or reset all three
+/// before reading a report as a pass or a fail.
 const ARRIVAL_OFFSET_M: f64 = 5e-3;
 
 /// How far the head's orientation may be from the posture it was sent to,
-/// radians, on the same terms.
+/// radians, on the same terms, and unmeasured on the same terms.
 const ARRIVAL_TURN_RAD: f64 = 0.05;
 
 /// How far an antenna may point away from where the posture puts it, radians.
 ///
 /// Looser than the head's: an antenna is a thin rod on an unloaded shaft with no
 /// travel limit, and where its tip ends up is the one thing on this machine
-/// nothing measures except the servo's own encoder.
+/// nothing measures except the servo's own encoder. Also unmeasured: the ratio
+/// to the head's figure is an argument, not an observation.
 const ARRIVAL_ANTENNA_RAD: f64 = 0.1;
 
 // The tolerances above are a machine's and not a solver's, which is the whole
@@ -125,6 +133,19 @@ struct Run {
     /// Anything that went wrong reading the log itself. Every one of these is a
     /// failure of the run.
     complaints: Complaints,
+    /// How far a sample's nominal instant may sit off the run's own grid and
+    /// still count as sitting on it, in nanoseconds.
+    ///
+    /// Zero, and that is the figure a machine's log is read with: a driver
+    /// computes each cycle's instant from an absolute grid rather than measuring
+    /// it, so its samples land on exact multiples of the period and any offset at
+    /// all is arithmetic that stopped working.
+    ///
+    /// It is a knob because one thing that produces this log is not a driver: the
+    /// host smoke run's plant is a cog woken by the wall-clock runner, and what it
+    /// stamps a sample with is when it actually ran. That jitter is the runner's,
+    /// not the system's, and a run of it says so on the command line.
+    grid_jitter_ns: i64,
 }
 
 impl Streams for Run {
@@ -263,6 +284,25 @@ impl Grid {
             elapsed.rem_euclid(self.period_ns),
         )
     }
+
+    /// The same, with an instant within `jitter_ns` of a cycle counted as being
+    /// on it.
+    ///
+    /// An instant that arrived late is over its own cycle's mark by the offset;
+    /// one that arrived early is under the *next* cycle's, which the remainder
+    /// reports as nearly a whole period. So both ends of the band are checked and
+    /// the answer is the cycle the instant is nearest, with a zero offset when it
+    /// is inside the band.
+    fn within(&self, nominal_ns: i64, jitter_ns: i64) -> (i64, i64) {
+        let (cycle, off) = self.at(nominal_ns);
+        if off <= jitter_ns {
+            (cycle, 0)
+        } else if off >= self.period_ns - jitter_ns {
+            (cycle + 1, 0)
+        } else {
+            (cycle, off)
+        }
+    }
 }
 
 /// The driver's heartbeat: one sample per cycle, on one grid, without a gap.
@@ -288,7 +328,7 @@ fn heartbeat(run: &Run, report: &mut Report) -> Option<Grid> {
     let mut repeated = 0_usize;
     for sample in &run.samples {
         let at = sample.message.nominal_time().as_nanos();
-        let (cycle, off) = grid.at(at);
+        let (cycle, off) = grid.within(at, run.grid_jitter_ns);
         // Whatever the sample turns out to be, the cycle it names is one the
         // stream has now reached: the position never moves backwards and never
         // stays put across a sample that failed a check of its own. A cycle
@@ -1056,9 +1096,19 @@ fn analyze(run: &Run) -> Report {
 /// on the terminal. The exit status is the verdict.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [log_dir] = args.as_slice() else {
-        eprintln!("usage: first_motion_report <log-dir>");
-        return ExitCode::FAILURE;
+    let (log_dir, jitter_ns) = match args.as_slice() {
+        [dir] => (dir, 0_i64),
+        [flag, value, dir] if flag == "--grid-jitter-ns" => match value.parse::<i64>() {
+            Ok(ns) if ns >= 0 => (dir, ns),
+            _ => {
+                eprintln!("--grid-jitter-ns takes a whole number of nanoseconds, not {value}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => {
+            eprintln!("usage: first_motion_report [--grid-jitter-ns <n>] <log-dir>");
+            return ExitCode::FAILURE;
+        }
     };
     let run = match Run::read(&PathBuf::from(log_dir)) {
         Ok(run) => run,
@@ -1066,6 +1116,10 @@ fn main() -> ExitCode {
             eprintln!("reading the log under {log_dir}: {err}");
             return ExitCode::FAILURE;
         }
+    };
+    let run = Run {
+        grid_jitter_ns: jitter_ns,
+        ..run
     };
     let report = analyze(&run);
     println!("first_motion_report over {log_dir}");
@@ -1331,6 +1385,71 @@ mod tests {
                 .iter()
                 .any(|finding| finding.contains("heartbeat skips from cycle 9 to cycle 20")),
             "the gap went unreported"
+        );
+    }
+
+    /// A jitter band moves what counts as on the grid, and nothing else.
+    #[test]
+    fn a_sample_inside_the_jitter_band_sits_on_its_cycle() {
+        // Built twice rather than cloned: a logged wire message is not `Clone`.
+        let jittered = || {
+            let mut samples = heartbeat(10);
+            let mut late = sample(4);
+            late.set_nominal_time(SyncTime::from_nanos(T0 + 4 * NOMINAL_CYCLE_NS + 400_000));
+            samples[4] = at(4, late);
+            let mut early = sample(6);
+            early.set_nominal_time(SyncTime::from_nanos(T0 + 6 * NOMINAL_CYCLE_NS - 400_000));
+            samples[6] = at(6, early);
+            samples
+        };
+        let report = analyze(&Run {
+            samples: jittered(),
+            grid_jitter_ns: 1_000_000,
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "off the"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "skips from") + findings_about(&report, "already read"),
+            0,
+            "a sample inside the band was read as a gap or a repeat: {:?}",
+            report.findings
+        );
+
+        // The same two samples with no band: both are off the grid, and the
+        // default is no band.
+        let report = analyze(&Run {
+            samples: jittered(),
+            ..Run::default()
+        });
+        assert!(
+            findings_about(&report, "off the") > 0,
+            "the band is not the default: {:?}",
+            report.findings
+        );
+    }
+
+    /// A sample outside the band is off the grid, band or no band.
+    #[test]
+    fn a_sample_past_the_jitter_band_is_still_off_the_grid() {
+        let mut samples = heartbeat(10);
+        let mut adrift = sample(5);
+        adrift.set_nominal_time(SyncTime::from_nanos(T0 + 5 * NOMINAL_CYCLE_NS + 4_000_000));
+        samples[5] = at(5, adrift);
+        let report = analyze(&Run {
+            samples,
+            grid_jitter_ns: 1_000_000,
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "off the"),
+            1,
+            "{:?}",
+            report.findings
         );
     }
 

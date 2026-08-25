@@ -227,8 +227,10 @@ pub struct ProvisionSection {
     pub return_delay_time: u8,
     /// Drive Mode, all nine.
     pub drive_mode: u8,
-    /// Bus Watchdog, all nine. Disabled: on this linkage a servo that stops
-    /// holding its goal drops the head.
+    /// Bus Watchdog, all nine. The provisioned baseline of 0, the disabled
+    /// register: a motion session arms it per commissioning sweep, and the
+    /// register resets to 0 at power-on, so this is exact over a unit that has
+    /// been power-cycled since its last session.
     pub bus_watchdog: u8,
     /// Temperature Limit, all nine.
     pub temperature_limit: u8,

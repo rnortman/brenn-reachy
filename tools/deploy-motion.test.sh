@@ -9,14 +9,19 @@
 # `repo_root` is that tree and the payload it pushes is a directory this test
 # made.
 #
-# What is worth pinning: the refusals, and the two numbers this script must not
-# retype. The refusals are a stale payload and a held servo bus — a refusal that
-# quietly stops refusing is discovered on the night it should have saved. The two
-# numbers are the pinion namespace and the shm root: both are stated once in
-# `cogs/robot_logger.textproto`, both have to appear in the commands that start
-# the two processes, and a mismatch is silent in the worst direction — the logger
-# comes up, finds no channels under its namespace, and writes an empty log while
-# the gesture runs perfectly.
+# What is worth pinning: the refusals, and the commands. The refusals are a stale
+# payload, a held servo bus, and a fetch that brought no records — a refusal that
+# quietly stops refusing is discovered on the night it should have saved. The
+# commands are what a person types with their eyes on a machine that can move, so
+# they are pinned to the letter: one launcher started from the release root with
+# the config the payload carries, the log files to watch, the observation step
+# that has to happen while the unit is still up, and the stop gesture.
+#
+# The only value read out of the staged configuration is the log root. The
+# pinion namespace and shm root are enforced at build time: nothing this script
+# prints carries a pinion flag, because the launcher config cannot, and the
+# build refuses a payload whose logger configuration does not restate the
+# compiled-in defaults.
 #
 # Run as a plain program; exits 0 on pass, non-zero on failure.
 
@@ -41,9 +46,8 @@ subject="${repo}/tools/deploy-motion.sh"
 # The logger configuration as the build stages it, in the syntax the real one is
 # written in: one field per line, strings quoted, and one of them indented — the
 # subject reads a scalar wherever the line puts it, so the file's formatting is
-# not load-bearing. These are the values every command below has to carry, and
-# they are deliberately not the shipped ones: a subject that hardcoded the real
-# ones would pass a test written against them.
+# not load-bearing. The log root here is deliberately not the shipped one: a
+# subject that hardcoded the real one would pass a test written against it.
 #
 # It sits in the payload, not in the tree. What the device will run is what was
 # staged, and a value printed from a tree edited since the last build describes
@@ -56,8 +60,8 @@ stage_logger_config() {
 	cat >"$logger_config" <<'CONFIG'
 # a comment, and a field name inside it: log_root_dir: "/decoy"
 log_root_dir: "/run/brenn-app/logs/testing"
-  pinion_shm_root: "/dev/shm-under-test"
-pinion_namespace: "undertest"
+  pinion_shm_root: "/dev/shm"
+pinion_namespace: ""
 max_write_mib_per_sec: 4
 CONFIG
 }
@@ -71,16 +75,19 @@ pinion_shm_root: "/dev/shm-from-the-tree"
 pinion_namespace: "fromthetree"
 CONFIG
 
+# The payload as the build stages it: three executables at the paths the launcher
+# config spells, the launcher config itself, and the configuration the modes read.
 stage_payload() {
 	local when=$1
 	local name
-	for name in reachy_motord robot_clk_exe; do
+	for name in reachy_motord cogs/robot_clk_exe simplelaunch; do
 		: >"${payload}/${name}"
 		chmod 0755 -- "${payload}/${name}"
 	done
+	: >"${payload}/robotcpu.textproto"
 	: >"${payload}/cogs/session_params.textproto"
 	stage_logger_config
-	touch -d "@${when}" -- "${payload}/robot_clk_exe"
+	touch -d "@${when}" -- "${payload}/cogs/robot_clk_exe"
 }
 
 stubs="${work}/bin"
@@ -92,6 +99,7 @@ export CALLS="${work}/calls"
 export GIT_COMMIT_TIME=""
 export SSH_PREPARE_STATUS=0
 export RSYNC_STATUS=0
+export RSYNC_OLOG=full
 
 # Every stub records its whole invocation on one line, so a case can assert both
 # that a command ran and that it did not.
@@ -101,10 +109,33 @@ printf 'ssh %s\n' "$*" >>"$CALLS"
 exit "${SSH_PREPARE_STATUS:-0}"
 STUB
 
+# rsync also has to *bring something back*, because the fetch decides on what
+# arrived: a run's records are a `.olog` with bytes in it, and a fetch that
+# brought none is refused. RSYNC_OLOG says what this invocation delivers into the
+# destination — a whole run, an empty file, or nothing at all.
 cat >"${stubs}/rsync" <<'STUB'
 #!/usr/bin/env bash
 printf 'rsync %s\n' "$*" >>"$CALLS"
-exit "${RSYNC_STATUS:-0}"
+status=${RSYNC_STATUS:-0}
+# A push's last argument is the remote destination and a fetch's is a local
+# directory, so this only delivers into the latter: writing into `root@host:/...`
+# as a relative path is how a stub makes a directory in the checkout.
+if [ "$status" = 0 ]; then
+	dest=${*: -1}
+	case "$dest" in *@*:*) exit 0 ;; esac
+	case "${RSYNC_OLOG:-full}" in
+		full)
+			mkdir -p -- "${dest}/run-20260825T120000Z"
+			echo records >"${dest}/run-20260825T120000Z/motion_0.olog"
+			;;
+		empty)
+			mkdir -p -- "${dest}/run-20260825T120000Z"
+			: >"${dest}/run-20260825T120000Z/motion_0.olog"
+			;;
+		none) ;;
+	esac
+fi
+exit "$status"
 STUB
 
 # The repository question the freshness check asks. An empty GIT_COMMIT_TIME is a
@@ -181,6 +212,23 @@ assert_lacks "a payload missing a binary is not reported as a stale one" \
 	"$(output_of "$result")" "older than the newest commit"
 stage_payload "$after"
 
+# The launcher is a payload binary like the other two: without it there is
+# nothing to start the run with, and the check is at the path the launcher config
+# spells rather than wherever the file happens to be.
+rm -f -- "${payload}/simplelaunch"
+result=$(deploy unit --push)
+assert_status "a payload missing the launcher refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names it" "$(output_of "$result")" "no executable simplelaunch"
+stage_payload "$after"
+
+rm -f -- "${payload}/cogs/robot_clk_exe"
+result=$(deploy unit --push)
+assert_status "a payload with the executable outside cogs/ refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path the launcher config spells" \
+	"$(output_of "$result")" "no executable cogs/robot_clk_exe"
+stage_payload "$after"
+
 rm -rf -- "$payload"
 result=$(deploy unit --push)
 assert_status "no payload at all refuses" 1 "$(status_of "$result")"
@@ -234,45 +282,48 @@ SSH_PREPARE_STATUS=0
 result=$(deploy unit --commands)
 printed=$(output_of "$result")
 assert_status "the commands print" 0 "$(status_of "$result")"
-assert_contains "the driver is started from the release directory" "$printed" \
-	"cd /run/brenn-app/releases/motion"
-assert_contains "the driver comes first" "$printed" "./reachy_motord"
-assert_contains "the logger is the executable plus its own description" "$printed" \
-	"./robot_clk_exe cogs/brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon --pinion-dir /dev/shm-under-test --pinion-ns undertest"
-assert_contains "the control loop is the same executable plus its own" "$printed" \
-	"./robot_clk_exe cogs/brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon --pinion-dir /dev/shm-under-test --pinion-ns undertest"
-assert_lacks "neither process asks for the deterministic runner" "$printed" \
-	"--deterministic-runner"
-assert_lacks "the namespace is read, not the shipped one retyped" "$printed" '--pinion-ns motion'
+assert_contains "one launcher, started from the release directory" "$printed" \
+	"cd /run/brenn-app/releases/motion && ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch"
+assert_lacks "and no process is started by hand" "$printed" "./robot_clk_exe"
+assert_lacks "not even the driver" "$printed" "./reachy_motord"
+assert_lacks "nothing carries a pinion flag any more" "$printed" "--pinion-"
+assert_lacks "and no start order is prescribed" "$printed" "in this order"
+
+assert_contains "the driver's console log is named" "$printed" \
+	"tail -f /run/brenn-app/logs/launch/motord_0.log"
+assert_contains "the control loop's is too" "$printed" \
+	"tail -f /run/brenn-app/logs/launch/proc_0.log"
+assert_contains "and the logger's" "$printed" \
+	"tail -f /run/brenn-app/logs/launch/logger_proc_0.log"
+
+# The observation step: whether the run wrote records is a question about the
+# unit, answered while the unit is still up. The log root comes out of the staged
+# configuration, like every other path this script prints.
+assert_contains "the records are looked at before power-down" "$printed" \
+	"ls -l /run/brenn-app/logs/testing/*/"
+assert_lacks "the log root is read, not retyped" "$printed" "/decoy"
 assert_lacks "and read out of the payload, not out of the tree" "$printed" "fromthetree"
+
+assert_contains "the stop gesture is named" "$printed" "curl -X POST 127.0.0.1:8080/quit"
 assert_lacks "printing commands reaches no device" "$(calls)" "ssh"
 
-# A configuration that lost the field the commands need is a refusal, not a
-# command with an empty flag.
-sed -i '/^pinion_namespace:/d' -- "$logger_config"
+# A configuration that lost the one field the commands need is a refusal, not a
+# command naming nothing.
+sed -i '/^log_root_dir:/d' -- "$logger_config"
 result=$(deploy unit --commands)
-assert_status "a configuration with no namespace refuses" 1 "$(status_of "$result")"
+assert_status "a configuration with no log root refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names the field" "$(output_of "$result")" \
-	"states no pinion_namespace"
-stage_logger_config
-
-# A field that is there and says nothing is its own refusal: to every caller it
-# is the same as a missing field, but it is a different edit to make.
-sed -i 's|^pinion_namespace: .*|pinion_namespace: ""|' -- "$logger_config"
-result=$(deploy unit --commands)
-assert_status "a configuration with an empty namespace refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal says it is empty" "$(output_of "$result")" \
-	"states an empty pinion_namespace"
+	"states no log_root_dir"
 stage_logger_config
 
 # ---------------------------------------------------------------------------
 # Values that mean something to a shell
 # ---------------------------------------------------------------------------
 #
-# These three values are pasted into a remote command run as root, a remote rsync
-# path the far end re-parses, and a local command a person copies. A value with a
-# space in it means a different thing at each of those sites, so it is refused
-# where it is read rather than quoted differently three times.
+# The log root is pasted into a remote command run as root, a remote rsync path
+# the far end re-parses, and a local command a person copies. A value with a space
+# in it means a different thing at each of those sites, so it is refused where it
+# is read rather than quoted differently three times.
 
 sed -i 's|^log_root_dir: .*|log_root_dir: "/run/brenn-app/logs/two words"|' -- "$logger_config"
 result=$(deploy unit --push)
@@ -286,11 +337,11 @@ assert_status "and the fetch refuses the same value" 1 "$(status_of "$result")"
 assert_lacks "the fetch reaches no device" "$(calls)" "rsync"
 stage_logger_config
 
-sed -i 's|^  pinion_shm_root: .*|  pinion_shm_root: "/dev/shm; rm -rf /"|' -- "$logger_config"
+sed -i 's|^log_root_dir: .*|log_root_dir: "/run/brenn-app/logs; rm -rf /"|' -- "$logger_config"
 result=$(deploy unit --commands)
-assert_status "a shm root carrying a command refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal names that field" "$(output_of "$result")" \
-	"pinion_shm_root is '/dev/shm; rm -rf /'"
+assert_status "a log root carrying a command refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names that field and its value" "$(output_of "$result")" \
+	"log_root_dir is '/run/brenn-app/logs; rm -rf /'"
 stage_logger_config
 
 # The shipped shapes are accepted, so the check above is a check on values and
@@ -315,6 +366,35 @@ else
 	fail "the fetch lands in one stamped directory" "found ${fetched}"
 fi
 assert_lacks "nothing partial is left behind" "$(find "$dest" -maxdepth 1)" ".part"
+
+# A fetch that succeeded and brought nothing readable is a refusal. rsync is
+# happy about an empty source, so its status says nothing about whether the run
+# logged — and the report command printed over an empty directory is how a
+# namespace mismatch used to survive a whole bench session unnoticed.
+empty_dest="${work}/records-empty"
+RSYNC_OLOG=none
+result=$(deploy unit --fetch "$empty_dest")
+assert_status "a fetch that brought nothing refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says there are no records" "$(output_of "$result")" \
+	"no .olog with anything in it"
+assert_contains "and says where the logger was told to look" "$(output_of "$result")" \
+	"cogs/robot_logger.textproto"
+assert_lacks "and does not offer the analyzer over nothing" "$(output_of "$result")" \
+	"first_motion_report"
+assert_eq "and keeps nothing" 0 \
+	"$(find "$empty_dest" -mindepth 1 -maxdepth 1 | wc -l)"
+
+# A zero-length `.olog` is the same refusal: the writer opened a file and the run
+# put nothing in it.
+zero_dest="${work}/records-zero"
+RSYNC_OLOG=empty
+result=$(deploy unit --fetch "$zero_dest")
+assert_status "a fetch that brought an empty .olog refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says the same thing" "$(output_of "$result")" \
+	"no .olog with anything in it"
+assert_eq "and keeps nothing either" 0 \
+	"$(find "$zero_dest" -mindepth 1 -maxdepth 1 | wc -l)"
+RSYNC_OLOG=full
 
 # Its own destination, because the fetch above may have been in this same second
 # and a stamp collision is now its own refusal — which is the case after this
@@ -392,9 +472,8 @@ assert_lacks "and that pushes nothing either" "$(calls)" "rsync"
 # --push refuses earlier, at its own directory check. These two reach the
 # configuration reader itself, whose refusal is the one that says to build. The
 # direction that matters is silence: a reader that answered empty instead of
-# refusing would print start commands with empty --pinion-dir/--pinion-ns flags,
-# and the logger would come up, find no channels and write an empty log while the
-# gesture ran perfectly.
+# refusing would make the unit's log directory, and later look for a run's
+# records, at a path naming nothing.
 
 rm -rf -- "$payload"
 result=$(deploy unit --commands)

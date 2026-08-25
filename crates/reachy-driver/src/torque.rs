@@ -372,6 +372,21 @@ impl<'a> TorqueOffConfirm<'a> {
         }
     }
 
+    /// What this pass has already said, if it has said anything.
+    ///
+    /// Each verdict goes out once, on the cycle it is reached; a caller that
+    /// missed that cycle has no second chance at it.
+    #[must_use]
+    pub fn said(&self) -> Option<ConfirmReport> {
+        if self.state.said_confirmed.get() {
+            Some(ConfirmReport::Confirmed)
+        } else if self.state.said_unconfirmed.get() {
+            Some(ConfirmReport::Unconfirmed)
+        } else {
+            None
+        }
+    }
+
     /// The row this pass is waiting on, if any.
     #[must_use]
     pub fn waiting_on(&self) -> Option<u8> {

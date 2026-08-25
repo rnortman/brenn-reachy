@@ -1,0 +1,379 @@
+// The online system on a workstation: the real control loop, and the modelled
+// machine behind the real seam.
+//
+// What this exists for is configuration, not physics. The online composition
+// next door -- the control process, the logger process, the process
+// descriptions, the shared-memory namespace, the log writer's own open -- has no
+// way to be exercised without a powered unit, so every one of those facts is
+// first tried at a machine that can move. This module closes that gap: the same
+// `robot::RobotBox`, unmodified, talking over the same six loopback ports to the
+// simulated plant the deterministic scenarios already prove, all of it under the
+// same launcher. A run either produces a log that shows the wake gesture or it
+// names the configuration that is wrong, on a workstation, for free.
+//
+// The plant is `sim::MotorSim` as it stands. It consumes and produces exactly
+// the six subjects the seam carries, and the seam's wire format is each schema's
+// Tachyon bytes at their own size -- which is what a `udp_socket` declaration
+// reads and writes. So the stand-in for `reachy-motord` here is not a program of
+// its own: it is that cog, in a process of its own, with sockets where `SimBox`
+// wires channel to channel. Nothing about the plant is re-implemented and
+// nothing about it is configured differently -- `cogs/sim_params.textproto` is
+// the file ten scenarios run on.
+//
+// The channels below are this module's own rather than `motion`'s, and that is
+// forced: every channel has exactly one publisher, and in this system the
+// control box's incoming sockets are the publishers of the `motion` channels the
+// driver fills. The plant's ends therefore need channels of their own, one per
+// subject, sized as their counterparts are. The seam between them is the
+// sockets, which is the point -- a datagram really is encoded, sent, received
+// and decoded here, exactly as it will be on a unit.
+//
+// `MotorSim` runs on `time_since_last_exec(20ms)`, which under the wall-clock
+// runner is the wall clock rather than a simulated grid. None of the reasons the
+// real driver cannot be a cog applies to it: it holds no serial port, blocks on
+// nothing, and owns no I/O but its own channels.
+//
+// What a run of this proves is the composition and the configuration -- the
+// process descriptions, the pinion namespace, the launcher config, the seam's
+// wire contract, the writer's open, and the analyzer over what it wrote. What it
+// cannot prove: serial timing, this device's kernel, aarch64, and anything at
+// all about real servos. Those belong to the unit and to the bench's own
+// self-tests.
+//
+// The foot of this file is the composition: the two boxes, the machine they run
+// on, and the three processes that host them -- here rather than in the system
+// module next door because the grammar admits a `system_target` only in a module
+// that generates nothing, and a process needs a module that generates an
+// executable.
+
+#![generate(cpp, cpp_exe)]
+#![cpp(namespace=brenn_reachy::robot_host)]
+
+use [cpp, proto, proto_conv] cogs::config;
+use cogs::robot;
+use cogs::session_cmd;
+use cogs::sim;
+use cogs::sim_state;
+use driver::goal;
+use driver::health;
+use driver::pose;
+use @clockwork::clockwork::logging::log_writer_config;
+use [cpp, proto, proto_conv] @clockwork::clockwork::logging::writers::channel_message_rates_config;
+use @clockwork::clockwork::logging::writers::logger;
+use [] @clockwork::clockwork::logging::writers::logger_channels;
+use [cpp, proto, proto_conv] @clockwork::clockwork::logging::writers::logger_config;
+use @clockwork::clockwork::logging::writers::logger_status;
+
+// The goal stream as the plant sees it: what arrived on the goal port, before
+// the gate decides which setpoint is due. Sized as `motion::DriverCmd` is, for
+// the same reason -- a goal the plant never saw is a goal the machine was never
+// asked for.
+channel HostGoalChan
+{
+    message_type: Tachyon<goal::GoalSetpoint>;
+    max_num_messages: 16;
+}
+
+// What the session asked the driver for, as it arrives on the session port.
+// Sized as `motion::SessionCmdChan` is: each datagram is liveness as well as a
+// request.
+channel HostSessionCmdChan
+{
+    message_type: Tachyon<session_cmd::SessionCmd>;
+    max_num_messages: 16;
+}
+
+// The plant's sample stream on its way out, and the plant's own read-back of it
+// for the wire sequence number. Sized as `motion::DriverPose` is.
+channel HostPoseChan
+{
+    message_type: Tachyon<pose::PoseSample>;
+    max_num_messages: 16;
+}
+
+// The edges the plant reported, on their way out.
+channel HostEvtChan
+{
+    message_type: Tachyon<health::DriverEvent>;
+    max_num_messages: 16;
+}
+
+// How one out-of-band transaction turned out, on its way out.
+channel HostAuxOutChan
+{
+    message_type: Tachyon<health::AuxOutcome>;
+    max_num_messages: 8;
+}
+
+// What the plant's rotating read of the status registers saw, on its way out.
+channel HostHealthChan
+{
+    message_type: Tachyon<health::HealthReport>;
+    max_num_messages: 16;
+}
+
+// The plant's injection channel, with nothing in it, ever.
+//
+// A scenario reaches the modelled world through this channel: jam a joint, write
+// an error byte, drop a cycle's replies. An online run has no such hand -- what
+// the plant does is whatever the control loop asks of it and nothing else -- so
+// this channel exists only because the plant's view of it is not optional and
+// every channel in a system must have a publisher. Its publisher is
+// `HostSimCmdIn` below, a bound port nothing sends to, so the plant reads the
+// empty view pinion gives a consumer of a channel nobody has published on. That
+// is exactly the no-injections behaviour wanted here.
+//
+// A cog that publishes nothing would have served equally, and would have had to
+// be C++: the Rust generator refuses a module that declares a `udp_socket`. A
+// bound port that nothing addresses costs a file descriptor and says the same
+// thing.
+//
+// Sized as the scenarios' own is, so the two cannot be read as different
+// channels.
+channel HostSimCmdChan
+{
+    message_type: Tachyon<sim_state::SimCmd>;
+    max_num_messages: 16;
+}
+
+// The goal port, bound by the plant. This is the port `reachy-motord` binds on a
+// unit, and this socket is the whole of what stands where it does.
+//
+// Loopback, and the trust that comes with it is the seam's own, stated once at
+// `robot.clk`'s sockets and unchanged by anything here: nothing off this machine
+// can reach these ports, any process on it can. On a workstation the sockets are
+// also the reason two runs cannot share a host -- both would bind the same six
+// ports -- which is the same refusal the launcher makes first, by name.
+udp_socket HostGoalIn
+{
+    address: 127.0.0.1;
+    port: 7401;
+    direction: incoming;
+    message_type: Tachyon<goal::GoalSetpoint>;
+}
+
+// The session port, bound by the plant: keep the dead-man fed, take torque off,
+// run this transaction.
+udp_socket HostSessionIn
+{
+    address: 127.0.0.1;
+    port: 7406;
+    direction: incoming;
+    message_type: Tachyon<session_cmd::SessionCmd>;
+}
+
+// The injection port: bound, listened on, and never sent to. It is the publisher
+// `HostSimCmdChan` names above, where the reason that channel must have one is
+// stated.
+//
+// It is deliberately not one of the seam's six: a datagram on this seam is
+// identified by the port it arrived on, and this subject exists in no driver.
+udp_socket HostSimCmdIn
+{
+    address: 127.0.0.1;
+    port: 7407;
+    direction: incoming;
+    message_type: Tachyon<sim_state::SimCmd>;
+}
+
+// The sample stream, leaving for the control process. `port` on an outgoing
+// socket is the destination -- 7402 is the port the control box binds, not one
+// this process holds.
+udp_socket HostPoseOut
+{
+    address: 127.0.0.1;
+    port: 7402;
+    direction: outgoing;
+    message_type: Tachyon<pose::PoseSample>;
+}
+
+// The edges the plant reported, leaving.
+udp_socket HostEvtOut
+{
+    address: 127.0.0.1;
+    port: 7403;
+    direction: outgoing;
+    message_type: Tachyon<health::DriverEvent>;
+}
+
+// How one out-of-band transaction turned out, leaving.
+udp_socket HostAuxOutOut
+{
+    address: 127.0.0.1;
+    port: 7404;
+    direction: outgoing;
+    message_type: Tachyon<health::AuxOutcome>;
+}
+
+// What the rotating read saw, leaving.
+udp_socket HostHealthOut
+{
+    address: 127.0.0.1;
+    port: 7405;
+    direction: outgoing;
+    message_type: Tachyon<health::HealthReport>;
+}
+
+// The driver's half, hosted: the modelled plant with the seam's own sockets on
+// every edge it has.
+//
+// `SimBox` is the wiring template and this is that wiring with a socket and a
+// channel of its own inserted in each edge. The plant's own loop -- reading back
+// the last sample it published for the wire sequence number -- is closed here
+// too, off this box's pose channel rather than off `motion::DriverPose`, because
+// in this system that channel belongs to the control process.
+box SimDriver
+{
+    new plant: sim::MotorSim;
+
+    // The plant's own slot, written by nothing else. No `init=`, so it is
+    // default-constructed into a buffer the compiler synthesizes.
+    new plant_state: State(representation=Tachyon<sim_state::SimState>);
+    connect plant_state to plant.sim;
+
+    // The cycle, the dead-man and the modelled servos' speed: the scenarios'
+    // own file, unchanged, so the plant here is the plant they prove.
+    new plant_params: SerializedDataFile(
+        representation=Protobuf<config::SimParams>,
+        path="cogs/sim_params.textproto");
+    connect plant_params to plant.params;
+
+    // What the control process asked for, off the wire.
+    new goal_in: HostGoalIn;
+    connect goal_in to HostGoalChan;
+    connect HostGoalChan to plant.goals;
+
+    new session_in: HostSessionIn;
+    connect session_in to HostSessionCmdChan;
+    connect HostSessionCmdChan to plant.session_cmds;
+
+    // The hand that is not here.
+    new sim_cmd_in: HostSimCmdIn;
+    connect sim_cmd_in to HostSimCmdChan;
+    connect HostSimCmdChan to plant.cmds;
+
+    // The sample stream: out on the wire, and back into the plant.
+    connect plant.pose to HostPoseChan;
+    connect HostPoseChan to plant.own_pose;
+    new pose_out: HostPoseOut;
+    connect HostPoseChan to pose_out;
+
+    connect plant.evt to HostEvtChan;
+    new evt_out: HostEvtOut;
+    connect HostEvtChan to evt_out;
+
+    connect plant.aux_out to HostAuxOutChan;
+    new aux_out: HostAuxOutOut;
+    connect HostAuxOutChan to aux_out;
+
+    connect plant.health_out to HostHealthChan;
+    new health_out: HostHealthOut;
+    connect HostHealthChan to health_out;
+}
+
+// What writes a host run down: the framework's two writer cogs, in a process of
+// their own, exactly as the device composition has them.
+//
+// A duplicate of `robot::RobotLogger` and not a parameterization of it, because
+// the two files it binds are bound by literal path: the writer's channel set
+// comes out of *this* system's target, and the log root is a directory on this
+// workstation. A box that took either as a parameter would be a box that can be
+// pointed at a device path from a host run, which is the class of configuration
+// lie this whole module exists to catch.
+//
+// Logging is observation only here as well: no channel leaves this box, so a
+// logger that died costs the run its records and nothing else.
+box RobotLoggerHost
+{
+    new init_cog: logger::LoggerInitCog;
+    new status_publisher_cog: logger::LoggerStatusPublisherCog;
+
+    // The writer's arena, sized as the device's is: one second of the configured
+    // write rate plus the 8 MiB schema reserve, in 256 KiB buffers, and headroom
+    // for the per-channel bookkeeping.
+    new memory: HeapMemory(max_size=33'554'432);
+
+    // Which channels are written, generated from this system's own logging
+    // policies. The same set the device system logs, so one analyzer reads
+    // either log.
+    new logged_channels: SerializedDataFile(
+        representation=Tachyon<log_writer_config::LogWriterConfig<>>,
+        path="cogs/system_host.motion_host.HostCpu_event_logger_config.tachyon");
+    connect logged_channels to init_cog.log_writer_config;
+
+    // Where the records go and where the channels are read from. A host path,
+    // and the same flagless pinion defaults every process in every one of these
+    // systems runs on.
+    new logger_params: SerializedDataFile(
+        representation=Protobuf<logger_config::LoggerConfig>,
+        path="cogs/host_logger.textproto");
+    connect logger_params to init_cog.logger_config;
+
+    // What counts as a channel gone quiet, for the status message only: the
+    // device's own file, because the rates are the system's and not the host's.
+    new rate_floors: SerializedDataFile(
+        representation=Protobuf<channel_message_rates_config::ChannelMessageRatesConfig>,
+        path="cogs/robot_logger_rates.textproto");
+    connect rate_floors to init_cog.channel_rates_config;
+
+    // The writer itself, built on the first execution and kept from then on. It
+    // holds a file descriptor and an io_uring across executions, which is why it
+    // is an extern type in a state slot rather than anything schema-resident.
+    new state: State(
+        representation=logger::LoggerCogState,
+        memory_resource=memory,
+        init=init_cog.logger_state);
+    connect state to status_publisher_cog.logger_state;
+
+    // What the logger says about itself, logged like anything else.
+    connect init_cog.logger_config_out to logger_channels::LoggerConfigChannel;
+    connect status_publisher_cog.logger_status to logger_channels::LoggerStatusChannel;
+    connect status_publisher_cog.channel_rates to logger_channels::LoggerMessageRatesChannel;
+}
+
+// The machine this runs on: a workstation.
+//
+// One domain for all three processes, because the seam between them is sockets
+// and their channels are shared memory -- the same arrangement the unit has, with
+// the driver's process being a Clockwork one here. The launcher config this
+// domain renders names all three, each with nothing but its process description
+// as arguments, so every process runs on the compiled-in pinion defaults. There
+// is no `simplelaunch_src` to merge: on a unit the driver is an OS process the
+// renderer knows nothing about, and here it is not.
+cpu_domain HostCpu;
+
+// Three processes on one workstation over one executable, wall-clock: the
+// control loop, the plant it commands, and the logger that watches both.
+// `robot_host_clk_exe` is the executable the compiler synthesizes for this file
+// under `cpp_exe`, named for the file stem; each process is started from it with
+// its own process description.
+//
+// `online_main`, the same as the device composition's, because this is the
+// online path: a deterministic run over live sockets would have nothing to read.
+//
+// The control box is `robot::RobotBox` with nothing done to it. That is the
+// whole value of the exercise -- the wake gesture, the session, the mover, the
+// clips and the seam's schemas here are the ones a unit runs.
+box System
+{
+    new box: robot::RobotBox;
+
+    new proc: Process(executable=robot_host_clk_exe);
+
+    apply HostProcess(process=proc) in box;
+    apply HostCpuDomain(cpu_domain=HostCpu) to proc;
+
+    new plant_box: SimDriver;
+
+    new plant_proc: Process(executable=robot_host_clk_exe);
+
+    apply HostProcess(process=plant_proc) in plant_box;
+    apply HostCpuDomain(cpu_domain=HostCpu) to plant_proc;
+
+    new logger_box: RobotLoggerHost;
+
+    new logger_proc: Process(executable=robot_host_clk_exe);
+
+    apply HostProcess(process=logger_proc) in logger_box;
+    apply HostCpuDomain(cpu_domain=HostCpu) to logger_proc;
+}

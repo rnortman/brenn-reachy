@@ -5,9 +5,11 @@
 //! tests that need no port and no machine. This file owns only the argument
 //! shape, the port, the printing and the exit code.
 //!
-//! `selftest` is read-only. The other three write to a servo, and none of them
+//! `selftest` is read-only. The other four write to a servo, and none of them
 //! commands an angle: `provision` writes one non-volatile register on a limp
-//! machine, and `reboot` and `off` are de-torques, which nothing gates.
+//! machine, `reboot` and `off` are de-torques, which nothing gates, and
+//! `watchdog` torques one servo at the position it is already standing at and
+//! watches its bus watchdog let it go.
 
 #![forbid(unsafe_code)]
 
@@ -28,7 +30,8 @@ const DEFAULT_CONFIG: &str = "reachy-bench.toml";
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
-    /// The words that were not flags: the one servo a reboot addresses.
+    /// The words that were not flags: the one servo a reboot or a watchdog
+    /// self-test addresses.
     operands: Vec<String>,
 }
 
@@ -43,9 +46,12 @@ fn usage() -> String {
          \x20 reboot [id]           restart every servo, or one; clears a latched error and \
          drops torque\n\
          \x20 off                   write torque off on every servo\n\
+         \x20 watchdog [id]         torque one servo and watch its bus watchdog release it\n\
          \n\
          Nothing here commands an angle: this tool reads the machine, provisions it and \
          releases it.\n\
+         The one goal `watchdog` writes is the count the servo reports for itself, which \
+         moves it nowhere.\n\
          Coordinated motion is the cog path's, and there is no command for it here.\n\
          \n\
          `reboot` restarts the servos, which is how a latched hardware error — an\n\
@@ -56,6 +62,14 @@ fn usage() -> String {
          the roster is asked whatever the ones before it answered. The head settles as it\n\
          goes, so take its weight if it is up. That is the way out of any session, at any\n\
          moment.\n\
+         \n\
+         `watchdog` is a supervised bring-up assertion, not a routine command: it arms the\n\
+         servos' own bus inactivity timeout on one servo — an antenna unless you name\n\
+         another — holds torque there, and then goes quiet so the watchdog releases it.\n\
+         It runs for a few seconds, the servo goes limp on its own partway through, and it\n\
+         leaves that servo disarmed and limp. Run it at rest, never with the head up, and\n\
+         power-cycle before the next read-only sweep: the register is RAM-resident and the\n\
+         sweep expects the provisioned zero.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -78,12 +92,19 @@ enum Command {
     Provision,
     Reboot,
     Off,
+    Watchdog,
 }
 
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 4] = [Self::Selftest, Self::Provision, Self::Reboot, Self::Off];
+    const ALL: [Command; 5] = [
+        Self::Selftest,
+        Self::Provision,
+        Self::Reboot,
+        Self::Off,
+        Self::Watchdog,
+    ];
 
     /// The command `word` names, or nothing.
     fn parse(word: &str) -> Option<Self> {
@@ -92,6 +113,7 @@ impl Command {
             "provision" => Self::Provision,
             "reboot" => Self::Reboot,
             "off" => Self::Off,
+            "watchdog" => Self::Watchdog,
             _ => return None,
         })
     }
@@ -103,6 +125,7 @@ impl Command {
             Self::Provision => "provision",
             Self::Reboot => "reboot",
             Self::Off => "off",
+            Self::Watchdog => "watchdog",
         }
     }
 
@@ -114,7 +137,7 @@ impl Command {
     fn operands(self) -> usize {
         match self {
             Self::Selftest | Self::Provision | Self::Off => 0,
-            Self::Reboot => 1,
+            Self::Reboot | Self::Watchdog => 1,
         }
     }
 }
@@ -135,6 +158,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Command::Provision => provision(&args),
         Command::Reboot => reboot(&args, optional_id(&args)?),
         Command::Off => off(&args),
+        Command::Watchdog => watchdog(&args, optional_id(&args)?),
     }
 }
 
@@ -184,7 +208,8 @@ fn check_invocation(args: &Args, command: Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The servo a command was pointed at, or nothing for all of them.
+/// The servo a command was pointed at, or nothing for the command's own default
+/// — every servo for `reboot`, an antenna for `watchdog`.
 ///
 /// A servo ID is a whole number the protocol can address, so a word that is not
 /// one is refused here rather than reaching the roster check as an ID nobody
@@ -335,6 +360,28 @@ fn off(args: &Args) -> anyhow::Result<()> {
     let port = bare_port(&device, timing.baud)?;
     bare::off(&map, timing, port, &mut |line| println!("{line}"))
         .map_err(|error| refused("off", error))
+}
+
+/// Establish what an armed bus watchdog does to one servo.
+///
+/// Not gated on anything the machine says, and it needs no envelope: the only
+/// goal it writes is the count the servo just reported for itself, so the
+/// conversion this tool has no business doing never comes up. What it does need
+/// is an operator standing there — it holds torque on one servo for a few
+/// seconds and the servo lets go on its own — so the warning is printed by the
+/// command itself, before the port is opened.
+fn watchdog(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
+    let (map, timing, device) = bare_config(args)?;
+
+    println!("watchdog over {device} at {} baud.", timing.baud);
+
+    let port = bare_port(&device, timing.baud)?;
+    let mut clock = MonotonicClock::new();
+
+    bare::watchdog(&map, timing, port, target, &mut clock, &mut |line| {
+        println!("{line}")
+    })
+    .map_err(|error| refused("watchdog", error))
 }
 
 #[cfg(test)]
@@ -562,6 +609,7 @@ mod tests {
             vec!["provision", "now"],
             vec!["reboot", "11", "12"],
             vec!["off", "please"],
+            vec!["watchdog", "11", "12"],
         ] {
             let refused = dispatch(argv(&words)).expect_err("that word means nothing here");
             let printed = refused.to_string();
@@ -575,7 +623,7 @@ mod tests {
     /// than silently accepted.
     #[test]
     fn there_is_no_flag_authorising_a_release() {
-        for command in ["selftest", "provision", "reboot", "off"] {
+        for command in ["selftest", "provision", "reboot", "off", "watchdog"] {
             let refused =
                 dispatch(argv(&[command, "--drop-head"])).expect_err("no such flag exists");
             let printed = refused.to_string();
@@ -663,6 +711,8 @@ mod tests {
             vec!["reboot"],
             vec!["reboot", "11"],
             vec!["off"],
+            vec!["watchdog"],
+            vec!["watchdog", "11"],
         ] {
             let refused = dispatch(argv(
                 &[&words[..], &["--config", "/nonexistent/reachy-bench.toml"]].concat(),

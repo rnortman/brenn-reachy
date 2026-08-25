@@ -11,20 +11,21 @@
 #                commit to the workspace, and refuses while anything else on the
 #                unit holds the servo bus.
 #   --stale-ok   push the old payload anyway.
-#   --commands   print the three commands that start the run, in the order they
-#                have to be started in, with the flags read out of the shipped
-#                configuration rather than retyped.
+#   --commands   print the commands that start a run, watch it, and stop it.
 #   --fetch      copy the run's `.olog` directories back to a local directory,
 #                under a name stamped with the moment they were fetched so a
-#                session's runs accumulate rather than overwrite.
+#                session's runs accumulate rather than overwrite. Refuses a fetch
+#                that brought no records rather than reporting over nothing.
 #
 # A motion run is **three OS processes**, not one: `reachy_motord` (the servo
 # bus), and two `robot_clk_exe` processes over the one synthesized executable
-# (the logger, and the control loop). This script does not start them. A bench
-# command is one invocation that ends; these run until an operator stops them,
-# in an order that matters, on a machine that can move — so what belongs in a
-# script is the payload and the flags, and what belongs to a person is the
-# starting. `docs/bench-runbook.md` is the procedure.
+# (the logger, and the control loop). All three are started by one supervisor —
+# `simplelaunch`, from the launcher config the compositions render — so there is
+# one command to start a run and one gesture to stop it, and no ordering for a
+# person to get right. This script still does not start them: it pushes the
+# payload and says what to type, because the run itself moves a machine and
+# belongs to whoever is standing next to it. `docs/bench-runbook.md` is the
+# procedure.
 #
 # Two device paths, both in RAM — nothing a dev cycle pushes touches the eMMC:
 #
@@ -47,10 +48,10 @@ set -euo pipefail
 # The payload tools/build-motion.sh stages.
 payload="${repo_root}/target/motion-arm64/release"
 
-# The two binaries, checked before anything is pushed. A payload directory that
-# exists and is missing one of them is a build that failed halfway or a stage
-# somebody edited by hand.
-binaries=(reachy_motord robot_clk_exe)
+# The three binaries, at the paths the launcher config spells, checked before
+# anything is pushed. A payload directory that exists and is missing one of them
+# is a build that failed halfway or a stage somebody edited by hand.
+binaries=(reachy_motord cogs/robot_clk_exe simplelaunch)
 
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
@@ -60,10 +61,16 @@ binaries=(reachy_motord robot_clk_exe)
 # a refusal that says to build one.
 logger_config="${payload}/cogs/robot_logger.textproto"
 
-# The two process descriptions the executable is started with. One binary, two
-# processes, and which one it becomes is this argument.
-control_desc=cogs/brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon
-logger_desc=cogs/brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon
+# The launcher config, at the payload root, and where the launcher puts the
+# console output of everything it starts. Both are named in the commands printed
+# below and nowhere else here: the config names the processes, their arguments
+# and their working-directory-relative executables, so this script has nothing
+# left to say about them.
+#
+# The log directory is on the same tmpfs as the payload and the records; the
+# launcher creates it.
+launch_config=robotcpu.textproto
+launch_logs="${store_mount}/logs/launch"
 
 # One directory, reused. Nothing on this path activates a release, so nothing
 # prunes the store either; rsync --delete is what makes reuse idempotent.
@@ -157,7 +164,7 @@ case "$mode" in
 			# accepting it silently means the freshness check runs
 			# for an operator who believes they overrode it.
 			[ $# -eq 0 ] || usage
-			refuse_if_stale "${payload}/robot_clk_exe" "device payload" \
+			refuse_if_stale "${payload}/cogs/robot_clk_exe" "device payload" \
 				"make motion-build" \
 				"push the old payload deliberately" \
 				"${prog} ${host} --push --stale-ok" \
@@ -204,31 +211,34 @@ case "$mode" in
 		;;
 
 	--commands)
-		# Printed rather than run, and derived rather than retyped: the
-		# namespace both processes have to agree on, and the shm root the
-		# logger reads channels out of, are stated once in the shipped
-		# configuration, and a mismatch is silent in the worst direction —
-		# the logger comes up, finds no channels, and writes an empty log
-		# while the gesture runs perfectly.
-		ns=$(config_string pinion_namespace)
-		shm=$(config_string pinion_shm_root)
+		# Printed rather than run: the run moves a machine, and what is
+		# printed is exactly what a person types with their eyes on it.
+		#
+		# One start command, because the launcher config names all three
+		# processes and every one of them runs on the pinion defaults --
+		# there are no flags to interpolate here and no order to state.
+		log_root=$(config_string log_root_dir)
 		cat <<COMMANDS
-# On ${host}, as root, in ${release}. Start in this order, one per terminal or
-# under a supervisor of your choosing; stop them in the reverse order. Any
-# ordering is safe -- a driver that outlives the cogs de-torques on its own
-# dead-man, and a driver stopped first leaves a machine already at rest.
-cd ${release}
+# On ${host}, as root. The launcher resolves every path in its config against
+# its working directory, so it is started from the release root and nowhere
+# else. It runs in the foreground; Ctrl-C stops all three processes.
+cd ${release} && ./simplelaunch ${launch_config} --logdir ${launch_logs}
 
-# 1. the driver. Fails safe: with nothing talking to it, it reaches the minimum
-#    risk condition on its own within its startup window.
-./reachy_motord
+# Watch the run: the launcher redirects each process's console into its own file,
+# named for the app and the number of times it has been started in this log
+# directory -- so the second run in it writes motord_1.log, and so on. The three
+# app names are the compositions', and build-motion.sh refuses a build whose
+# rendered launcher config names any other set, so these three paths are the ones
+# that will appear.
+tail -f ${launch_logs}/motord_0.log        # the driver: cycles, torque, faults
+tail -f ${launch_logs}/proc_0.log          # the control loop: the session
+tail -f ${launch_logs}/logger_proc_0.log   # the logger
 
-# 2. the logger. Writes the run's records; gates nothing, so a dead logger costs
-#    records and nothing else.
-./robot_clk_exe ${logger_desc} --pinion-dir ${shm} --pinion-ns ${ns}
+# Before powering down, while the unit is still up: the run wrote records.
+ls -l ${log_root}/*/
 
-# 3. the control loop. The wake gesture starts as soon as the session commissions.
-./robot_clk_exe ${control_desc} --pinion-dir ${shm} --pinion-ns ${ns}
+# Stopping: Ctrl-C in the launcher's terminal, or from anywhere on the unit
+curl -X POST 127.0.0.1:8080/quit
 COMMANDS
 		;;
 
@@ -266,6 +276,23 @@ COMMANDS
 			die "nothing fetched from ${host}:${log_root}." \
 				"A run that wrote no records leaves that directory empty."
 		}
+		# A fetch that succeeded and brought nothing worth reading is a
+		# refusal, not a report command over an empty directory. rsync is
+		# happy about an empty source, so its exit status says nothing
+		# about whether the run logged: what does is a `.olog` with bytes
+		# in it. The likeliest cause is the logger having looked for the
+		# control process's channels somewhere else, which is silent at
+		# run time and looks exactly like this afterwards.
+		if [ -z "$(find "$part" -name '*.olog' -size +0 -print -quit)" ]; then
+			rm -rf -- "$part"
+			die "the fetch from ${host}:${log_root} carries no .olog with anything in it." \
+				"The run wrote no records. Either the logger never started, or it found no" \
+				"channels: it reads the buffer directory and namespace out of the payload's" \
+				"cogs/robot_logger.textproto, and every process is started with no pinion" \
+				"flags at all, so those two values have to be the compiled-in defaults." \
+				"Nothing was kept, so the next fetch is not merging into this one."
+		fi
+
 		mv -- "$part" "$out"
 		echo "${prog}: ${out}"
 		echo "${prog}: read it: bazel run //cogs:first_motion_report -- ${out}/<run>"

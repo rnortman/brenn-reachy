@@ -1,0 +1,100 @@
+// The host smoke system: the target, over the boxes next door.
+//
+// No `generate` attribute, and that is forced rather than stylistic: the grammar
+// admits a `system_target` only in a module that generates nothing. So the three
+// processes, the machine they run on and the boxes they host are declared in
+// `robot_host.clk`, and this file names the target over them and emits the
+// process descriptions and per-domain configs the runner reads at start-up.
+//
+// The policy set is `system_robot.clk`'s, channel for channel and deliberately:
+// what a host run writes has to be the same vocabulary of record a unit writes,
+// or the analyzer that judges the first hardware run is not the analyzer a host
+// run exercises. The plant's own channels on the far side of the seam are not
+// among them -- they are this system's scaffolding and no part of what a run is
+// judged by.
+//
+// Duplicated rather than imported: a module that generates nothing may not be
+// imported by another, and a policy is declared where the system that binds it
+// is named. The two sets drifting apart is what the host run's own report would
+// show first.
+//
+// The logger's own three channels are logged too, by the framework's own policy
+// module for them: a run's records say whether the thing writing them was
+// keeping up.
+
+use cogs::motion;
+use cogs::robot_host;
+use @clockwork::clockwork::logging::writers::logger_channel_policies;
+use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy, LogType};
+
+// The machine's heartbeat: one sample per cycle, always.
+policy ChannelLoggingPolicy for motion::DriverPose
+{
+    log_type = LogType::event;
+}
+
+// What it was asked to hold next.
+policy ChannelLoggingPolicy for motion::DriverCmd
+{
+    log_type = LogType::event;
+}
+
+// What the gate did that the sample stream does not show.
+policy ChannelLoggingPolicy for motion::DriverEvt
+{
+    log_type = LogType::event;
+}
+
+// What the session asked the driver for, and what came back: the answer to one
+// transaction, and the rotating read of the status registers.
+policy ChannelLoggingPolicy for motion::SessionCmdChan
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for motion::DriverAuxOut
+{
+    log_type = LogType::event;
+}
+
+policy ChannelLoggingPolicy for motion::DriverHealth
+{
+    log_type = LogType::event;
+}
+
+// What was asked of the machine, kept beside what it did. In this system the
+// asking is the wake cog next door rather than a log the runner replays.
+policy ChannelLoggingPolicy for motion::ScriptsIn
+{
+    log_type = LogType::event;
+}
+
+// What the session made of a script: the schedule the mover streams, whole and
+// once per change.
+policy ChannelLoggingPolicy for motion::ScheduleChan
+{
+    log_type = LogType::event;
+}
+
+// What the decision tick raised.
+policy ChannelLoggingPolicy for motion::TickFaults
+{
+    log_type = LogType::event;
+}
+
+// What the session said about the session: one report per wake, oldest first.
+policy ChannelLoggingPolicy for motion::ReportsOut
+{
+    log_type = LogType::event;
+}
+
+// Where the head was, once per sample.
+policy ChannelLoggingPolicy for motion::Estimates
+{
+    log_type = LogType::event;
+}
+
+system_target motion_host
+{
+    box: robot_host::System;
+}

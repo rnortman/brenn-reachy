@@ -282,7 +282,17 @@ box RobotLogger
 }
 
 // The machine the control loop runs on: the unit's own CPU.
-cpu_domain RobotCpu;
+//
+// The launcher config this domain renders names the two cog processes; the
+// driver is a third OS process on the same machine and is merged in from the
+// hand-written app config the `simplelaunch_src` names, so one launcher starts
+// and stops all three. The renderer emits only a process-description path as a
+// generated app's args, so every process here runs on the compiled-in pinion
+// defaults -- see `robot_logger.textproto`, which restates them.
+cpu_domain RobotCpu
+{
+    simplelaunch_src: "//driver:motord_launch.textproto";
+}
 
 // Two processes on one machine over one executable, wall-clock: the control
 // loop, and the logger that watches it. `robot_clk_exe` is the executable the

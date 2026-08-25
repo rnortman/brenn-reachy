@@ -8,7 +8,7 @@
 //!
 //! Test-only: nothing here is compiled into the binary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
@@ -34,6 +34,68 @@ const HEALTHY_RAIL: u16 = 118;
 /// temperature case asserts.
 const RESTING_TEMP_C: u8 = 28;
 
+/// A scripted Bus Watchdog on one servo: what a real one is documented to do,
+/// as a fixture a test can point at a verdict.
+///
+/// Modelling it does not launder the hardware fact the bench command exists to
+/// establish -- what a servo on a bench does with silence is that command's
+/// assertion and this cannot answer it. What it does check is that the command
+/// reads a latch correctly when it meets one, which is otherwise only ever
+/// exercised at a powered unit.
+///
+/// The trip has two triggers. Silence is the real one: the host's own clock is
+/// shared with this fixture, so a servo trips when the gap between two frames
+/// addressed to it exceeds what its armed register says it tolerates. The frame
+/// countdown is the other: a trip that arrives at a chosen frame regardless of
+/// traffic, which is how a case puts a latch in the middle of a phase that is
+/// keeping the bus busy.
+pub(crate) struct BusWatchdogModel {
+    /// The servo this one is on. Every other servo has none.
+    pub(crate) id: u8,
+    /// The host's clock, shared: silence is measured in the time base the
+    /// command sleeps in.
+    pub(crate) now: Rc<Cell<Duration>>,
+    /// What one count of the register is worth.
+    pub(crate) unit: Duration,
+    /// Frames addressed to this servo before it trips whatever the traffic;
+    /// `None` for one that trips on silence alone.
+    pub(crate) trips_after_frames: Option<u32>,
+    /// Whether a trip leaves the marker in the register.
+    pub(crate) marks_register: bool,
+    /// Whether a trip lets the servo go.
+    pub(crate) drops_torque: bool,
+    /// The error byte a tripped servo answers an ordinary write with, or `None`
+    /// for one that goes on taking writes as though nothing had happened.
+    pub(crate) refuses_writes_with: Option<u8>,
+    /// When this servo was last addressed.
+    last_seen: Duration,
+    /// Whether it has tripped.
+    latched: bool,
+}
+
+impl BusWatchdogModel {
+    /// A watchdog on `id` that behaves as the vendor documents: it trips on
+    /// silence, marks its register, lets the servo go, and refuses ordinary
+    /// writes with Data Range until a zero clears it.
+    pub(crate) fn documented(id: u8, now: &Rc<Cell<Duration>>, unit: Duration) -> Self {
+        Self {
+            id,
+            now: Rc::clone(now),
+            unit,
+            trips_after_frames: None,
+            marks_register: true,
+            drops_torque: true,
+            refuses_writes_with: Some(DATA_RANGE),
+            last_seen: now.get(),
+            latched: false,
+        }
+    }
+}
+
+/// The status error byte a latched watchdog answers a write with: Data Range,
+/// with the alert bit clear.
+pub(crate) const DATA_RANGE: u8 = 4;
+
 /// A scripted machine: nine servos with a register file, answering pings, reads
 /// and writes over the port seam.
 ///
@@ -49,6 +111,12 @@ pub(crate) struct FakeMachine {
     /// Reads of a register a servo answers nothing to, counted down as they
     /// arrive: a dropout that ends, rather than a servo that is gone.
     pub(crate) mute: HashMap<(u8, u16), u32>,
+    /// Reads of a register a servo answers normally and then stops answering
+    /// for good, counted down as they arrive: a servo that goes away part way
+    /// through a sequence, which is the shape a cut wire or a browned-out rail
+    /// has. The opposite end of [`Self::mute`], whose counts are spent on the
+    /// first reads rather than the last.
+    pub(crate) deaf_after: HashMap<(u8, u16), u32>,
     /// Reads of a register this machine answers with a frame damaged after its
     /// checksum was taken, so the host sees bytes that disagree with
     /// themselves.
@@ -97,6 +165,8 @@ pub(crate) struct FakeMachine {
     /// that took the torque and not the latch. Not what the machine on the bench
     /// does — which is what makes it worth modelling separately.
     pub(crate) keeps_latch: Vec<u8>,
+    /// One servo's Bus Watchdog, if a case scripted one.
+    pub(crate) watchdog: Option<BusWatchdogModel>,
     out: VecDeque<u8>,
 }
 
@@ -108,6 +178,7 @@ impl FakeMachine {
             silent: Vec::new(),
             ignored: Vec::new(),
             mute: HashMap::new(),
+            deaf_after: HashMap::new(),
             damaged: Vec::new(),
             verbose: Vec::new(),
             unmirrored: Vec::new(),
@@ -119,6 +190,7 @@ impl FakeMachine {
             pings_ignored: HashMap::new(),
             deaf_to_reboot: Vec::new(),
             keeps_latch: Vec::new(),
+            watchdog: None,
             out: VecDeque::new(),
         }
     }
@@ -244,6 +316,11 @@ impl FakeMachine {
         if self.silent.contains(&id) {
             return true;
         }
+        match self.deaf_after.get_mut(&(id, addr)) {
+            Some(0) => return true,
+            Some(left) => *left -= 1,
+            None => {}
+        }
         match self.mute.get_mut(&(id, addr)) {
             Some(left) if *left > 0 => {
                 *left -= 1;
@@ -276,6 +353,67 @@ impl FakeMachine {
         }
     }
 
+    /// Let the scripted watchdog see this frame, tripping it if this is the
+    /// frame that trips it.
+    ///
+    /// Called before the instruction is answered, so a servo that has just
+    /// tripped answers the frame that found it as a tripped servo does.
+    fn watchdog_saw(&mut self, id: u8) {
+        let Some(mut dog) = self.watchdog.take() else {
+            return;
+        };
+        if dog.id != id {
+            self.watchdog = Some(dog);
+            return;
+        }
+        let now = dog.now.get();
+        let armed = self
+            .get(id, named_reg(RegId::BusWatchdog))
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(0);
+        let counted_out = armed > 0
+            && armed != 0xFF
+            && self.torqued(id)
+            && now.saturating_sub(dog.last_seen) > dog.unit * u32::from(armed);
+        let forced = match dog.trips_after_frames {
+            Some(0) => true,
+            Some(left) => {
+                dog.trips_after_frames = Some(left - 1);
+                false
+            }
+            None => false,
+        };
+        if !dog.latched && (counted_out || forced) {
+            dog.latched = true;
+            if dog.marks_register {
+                self.set(id, named_reg(RegId::BusWatchdog), &[0xFF]);
+            }
+            if dog.drops_torque {
+                self.set(id, named_reg(RegId::TorqueEnable), &[0]);
+            }
+        }
+        dog.last_seen = now;
+        self.watchdog = Some(dog);
+    }
+
+    /// The error byte a tripped servo answers this write with, if it refuses it.
+    ///
+    /// A zero to the Bus Watchdog is the documented clear and is always taken;
+    /// everything else is refused for as long as the trip stands.
+    fn watchdog_refusal(&mut self, id: u8, addr: u16, data: &[u8]) -> Option<u8> {
+        let dog = self.watchdog.as_mut()?;
+        if dog.id != id || !dog.latched {
+            return None;
+        }
+        let clearing = addr == named_reg(RegId::BusWatchdog).addr && data.first() == Some(&0);
+        if clearing {
+            dog.latched = false;
+            dog.last_seen = dog.now.get();
+            return None;
+        }
+        dog.refuses_writes_with
+    }
+
     /// A status frame as a servo puts it on the wire.
     fn reply(&mut self, id: u8, error: u8, params: &[u8]) {
         let mut frame = Vec::from(HEADER);
@@ -299,6 +437,7 @@ impl BusPort for FakeMachine {
         if self.silent.contains(&id) {
             return Ok(());
         }
+        self.watchdog_saw(id);
         match instruction {
             INST_PING => {
                 if let Some(left) = self.pings_ignored.get_mut(&id)
@@ -331,6 +470,13 @@ impl BusPort for FakeMachine {
             }
             INST_WRITE => {
                 let addr = u16::from_le_bytes([params[0], params[1]]);
+                // A tripped watchdog refuses the write instead of taking it,
+                // which is the signature a host sees rather than a value that
+                // went in.
+                if let Some(refusal) = self.watchdog_refusal(id, addr, &params[2..]) {
+                    self.reply(id, refusal, &[]);
+                    return Ok(());
+                }
                 let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
                 if error == 0 && !self.ignored.contains(&(id, addr)) {
                     self.store(id, addr, params[2..].to_vec());
@@ -503,19 +649,32 @@ impl BusPort for Spy {
 /// nothing and the waits themselves are what gets asserted.
 #[derive(Debug, Default)]
 pub(crate) struct TestClock {
-    now: Duration,
+    /// Shared rather than owned, so a fixture that models a timer of its own --
+    /// a servo's bus watchdog -- measures silence in the same time base the
+    /// command sleeps in.
+    now: Rc<Cell<Duration>>,
     pub(crate) waits: Vec<Duration>,
+}
+
+impl TestClock {
+    /// A clock reading the instant `now` holds.
+    pub(crate) fn sharing(now: &Rc<Cell<Duration>>) -> Self {
+        Self {
+            now: Rc::clone(now),
+            waits: Vec::new(),
+        }
+    }
 }
 
 impl Clock for TestClock {
     fn now(&self) -> Duration {
-        self.now
+        self.now.get()
     }
 
     fn sleep_until(&mut self, until: Duration) {
         self.waits.push(until);
-        if until > self.now {
-            self.now = until;
+        if until > self.now.get() {
+            self.now.set(until);
         }
     }
 }

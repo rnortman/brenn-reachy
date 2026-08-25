@@ -151,6 +151,15 @@ pub const PROFILE_ACCELERATION: i64 = 20;
 /// The servo-side profile velocity the sweep writes, register units.
 pub const PROFILE_VELOCITY: i64 = 50;
 
+/// The servos' Bus Watchdog timeout the commissioning sweep arms, in the
+/// register's 20 ms units.
+///
+/// Mirrors the deployed `SessionParams.bus_watchdog`. The sweep writes it twice
+/// per servo -- zero to clear, then this -- and
+/// [`check::commissioned_profile`](crate::check::commissioned_profile) is what
+/// finds both on the wire, in that order.
+pub const BUS_WATCHDOG: i64 = 10;
+
 /// How long the session may go without executing: the floor its wake condition
 /// puts under a run where nothing arrives, nanoseconds.
 ///
@@ -690,6 +699,7 @@ pub fn check_params(
             ),
             ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
             ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
+            ("bus_watchdog", Value::Int(BUS_WATCHDOG)),
         ],
         &mut failures,
     );
@@ -808,5 +818,71 @@ fn expect(path: &str, wanted: &[(&str, Value)], failures: &mut Vec<String>) {
             )),
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What the shipped wake gesture's lead has to cover.
+    //!
+    //! The lead is the room the session gets between a script arriving and its
+    //! first step opening, and what has to fit in it is the start-up survey:
+    //! every transaction that arms the machine, at the cycles a transaction
+    //! costs. Both halves of that product are derived from tables this tree
+    //! grows -- the provisioning table's cells and the gains-and-profile write
+    //! set -- so the file's number is the one part of the derivation that cannot
+    //! grow by itself. This is what makes it grow: a register added to the sweep
+    //! widens the survey and fails here, rather than costing the gesture its
+    //! window on a machine whose survey is still running. What an overrun does
+    //! and does not cost is argued once, beside the number: the `lead_ms`
+    //! comment in `wake_params.textproto`.
+
+    use super::{PERIOD_NS, commission_allowance_cycles, commission_transactions};
+
+    /// The shipped gesture, embedded so the case needs no runfiles.
+    const WAKE_PARAMS: &str = include_str!("wake_params.textproto");
+
+    /// What the file says the lead is, in milliseconds.
+    fn lead_ms() -> i64 {
+        WAKE_PARAMS
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(key, value)| {
+                (key.trim() == "lead_ms").then(|| {
+                    value
+                        .trim()
+                        .parse::<i64>()
+                        .expect("the shipped lead is a count of milliseconds")
+                })
+            })
+            .expect("the shipped wake gesture states a lead")
+    }
+
+    /// The margin the lead must hold over the survey's allowance, as a fraction.
+    /// Bare sufficiency — a lead that merely equals the allowance — leaves no
+    /// room for bus-retry noise; asserting the margin catches an edit that
+    /// erodes it before it shows up as a late first step.
+    const HEADROOM_NUMERATOR: i64 = 5;
+    const HEADROOM_DENOMINATOR: i64 = 4;
+
+    #[test]
+    fn the_wake_gestures_lead_covers_the_survey_that_has_to_finish_inside_it() {
+        let lead_ns = lead_ms() * 1_000_000;
+        let allowance_ns = commission_allowance_cycles() * PERIOD_NS;
+        let required_ns = allowance_ns * HEADROOM_NUMERATOR / HEADROOM_DENOMINATOR;
+        assert!(
+            lead_ns >= required_ns,
+            "the wake gesture leads by {} ms and taking hold of the machine allows {} \
+             transactions at three cycles each, which is {} ms: the lead has to clear that \
+             by a quarter of it again -- {} ms -- so that what a noisy bus costs beyond the \
+             per-transaction allowance still fits, and an edit that eats the margin is read \
+             here rather than as a late, truncated or skipped first step",
+            lead_ns / 1_000_000,
+            commission_transactions(),
+            allowance_ns / 1_000_000,
+            required_ns / 1_000_000
+        );
     }
 }

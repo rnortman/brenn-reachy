@@ -64,8 +64,13 @@ rust_clk_module(
 )
 
 # The numbers the driver ships with, read by the driver at startup and by the
-# test that holds this file to the schema.
-exports_files(["motord_params.textproto"])
+# test that holds this file to the schema; and the driver's entry in the
+# launcher's app table, which `cogs/robot.clk`'s `RobotCpu` merges into the
+# launcher config it renders.
+exports_files([
+    "motord_launch.textproto",
+    "motord_params.textproto",
+])
 
 clk_schema_module(
     name = "goal",

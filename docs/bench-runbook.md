@@ -124,6 +124,12 @@ before the first session:
   and prints both windows in counts and degrees, and is a mis-provisioned unit
   rather than something to widen the tolerance for.
   A diagnostic and a regression guard; it gates nothing.
+  **Power-cycle the unit before a sweep**, or run it before anything else in a
+  session: the Bus Watchdog register is RAM-resident and resets to 0 at
+  power-on, and the sweep checks it against that provisioned 0. A session — or
+  the `watchdog` command below — leaves 10 in it, and a sweep taken afterwards
+  fails on that register and nothing else. That failure is exact and benign, and
+  the check stays hard rather than tolerating stale session state.
 - `provision` — writes the antennas' operating mode. Torque must be off on
   both; it moves nothing.
 - `off` — writes torque off on every servo on the roster. It gates on nothing
@@ -132,11 +138,14 @@ before the first session:
   acknowledged fails the command rather than riding out on the closing line.
   The head settles as it goes, so take its weight if it is up.
 - `reboot [id]` — see below.
+- `watchdog [id]` — see below. The one command here that holds torque.
 
 **There is no command here that moves the machine, and there will not be
 one.** This tool validates that we can talk to the hardware: the read-only
-registry, provisioning, `reboot`, and `off` — so the machine can always be read
-and always be released. The supervised motion commands — `arm`, `up`, `hold`,
+registry, provisioning, `reboot`, `off`, and the `watchdog` assertion — so the
+machine can always be read and always be released. `watchdog` is the one that
+holds torque, and it commands no angle either: the only goal it ever writes is
+the count the servo reports for itself. The supervised motion commands — `arm`, `up`, `hold`,
 `stow`, `yaw`, `antennas`, `demo`, `play` — and everything under them, the
 fixed-rate pump and the trace writer included, are deleted rather than parked.
 Coordinated motion is the cog system's, and a motion test on a unit is a run of
@@ -219,6 +228,47 @@ count back into a single turn; the self-test's `antenna-fold` case is what
 asserts it, and a reading outside one turn is a finding for a person, never a
 bound to widen. See the open observations at the end.
 
+## The `watchdog` self-test
+
+The servos' own Bus Watchdog is what answers a driver that was killed, crashed
+or unplugged with the machine under torque: the register counts bus silence in
+20 ms units, and a session arms it at 10 — 200 ms — on every servo, every
+engagement. Two things about it are vendor documentation nobody here has watched
+happen, and the whole de-energize story rests on both: that ordinary bus traffic
+resets the count, and that a servo whose count runs out **stops holding**.
+
+    make bench-run ARGS="watchdog"        # an antenna, the default
+    make bench-run ARGS="watchdog 17"     # a servo you name
+
+Supervised, at rest, on one servo — an antenna unless you name another, because
+the servo is going to let go and an antenna letting go costs the least. **Never
+with the head up.** It runs for a few seconds and asserts, in order:
+
+1. arming at 10 reads back 10,
+2. a released servo reads its goal register as its present position, which is
+   what makes torquing it a hold rather than a move,
+3. five timeouts of reads and goal rewrites at 20 ms do not trip it,
+4. five timeouts of reads alone do not trip it either,
+5. two timeouts of true silence do: the register reads `0xff`, a goal rewrite
+   comes back refused with Data Range, and the servo is no longer holding,
+6. a zero clears the trip, re-arming takes, and torque can be enabled again,
+7. it leaves that servo disarmed and limp.
+
+Torque only ever goes on with the servo's own present position written as its
+goal first, so neither the initial hold nor the re-arm after the trip can be a
+commanded move — the servo has been limp in between and may have drooped.
+
+Every one of those is an assertion, so a failure is the discovery and the run's
+exit code says so. **An unexpected reading goes to a person before anything is
+changed to make it pass** — assertion 4 is the one to expect trouble from, and
+the recorded contingency if reads turn out not to feed the watchdog is a
+driver-side keep-alive write while torqued. Do not implement it before the
+reading says it is needed.
+
+Run this **before the first motion run**, and power-cycle afterwards if a
+read-only sweep comes next: this command leaves the register at 0 on the servo it
+addressed, but a session leaves 10 on all nine.
+
 ## The motion test
 
 The run that moves the machine. Not a bench command and never will be: motion
@@ -230,29 +280,75 @@ gates, written before the first run rather than after it. The first person to do
 it is discovering things; the bring-up rule applies — an unexpected reading goes
 to a person before anything is changed to accommodate it.
 
+**Before the first motion run on a unit, run the `watchdog` self-test** (above)
+and then power-cycle. The de-energize story this section tells has two layers,
+and that test is what establishes the lower one on this machine: until it has
+passed here, the 200 ms watchdog is armed by every session and its semantics are
+unverified, which means a killed or crashed driver may leave the machine holding.
+The launcher's own stop gesture does not depend on it.
+
+### Before you take it to a unit: the same system on your workstation
+
+    make motion-host-run
+
+This starts the whole online system here — the real control process, the real
+logger, and the simulated plant in a process of its own behind the same six
+loopback ports `reachy_motord` binds — under the same launcher, from the same
+kind of rendered config, on the same shared-memory defaults. It runs the wake
+gesture, stops, and judges the log with `first_motion_report`, and the target's
+verdict is the report's.
+
+Run it before a bench session and after any change to the compositions or the
+configs. What it catches is everything about the *configuration* that a unit
+would otherwise be the first to find: a process description nothing can find, a
+pinion namespace that disagrees, a launcher config naming a path that is not
+there, a writer that cannot open its directory, a seam schema whose two ends
+disagree about a datagram's size, a log the analyzer cannot read.
+
+What it cannot tell you: nothing about serial timing, nothing about direct I/O on
+*this unit's* kernel, nothing about aarch64, and nothing whatever about real
+servos — which is also why the device-config-only smoke test this replaces is not
+worth building. The two configuration facts it does not cover are the driver's
+serial device and the device log root, and those are precisely the two a
+workstation cannot check.
+
+The plant is a cog woken by the wall-clock runner, so it stamps its samples with
+when it ran rather than with an exact grid instant; the harness passes the
+analyzer a jitter band for that reason and says so. A hardware log is read with
+no band, because a driver computes its instants.
+
 ### What runs
 
-Three OS processes, two binaries:
+Three OS processes, two binaries, one supervisor:
 
 | | |
 |---|---|
+| `simplelaunch` | the launcher, from the pinned Clockwork drop. Starts all three processes from `robotcpu.textproto`, redirects each one's console into its own file, and stops them all together |
 | `reachy_motord` | the servo bus. Not a cog: it owns the serial port, a 20 ms grid on the real clock, and the driver decisions. Talks to the cogs over six UDP sockets on loopback |
-| `robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
-| `robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose`, `Session`, and the wake gesture that asks for the one thing this system does unprompted |
+| `cogs/robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
+| `cogs/robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose`, `Session`, and the wake gesture that asks for the one thing this system does unprompted |
 
 One executable, two processes: which one it becomes is the process description
-it is started with. Both need the same `--pinion-dir` and `--pinion-ns` — the
-logger finds the control process's channels through that namespace, and a
-mismatch is silent in the worst direction: the logger comes up, finds nothing,
-and writes an empty log while the gesture runs perfectly. Both values are stated
-once in `cogs/robot_logger.textproto` and `make motion-commands` reads them from
-there.
+it is started with. `robotcpu.textproto` is not written by hand — the
+compositions render it from `cogs/robot.clk`, and the payload carries it as
+rendered. It names two of the apps itself; the driver is merged into it from
+`driver/motord_launch.textproto`, because the renderer only knows about
+Clockwork processes.
+
+Nothing carries a `--pinion-dir` or a `--pinion-ns`. The rendered config cannot
+express per-process flags, so every process runs on the compiled-in defaults —
+`/dev/shm`, and the empty namespace, which is a namespace like any other. The
+logger is handed those two values as configuration rather than on a command
+line, so `cogs/robot_logger.textproto` restates them, and `make motion-build`
+refuses to stage a payload where it says anything else. That refusal is the whole
+of the namespace agreement: there is no longer a start command for it to drift
+from.
 
 ### The loop
 
-    make motion-build       # the aarch64 payload: both binaries and every config they read
+    make motion-build       # the aarch64 payload: the launcher, both binaries, every config
     make motion-deploy      # push it into the unit's RAM, and make the log directory
-    make motion-commands    # print the three commands, in the order to start them
+    make motion-commands    # print the start command, the logs to watch, and the stop
     # ... the run ...
     make motion-fetch       # bring the .olog directories back, timestamped
     bazel run //cogs:first_motion_report -- .local/motion-logs/<fetch>/<run>
@@ -262,27 +358,58 @@ cannot push a payload older than your tree. It refuses while `brenn-app.service`
 or `reachy-motiond.service` is running — either of them holds the servo bus —
 and the refusal names the service and the command, exactly as the bench's does.
 That question is advisory here, which it is not for the bench: a push starts
-nothing, and the run itself is three commands a person types later. What keeps
-two claimants off the bus at that point is the driver's exclusive open of the
-port, so clear the bus before you start the run and not merely before you push.
+nothing, and the run itself is a command a person types later. What keeps two
+claimants off the bus at that point is the driver's exclusive open of the port,
+so clear the bus before you start the run and not merely before you push.
 
 The payload lands at `/run/brenn-app/releases/motion` — tmpfs, cleared by a
-reboot, and the working directory all three processes are started from, because
-every configuration file in the payload is named by a path relative to it. The
-records land under `/run/brenn-app/logs/motion`, also RAM: pull them off with
-the run.
+reboot, and the working directory the launcher is started from, because every
+path in its config, and every configuration file each process reads, is named
+relative to it. The records land under `/run/brenn-app/logs/motion` and the
+processes' console output under `/run/brenn-app/logs/launch`, also RAM: pull
+what you want off with the run.
 
-### Starting and stopping
+### Starting, watching, stopping
 
-`make motion-commands` prints them; the order is the driver, then the logger,
-then the control loop, and stopping is the reverse. Start the driver first
-because it fails safe: with nothing talking to it, it reaches the minimum risk
-condition on its own inside its startup window and reports having done so.
+`make motion-commands` prints them. One command starts the run:
 
-**Any stop order is safe.** A driver that outlives the cogs de-torques on its
-own dead-man — silence is what makes it let go — and a driver stopped first
-leaves a machine already at rest. There is no ordering in which the machine
-stays energised with nobody commanding it.
+    cd /run/brenn-app/releases/motion && ./simplelaunch robotcpu.textproto \
+        --logdir /run/brenn-app/logs/launch
+
+It runs in the foreground. Watch the driver with `tail -f` on
+`/run/brenn-app/logs/launch/motord_0.log`, and the session on `proc_0.log`
+beside it; a second run in the same log directory writes `motord_1.log`, and so
+on.
+
+**There is no start order to get right, and none to get wrong.** The launcher
+spawns all three at once, in whatever order it happens to walk them, and each is
+safe alone: a driver with nobody talking to it reaches the minimum risk
+condition inside its startup window and says so; a control loop whose driver is
+not up yet finds the servos absent — its first presence ping has an 800 ms
+delivery budget against a port bound milliseconds after the fork — and parks the
+session without ever writing torque, which is a dead run and never a hazard; a
+logger that starts late costs early records and nothing else.
+
+**Stopping is one gesture, and any way of stopping is safe.** Ctrl-C in the
+launcher's terminal, or `curl -X POST 127.0.0.1:8080/quit` from anywhere on the
+unit. The launcher SIGINTs all three children: the cog processes stop cleanly,
+and the driver de-torques the machine, confirms it, prints what it did, and
+exits — well inside the 3 s before the launcher escalates to SIGTERM. What
+covers everything a signal cannot — SIGKILL, a crash, a yanked cable, a wedged
+host — is the servos' own Bus Watchdog, armed by the session at 200 ms: a head
+held by nobody goes limp on its own. That claim about the watchdog is asserted by
+the bench `watchdog` self-test and is **unverified on hardware** until that test
+has passed on this unit; run it before the first motion run.
+
+If the launcher refuses to start with a complaint about a running process, that
+is its own check: it will not start an app whose executable basename is already
+running. A stray `robot_clk_exe` or `reachy_motord` from an earlier experiment is
+what that means. Find it and stop it; the refusal is the port-bind refusal you
+would otherwise have hit later and less clearly.
+
+The launcher also listens on 127.0.0.1:8080 for the duration of the run. That is
+one more local-trust-only surface on the loopback seam this machine already has,
+and no new class of exposure.
 
 ### What a good run looks like
 
@@ -292,6 +419,13 @@ rest-class, which is not a fault — a rest-class ending is the machine at the
 minimum risk condition, and the next wake is a fresh session rather than a
 recovery. The gesture is `cogs/wake_params.textproto`; it is the same gesture
 the S1 scenario runs, so every phase of it is already pinned by a test.
+
+Expect the first dozen seconds to look like nothing happening. Commissioning is
+about five seconds of bus transactions with the machine still, and the wake lead
+— `lead_ms` in `cogs/wake_params.textproto`, eight seconds — is deliberate room
+for that survey to finish before the first step opens. A motionless machine in
+that window is the normal shape of a good run, not a wedged one; the survey is
+visible meanwhile in the driver's log, which is what the `tail` above is for.
 
 Watch for it with your eyes on the machine and your verdict from the log.
 `first_motion_report` over the fetched records is the verdict: the phase
@@ -304,13 +438,28 @@ exactly the run whose numbers somebody needs. Its own test runs it over the S1
 scenario's deterministic log, so the analyzer was proved before any hardware log
 existed.
 
-File the report and the log with the run record. Three things to check on the
-unit the first time, none of which any test here can answer: that the log
-directory's filesystem accepts direct I/O on that kernel — the writer opens
-every file `O_DIRECT | O_DSYNC` and a refusal is a failed open at the first file
-— that the aarch64 binaries run at all, which `make check-device` says nothing
-about because it builds and never executes them, and that the unit's time daemon
-is configured to slew rather than step while a session runs. A backwards step of
+**Before you power the unit down, look at the log root while it is still up:**
+
+    ls -l /run/brenn-app/logs/motion/*/
+
+A run directory holding a non-zero-length `.olog` is the only evidence that the
+writer got as far as records; that directory is tmpfs and a power-down takes the
+answer with it. `make motion-fetch` refuses a fetch that brought no records
+rather than printing a report command over nothing, but by then the machine may
+be off and the run unrepeatable — so the observation belongs here, while it is
+still a question you can act on.
+
+File the report and the log with the run record. Four things to check on the unit
+the first time, none of which any test here can answer: that the log directory's
+filesystem accepts direct I/O on that kernel — the writer opens every file
+`O_DIRECT | O_DSYNC` and a refusal is a failed open at the first file — that the
+aarch64 binaries run at all, which `make check-device` says nothing about because
+it builds and never executes them, that the arrival tolerances the report judges
+by are the ones you want — `ARRIVAL_OFFSET_M`, `ARRIVAL_TURN_RAD` and
+`ARRIVAL_ANTENNA_RAD` in `cogs/first_motion_report.rs` were sized from the
+mechanism on paper by an agent and nobody has measured this machine, so confirm
+or reset all three before a verdict turns on one — and that the unit's time
+daemon is configured to slew rather than step while a session runs. A backwards step of
 `CLOCK_REALTIME` is loss of the driver's time base: every timer that can
 de-torque the machine is a difference against the clock that just moved, so the
 driver answers a step by latching torque off, and nothing clears that latch but

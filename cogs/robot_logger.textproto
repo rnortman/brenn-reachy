@@ -19,19 +19,20 @@
 # records and nothing else.
 log_root_dir: "/run/brenn-app/logs/motion"
 
-# Where the control process's channel buffers are. The logger reads the logged
-# channels straight out of them, so this is the same directory the control
-# process is started with -- its `--pinion-dir`.
+# Where the control process's channel buffers are, and the namespace the logger
+# finds them under. Both have to match what the control process runs with, and a
+# mismatch is silent in the worst direction: the logger comes up, finds no
+# channels, and writes an empty log while the gesture runs perfectly.
+#
+# So these two are not free values. The launcher config the compositions render
+# carries nothing but a process-description path as a generated app's args, so
+# every process a run starts is flagless and uses the compiled-in defaults --
+# `/dev/shm` for `--pinion-dir`, and the empty string for `--pinion-ns`, which is
+# a namespace like any other and selects `<root>/clockwork/pinion/pub`. These two
+# lines therefore restate those defaults, and nothing else is correct here:
+# `tools/build-motion.sh` refuses to stage a payload that says otherwise.
 pinion_shm_root: "/dev/shm"
-
-# The socket namespace, which both processes have to name identically: the
-# logger finds the control process's channels through it. This is the value the
-# control process's `--pinion-ns` must carry, taken from here rather than typed
-# again, because a mismatch is silent in the worst direction -- the logger comes
-# up, finds no channels under its namespace, and writes an empty log while the
-# gesture runs perfectly. Empty is a namespace too, and the one a process started
-# with no `--pinion-ns` uses.
-pinion_namespace: "motion"
+pinion_namespace: ""
 
 # The write rate the buffer pool is sized against, MiB per second. The pool is
 # one second of it plus an 8 MiB schema reserve, in 256 KiB buffers -- 12 MiB at

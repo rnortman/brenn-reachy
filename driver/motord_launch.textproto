@@ -1,0 +1,16 @@
+# The driver's entry in the launcher's app table, merged into the launcher
+# config `RobotCpu` renders (`cogs/robot.clk`) so that one supervisor starts and
+# stops all three of a run's processes.
+#
+# One message of simplelaunch's `AppConfig`. Hand-written because the renderer
+# only knows about Clockwork processes, and the driver is not one: it owns a
+# serial port and a real-clock grid of its own.
+#
+# The executable is resolved against the launcher's working directory, which is
+# the payload root -- so this is where `tools/build-motion.sh` stages the driver
+# binary. No args: the driver's default `--config` path is relative to the same
+# directory and resolves without one.
+app {
+  name: "motord"
+  executable: "reachy_motord"
+}

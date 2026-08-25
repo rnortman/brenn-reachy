@@ -117,6 +117,57 @@ verify_aarch64() {
 		"The platform flag did not take effect; the device cannot execute this."
 }
 
+# Several targets as one cquery set expression, so one question can name a whole
+# payload's worth of outputs. Shared because both build paths — the device
+# payload and the host run — ask exactly one such question per kind of answer,
+# and a change to how targets are joined has to reach both.
+union() {
+	local expr=$1
+	shift
+	local target
+	for target in "$@"; do
+		expr="${expr} + ${target}"
+	done
+	echo "$expr"
+}
+
+# The two values a logger configuration has to restate.
+#
+# The launcher configs the compositions render carry no per-process arguments
+# beyond a process description, so every process a run starts is flagless and
+# finds its channel buffers under the compiled-in pinion defaults. A logger is
+# handed those two values as configuration instead, and a logger looking
+# somewhere else is a run that logs nothing while the gesture runs perfectly.
+# Nothing at run time can notice that, so it is asserted before anything is
+# staged -- on the device path and on the host run, whose own logger config
+# carries the same two lines for the same reason.
+pinion_defaults=(
+	'pinion_shm_root: "/dev/shm"'
+	'pinion_namespace: ""'
+)
+
+# The pinion agreement, checked against one logger configuration.
+#
+#   check_pinion_defaults <workspace-relative path>
+#
+# Line-oriented and exact, leading whitespace allowed, the same shape
+# deploy-motion.sh reads a scalar with: what must hold is that the file states
+# these values and not some others.
+check_pinion_defaults() {
+	local config=$1 want line
+	[ -f "${repo_root}/${config}" ] ||
+		die "the run wants ${config} and the tree has no such file."
+	for want in "${pinion_defaults[@]}"; do
+		line=$(sed -n "s/^[[:space:]]*\(${want%%:*}: .*\)\$/\1/p" \
+			-- "${repo_root}/${config}" | head -n 1)
+		[ "$line" = "$want" ] || die \
+			"${config} states '${line:-nothing}' where the run needs '${want}'." \
+			"Every process a run starts is flagless -- the rendered launcher config cannot" \
+			"carry pinion flags -- so these two values are the compiled-in defaults, and the" \
+			"logger has to name the same buffers the control process creates."
+	done
+}
+
 # Where Bazel put what it built, as a listing of workspace-relative paths.
 # cquery rather than the bazel-bin symlink: that symlink points at whatever
 # configuration ran last, and a plain `bazel test //...` afterwards repoints it
