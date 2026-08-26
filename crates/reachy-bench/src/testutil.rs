@@ -9,7 +9,7 @@
 //! Test-only: nothing here is compiled into the binary.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -34,14 +34,15 @@ const HEALTHY_RAIL: u16 = 118;
 /// temperature case asserts.
 const RESTING_TEMP_C: u8 = 28;
 
-/// A scripted Bus Watchdog on one servo: what a real one is documented to do,
-/// as a fixture a test can point at a verdict.
+/// A scripted Bus Watchdog on one servo, as a fixture a test can point at a
+/// verdict.
 ///
 /// Modelling it does not launder the hardware fact the bench command exists to
 /// establish -- what a servo on a bench does with silence is that command's
-/// assertion and this cannot answer it. What it does check is that the command
-/// reads a latch correctly when it meets one, which is otherwise only ever
-/// exercised at a powered unit.
+/// assertion and this cannot answer it, which is why the fields say which of
+/// them a hardware run has settled (see `expected`). What it does check is that
+/// the command reads a latch correctly when it meets one, which is otherwise
+/// only ever exercised at a powered unit.
 ///
 /// The trip has two triggers. Silence is the real one: the host's own clock is
 /// shared with this fixture, so a servo trips when the gap between two frames
@@ -74,10 +75,27 @@ pub(crate) struct BusWatchdogModel {
 }
 
 impl BusWatchdogModel {
-    /// A watchdog on `id` that behaves as the vendor documents: it trips on
-    /// silence, marks its register, lets the servo go, and refuses ordinary
-    /// writes with Data Range until a zero clears it.
-    pub(crate) fn documented(id: u8, now: &Rc<Cell<Duration>>, unit: Duration) -> Self {
+    /// A watchdog on `id` that behaves the way the bench command expects: it
+    /// trips on silence, marks its register, lets the servo go, and refuses
+    /// ordinary writes with Access until a zero clears it.
+    ///
+    /// Two of those three fields are observation-backed and one is not, and the
+    /// difference matters to anything reading a case built on this fixture:
+    ///
+    /// - `marks_register` and `refuses_writes_with: Some(ACCESS)` are what a
+    ///   servo on this bench does — `0xff` in the register, and an error field
+    ///   whose masked code is Access. The vendor's manual says Data Range in its
+    ///   worked example and "read-only" (which is Access) in its prose, so it is
+    ///   no help; the hardware is.
+    /// - `drops_torque` is what the fault policy requires of an armed watchdog,
+    ///   and it is **not what this hardware does**. A tripped servo reads Torque
+    ///   Enable as 1 — the vendor's manual is right that a trip halts the servo
+    ///   with acceleration and velocity applied as zero, which is a stop under
+    ///   torque rather than a release. The field stays true here and the bench
+    ///   command goes on asserting it: an armed watchdog that does not de-torque
+    ///   is a policy-level finding awaiting its own cycle, and a fixture edited
+    ///   to match would be the assertion quietly retracted.
+    pub(crate) fn expected(id: u8, now: &Rc<Cell<Duration>>, unit: Duration) -> Self {
         Self {
             id,
             now: Rc::clone(now),
@@ -85,15 +103,20 @@ impl BusWatchdogModel {
             trips_after_frames: None,
             marks_register: true,
             drops_torque: true,
-            refuses_writes_with: Some(DATA_RANGE),
+            refuses_writes_with: Some(ACCESS),
             last_seen: now.get(),
             latched: false,
         }
     }
 }
 
-/// The status error byte a latched watchdog answers a write with: Data Range,
-/// with the alert bit clear.
+/// The status error byte a latched watchdog answers a write with on this
+/// hardware: Access, with the alert bit clear.
+pub(crate) const ACCESS: u8 = 7;
+
+/// Data Range, with the alert bit clear — the code the vendor's worked example
+/// claims for a latched watchdog and the hardware does not answer with. Kept as
+/// a well-formed refusal that is *not* the expected signature.
 pub(crate) const DATA_RANGE: u8 = 4;
 
 /// A scripted machine: nine servos with a register file, answering pings, reads
@@ -111,12 +134,14 @@ pub(crate) struct FakeMachine {
     /// Reads of a register a servo answers nothing to, counted down as they
     /// arrive: a dropout that ends, rather than a servo that is gone.
     pub(crate) mute: HashMap<(u8, u16), u32>,
-    /// Reads of a register a servo answers normally and then stops answering
-    /// for good, counted down as they arrive: a servo that goes away part way
-    /// through a sequence, which is the shape a cut wire or a browned-out rail
-    /// has. The opposite end of [`Self::mute`], whose counts are spent on the
-    /// first reads rather than the last.
-    pub(crate) deaf_after: HashMap<(u8, u16), u32>,
+    /// Registers a servo has stopped answering about for good: a servo that
+    /// goes away part way through a sequence, which is the shape a cut wire or
+    /// a browned-out rail has. The opposite end of [`Self::mute`], which ends.
+    ///
+    /// Flipped by [`Self::go_deaf`] while a command runs rather than scripted
+    /// up front, so a case says *when* in the command's own transcript the
+    /// servo goes away instead of counting the transactions that come first.
+    pub(crate) deaf: HashSet<(u8, u16)>,
     /// Reads of a register this machine answers with a frame damaged after its
     /// checksum was taken, so the host sees bytes that disagree with
     /// themselves.
@@ -178,7 +203,7 @@ impl FakeMachine {
             silent: Vec::new(),
             ignored: Vec::new(),
             mute: HashMap::new(),
-            deaf_after: HashMap::new(),
+            deaf: HashSet::new(),
             damaged: Vec::new(),
             verbose: Vec::new(),
             unmirrored: Vec::new(),
@@ -304,6 +329,11 @@ impl FakeMachine {
         );
     }
 
+    /// Stop answering reads of `addr` on `id`, from now on.
+    pub(crate) fn go_deaf(&mut self, id: u8, addr: u16) {
+        self.deaf.insert((id, addr));
+    }
+
     /// What `id`'s four-byte position register holds, as the signed count it is.
     fn counts(&self, id: u8, reg: RegId) -> Option<i32> {
         let bytes: [u8; 4] = self.get(id, named_reg(reg))?.try_into().ok()?;
@@ -316,10 +346,8 @@ impl FakeMachine {
         if self.silent.contains(&id) {
             return true;
         }
-        match self.deaf_after.get_mut(&(id, addr)) {
-            Some(0) => return true,
-            Some(left) => *left -= 1,
-            None => {}
+        if self.deaf.contains(&(id, addr)) {
+            return true;
         }
         match self.mute.get_mut(&(id, addr)) {
             Some(left) if *left > 0 => {
@@ -375,8 +403,15 @@ impl FakeMachine {
             && armed != 0xFF
             && self.torqued(id)
             && now.saturating_sub(dog.last_seen) > dog.unit * u32::from(armed);
+        // A forced trip fires once and is spent. A count that stayed at zero
+        // would re-latch the servo on the frame after every clear, which is a
+        // machine no clear can ever recover -- and it would hide whether the
+        // clear worked.
         let forced = match dog.trips_after_frames {
-            Some(0) => true,
+            Some(0) => {
+                dog.trips_after_frames = None;
+                true
+            }
             Some(left) => {
                 dog.trips_after_frames = Some(left - 1);
                 false
@@ -679,25 +714,10 @@ impl Clock for TestClock {
     }
 }
 
-/// The configuration the example ships with, which is what an operator copies.
-/// It carries no datum table — the first run has no way to have one — so it is
-/// exactly the file a bring-up starts from.
-pub(crate) fn undatumed_config() -> BenchConfig {
-    let cfg =
-        crate::config::parse(include_str!("../reachy-bench.example.toml")).expect("it parses");
-    assert_eq!(cfg.datum, None, "the shipped example resolves no datum");
-    cfg
-}
-
-/// The same file with a datum recorded, which is what a reviewed unit's copy
-/// looks like and the only shape that resolves.
-pub(crate) fn datumed_config() -> BenchConfig {
-    let mut cfg = undatumed_config();
-    cfg.datum = Some(crate::config::DatumSection {
-        crank_datum: crate::config::DatumSetting::Direct,
-        provenance: "a test, not a unit".to_string(),
-    });
-    cfg
+/// The configuration the example ships with, which is what an operator copies
+/// and therefore the file every command is exercised against.
+pub(crate) fn example_config() -> BenchConfig {
+    crate::config::parse(include_str!("../reachy-bench.example.toml")).expect("it parses")
 }
 
 /// What a command needs off a configuration — the servo map and the bus timing —
@@ -727,7 +747,7 @@ pub(crate) fn configured(file: &BenchConfig) -> Configured {
 
 /// The configuration of a reviewed unit as a command consumes it.
 pub(crate) fn resolved() -> Configured {
-    let mut cfg = datumed_config();
+    let mut cfg = example_config();
     wind_down_bus(&mut cfg);
     configured(&cfg)
 }

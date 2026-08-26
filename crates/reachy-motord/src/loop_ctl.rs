@@ -30,7 +30,8 @@
 //!   cycling until the confirmation pass says what it read back, and returns.
 //!   An operator's stop is the one case where control is still trusted while
 //!   the process is ending, so the release is commanded rather than left to the
-//!   servos' own watchdog — which is what covers every stop this cannot answer.
+//!   servos' own watchdog — which, on every stop this cannot answer, stops the
+//!   machine with torque still held.
 //!
 //! And one thing the clock does that the grid cannot express: a
 //! `CLOCK_REALTIME` step backwards. The grid is drawn on that clock, so a step
@@ -141,13 +142,15 @@ impl WoundDown {
         match self {
             Self::AlreadyReleased => {
                 "stopping: nothing believed torqued and nothing outstanding, so no torque-off was \
-                 written and nothing was read back; the servos' own bus watchdog is what covers a \
-                 machine this process never commanded"
+                 written and nothing was read back; nothing automatic releases torque this process \
+                 never commanded"
             }
             Self::Confirmed => "stopping: torque off, read back released on every row",
             Self::Unconfirmed => {
                 "stopping: torque off written on every cycle of the confirmation budget and not \
-                 read back released; the servos' own bus watchdog is the layer that answers this"
+                 read back released; the servos' own bus watchdog stops motion but does not \
+                 release torque on this hardware, so treat the machine as holding torque and \
+                 power it down before reaching in"
             }
         }
     }
@@ -520,8 +523,8 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
     /// enough to see it take. Nothing here gates the sweep — the write goes out
     /// on the first cycle of the wind-down and on every cycle after it — and
     /// nothing recovers anything: a wind-down that cannot confirm says so and
-    /// ends, leaving the servos' own bus watchdog as the layer that answers a
-    /// machine this process can no longer reach.
+    /// ends, and what is left is a servo-side watchdog that stops motion
+    /// without releasing torque, so the machine is to be treated as holding.
     ///
     /// The bound is the confirmation's own budget plus a cycle of margin, so a
     /// wind-down ends in about four hundred milliseconds at worst — well inside
@@ -1831,8 +1834,9 @@ mod tests {
         // And what a wind-down that ran no cycle did *not* do: a re-anchoring
         // asks the cycle for the release rather than writing it, so a grid that
         // was re-drawn on every iteration leaves nothing on the wire. The
-        // machine this driver can no longer schedule against is the servos' own
-        // bus watchdog's case, which is what the verdict's line names.
+        // machine this driver can no longer schedule against is left to the
+        // servos' own bus watchdog, which stops it without releasing it — which
+        // is what the verdict's line names.
         assert_eq!(
             machine.writes_of(TORQUE_ENABLE, 0),
             0,

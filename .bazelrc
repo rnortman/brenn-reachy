@@ -97,6 +97,27 @@ build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
 build:device --compilation_mode=opt
 build:device --platforms=//bazel/platform:reachy-device
 
+# The target ISA, stated rather than inherited. The fleet is one unit,
+# `reachy00`, whose CPU is a Cortex-A72: ARMv8.0-A plus CRC32, and that core's
+# ISA is the target, no more and no less. Without these the arch level is the
+# pinned Clockwork drop's own `-march=armv8.2-a+fp16+simd+dotprod+ssbs`, three
+# extension levels above this CPU — its LSE atomics alone (`cas`, `ldaddal`,
+# `swp`) produce a SIGILL on the unit.
+#
+# Both flags, because either alone is wrong here: `-mcpu` names the core for
+# tuning but clang takes the architecture from `-march` whenever both are
+# present, and the drop's `-march` is on every device compile ahead of these, so
+# only a restated `-march` lowers the arch level. A user copt is appended after
+# the toolchain's, which is what makes the restatement win.
+#
+# On this config because it must reach every device C++ compile, the drop's
+# cross-built boost, protobuf and abseil included. Rust is untouched: its
+# aarch64-unknown-linux-gnu target is baseline ARMv8.0-A already.
+# tools/assert-device-isa.sh is the durable guard — a flag can be out-ordered
+# silently, a disassembly cannot.
+build:device --copt=-march=armv8-a+crc
+build:device --copt=-mcpu=cortex-a72
+
 # CI's caches, behind a config so a local build neither reads nor writes them.
 # Both stores are content-addressed — a missing entry is a cache miss and an
 # extraneous one is dead weight, so restoring them from a CI cache archive

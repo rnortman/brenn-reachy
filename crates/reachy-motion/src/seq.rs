@@ -190,9 +190,10 @@ pub enum BusResult {
     DriverRefused,
     /// The servo answered with its error field set.
     ServoError {
-        /// The status error field, verbatim. Never reinterpreted here: one code
-        /// covers both a refused out-of-range goal and a latched bus watchdog,
-        /// and a sequencer that guessed between them would guess wrong.
+        /// The status error field, verbatim. Never reinterpreted here: which
+        /// number a latched bus watchdog refuses a write with is something the
+        /// vendor's manual and the hardware disagree about, and a sequencer that
+        /// classified the byte would classify it wrong.
         code: u8,
     },
     /// The write was acknowledged, and the register does not hold what was

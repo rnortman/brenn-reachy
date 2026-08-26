@@ -128,7 +128,7 @@ pub fn init_arm_config(profile: ProfileConfig) {
     assert!(
         profile.bus_watchdog > 0,
         "the servo profile is {profile:?}, and zero in the watchdog register is a machine that \
-         keeps holding its pose after the driver commanding it has died",
+         keeps chasing a stale goal after the driver commanding it has died",
     );
     let _ = CONFIGURED
         .get_or_init(|| arm::arm_config(&EnvelopeConfig::default(), provision_table(), profile));
@@ -1271,10 +1271,10 @@ mod tests {
     /// A profile a configuration that lost its watchdog line parses to.
     ///
     /// The realistic drift: a textproto omitting the field parses to zero, which
-    /// is the register disabled -- a machine that keeps holding its pose after
-    /// the driver commanding it has died. Refusing it here is the whole of what
-    /// stands between that file and a commissioned machine, so it is asserted
-    /// rather than assumed.
+    /// is the register disabled -- a machine that keeps chasing a stale goal
+    /// after the driver commanding it has died. Refusing it here is the whole
+    /// of what stands between that file and a commissioned machine, so it is
+    /// asserted rather than assumed.
     #[test]
     #[should_panic(expected = "zero in the watchdog register")]
     fn a_session_with_the_watchdog_disabled_is_refused_before_anything_is_armed() {

@@ -9,13 +9,13 @@
 # `repo_root` is that tree and the payload it pushes is a directory this test
 # made.
 #
-# What is worth pinning: the refusals, and the commands. The refusals are a stale
-# payload, a held servo bus, and a fetch that brought no records — a refusal that
-# quietly stops refusing is discovered on the night it should have saved. The
-# commands are what a person types with their eyes on a machine that can move, so
-# they are pinned to the letter: one launcher started from the release root with
-# the config the payload carries, the log files to watch, the observation step
-# that has to happen while the unit is still up, and the stop gesture.
+# What is worth pinning: the refusals, and the run. The refusals are a stale
+# payload, a held servo bus, a fetch that brought no records, and every exit
+# status of a run that is not the budgeted stop — a refusal that quietly stops
+# refusing is discovered on the night it should have saved. The run is what moves
+# a machine, so its remote command is pinned to the letter: the bus question and
+# the launcher in one invocation, started from the release root with the config
+# the payload carries, under the budget that stops it.
 #
 # The only value read out of the staged configuration is the log root. The
 # pinion namespace and shm root are enforced at build time: nothing this script
@@ -98,6 +98,7 @@ export PATH
 export CALLS="${work}/calls"
 export GIT_COMMIT_TIME=""
 export SSH_PREPARE_STATUS=0
+export SSH_RUN_STATUS=124
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
 
@@ -106,6 +107,12 @@ export RSYNC_OLOG=full
 cat >"${stubs}/ssh" <<'STUB'
 #!/usr/bin/env bash
 printf 'ssh %s\n' "$*" >>"$CALLS"
+# A run's ssh is the one carrying a pty, and its status is the launcher's rather
+# than the probe's, so the two are separate knobs: a case can hold the bus for a
+# push and answer 124 for a run.
+case " $* " in
+	*" -t "*) exit "${SSH_RUN_STATUS:-124}" ;;
+esac
 exit "${SSH_PREPARE_STATUS:-0}"
 STUB
 
@@ -147,7 +154,17 @@ printf 'git %s\n' "$*" >>"$CALLS"
 echo "$GIT_COMMIT_TIME"
 STUB
 
-chmod 0755 -- "${stubs}/ssh" "${stubs}/rsync" "${stubs}/git"
+# The analyzer, whose verdict a run's verdict is. It reports its argument so a
+# case can pin which run directory was judged, and its status is the knob that
+# says whether the log passed.
+cat >"${stubs}/bazel" <<'STUB'
+#!/usr/bin/env bash
+printf 'bazel %s\n' "$*" >>"$CALLS"
+exit "${BAZEL_STATUS:-0}"
+STUB
+
+chmod 0755 -- "${stubs}/ssh" "${stubs}/rsync" "${stubs}/git" "${stubs}/bazel"
+export BAZEL_STATUS=0
 
 deploy() {
 	: >"$CALLS"
@@ -276,54 +293,174 @@ assert_contains "it says the push did not happen" "$(output_of "$result")" \
 SSH_PREPARE_STATUS=0
 
 # ---------------------------------------------------------------------------
-# The commands that start the run
+# The run
 # ---------------------------------------------------------------------------
 
-result=$(deploy unit --commands)
-printed=$(output_of "$result")
-assert_status "the commands print" 0 "$(status_of "$result")"
-assert_contains "one launcher, started from the release directory" "$printed" \
-	"cd /run/brenn-app/releases/motion && ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch"
-assert_lacks "and no process is started by hand" "$printed" "./robot_clk_exe"
-assert_lacks "not even the driver" "$printed" "./reachy_motord"
-assert_lacks "nothing carries a pinion flag any more" "$printed" "--pinion-"
-assert_lacks "and no start order is prescribed" "$printed" "in this order"
+run_dest="${work}/run-records"
+result=$(deploy unit --run "$run_dest")
+ran=$(calls)
+assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
+assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 1; cd /run/brenn-app/releases/motion || exit 1; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; exit \$?"
+assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
+	"ssh -t -o BatchMode=yes root@unit"
+# This suite's stdin is not a terminal, which is the case ssh downgrades
+# silently: the pty is what carries a ^C to the unit, so its absence is said.
+assert_contains "a run with no terminal to ask a pty for says the ^C is gone" \
+	"$(output_of "$result")" "stdin is not a terminal"
+assert_contains "and says what stops the run instead" "$(output_of "$result")" \
+	"pkill -x simplelaunch"
+assert_lacks "no process is started by hand" "$ran" "./robot_clk_exe"
+assert_lacks "not even the driver" "$ran" "./reachy_motord"
+assert_lacks "nothing carries a pinion flag" "$ran" "--pinion-"
 
-assert_contains "the driver's console log is named" "$printed" \
-	"tail -f /run/brenn-app/logs/launch/motord_0.log"
-assert_contains "the control loop's is too" "$printed" \
-	"tail -f /run/brenn-app/logs/launch/proc_0.log"
-assert_contains "and the logger's" "$printed" \
-	"tail -f /run/brenn-app/logs/launch/logger_proc_0.log"
+assert_contains "the records are fetched from the configured log root" "$ran" \
+	"root@unit:/run/brenn-app/logs/testing/"
+assert_lacks "the log root is read, not retyped" "$ran" "/decoy"
+assert_lacks "and read out of the payload, not out of the tree" "$ran" "fromthetree"
+assert_contains "the analyzer judges the run directory that was discovered" "$ran" \
+	"bazel run -- //cogs:first_motion_report ${run_dest}/motion-log-"
+assert_contains "and the directory it names is the writer's own" "$ran" \
+	"run-20260825T120000Z"
+assert_lacks "a hardware log is read with no jitter band" "$ran" "--grid-jitter-ns"
+assert_contains "the run says where the log is" "$(output_of "$result")" "run-20260825T120000Z"
 
-# The observation step: whether the run wrote records is a question about the
-# unit, answered while the unit is still up. The log root comes out of the staged
-# configuration, like every other path this script prints.
-assert_contains "the records are looked at before power-down" "$printed" \
-	"ls -l /run/brenn-app/logs/testing/*/"
-assert_lacks "the log root is read, not retyped" "$printed" "/decoy"
-assert_lacks "and read out of the payload, not out of the tree" "$printed" "fromthetree"
+# The log root the run empties is the configured one, and only a log root inside
+# the payload store is emptied at all: the value comes out of a configuration
+# file and the clear runs as root on the unit.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/etc"|' \
+	-- "$logger_config"
+result=$(deploy unit --run "${work}/run-outside")
+assert_status "a run whose log root is outside the payload store refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the value and where it has to be" \
+	"$(output_of "$result")" "which is not under /run/brenn-app"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
 
-assert_contains "the stop gesture is named" "$printed" "curl -X POST 127.0.0.1:8080/quit"
-assert_lacks "printing commands reaches no device" "$(calls)" "ssh"
+# A log root that keeps the prefix and walks out of it anyway. The store check is
+# textual and dots are in the accepted charset, so `..` is refused as its own
+# thing -- a debug edit pointing the logs at flash would otherwise hand the
+# remote `rm -rf` a path outside the store, as root.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/run/brenn-app/../persistent"|' \
+	-- "$logger_config"
+result=$(deploy unit --run "${work}/run-traversal")
+assert_status "a log root that walks out of the store refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the component it will not take" \
+	"$(output_of "$result")" "which carries a . or .. component"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
 
-# A configuration that lost the one field the commands need is a refusal, not a
-# command naming nothing.
+# A records directory named relatively, which is what the Makefile passes. The
+# analyzer runs under `bazel run`, from its own runfiles tree, so the path it is
+# handed has to be absolute -- and the failure shape when it is not is an
+# analyzer reporting no log over a directory full of records.
+rel_dest=$(basename -- "${work}")/run-records-relative
+result=$(cd -- "$(dirname -- "${work}")" && deploy unit --run "$rel_dest")
+assert_status "a relative records directory runs" 0 "$(status_of "$result")"
+assert_contains "and the analyzer is handed an absolute path" "$(calls)" 	"bazel run -- //cogs:first_motion_report ${work}/run-records-relative/motion-log-"
+
+# The report's verdict is the wrapper's: a green run over a log the analyzer
+# fails is a failed run.
+BAZEL_STATUS=7
+result=$(deploy unit --run "${work}/run-records-failed")
+assert_status "the analyzer's verdict is the run's" 7 "$(status_of "$result")"
+BAZEL_STATUS=0
+
+# The exit statuses. 124 above is the budgeted stop and the only one that
+# proceeds; every other reading is a failure, and none of them is read as
+# "probably fine".
+SSH_RUN_STATUS=0
+result=$(deploy unit --run "${work}/run-early")
+assert_status "a launcher that exited before the budget refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says the gesture did not finish" "$(output_of "$result")" \
+	"before the 30s budget was up"
+assert_contains "and says where its console output is" "$(output_of "$result")" \
+	"/run/brenn-app/logs/launch"
+assert_lacks "and nothing is fetched from a run that did not happen" "$(calls)" "rsync"
+assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
+
+SSH_RUN_STATUS=137
+result=$(deploy unit --run "${work}/run-wedged")
+assert_status "a launcher killed after the SIGINT grace refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says it did not stop on SIGINT" "$(output_of "$result")" \
+	"did not stop on SIGINT"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+SSH_RUN_STATUS=7
+result=$(deploy unit --run "${work}/run-failed")
+assert_status "any other status refuses" 1 "$(status_of "$result")"
+assert_contains "and carries the code" "$(output_of "$result")" "exit 7"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+# A launcher killed by a signal, which the remote shell reports as 128+signal
+# because a shell is kept in front of it. Without one, ssh reports
+# its own 255 instead and a payload binary that faults reads as an unreachable
+# host — which is how a SIGILL from a payload compiled for the wrong ISA first
+# looked at a bench.
+SSH_RUN_STATUS=132
+result=$(deploy unit --run "${work}/run-signalled")
+assert_status "a launcher killed by a signal refuses" 1 "$(status_of "$result")"
+assert_contains "and carries the shell's code rather than ssh's" "$(output_of "$result")" \
+	"exit 132"
+assert_lacks "and is not reported as ssh failing" "$(output_of "$result")" \
+	"ssh to root@unit failed"
+
+# The probe is binding for a run, unlike for a push: the question and the work
+# are one invocation, so a service holding the bus stops the run before it
+# starts.
+SSH_RUN_STATUS=3
+result=$(deploy unit --run "${work}/run-held")
+assert_status "the payload holding the bus refuses a run" 1 "$(status_of "$result")"
+assert_contains "it names the service holding it" "$(output_of "$result")" \
+	"brenn-app.service is running"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+SSH_RUN_STATUS=4
+result=$(deploy unit --run "${work}/run-motiond")
+assert_status "the motion daemon holding the bus refuses a run" 1 "$(status_of "$result")"
+assert_contains "the way back is named" "$(output_of "$result")" \
+	"systemctl start reachy-motiond.service"
+
+# 255 is ssh's own code and also a run's, if the launcher exits with it, so the
+# refusal says both rather than asserting that nothing happened on the unit.
+SSH_RUN_STATUS=255
+result=$(deploy unit --run "${work}/run-unreachable")
+assert_status "ssh failing refuses" 1 "$(status_of "$result")"
+assert_contains "and does not claim the run never started" "$(output_of "$result")" \
+	"also the run's if the launcher exited with it"
+assert_contains "and says how to keep this run's records" "$(output_of "$result")" \
+	"--fetch <records-dir> first"
+SSH_RUN_STATUS=124
+
+# A run whose records never arrived is the fetch's refusal, unchanged by being
+# reached from here, and the analyzer is never offered an empty directory.
+RSYNC_OLOG=none
+result=$(deploy unit --run "${work}/run-norecords")
+assert_status "a run that wrote no records refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says there are no records" "$(output_of "$result")" \
+	"no .olog with anything in it"
+assert_lacks "and the analyzer was never run" "$(calls)" "first_motion_report"
+RSYNC_OLOG=full
+
+# A configuration that lost the one field a run needs is a refusal before
+# anything is started.
 sed -i '/^log_root_dir:/d' -- "$logger_config"
-result=$(deploy unit --commands)
+result=$(deploy unit --run "${work}/run-nofield")
 assert_status "a configuration with no log root refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names the field" "$(output_of "$result")" \
 	"states no log_root_dir"
+assert_lacks "and nothing was started" "$(calls)" "simplelaunch"
 stage_logger_config
 
 # ---------------------------------------------------------------------------
 # Values that mean something to a shell
 # ---------------------------------------------------------------------------
 #
-# The log root is pasted into a remote command run as root, a remote rsync path
-# the far end re-parses, and a local command a person copies. A value with a space
-# in it means a different thing at each of those sites, so it is refused where it
-# is read rather than quoted differently three times.
+# The log root is pasted into a remote command run as root and into a remote
+# rsync path the far end re-parses. A value with a space in it means a different
+# thing at each of those sites, so it is refused where it is read rather than
+# quoted differently at each.
 
 sed -i 's|^log_root_dir: .*|log_root_dir: "/run/brenn-app/logs/two words"|' -- "$logger_config"
 result=$(deploy unit --push)
@@ -338,15 +475,16 @@ assert_lacks "the fetch reaches no device" "$(calls)" "rsync"
 stage_logger_config
 
 sed -i 's|^log_root_dir: .*|log_root_dir: "/run/brenn-app/logs; rm -rf /"|' -- "$logger_config"
-result=$(deploy unit --commands)
+result=$(deploy unit --run "${work}/run-injected")
 assert_status "a log root carrying a command refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names that field and its value" "$(output_of "$result")" \
 	"log_root_dir is '/run/brenn-app/logs; rm -rf /'"
+assert_lacks "and nothing was started with it" "$(calls)" "simplelaunch"
 stage_logger_config
 
 # The shipped shapes are accepted, so the check above is a check on values and
 # not a ban on paths.
-result=$(deploy unit --commands)
+result=$(deploy unit --run "${work}/run-ordinary")
 assert_status "an ordinary path and name are accepted" 0 "$(status_of "$result")"
 
 # ---------------------------------------------------------------------------
@@ -454,6 +592,19 @@ assert_status "a mode the script does not have refuses" 1 "$(status_of "$result"
 result=$(deploy unit --fetch)
 assert_status "a fetch with no destination refuses" 1 "$(status_of "$result")"
 
+result=$(deploy unit --run)
+assert_status "a run with no records directory refuses" 1 "$(status_of "$result")"
+assert_lacks "and starts nothing" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --run "${work}/run-extra" --wat)
+assert_status "an extra argument after --run refuses" 1 "$(status_of "$result")"
+assert_lacks "and starts nothing either" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --commands)
+assert_status "the mode that only printed commands is gone" 1 "$(status_of "$result")"
+assert_contains "and the usage names the one that runs them" "$(output_of "$result")" \
+	"--run <dir>"
+
 # A misspelling of the one flag --push takes is not "check the freshness after
 # all": an operator who thinks they overrode the refusal gets the usage line.
 result=$(deploy unit --push --stale-okay)
@@ -476,11 +627,12 @@ assert_lacks "and that pushes nothing either" "$(calls)" "rsync"
 # records, at a path naming nothing.
 
 rm -rf -- "$payload"
-result=$(deploy unit --commands)
-assert_status "printing commands with no payload refuses" 1 "$(status_of "$result")"
+result=$(deploy unit --run "${work}/run-nopayload")
+assert_status "a run with no payload refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names the missing configuration" "$(output_of "$result")" \
 	"no logger configuration at"
 assert_contains "and says to build one" "$(output_of "$result")" "make motion-build"
+assert_lacks "and reaches no device" "$(calls)" "ssh -t"
 
 result=$(deploy unit --fetch "${work}/nowhere")
 assert_status "fetching with no payload refuses" 1 "$(status_of "$result")"
@@ -489,6 +641,12 @@ assert_contains "the refusal names the missing configuration" "$(output_of "$res
 assert_lacks "and reaches no device" "$(calls)" "rsync"
 mkdir -p -- "${payload}/cogs" "${payload}/driver"
 stage_payload "$after"
+
+# ---------------------------------------------------------------------------
+# The run budget against the wake lead it is mostly made of
+# ---------------------------------------------------------------------------
+
+assert_run_budget_covers_lead "${script_dir}/deploy-motion.sh"
 
 # ---------------------------------------------------------------------------
 

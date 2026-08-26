@@ -406,35 +406,6 @@ assert_status "and the shipped set runs again" 0 "$(status_of "$result")"
 # The run budget against the wake lead it is mostly made of
 # ---------------------------------------------------------------------------
 
-# The run budget is a hand-maintained sum whose largest term — the shipped wake
-# lead — lives in another file and language. A lead that grows without the
-# budget following is red here rather than a `POST /quit` mid-gesture.
-#
-# Besides the lead: commissioning's bus survey (~5 s), the raise-hold-stow
-# gesture (~5 s), and the release (~4 s) — fourteen seconds, deliberately
-# without the subject's margin (which is for a loaded workstation, not this sum).
-checkout=$(cd -- "${script_dir}/.." && pwd)
-shipped_lead_ms=$(sed -n 's/^lead_ms:[[:space:]]*\([0-9]*\).*/\1/p' \
-	-- "${checkout}/cogs/wake_params.textproto")
-shipped_budget=$(sed -n 's/^run_seconds=\([0-9]*\).*/\1/p' \
-	-- "${checkout}/tools/host-motion-run.sh")
-phases_seconds=14
-
-if [ -n "$shipped_lead_ms" ] && [ -n "$shipped_budget" ]; then
-	needed=$((shipped_lead_ms / 1000 + phases_seconds))
-	if [ "$shipped_budget" -ge "$needed" ]; then
-		pass "the run budget covers the shipped wake lead and the phases around it"
-	else
-		fail "the run budget covers the shipped wake lead and the phases around it" \
-			"the budget is ${shipped_budget} s" \
-			"the shipped wake lead is ${shipped_lead_ms} ms, and commissioning, the" \
-			"gesture and the release want ${phases_seconds} s around it: ${needed} s" \
-			"the launcher would be stopped mid-gesture"
-	fi
-else
-	fail "the run budget covers the shipped wake lead and the phases around it" \
-		"read no lead_ms from cogs/wake_params.textproto or no run_seconds from" \
-		"tools/host-motion-run.sh — one of the two names has moved"
-fi
+assert_run_budget_covers_lead "${script_dir}/host-motion-run.sh"
 
 tally

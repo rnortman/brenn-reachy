@@ -9,7 +9,7 @@
 //! commands an angle: `provision` writes one non-volatile register on a limp
 //! machine, `reboot` and `off` are de-torques, which nothing gates, and
 //! `watchdog` torques one servo at the position it is already standing at and
-//! watches its bus watchdog let it go.
+//! watches what its bus watchdog does to it — a stop, with torque held.
 
 #![forbid(unsafe_code)]
 
@@ -46,7 +46,8 @@ fn usage() -> String {
          \x20 reboot [id]           restart every servo, or one; clears a latched error and \
          drops torque\n\
          \x20 off                   write torque off on every servo\n\
-         \x20 watchdog [id]         torque one servo and watch its bus watchdog release it\n\
+         \x20 watchdog [id]         torque one servo and watch what its bus watchdog does to \
+         it\n\
          \n\
          Nothing here commands an angle: this tool reads the machine, provisions it and \
          releases it.\n\
@@ -65,9 +66,12 @@ fn usage() -> String {
          \n\
          `watchdog` is a supervised bring-up assertion, not a routine command: it arms the\n\
          servos' own bus inactivity timeout on one servo — an antenna unless you name\n\
-         another — holds torque there, and then goes quiet so the watchdog releases it.\n\
-         It runs for a few seconds, the servo goes limp on its own partway through, and it\n\
-         leaves that servo disarmed and limp. Run it at rest, never with the head up, and\n\
+         another — holds torque there, and then goes quiet and reads what the trip did.\n\
+         It runs for a few seconds. On this hardware the trip stops the servo and leaves it\n\
+         holding torque, so the assertion that it releases fails: that failure is the\n\
+         standing record of an unresolved policy defect and is not to be made green. The\n\
+         command's own make-safe disarms the register and releases torque on the way out,\n\
+         whichever way it ends. Run it at rest, never with the head up, and\n\
          power-cycle before the next read-only sweep: the register is RAM-resident and the\n\
          sweep expects the provisioned zero.\n\
          \n\
@@ -368,8 +372,9 @@ fn off(args: &Args) -> anyhow::Result<()> {
 /// goal it writes is the count the servo just reported for itself, so the
 /// conversion this tool has no business doing never comes up. What it does need
 /// is an operator standing there — it holds torque on one servo for a few
-/// seconds and the servo lets go on its own — so the warning is printed by the
-/// command itself, before the port is opened.
+/// seconds, and the trip does not release it: the command's own make-safe is
+/// what does, on the way out — so the warning is printed by the command itself,
+/// before the port is opened.
 fn watchdog(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
     let (map, timing, device) = bare_config(args)?;
 

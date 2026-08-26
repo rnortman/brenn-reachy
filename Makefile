@@ -35,7 +35,7 @@ help:
 	@echo "  make bench-fetch     bring a run's state file back, timestamped"
 	@echo "  make motion-build    the aarch64 motion payload: launcher, binaries, configs"
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
-	@echo "  make motion-commands print the commands that start, watch and stop a run"
+	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
 
 # The shell half of the gate. These scripts push binaries and configuration onto
@@ -187,10 +187,16 @@ check:
 # cover a different set than a deploy ships. One invocation, so one analysis
 # phase serves them all: the cog executable's own C++ graph is most of the work,
 # and the bench and the driver ride along on it.
+#
+# The build is not the whole of it: a binary that compiles for the device can
+# still carry instructions the device's CPU cannot execute. So the build is
+# followed by a disassembly of what it just produced, asserting the instruction
+# set is the one that unit implements.
 .PHONY: check-device
 check-device: require-bazel
 	bazel build --config=device $(BAZEL_FLAGS) -- \
 	    //bazel/platform:device_deployables
+	tools/assert-device-isa.sh
 
 # Auto-fix, which means formatting: rules_rust's rustfmt runner formats every
 # Rust target in the tree with the pinned toolchain's rustfmt, which is the same
@@ -248,8 +254,9 @@ clip-config: require-bazel
 
 # The online system, on this machine: the real control loop and the real logger,
 # with the simulated plant behind the real UDP seam, all three under the launcher
-# a unit uses. Twenty-five seconds of wall clock, then `first_motion_report` over
-# the log the run wrote, and the target's verdict is the report's.
+# a unit uses. A fixed budget of wall clock — the script states it and derives it
+# — then `first_motion_report` over the log the run wrote, and the target's
+# verdict is the report's.
 #
 # What it is for is configuration, not physics: the composition, the process
 # descriptions, the shared-memory namespace, the launcher config, the seam's wire
@@ -283,7 +290,7 @@ ifeq ($(origin REACHY_HOST), undefined)
 endif
 
 # The bench's configuration for this unit. Gitignored: it holds the serial node
-# and, once a person has reviewed a run, the crank datum record for one machine.
+# this machine's servos are on.
 BENCH_CONFIG ?= .local/reachy-bench.toml
 
 # Where fetched state files accumulate. One per run, named for its fetch time.
@@ -333,7 +340,7 @@ bench-config: device-host
 # binary older than the newest commit, and this target is why that refusal
 # should never fire.
 .PHONY: bench-run
-bench-run: device-host bench-build
+bench-run: device-host bench-config bench-build
 	tools/deploy-bench.sh $(REACHY_HOST) --run $(ARGS)
 
 # Build, push, and run the read-only self-test registry on the unit. ARGS is
@@ -343,7 +350,7 @@ bench-run: device-host bench-build
 # configuration. A --record elsewhere writes to RAM that no target brings
 # back and a reboot clears.
 .PHONY: bench-selftest
-bench-selftest: device-host bench-build
+bench-selftest: device-host bench-config bench-build
 	tools/deploy-bench.sh $(REACHY_HOST) --run selftest $(ARGS)
 
 # Bring a run's state file back. Each fetch lands under its own timestamped
@@ -358,9 +365,10 @@ bench-fetch: device-host
 #
 # Not a variant of the bench path. A bench command is one invocation that ends; a
 # motion run is three long-lived processes under a supervisor, on a machine that
-# can move, so there is no `motion-run`. These targets build the payload, push it,
-# say what to start, and bring the records back; `docs/bench-runbook.md` is the
-# procedure, and the starting is a person's.
+# can move. `motion-run` is the one command that builds, pushes, runs, fetches
+# and judges; the person in the loop is the operator who types it standing at the
+# machine, and the bus refusals plus the runbook's eyes-on rule are what that
+# presence is for. `docs/bench-runbook.md` is the procedure.
 
 # Where fetched run logs accumulate. One directory per fetch, named for its
 # fetch time.
@@ -383,12 +391,15 @@ motion-build:
 motion-deploy: device-host motion-build
 	tools/deploy-motion.sh $(REACHY_HOST) --push
 
-# What a run is started, watched and stopped with, and the log root read out of
-# the shipped logger configuration rather than retyped. Reaches no device, so it
-# answers with a unit powered off.
-.PHONY: motion-commands
-motion-commands: device-host
-	tools/deploy-motion.sh $(REACHY_HOST) --commands
+# Build, push, run, fetch, judge. The run is given a fixed budget and stopped by
+# it; the launcher's console streams here meanwhile, and this target's verdict is
+# `first_motion_report`'s over the records it brought back. The runbook's manual
+# appendix is the same run started by hand.
+#
+# Needs a reachable unit and bazel — the analyzer runs here, over the fetched log.
+.PHONY: motion-run
+motion-run: device-host motion-deploy require-bazel
+	tools/deploy-motion.sh $(REACHY_HOST) --run $(MOTION_RECORDS)
 
 # Bring a run's records back. Each fetch lands under its own timestamped
 # directory, so a session's runs accumulate rather than overwrite.

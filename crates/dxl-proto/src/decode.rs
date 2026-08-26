@@ -57,16 +57,16 @@ pub enum StatusCode {
     Instruction,
     /// The instruction packet's own CRC did not match.
     Crc,
-    /// A written value fell outside the register's range. Also the signature a
-    /// latched bus watchdog returns, so callers must surface it verbatim rather
-    /// than deciding which of the two it means.
+    /// A written value fell outside the register's range.
     DataRange,
     /// Data length shorter or longer than the register.
     DataLength,
     /// A written value fell outside the configured limit.
     DataLimit,
     /// Write to a read-only register, read of a write-only one, or a write to
-    /// EEPROM while torque is enabled.
+    /// EEPROM while torque is enabled. Also what this hardware answers a goal
+    /// write with while its bus watchdog is latched, a trip making the goal
+    /// registers read-only.
     Access,
 }
 

@@ -109,14 +109,19 @@ pub const POSITION_GAINS: Reg = Reg::new(80, 6);
 /// Bus inactivity timeout, in 20 ms units. 0 disables it.
 ///
 /// Armed, per session, at the value the session's configuration carries: a servo
-/// whose bus has been silent that long stops holding its goal, which is what
-/// answers a driver that was killed, crashed or unplugged while the machine was
-/// under torque. The register lives in RAM and resets to 0 at power-on, so the
-/// arming write is part of every commissioning sweep.
+/// whose bus has been silent that long stops. The register lives in RAM and
+/// resets to 0 at power-on, so the arming write is part of every commissioning
+/// sweep.
 ///
-/// Written as a pair, clear then arm: a latched watchdog answers ordinary writes
-/// with a Data Range error -- the same status a servo sends for an out-of-range
-/// goal -- and 0 is the vendor's documented clear.
+/// The stop does **not** release the torque the servo was holding: a tripped
+/// servo reads Torque Enable as 1, matching the vendor's description of a halt
+/// with the motion profile applied as zero. Nothing in this crate depends on
+/// whether callers want a release.
+///
+/// Written as a pair, clear then arm: a latched watchdog refuses ordinary
+/// writes, and 0 is the vendor's documented clear, accepted even while latched.
+/// Which error a refusal carries is not classified anywhere -- the vendor's
+/// manual and the hardware disagree about it -- so the byte travels verbatim.
 pub const BUS_WATCHDOG: Reg = Reg::new(98, 1);
 /// Goal current, in raw register units. Meaningful only outside position mode.
 pub const GOAL_CURRENT: Reg = Reg::new(102, 2);

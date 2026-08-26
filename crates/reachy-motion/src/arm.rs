@@ -260,9 +260,10 @@ pub struct ProfileConfig {
     pub acceleration: u32,
     /// Profile velocity, register units.
     pub velocity: u32,
-    /// Bus Watchdog timeout, in the register's 20 ms units. Armed: a host that
-    /// has gone quiet is a machine nobody is holding, and de-torque is what
-    /// that state calls for. The register is RAM-resident and resets at
+    /// Bus Watchdog timeout, in the register's 20 ms units. Armed, because a
+    /// servo that has stopped beats one chasing a stale goal once its host has
+    /// gone quiet; the trip does not release torque on this hardware, which is
+    /// observed rather than assumed. The register is RAM-resident and resets at
     /// power-on, which is why it is written per session.
     pub bus_watchdog: u8,
 }
@@ -304,9 +305,10 @@ pub type ProfileWrite = (RegId, fn(&ProfileConfig) -> Value);
 ///
 /// After the one position-gains write. The Bus Watchdog appears twice: zero
 /// first, then the configured timeout. Zero is the vendor's documented clear for
-/// a latched watchdog, which otherwise answers ordinary writes with a Data Range
-/// error, so the pair arms the register from either state a fresh engagement can
-/// find it in.
+/// a latched watchdog, which otherwise refuses ordinary writes, so the pair arms
+/// the register from either state a fresh engagement can find it in. Which error
+/// a refusal carries is nothing this sweep reads -- the vendor's manual and the
+/// hardware disagree about it, and the byte travels verbatim.
 ///
 /// The sweep's arithmetic and the cursor bound
 /// [`GAINS_PROFILE_WRITES`](crate::resume::GAINS_PROFILE_WRITES) both derive
@@ -4732,12 +4734,12 @@ mod tests {
         );
         assert_eq!(machine.enabled(), [false; ROW_COUNT]);
 
-        // A servo refusing the watchdog write — the Data Range refusal, alert
-        // bit set, that a latched watchdog answers ordinary writes with — stops
-        // the sweep naming that servo and that register, rather than being read
-        // as an out-of-range goal somewhere else.
+        // A servo refusing the watchdog write — 0x87, the refusal a latched
+        // watchdog on this hardware answers with, alert bit and all — stops the
+        // sweep naming that servo and that register. The byte reaches the error
+        // whole; nothing here reads what it means.
         let mut machine = Machine {
-            fail_write: Some((13, RegId::BusWatchdog, BusResult::ServoError { code: 0x84 })),
+            fail_write: Some((13, RegId::BusWatchdog, BusResult::ServoError { code: 0x87 })),
             ..bus()
         };
         let error = drive(&cfg, &mut machine).expect_err("servo 13 refuses the watchdog write");
@@ -4745,7 +4747,7 @@ mod tests {
             error,
             SeqError::Refused {
                 context: StepContext::reg(SeqStepKind::GainsProfiles, 13, RegId::BusWatchdog),
-                code: 0x84,
+                code: 0x87,
             }
         );
         assert_eq!(machine.enabled(), [false; ROW_COUNT]);

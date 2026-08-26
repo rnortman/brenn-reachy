@@ -40,7 +40,8 @@ torque_off_confirm_budget_ns: 500000000
 
 # The servo-side motion profile the commission sequencer writes, in the
 # registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
-# acceleration). Nothing has run this pair on hardware.
+# acceleration). This pair has run on hardware but nobody has measured whether
+# it is the right pair.
 #
 # The bench's trial-validated figures (400/600, including an 855°/s antenna sweep
 # and the 0.8 s presence gesture) were sized for a host commanding whole moves,
@@ -52,11 +53,14 @@ profile_acceleration: 20
 profile_velocity: 50
 
 # The servos' own Bus Watchdog timeout, in the register's 20 ms units: ten of
-# them, 200 ms. A servo whose bus has been silent that long stops holding its
-# goal, which is the only thing that answers a driver killed, crashed or
-# unplugged mid-gesture -- no code of ours runs in that machine state. Ten
-# consecutive lost cycles is far past the measured jitter of a loop that writes
-# a goal and reads a position every 20 ms while anything is held. The same
-# 200 ms as the driver's own `hold_timeout_ns`, which is the same judgment about
-# the same silence made one layer up.
+# them, 200 ms. A servo whose bus has been silent that long stops -- and keeps
+# holding torque, observed on this hardware. Armed anyway, because a stopped
+# servo beats one chasing a stale goal once its driver is killed, crashed or
+# unplugged mid-gesture; what answers the torque half of that state is nothing
+# here. TODO(watchdog-holds-torque)
+#
+# Ten consecutive lost cycles is far past the measured jitter of a loop that
+# writes a goal and reads a position every 20 ms while anything is held. The
+# same 200 ms as the driver's own `hold_timeout_ns`, which is the same judgment
+# about the same silence made one layer up.
 bus_watchdog: 10

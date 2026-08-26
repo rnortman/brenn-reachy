@@ -2,9 +2,7 @@
 #
 # Copy this beside the binary and change what your unit needs. Every key written
 # here is at its default, so deleting one changes nothing and the file doubles as
-# the documentation of what omitting it means. The exception is `[datum]`: it has
-# no default, it is commented out below, and a human writes it in from a
-# self-test record.
+# the documentation of what omitting it means.
 #
 # The bench talks to hardware and moves nothing. There is no motion, envelope or
 # settle table here: coordinated motion runs in the cog system, configured by its
@@ -107,20 +105,3 @@ leg_position_limits = [
     [1252, 2958],
     [1138, 2594],
 ]
-
-# [datum] — absent from a fresh configuration, and nothing converts a count to a
-# model angle without it. That a converted count is the model's crank angle rests
-# on every servo carrying its provisioned homing offset: the self-test's datum case
-# reads all nine back and compares them, and whatever arms this machine
-# re-verifies them before it enables anything. This table is not that check — it is the record
-# that a person read a run and stands behind what it says.
-#
-# It is commented out rather than filled in, so as shipped this file has no datum
-# to hand a host that asks for one. That is the intended state: an example cannot
-# have read your unit's run, and a value copied from here would be a review
-# nobody performed standing where the review is supposed to be.
-# Uncomment both lines and write your own note.
-#
-# [datum]
-# crank_datum = "direct"          # the only reading; anything else is refused
-# provenance = "who reviewed it, when, and from which self-test record"

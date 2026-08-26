@@ -14,10 +14,10 @@
 //! - **A case that did not run is a failure, not silence.** [`Outcome::NotRun`]
 //!   never counts as a pass, and a case missing from a record reads as
 //!   `NotRun` rather than as absent.
-//! - **The registry records; a person resolves.** The datum case reads the
-//!   servos' provisioned homing offsets and writes down what it saw. That a
-//!   person has read the evidence is recorded separately, in the bench
-//!   configuration, with a note saying where it came from.
+//! - **The registry records what it measured.** The datum case reads the
+//!   servos' provisioned homing offsets, compares them against the vendor
+//!   offsets baked into the motion layer, and writes down what it saw. That
+//!   record is the datum: nothing else in the tree carries one.
 //! - **The record is evidence, not memory.** It says what was observed and
 //!   when. Nothing reads it to find out what state the machine is in now —
 //!   arming re-verifies every one of these facts against the hardware on every
@@ -46,7 +46,7 @@ use reachy_motion::{
 };
 
 use crate::bare;
-use crate::config::{BenchConfig, ConfigError, DatumSetting, positive};
+use crate::config::{BenchConfig, ConfigError, positive};
 
 /// What a case decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,6 +356,29 @@ impl fmt::Display for Report {
     }
 }
 
+/// The datum as the self-test record spells it.
+///
+/// One variant, deliberately. A host-side correction is never the answer to a
+/// servo that lacks its provisioned offset: that is one servo's fault, refused
+/// by name, and a compensating shift would move all six legs for it. The enum
+/// exists so that a record saying anything else is refused by serde rather than
+/// read past.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatumSetting {
+    /// A converted count is the crank angle as the model means it, because each
+    /// leg servo applies its provisioned homing offset before reporting.
+    Direct,
+}
+
+impl fmt::Display for DatumSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
+        }
+    }
+}
+
 /// What the datum case saw and what it establishes.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,9 +454,8 @@ impl SelftestRecord {
     ///
     /// A verdict for a reader, not a gate: nothing in this workspace conditions
     /// arming or commanding on a record. The datum is one of the cases, and it
-    /// passes only when all nine homing offsets are the vendor's; that a person
-    /// reviewed that evidence is the configuration's `[datum]` table, which is
-    /// checked at load because every converted angle rests on it.
+    /// passes only when all nine homing offsets are the vendor's — the evidence
+    /// every converted angle rests on, recorded here and nowhere else.
     pub fn every_case_passed(&self) -> Result<(), RecordRefusal> {
         if let Some((case, outcome)) = first_not_passed(&self.cases) {
             return Err(RecordRefusal::CaseNotPassed { case, outcome });
@@ -592,10 +614,10 @@ pub fn margin_verdict(min_margin: f64, floor: Option<f64>, detail: &str) -> Case
 
 /// Everything the read-only registry needs that is not the machine.
 ///
-/// Built from a configuration file with no reviewed `[datum]` record in it,
-/// because this registry is what produces the evidence that record is written
-/// from. Nothing here is a value the registry could send: the only wire traffic
-/// it produces is pings and register reads.
+/// Built from a configuration file, which records no datum: this registry is
+/// what establishes the datum, by reading the offsets back. Nothing here is a
+/// value the registry could send: the only wire traffic it produces is pings
+/// and register reads.
 #[derive(Clone, Debug)]
 pub struct Registry {
     device: String,
@@ -613,9 +635,7 @@ pub struct Registry {
 impl Registry {
     /// The registry a configuration describes.
     ///
-    /// Only the tables the read-only half needs are converted, so a file with no
-    /// `[datum]` table — every file, before the first run — still produces a
-    /// runnable registry.
+    /// Only the tables the read-only half needs are converted.
     pub fn from_config(cfg: &BenchConfig) -> Result<Self, ConfigError> {
         let ids = cfg.servo_ids()?;
         Ok(Self {
@@ -1476,7 +1496,7 @@ mod runner_tests {
     use super::*;
     use reachy_bus::named_reg;
 
-    use crate::testutil::{FakeMachine, Spy, machine_at, rest_legs, stow_legs, undatumed_config};
+    use crate::testutil::{FakeMachine, Spy, example_config, machine_at, rest_legs, stow_legs};
 
     /// A run of the registry against a machine, with the port already open, and
     /// every instruction that crossed the wire.
@@ -1524,7 +1544,7 @@ mod runner_tests {
     /// reviewed number and a correct machine clears it.
     #[test]
     fn a_correct_machine_passes_every_case() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let machine = machine_at(&cfg, &stow_legs());
         let (report, _) = run(&cfg, machine);
 
@@ -1556,7 +1576,7 @@ mod runner_tests {
     /// fact, so both halves are asserted here rather than only the instruction.
     #[test]
     fn the_registry_only_ever_pings_and_reads_its_own_roster() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let machine = machine_at(&cfg, &stow_legs());
         let ids = cfg.servo_ids().expect("the roster is nine servos");
         let (_, instructions) = run(&cfg, machine);
@@ -1591,7 +1611,7 @@ mod runner_tests {
     #[test]
     fn an_arming_floor_that_is_not_a_voltage_refuses_the_registry() {
         for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
-            let mut cfg = undatumed_config();
+            let mut cfg = example_config();
             cfg.arm.min_arm_voltage = bad;
             let Err(refusal) = Registry::from_config(&cfg) else {
                 panic!("{bad} is not a supply floor, and a registry was built on it");
@@ -1609,7 +1629,7 @@ mod runner_tests {
     /// A port that does not open fails the first case and runs nothing after it.
     #[test]
     fn a_port_that_does_not_open_stops_the_run_at_the_first_case() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let registry = Registry::from_config(&cfg).expect("the configuration converts");
         let mut report = Report::new();
         registry.run(Err::<FakeMachine, _>("no such device"), &mut report);
@@ -1626,7 +1646,7 @@ mod runner_tests {
     /// questions of a machine that is not all there.
     #[test]
     fn silent_servos_are_all_named_and_stop_the_run() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.silent = vec![12, 17];
         let (report, _) = run(&cfg, machine);
@@ -1643,7 +1663,7 @@ mod runner_tests {
     /// sweep still finishes, so one disagreement does not hide the next.
     #[test]
     fn a_provisioned_register_that_disagrees_is_named_with_both_values() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         // Operating mode 0 on one servo: the reading that voids the servo-side
         // position envelope.
@@ -1669,7 +1689,7 @@ mod runner_tests {
     /// and the register have to survive that hand-off.
     #[test]
     fn a_register_a_servo_will_not_answer_fails_the_sweep_by_servo_and_register() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .mute
@@ -1691,7 +1711,7 @@ mod runner_tests {
     /// so the expectation is genuinely per servo rather than one value.
     #[test]
     fn an_antenna_in_single_turn_mode_fails_the_sweep_by_name() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(17, named_reg(RegId::OperatingMode), &[3]);
         let (report, _) = run(&cfg, machine);
@@ -1713,7 +1733,7 @@ mod runner_tests {
     /// A rail under the arm floor fails, and the reading is reported either way.
     #[test]
     fn a_rail_under_the_arm_floor_fails_and_says_which_servo() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             15,
@@ -1736,7 +1756,7 @@ mod runner_tests {
     /// all.
     #[test]
     fn a_temperature_outside_the_resting_band_fails_and_says_which_servo() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let legs = stow_legs();
 
         let mut hot = machine_at(&cfg, &legs);
@@ -1773,7 +1793,7 @@ mod runner_tests {
     /// people, and this is the only thing in the tree that compares them.
     #[test]
     fn the_provisioned_leg_fences_agree_with_the_envelope() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let (report, _) = run(&cfg, machine_at(&cfg, &stow_legs()));
 
         assert_eq!(report.outcome(Case::LegFence), Outcome::Pass);
@@ -1796,7 +1816,7 @@ mod runner_tests {
     /// leg, the bound and both windows in both units.
     #[test]
     fn a_fence_inside_the_host_window_fails_and_says_which_bound() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         // Leg 0 is servo 11, a hundred counts up from where it is provisioned:
         // a window the host would command straight through the bottom of.
@@ -1828,7 +1848,7 @@ mod runner_tests {
     /// commanded pose.
     #[test]
     fn a_fence_past_the_envelope_fails_and_says_which_bound() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             11,
@@ -1857,7 +1877,7 @@ mod runner_tests {
     /// are moved in both directions in one run.
     #[test]
     fn one_count_of_rounding_on_a_bound_is_agreement() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         for (lower, upper) in [(1501u32, 2959u32), (1503u32, 2957u32)] {
             let mut machine = machine_at(&cfg, &stow_legs());
             machine.set(11, named_reg(RegId::MinPositionLimit), &lower.to_le_bytes());
@@ -1898,7 +1918,7 @@ mod runner_tests {
     /// condition where the detail is all an operator has.
     #[test]
     fn a_fence_register_nothing_answers_fails_by_name() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .mute
@@ -1926,7 +1946,7 @@ mod runner_tests {
     /// as agreement — a mis-provisioned unit passing.
     #[test]
     fn a_fence_bound_no_count_can_take_fails_by_name() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             11,
@@ -1955,7 +1975,7 @@ mod runner_tests {
     /// stories to an operator triaging a bus.
     #[test]
     fn a_temperature_nothing_answers_fails_that_case_by_name() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .mute
@@ -1981,7 +2001,7 @@ mod runner_tests {
     /// which of them the verdict is about.
     #[test]
     fn the_fence_and_temperature_cells_are_read_once_each() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let machine = machine_at(&cfg, &stow_legs());
         let (report, _, reads) = run_watched(&cfg, machine);
 
@@ -2017,7 +2037,7 @@ mod runner_tests {
     /// and is still printed.
     #[test]
     fn only_bits_beyond_input_voltage_fail_health() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let legs = stow_legs();
 
         let mut voltage_only = machine_at(&cfg, &legs);
@@ -2040,7 +2060,7 @@ mod runner_tests {
     /// the case, named with both values.
     #[test]
     fn a_servo_of_the_wrong_kind_fails_the_identity_case() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         // The right antenna answering as one of the legs.
         machine.set(
@@ -2077,7 +2097,7 @@ mod runner_tests {
     /// where the head is.
     #[test]
     fn a_servo_without_its_vendor_homing_offset_fails_the_datum_case() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(13, named_reg(RegId::HomingOffset), &0i32.to_le_bytes());
         let (report, _) = run(&cfg, machine);
@@ -2110,7 +2130,7 @@ mod runner_tests {
     /// a half from the one the antenna is physically in.
     #[test]
     fn an_antenna_outside_its_turn_fails_the_fold_case_by_name() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             17,
@@ -2141,7 +2161,7 @@ mod runner_tests {
     /// to.
     #[test]
     fn the_fold_case_judges_only_the_antennas() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             13,
@@ -2180,7 +2200,7 @@ mod runner_tests {
             (-1, Outcome::Fail),
             (COUNTS_PER_REV, Outcome::Fail),
         ] {
-            let cfg = undatumed_config();
+            let cfg = example_config();
             let mut machine = machine_at(&cfg, &stow_legs());
             machine.set(17, named_reg(RegId::PresentPosition), &count.to_le_bytes());
             let (report, _) = run(&cfg, machine);
@@ -2197,7 +2217,7 @@ mod runner_tests {
     /// so the second one is not lost behind the first.
     #[test]
     fn two_unfolded_antennas_are_both_named_on_one_line() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine.set(
             17,
@@ -2225,7 +2245,7 @@ mod runner_tests {
     /// reports what it measured, whatever the verdict on it.
     #[test]
     fn the_clearance_is_measured_off_the_resting_counts() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let machine = machine_at(&cfg, &rest_legs());
         let (report, _) = run(&cfg, machine);
 
@@ -2251,7 +2271,7 @@ mod runner_tests {
     /// with the torque still off.
     #[test]
     fn a_limp_servo_whose_goal_is_not_its_present_fails_the_shadow_case() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         // A servo that stores its goal, holding one a long way from where it
         // stands: 200 counts is about 17.6°, far outside the 2° gate.
@@ -2290,7 +2310,7 @@ mod runner_tests {
     /// mirror would fail every machine that opened the session still holding.
     #[test]
     fn a_torqued_servo_is_exempt_from_the_shadow_assertion_and_still_reported() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         let resting = i32::from_le_bytes(
             machine
@@ -2326,7 +2346,7 @@ mod runner_tests {
     /// closes the gap a hand could move the machine through between two sweeps.
     #[test]
     fn the_shadow_case_reads_all_three_registers_from_every_servo() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let machine = machine_at(&cfg, &stow_legs());
         let ids = cfg.servo_ids().expect("the roster is nine servos");
         let (report, _, reads) = run_watched(&cfg, machine);
@@ -2364,7 +2384,7 @@ mod runner_tests {
     #[test]
     fn a_shadow_tolerance_that_is_not_an_angle_refuses_the_registry() {
         for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY] {
-            let mut cfg = undatumed_config();
+            let mut cfg = example_config();
             cfg.arm.goal_shadow_tolerance_deg = bad;
             let Err(refusal) = Registry::from_config(&cfg) else {
                 panic!("{bad} is not a tolerance, and a registry was built on it");
@@ -2381,7 +2401,7 @@ mod runner_tests {
     /// that asked, with the number intact.
     #[test]
     fn a_servo_refusing_a_read_fails_the_case_that_asked() {
-        let cfg = undatumed_config();
+        let cfg = example_config();
         let mut machine = machine_at(&cfg, &stow_legs());
         machine
             .errors

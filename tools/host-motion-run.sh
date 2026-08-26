@@ -4,14 +4,14 @@
 #
 #   tools/host-motion-run.sh          (or: make motion-host-run)
 #
-# The online system is the one thing in this repo that has never run anywhere:
-# the control process, the logger process, the process descriptions, the
-# shared-memory namespace, the launcher config and the log writer's own open are
-# all first exercised at a powered unit. This script exercises them here. It
-# stages the host composition the way the device payload is staged, starts all
-# three processes under the same launcher a unit uses, lets the wake gesture
-# happen, stops them, and runs the same analyzer the first hardware run will be
-# judged by over the log the real writer wrote.
+# The online system — the control process, the logger process, the process
+# descriptions, the shared-memory namespace, the launcher config and the log
+# writer's own open — has met a powered unit. This script is the workstation
+# rehearsal of it and the gate before a hardware run: cheap, deterministic, and
+# runnable without the machine. It stages the host composition the way the device
+# payload is staged, starts all three processes under the same launcher a unit
+# uses, lets the wake gesture happen, stops them, and runs the same analyzer a
+# hardware run is judged by over the log the real writer wrote.
 #
 # What passing means: the composition, the configs, the launcher, the seam's wire
 # contract, the writer and the analyzer agree with each other. What it does not
@@ -66,14 +66,14 @@ build_flags=()
 # What is built. The executable all three processes are started from, the system
 # target that emits their process descriptions and the writer's channel set, the
 # rendered launcher config, the launcher itself, the prelaunch script the config
-# names, the configuration files the processes read, and the analyzer.
+# names, the configuration files the processes read, and the analyzer -- whose
+# label is lib.sh's `report_target`, shared with the device harness.
 exe_target=//cogs:robot_host_clk_exe
 system_target=//cogs:system_host_clk
 launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:hostcpu.textproto
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 config_target=//cogs:host_config_files
-report_target=//cogs:first_motion_report
 
 # The generated files a process reads, by basename: three process descriptions
 # and the writer's channel set. Flattened into `cogs/`, which is where the
@@ -242,26 +242,6 @@ run() {
 	wait "$pid" || true
 }
 
-# The run directory the writer named for the instant it opened, and a refusal
-# when there is nothing in it. An empty log root is the namespace-mismatch
-# failure this whole exercise exists to catch, and it has to be a refusal here
-# rather than a report over nothing — which is what the device fetch says too.
-run_directory() {
-	local dir found
-	dir=$(find "$logs" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
-	[ -n "$dir" ] || die \
-		"the logger wrote no run directory under ${logs}." \
-		"Either it never started or it could not open a file there; its output is" \
-		"under ${launch_logs}."
-	found=$(find "$dir" -name '*.olog' -size +0 -print -quit)
-	[ -n "$found" ] || die \
-		"${dir} holds no non-empty .olog file." \
-		"The logger came up and wrote nothing, which is what a pinion namespace or" \
-		"shm-root disagreement looks like: compare ${logger_config} against the" \
-		"flagless defaults every process here runs on."
-	echo "$dir"
-}
-
 require_bazel "host motion run"
 check_pinion_defaults "$logger_config"
 refuse_leftovers
@@ -277,7 +257,11 @@ stage "$exe_out" "$launcher_out" "$launch_config_out" "$prelaunch_out" \
 	"$configs" "$built"
 echo "${prog}: staged  ${staging}"
 run "$(pick_port)"
-run_dir=$(run_directory)
+# The refusal hints are this staging's: the launcher put every process's console
+# under the scratch tree, and the namespace a logger that wrote nothing probably
+# disagrees about is stated in the staged copy of the logger configuration.
+run_dir=$(run_directory "$logs" \
+	"Either it never started or it could not open a file there; its output is under ${launch_logs}." \
+	"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare ${logger_config} against the flagless defaults every process here runs on.")
 echo "${prog}: log  ${run_dir}"
-"$bazel" run "${build_flags[@]}" -- "$report_target" \
-	--grid-jitter-ns "$grid_jitter_ns" "$run_dir"
+report_verdict "$run_dir" --grid-jitter-ns "$grid_jitter_ns"

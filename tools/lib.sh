@@ -327,3 +327,53 @@ refuse_if_stale() {
 		"or, to ${deliberately}:" \
 		"    ${stale_ok}"
 }
+
+# ---------------------------------------------------------------------------
+# A run's records
+# ---------------------------------------------------------------------------
+
+# The run directory the logger named for the instant it opened, and a refusal
+# when there is nothing in it.
+#
+#   run_directory <log-root> <no-directory-hint> <no-records-hint>
+#
+# Echoes the newest directory directly under the log root that holds a
+# non-empty `.olog`. Both failures are refusals rather than a report over
+# nothing: an empty log root is the namespace-mismatch failure that survives a
+# whole session unnoticed if anything downstream is willing to read zero
+# records. The two hints are the caller's, because where a process's console
+# output landed and which configuration file states the namespace differ
+# between a host staging tree and a device fetch.
+run_directory() {
+	local logs=$1 no_directory=$2 no_records=$3
+	local dir found
+	dir=$(find "$logs" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
+	[ -n "$dir" ] || die \
+		"the logger wrote no run directory under ${logs}." "$no_directory"
+	found=$(find "$dir" -name '*.olog' -size +0 -print -quit)
+	[ -n "$found" ] || die \
+		"${dir} holds no non-empty .olog file." "$no_records"
+	echo "$dir"
+}
+
+# The label of the analyzer that judges a run's records. One string, because
+# both run harnesses invoke the same analyzer over their own fetched or staged
+# log and a rename has to reach both.
+report_target=//cogs:first_motion_report
+
+# Judge a run's records, and let the analyzer's verdict be the caller's.
+#
+#   report_verdict <run directory> [extra analyzer arguments...]
+#
+# The analyzer is a host tool over a log that has stopped being written, so it
+# builds in the default configuration whatever configuration the payload was
+# built in: callers pass $bazel and $build_flags, and the device harness's
+# $build_flags is deliberately empty for that reason. The extra arguments are
+# the caller's — the host run reads a staged log with a jitter band, a device
+# run reads hardware timestamps strictly — and the exit status is returned
+# rather than judged, because it is the wrapper's verdict.
+report_verdict() {
+	local run_dir=$1
+	shift
+	"$bazel" run "${build_flags[@]}" -- "$report_target" "$@" "$run_dir"
+}

@@ -26,9 +26,10 @@ period_ns: 20000000
 # (`cogs/sim_params.textproto`), because a scenario's evidence about when a
 # machine goes limp is only evidence if the real driver waits as long. The
 # servos' own Bus Watchdog (`bus_watchdog` in `cogs/session_params.textproto`)
-# is armed at the same 200 ms: this answers a control process that stopped, that
-# answers a driver that stopped, and the two are the same judgment about the
-# same length of silence, so neither moves alone.
+# is armed at the same 200 ms: this de-torques when a control process stops,
+# that stops the servos -- torque still held -- when a driver stops, and the two
+# are the same judgment about the same length of silence, so neither moves
+# alone.
 hold_timeout_ns: 200000000
 
 # A health read offered every 500 ms. The slot runs at most one transaction per

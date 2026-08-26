@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(
             error.code(),
             Some(StatusCode::DataRange),
-            "the one code that means two things must survive this layer"
+            "the byte a servo answered with must survive this layer whole"
         );
     }
 

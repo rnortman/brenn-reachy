@@ -1,6 +1,6 @@
 //! What one run of the motion system did, read off its log.
 //!
-//! The tool the first hardware run is judged by. Given the directory a run's log
+//! The tool a hardware run is judged by. Given the directory a run's log
 //! was written to, it answers
 //! one question -- did the wake gesture happen, whole -- and prints the numbers
 //! an operator wants beside the answer: how the driver's heartbeat held up, what
@@ -13,8 +13,8 @@
 //! finished a second ago.
 //!
 //! The channel set is the one both systems declare, so the same binary reads a
-//! hardware log and a scenario log. That is what makes it testable before any
-//! hardware log exists: the deterministic S1 run performs the same gesture, and
+//! hardware log and a scenario log. That is what makes it testable without a
+//! hardware log at all: the deterministic S1 run performs the same gesture, and
 //! the test beside this file runs this analyzer over its output.
 //!
 //! Two things it deliberately does not do. It does not reason in cycle numbers
@@ -68,8 +68,7 @@ use reachy_motion::tick::{
 /// arithmetic; asserting that here would fail every hardware run on physics.
 ///
 /// Nobody has measured this machine. This figure and the two below were sized
-/// from the mechanism on paper, so what they are is a guess of the right order
-/// -- the first hardware runs are what turn them into knowledge, and until then
+/// from the mechanism on paper, so what they are is a guess of the right order;
 /// a verdict that turns on one of them is a verdict about a number an agent
 /// chose. The runbook's first-run checks say to confirm or reset all three
 /// before reading a report as a pass or a fail.
@@ -426,7 +425,7 @@ fn jitter(run: &Run, report: &mut Report) {
 
 /// What the bus answered, and what it did not.
 ///
-/// Two numbers an operator wants first on a machine that has never run: how many
+/// Two numbers an operator wants first out of any run: how many
 /// cycles read every row, and which rows are the ones that go missing. A row
 /// that answers nothing all run is a wiring or an id problem, and it reads here
 /// as its own line rather than as a share of one total.

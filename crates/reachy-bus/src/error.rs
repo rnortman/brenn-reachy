@@ -47,9 +47,10 @@ pub enum XactError {
         cause: FrameError,
     },
 
-    /// The servo replied with its error field set. Surfaced verbatim: the Data
-    /// Range number is both an out-of-window goal refusal and the signature of
-    /// a latched bus watchdog, and this layer cannot tell those apart.
+    /// The servo replied with its error field set. Surfaced verbatim: the
+    /// vendor's manual and this hardware disagree about which number a latched
+    /// bus watchdog refuses a write with, so this layer carries the byte and
+    /// classifies nothing.
     #[error("servo {id} answered with error field {:#04x} ({:?})", .error.0, .error.code())]
     ServoError {
         /// The servo that replied.
@@ -224,8 +225,8 @@ pub enum IdOutcome {
     Timeout,
     /// The register, as this servo reported it.
     Ok(RawValue),
-    /// The servo answered with its error field set. Carried whole: one of its
-    /// numbers means two different things and only the caller knows which.
+    /// The servo answered with its error field set. Carried whole: only the
+    /// caller knows what a given number means in the state it asked from.
     ServoError(StatusError),
     /// The servo answered with fewer parameter bytes than the register is wide.
     ShortReply {

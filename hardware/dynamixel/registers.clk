@@ -66,10 +66,12 @@ enum RegId
         #14 velocity_limit { underlying_value: 14; }
         // The temperature ceiling.
         #15 temperature_limit { underlying_value: 15; }
-        // The timeout after which the servo stops holding its goal because the
-        // host went quiet. Armed at the session's configured value: a head held
-        // by a driver that has died is held by nobody, and going limp is the
-        // answer this machine's fault doctrine gives that state.
+        // The timeout after which the servo stops because the host went quiet.
+        // Armed at the session's configured value: a head held by a driver that
+        // has died is held by nobody. The stop halts motion and does not release
+        // torque -- observed on this hardware, and what the vendor describes --
+        // so the register is a stop-motion net rather than the de-torque net the
+        // fault doctrine wants from it.
         #16 bus_watchdog { underlying_value: 16; }
         // The acceleration limit of the servo's own profile, the backstop under
         // host-side shaping.

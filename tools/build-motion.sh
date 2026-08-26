@@ -114,12 +114,16 @@ logger_config=cogs/robot_logger.textproto
 # The apps the rendered launcher config is expected to name, sorted.
 #
 # The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
-# `deploy-motion.sh --commands` prints a `tail -f` per app by name. Those names
-# are the compositions' -- `proc` and `logger_proc` from the `Process` names, and
-# `motord` from the app merged in through `simplelaunch_src` -- so a rename in a
-# `.clk` file would leave the printed commands naming files that never appear.
+# those are the files an operator tails and the runbook names one by one. The
+# names are the compositions' -- `proc` and `logger_proc` from the `Process`
+# names, and `motord` from the app merged in through `simplelaunch_src` -- so a
+# rename in a `.clk` file would leave the documented tails naming files that
+# never appear.
 # This is the join: the names are pinned here against the config actually built,
-# and a rename is a refused build with the two lists side by side.
+# and a rename is a refused build with the two lists side by side. The other
+# half -- that the runbook tails a file for every name in this list -- is
+# asserted by tools/build-motion.test.sh, so the refusal below cites a document
+# a self-check keeps true.
 launcher_apps=(logger_proc motord proc)
 
 compile() {
@@ -147,7 +151,7 @@ check_launcher_apps() {
 	[ "$named" = "${launcher_apps[*]}" ] || die \
 		"the rendered launcher config names the apps '${named:-nothing}' and the run needs '${launcher_apps[*]}'." \
 		"Those names are what the launcher calls each process's log file, and" \
-		"deploy-motion.sh --commands prints a tail command per name. A process renamed in" \
+		"docs/bench-runbook.md names one tail command per name. A process renamed in" \
 		"a composition, or an app merged in under another name, has to be renamed there too."
 }
 

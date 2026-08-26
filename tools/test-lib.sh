@@ -112,6 +112,47 @@ assert_no_file() {
 	fi
 }
 
+# A motion-run harness's budget against the wake lead it is mostly made of.
+#
+#   assert_run_budget_covers_lead <harness script in the checkout>
+#
+# Both harnesses — the host one and the device one — stop their launcher on a
+# hand-maintained budget whose largest term, the shipped wake lead, lives in
+# another file and language. A lead that grows without a budget following it is
+# red here rather than a launcher stopped mid-gesture.
+#
+# The sum around the lead is stated once, here: commissioning's bus survey
+# (~5 s), the raise-hold-stow gesture (~5 s), and the release (~4 s). The
+# margin each harness carries above this is deliberately excluded — that is for
+# a loaded workstation or a serial bus that retries, and each script's own
+# comment says which.
+assert_run_budget_covers_lead() {
+	local script=$1
+	local label="${script##*/}'s run budget covers the shipped wake lead and the phases around it"
+	local checkout lead budget phases needed
+	checkout=$(cd -- "$(dirname -- "$script")/.." && pwd)
+	phases=14
+	lead=$(sed -n 's/^lead_ms:[[:space:]]*\([0-9]*\).*/\1/p' \
+		-- "${checkout}/cogs/wake_params.textproto")
+	budget=$(sed -n 's/^run_seconds=\([0-9]*\).*/\1/p' -- "$script")
+	if [ -z "$lead" ] || [ -z "$budget" ]; then
+		fail "$label" \
+			"read no lead_ms from cogs/wake_params.textproto or no run_seconds from" \
+			"${script} — one of the two names has moved"
+		return
+	fi
+	needed=$((lead / 1000 + phases))
+	if [ "$budget" -ge "$needed" ]; then
+		pass "$label"
+	else
+		fail "$label" \
+			"the budget is ${budget} s" \
+			"the shipped wake lead is ${lead} ms, and commissioning, the gesture" \
+			"and the release want ${phases} s around it: ${needed} s" \
+			"the launcher would be stopped mid-gesture"
+	fi
+}
+
 # ---------------------------------------------------------------------------
 # The run's own directory
 # ---------------------------------------------------------------------------

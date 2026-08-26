@@ -457,10 +457,10 @@ result=$(build)
 assert_status "and the shipped values build" 0 "$(status_of "$result")"
 
 # The launcher's app names, which are the names of the log files an operator
-# tails. They come out of the compositions and `deploy-motion.sh --commands`
-# retypes them, so this assertion is the join between the two: a process renamed
-# in a `.clk` file is a refused build here rather than three tail commands at a
-# bench naming files that never appear.
+# tails. They come out of the compositions and `docs/bench-runbook.md` retypes
+# them, so this assertion is the join between the two: a process renamed in a
+# `.clk` file is a refused build here rather than three tail commands at a bench
+# naming files that never appear.
 
 mark_payload
 APP_CONTROL=control_proc
@@ -588,6 +588,28 @@ assert_contains "and the gate builds that list" \
 assert_contains "and this script builds the payload filegroup itself" \
 	"$(cat -- "${real_repo}/tools/build-motion.sh")" \
 	"build_target=//bazel/platform:motion_payload"
+
+# ---------------------------------------------------------------------------
+# The app names and the log files the runbook tells an operator to tail
+# ---------------------------------------------------------------------------
+#
+# The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
+# `docs/bench-runbook.md` retypes those paths for a person following it by hand.
+# The build refusal above cites the runbook as if it were authoritative, so the
+# other half of that join is asserted here: every app the payload starts is a
+# name the runbook actually tails. Read out of this checkout, both sides.
+
+runbook=$(cat -- "${real_repo}/docs/bench-runbook.md")
+shipped_apps=$(sed -n 's/^launcher_apps=(\(.*\))$/\1/p' \
+	-- "${real_repo}/tools/build-motion.sh")
+if [ -n "$shipped_apps" ]; then
+	for app in $shipped_apps; do
+		assert_contains "the runbook names ${app}'s log file" "$runbook" "${app}_0.log"
+	done
+else
+	fail "the runbook names every app's log file" \
+		"read no launcher_apps=(...) from tools/build-motion.sh — the name has moved"
+fi
 
 # ---------------------------------------------------------------------------
 

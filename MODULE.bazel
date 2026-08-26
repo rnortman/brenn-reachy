@@ -160,8 +160,8 @@ crate.spec(
 )
 
 # The bench binary's configuration file format: the bus port and its baud, the
-# arm thresholds the self-test registry reads, the register values provisioning
-# writes, and the resolved crank datum.
+# arm thresholds the self-test registry reads, and the register values
+# provisioning writes. Also the self-test record written beside that file.
 crate.spec(
     package = "toml",
     version = "1",

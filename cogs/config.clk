@@ -112,7 +112,8 @@ schema SessionParams
         // is a stream that asked for more than a step. Zero is refused by the
         // host before it commissions anything -- a servo reads it as no limit
         // at all, which is what a file that lost this line would ask for. The
-        // shipped pair has never run on hardware:
+        // shipped pair has run on hardware but nobody has measured whether it is
+        // the right pair for this machine:
         // TODO(session-servo-profile)
         #6 profile_acceleration: UInt32;
 
@@ -122,9 +123,10 @@ schema SessionParams
         #7 profile_velocity: UInt32;
 
         // The servos' Bus Watchdog timeout the sweep writes, in the register's
-        // own 20 ms units. What stops a servo holding its goal when the host
-        // has gone quiet: the driver's dead-man answers a control process that
-        // stopped, and this answers a driver that stopped. Zero disables the
+        // own 20 ms units. What stops a servo -- without releasing its torque,
+        // observed on this hardware -- when the host has gone quiet: the
+        // driver's dead-man de-torques when a control process stops, and this
+        // stops the servos when a driver stops. Zero disables the
         // register and is refused by the host before it commissions anything --
         // armed is the policy, and a build that wants it off changes the policy
         // rather than the number. One byte wide because the register is: a count

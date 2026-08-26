@@ -394,9 +394,14 @@ pub enum BareError {
     /// The watchdog tripped and the servo is still holding its goal — the
     /// mechanism fires and does not de-torque, which is not the backstop the
     /// fault doctrine is relying on it to be.
+    ///
+    /// The vendor's manual predicts exactly this: it describes a trip as a stop
+    /// under torque rather than a release. So this verdict is a policy-level
+    /// finding for a human, not an assertion to relax until it passes.
     #[error(
         "servo {id} bus watchdog tripped and the servo is still holding torque, so a tripped \
-         watchdog does not release this machine"
+         watchdog does not release this machine. Stop: this is a policy-level finding about what \
+         the armed watchdog is a backstop for, not a test to make green"
     )]
     WatchdogStillHolding {
         /// The servo addressed.
@@ -406,8 +411,7 @@ pub enum BareError {
     /// A tripped watchdog took a goal write instead of refusing it, so nothing
     /// on the wire distinguishes a tripped servo from a live one.
     #[error(
-        "servo {id} accepted a goal write with its bus watchdog tripped, where a trip refuses one \
-         with Data Range"
+        "servo {id} accepted a goal write with its bus watchdog tripped, where a trip refuses one"
     )]
     WatchdogGoalAccepted {
         /// The servo addressed.
@@ -419,7 +423,7 @@ pub enum BareError {
     /// signature a host has for this state.
     #[error(
         "servo {id} refused a goal write with its bus watchdog tripped, but with error field \
-         {:#04x} ({:?}) rather than Data Range", .error.0, .error.code()
+         {:#04x} ({:?}) rather than Access", .error.0, .error.code()
     )]
     WatchdogRefusedOtherwise {
         /// The servo addressed.
@@ -847,13 +851,13 @@ fn reading<P: BusPort>(
 /// Establish what an armed Bus Watchdog does on this machine, on one servo.
 ///
 /// The register is armed on every session (`crates/reachy-motion`'s
-/// commissioning sweep writes it), and two things about it are vendor
-/// documentation this project has never watched happen: that ordinary bus
-/// traffic resets the count, and that a servo whose count ran out stops holding
-/// its goal. The second one is the whole reason the register is armed — it is
-/// what answers a driver that was killed, crashed or unplugged with the machine
-/// under torque — so it is asserted here rather than assumed, and a failure is
-/// the discovery.
+/// commissioning sweep writes it), and this is what watches it do its job. That
+/// ordinary bus traffic resets the count is vendor documentation nobody here
+/// has watched happen; what a servo whose count ran out does with the torque it
+/// is holding has been watched, on this unit, and the answer is that it stops
+/// and keeps holding. So stage 5 below asserts a release the fault policy
+/// requires and this hardware does not perform: the failure is the standing
+/// record of that, not a test to make green.
 ///
 /// Supervised, on one servo, at whatever pose the machine is resting in. The
 /// sequence torques the servo, keeps the bus busy, then goes quiet and reads
@@ -863,19 +867,26 @@ fn reading<P: BusPort>(
 /// 2. a released servo reads its goal as its present position,
 /// 3. a busy bus with goal rewrites does not trip it,
 /// 4. a busy bus of reads alone does not trip it either,
-/// 5. silence trips it: the register reads the trip marker, a goal write is
-///    refused with Data Range, and the servo is no longer holding,
+/// 5. silence trips it: the register reads the trip marker, the torque reading
+///    is taken and reported, and a goal rewrite is answered. All three are read
+///    and printed before any of them is judged; the assertions are then that
+///    the register latched, that the servo let go (the expectation the fault
+///    policy requires, and a failure here is a finding for a human), and that
+///    the refusal carries the Access code this hardware answers with,
 /// 6. writing zero clears the trip, re-arming takes, and torque can be enabled
 ///    again,
 /// 7. the servo is left disarmed and limp.
+///
+/// Every write lives in the exercise half, and the make-safe half — a watchdog
+/// clear and a torque-off, nothing else — runs whatever the exercise said.
 ///
 /// It commands no angle: the only goal ever written is the count the servo just
 /// reported for itself, which is a rewrite of where it already stands -- written
 /// before each torque-enable, so the hold is where the servo is standing at that
 /// instant whatever its goal register held. Torque
-/// it does take, and the servo does go limp on its own partway through — which
-/// is why it addresses an antenna by default and refuses to start on a servo
-/// that is already holding something.
+/// it does take, and the make-safe releases it whichever way the run ends —
+/// which is why it addresses an antenna by default and refuses to start on a
+/// servo that is already holding something.
 pub fn watchdog<P: BusPort>(
     map: &ServoMap,
     timing: BusTiming,
@@ -889,10 +900,11 @@ pub fn watchdog<P: BusPort>(
 
     line(&format!(
         "watchdog: servo {id} is armed with a {timeout:?} bus watchdog, torqued at the position \
-         it already holds, and then left in silence until it lets go. It is commanded nowhere — \
-         the only goal written is the count it reports for itself — but it does hold torque for \
-         a few seconds and it does go limp on its own. Stay clear of it, and do not run this \
-         with the head up.",
+         it already holds, and then left in silence to be read. It is commanded nowhere — the \
+         only goal written is the count it reports for itself — but it does hold torque for a \
+         few seconds, and on this hardware the trip stops it without releasing it: this \
+         command's own make-safe is what releases the torque on the way out. Stay clear of it, \
+         and do not run this with the head up.",
         timeout = WATCHDOG_TIMEOUT,
     ));
 
@@ -906,50 +918,13 @@ pub fn watchdog<P: BusPort>(
         model = info.model
     ));
 
-    // Clear then arm, which is the pair a session writes: a tripped watchdog
-    // refuses ordinary writes, and zero is the documented clear. On a servo
-    // that is not tripped the clear is a write of the value the register already
-    // resets to.
-    write_byte(&mut bus, map, row, RegId::BusWatchdog, 0)?;
-    write_byte(&mut bus, map, row, RegId::BusWatchdog, WATCHDOG_COUNTS)?;
-    // A read of its own, after a write path that already read the register back:
-    // the write's read-back says the value went in, and this says the register
-    // still holds it a transaction later. A servo that takes the value and then
-    // changes it — the shape a trip already latched would have — is caught here
-    // and nowhere else.
-    let armed = read_byte(&mut bus, map, row, RegId::BusWatchdog)?;
-    if armed != WATCHDOG_COUNTS {
-        return Err(BareError::WatchdogNotArmed {
-            id,
-            armed: WATCHDOG_COUNTS,
-            read: armed,
-        });
-    }
-    line(&format!(
-        "  armed: bus watchdog {armed} counts, {WATCHDOG_TIMEOUT:?}, read back"
-    ));
+    let outcome = watchdog_exercise(&mut bus, map, row, clock, line);
 
-    // That a released servo reads its goal as its position, asserted rather
-    // than assumed: the whole claim that this test commands nothing rests on
-    // it, and it is a hardware fact of the same kind as the ones below.
-    watchdog_tracks_its_goal(&mut bus, map, row, line)?;
-
-    // Torque on at where the servo stands, with the goal rewritten to that
-    // position first. The reading above says the rewrite is a no-op on this
-    // platform, and it is written anyway: a servo whose goal register held
-    // something else would otherwise be commanded there by the write below.
-    hold_where_it_stands(&mut bus, map, row)?;
-    line("  holding: torque on at the position it was resting at");
-
-    let outcome = watchdog_busy(&mut bus, map, row, Busy::ReadsAndGoals, clock, line)
-        .and_then(|()| watchdog_busy(&mut bus, map, row, Busy::ReadsOnly, clock, line))
-        .and_then(|()| watchdog_silence(&mut bus, map, row, clock, line));
-
-    // The cleanup runs whatever the assertions said. A servo left armed and
+    // The make-safe runs whatever the assertions said. A servo left armed and
     // torqued by an early return is a servo whose next silence is a trip
     // nobody is watching, and one left disarmed and limp is the machine's
     // resting state.
-    let cleared = watchdog_release(&mut bus, map, row, line);
+    let cleared = watchdog_make_safe(&mut bus, map, row, line);
     if let Err(failed) = outcome {
         // Both halves are said, and the cleanup's failure is said first: an
         // assertion that came back wrong is a discovery, while a cleanup that
@@ -968,6 +943,63 @@ pub fn watchdog<P: BusPort>(
          when it trips, and clears on a zero. Disarmed and limp now.",
     );
     Ok(())
+}
+
+/// Every write the watchdog self-test makes, and every assertion it draws from
+/// them, in one place whose error the caller captures rather than propagates.
+///
+/// Nothing here returns past the caller's make-safe: a phase that arms the
+/// register or enables torque and then fails leaves the servo in a state only
+/// the make-safe half puts right, so all of them live inside this boundary.
+/// The chain short-circuits on the first failing phase.
+fn watchdog_exercise<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), BareError> {
+    let id = map.ids()[row];
+
+    // Clear then arm, which is the pair a session writes: a tripped watchdog
+    // refuses ordinary writes, and zero is the vendor's documented clear,
+    // accepted even while latched. On a servo that is not tripped the clear is
+    // a write of the value the register already resets to.
+    write_byte(bus, map, row, RegId::BusWatchdog, 0)?;
+    write_byte(bus, map, row, RegId::BusWatchdog, WATCHDOG_COUNTS)?;
+    // A read of its own, after a write path that already read the register back:
+    // the write's read-back says the value went in, and this says the register
+    // still holds it a transaction later. A servo that takes the value and then
+    // changes it — the shape a trip already latched would have — is caught here
+    // and nowhere else.
+    let armed = read_byte(bus, map, row, RegId::BusWatchdog)?;
+    if armed != WATCHDOG_COUNTS {
+        return Err(BareError::WatchdogNotArmed {
+            id,
+            armed: WATCHDOG_COUNTS,
+            read: armed,
+        });
+    }
+    line(&format!(
+        "  armed: bus watchdog {armed} counts, {WATCHDOG_TIMEOUT:?}, read back"
+    ));
+
+    // That a released servo reads its goal as its position, asserted rather
+    // than assumed: the whole claim that this test commands nothing rests on
+    // it, and it is a hardware fact of the same kind as the ones below.
+    watchdog_tracks_its_goal(bus, map, row, line)?;
+
+    // Torque on at where the servo stands, with the goal rewritten to that
+    // position first. The reading above says the rewrite is a no-op on this
+    // platform, and it is written anyway: a servo whose goal register held
+    // something else would otherwise be commanded there by the write below.
+    hold_where_it_stands(bus, map, row)?;
+    line("  holding: torque on at the position it was resting at");
+
+    watchdog_busy(bus, map, row, Busy::ReadsAndGoals, clock, line)?;
+    watchdog_busy(bus, map, row, Busy::ReadsOnly, clock, line)?;
+    watchdog_silence(bus, map, row, clock, line)?;
+    watchdog_rearms(bus, map, row, line)
 }
 
 /// The servo a watchdog self-test addresses: the one asked for, or an antenna.
@@ -1055,12 +1087,23 @@ fn watchdog_busy<P: BusPort>(
     Ok(())
 }
 
-/// Go quiet with torque held, then assert the watchdog tripped, that it refuses
-/// a goal write, and that the servo has let go.
+/// What a goal rewrite came back with, recorded before anything judges it.
+enum Probe {
+    /// The servo took the write.
+    Accepted,
+    /// The servo refused it, with this error field whole.
+    Refused(StatusError),
+}
+
+/// Go quiet with torque held, take every reading of the resulting state, print
+/// each one, and only then judge them.
 ///
-/// The three readings are one state and are taken in that order: the register
-/// says the count ran out, the refusal is the signature a host would see, and
-/// the torque is the consequence the fault doctrine is relying on.
+/// The three readings are one state, and the order they are *taken* in is not
+/// the order they are judged in. Taking comes first and completely: the
+/// register, the torque, and the answer to a goal rewrite are all on the
+/// transcript before any of them can end the run — an early verdict on the
+/// refusal byte would finish the run without ever reading whether the trip
+/// released torque, which is the one reading the fault doctrine needs.
 fn watchdog_silence<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
@@ -1076,6 +1119,49 @@ fn watchdog_silence<P: BusPort>(
     clock.sleep_until(clock.now() + silent);
 
     let read = read_byte(bus, map, row, RegId::BusWatchdog)?;
+    line(&format!(
+        "  register: bus watchdog reads {read:#04x} after {silent:?} of silence, where a trip \
+         reads {WATCHDOG_LATCHED:#04x}"
+    ));
+
+    // The one the fault doctrine is relying on, taken before the goal probe:
+    // a run that ends without it has established nothing about what an armed
+    // watchdog is a backstop for.
+    let torque = read_byte(bus, map, row, RegId::TorqueEnable)?;
+    let held = torque != 0;
+    line(&format!(
+        "  torque after the trip: enable reads {torque} — {}",
+        if held { "HELD" } else { "released" }
+    ));
+
+    // The goal it is standing at, written back to it — a rewrite of where it
+    // already is, which a servo that is not tripped takes without moving. A
+    // bus-level answer here is a failed observation rather than a judged one and
+    // returns as itself; the two readings above are already on the transcript.
+    let at = read_raw(bus, map, row, RegId::PresentPosition)?;
+    let probe = match write_verified(bus, map, row, RegId::GoalPosition, &at) {
+        Ok(()) => {
+            line("  probe: a goal rewrite was accepted");
+            Probe::Accepted
+        }
+        Err(BareError::Bus {
+            source: XactError::ServoError { error, .. },
+            ..
+        }) => {
+            line(&format!(
+                "  probe: a goal rewrite comes back with error field {:#04x} ({:?})",
+                error.0,
+                error.code()
+            ));
+            Probe::Refused(error)
+        }
+        Err(other) => return Err(other),
+    };
+
+    // Judgments, now that every reading is taken and printed. The order is by
+    // consequence: a watchdog that never tripped makes the other two readings
+    // meaningless (a torqued servo under a live hold is correct), and after
+    // that the torque outranks the refusal byte.
     if read != WATCHDOG_LATCHED {
         return Err(BareError::WatchdogNeverTripped {
             id,
@@ -1084,45 +1170,36 @@ fn watchdog_silence<P: BusPort>(
             latched: WATCHDOG_LATCHED,
         });
     }
-    line(&format!(
-        "  tripped: bus watchdog reads {read:#04x} after {silent:?} of silence"
-    ));
-
-    // The goal it is standing at, written back to it: a rewrite of where it
-    // already is, which a servo that is not tripped takes without moving.
-    let at = read_raw(bus, map, row, RegId::PresentPosition)?;
-    match write_verified(bus, map, row, RegId::GoalPosition, &at) {
-        Ok(()) => return Err(BareError::WatchdogGoalAccepted { id }),
-        Err(BareError::Bus {
-            source: XactError::ServoError { error, .. },
-            ..
-        }) => {
-            if error.code() != Some(StatusCode::DataRange) {
-                return Err(BareError::WatchdogRefusedOtherwise { id, error });
-            }
-            line(&format!(
-                "  refused: a goal rewrite comes back with error field {:#04x} (Data Range)",
-                error.0
-            ));
-        }
-        Err(other) => return Err(other),
-    }
-
-    if read_byte(bus, map, row, RegId::TorqueEnable)? != 0 {
+    if held {
         return Err(BareError::WatchdogStillHolding { id });
+    }
+    match probe {
+        Probe::Accepted => return Err(BareError::WatchdogGoalAccepted { id }),
+        // Observed on this hardware: a latched watchdog answers a goal write
+        // with Access. The vendor's manual contradicts itself here — its worked
+        // example says Data Range, its "the goal registers become read-only"
+        // prose implies Access — so this is the reading, not the document. The
+        // comparison is on the masked code because this unit's standing
+        // input-voltage latch sets the alert bit on every status packet; the
+        // byte itself is carried verbatim into the error either way.
+        Probe::Refused(error) if error.code() != Some(StatusCode::Access) => {
+            return Err(BareError::WatchdogRefusedOtherwise { id, error });
+        }
+        Probe::Refused(_) => {}
     }
     line("  released: torque enable reads off, so the trip let the servo go");
     Ok(())
 }
 
-/// Clear the trip, prove the servo takes torque again, and leave it disarmed and
-/// limp.
+/// Clear the trip and prove the servo arms and takes torque again.
 ///
-/// The clear is the same zero the arming pair opens with, and it is what says a
-/// trip is recoverable at all. The torque write after it is the other half: a
-/// servo that clears its register and will not take torque again has not
-/// recovered from anything.
-fn watchdog_release<P: BusPort>(
+/// The last exercise phase, not part of the make-safe: the clear is the same
+/// zero the arming pair opens with and it is what says a trip is recoverable at
+/// all, and the torque write after it is the other half — a servo that clears
+/// its register and will not take torque again has not recovered from anything.
+/// Both are test steps, and a test step inside a make-safe path is a make-safe
+/// path that can re-torque a servo in an unknown state.
+fn watchdog_rearms<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
     row: usize,
@@ -1139,19 +1216,53 @@ fn watchdog_release<P: BusPort>(
     line(&format!(
         "  re-armed at {WATCHDOG_COUNTS} counts and holding torque again"
     ));
+    Ok(())
+}
+
+/// Disarm the servo and release it, whatever else happened.
+///
+/// Exactly two writes and no assertions. The torque-off goes out even when the
+/// disarm failed: nothing gates de-torquing, a failed sibling write least of
+/// all, and the watchdog register is RAM that a power cycle clears. When both
+/// fail the returned error is the torque one, because that is the one an
+/// operator has to act on; the disarm's failure is printed beside it.
+fn watchdog_make_safe<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), BareError> {
     // Disarmed before released, so the window between the two writes is not one
     // where a trip could beat the release to it.
-    write_byte(bus, map, row, RegId::BusWatchdog, 0)?;
-    write_byte(bus, map, row, RegId::TorqueEnable, 0)?;
-    line("  disarmed and released, both read back");
-    Ok(())
+    let disarmed = write_byte(bus, map, row, RegId::BusWatchdog, 0);
+    let released = write_byte(bus, map, row, RegId::TorqueEnable, 0);
+    match (disarmed, released) {
+        (Ok(()), Ok(())) => {
+            line("  disarmed and released, both read back");
+            Ok(())
+        }
+        (Err(disarm), Ok(())) => {
+            line(
+                "  released, but the bus watchdog would not disarm; the register is RAM and a \
+                  power cycle clears it",
+            );
+            Err(disarm)
+        }
+        (Ok(()), Err(release)) => Err(release),
+        (Err(disarm), Err(release)) => {
+            line(&format!(
+                "  the bus watchdog would not disarm either: {disarm}"
+            ));
+            Err(release)
+        }
+    }
 }
 
 /// Assert that a released servo reads its goal as its present position.
 ///
 /// The property every "this commands nothing" claim in this command rests on.
-/// It is vendor behaviour this project has never watched either, so it is one
-/// more reading the self-test establishes rather than a comment stating it.
+/// It is vendor behaviour, so it is one more reading the self-test establishes
+/// on each run rather than a comment stating it.
 fn watchdog_tracks_its_goal<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
@@ -1307,8 +1418,8 @@ mod tests {
     use super::*;
 
     use crate::testutil::{
-        BusWatchdogModel, Configured, DATA_RANGE, FakeMachine, Spy, TestClock, configured,
-        datumed_config, machine_at, resolved, rest_legs, stow_legs, wind_down_bus,
+        ACCESS, BusWatchdogModel, Configured, DATA_RANGE, FakeMachine, Spy, TestClock, configured,
+        example_config, machine_at, resolved, rest_legs, stow_legs, wind_down_bus,
     };
 
     /// What a command left behind: the registers it ended on, every instruction
@@ -1393,6 +1504,58 @@ mod tests {
         }
     }
 
+    /// Run `watchdog`, with `id` going deaf about `regs` the moment the
+    /// transcript reaches a line starting with `after`.
+    ///
+    /// A case names the reading it wants the servo to survive and no more, so it
+    /// says "the servo is gone by the time the next phase writes" without
+    /// counting the transactions every phase before it happens to take -- a
+    /// count that moves under any change to the command's traffic and says
+    /// nothing about what the case is for.
+    fn run_deaf_from(
+        machine: FakeMachine,
+        cfg: &Configured,
+        id: u8,
+        after: &str,
+        regs: &[RegId],
+    ) -> Run {
+        run_deaf_from_at(
+            machine,
+            &Rc::new(Cell::new(Duration::ZERO)),
+            cfg,
+            id,
+            after,
+            regs,
+        )
+    }
+
+    /// As [`run_deaf_from`], on a clock the case shares with a machine that
+    /// models a watchdog of its own.
+    fn run_deaf_from_at(
+        machine: FakeMachine,
+        now: &Rc<Cell<Duration>>,
+        cfg: &Configured,
+        id: u8,
+        after: &str,
+        regs: &[RegId],
+    ) -> Run {
+        let addrs: Vec<u16> = regs.iter().map(|reg| named_reg(*reg).addr).collect();
+        let after = after.to_string();
+        run_at(machine, now, |port, clock, line| {
+            let machine = port.machine();
+            let mut watched = |text: &str| {
+                if text.trim_start().starts_with(&after) {
+                    let mut machine = machine.borrow_mut();
+                    for addr in &addrs {
+                        machine.go_deaf(id, *addr);
+                    }
+                }
+                line(text);
+            };
+            watchdog(&cfg.map, cfg.timing, port, None, clock, &mut watched)
+        })
+    }
+
     /// What each servo's Torque Enable register holds after a run.
     fn torque(cfg: &Configured, run: &Run) -> Vec<u8> {
         let machine = run.registers.borrow();
@@ -1411,7 +1574,7 @@ mod tests {
     #[test]
     fn off_releases_every_servo_on_the_roster() {
         let cfg = resolved();
-        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        let mut machine = machine_at(&example_config(), &stow_legs());
         for id in cfg.map.ids() {
             machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
         }
@@ -1436,7 +1599,7 @@ mod tests {
     fn off_releases_a_machine_that_is_already_limp() {
         let cfg = resolved();
         let run = run(
-            machine_at(&datumed_config(), &stow_legs()),
+            machine_at(&example_config(), &stow_legs()),
             |port, _, line| off(&cfg.map, cfg.timing, port, line),
         );
         run.ok("a limp machine releases");
@@ -1453,7 +1616,7 @@ mod tests {
     fn a_silent_servo_does_not_stop_the_release_of_the_others() {
         let cfg = resolved();
         let silent = cfg.map.ids()[2];
-        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        let mut machine = machine_at(&example_config(), &stow_legs());
         for id in cfg.map.ids() {
             machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
         }
@@ -1487,7 +1650,7 @@ mod tests {
     /// A machine as the vendor provisions it: every servo in single-turn
     /// position mode, torque off.
     fn unprovisioned(cfg: &Configured) -> FakeMachine {
-        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        let mut machine = machine_at(&example_config(), &stow_legs());
         for id in [cfg.map.ids()[7], cfg.map.ids()[8]] {
             machine.set(id, named_reg(RegId::OperatingMode), &[3]);
         }
@@ -1543,7 +1706,7 @@ mod tests {
     #[test]
     fn provision_writes_nothing_to_a_machine_already_in_the_mode() {
         let cfg = resolved();
-        let machine = machine_at(&datumed_config(), &stow_legs());
+        let machine = machine_at(&example_config(), &stow_legs());
         let run = run(machine, |port, _, line| {
             provision(&cfg.map, cfg.timing, port, line)
         });
@@ -1623,7 +1786,7 @@ mod tests {
     /// A machine holding torque on all nine, with one servo carrying a latched
     /// overload — the state an operator reaches for `reboot` in.
     fn overloaded(cfg: &Configured) -> FakeMachine {
-        let mut machine = machine_at(&datumed_config(), &stow_legs());
+        let mut machine = machine_at(&example_config(), &stow_legs());
         for id in cfg.map.ids() {
             machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
         }
@@ -2104,7 +2267,7 @@ mod tests {
     /// and the clock is the test's, so the quarter-second costs nothing.
     #[test]
     fn servos_that_come_back_on_later_rounds_are_reported_with_what_they_waited() {
-        let mut file = datumed_config();
+        let mut file = example_config();
         wind_down_bus(&mut file);
         file.bus.retry_spacing_ms = 250;
         let cfg = configured(&file);
@@ -2255,7 +2418,7 @@ mod tests {
     fn the_watchdog_test_refuses_a_servo_that_is_already_holding() {
         let cfg = resolved();
         let id = antenna(&cfg);
-        let mut machine = machine_at(&datumed_config(), &rest_legs());
+        let mut machine = machine_at(&example_config(), &rest_legs());
         machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
 
         let run = run(machine, |port, clock, line| {
@@ -2288,7 +2451,7 @@ mod tests {
         assert!(!cfg.map.ids().contains(&stranger));
 
         let run = run(
-            machine_at(&datumed_config(), &rest_legs()),
+            machine_at(&example_config(), &rest_legs()),
             |port, clock, line| watchdog(&cfg.map, cfg.timing, port, Some(stranger), clock, line),
         );
 
@@ -2316,7 +2479,7 @@ mod tests {
         let id = antenna(&cfg);
 
         let run = run(
-            machine_at(&datumed_config(), &rest_legs()),
+            machine_at(&example_config(), &rest_legs()),
             |port, clock, line| watchdog(&cfg.map, cfg.timing, port, None, clock, line),
         );
 
@@ -2346,6 +2509,20 @@ mod tests {
             );
         }
 
+        // The register verdict is the one that fired, and the other two readings
+        // were taken anyway: this is the path a bring-up run takes, and a
+        // judgment hoisted above a reading would end it with nothing said about
+        // the torque -- which is the defect this shape exists to close.
+        for reading in ["torque after the trip:", "probe:"] {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|printed| printed.trim_start().starts_with(reading)),
+                "the run judged the register without reading {reading}: {:?}",
+                run.printed,
+            );
+        }
+
         assert_eq!(
             (
                 byte_of(&run, id, RegId::BusWatchdog),
@@ -2370,17 +2547,18 @@ mod tests {
         }
     }
 
-    /// A machine whose watchdog behaves as documented, and the clock both it and
-    /// the command read.
+    /// A machine whose watchdog behaves the way the command expects, and the
+    /// clock both it and the command read.
     ///
-    /// The fixture is scripted from the vendor's description -- silence trips
-    /// it, the trip marks the register and releases the servo, and a zero clears
-    /// it -- which is what lets these cases put the *command* to a latch. What a
-    /// real servo does is still the hardware assertion the command exists for.
+    /// Silence trips it, the trip marks the register and releases the servo, and
+    /// a zero clears it -- which is what lets these cases put the *command* to a
+    /// latch. What a real servo does is still the hardware assertion the command
+    /// exists for, and the release half of this fixture is what the fault policy
+    /// requires rather than anything anyone has watched.
     fn watchdog_machine(id: u8) -> (FakeMachine, Rc<Cell<Duration>>) {
         let now = Rc::new(Cell::new(Duration::ZERO));
-        let mut machine = machine_at(&datumed_config(), &rest_legs());
-        machine.watchdog = Some(BusWatchdogModel::documented(
+        let mut machine = machine_at(&example_config(), &rest_legs());
+        machine.watchdog = Some(BusWatchdogModel::expected(
             id,
             &now,
             Duration::from_millis(WATCHDOG_UNIT_MS),
@@ -2388,10 +2566,10 @@ mod tests {
         (machine, now)
     }
 
-    /// The whole sequence over a servo whose watchdog does what it is documented
-    /// to do: every stage reported, and the servo left disarmed and limp.
+    /// The whole sequence over a servo whose watchdog does what this command
+    /// expects: every stage reported, and the servo left disarmed and limp.
     #[test]
-    fn a_watchdog_that_behaves_as_documented_passes_every_stage() {
+    fn a_watchdog_that_behaves_as_expected_passes_every_stage() {
         let cfg = resolved();
         let id = antenna(&cfg);
         let (machine, now) = watchdog_machine(id);
@@ -2408,8 +2586,9 @@ mod tests {
             Busy::ReadsAndGoals.name(),
             Busy::ReadsOnly.name(),
             "silence:",
-            "tripped:",
-            "refused:",
+            "register:",
+            "torque after the trip:",
+            "probe:",
             "released: torque enable reads off",
             "cleared:",
             "re-armed",
@@ -2493,29 +2672,112 @@ mod tests {
 
     /// A refusal with some other code is surfaced with the byte in it, because
     /// which refusal it was is the discovery.
+    ///
+    /// Data Range is the code the vendor's worked example claims for a latched
+    /// watchdog, and it is the *wrong* one here: the hardware answers Access, so
+    /// a servo answering Data Range is a servo whose signature nobody has seen
+    /// and the byte goes out whole.
     #[test]
     fn a_trip_that_refuses_with_another_code_carries_the_byte_it_answered_with() {
         let cfg = resolved();
         let id = antenna(&cfg);
         let (mut machine, now) = watchdog_machine(id);
-        // Data Length rather than Data Range: a well-formed refusal that is not
-        // the documented signature.
         machine
             .watchdog
             .as_mut()
             .expect("the fixture has one")
-            .refuses_writes_with = Some(5);
+            .refuses_writes_with = Some(DATA_RANGE);
 
         let run = run_at(machine, &now, |port, clock, line| {
             watchdog(&cfg.map, cfg.timing, port, None, clock, line)
         });
 
-        let error = run.err("a refusal that is not Data Range is not the signature");
+        let error = run.err("a refusal that is not Access is not the signature");
         let BareError::WatchdogRefusedOtherwise { id: named, error } = error else {
             panic!("expected the other-refusal verdict, got {error}");
         };
-        assert_eq!((*named, error.0), (id, 5));
-        assert_ne!(DATA_RANGE, 5, "the case rests on these being different");
+        assert_eq!((*named, error.0), (id, DATA_RANGE));
+        assert_ne!(
+            DATA_RANGE, ACCESS,
+            "the case rests on these being different"
+        );
+    }
+
+    /// The refusal check reads the code and not the byte, so the alert bit this
+    /// unit carries on every status packet does not turn a good signature into a
+    /// finding.
+    ///
+    /// `0x87` is Access with the alert bit set by the standing input-voltage
+    /// latch that every servo on this machine carries, which has nothing to do
+    /// with the watchdog.
+    #[test]
+    fn a_refusal_carrying_the_alert_bit_is_still_the_expected_signature() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let (mut machine, now) = watchdog_machine(id);
+        machine
+            .watchdog
+            .as_mut()
+            .expect("the fixture has one")
+            .refuses_writes_with = Some(0x80 | ACCESS);
+
+        let run = run_at(machine, &now, |port, clock, line| {
+            watchdog(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        run.ok("an alert bit beside Access is the signature this hardware sends");
+        assert!(
+            run.printed
+                .iter()
+                .any(|printed| printed.contains("probe:") && printed.contains("0x87")),
+            "the byte was not printed whole: {:?}",
+            run.printed,
+        );
+    }
+
+    /// Every reading is taken before any of them is judged, and the torque
+    /// reading outranks the refusal byte.
+    ///
+    /// The two failures together — an unexpected refusal code beside a servo
+    /// that did not let go — are why the ordering matters. Judged in wire order
+    /// the refusal ends the run and nobody learns about the torque. The verdict
+    /// here is the torque one, and the probe byte is on the transcript
+    /// regardless.
+    #[test]
+    fn the_torque_reading_outranks_the_refusal_byte_and_both_are_on_the_transcript() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let (mut machine, now) = watchdog_machine(id);
+        {
+            let dog = machine.watchdog.as_mut().expect("the fixture has one");
+            dog.drops_torque = false;
+            dog.refuses_writes_with = Some(DATA_RANGE);
+        }
+
+        let run = run_at(machine, &now, |port, clock, line| {
+            watchdog(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("a servo still holding after a trip is the finding");
+        assert!(
+            matches!(error, BareError::WatchdogStillHolding { id: named } if *named == id),
+            "expected the torque verdict to outrank the refusal one, got {error}",
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|printed| printed.contains("torque after the trip:")
+                    && printed.contains("HELD")),
+            "the torque reading was not reported: {:?}",
+            run.printed,
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|printed| printed.contains("probe:") && printed.contains("0x04")),
+            "the probe byte was not reported: {:?}",
+            run.printed,
+        );
     }
 
     /// A watchdog that trips while the bus is busy fails the phase that was
@@ -2622,9 +2884,13 @@ mod tests {
             (*named, *armed, *read),
             (id, WATCHDOG_COUNTS, WATCHDOG_LATCHED)
         );
-        assert!(
-            matches!(byte_of(&run, id, RegId::TorqueEnable), None | Some(0)),
-            "nothing was torqued",
+        assert_eq!(
+            (
+                byte_of(&run, id, RegId::BusWatchdog),
+                byte_of(&run, id, RegId::TorqueEnable),
+            ),
+            (Some(0), Some(0)),
+            "an arming-phase failure still leaves the servo disarmed and limp",
         );
     }
 
@@ -2634,7 +2900,7 @@ mod tests {
     fn a_servo_that_does_not_track_its_goal_while_limp_stops_before_torque() {
         let cfg = resolved();
         let id = antenna(&cfg);
-        let mut machine = machine_at(&datumed_config(), &rest_legs());
+        let mut machine = machine_at(&example_config(), &rest_legs());
         // A servo whose goal register is a store rather than a mirror, holding a
         // pose from before it was released.
         machine.unmirrored.push(id);
@@ -2655,10 +2921,120 @@ mod tests {
         };
         assert_eq!((*named, *goal), (id, 1_234));
         assert_ne!(*at, 1_234, "the case rests on the two disagreeing");
+        assert_eq!(
+            (
+                byte_of(&run, id, RegId::BusWatchdog),
+                byte_of(&run, id, RegId::TorqueEnable),
+            ),
+            (Some(0), Some(0)),
+            "nothing was torqued, and the register the run armed was disarmed again",
+        );
+    }
+
+    /// A torque-enable that will not take stops the run, and the watchdog this
+    /// run armed a moment earlier is disarmed on the way out.
+    ///
+    /// The register is armed before the hold, so this is the first phase whose
+    /// failure would otherwise leave a servo armed with nobody watching it. It
+    /// is the reason every write in this command lives inside the exercise half.
+    #[test]
+    fn a_hold_that_will_not_take_still_leaves_the_servo_disarmed_and_limp() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let mut machine = machine_at(&example_config(), &rest_legs());
+        // Torque Enable acknowledges its writes and stores nothing, so enabling
+        // torque reads back as off and the verified write fails -- while the
+        // make-safe's write of zero reads back as the zero it wanted.
+        machine
+            .ignored
+            .push((id, named_reg(RegId::TorqueEnable).addr));
+
+        let run = run(machine, |port, clock, line| {
+            watchdog(&cfg.map, cfg.timing, port, None, clock, line)
+        });
+
+        let error = run.err("a servo that will not hold has nothing to observe");
+        assert!(
+            matches!(error, BareError::Bus { id: named, .. } if *named == id),
+            "expected the torque write's read-back to catch it, got {error}",
+        );
+        assert_eq!(
+            byte_of(&run, id, RegId::BusWatchdog),
+            Some(0),
+            "a hold that failed still left the register this run armed disarmed",
+        );
+        // This servo stores nothing about its torque, which is the whole point
+        // of the case, so all its register can say is that nothing was stored.
         assert!(
             matches!(byte_of(&run, id, RegId::TorqueEnable), None | Some(0)),
-            "nothing was torqued",
+            "nothing is holding",
         );
+    }
+
+    /// The make-safe writes the torque off even when the disarm before it
+    /// failed, and says both.
+    ///
+    /// Nothing gates de-torquing, a failed sibling write least of all: the
+    /// watchdog register is RAM a power cycle clears, and a servo left holding
+    /// because an unrelated write did not land is the one state that matters.
+    #[test]
+    fn a_disarm_that_fails_does_not_stop_the_torque_from_being_released() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let machine = machine_at(&example_config(), &rest_legs());
+        // Nothing models a watchdog, so the silence assertion is what fails; and
+        // this servo goes away about its watchdog register once that phase has
+        // taken its readings, so the make-safe's disarm cannot read its write
+        // back.
+        let run = run_deaf_from(machine, &cfg, id, "probe:", &[RegId::BusWatchdog]);
+
+        let error = run.err("a register file trips on nothing");
+        assert!(
+            matches!(error, BareError::WatchdogNeverTripped { .. }),
+            "the assertion's own failure is what the run returns, got {error}",
+        );
+        assert!(
+            run.printed
+                .iter()
+                .any(|printed| printed.contains("would not disarm")),
+            "the disarm's failure was swallowed: {:?}",
+            run.printed,
+        );
+        assert_eq!(
+            byte_of(&run, id, RegId::TorqueEnable),
+            Some(0),
+            "the torque came off anyway, and it read back",
+        );
+    }
+
+    /// Both make-safe writes failing says both, and the error that comes out is
+    /// the torque one.
+    #[test]
+    fn a_make_safe_that_fails_twice_reports_both_and_returns_the_torque_failure() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let machine = machine_at(&example_config(), &rest_legs());
+        // Both of the make-safe's registers, gone by the time it writes.
+        let run = run_deaf_from(
+            machine,
+            &cfg,
+            id,
+            "probe:",
+            &[RegId::BusWatchdog, RegId::TorqueEnable],
+        );
+
+        let error = run.err("a register file trips on nothing");
+        assert!(
+            matches!(error, BareError::WatchdogNeverTripped { .. }),
+            "the assertion's own failure is still what the run returns, got {error}",
+        );
+        for said in ["would not disarm either", "cleanup did not finish"] {
+            assert!(
+                run.printed.iter().any(|printed| printed.contains(said)),
+                "no line said `{said}`: {:?}",
+                run.printed,
+            );
+        }
     }
 
     /// A run whose assertion fails *and* whose cleanup fails says both, because
@@ -2667,20 +3043,12 @@ mod tests {
     fn a_cleanup_that_could_not_finish_is_reported_beside_the_assertion_that_failed() {
         let cfg = resolved();
         let id = antenna(&cfg);
-        let mut machine = machine_at(&datumed_config(), &rest_legs());
+        let machine = machine_at(&example_config(), &rest_legs());
         // Nothing models a watchdog here, so the silence assertion is what
-        // fails; and this servo stops answering about its torque after the four
-        // reads that come before the cleanup -- the one that checks it arrived
-        // released, the read-back of the write that torqued it, and one at the
-        // end of each busy phase -- so the cleanup's own verified write cannot
-        // read anything back.
-        machine
-            .deaf_after
-            .insert((id, named_reg(RegId::TorqueEnable).addr), 4);
-
-        let run = run(machine, |port, clock, line| {
-            watchdog(&cfg.map, cfg.timing, port, None, clock, line)
-        });
+        // fails; and this servo goes away about its torque register once that
+        // phase has taken its readings, so the make-safe's verified write
+        // cannot read anything back.
+        let run = run_deaf_from(machine, &cfg, id, "probe:", &[RegId::TorqueEnable]);
 
         let error = run.err("a register file trips on nothing");
         assert!(
@@ -2706,7 +3074,7 @@ mod tests {
     fn an_arming_write_that_does_not_take_stops_before_any_torque() {
         let cfg = resolved();
         let id = antenna(&cfg);
-        let mut machine = machine_at(&datumed_config(), &rest_legs());
+        let mut machine = machine_at(&example_config(), &rest_legs());
         machine
             .ignored
             .push((id, named_reg(RegId::BusWatchdog).addr));
@@ -2723,6 +3091,134 @@ mod tests {
         assert!(
             matches!(byte_of(&run, id, RegId::TorqueEnable), None | Some(0)),
             "nothing was torqued",
+        );
+    }
+    /// A re-arm phase that fails leaves the servo disarmed and limp anyway.
+    ///
+    /// The one phase that fails with the register freshly armed: it is why the
+    /// clear and the re-arm are exercise steps rather than make-safe ones, and
+    /// the residual state it can leave -- armed and holding -- is the machine's
+    /// only pinch hazard, so what undoes it is asserted rather than assumed.
+    #[test]
+    fn a_re_arm_that_fails_still_leaves_the_servo_disarmed_and_limp() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let (machine, now) = watchdog_machine(id);
+
+        // Through the silence and its clear, then gone about the goal register:
+        // the re-arm's hold writes a goal before it enables torque, so this
+        // fails the phase after the register has been armed again.
+        let run = run_deaf_from_at(machine, &now, &cfg, id, "cleared:", &[RegId::GoalPosition]);
+
+        let error = run.err("a goal write nobody reads back is not a re-arm");
+        assert!(
+            matches!(error, BareError::Bus { id: named, .. } if *named == id),
+            "expected the re-arm's own write to catch it, got {error}",
+        );
+        assert!(
+            !run.printed
+                .iter()
+                .any(|printed| printed.contains("re-armed")),
+            "the phase reported a re-arm it did not finish: {:?}",
+            run.printed,
+        );
+        assert_eq!(
+            (
+                byte_of(&run, id, RegId::BusWatchdog),
+                byte_of(&run, id, RegId::TorqueEnable),
+            ),
+            (Some(0), Some(0)),
+            "a servo left armed by the re-arm was disarmed and released by the make-safe",
+        );
+    }
+
+    /// A run whose assertions all passed and whose make-safe could not release
+    /// the servo returns the make-safe's failure, and claims nothing.
+    ///
+    /// The one path where the cleanup's error is what comes out of the command.
+    /// A run that read green while the release was never confirmed is the report
+    /// an operator would trust and walk away from.
+    #[test]
+    fn a_green_run_whose_make_safe_could_not_release_returns_that_failure() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let (machine, now) = watchdog_machine(id);
+
+        // Every exercise phase passes -- the re-arm's own hold is written before
+        // its line prints -- and the servo is gone about its torque register by
+        // the time the make-safe writes.
+        let run = run_deaf_from_at(machine, &now, &cfg, id, "re-armed", &[RegId::TorqueEnable]);
+
+        let error = run.err("a release nobody read back is not a release");
+        assert!(
+            matches!(error, BareError::Bus { id: named, .. } if *named == id),
+            "expected the make-safe's failure to be the verdict, got {error}",
+        );
+        for unsaid in ["disarmed and released", "Disarmed and limp now."] {
+            assert!(
+                !run.printed.iter().any(|printed| printed.contains(unsaid)),
+                "the run said `{unsaid}` about a release it could not confirm: {:?}",
+                run.printed,
+            );
+        }
+        assert_eq!(
+            byte_of(&run, id, RegId::BusWatchdog),
+            Some(0),
+            "the disarm before it did land",
+        );
+    }
+
+    /// A bus-level answer to the goal probe returns as itself, after both
+    /// register readings are on the transcript.
+    ///
+    /// A failed observation, not a judged one: the register and the torque are
+    /// already read by then, and a probe hoisted above them would end a run
+    /// with nothing said about the torque -- which is exactly the shape of the
+    /// first hardware run's defect.
+    #[test]
+    fn a_bus_error_on_the_probe_returns_after_both_readings_are_printed() {
+        let cfg = resolved();
+        let id = antenna(&cfg);
+        let machine = machine_at(&example_config(), &rest_legs());
+
+        // Gone about its goal register the moment the torque reading prints, so
+        // the probe's verified write is what cannot be read back.
+        let run = run_deaf_from(
+            machine,
+            &cfg,
+            id,
+            "torque after the trip:",
+            &[RegId::GoalPosition],
+        );
+
+        let error = run.err("a probe nobody can read back observes nothing");
+        assert!(
+            matches!(error, BareError::Bus { id: named, .. } if *named == id),
+            "expected the probe's own write to be the verdict, got {error}",
+        );
+        for reading in ["register:", "torque after the trip:"] {
+            assert!(
+                run.printed
+                    .iter()
+                    .any(|printed| printed.trim_start().starts_with(reading)),
+                "the probe failed before {reading} was said: {:?}",
+                run.printed,
+            );
+        }
+        assert!(
+            !run.printed
+                .iter()
+                .any(|printed| printed.trim_start().starts_with("probe:")),
+            "a probe that never answered was reported anyway: {:?}",
+            run.printed,
+        );
+        assert_eq!(
+            (
+                byte_of(&run, id, RegId::BusWatchdog),
+                byte_of(&run, id, RegId::TorqueEnable),
+            ),
+            (Some(0), Some(0)),
+            "a failed observation still left the servo disarmed and limp",
         );
     }
 }

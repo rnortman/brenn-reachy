@@ -3,36 +3,26 @@
 //!
 //! One TOML file maps onto what the bench's two halves need: the bus device and
 //! its timing, the roster, what the read-only registry verifies and the two
-//! thresholds it judges against, and the resolved crank datum. Every default
-//! here carries the provenance of its number, because a bench configuration is
-//! the place where a measured figure eventually replaces a guess and the two
-//! have to be told apart.
+//! thresholds it judges against. Every default here carries the provenance of
+//! its number, because a bench configuration is the place where a measured
+//! figure eventually replaces a guess and the two have to be told apart.
 //!
 //! Nothing here configures motion. Coordinated motion is the cog system's, and
 //! it is configured by its own schema-typed parameter files; a key here with no
 //! consumer in this crate is a key an operator would read as a bound that
 //! something enforces, so there are none.
 //!
-//! ## The datum record
-//!
-//! There is no default crank datum and there never will be. That a converted
-//! count is the model's crank angle rests on every leg servo carrying its
-//! provisioned homing offset, which the self-test reads back; the `[datum]`
-//! table is the record that a person checked that evidence and stands behind
-//! it. A configuration without the table, or with one carrying no provenance
-//! line, is a typed refusal from [`BenchConfig::datum`] — the accessor a host
-//! that converts counts to model angles runs before it trusts one.
-//!
-//! It is calibration rather than a safety gate: a datum nobody has checked
-//! makes every converted angle a guess, so what a failure means is that there
-//! is nothing to reason *with*, not something to protect the machine *from*.
+//! The datum is not configured here. That a converted count is the model's
+//! crank angle rests on every leg servo carrying its provisioned homing offset,
+//! and the record of it is the self-test's `datum` case: a hardware comparison
+//! against [`VENDOR_HOMING_OFFSETS`], written into the self-test state with its
+//! provenance.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -90,18 +80,6 @@ pub enum ConfigError {
         id: u8,
     },
 
-    /// No crank datum has been resolved.
-    #[error(
-        "no crank datum is configured: add a [datum] table once a human has read a self-test record and stands behind what its datum case says"
-    )]
-    MissingDatum,
-
-    /// A datum recorded with nothing saying where it came from.
-    #[error(
-        "the [datum] table has no provenance: record who resolved the datum, when, and from which self-test record"
-    )]
-    DatumProvenanceEmpty,
-
     /// A count could not cross the joint/wire boundary.
     #[error(transparent)]
     Map(#[from] MapError),
@@ -109,9 +87,7 @@ pub enum ConfigError {
 
 /// The configuration file as written.
 ///
-/// Every table may be omitted, in which case its defaults apply — except
-/// `[datum]`, which has no default and whose absence is a refusal from
-/// [`BenchConfig::datum`].
+/// Every table may be omitted, in which case its defaults apply.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BenchConfig {
@@ -124,10 +100,6 @@ pub struct BenchConfig {
     /// What the provisioned registers must hold.
     #[serde(default)]
     pub provision: ProvisionSection,
-    /// The resolved crank datum. Absent until a human has read a self-test
-    /// record and written it in.
-    #[serde(default)]
-    pub datum: Option<DatumSection>,
 }
 
 /// `[bus]` — the port and the transaction timing.
@@ -274,48 +246,10 @@ impl Default for ProvisionSection {
     }
 }
 
-/// `[datum]` — how the legs' counts relate to the model's crank angles.
-///
-/// Both keys are required. A datum without a provenance line is a claim nobody
-/// can trace back to the reading that produced it, and the whole point of this
-/// table is that a person read the evidence.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DatumSection {
-    /// Which reading of the counts is the model's crank angle.
-    pub crank_datum: DatumSetting,
-    /// Who resolved it, when, and from which self-test record.
-    pub provenance: String,
-}
-
-/// The datum as a file spells it — the bench configuration and the self-test
-/// record alike, which is why one spelling serves both.
-///
-/// One variant, deliberately. A host-side correction is never the answer to a
-/// servo that lacks its provisioned offset: that is one servo's fault, refused
-/// by name, and a compensating shift would move all six legs for it. The enum
-/// exists so that a file saying anything else is refused by serde rather than
-/// read past.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DatumSetting {
-    /// A converted count is the crank angle as the model means it, because each
-    /// leg servo applies its provisioned homing offset before reporting.
-    Direct,
-}
-
-impl fmt::Display for DatumSetting {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Direct => f.write_str("direct"),
-        }
-    }
-}
-
 /// Read and parse a configuration file.
 ///
 /// Parsing only: a file that parses can still be refused by
-/// [`BenchConfig::servo_ids`] or [`BenchConfig::datum`].
+/// [`BenchConfig::servo_ids`].
 pub fn load(path: &Path) -> anyhow::Result<BenchConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the bench configuration at {}", path.display()))?;
@@ -364,18 +298,6 @@ impl BenchConfig {
             }
         }
         Ok(ids)
-    }
-
-    /// Where the recorded datum came from.
-    ///
-    /// This is the gate that keeps every motion command off a machine nobody
-    /// has reviewed the provisioning evidence for.
-    pub fn datum(&self) -> Result<&str, ConfigError> {
-        let section = self.datum.as_ref().ok_or(ConfigError::MissingDatum)?;
-        if section.provenance.trim().is_empty() {
-            return Err(ConfigError::DatumProvenanceEmpty);
-        }
-        Ok(section.provenance.as_str())
     }
 
     /// What arming verifies, per servo and register.
@@ -497,18 +419,6 @@ mod tests {
     /// The example shipped beside the crate, which an operator copies.
     const EXAMPLE: &str = include_str!("../reachy-bench.example.toml");
 
-    /// The `[datum]` table the example deliberately does not ship, appended by
-    /// the tests that need a configuration which resolves. A real one is written
-    /// by a human from a self-test record; this one stands for that step.
-    const RESOLVED_DATUM: &str =
-        "\n[datum]\ncrank_datum = \"direct\"\nprovenance = \"test fixture\"\n";
-
-    /// The shipped example with a datum written in, which is the file an
-    /// operator ends up with after reviewing a run.
-    fn example_resolved() -> BenchConfig {
-        parse(&format!("{EXAMPLE}{RESOLVED_DATUM}")).expect("the example plus a datum parses")
-    }
-
     /// The bounds the motion layer refuses a goal or a stored pin on are count
     /// bounds, and this is the one place the two layers that hold them meet:
     /// the motion layer states them over its own copy of the count frame, and
@@ -582,43 +492,33 @@ mod tests {
         }
     }
 
-    /// The smallest file with a reviewed datum: every other table defaulted.
-    const MINIMAL: &str = "\
-[datum]
-crank_datum = \"direct\"
-provenance = \"test fixture\"
-";
+    /// The smallest file there is: empty, every table defaulted.
+    const MINIMAL: &str = "";
 
     fn minimal() -> BenchConfig {
         parse(MINIMAL).expect("the minimal configuration parses")
     }
 
     #[test]
-    fn the_example_file_parses_and_carries_a_datum_once_one_is_written_in() {
-        let cfg = example_resolved();
+    fn the_example_file_parses_as_shipped() {
+        let cfg = parse(EXAMPLE).expect("the shipped example parses");
         assert_eq!(
             cfg.servo_ids().expect("the roster is nine servos"),
             reachy_motion::arm::SERVO_IDS
         );
-        assert!(
-            !cfg.datum()
-                .expect("a datum is written in")
-                .trim()
-                .is_empty()
-        );
     }
 
-    /// The shipped example carries no datum, and therefore refuses every command
-    /// that moves something exactly as it stands.
-    ///
-    /// A filled-in example would be a datum nobody reviewed sitting on the gate
-    /// that exists to force a human to review one: the copied file would
-    /// resolve, and nothing downstream re-asks the question the table answers.
+    /// A per-unit file left over from when the schema had a `[datum]` table
+    /// fails parse naming the table, which is the migration prompt: the copy is
+    /// gitignored and per-machine, so the parse error is the only place an
+    /// operator learns the table is gone.
     #[test]
-    fn the_shipped_example_resolves_no_datum() {
-        let cfg = parse(EXAMPLE).expect("the shipped example parses");
-        assert_eq!(cfg.datum, None);
-        assert_eq!(cfg.datum().unwrap_err(), ConfigError::MissingDatum);
+    fn a_file_still_carrying_a_datum_table_is_refused_by_name() {
+        let stale = parse(&format!(
+            "{MINIMAL}\n[datum]\ncrank_datum = \"direct\"\nprovenance = \"an old copy\"\n"
+        ));
+        let message = format!("{:#}", stale.expect_err("the table is no longer a key"));
+        assert!(message.contains("datum"), "{message}");
     }
 
     #[test]
@@ -647,19 +547,6 @@ provenance = \"test fixture\"
         assert_eq!(timing, BusTiming::default());
     }
 
-    #[test]
-    fn a_file_without_a_datum_refuses() {
-        let cfg = parse("[bus]\nbaud = 1000000\n").expect("parses");
-        assert_eq!(cfg.datum().unwrap_err(), ConfigError::MissingDatum);
-    }
-
-    #[test]
-    fn a_datum_without_provenance_refuses() {
-        let text = "[datum]\ncrank_datum = \"direct\"\nprovenance = \"   \"\n";
-        let cfg = parse(text).expect("parses");
-        assert_eq!(cfg.datum().unwrap_err(), ConfigError::DatumProvenanceEmpty);
-    }
-
     /// An unknown key is refused by name rather than ignored.
     #[test]
     fn an_unknown_key_is_refused() {
@@ -668,7 +555,7 @@ provenance = \"test fixture\"
         assert!(message.contains("baud_rate"), "{message}");
     }
 
-    /// The datum has one record, and this file is not it.
+    /// The datum has one record, the self-test's, and this file is not it.
     ///
     /// A homing offset is what makes a converted count the model's crank angle;
     /// a file that could set it would be a second record of the same truth,

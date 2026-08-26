@@ -125,8 +125,8 @@ fn usage() -> String {
          machine and keeps running.\n\
          \n\
          SIGINT or SIGTERM de-torques the machine, reads back what it can, says so and exits.\n\
-         A stop it cannot answer -- SIGKILL, a crash, a cut cable -- is answered by the servos'\n\
-         own bus watchdog instead.\n\
+         A stop it cannot answer -- SIGKILL, a crash, a cut cable -- leaves the servos' own bus\n\
+         watchdog to stop the machine, which it does with torque still held.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}, relative to the working directory."
     )
@@ -362,7 +362,7 @@ mod tests {
         );
         assert!(
             WoundDown::Unconfirmed.line().contains("bus watchdog"),
-            "a de-torquing nobody read back names the layer that answers it anyway"
+            "a de-torquing nobody read back names what is left watching the bus"
         );
     }
 

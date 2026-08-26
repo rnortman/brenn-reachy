@@ -266,12 +266,12 @@ rust_clk_module(
 )
 
 # What one run of the motion system did, read off its log: the operator's tool
-# for the first hardware run. Run as
+# for judging a hardware run. Run as
 # `bazel run //cogs:first_motion_report -- <log-dir>`, or over a log pulled off
 # a unit.
 #
 # It reads the channel set both systems declare, which is what lets the test
-# below prove it against a deterministic run before any hardware log exists.
+# below prove it against a deterministic run with no hardware log at all.
 rust_binary(
     name = "first_motion_report",
     srcs = ["first_motion_report.rs"],

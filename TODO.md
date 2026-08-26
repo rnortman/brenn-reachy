@@ -380,7 +380,9 @@ Deferral context: the configuration half is done — `profile_acceleration` and
 in `cogs/session_params.textproto`, and `check::commissioned_profile` pins the
 file's values to the writes that reach all nine servos. What remains is the
 measurement. The shipped pair is a modest backstop chosen for a host that streams
-one step-bounded setpoint per period and nothing has run it on hardware; it is an
+one step-bounded setpoint per period; the commissioning sweep has since written
+it on a unit and the machine moved under it, but nobody has measured whether it
+is the right pair. It is an
 order of magnitude below the figures the bench ran (400 / 600, trial-validated,
 including an 855°/s antenna sweep), which were sized for a host commanding whole
 moves outright, so the two cannot both be right for the same machine. What
@@ -591,9 +593,11 @@ so an online run's records land on real disk instead of on the unit's tmpfs.
 
 Deferral context: the logger runs beside the control process on the unit today,
 writing `.olog` files to `/run/brenn-app/logs/motion`, and the run's records are
-pulled off with `rsync` after the run. That works and it keeps the deployment
-doctrine — nothing pushed to a unit touches its flash — but it has two costs: a
-step between the run and the record, and a dependency on tmpfs accepting the
+pulled off with `rsync` after the run — scripted into `make motion-run` now,
+which fetches before the operator can power the unit down. That works and it
+keeps the deployment doctrine — nothing pushed to a unit touches its flash — but
+it has two costs: a step between the run and the record, and a dependency on
+tmpfs accepting the
 `O_DIRECT | O_DSYNC` the framework's writer opens every file with. The writer
 has no way to be told otherwise, direct I/O on tmpfs is a kernel-version
 capability, and the unit's kernel is not the one this was verified on. The other
@@ -666,3 +670,21 @@ rather than from scratch. The forensic half is now built rather than wished for:
 path, so a second sighting leaves the stubs, the mtimes and the payload layout
 that produced it. This entry exists so that a second sighting starts from that
 instead of from zero. Marked at the header of `tools/build-motion.test.sh`.
+
+## `watchdog-holds-torque`
+
+Decide what, if anything, answers an uncontrolled exit with the machine under
+torque. The servos' own Bus Watchdog, armed at 200 ms by every session, does not:
+a trip stops the servo and leaves torque held. Observed on hardware.
+
+Deferral context: the driver's controlled wind-down de-torques on every stop it
+can answer, and nothing answers the ones it cannot — SIGKILL, a crash, a yanked
+cable — so the head stays where it was, holding its pose, until somebody powers
+the unit down. The arming stays regardless: a stopped servo is better than one
+chasing a stale goal. What to do about the torque is a fault-policy design cycle
+extending `docs/fault-management.md`, not a change any one site can carry, and
+the answer may be mechanical or procedural rather than code. Until that cycle
+runs, the bench `watchdog` self-test's standing failure — it asserts a release,
+which is what the policy requires, and fails on this hardware by design — is the
+record, and it is not to be made green. Marked at the `bus_watchdog` comment in
+`cogs/session_params.textproto`, where the armed value lives.

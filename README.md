@@ -136,16 +136,19 @@ de-torque responses — is pinned. The bench binary's own motion layer, which wa
 the host for supervised bring-up, is deleted: the bench validates that we can
 talk to the hardware and nothing else.
 
-The host that puts the cog system on a real bus is built and has never been
-run on one. `reachy-motord` is the driver process — a 20 ms grid on the real
-clock, the serial port, and `reachy-driver`'s decisions — and it meets the cogs
+The host that puts the cog system on a real bus is built and has run on one:
+`reachy00` completes runs end to end, and every verdict so far is red for
+reasons the runbook's open observations record. `reachy-motord` is the driver
+process — a 20 ms grid on the real clock, the serial port, and
+`reachy-driver`'s decisions — and it meets the cogs
 over six UDP sockets on loopback, filling the slots the simulated plant fills in
 the scenario suite. The online composition is that seam plus the control core, a
 logger process, and a wake gesture that asks the machine to raise and stow once.
 `make check-device` cross-compiles every device deployable — the motion
 payload's two binaries and the composition it is staged from, plus the bench
-binary, named once as `//bazel/platform:device_deployables` — and CI blocks on
-it;
+binary, named once as `//bazel/platform:device_deployables` — then disassembles
+the C++ two and refuses any instruction the unit's Cortex-A72 does not
+implement, and CI blocks on both halves;
 `docs/bench-runbook.md` is the procedure for the first run, and
 `//cogs:first_motion_report` is what reads its log.
 
