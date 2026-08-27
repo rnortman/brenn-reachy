@@ -53,9 +53,20 @@ tally() {
 # ---------------------------------------------------------------------------
 
 # Fixed strings throughout: every needle a self-check here passes is a message
-# or a path, and a message with a bracket or a dot in it is not a pattern.
+# or a path, and a message with a bracket or a dot in it is not a pattern. The
+# quoted needle inside the pattern is what makes it fixed -- a `*` or a `[` in a
+# message matches itself.
+#
+# In the shell rather than through `grep`, and that is load-bearing: a pipeline
+# under `pipefail` reports the writer's death, so a `grep -q` that matched early
+# in a large haystack and closed the pipe made `printf` exit on SIGPIPE and the
+# whole call answer "no match" -- intermittently, depending on which of the two
+# ran first.
 contains() {
-	printf '%s' "$1" | grep -qF -- "$2"
+	case "$1" in
+	*"$2"*) return 0 ;;
+	*) return 1 ;;
+	esac
 }
 
 assert_contains() {

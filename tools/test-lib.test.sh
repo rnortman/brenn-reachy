@@ -152,6 +152,27 @@ assert_file "and kept with what the run staged" "${kept}/evidence"
 rm -rf -- "$kept"
 
 # ---------------------------------------------------------------------------
+# The needle is a fixed string, not a pattern
+# ---------------------------------------------------------------------------
+
+# Every needle the suites pass is a message or a path, and messages hold
+# brackets, dots and stars. The literalness rests entirely on the quoting of the
+# needle inside `contains`'s pattern: drop those quotes and every
+# `assert_contains` in every suite silently becomes a glob match, so assertions
+# start passing against haystacks they should reject and no suite goes red.
+assert_contains "a star in a needle matches a star in the haystack" "a foo*bar b" "foo*bar"
+assert_lacks "and matches nothing else: a needle is not a pattern" "a fooXbar b" "foo*bar"
+assert_contains "a bracket expression matches itself" "a [abc] b" "[abc]"
+assert_lacks "and not one of the characters in it" "a b" "[abc]"
+
+# The pipeline-free reading, which is what the SIGPIPE fix was: a needle that
+# matches early in a haystack far larger than a pipe buffer still answers, every
+# time rather than depending on which of two processes ran first.
+big_haystack="the needle is right here$(printf 'x%.0s' $(seq 1 200000))"
+assert_contains "a needle matching early in a large haystack is still found" \
+	"$big_haystack" "the needle is right here"
+
+# ---------------------------------------------------------------------------
 # Which stream each line is on
 # ---------------------------------------------------------------------------
 

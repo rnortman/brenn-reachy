@@ -21,8 +21,9 @@
 //! # Where a record is built, and where it is read
 //!
 //! Every sequencer builds into its own state: `set_ping`, `set_read_reg`,
-//! `set_write_reg_verified` and `set_none` write a caller's `&mut BusTxn`
-//! through the validated view, so nothing is built beside the record and copied
+//! `set_write_reg_verified`, `set_write_reg_unverified` and `set_none` write a
+//! caller's `&mut BusTxn` through the validated view, so nothing is built
+//! beside the record and copied
 //! into it, and [`fields`] and [`held`] read it back the same way. [`none`] and
 //! [`ping`] answer a fresh [`BusTxnWire`], and [`read`], [`active`] and [`op`]
 //! read one off the wire type — the boundary shape, for a host or a fixture
@@ -73,6 +74,46 @@ pub fn set_write_reg_verified(out: &mut BusTxn, id: u8, reg: RegId, value: Value
     build(out, AuxOpKind::WriteRegVerified, id, reg, value);
 }
 
+/// Write one register and take the acknowledgement, reading nothing back, in
+/// the record `out`.
+///
+/// The answer says the servo took the instruction and nothing about what the
+/// register holds afterwards. For a sequence that documents that it does not
+/// judge the read-back: a register the platform mirrors from elsewhere reads
+/// back its own state, so asking for the read-back manufactures a mismatch
+/// nobody reads.
+pub fn set_write_reg_unverified(out: &mut BusTxn, id: u8, reg: RegId, value: Value) {
+    build(out, AuxOpKind::WriteReg, id, reg, value);
+}
+
+/// What a write operation takes as its answer, or [`None`] for an operation that
+/// is not a write.
+///
+/// The classification of the write ops lives here, where the operation
+/// vocabulary is already interpreted, because every driver that runs one asks
+/// the same question of the same field. A driver deriving it from its own copy
+/// of the mapping is a second source of truth for a fact the request already
+/// carries.
+#[must_use]
+pub fn write_answer(op: AuxOpKind) -> Option<WriteAnswer> {
+    match op {
+        AuxOpKind::WriteRegVerified => Some(WriteAnswer::ReadBack),
+        AuxOpKind::WriteReg => Some(WriteAnswer::Acknowledgement),
+        AuxOpKind::None | AuxOpKind::Ping | AuxOpKind::ReadReg => None,
+    }
+}
+
+/// Where a write's answer comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAnswer {
+    /// The register is read back and compared, so the answer is what the servo
+    /// holds afterwards.
+    ReadBack,
+    /// The servo's acknowledgement and nothing further, so the answer says the
+    /// instruction was taken and nothing about the register.
+    Acknowledgement,
+}
+
 /// Nothing outstanding, in the record `out`.
 pub fn set_none(out: &mut BusTxn) {
     build(out, AuxOpKind::None, 0, RegId::None, value::NONE);
@@ -97,7 +138,7 @@ pub fn held(txn: &BusTxn) -> bool {
 pub fn fields(txn: &BusTxn, step: SeqStepKind) -> Result<(StepContext, Value), SeqError> {
     let reg = match txn.op {
         AuxOpKind::None | AuxOpKind::Ping => None,
-        AuxOpKind::ReadReg | AuxOpKind::WriteRegVerified => match txn.reg {
+        AuxOpKind::ReadReg | AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => match txn.reg {
             RegId::None => {
                 return Err(SeqError::PendingUnreadable {
                     context: StepContext::servo(step, txn.id),
@@ -187,8 +228,12 @@ mod tests {
         wire(AuxOpKind::WriteRegVerified, id, reg, value)
     }
 
+    fn write_reg(id: u8, reg: RegId, value: Value) -> BusTxnWire {
+        wire(AuxOpKind::WriteReg, id, reg, value)
+    }
+
     #[test]
-    fn the_three_transactions_say_what_they_are() {
+    fn the_four_transactions_say_what_they_are() {
         let ping = ping(4);
         let (context, value) = read(&ping, SeqStepKind::Presence).expect("a ping reads");
         assert_eq!(context, StepContext::servo(SeqStepKind::Presence, 4));
@@ -209,6 +254,66 @@ mod tests {
             StepContext::reg(SeqStepKind::VerifyAtStow, 9, RegId::TorqueEnable)
         );
         assert_eq!(value, value::u8(1));
+
+        let unverified = write_reg(9, RegId::GoalPosition, value::radians(0.5));
+        let (context, value) =
+            read(&unverified, SeqStepKind::PinAndEnable).expect("an unverified write reads");
+        assert_eq!(
+            context,
+            StepContext::reg(SeqStepKind::PinAndEnable, 9, RegId::GoalPosition)
+        );
+        assert_eq!(value, value::radians(0.5));
+    }
+
+    /// An unverified write is written like any other, and reading it back off
+    /// the record is how a driver learns it is the one that takes no read-back.
+    #[test]
+    fn an_unverified_write_is_built_into_a_record_like_the_verified_one() {
+        let mut wire = BusTxnWire::new();
+        let out = wire.clear_valid();
+
+        set_write_reg_unverified(out, 12, RegId::GoalPosition, value::radians(-0.25));
+        assert!(held(out));
+        assert_eq!(out.op, AuxOpKind::WriteReg);
+        assert_eq!(out.id, 12);
+        assert_eq!(out.reg, RegId::GoalPosition);
+        assert_eq!(
+            value::carried(out.value_kind, out.value),
+            value::radians(-0.25)
+        );
+    }
+
+    /// Which writes are read back, said once for every driver that runs one.
+    ///
+    /// Exhaustive by count: an operation appended to the vocabulary without a
+    /// line here fails this rather than reaching a driver that has to guess
+    /// whether it takes a read-back.
+    #[test]
+    fn every_operation_says_whether_its_answer_is_read_back() {
+        let table = [
+            (AuxOpKind::None, None),
+            (AuxOpKind::Ping, None),
+            (AuxOpKind::ReadReg, None),
+            (AuxOpKind::WriteRegVerified, Some(WriteAnswer::ReadBack)),
+            (AuxOpKind::WriteReg, Some(WriteAnswer::Acknowledgement)),
+        ];
+        assert_eq!(table.len(), AuxOpKind::VARIANTS.len());
+        for (op, answer) in table {
+            assert_eq!(write_answer(op), answer, "{op:?}");
+        }
+    }
+
+    /// A write of no register is a record about nothing, unverified or not.
+    #[test]
+    fn an_unverified_write_naming_no_register_is_refused() {
+        let mut txn = write_reg(8, RegId::GoalPosition, value::radians(0.0));
+        txn.set_reg(RegId::None.into());
+        assert_eq!(
+            read(&txn, SeqStepKind::PinAndEnable),
+            Err(SeqError::PendingUnreadable {
+                context: StepContext::servo(SeqStepKind::PinAndEnable, 8),
+            })
+        );
     }
 
     #[test]

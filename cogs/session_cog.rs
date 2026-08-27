@@ -53,15 +53,17 @@ use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__faults_clk_rs::ResponseKindWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
+use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
 use clockwork_rs::SyncTime;
 use motion_slots::{MS_NS, configured, counters};
 use reachy_motion::arm::{ProfileConfig, row_of_id};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{self, JointRef};
-use reachy_motion::seq::BusResult;
+use reachy_motion::seq::{BusResult, SeqFailureKind};
 use reachy_motion::tick::ResponseKind;
 use reachy_motion::value;
+use reachy_motion::verdict::{self, VerdictError};
 use reachy_motion::winddown::Disposition;
 use session_slots::{clear_timeline, mark_published, oldest_unpublished, push_report};
 
@@ -759,6 +761,43 @@ fn record_fault(
     }
 }
 
+/// The survey's verdict, as the one row that says what parked the machine.
+///
+/// The verdict itself is a state slot nothing publishes -- where a live debugger
+/// reads it, and where it stays. What goes on the wire is the headline: which
+/// failure, which servo it names, and the kind's own number. A reader of the
+/// report stream then learns which servo the survey refused the machine over,
+/// which is the question a parked run leaves an operator holding.
+///
+/// A verdict whose fields do not read back as a failure is narrated as exactly
+/// that: `verdict_unreadable` is a failure kind of its own, and a parked machine
+/// with no row at all is the silence this closes. Nothing is assembled out of
+/// the fields that are still there -- but the refusal's own number goes in
+/// `detail`, because a slot nobody wrote, a slot holding another build's bytes
+/// and a slot whose evidence does not suit its kind are three different stories
+/// and this row is the only place they are told apart.
+fn commission_report(slot: &SessionStateWire, now: i64) -> Report {
+    let read = match slot.commission().failure().validate() {
+        Ok(snap) => verdict::read(snap).map_err(VerdictError::code),
+        Err(_) => Err(verdict::BYTES_UNREADABLE),
+    };
+    let (kind, id, detail) = match read {
+        Ok(failure) => (
+            failure.kind(),
+            failure.context().id,
+            verdict::headline(&failure),
+        ),
+        Err(code) => (SeqFailureKind::VerdictUnreadable, 0, f64::from(code)),
+    };
+    Report {
+        time_ns: now,
+        kind: ReportKind::CommissionFailed,
+        a: u32::from(SeqFailureKindWire::from(kind).0),
+        b: u32::from(id),
+        detail,
+    }
+}
+
 /// A phase change, as the story of one.
 fn phase_report(entered: &Entered, now: i64) -> Report {
     Report {
@@ -1039,6 +1078,16 @@ fn run_bus(
         narrate(dial.states.sess, counters, &report);
     }
     if let Some(entered) = turn.entered {
+        // The survey's verdict, immediately before the phase row it explains.
+        // Before, because a reader of the stream meets the row that says the
+        // machine was refused and then the row that says why -- and because
+        // this is the only ordering enforceable anywhere: the phase row is
+        // narrated here, and nothing else about a parked survey ever leaves the
+        // session.
+        if entered.to == SessionPhaseWire::PARKED && entered.from == SessionPhaseWire::STARTING {
+            let report = commission_report(dial.states.sess, now);
+            narrate(dial.states.sess, counters, &report);
+        }
         narrate(dial.states.sess, counters, &phase_report(&entered, now));
     }
     if turn.release {
@@ -1230,6 +1279,11 @@ fn result_of(
             AuxOpKind::Ping => BusResult::Pinged { model },
             AuxOpKind::ReadReg => BusResult::Value(value::carried(value_kind, bits)),
             AuxOpKind::WriteRegVerified => BusResult::Written,
+            // An unverified write's answer is the servo's acknowledgement and
+            // nothing about the register, so it is its own result: a step that
+            // judges a write asks whether the register holds what it wrote, and
+            // this cannot answer that question.
+            AuxOpKind::WriteReg => BusResult::Acknowledged,
             // A datagram asking nothing is one this cog never issues, so an
             // answer to one is an answer to a question nobody asked: the
             // library's word for a transaction that never reached the bus.
@@ -1359,7 +1413,11 @@ mod tests {
     //! What the screen's restated numbers are, measured against the schemas that
     //! own them, and how one transaction's outcome reads as a result.
 
-    use super::{AuxOpKind, AuxStatus, BusResult, MAX_MOTIONS, ValueShape, result_of, value};
+    use super::{
+        AuxOpKind, AuxStatus, BusResult, MAX_MOTIONS, ReportKind, SeqFailureKind,
+        SeqFailureKindWire, SessionStateWire, ValueShape, commission_report, result_of, value,
+        verdict,
+    };
     use brenn_reachy__cogs__config_clk_rs::ClipLibraryConfigWire;
     use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
@@ -1386,6 +1444,123 @@ mod tests {
         let schedule = SessionScheduleWire::new();
         assert_eq!(script.steps().capacity(), schedule.steps().capacity());
         assert_eq!(script.overlays().capacity(), schedule.overlays().capacity());
+    }
+
+    /// A verdict of `error` in a fresh session slot, as the survey leaves one.
+    fn parked_on(error: &reachy_motion::seq::SeqError) -> SessionStateWire {
+        let mut slot = SessionStateWire::new();
+        verdict::write(slot.commission_mut().failure_mut().clear_valid(), error)
+            .expect("a reachable verdict crosses");
+        slot
+    }
+
+    /// Where a step this crate's cases file a failure under: a servo and a
+    /// register, so the row's servo number is one a wrong field cannot produce.
+    fn context() -> reachy_motion::seq::StepContext {
+        reachy_motion::seq::StepContext::servo(reachy_motion::seq::SeqStepKind::Provision, 14)
+    }
+
+    /// The row a parked machine is narrated by, per failure shape.
+    ///
+    /// For a parked run this row is the only recorded clue an operator gets, so
+    /// what each kind puts in `detail` is asserted rather than sampled: a
+    /// refusal whose status code did not travel, or an unhealthy servo narrated
+    /// by a zero, reads exactly like a correct row and would leave the next
+    /// parked run saying the machine was refused without saying over what.
+    #[test]
+    fn the_commission_row_states_the_kind_the_servo_and_the_kinds_own_number() {
+        let context = context();
+        let readings = [11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 12.0, 12.1, 12.2];
+        let table: Vec<(reachy_motion::seq::SeqError, f64)> = vec![
+            (
+                reachy_motion::seq::SeqError::Refused { context, code: 7 },
+                7.0,
+            ),
+            (
+                reachy_motion::seq::SeqError::UnhealthyServo {
+                    context,
+                    bits: 0b0000_0001,
+                },
+                1.0,
+            ),
+            (
+                reachy_motion::seq::SeqError::VerifyMismatch {
+                    context,
+                    expected: value::radians(-1.003_2),
+                    read_back: value::radians(-1.001_7),
+                },
+                -1.001_7,
+            ),
+            (
+                reachy_motion::seq::SeqError::VoltageLow {
+                    context,
+                    readings,
+                    lowest: 11.4,
+                    limit: 11.9,
+                    waited: core::time::Duration::from_secs(3),
+                },
+                11.4,
+            ),
+        ];
+        for (error, detail) in &table {
+            let report = commission_report(&parked_on(error), 123);
+            assert_eq!(report.kind, ReportKind::CommissionFailed, "{error}");
+            assert_eq!(
+                report.a,
+                u32::from(SeqFailureKindWire::from(error.kind()).0),
+                "{error}"
+            );
+            assert_eq!(report.b, 14, "the servo the failure names: {error}");
+            assert_eq!(report.detail, *detail, "{error}");
+            assert_eq!(report.time_ns, 123);
+        }
+    }
+
+    /// A slot holding bytes that are not a verdict at all narrates that, by the
+    /// number the schema's own refusal carries.
+    ///
+    /// The alternative is the silence this row exists to close: a parked machine
+    /// with no verdict beside it. Which of the three unreadable stories it is --
+    /// nobody wrote it, another build wrote it, its evidence does not suit its
+    /// kind -- is what `detail` carries, and it is all a later reader gets.
+    #[test]
+    fn a_verdict_this_build_cannot_read_is_narrated_as_exactly_that() {
+        let mut slot = parked_on(&reachy_motion::seq::SeqError::Refused {
+            context: context(),
+            code: 7,
+        });
+        // A failure kind from no vocabulary this build has, which is what
+        // another build's bytes look like from here.
+        slot.commission_mut()
+            .failure_mut()
+            .set_kind(SeqFailureKindWire(200));
+        let report = commission_report(&slot, 123);
+        assert_eq!(
+            report.a,
+            u32::from(SeqFailureKindWire::from(SeqFailureKind::VerdictUnreadable).0)
+        );
+        assert_eq!(report.b, 0, "no servo is named by bytes nobody can read");
+        assert_eq!(
+            report.detail,
+            f64::from(verdict::BYTES_UNREADABLE),
+            "the schema's own refusal, by number"
+        );
+    }
+
+    /// And a slot nobody ever wrote is the third story, told apart from the
+    /// other two by its own number rather than by a zero.
+    #[test]
+    fn a_verdict_nobody_wrote_is_narrated_by_the_refusals_own_number() {
+        let report = commission_report(&SessionStateWire::new(), 123);
+        assert_eq!(
+            report.a,
+            u32::from(SeqFailureKindWire::from(SeqFailureKind::VerdictUnreadable).0)
+        );
+        assert_eq!(
+            report.detail,
+            f64::from(super::VerdictError::NoFailure.code()),
+            "a slot nobody wrote says so, rather than reading as a failure of no kind"
+        );
     }
 
     /// An `ok` outcome reads as whatever the transaction that was asked answers
@@ -1420,6 +1595,11 @@ mod tests {
                 0
             ),
             BusResult::Written,
+        );
+        assert_eq!(
+            result_of(AuxOpKind::WriteReg, AuxStatus::Ok, ValueShape::None, 0, 0),
+            BusResult::Acknowledged,
+            "a write nothing read back settles nothing about the register",
         );
         assert_eq!(
             result_of(AuxOpKind::None, AuxStatus::Ok, ValueShape::None, 0, 0),

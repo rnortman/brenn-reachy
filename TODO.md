@@ -47,6 +47,25 @@ publishes at three fidelities plus a segment-distance test that the envelope
 does not currently carry. Marked at `EnvelopeConfig` in
 `crates/reachy-kin/src/envelope.rs`.
 
+## `cycle-skip-budget`
+
+Decide whether the first-motion report should allow a rate of missed cycle
+slots, and if so what rate. Today any missed slot makes a run red, in one
+aggregate finding that prints the count, the rate and how many of the skips
+followed a cycle carrying out-of-band bus work.
+
+Deferral context: every hardware run so far has missed slots by the hundred —
+132 to 134 in a moving run, 59 in a parked one — and until this cycle nothing
+measured what a cycle actually costs, so there was no evidence to size a budget
+from and nothing to attribute the skips to. The driver now publishes a measured
+work span per skip and a once-a-second window of worst spans, which is the
+input a budget would be sized from. Sizing it is not a code decision: it needs a
+diagnosis run's measurements plus a human's call on whether a nonzero
+steady-state skip rate is acceptable at all, or whether the 20 ms grid is a hard
+guarantee and the cycle's work is re-engineered until nothing misses. Guessing a
+number before that would launder a red run green. Marked at `cycle_skips` in
+`cogs/first_motion_report.rs`.
+
 ## `health-read-budget`
 
 Decide whether a run of health sweeps that fall short should stop the tick loop
@@ -75,6 +94,67 @@ voltage and the present temperature — so a row that answers two of them and no
 the third costs a report the same way a row that answers none does. That widens
 the surface this decision is about without changing it, and the cycle budget the
 three reads are charged against is `CycleBounds::of` beside the marker.
+
+## `olog-head-capture`
+
+Capture the start of a run. Every recorded run's `.olog` holds fewer datagrams
+than the driver counted taking off its own socket, with the loss at the front, so
+the commissioning-window traffic — which is what says why a session parked — is
+missing from the log the report reads. Done is concrete: a run whose report
+cross-check against the driver's counters finds no shortfall.
+
+Deferral context: the mechanism is confirmed in the pinned Clockwork drop's
+source, and it rules out the obvious fix. The supervisor starts the logger and
+the payload processes in no particular order and waits for no readiness; the
+logger opens its subscriptions lazily, on a one-second poll after it opens the
+log; and on attaching to a `regular` channel — which every channel in this repo
+is — the observer snaps its cursor to the write head and skips whatever the ring
+still holds. So **enlarging the ring recovers nothing**: retention is not the
+limit, the attach position is, and the skipped messages are sitting in the ring
+when the logger declines to read them. Ring capacity sized to the startup burst
+is the right companion change only if the attach policy changes with it.
+
+Two routes, and picking between them is the deferred work. Either the payload's
+first publishes are made to postdate every logger subscription — launch ordering,
+or a readiness barrier — which is this repo's to build; or the attach policy
+itself changes upstream (first notify starting at the oldest retained slot, or a
+channel type that replays more than the one newest message a persistent channel
+replays), which is an ask against the pinned drop and needs the ring sizing
+beside it. The report already treats a shortfall as a finding against the log
+rather than against the run, so nothing reads a truncated trail as a complete
+one in the meantime. Marked in `tools/deploy-motion.sh`, where a run prepares
+the log root and starts the payload — the place a fixed capture is verified.
+
+## `olog-schema-evolution`
+
+Let the analyzer at HEAD read an `.olog` recorded under earlier schemas. Today a
+schema append puts the whole fetched corpus behind a checkout: the reader binds a
+channel by its recorded schema definition byte for byte, and every appended field
+or enum value differs. Done is concrete: the report at HEAD decodes a fetched
+records directory that was recorded before the most recent schema append.
+
+Deferral context: the work is two halves, neither of them in this tree alone. The
+`.olog` format already stores each channel's full serialized schema definition,
+and the upstream half of the pinned Clockwork drop already ships a
+decode-by-recorded-schema upgrader that its C++ and Python readers use — filling
+an appended field from its declared initial value, keyed on the `version` and
+`history` declarations the `.clk` grammar carries. So the first half is an ask
+against the pinned drop: the Rust reader gaining that upgrader binding, which it
+has none of. The second is this tree's: no schema here declares a history block
+for an upgrader to key on, so the declarations have to be written and then kept
+written with every append.
+
+What absorbs the cost meanwhile is that the refusal is loud rather than wrong —
+the reader turns an older recording away instead of misdecoding it — and that a
+fetched records directory names the build that recorded it, so reading one is a
+`git switch --detach` on the commit in its `provenance.txt`. And the refusal must
+not be relaxed on its own whatever else happens here: a reader with no decode
+engine that accepted a differing definition would read one schema's bytes as
+another's, and an appended field changes the record size, so the payload does not
+decode at any tolerance. The upgrader has to arrive before the check can soften.
+Marked on `binding` in `cogs/log_read.rs`, the check that states the current
+behaviour and is the refusal an upgrader-equipped reader would answer with a
+decode instead.
 
 ## `provisioning-repair`
 
@@ -436,26 +516,6 @@ end-to-end statement, and the day the mask reaches the goal stream that assertio
 is where the run has to say which joint left. Marked at the evidence the maneuver
 is stepped with in `cogs/session_stow.rs`, and at the goal stream S8 asserts in
 `cogs/s8_checker.rs`.
-
-## `commission-verdict-narration`
-
-Give the timeline a row that says *why* the commissioning survey refused the
-machine, so an operator reading the report stream learns which servo the sweep
-did not find rather than only that the machine is parked.
-
-Deferral context: a failed survey leaves the session parked without ever writing
-torque, and what the record carries for it is a phase row from starting to parked
-and nothing else. The verdict -- which rows answered, which register read what --
-stands in the survey's own snapshot, which is a state slot and does not reach the
-output log, so the report stream says "parked" and no more. The condition is not a
-fault: nothing about a machine that is not the one this process was configured for
-is broken, so it is not on the fault path, and the report vocabulary has no kind
-for it. The fix is a report kind and a decision about which of the survey's
-findings a reader is owed -- an addition to the log contract in
-`motion/reports.clk` rather than a code change -- and it is the same decision
-`engagement-declined-narration` is waiting on, so the two want taking together.
-Marked where the survey's endings are read in `cogs/session_bus.rs`, and at the
-narration S9 pins as it stands in `cogs/s9_checker.rs`.
 
 ## `engagement-declined-narration`
 

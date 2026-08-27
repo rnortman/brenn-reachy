@@ -77,6 +77,12 @@ CONFIG
 
 # The payload as the build stages it: three executables at the paths the launcher
 # config spells, the launcher config itself, and the configuration the modes read.
+# What the build recorded in the payload about the commit it was staged from.
+# Empty stages no such file at all, which is a payload from a build script that
+# wrote none — the default here, because that is the case the push has to fall
+# back on and every stamp assertion below the fallback reads.
+BUILD_COMMIT=""
+
 stage_payload() {
 	local when=$1
 	local name
@@ -87,6 +93,9 @@ stage_payload() {
 	: >"${payload}/robotcpu.textproto"
 	: >"${payload}/cogs/session_params.textproto"
 	stage_logger_config
+	rm -f -- "${payload}/build-commit.txt"
+	[ -z "$BUILD_COMMIT" ] ||
+		echo "commit=${BUILD_COMMIT}" >"${payload}/build-commit.txt"
 	touch -d "@${when}" -- "${payload}/cogs/robot_clk_exe"
 }
 
@@ -97,10 +106,18 @@ export PATH
 
 export CALLS="${work}/calls"
 export GIT_COMMIT_TIME=""
+export GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+export GIT_DIRTY=""
+export GIT_STATUS_FAILS=no
+# Where the rsync stub keeps whatever provenance stamp a push handed it, so a
+# case can read what the file says rather than only that the payload was sent.
+export PUSHED_PROVENANCE="${work}/pushed-provenance"
 export SSH_PREPARE_STATUS=0
 export SSH_RUN_STATUS=124
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
+export RSYNC_CONSOLE=full
+export TEE_STATUS=0
 
 # Every stub records its whole invocation on one line, so a case can assert both
 # that a command ran and that it did not.
@@ -116,6 +133,20 @@ esac
 exit "${SSH_PREPARE_STATUS:-0}"
 STUB
 
+# `tee` is stubbed so that a case can make the console copy fail: the records
+# still only exist on the unit's tmpfs when it runs, so a failure here must not
+# be able to end the script. The passing path writes the file the way `tee` does,
+# because later cases look for it.
+cat >"${stubs}/tee" <<'STUB'
+#!/usr/bin/env bash
+status=${TEE_STATUS:-0}
+if [ "$status" != 0 ]; then
+	cat >/dev/null
+	exit "$status"
+fi
+cat >"${*: -1}"
+STUB
+
 # rsync also has to *bring something back*, because the fetch decides on what
 # arrived: a run's records are a `.olog` with bytes in it, and a fetch that
 # brought none is refused. RSYNC_OLOG says what this invocation delivers into the
@@ -129,11 +160,43 @@ status=${RSYNC_STATUS:-0}
 # as a relative path is how a stub makes a directory in the checkout.
 if [ "$status" = 0 ]; then
 	dest=${*: -1}
+	# The provenance stamp rides in the payload, so what the push delivered
+	# is read out of the source directory -- the argument before the
+	# destination -- and kept where a case can read it.
+	case "$dest" in
+	*:*/releases/*)
+		if [ -e "${*: -2:1}provenance.txt" ]; then
+			cp -- "${*: -2:1}provenance.txt" "$PUSHED_PROVENANCE"
+		fi
+		;;
+	esac
 	case "$dest" in *@*:*) exit 0 ;; esac
+	# The console copy is its own delivery: it lands beside the records
+	# under a name ending in .console, and what it brings is the launcher's
+	# files rather than a run directory. RSYNC_CONSOLE says whether the
+	# driver's own is among them.
+	case "$dest" in
+	*.console/)
+		case "${RSYNC_CONSOLE:-full}" in
+			full)
+				echo 'cycles=1500 session_cmds=223 taken=223 aux_refused=2' \
+					>"${dest}motord_0.log"
+				echo 'the control process said things' >"${dest}proc_0.log"
+				;;
+			nodriver) echo 'no driver here' >"${dest}proc_0.log" ;;
+			none) ;;
+		esac
+		exit 0
+		;;
+	esac
 	case "${RSYNC_OLOG:-full}" in
 		full)
 			mkdir -p -- "${dest}/run-20260825T120000Z"
 			echo records >"${dest}/run-20260825T120000Z/motion_0.olog"
+			# What the run copied into the log root: the stamp sits
+			# at the root beside the writer's run directory, so a
+			# fetch carries it home with no fetch-side logic.
+			echo "commit=${GIT_HEAD:-}" >"${dest}/provenance.txt"
 			;;
 		empty)
 			mkdir -p -- "${dest}/run-20260825T120000Z"
@@ -145,11 +208,26 @@ fi
 exit "$status"
 STUB
 
-# The repository question the freshness check asks. An empty GIT_COMMIT_TIME is a
-# tree whose history says nothing about these paths.
+# The three questions the subject asks the repository, on three knobs. An empty
+# GIT_COMMIT_TIME is a tree whose history says nothing about the workspace paths;
+# an empty GIT_HEAD is one that cannot state its commit at all, which is a push
+# refusal rather than an unstamped push; GIT_DIRTY is the porcelain status, whose
+# emptiness is the whole of the dirty question.
 cat >"${stubs}/git" <<'STUB'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >>"$CALLS"
+case " $* " in
+	*" rev-parse "*)
+		[ -n "${GIT_HEAD:-}" ] || exit 128
+		echo "$GIT_HEAD"
+		exit 0
+		;;
+	*" status "*)
+		[ "${GIT_STATUS_FAILS:-no}" = no ] || exit 128
+		[ -z "${GIT_DIRTY:-}" ] || echo "$GIT_DIRTY"
+		exit 0
+		;;
+esac
 [ -n "${GIT_COMMIT_TIME:-}" ] || exit 0
 echo "$GIT_COMMIT_TIME"
 STUB
@@ -163,7 +241,7 @@ printf 'bazel %s\n' "$*" >>"$CALLS"
 exit "${BAZEL_STATUS:-0}"
 STUB
 
-chmod 0755 -- "${stubs}/ssh" "${stubs}/rsync" "${stubs}/git" "${stubs}/bazel"
+chmod 0755 -- "${stubs}/ssh" "${stubs}/rsync" "${stubs}/git" "${stubs}/bazel" "${stubs}/tee"
 export BAZEL_STATUS=0
 
 deploy() {
@@ -293,6 +371,115 @@ assert_contains "it says the push did not happen" "$(output_of "$result")" \
 SSH_PREPARE_STATUS=0
 
 # ---------------------------------------------------------------------------
+# Which build a run's records came off
+# ---------------------------------------------------------------------------
+#
+# The log reader binds each channel's schema byte for byte, so a run's records
+# are readable only by the build that recorded them. The push-time facts are
+# weaker than they look: the freshness refusal does not catch uncommitted edits
+# and --stale-ok skips it entirely, so the stamp describes the artefact honestly
+# rather than assuming a clean tree.
+
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a push that can state its commit succeeds" 0 "$(status_of "$result")"
+assert_file "the stamp is in the payload the one rsync delivered" "$PUSHED_PROVENANCE"
+assert_eq "and it took no transfer of its own" 1 \
+	"$(calls | grep -c '^rsync ')"
+stamp=$(cat -- "$PUSHED_PROVENANCE")
+assert_contains "a payload that recorded no build commit is stamped with the tree's" \
+	"$stamp" "commit=${GIT_HEAD}"
+assert_contains "and the stamp says that is where the commit came from" "$stamp" \
+	"commit_source=push"
+assert_contains "with the pushing tree's own HEAD beside it either way" "$stamp" \
+	"pushed_from=${GIT_HEAD}"
+assert_contains "a clean tree is stamped clean" "$stamp" "dirty=no"
+assert_contains "and a checked age says so" "$stamp" "age_unchecked=no"
+assert_contains "and the file says how to read a log with that build" "$stamp" \
+	"git switch --detach ${GIT_HEAD}"
+assert_contains "the push says out loud what it stamped" "$(output_of "$result")" \
+	"commit ${GIT_HEAD} (push), pushed from ${GIT_HEAD}, dirty=no"
+
+# A tree with uncommitted edits is exactly what the freshness refusal cannot see,
+# so the stamp is the only thing that can say it.
+GIT_DIRTY=" M crates/reachy-motord/src/tick.rs"
+result=$(deploy unit --push)
+assert_status "a dirty tree still pushes" 0 "$(status_of "$result")"
+assert_contains "and is stamped dirty" "$(cat -- "$PUSHED_PROVENANCE")" "dirty=yes"
+assert_contains "and says so out loud" "$(output_of "$result")" "dirty=yes"
+GIT_DIRTY=""
+
+# A question the repository refused to answer is not a clean tree.
+GIT_STATUS_FAILS=yes
+result=$(deploy unit --push)
+assert_status "a repository that will not answer still pushes" 0 "$(status_of "$result")"
+assert_contains "and the stamp claims nothing it does not know" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "dirty=unknown"
+GIT_STATUS_FAILS=no
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok pushes" 0 "$(status_of "$result")"
+assert_contains "and the stamp records that the age went unchecked" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "age_unchecked=yes"
+
+# The commit the binaries came out of is the build's fact, not the push's. A
+# payload built at one commit and pushed from a checkout at another passes the
+# freshness refusal — it only turns away a payload that is too old — so a stamp
+# reading the pushing tree's HEAD would name a commit that never produced these
+# binaries, and an operator switching to it later would find a schema that does
+# not bind. The build records what it built from and the stamp prefers it.
+BUILD_COMMIT=fedcba9876543210fedcba9876543210fedcba98
+stage_payload "$after"
+result=$(deploy unit --push)
+assert_status "a push over a payload that names its build succeeds" 0 \
+	"$(status_of "$result")"
+stamp=$(cat -- "$PUSHED_PROVENANCE")
+assert_contains "the stamp names the commit the payload was built from" "$stamp" \
+	"commit=${BUILD_COMMIT}"
+assert_contains "and says the payload is where that came from" "$stamp" \
+	"commit_source=build"
+assert_contains "and the tree it was pushed from is beside it, not averaged in" \
+	"$stamp" "pushed_from=${GIT_HEAD}"
+assert_contains "so reading the log names the build, not the push" "$stamp" \
+	"git switch --detach ${BUILD_COMMIT}"
+assert_contains "and the push says both out loud" "$(output_of "$result")" \
+	"commit ${BUILD_COMMIT} (build), pushed from ${GIT_HEAD}"
+
+# A build in a tree with no history records `unknown` rather than a guess, and
+# the push falls back the way it does for a payload that recorded nothing.
+BUILD_COMMIT=unknown
+stage_payload "$after"
+result=$(deploy unit --push)
+assert_status "a payload whose build could not name a commit still pushes" 0 \
+	"$(status_of "$result")"
+assert_contains "and the stamp falls back to the pushing tree" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "commit=${GIT_HEAD}"
+assert_contains "saying which of the two answered" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "commit_source=push"
+BUILD_COMMIT=""
+stage_payload "$after"
+
+# A push that cannot state its own commit is a refusal, not a stamp saying
+# nothing: an unnamed build is a records directory nobody can decode later.
+GIT_HEAD=""
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a tree that cannot state its commit refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says why that matters" "$(output_of "$result")" \
+	"could not say which build ran"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
+assert_lacks "and the device is not touched" "$(calls)" "ssh"
+GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+
+# The stamp travels inside the payload, so a payload that landed without one is a
+# payload that did not land: the transfer's own failure is the whole story, and
+# there is no second one that can go missing on its own.
+RSYNC_STATUS=23
+result=$(deploy unit --push)
+assert_status "a payload that did not land fails" 23 "$(status_of "$result")"
+RSYNC_STATUS=0
+
+# ---------------------------------------------------------------------------
 # The run
 # ---------------------------------------------------------------------------
 
@@ -301,7 +488,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 1; cd /run/brenn-app/releases/motion || exit 1; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; exit \$?"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; exit \$?"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -319,11 +506,95 @@ assert_contains "the records are fetched from the configured log root" "$ran" \
 assert_lacks "the log root is read, not retyped" "$ran" "/decoy"
 assert_lacks "and read out of the payload, not out of the tree" "$ran" "fromthetree"
 assert_contains "the analyzer judges the run directory that was discovered" "$ran" \
-	"bazel run -- //cogs:first_motion_report ${run_dest}/motion-log-"
+	"bazel run -- //cogs:first_motion_report --console ${run_dest}/motion-log-"
 assert_contains "and the directory it names is the writer's own" "$ran" \
 	"run-20260825T120000Z"
 assert_lacks "a hardware log is read with no jitter band" "$ran" "--grid-jitter-ns"
 assert_contains "the run says where the log is" "$(output_of "$result")" "run-20260825T120000Z"
+
+# ---------------------------------------------------------------------------
+# What a run brings back besides the records
+# ---------------------------------------------------------------------------
+#
+# The console output of the processes the launcher started, and the unit's clock
+# discipline. Neither says anything about the machine: the driver's counters are
+# the independent witness a recorded trail is cross-checked against, and a clock
+# that steps is the loss of the time base every timestamp in the log is in. Both
+# lived only on a tmpfs the next boot empties, and were recovered by hand the
+# first time they were wanted.
+
+assert_contains "the launcher's console directory is fetched whole" "$ran" \
+	"root@unit:/run/brenn-app/logs/launch/"
+assert_lacks "and no console filename is spelled out" "$ran" "motord_0.log"
+console_dir=$(find "$run_dest" -mindepth 1 -maxdepth 1 -type d -name '*.console')
+assert_contains "the console lands beside the records under the fetch's own stamp" \
+	"$console_dir" "${run_dest}/motion-log-"
+assert_eq "the driver's console came back" 1 \
+	"$(find "$console_dir" -name 'motord*' | wc -l)"
+assert_eq "so did the run's own console stream" 1 \
+	"$(find "$console_dir" -name 'run-console.log' | wc -l)"
+assert_eq "and the clock was read on both sides of the run" 2 \
+	"$(find "$console_dir" -name 'clock-*.txt' | wc -l)"
+assert_contains "the clock reading asks the time daemon what it does" "$ran" \
+	"timedatectl show"
+assert_contains "and asks whichever NTP service the unit runs" "$ran" \
+	"systemd-timesyncd"
+
+# The console is beside the records rather than under them for a reason worth
+# pinning: the run directory is the newest *directory* under the fetched root,
+# so a directory of console files there would be judged as the run.
+assert_eq "nothing but run directories sits under the fetched records" 0 \
+	"$(find "${run_dest}"/motion-log-*/ -mindepth 1 -maxdepth 1 -type d \
+		! -name 'run-*' | wc -l)"
+
+assert_contains "the console the analyzer is handed is the one that was fetched" "$ran" \
+	"--console ${console_dir} "
+
+# The push's stamp is copied into the log root before the launcher starts, so it
+# comes home at the root of the records with no fetch-side logic having placed it
+# -- which the pinned remote command above is the evidence for. What is pinned
+# here is the risk that root-level file introduces on the fetch side: a file
+# beside the writer's run directory must survive the fetch and must not be taken
+# for the run itself.
+assert_eq "a root-level file in the fetched log root survives the fetch" 1 \
+	"$(find "${run_dest}"/motion-log-*/ -maxdepth 1 -type f -name provenance.txt | wc -l)"
+assert_contains "and the run directory is still the writer's own" "$ran" \
+	"run-20260825T120000Z"
+
+# A console copy that fails is a lost console and nothing more. It happens on the
+# host, after the run, while the only copy of the records is still on a tmpfs the
+# next boot empties -- so the fetch and the analyzer have to happen anyway.
+TEE_STATUS=1
+result=$(deploy unit --run "${work}/run-teefailed")
+assert_status "a run whose console copy failed still reports" 0 "$(status_of "$result")"
+assert_contains "and says the copy is what failed" "$(output_of "$result")" \
+	"the console copy failed"
+assert_contains "and the records were fetched anyway" "$(calls)" \
+	"root@unit:/run/brenn-app/logs/testing/"
+assert_contains "and the analyzer still judged the run" "$(calls)" \
+	"//cogs:first_motion_report"
+assert_contains "and the console that did land was filed" "$(output_of "$result")" \
+	"no run-console.log to file with the records"
+TEE_STATUS=0
+
+# A launcher directory that came back without the driver's own console is not a
+# failed run: the analyzer refuses a console path holding no driver log, so it
+# is offered one only when there is one.
+RSYNC_CONSOLE=nodriver
+result=$(deploy unit --run "${work}/run-nodriverconsole")
+assert_status "a run whose driver console did not come back still reports" 0 \
+	"$(status_of "$result")"
+assert_contains "and says the trail went uncross-checked" "$(output_of "$result")" \
+	"uncross-checked"
+assert_lacks "and the analyzer is offered no console" "$(calls)" "--console"
+
+RSYNC_CONSOLE=none
+result=$(deploy unit --run "${work}/run-noconsole")
+assert_status "a run whose launcher directory was empty still reports" 0 \
+	"$(status_of "$result")"
+assert_contains "and says the directory held nothing" "$(output_of "$result")" \
+	"held no console files"
+RSYNC_CONSOLE=full
 
 # The log root the run empties is the configured one, and only a log root inside
 # the payload store is emptied at all: the value comes out of a configuration
@@ -351,6 +622,43 @@ assert_contains "the refusal names the component it will not take" \
 assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
 stage_logger_config
 
+# A log root that names the path the stamp is staged at. The staging path exists
+# so that no copy failure can follow the wipe, and a log root colliding with it
+# would wipe the stage and turn the move in into the alarming refusal the staging
+# exists to prevent.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/run/brenn-app/motion-provenance.staged"|' \
+	-- "$logger_config"
+result=$(deploy unit --run "${work}/run-staging-collision")
+assert_status "a log root that collides with the staging path refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says what that path is for" "$(output_of "$result")" \
+	"which is where a run stages its provenance stamp"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
+
+# And a log root *under* the staging path, which collides just as badly: the
+# stage would be written into the parent of the directory the run then removes.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/run/brenn-app/motion-provenance.staged/testing"|' \
+	-- "$logger_config"
+result=$(deploy unit --run "${work}/run-staging-under")
+assert_status "a log root under the staging path refuses" 1 "$(status_of "$result")"
+assert_contains "with the same refusal" "$(output_of "$result")" \
+	"which is where a run stages its provenance stamp"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
+
+# A log root that holds the payload. Everything ahead of the wipe passes, so the
+# run would delete the binaries it is about to start and report it as a full or
+# read-only store two steps later.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/run/brenn-app/releases"|' \
+	-- "$logger_config"
+result=$(deploy unit --run "${work}/run-release-collision")
+assert_status "a log root that holds the payload refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names what is in there" "$(output_of "$result")" \
+	"which holds the payload at /run/brenn-app/releases/motion"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
+
 # A records directory named relatively, which is what the Makefile passes. The
 # analyzer runs under `bazel run`, from its own runfiles tree, so the path it is
 # handed has to be absolute -- and the failure shape when it is not is an
@@ -358,7 +666,7 @@ stage_logger_config
 rel_dest=$(basename -- "${work}")/run-records-relative
 result=$(cd -- "$(dirname -- "${work}")" && deploy unit --run "$rel_dest")
 assert_status "a relative records directory runs" 0 "$(status_of "$result")"
-assert_contains "and the analyzer is handed an absolute path" "$(calls)" 	"bazel run -- //cogs:first_motion_report ${work}/run-records-relative/motion-log-"
+assert_contains "and the analyzer is handed an absolute path" "$(calls)" 	"bazel run -- //cogs:first_motion_report --console ${work}/run-records-relative/motion-log-"
 
 # The report's verdict is the wrapper's: a green run over a log the analyzer
 # fails is a failed run.
@@ -387,10 +695,70 @@ assert_contains "the refusal says it did not stop on SIGINT" "$(output_of "$resu
 	"did not stop on SIGINT"
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
 
+# The stamp is asked about before the log root is emptied and copied before the
+# launcher is reached, so a payload pushed by something that did not stamp it
+# stops the run there rather than recording a log whose build nothing names --
+# and stops it with the previous run's records still on the unit to be fetched.
+SSH_RUN_STATUS=5
+result=$(deploy unit --run "${work}/run-unstamped")
+assert_status "a unit with no stamp beside its payload refuses the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the records could not name their build" \
+	"$(output_of "$result")" "could not name their build"
+assert_contains "and says to push again" "$(output_of "$result")" "--push"
+assert_contains "and says the unit was left as it was" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_lacks "and does not tell the copy's story" "$(output_of "$result")" \
+	"copying it into"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+# The stamp is staged before the wipe rather than copied after it, so a copy
+# that fails has emptied nothing and the refusal can send the operator to fetch
+# the records that are still there.
+SSH_RUN_STATUS=6
+result=$(deploy unit --run "${work}/run-stamp-unstaged")
+assert_status "a stamp that could not be staged refuses the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the stamp is there and the copy failed" \
+	"$(output_of "$result")" "carries its provenance stamp, but copying it to"
+assert_contains "and names the staging path" "$(output_of "$result")" \
+	"/run/brenn-app/motion-provenance.staged"
+assert_contains "and says the unit was left as it was" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_contains "and says the previous run is still fetchable" "$(output_of "$result")" \
+	"--fetch"
+assert_contains "and says the launcher never started" "$(output_of "$result")" \
+	"Nothing was started"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
+
+# The four steps that run once the wipe has begun -- the log root's mkdir, the
+# stamp's move into it, the launcher console directory's clear, the cd -- share
+# one code, because the one thing an operator needs from any of them is that the
+# previous run's records are gone.
 SSH_RUN_STATUS=7
+result=$(deploy unit --run "${work}/run-post-wipe")
+assert_status "a preparation step that failed after the wipe refuses the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the wipe had begun" "$(output_of "$result")" \
+	"after the log root wipe had begun"
+assert_contains "and says to treat the previous records as gone" \
+	"$(output_of "$result")" "as gone"
+assert_contains "and says the launcher never started" "$(output_of "$result")" \
+	"launcher was not started"
+assert_lacks "and does not send the operator to a console nothing wrote" \
+	"$(output_of "$result")" "/run/brenn-app/logs/launch"
+assert_lacks "and does not claim the unit was left as it was" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
+
+# A code the run path does not read at all, which is what the catch-all arm is
+# for.
+SSH_RUN_STATUS=8
 result=$(deploy unit --run "${work}/run-failed")
 assert_status "any other status refuses" 1 "$(status_of "$result")"
-assert_contains "and carries the code" "$(output_of "$result")" "exit 7"
+assert_contains "and carries the code" "$(output_of "$result")" "exit 8"
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
 
 # A launcher killed by a signal, which the remote shell reports as 128+signal
@@ -497,12 +865,16 @@ assert_status "a fetch succeeds" 0 "$(status_of "$result")"
 assert_contains "the fetch reads the log root out of the configuration" "$(calls)" \
 	"root@unit:/run/brenn-app/logs/testing/"
 assert_contains "the fetch names the analyzer" "$(output_of "$result")" "first_motion_report"
-fetched=$(find "$dest" -mindepth 1 -maxdepth 1 -type d | wc -l)
+assert_contains "and hands it the console beside the records" "$(output_of "$result")" \
+	"--console ${dest}/motion-log-"
+fetched=$(find "$dest" -mindepth 1 -maxdepth 1 -type d ! -name '*.console' | wc -l)
 if [ "$fetched" = 1 ]; then
 	pass "the fetch lands in one stamped directory"
 else
 	fail "the fetch lands in one stamped directory" "found ${fetched}"
 fi
+assert_eq "with the run's consoles beside it" 1 \
+	"$(find "$dest" -mindepth 1 -maxdepth 1 -type d -name '*.console' | wc -l)"
 assert_lacks "nothing partial is left behind" "$(find "$dest" -maxdepth 1)" ".part"
 
 # A fetch that succeeded and brought nothing readable is a refusal. rsync is
@@ -577,6 +949,18 @@ occupy "$leftover" ".part"
 result=$(deploy unit --fetch "$leftover")
 assert_status "a leftover partial directory refuses" 1 "$(status_of "$result")"
 assert_lacks "and nothing is fetched into it" "$(calls)" "rsync"
+
+# And a leftover console directory, for a reason of its own: rsync would merge
+# this run's launcher files into the last run's, and a console directory holding
+# two runs' driver logs is one the report refuses to cross-check against — or
+# worse, cross-checks against the wrong run's counters.
+stale_console="${work}/stale-console"
+occupy "$stale_console" ".console"
+result=$(deploy unit --fetch "$stale_console")
+assert_status "a leftover console directory refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says it has nowhere of its own to land" "$(output_of "$result")" \
+	"has nowhere of its own to land"
+assert_lacks "and nothing is fetched beside it" "$(calls)" "rsync"
 
 # ---------------------------------------------------------------------------
 # The grammar

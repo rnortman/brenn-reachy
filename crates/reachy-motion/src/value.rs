@@ -286,6 +286,30 @@ impl fmt::Display for Shown {
     }
 }
 
+/// A value as the one number a fixed-layout row carries it as.
+///
+/// The engineering unit where the shape names one, and the bits read as a whole
+/// number where it does not. Lossy where a shape carries more than one number: a
+/// gain triple goes as its proportional term, because a row with one number in
+/// it has one number in it.
+///
+/// The match is exhaustive over [`ValueShape`] rather than a ladder of readers,
+/// so a shape added to the vocabulary stops the build here instead of quietly
+/// projecting to the no-value zero.
+#[must_use]
+pub fn headline(value: Value) -> f64 {
+    match value.shape() {
+        ValueShape::None => 0.0,
+        ValueShape::U8 => value.as_u8().map_or(0.0, f64::from),
+        ValueShape::U16 => value.as_u16().map_or(0.0, f64::from),
+        ValueShape::U32 => value.as_u32().map_or(0.0, f64::from),
+        ValueShape::I32 => value.as_i32().map_or(0.0, f64::from),
+        ValueShape::Radians => value.as_radians().unwrap_or(0.0),
+        ValueShape::Volts => value.as_volts().unwrap_or(0.0),
+        ValueShape::Gains => value.as_gains().map_or(0.0, |(p, _, _)| f64::from(p)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +317,29 @@ mod tests {
 
     fn context() -> StepContext {
         StepContext::servo(SeqStepKind::Presence, 10)
+    }
+
+    /// The one number a fixed-layout row carries a value as, per shape.
+    ///
+    /// A row with one number in it is all a narrated verdict has, so the
+    /// projection is what an operator actually reads: a shape reading the wrong
+    /// accessor, or a gain triple going as its derivative term, misstates every
+    /// value a verdict ever names. The absent value's zero is asserted rather
+    /// than defaulted, because it is the one shape whose zero is a statement.
+    #[test]
+    fn every_shape_states_the_one_number_a_row_carries_it_as() {
+        assert_eq!(headline(NONE), 0.0, "there is no number in an absent value");
+        assert_eq!(headline(u8(200)), 200.0);
+        assert_eq!(headline(u16(4_000)), 4_000.0);
+        assert_eq!(headline(u32(70_000)), 70_000.0);
+        assert_eq!(headline(i32(-70_000)), -70_000.0);
+        assert_eq!(headline(radians(-1.25)), -1.25);
+        assert_eq!(headline(volts(11.4)), 11.4);
+        assert_eq!(
+            headline(gains(640, 128, 32)),
+            640.0,
+            "a triple goes as its proportional term, which is the first of them"
+        );
     }
 
     /// A number that is not one does not cross: the one value nothing above the

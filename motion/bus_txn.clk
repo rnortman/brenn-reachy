@@ -36,6 +36,20 @@ enum AuxOpKind
         // Write one register and read it back, so the answer is what the servo
         // holds rather than what was sent.
         #3 write_reg_verified { underlying_value: 3; }
+        // Put one register's value on the wire and take the acknowledgement.
+        // Nothing is read back, so the answer says the servo took the
+        // instruction and says nothing about what the register now holds.
+        //
+        // The exception and not the default, whatever the plainer name
+        // suggests: `write_reg_verified` is what a write in this system is
+        // unless its issuer says otherwise, and every issuer but the pin sweep
+        // asks for that one.
+        //
+        // For a write whose issuer documents that it does not judge the
+        // read-back: a register the platform mirrors from elsewhere answers a
+        // read-back with its own state rather than the write, so asking for one
+        // manufactures a mismatch nobody reads.
+        #4 write_reg { underlying_value: 4; }
     }
 }
 

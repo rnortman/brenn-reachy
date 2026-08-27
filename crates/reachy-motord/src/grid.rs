@@ -17,8 +17,9 @@
 //! No clock is read here and nothing sleeps, so every rule above is a function
 //! of two numbers and a test can state it directly.
 
-/// A second, in nanoseconds. What a grid's start is rounded to.
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
+/// A second, in nanoseconds. What a grid's start is rounded to, and what a
+/// cadence counted in cycles of a grid is measured against.
+pub(crate) const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// A cycle the loop is about to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

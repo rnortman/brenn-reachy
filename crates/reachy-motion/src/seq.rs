@@ -180,6 +180,12 @@ pub enum BusResult {
     Value(Value),
     /// The write was acknowledged and read back as written.
     Written,
+    /// The write was acknowledged, and nothing was read back: the register was
+    /// never read, so this says the instruction was taken and nothing about what
+    /// the register holds. Only a step that does not judge its answer asks for a
+    /// write this way, and [`Self::written`] refuses it — a row's torque state is
+    /// never settled on an acknowledgement.
+    Acknowledged,
     /// Nothing came back within the deadline, and the retries are spent.
     NoAnswer,
     /// The driver would not attempt the transaction: it was asked while another
@@ -229,6 +235,7 @@ pub mod answer {
             AnswerShape::Refused => "refusal",
             AnswerShape::Mismatched => "read-back mismatch",
             AnswerShape::Corrupt => "corrupt frame",
+            AnswerShape::Acknowledged => "write nothing read back",
         }
     }
 
@@ -249,6 +256,7 @@ impl BusResult {
             Self::Pinged { .. } => AnswerShape::Pinged,
             Self::Value(_) => AnswerShape::Value,
             Self::Written => AnswerShape::Written,
+            Self::Acknowledged => AnswerShape::Acknowledged,
             Self::NoAnswer => AnswerShape::Missing,
             Self::DriverRefused => AnswerShape::DriverRefused,
             Self::ServoError { .. } => AnswerShape::Refused,
@@ -275,6 +283,11 @@ impl BusResult {
 
     /// Confirmation that `wrote` landed, or the typed failure to report. `wrote`
     /// is what the sequencer asked for, so a mismatch can say both halves.
+    ///
+    /// [`Self::Acknowledged`] is a failure here, not a lesser success: a write
+    /// nothing read back is not confirmation that anything landed, and every
+    /// caller of this asks because it is about to act on the register having
+    /// changed.
     pub fn written(&self, context: StepContext, wrote: Value) -> Result<(), SeqError> {
         match self {
             Self::Written => Ok(()),
@@ -849,6 +862,7 @@ mod tests {
         assert_eq!(BusResult::Pinged { model: 1 }.kind(), AnswerShape::Pinged);
         assert_eq!(BusResult::Value(value::u8(3)).kind(), AnswerShape::Value);
         assert_eq!(BusResult::Written.kind(), AnswerShape::Written);
+        assert_eq!(BusResult::Acknowledged.kind(), AnswerShape::Acknowledged);
         assert_eq!(BusResult::NoAnswer.kind(), AnswerShape::Missing);
         assert_eq!(BusResult::DriverRefused.kind(), AnswerShape::DriverRefused);
         assert_eq!(
@@ -932,6 +946,32 @@ mod tests {
             Ok(1200)
         );
         assert_eq!(BusResult::Written.written(context(), value::u8(3)), Ok(()));
+    }
+
+    /// A write nobody read back is not confirmation that the write landed.
+    ///
+    /// The one word for a settled write means the read-back matched, and the
+    /// unverified op claims one fact fewer. Anything that asks this question is
+    /// about to act on the register having changed, so an acknowledgement is a
+    /// wrong-shaped answer here and not a lesser yes.
+    #[test]
+    fn an_acknowledged_write_is_not_confirmation_that_it_landed() {
+        assert_eq!(
+            BusResult::Acknowledged.written(context(), value::u8(3)),
+            Err(SeqError::WrongAnswer {
+                context: context(),
+                expected: AnswerShape::Written,
+                observed: AnswerShape::Acknowledged,
+            })
+        );
+        assert_eq!(
+            BusResult::Acknowledged
+                .written(context(), value::u8(3))
+                .expect_err("an acknowledgement is not a verified write")
+                .to_string(),
+            "provisioning of servo 12, operating mode: expected a verified write \
+             and got a write nothing read back"
+        );
     }
 
     /// A mismatched read-back reports both halves: what was asked for and what

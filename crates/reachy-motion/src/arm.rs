@@ -2220,13 +2220,25 @@ impl<'a> EngageSequencer<'a> {
         txn::set_write_reg_verified(&mut self.state.pending, self.cfg.ids[row], reg, value);
     }
 
+    /// Write `value` to `reg` on the servo at bus row `row` and take the
+    /// acknowledgement, reading nothing back.
+    ///
+    /// The pin sweep's write and nothing else here. With torque off this
+    /// platform's goal register mirrors the present position, so a read-back
+    /// answers with where the servo is rather than what was written — and this
+    /// walk does not judge the answer either way, so asking for one would only
+    /// manufacture a mismatch nobody reads.
+    fn write_unverified(&mut self, row: usize, reg: RegId, value: Value) {
+        txn::set_write_reg_unverified(&mut self.state.pending, self.cfg.ids[row], reg, value);
+    }
+
     fn emit(&mut self) -> SeqAction<EngageSummary> {
         self.skip_degraded();
         let cursor = self.cursor();
         match self.state.phase {
             EngagePhaseKind::Pin => {
                 let goal = value::radians(Self::angle_at(&self.state.pins.pinned, cursor));
-                self.write(cursor, RegId::GoalPosition, goal);
+                self.write_unverified(cursor, RegId::GoalPosition, goal);
             }
             EngagePhaseKind::Enable => {
                 self.state.torque_written = true.into();
@@ -3151,7 +3163,7 @@ mod tests {
                 return BusResult::NoAnswer;
             }
             let scripted = match op {
-                AuxOpKind::WriteRegVerified => self.fail_write,
+                AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => self.fail_write,
                 _ => self.fail_read,
             };
             if let Some((id, reg, result)) = scripted
@@ -3168,7 +3180,7 @@ mod tests {
                     BusResult::Value(self.value(row, context.reg.expect("a read names a register")))
                 }
                 AuxOpKind::None => panic!("a sequencer emitted no transaction"),
-                AuxOpKind::WriteRegVerified => {
+                AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => {
                     let reg = context.reg.expect("a write names a register");
                     match reg {
                         // A goal written to a limp servo is dropped on the
@@ -3348,11 +3360,14 @@ mod tests {
             .count()
     }
 
+    /// Whether a transaction put a value on the wire, verified or not.
+    fn wrote(op: AuxOpKind) -> bool {
+        matches!(op, AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg)
+    }
+
     fn writes(log: &[(SeqStepKind, Asked)], reg: RegId) -> usize {
         log.iter()
-            .filter(|(_, request)| {
-                request.op == AuxOpKind::WriteRegVerified && request.context.reg == Some(reg)
-            })
+            .filter(|(_, request)| wrote(request.op) && request.context.reg == Some(reg))
             .count()
     }
 
@@ -3392,7 +3407,7 @@ mod tests {
         let first_write = machine
             .log
             .iter()
-            .position(|(_, request)| request.op == AuxOpKind::WriteRegVerified)
+            .position(|(_, request)| wrote(request.op))
             .expect("commissioning writes");
         let last_voltage = machine
             .log
@@ -3565,10 +3580,12 @@ mod tests {
     /// With torque off this platform's goal register mirrors the present
     /// position and keeps nothing written to it — the fixture models exactly
     /// that — so every one of these writes lands nowhere. That is the expected
-    /// case, and the sequence neither depends on the write sticking nor treats
-    /// the mirrored read-back as a refusal.
+    /// case, and the sequence neither depends on the write sticking nor judges
+    /// the answer. Which is why the sweep asks for the unverified write: a
+    /// read-back of a mirrored register would report the servo's own position
+    /// as a mismatch on every pin, run after run.
     #[test]
-    fn the_pin_sweep_is_issued_and_its_answers_are_not_judged() {
+    fn the_pin_sweep_is_issued_unverified_and_its_answers_are_not_judged() {
         let cfg = provisioned_config();
         let mut machine = bus();
         let summary = drive(&cfg, &mut machine).expect("a mirroring register engages");
@@ -3577,9 +3594,7 @@ mod tests {
             .log
             .iter()
             .filter_map(|(_, request)| match (request.op, request.reg()) {
-                (AuxOpKind::WriteRegVerified, Some(RegId::GoalPosition)) => {
-                    request.value.as_radians()
-                }
+                (AuxOpKind::WriteReg, Some(RegId::GoalPosition)) => request.value.as_radians(),
                 _ => None,
             })
             .collect();
@@ -3605,9 +3620,7 @@ mod tests {
         for answer in [
             BusResult::NoAnswer,
             BusResult::ServoError { code: 0x08 },
-            BusResult::VerifyMismatch {
-                read_back: value::radians(1.0),
-            },
+            BusResult::DriverRefused,
         ] {
             let mut machine = Machine {
                 fail_write: Some((14, RegId::GoalPosition, answer)),
@@ -3673,7 +3686,7 @@ mod tests {
             SeqAction::Transact
         ));
         let request = asked(seq.pending(), SeqStepKind::PinAndEnable);
-        assert_eq!(request.op, AuxOpKind::WriteRegVerified);
+        assert_eq!(request.op, AuxOpKind::WriteReg);
         assert_eq!(request.context.reg, Some(RegId::GoalPosition));
         assert!(!seq.torque_written(), "a pin is not an enable");
 
@@ -4415,10 +4428,7 @@ mod tests {
         assert_eq!(context.reg, Some(RegId::PresentPosition));
         assert!(angle.is_nan(), "{angle}");
         assert!(
-            !machine
-                .log
-                .iter()
-                .any(|(_, request)| request.op == AuxOpKind::WriteRegVerified),
+            !machine.log.iter().any(|(_, request)| wrote(request.op)),
             "the refusal came after writing to the machine"
         );
     }
@@ -4439,10 +4449,7 @@ mod tests {
         for mut machine in cases {
             let error = drive(&cfg, &mut machine).expect_err("this machine does not commission");
             assert!(
-                !machine
-                    .log
-                    .iter()
-                    .any(|(_, request)| request.op == AuxOpKind::WriteRegVerified),
+                !machine.log.iter().any(|(_, request)| wrote(request.op)),
                 "{error} was raised after writing to the machine"
             );
             assert_eq!(machine.enabled(), [false; ROW_COUNT]);

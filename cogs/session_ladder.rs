@@ -92,7 +92,8 @@ impl Budgets {
 /// commanded release no row acknowledged. The rest are either the machine
 /// working as designed -- the minimum-risk write it makes at start-up, the
 /// confirmation of a release, a goal it dropped or ran late -- or a report about
-/// this host's own timing rather than about the servos.
+/// this host's own timing rather than about the servos, which is what a window
+/// of cycle measurements is.
 ///
 /// A hold timeout says the goal stream went quiet for longer than the driver
 /// waits, and the machine was de-torqued because of it. Nothing here answers it
@@ -109,6 +110,7 @@ pub fn fault_of_event(kind: EventKind) -> Option<FaultKind> {
         | EventKind::StartupMrcWrite
         | EventKind::TorqueOffConfirmed
         | EventKind::CycleSkipped
+        | EventKind::CycleStats
         | EventKind::GoalDroppedQueueFull
         | EventKind::GoalStaleOrOutOfOrder => None,
     }

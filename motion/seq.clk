@@ -191,7 +191,7 @@ enum AnswerShape
         #1 pinged { underlying_value: 1; }
         // A register value came back.
         #2 value { underlying_value: 2; }
-        // A write was acknowledged.
+        // A write was acknowledged and read back as written.
         #3 written { underlying_value: 3; }
         // Nothing came back.
         #4 missing { underlying_value: 4; }
@@ -203,6 +203,9 @@ enum AnswerShape
         #7 mismatched { underlying_value: 7; }
         // What came back was not a reply.
         #8 corrupt { underlying_value: 8; }
+        // A write was acknowledged and nothing was read back, so the answer
+        // says the instruction was taken and nothing about the register.
+        #9 acknowledged { underlying_value: 9; }
     }
 }
 

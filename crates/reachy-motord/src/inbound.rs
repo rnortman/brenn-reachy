@@ -228,6 +228,15 @@ impl Counts {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The label the datagram count is printed under.
+    ///
+    /// A `pub const` rather than a literal at the one place it is written,
+    /// because the driver's summary line is read back by the offline report as
+    /// the independent witness to what the log kept: a rename here would
+    /// otherwise be a refactor in this crate that silently stops that
+    /// cross-check working.
+    pub const SESSION_CMDS: &str = "session_cmds";
+
     /// Every count, as plain numbers taken one at a time. Not an instant's
     /// snapshot — the readers keep counting while this reads — which is all a
     /// log line at the end of a cycle needs. What was wrong with the refused
@@ -237,7 +246,10 @@ impl Counts {
         [
             ("queued", self.queued.load(Ordering::Relaxed)),
             ("goals", self.goals.load(Ordering::Relaxed)),
-            ("session_cmds", self.session_cmds.load(Ordering::Relaxed)),
+            (
+                Self::SESSION_CMDS,
+                self.session_cmds.load(Ordering::Relaxed),
+            ),
             ("wrong_size", self.wrong_size.load(Ordering::Relaxed)),
             ("invalid", self.invalid.load(Ordering::Relaxed)),
             ("overflowed", self.overflowed.load(Ordering::Relaxed)),

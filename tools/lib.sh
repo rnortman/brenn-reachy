@@ -41,6 +41,15 @@ app_home=/var/lib/brenn-app
 # executable at all.
 store_mount=/run/brenn-app
 
+# The file a build script writes into the payload it stages, naming the commit
+# the payload's binaries were built from. `deploy-motion.sh --push` reads it into
+# the provenance stamp a run's records carry home: the pushing tree's own HEAD
+# says nothing about which checkout produced the binaries, because a payload
+# built at one commit can be pushed from a checkout at any other and the
+# freshness refusal only catches a payload that is too old. One name here, so the
+# writer and the reader cannot disagree about it.
+build_commit_name=build-commit.txt
+
 # A leading `~` replaced with $HOME, any other path unchanged. Bazel's path
 # converter expands a leading `~` and so does the cache action in its path list;
 # a shell passing an environment variable through does not, and neither does a

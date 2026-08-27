@@ -202,6 +202,19 @@ pub struct Logged<T> {
 /// Called for every bound channel before a single message is read, including the
 /// channels a run expects to be empty: zero messages on a channel means silence
 /// only if the channel is there and carries what it claims to.
+///
+/// The identity checked is the whole one: the schema's name *and* its recorded
+/// definition, which carries every field and every enum value by name. So a log
+/// written before a schema grew a value or a field is refused here, and that is
+/// the behaviour rather than an oversight. A schema's numbering is append-only
+/// so that a recorded log and a running build agree on what a number means, and
+/// that is a different guarantee from a new build reading an old log: appending
+/// a field changes the wire size, and payloads written at the old size do not
+/// decode at all ([`typed`] refuses them). A log is therefore read by a build of
+/// the schemas it was written under -- for the logs already on disk, the build
+/// they were recorded with -- and the two refusals here and in [`typed`] are
+/// what say so out loud instead of decoding one schema's bytes as another's.
+// TODO(olog-schema-evolution): softening this check is never the fix.
 pub fn binding<T: SchemaMeta>(
     channels: &[ChannelMetadata],
     name: &str,
@@ -209,9 +222,17 @@ pub fn binding<T: SchemaMeta>(
 ) {
     match channels.iter().find(|channel| channel.channel_name == name) {
         None => complaints.push(format!("no channel named {name} in the log")),
-        Some(metadata) if !metadata.carries::<T>() => complaints.push(format!(
+        Some(metadata) if metadata.schema_name != T::SCHEMA_NAME => complaints.push(format!(
             "{name} carries {:?}, not {}",
             metadata.schema_name,
+            T::SCHEMA_NAME
+        )),
+        // Same name, other identity: the recorded definition or the message
+        // encoding differs. Said as its own thing, because the complaint above
+        // would print the one name twice and read as nonsense.
+        Some(metadata) if !metadata.carries::<T>() => complaints.push(format!(
+            "{name} carries a {} recorded under another schema definition or encoding than this \
+             build's, so it was written by a build whose schemas differ from these",
             T::SCHEMA_NAME
         )),
         Some(_) => {}
@@ -267,8 +288,9 @@ mod tests {
     use super::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
     use clockwork_logs::offboard::{OffboardWriter, OffboardWriterConfig};
     use clockwork_logs::onboard::OnboardWriter;
-    use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage, MessageEncoding};
+    use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage, MessageEncoding, MessageFlags};
     use clockwork_rs::{Blob, SchemaMeta, SyncTime, blob_as_bytes, blob_type};
+    use std::borrow::Cow;
     use std::path::{Path, PathBuf};
 
     blob_type! {
@@ -290,6 +312,31 @@ mod tests {
     impl SchemaMeta for Other {
         const SCHEMA_NAME: &str = "@brenn_reachy::cogs::log_read::Other";
         const SCHEMA_DEFINITION: &[u8] = b"\x0a\x05Other";
+    }
+
+    blob_type! {
+        /// `Sample` after an append that costs no bytes on the wire: one more
+        /// value in an enum one of its fields names. The generator writes every
+        /// value's name into the definition, so the identity moves and the
+        /// layout does not.
+        struct Grown, size = 8, align = 8
+    }
+
+    impl SchemaMeta for Grown {
+        const SCHEMA_NAME: &str = "@brenn_reachy::cogs::log_read::Sample";
+        const SCHEMA_DEFINITION: &[u8] = b"\x0a\x06Sample\x2a\x05added";
+    }
+
+    blob_type! {
+        /// `Sample` after an append that does cost bytes: one more field. Same
+        /// name, longer definition, and eight bytes wider than anything written
+        /// before it.
+        struct Widened, size = 16, align = 8
+    }
+
+    impl SchemaMeta for Widened {
+        const SCHEMA_NAME: &str = "@brenn_reachy::cogs::log_read::Sample";
+        const SCHEMA_DEFINITION: &[u8] = b"\x0a\x06Sample\x32\x05extra";
     }
 
     /// The two channels a case binds: one it writes and one it does not.
@@ -448,6 +495,67 @@ mod tests {
              system that did not compose the way the table says"
         );
         assert_eq!(run.samples.len(), 1);
+    }
+
+    /// What a schema append does to a log recorded before it, both halves.
+    ///
+    /// The append-only rule on a `.clk` vocabulary buys agreement about what a
+    /// number means, not the ability to read yesterday's log with today's
+    /// build. This pins the second part, because it is the part that surprises:
+    /// the recorded definition carries every value and field by name, so a
+    /// channel written before the append fails the binding check, and a payload
+    /// written before a *field* was appended is the wrong size to decode at
+    /// all. A log outlives the build that wrote it only in the sense that the
+    /// build that wrote it can still read it.
+    #[test]
+    fn a_schema_that_only_grew_is_still_another_schema_to_a_log_written_before_it() {
+        let recorded = vec![ChannelMetadata::for_schema::<Sample>(SPOKEN)];
+        let mut complaints = Complaints::new();
+
+        binding::<Grown>(&recorded, SPOKEN, &mut complaints);
+
+        assert_eq!(
+            complaints.len(),
+            1,
+            "an appended enum value moves the recorded definition, and the check is on the whole \
+             identity: {complaints:?}"
+        );
+        assert!(
+            complaints[0].contains(SPOKEN) && complaints[0].contains("another schema definition"),
+            "the complaint says which channel and that the definition is what differs, rather \
+             than printing the one schema name twice: {complaints:?}"
+        );
+    }
+
+    #[test]
+    fn a_payload_written_before_a_field_was_appended_does_not_decode_either() {
+        let recorded = ChannelMetadata::for_schema::<Sample>(SPOKEN);
+        let payload = payload();
+        let message = LoggedMessage {
+            channel_id: 1,
+            metadata: &recorded,
+            sequence_number: 0,
+            log_time: SyncTime::from_nanos(1_000),
+            message_time: SyncTime::from_nanos(1_000),
+            header: &[],
+            payload: Cow::Borrowed(&payload),
+            flags: MessageFlags::default(),
+        };
+        let mut kept: Vec<Logged<Widened>> = Vec::new();
+        let mut complaints = Complaints::new();
+
+        typed::<Widened>(&message, &mut kept, &mut complaints);
+
+        assert!(kept.is_empty(), "nothing of another size is kept");
+        assert_eq!(
+            complaints.len(),
+            1,
+            "a payload of the old width is refused rather than read short: {complaints:?}"
+        );
+        assert!(
+            complaints[0].contains(SPOKEN) && complaints[0].contains("1000"),
+            "the complaint names the channel and the instant, like every other one: {complaints:?}"
+        );
     }
 
     #[test]

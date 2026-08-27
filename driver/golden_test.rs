@@ -126,14 +126,18 @@ fn an_event_is_the_bytes_it_was() {
     event.kind = EventKind::HoldTimeoutTorqueOff;
     event.time = SyncTime::from_nanos(T0_NS);
     event.silence = Duration::from_nanos(250_000_000);
+    event.work = Duration::from_nanos(21_500_000);
+    event.exchange = Duration::from_nanos(3_250_000);
     event.count = 3;
+    event.out_of_band = 7;
     event.rows = JointFlags::LEG_0 | JointFlags::LEG_5;
     event.id = 42;
 
     pins(
         "DriverEvent",
         blob_as_bytes(&msg),
-        "00002a36fe9c971780b2e60e00000000030000004200012a",
+        "00002a36fe9c971780b2e60e00000000601048010000000050973100000000000300000007000000\
+         4200012a00000000",
     );
 }
 

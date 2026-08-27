@@ -73,6 +73,17 @@ enum EventKind
         // all. `count` is that run, in cycles. `id` names no servo -- a bus
         // that answers nothing has no single failing one to name.
         #8 bus_failure { underlying_value: 8; }
+
+        // What the last window of cycles cost, published on a fixed cadence
+        // rather than on an edge -- the one kind here that is a measurement and
+        // not an occurrence, because a grid that is being missed is a question
+        // about the distribution and not about any one cycle. `work` is the
+        // longest a cycle in the window took, `exchange` the longest its
+        // out-of-band exchange took, `count` how many cycles the window held,
+        // and `out_of_band` how many of them ran an out-of-band transaction at
+        // all. A window is not made up for: a run that ends mid-window
+        // publishes nothing for it.
+        #9 cycle_stats { underlying_value: 9; }
     }
 }
 
@@ -104,8 +115,34 @@ schema DriverEvent
 
         // The one servo the kind names, as its bus id. Zero where it names
         // none: a bus id is configuration, and the driver reports what it wrote
-        // to rather than a row it inferred.
+        // to rather than a row it inferred. Nothing counts with it -- what a
+        // kind counts is `count`.
         #5 id: UInt8;
+
+        // How long the cycle the kind names actually took, measured rather than
+        // derived from the grid: `silence` on a skipped cycle is how late the
+        // grid says the loop was, and this is what the cycle before it spent.
+        // The two answer different questions and a report that carries only the
+        // first cannot say why the slot was missed.
+        //
+        // Measured between two reads of a clock that can be stepped, so it can
+        // come out negative. It is published as measured -- a negative span is
+        // a time base that moved under the measurement, which is a reading
+        // worth having and not one to round away.
+        #6 work: Duration;
+
+        // How long the out-of-band exchange the kind names took, measured the
+        // same way and negative for the same reason. Its own field rather than
+        // a second meaning for `silence`: what a cycle spent talking to one
+        // servo out of band is not a silence and not a lateness, and a reader
+        // that has to know the kind before it knows what an interval is has
+        // stopped reading a record and started decoding a union.
+        #7 exchange: Duration;
+
+        // How many of the cycles a windowed kind counted ran an out-of-band
+        // transaction. A second count, because a window has two: how many
+        // cycles it held and how many of those did out-of-band work.
+        #8 out_of_band: UInt32;
     }
 }
 

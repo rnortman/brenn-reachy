@@ -198,6 +198,26 @@ plan() {
 	done
 }
 
+# The commit the payload's binaries came out of, into the payload itself.
+#
+#   stamp_build_commit <file>
+#
+# The push writes the provenance stamp a run's records carry home, and the only
+# commit it can see is the pushing tree's HEAD — which is not the same fact: a
+# payload staged here and pushed from another checkout would be stamped with a
+# commit that never produced it, and the freshness refusal there only catches a
+# payload older than its tree. So the build records what it actually built from
+# and the push reads it.
+#
+# A tree with no history for it says `unknown` rather than guessing: a build is
+# not the place to refuse over provenance, and the push is where a stamp that
+# cannot name a build says so.
+stamp_build_commit() {
+	local into=$1 commit
+	commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || commit=
+	printf 'commit=%s\n' "${commit:-unknown}" >"$into"
+}
+
 # Build the payload directory from scratch every time. Removed rather than
 # overwritten: a file the layout no longer wants — a configuration a composition
 # stopped reading, a process description whose name changed — would otherwise sit
@@ -234,6 +254,8 @@ stage() {
 	for entry in "${plan_files[@]}"; do
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
+
+	stamp_build_commit "${staging}/${build_commit_name}"
 
 	if [ -e "$payload" ]; then
 		mv -- "$payload" "$previous"

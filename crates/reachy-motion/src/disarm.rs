@@ -785,6 +785,12 @@ mod tests {
                 AuxOpKind::Ping | AuxOpKind::None => {
                     panic!("disarming pings nothing")
                 }
+                // A release is evidence or it is nothing: every write here is
+                // read back, so an unverified one is a transaction this
+                // sequencer never emits.
+                AuxOpKind::WriteReg => {
+                    panic!("disarming reads every write back")
+                }
                 AuxOpKind::WriteRegVerified => {
                     let value = written;
                     if value == value::u8(0) {

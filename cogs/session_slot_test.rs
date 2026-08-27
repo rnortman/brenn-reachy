@@ -108,7 +108,7 @@ reachy_motion::vocab_numbering! {
     /// inserted among these renarrates every story already on disk. Nothing in
     /// either language says so, which is why it is said here.
     the_report_numbering_is_the_one_written_down:
-        ReportKind as ReportKindSlot, past the end 14 {
+        ReportKind as ReportKindSlot, past the end 15 {
         ReportKind::None => 0,
         ReportKind::PhaseChanged => 1,
         ReportKind::ScriptAccepted => 2,
@@ -123,6 +123,7 @@ reachy_motion::vocab_numbering! {
         ReportKind::AuxGaveUp => 11,
         ReportKind::SchedulePublished => 12,
         ReportKind::DegradeReleased => 13,
+        ReportKind::CommissionFailed => 14,
     }
 }
 
@@ -132,11 +133,12 @@ reachy_motion::vocab_numbering! {
     /// What a session asks a driver to do sits in a slot and, at the process
     /// edge, in a transaction; the number is all the two ends have in common.
     the_aux_operation_numbering_is_the_one_written_down:
-        AuxOpKind as AuxOpKindWire, past the end 4 {
+        AuxOpKind as AuxOpKindWire, past the end 5 {
         AuxOpKind::None => 0,
         AuxOpKind::Ping => 1,
         AuxOpKind::ReadReg => 2,
         AuxOpKind::WriteRegVerified => 3,
+        AuxOpKind::WriteReg => 4,
     }
 }
 

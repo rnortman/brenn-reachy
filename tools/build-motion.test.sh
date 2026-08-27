@@ -252,6 +252,25 @@ exec "$REAL_INSTALL" "$@"
 STUB
 chmod 0755 -- "${stubs}/install"
 
+# A third stub: `git`, answering the one question the subject asks it — which
+# commit the payload is being staged from. The temporary tree has no history of
+# its own, and what the push does with an answer of `unknown` is
+# deploy-motion.sh's business; here the knob is what lets both answers be a case.
+export GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+
+cat >"${stubs}/git" <<'STUB'
+#!/usr/bin/env bash
+# -C <dir> rev-parse HEAD, and nothing else is asked.
+case "$*" in
+*rev-parse*HEAD*)
+	[ -n "${GIT_HEAD:-}" ] || exit 128
+	echo "$GIT_HEAD"
+	;;
+*) echo "unstubbed git ${*}" >&2; exit 1 ;;
+esac
+STUB
+chmod 0755 -- "${stubs}/git"
+
 build() {
 	: >"$CALLS"
 	: >"$INSTALL_COUNT"
@@ -298,6 +317,27 @@ assert_file "the control process description is staged" \
 	"${payload}/cogs/brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon"
 assert_file "the logger process description is staged" \
 	"${payload}/cogs/brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon"
+
+# What the push cannot work out for itself: the commit these binaries came out
+# of. A payload built here and pushed from another checkout would otherwise be
+# stamped with the pushing tree's HEAD, which never produced it, and the
+# freshness refusal there only turns away a payload that is too old.
+assert_file "the payload names the commit it was built from" \
+	"${payload}/build-commit.txt"
+assert_eq "and it is the commit the tree was at" "commit=${GIT_HEAD}" \
+	"$(cat -- "${payload}/build-commit.txt")"
+
+# A tree with no history is not a build refusal — provenance is the push's
+# refusal to make — but it is not a guess either.
+GIT_HEAD=""
+result=$(build)
+assert_status "a build in a tree that cannot state its commit succeeds" 0 \
+	"$(status_of "$result")"
+assert_eq "and says so rather than naming one" "commit=unknown" \
+	"$(cat -- "${payload}/build-commit.txt")"
+GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+result=$(build)
+assert_status "and the stamped build is back" 0 "$(status_of "$result")"
 
 # The system target emits eleven files and the payload carries three. Everything
 # else belongs to the launcher, the channel spy or the diagnostics database, none

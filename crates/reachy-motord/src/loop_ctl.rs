@@ -63,7 +63,7 @@ use clockwork_rs::{Blob, blob_as_bytes};
 use reachy_bus::BusPort;
 use reachy_driver::{ConfirmReport, Event, TORQUE_OFF_CONFIRM_BUDGET_NS};
 
-use crate::grid::{Cycle, Grid};
+use crate::grid::{Cycle, Grid, NANOS_PER_SECOND};
 use crate::inbound::{Counts, Inbound, Inbox};
 use crate::ports::{AUX_OUT_PORT, EVENT_PORT, HEALTH_PORT, LOOPBACK, POSE_PORT};
 use crate::tick::{CycleReport, Tick, TickCounts, now_ns};
@@ -136,6 +136,15 @@ pub enum WoundDown {
 }
 
 impl WoundDown {
+    /// How every one of these lines starts.
+    ///
+    /// A driver that answered its stop prints its last counter summary and one
+    /// of these lines together, so this prefix is what a reader of the console
+    /// can find the end of the run by. Named here rather than spelled in the
+    /// offline report, so a rewording of a line stops that build instead of
+    /// quietly turning the check off.
+    pub const STOPPING: &str = "stopping:";
+
     /// What to print about it.
     #[must_use]
     pub fn line(self) -> &'static str {
@@ -186,8 +195,13 @@ pub trait Schedule {
 /// How a wait ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Waited {
-    /// The target instant arrived.
-    Arrived,
+    /// The target instant arrived, and this is what the clock read when it did.
+    ///
+    /// The instant is answered rather than read again by the caller: the wait
+    /// has the reading in hand at the moment it decides the target has passed,
+    /// so a cycle's start is measured with a clock read that already happens
+    /// instead of one added for the measurement.
+    Arrived(i64),
     /// The clock went backwards while waiting, so the target is now further
     /// away in real time than the grid ever put it. The grid has to be re-drawn
     /// from where the clock says it is; waiting for the old target would leave
@@ -230,7 +244,7 @@ impl Schedule for RealTime {
         loop {
             let now = self.now_ns();
             let Some(wait) = chunk_to(now, target_ns) else {
-                return Waited::Arrived;
+                return Waited::Arrived(now);
             };
             std::thread::sleep(StdDuration::from_nanos(
                 u64::try_from(wait).unwrap_or_default(),
@@ -435,7 +449,68 @@ pub struct Driver<P: BusPort, S: Schedule> {
     /// Whether the startup release has already been written. Once only: a
     /// window that closed does not keep closing.
     startup_written: bool,
+    /// What the cycle before this one spent, where one has been measured. It is
+    /// the previous cycle's number because the skip it explains is reported by
+    /// the cycle after it: the grid points that went by were the ones the
+    /// overlong cycle ran through.
+    last_work_ns: Option<i64>,
+    /// What the cycles since the last statistics event cost.
+    window: CycleWindow,
     counts: LoopCounts,
+}
+
+/// The worst of what a run of cycles cost, until it is published and started
+/// again.
+///
+/// A window rather than a per-cycle stream: fifty events a second on a channel
+/// a whole run is read off would be the measurement drowning what it measures,
+/// and the question the measurement exists for -- whether cycles are running
+/// past their slot, and whether the out-of-band work is why -- is one the worst
+/// case of a second answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CycleWindow {
+    /// Cycles counted since the last publication.
+    cycles: u32,
+    /// How many of them ran an out-of-band transaction.
+    aux_cycles: u32,
+    /// The worst a cycle in the window measured: the longest of them, or a
+    /// negative span where one came out negative.
+    worst_work_ns: i64,
+    /// The worst an out-of-band exchange in the window measured, read the same
+    /// way.
+    worst_aux_ns: i64,
+}
+
+impl CycleWindow {
+    /// Fold one cycle in.
+    fn note(&mut self, work_ns: i64, aux_span_ns: Option<i64>) {
+        self.worst_work_ns = worst_of(self.worst_work_ns, work_ns, self.cycles == 0);
+        self.cycles = self.cycles.saturating_add(1);
+        if let Some(aux_ns) = aux_span_ns {
+            self.worst_aux_ns = worst_of(self.worst_aux_ns, aux_ns, self.aux_cycles == 0);
+            self.aux_cycles = self.aux_cycles.saturating_add(1);
+        }
+    }
+}
+
+/// The worse of two measured spans, `first` saying that `held` is the zero a
+/// window starts at rather than a reading.
+///
+/// Longer is worse among spans a clock that moved forwards produced, and a
+/// negative span is worse than any of them: it says the clock the driver
+/// measures on went backwards between the two reads that bracket the span,
+/// which is loss of the time base every de-torquing timer runs on and the one
+/// reading a window must not round away. So a negative span holds the window
+/// against every ordinary cycle after it, and the most negative of several
+/// holds it against the rest.
+fn worst_of(held: i64, span: i64, first: bool) -> i64 {
+    if first {
+        span
+    } else if held < 0 || span < 0 {
+        held.min(span)
+    } else {
+        held.max(span)
+    }
 }
 
 impl<P: BusPort, S: Schedule> Driver<P, S> {
@@ -464,6 +539,8 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
             startup_closes_ns: grid.instant(0) + startup_window_ns,
             heard: false,
             startup_written: false,
+            last_work_ns: None,
+            window: CycleWindow::default(),
             counts: LoopCounts::default(),
         }
     }
@@ -507,12 +584,20 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
     /// that writes the torque-off sweep.
     fn cycle_once(&mut self) -> Stepped {
         let cycle = self.next;
-        if self.schedule.sleep_until(cycle.nominal_ns) == Waited::ClockSteppedBack {
-            self.reanchor();
-            return Stepped::Reanchored;
-        }
-        self.step(cycle);
-        self.next = self.grid.next_after(&cycle, self.schedule.now_ns());
+        let started_ns = match self.schedule.sleep_until(cycle.nominal_ns) {
+            Waited::ClockSteppedBack => {
+                self.reanchor();
+                return Stepped::Reanchored;
+            }
+            Waited::Arrived(now_ns) => now_ns,
+        };
+        let aux_span_ns = self.step(cycle);
+        // The read that picks the next grid point is also the cycle's end: what
+        // the loop spent is the distance between the two reads the cycle
+        // already takes, and neither of them is here for the measurement.
+        let ended_ns = self.schedule.now_ns();
+        self.note_cycle(cycle, ended_ns.saturating_sub(started_ns), aux_span_ns);
+        self.next = self.grid.next_after(&cycle, ended_ns);
         Stepped::Advanced
     }
 
@@ -590,6 +675,11 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
             // available.
             return;
         };
+        // Neither the part-built window nor the last cycle's span survives a
+        // re-drawn grid: both are spans on a time base that has just moved, and
+        // a worst case measured across a step is a measurement of the step.
+        self.window = CycleWindow::default();
+        self.last_work_ns = None;
         let window_ns = self.startup_closes_ns - self.grid.instant(0);
         self.grid = grid;
         self.next = grid.first_from(now);
@@ -602,7 +692,7 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
     /// and the last; then the seam, so the cycle acts on everything that has
     /// arrived; then the two conditions the cycle cannot see for itself; then
     /// the cycle, and its reports.
-    fn step(&mut self, cycle: Cycle) {
+    fn step(&mut self, cycle: Cycle) -> Option<i64> {
         self.counts.cycles += 1;
         if cycle.skipped > 0 {
             self.counts.skipped += u64::from(cycle.skipped);
@@ -610,6 +700,13 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
             self.out.publish_event(&raised(&Event {
                 kind: EventKind::CycleSkipped,
                 silence_ns: late,
+                // What the cycle that ran through those grid points spent. Zero
+                // where no cycle has been measured on this grid yet, which is
+                // the same zero every unmeasured field on this record carries;
+                // the first cycle of a grid and the first after one was
+                // re-drawn both report no skip, so a run leaves that state
+                // before it can say this.
+                work_ns: self.last_work_ns.unwrap_or_default(),
                 count: cycle.skipped,
                 ..Event::at(cycle.nominal_ns)
             }));
@@ -619,6 +716,32 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
         self.answer_startup_window(cycle.nominal_ns);
         let report = self.tick.run(cycle.nominal_ns);
         self.out.publish(&report);
+        report.aux_span_ns
+    }
+
+    /// Fold what a cycle cost into the window, and publish the window when it
+    /// is a second old.
+    ///
+    /// The cadence is counted in cycles rather than measured against the clock:
+    /// the grid is what a window of cycles is a window of, so a run whose cycles
+    /// are running late publishes on the same count of cycles and says they
+    /// were late, instead of publishing more often the worse it gets.
+    fn note_cycle(&mut self, cycle: Cycle, work_ns: i64, aux_span_ns: Option<i64>) {
+        self.last_work_ns = Some(work_ns);
+        self.window.note(work_ns, aux_span_ns);
+        let per_second = (NANOS_PER_SECOND / self.grid.period_ns().max(1)).max(1);
+        if i64::from(self.window.cycles) < per_second {
+            return;
+        }
+        let window = std::mem::take(&mut self.window);
+        self.out.publish_event(&raised(&Event {
+            kind: EventKind::CycleStats,
+            work_ns: window.worst_work_ns,
+            exchange_ns: window.worst_aux_ns,
+            count: window.cycles,
+            out_of_band: window.aux_cycles,
+            ..Event::at(cycle.nominal_ns)
+        }));
     }
 
     /// Hand everything waiting on the seam to the cycle.
@@ -757,12 +880,12 @@ impl<P: BusPort, S: Schedule> Driver<P, S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicBool, Destinations, Driver, LoopCounts, Outbound, Ran, SLEEP_CHUNK_NS, Schedule,
-        Stop, TORQUE_OFF_CONFIRM_BUDGET_NS, Waited, WoundDown, chunk_to,
+        AtomicBool, CycleWindow, Destinations, Driver, LoopCounts, Outbound, Ran, SLEEP_CHUNK_NS,
+        Schedule, Stop, TORQUE_OFF_CONFIRM_BUDGET_NS, Waited, WoundDown, chunk_to,
     };
     use crate::grid::Grid;
     use crate::inbound::{Counts, Inbox};
-    use crate::tick::{CycleReport, Tick, TickConfig, cycle_timing};
+    use crate::tick::{CycleReport, Tick, TickConfig, TickCounts, cycle_timing};
     use brenn_reachy__cogs__session_cmd_clk_rs::{SessionCmdKind, SessionCmdWire};
     use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
     use brenn_reachy__driver__health_clk_rs::{
@@ -967,6 +1090,11 @@ mod tests {
         /// How far it goes backwards on every wait, for as long as it is set:
         /// a time base that keeps being lost rather than one that slipped once.
         back_every_ns: Rc<Cell<Option<i64>>>,
+        /// How far the clock moves on each read of it. Zero by default, which
+        /// is a case that spends no time inside a cycle; a case measuring what a
+        /// cycle cost sets it, because the loop reads this clock once per cycle
+        /// after the cycle's work.
+        per_read_ns: Rc<Cell<i64>>,
     }
 
     impl Fake {
@@ -976,12 +1104,14 @@ mod tests {
                 overrun_ns: Rc::new(Cell::new(0)),
                 step_back_ns: Rc::new(Cell::new(None)),
                 back_every_ns: Rc::new(Cell::new(None)),
+                per_read_ns: Rc::new(Cell::new(0)),
             }
         }
     }
 
     impl Schedule for Fake {
         fn now_ns(&self) -> i64 {
+            self.now.set(self.now.get() + self.per_read_ns.get());
             self.now.get()
         }
 
@@ -998,7 +1128,7 @@ mod tests {
             }
             self.now
                 .set(target_ns.max(self.now.get()) + self.overrun_ns.get());
-            Waited::Arrived
+            Waited::Arrived(self.now.get())
         }
     }
 
@@ -1225,6 +1355,208 @@ mod tests {
         );
     }
 
+    /// Every event of `kind` the loop published on `socket`.
+    fn events_of(socket: &UdpSocket, kind: EventKind) -> Vec<reachy_driver::Event> {
+        published(socket)
+            .iter()
+            .map(|bytes| as_event(bytes))
+            .filter_map(|message| {
+                let event = message.validate().expect("a published event validates");
+                (event.kind == kind).then_some(reachy_driver::Event {
+                    kind: event.kind,
+                    time_ns: event.time.as_nanos(),
+                    silence_ns: event.silence.as_nanos(),
+                    work_ns: event.work.as_nanos(),
+                    exchange_ns: event.exchange.as_nanos(),
+                    count: event.count,
+                    out_of_band: event.out_of_band,
+                    rows: event.rows,
+                    id: event.id,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_skip_says_what_the_cycle_that_caused_it_actually_spent() {
+        let (mut driver, seam, clock) = driver(T0, T0);
+
+        // A cycle that takes two and a half periods: the grid points it runs
+        // through are the ones the next cycle reports as skipped, and what it
+        // spent is the number that says why.
+        clock.per_read_ns.set(2 * PERIOD + PERIOD / 2);
+        driver.run_cycles(3);
+
+        let skips = events_of(&seam.event, EventKind::CycleSkipped);
+        assert_eq!(skips.len(), 2, "one report per late cycle");
+        for skip in &skips {
+            assert_eq!(skip.count, 2, "two grid points passed over");
+            assert_eq!(
+                skip.silence_ns,
+                2 * PERIOD,
+                "the lateness the grid says, which is arithmetic"
+            );
+            assert_eq!(
+                skip.work_ns,
+                2 * PERIOD + PERIOD / 2,
+                "and what the cycle before it measured, which is not"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loop_publishes_what_a_second_of_cycles_cost() {
+        let (mut driver, seam, clock) = driver(T0, T0);
+        let spend_ns = PERIOD / 4;
+        clock.per_read_ns.set(spend_ns);
+
+        // A second of a twenty-millisecond grid is fifty cycles, and the window
+        // is counted in cycles of the grid it measures.
+        driver.run_cycles(49);
+        assert!(
+            events_of(&seam.event, EventKind::CycleStats).is_empty(),
+            "a window is published when it is full and not before"
+        );
+        driver.run_cycles(51);
+        let stats = events_of(&seam.event, EventKind::CycleStats);
+        assert_eq!(stats.len(), 2, "one per second of cycles");
+        for window in &stats {
+            assert_eq!(window.count, 50, "the cycles the window held");
+            assert_eq!(window.work_ns, spend_ns, "the longest of them, as measured");
+            // The health rotation alone reads on one cycle in five here, and the
+            // torque-off confirmation the closed startup window opened takes
+            // the slot on most of the rest: what the count must never be is
+            // zero, which is what a cycle report that stopped saying it ran a
+            // transaction would leave on the wire forever.
+            assert!(
+                window.out_of_band >= window.count / 5 && window.out_of_band <= window.count,
+                "the out-of-band cycles are some of the cycles, and the rotation ran on some: \
+                 {window:?}"
+            );
+            assert!(
+                window.exchange_ns > 0,
+                "an exchange that ran took time, and the window carries what it took: {window:?}"
+            );
+            assert_eq!(
+                (window.silence_ns, window.id),
+                (0, 0),
+                "a window names no silence and no servo, so both carry the zero that says so"
+            );
+        }
+    }
+
+    /// A span that came out negative is the worst thing in its window, and it
+    /// stays the worst however many ordinary cycles stand beside it.
+    ///
+    /// A backwards clock step landing inside one cycle's span makes that cycle
+    /// look instant, so nothing else about the run marks it: a window that took
+    /// the longest span would drop the reading, and the analyzer's finding
+    /// about the time base could never fire for the one step that matters.
+    #[test]
+    fn one_span_the_clock_made_negative_is_the_worst_of_its_window() {
+        let mut window = CycleWindow::default();
+        window.note(PERIOD / 4, Some(2_000));
+        window.note(-PERIOD, Some(-500));
+        for _ in 0..10 {
+            window.note(PERIOD / 2, Some(3_000));
+        }
+        assert_eq!(window.cycles, 12);
+        assert_eq!(
+            window.worst_work_ns, -PERIOD,
+            "the negative span was rounded away by its neighbours"
+        );
+        assert_eq!(window.worst_aux_ns, -500, "and the exchange's, likewise");
+
+        // And the most negative of several holds it against the rest.
+        let mut window = CycleWindow::default();
+        window.note(-1_000, None);
+        window.note(-9_000, None);
+        window.note(PERIOD, None);
+        assert_eq!(window.worst_work_ns, -9_000);
+    }
+
+    /// A window is thrown away when the grid it measured is re-drawn.
+    ///
+    /// The spans in a part-built window were measured on a time base that has
+    /// just moved, and a window carrying them forward would publish the step's
+    /// own size as what a cycle cost -- the number a skip budget is to be sized
+    /// from, laundered out of a clock event.
+    #[test]
+    fn a_window_measured_before_a_clock_step_is_not_published_after_it() {
+        let (mut driver, seam, clock) = driver(T0, T0);
+
+        // Expensive cycles, and not enough of them to fill a window.
+        clock.per_read_ns.set(PERIOD / 2);
+        driver.run_cycles(20);
+        assert!(
+            events_of(&seam.event, EventKind::CycleStats).is_empty(),
+            "a window is published when it is full and not before"
+        );
+
+        // An hour backwards, and cheap cycles from here on.
+        clock.per_read_ns.set(PERIOD / 8);
+        clock.step_back_ns.set(Some(3_600 * 1_000_000_000));
+        driver.run_cycles(51);
+
+        let stats = events_of(&seam.event, EventKind::CycleStats);
+        assert_eq!(stats.len(), 1, "one window, built after the step");
+        assert_eq!(stats[0].count, 50, "the cycles of the re-drawn grid");
+        assert_eq!(
+            stats[0].work_ns,
+            PERIOD / 8,
+            "the expensive cycles from before the step are no part of this window"
+        );
+    }
+
+    /// And neither is the last span, which is what a skip is explained by.
+    #[test]
+    fn a_skip_after_a_clock_step_is_explained_by_a_cycle_measured_after_it() {
+        let (mut driver, seam, clock) = driver(T0, T0);
+
+        clock.per_read_ns.set(PERIOD / 2);
+        driver.run_cycles(4);
+
+        clock.per_read_ns.set(0);
+        clock.step_back_ns.set(Some(3_600 * 1_000_000_000));
+        driver.run_cycles(1);
+        // The first cycle of the re-drawn grid runs on time; the ones after it
+        // overrun, so the skip they report is explained by a span measured on
+        // this grid.
+        clock.overrun_ns.set(2 * PERIOD);
+        driver.run_cycles(3);
+
+        let skips = events_of(&seam.event, EventKind::CycleSkipped);
+        let after: Vec<_> = skips
+            .iter()
+            .filter(|skip| skip.time_ns < T0 - 3_000 * 1_000_000_000)
+            .collect();
+        assert!(!after.is_empty(), "the cycles after the step reported one");
+        for skip in after {
+            assert_ne!(
+                skip.work_ns,
+                PERIOD / 2,
+                "a span from before the step explained a skip after it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cycle_measured_across_a_clock_that_moved_publishes_the_span_it_measured() {
+        let (mut driver, seam, clock) = driver(T0, T0);
+        clock.per_read_ns.set(-PERIOD / 4);
+
+        driver.run_cycles(50);
+
+        let stats = events_of(&seam.event, EventKind::CycleStats);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            stats[0].work_ns,
+            -PERIOD / 4,
+            "a span the clock made negative is published as it was measured: the negative \
+             number is the reading"
+        );
+    }
+
     #[test]
     fn a_driver_nobody_talks_to_lets_the_machine_go_once_when_the_window_closes() {
         let (mut driver, seam, _clock) = driver(T0, T0);
@@ -1309,6 +1641,7 @@ mod tests {
             event: Some(DriverEventWire::new()),
             outcome: Some(AuxOutcomeWire::new()),
             health: Some(HealthReportWire::new()),
+            aux_span_ns: None,
         };
         out.publish(&report);
 
@@ -1878,5 +2211,54 @@ mod tests {
             !line.contains("last_refusal"),
             "nothing has been refused, so there is nothing to name"
         );
+    }
+
+    /// The two numbers the offline report reads back out of this line, in the
+    /// shape it reads them in: one line, `label=value` pairs separated by
+    /// spaces. The report imports the labels rather than spelling them, so what
+    /// this pins is the shape around them.
+    #[test]
+    fn the_summary_line_carries_the_two_counts_the_report_cross_checks_against() {
+        let (mut driver, _seam, _clock) = driver(T0, T0);
+        driver.run_cycles(1);
+
+        let line = driver.report();
+        assert_eq!(line.lines().count(), 1, "the summary is one line: `{line}`");
+        for label in [Counts::SESSION_CMDS, TickCounts::AUX_REFUSED] {
+            let value = line
+                .split_whitespace()
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == label)
+                .map(|(_, value)| value.parse::<u64>());
+            assert_eq!(
+                value,
+                Some(Ok(0)),
+                "{label}=<number> is missing from `{line}`"
+            );
+        }
+        assert!(
+            !line.contains(WoundDown::STOPPING),
+            "a cadence summary is not the end of a run: `{line}`"
+        );
+    }
+
+    /// Every wind-down line carries the prefix the offline report finds the end
+    /// of a run by. A reworded line that dropped it would make every hard-killed
+    /// run's counters read as the run's last word, which is what the prefix is
+    /// checked for.
+    #[test]
+    fn every_wind_down_line_says_it_is_stopping() {
+        for how in [
+            WoundDown::AlreadyReleased,
+            WoundDown::Confirmed,
+            WoundDown::Unconfirmed,
+        ] {
+            assert!(
+                how.line().starts_with(WoundDown::STOPPING),
+                "`{}` does not start with `{}`",
+                how.line(),
+                WoundDown::STOPPING
+            );
+        }
     }
 }

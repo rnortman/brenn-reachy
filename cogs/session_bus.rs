@@ -643,10 +643,9 @@ fn commission(slot: &mut SessionStateWire, prior: Option<BusResult>, now: Now, t
         // snapshot, the phase latches, and only an operator restarting the
         // process clears it -- no automatic recovery, ever.
         //
-        // What the report stream carries for it is the phase row and nothing
-        // else, so a reader of it learns that the machine was refused and not
-        // which servo refused it.
-        // TODO(commission-verdict-narration)
+        // The verdict stays in the snapshot; its headline is narrated by the
+        // caller, immediately before the phase row -- the caller owns the report
+        // ring, and nothing here publishes.
         Some(Ending::Failed) => SessionPhaseWire::PARKED,
     };
     turn.entered = Some(enter(slot, entered));
@@ -960,14 +959,18 @@ pub fn degrade(
             Settled::Answered(result) => {
                 slot.set_degrade_pending(false);
                 let joint = addressed(slot);
-                // Anything but a verified write leaves the row where it was:
-                // a servo that answered nothing, answered wrongly, or read back
-                // something else is a servo whose torque state this session does
-                // not know. A record naming an id this configuration does not
-                // have is answered the same way however the write came back:
-                // there is no bit to take out of the set for it, so a drain that
-                // read it as released would ask for the same row every wake for
-                // as long as the process ran.
+                // Anything but a verified write leaves the row where it was: a
+                // servo that answered nothing, answered wrongly, read back
+                // something else, or only acknowledged the instruction is a
+                // servo whose torque state this session does not know.
+                // `BusResult::Written` is the read-back and nothing else, so an
+                // acknowledgement never reaches this test as a success.
+                //
+                // A record naming an id this configuration does not have is
+                // answered the same way however the write came back: there is no
+                // bit to take out of the set for it, so a drain that read it as
+                // released would ask for the same row every wake for as long as
+                // the process ran.
                 if matches!(joint, JointRef::None) || !matches!(result, BusResult::Written) {
                     drain.refused = Some(joint);
                     return drain;
@@ -1202,7 +1205,10 @@ mod tests {
     //! field the schema declares: a field this module does not carry is a
     //! mismatch here rather than a register written wrong on a bus.
 
-    use super::{ProfileConfig, Txn, init_arm_config, record_pending};
+    use super::{
+        BusResult, JointFlagsWire, JointRef, ProfileConfig, Timing, Txn, degrade, degrade_rows,
+        flags, init_arm_config, record_pending,
+    };
     use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
@@ -1229,6 +1235,56 @@ mod tests {
         held.value_kind = ValueShape::I32;
         held.value = 0x0123_4567_89ab_cdef;
         wire
+    }
+
+    /// A slot mid-drain: the antenna pair owed a de-torque, the first row's
+    /// write outstanding.
+    fn draining() -> (SessionStateWire, JointRef) {
+        let mut slot = SessionStateWire::new();
+        slot.set_degrade_release(JointFlagsWire::from(degrade_rows()));
+        let drain = degrade(&mut slot, None, 0, &timing());
+        assert!(drain.delivery.datagram.is_some(), "a row was asked for");
+        let asked = flags::iter(degrade_rows()).next().expect("a row is owed");
+        (slot, asked)
+    }
+
+    fn timing() -> Timing {
+        Timing {
+            aux_timeout_ns: 1_000_000,
+            aux_retries: 3,
+        }
+    }
+
+    /// A de-torque the servo only acknowledged is a row this session cannot say
+    /// went limp, so the row stays owed and the drain reports it refused.
+    ///
+    /// The one place the two writes have to stay apart: every de-torque is
+    /// issued verified, and the guard against a later one being issued the
+    /// cheaper way is that an acknowledgement is not the result this test
+    /// accepts.
+    #[test]
+    fn a_de_torque_nothing_read_back_does_not_release_a_row() {
+        let (mut slot, asked) = draining();
+        let drain = degrade(&mut slot, Some(BusResult::Acknowledged), 1, &timing());
+        assert_eq!(drain.refused, Some(asked));
+        assert_eq!(drain.released, None);
+        assert_eq!(
+            slot.degrade_release().to_known().expect("a session"),
+            degrade_rows(),
+            "the row is still owed a write",
+        );
+    }
+
+    /// The same drain, answered by a write that read back: the row lets go.
+    #[test]
+    fn a_de_torque_read_back_releases_its_row() {
+        let (mut slot, asked) = draining();
+        let drain = degrade(&mut slot, Some(BusResult::Written), 1, &timing());
+        assert_eq!(drain.refused, None);
+        assert_eq!(
+            slot.degrade_release().to_known().expect("a session"),
+            flags::without(degrade_rows(), flags::bit(asked)),
+        );
     }
 
     /// What the sequencer asked for is what the datagram carries.

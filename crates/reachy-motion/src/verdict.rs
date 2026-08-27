@@ -39,7 +39,8 @@ use crate::snap::{
     FkFailureKind, FkFieldError, duration_from_nanos, duration_nanos, fk_cause, fk_fields,
 };
 use crate::value::{self, ShapeName, Value, ValueShape};
-use brenn_reachy__motion__seq_clk_rs::SeqFailureSnap;
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::ValueShapeWire;
+use brenn_reachy__motion__seq_clk_rs::{AnswerShapeWire, SeqFailureSnap};
 use clockwork_rs::Duration as SlotDuration;
 
 /// Numbers in a verdict slot that name no sequencer failure.
@@ -80,6 +81,86 @@ pub enum VerdictError {
     /// not a length of time.
     #[error("the wait in the slot is not one: {0}")]
     Wait(#[from] crate::snap::DurationError),
+}
+
+impl VerdictError {
+    /// This refusal as one small number, for a row that has a slot for a number
+    /// and none for a sentence.
+    ///
+    /// The narration of a verdict nobody can read is the case with the least
+    /// evidence in it, so what little there is travels: a reader learns whether
+    /// the slot held no failure at all, a failure under no phase, or evidence
+    /// that does not suit the kind beside it. Zero is not among the answers --
+    /// it is what a row carries when nothing wrote this number.
+    ///
+    /// Numbering is append-only, for the reason every vocabulary here is: a
+    /// recorded row and a running build have to have the number in common.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            VerdictError::NoFailure => 1,
+            VerdictError::NoStep => 2,
+            VerdictError::NonFiniteValue(_) => 3,
+            VerdictError::TooManyAbsent(_) => 4,
+            VerdictError::NoAnswerShape => 5,
+            VerdictError::NoValueShape => 6,
+            VerdictError::Solve(_) => 7,
+            VerdictError::Wait(_) => 8,
+        }
+    }
+}
+
+/// What a slot whose bytes are not a valid message at all reads as.
+///
+/// Not a [`VerdictError`] -- the refusal comes from the schema's own validation,
+/// before anything here looks at a field -- but it shares the numbering, because
+/// a row carrying one of these numbers carries no second field saying which
+/// vocabulary it came from.
+pub const BYTES_UNREADABLE: u8 = 9;
+
+/// The one number a sequencer failure is worth stating beside its kind.
+///
+/// One per kind, and zero for the kinds whose whole evidence is that nothing
+/// came back: there is no headline for a silence. Lossy on purpose where a
+/// failure carries more than one number -- nine voltages become the lowest, a
+/// set of silent servos becomes its size -- because a row of "which kind, which
+/// servo, roughly how bad" is what a fixed-layout report has room for and the
+/// verdict itself answers the rest.
+///
+/// Here rather than in a host: this module is where the two forms of a verdict
+/// meet, and a projection of one of them living in a binary is a third form that
+/// the next host to want it would copy.
+#[must_use]
+pub fn headline(failure: &SeqError) -> f64 {
+    match failure {
+        SeqError::Refused { code, .. } => f64::from(*code),
+        SeqError::UnhealthyServo { bits, .. } => f64::from(*bits),
+        SeqError::VerifyMismatch { read_back, .. } => value::headline(*read_back),
+        SeqError::ProvisionMismatch { observed, .. } => value::headline(*observed),
+        SeqError::WrongValue { observed, .. } => f64::from(ValueShapeWire::from(*observed).0),
+        SeqError::WrongAnswer { observed, .. } => f64::from(AnswerShapeWire::from(*observed).0),
+        // The evidence, non-finite included: what makes this failure the failure
+        // it is, is that the number places no angle.
+        SeqError::UnplaceableAngle { angle, .. } => *angle,
+        SeqError::AbsentServos { absent, .. } => {
+            f64::from(u8::try_from(absent.count()).unwrap_or(u8::MAX))
+        }
+        SeqError::IdentityMismatch { model, .. } => f64::from(*model),
+        SeqError::VoltageLow { lowest, .. } | SeqError::SupplyBelowFloor { lowest, .. } => *lowest,
+        SeqError::RestPoseImplausible { cause, .. }
+        | SeqError::PinnedPoseUnsolvable { cause, .. } => {
+            let (_, first, _) = fk_fields(*cause);
+            first
+        }
+        SeqError::NoAnswer { .. }
+        | SeqError::DriverRefused { .. }
+        | SeqError::WireCorrupt { .. }
+        | SeqError::PendingUnreadable { .. }
+        | SeqError::VerdictUnreadable { .. }
+        | SeqError::ClockOutOfRange { .. }
+        | SeqError::RecordUnreadable { .. }
+        | SeqError::RecordAbsent { .. } => 0.0,
+    }
 }
 
 /// Write `error` into the fields a verdict slot holds one in.
@@ -441,6 +522,187 @@ mod tests {
     /// `write` assigns is a value the schema declares, so this cannot refuse.
     fn valid(wire: &SeqFailureSnapWire) -> &SeqFailureSnap {
         wire.validate().expect("a written verdict validates")
+    }
+
+    /// A row that says "unreadable" and nothing else is the least a parked
+    /// machine can be told, so the refusal's own number travels: every one of
+    /// them is distinct, none is the zero a field nobody wrote carries, and none
+    /// collides with the bytes-unreadable number that shares the numbering.
+    #[test]
+    fn every_refusal_has_a_number_of_its_own() {
+        let refusals = [
+            VerdictError::NoFailure,
+            VerdictError::NoStep,
+            VerdictError::NonFiniteValue(ValueShape::Radians),
+            VerdictError::TooManyAbsent(11),
+            VerdictError::NoAnswerShape,
+            VerdictError::NoValueShape,
+            VerdictError::Solve(FkFieldError::NoSolveFailure),
+            VerdictError::Wait(crate::snap::DurationError::Negative(-1)),
+        ];
+        let mut seen = Vec::new();
+        for refusal in refusals {
+            let code = refusal.code();
+            assert_ne!(code, 0, "{refusal} reads as a field nobody wrote");
+            assert_ne!(
+                code, BYTES_UNREADABLE,
+                "{refusal} reads as unreadable bytes"
+            );
+            assert!(!seen.contains(&code), "{refusal} shares a number");
+            seen.push(code);
+        }
+    }
+
+    /// The common case has a number too: a slot nobody ever wrote.
+    #[test]
+    fn a_slot_nobody_wrote_says_so_by_number() {
+        let wire = SeqFailureSnapWire::new();
+        let refusal = read(wire.validate().expect("zeroes validate"))
+            .expect_err("a slot nobody wrote names no failure");
+        assert_eq!(refusal, VerdictError::NoFailure);
+        assert_eq!(
+            refusal.code(),
+            1,
+            "the number a row carries for the commonest refusal of all"
+        );
+    }
+
+    /// The one number each kind is worth stating beside itself, per kind.
+    ///
+    /// This is the whole of what a parked run's narration says about how bad it
+    /// was, so a field picked from the wrong side of a failure -- a floor for a
+    /// reading, a derivative term for a proportional one -- mis-narrates every
+    /// parked run and nothing else in the tree has a view. The zeroes are
+    /// asserted rather than defaulted: the kinds whose whole evidence is that
+    /// nothing came back have no headline, and saying so here is what keeps
+    /// "nothing to state" apart from "nobody wrote this field".
+    #[test]
+    fn every_failure_states_the_one_number_it_is_worth_stating() {
+        let context = failure_context();
+        let readings = [11.4, 11.5, 11.6, 11.7, 11.8, 11.9, 12.0, 12.1, 12.2];
+        let table: Vec<(SeqError, f64)> = vec![
+            (SeqError::Refused { context, code: 7 }, 7.0),
+            (
+                SeqError::UnhealthyServo {
+                    context,
+                    bits: 0b0010_0001,
+                },
+                33.0,
+            ),
+            (
+                SeqError::VerifyMismatch {
+                    context,
+                    expected: value::radians(0.5),
+                    read_back: value::radians(0.25),
+                },
+                0.25,
+            ),
+            (
+                SeqError::ProvisionMismatch {
+                    context,
+                    expected: value::u16(3),
+                    observed: value::u16(4),
+                },
+                4.0,
+            ),
+            (
+                SeqError::WrongValue {
+                    context,
+                    expected: ValueShape::U8,
+                    observed: ValueShape::U16,
+                },
+                f64::from(ValueShapeWire::from(ValueShape::U16).0),
+            ),
+            (
+                SeqError::WrongAnswer {
+                    context,
+                    expected: answer::AnswerShape::Value,
+                    observed: answer::AnswerShape::Pinged,
+                },
+                f64::from(AnswerShapeWire::from(answer::AnswerShape::Pinged).0),
+            ),
+            (
+                SeqError::UnplaceableAngle {
+                    context,
+                    joint: ROWS[0],
+                    angle: -3.5,
+                },
+                -3.5,
+            ),
+            (
+                SeqError::AbsentServos {
+                    context,
+                    absent: AbsentSet::new(
+                        &[10, 11, 12, 13, 14, 15, 16, 17, 18],
+                        &[true, true, false, false, false, false, false, false, false],
+                    ),
+                },
+                2.0,
+            ),
+            (
+                SeqError::IdentityMismatch {
+                    context,
+                    model: 1_060,
+                    expected: 1_020,
+                },
+                1_060.0,
+            ),
+            (
+                SeqError::VoltageLow {
+                    context,
+                    readings,
+                    lowest: 11.4,
+                    limit: 11.9,
+                    waited: Duration::from_secs(3),
+                },
+                11.4,
+            ),
+            (
+                SeqError::SupplyBelowFloor {
+                    context,
+                    readings,
+                    lowest: 10.2,
+                    limit: 11.9,
+                },
+                10.2,
+            ),
+            (
+                SeqError::RestPoseImplausible {
+                    context,
+                    cause: FkError::NoConvergence {
+                        iters: 12,
+                        residual: 0.004,
+                    },
+                },
+                12.0,
+            ),
+            (
+                SeqError::PinnedPoseUnsolvable {
+                    context,
+                    cause: FkError::WrongAssemblyMode {
+                        cone_deg: 41.0,
+                        z: 0.1,
+                    },
+                },
+                41.0,
+            ),
+            (SeqError::NoAnswer { context }, 0.0),
+            (SeqError::DriverRefused { context }, 0.0),
+            (SeqError::WireCorrupt { context }, 0.0),
+            (SeqError::PendingUnreadable { context }, 0.0),
+            (SeqError::VerdictUnreadable { context }, 0.0),
+            (SeqError::ClockOutOfRange { context }, 0.0),
+            (SeqError::RecordUnreadable { context }, 0.0),
+            (SeqError::RecordAbsent { context }, 0.0),
+        ];
+        assert_eq!(
+            table.len(),
+            failure::raised().count(),
+            "one per kind, so this sweep is exhaustive by count as well"
+        );
+        for (error, expected) in &table {
+            assert_eq!(headline(error), *expected, "{error}");
+        }
     }
 
     /// A blank verdict of a kind, for the refusal cases to spoil one field of.

@@ -28,8 +28,18 @@ pub struct Event {
     pub time_ns: i64,
     /// The silence or the lateness, where the kind names one.
     pub silence_ns: i64,
+    /// How long the cycle the kind names took, where something measured it.
+    /// Nothing in this crate does: every span on this field is read off a clock
+    /// by the host that owns one, and a raiser here leaves the zero that says so.
+    pub work_ns: i64,
+    /// How long the out-of-band exchange the kind names took, where something
+    /// measured it. Nothing in this crate does, for the reason `work_ns` states.
+    pub exchange_ns: i64,
     /// How many of whatever the kind counts.
     pub count: u32,
+    /// How many of the cycles a windowed kind counted ran an out-of-band
+    /// transaction.
+    pub out_of_band: u32,
     /// The servos the kind names, where it names a set of them.
     pub rows: JointFlags,
     /// The one servo the kind names, as its bus id.
@@ -46,7 +56,10 @@ impl Event {
             kind: EventKind::None,
             time_ns,
             silence_ns: 0,
+            work_ns: 0,
+            exchange_ns: 0,
             count: 0,
+            out_of_band: 0,
             rows: JointFlags::NONE,
             id: 0,
         }
@@ -61,8 +74,11 @@ impl Event {
         out.kind = self.kind;
         out.time = SyncTime::from_nanos(self.time_ns);
         out.silence = Duration::from_nanos(self.silence_ns);
+        out.work = Duration::from_nanos(self.work_ns);
+        out.exchange = Duration::from_nanos(self.exchange_ns);
         out.rows = self.rows;
         out.count = self.count;
+        out.out_of_band = self.out_of_band;
         out.id = self.id;
     }
 }

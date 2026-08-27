@@ -22,14 +22,17 @@ use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
+use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
+use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 use reachy_motion::arm::SERVO_IDS;
+use reachy_motion::joints;
 use reachy_motion::joints::ROW_COUNT;
 use scenario::check;
 use scenario::cycle_within;
 use scenario::read::Run;
 use scenario::{FIRST_CYCLE, hold_timeout_cycles};
 
-use s9_scenario::{SCRIPT_ID, end_cycle, parked_by_cycle, script_sent_cycle};
+use s9_scenario::{SCRIPT_ID, absent_joint, end_cycle, parked_by_cycle, script_sent_cycle};
 
 fn main() -> ExitCode {
     check::main("s9_checker", |run, failures| {
@@ -77,22 +80,21 @@ fn main() -> ExitCode {
         // all -- so the window closing on it in silence, twice over before the
         // run ends, must raise nothing.
         check::no_events(run, failures);
-        // Two rows, and the whole of what a failed survey is written down as:
-        // the phase it latched into, and the script it then declined. Which
-        // servo the sweep did not find is in the survey's own verdict, which is
-        // a state slot and does not reach this stream -- so an operator reading
-        // the report stream learns that the machine was refused and not why.
-        // Pinned as it stands deliberately: a row that says which row failed is
-        // an addition to the report vocabulary.
-        // TODO(commission-verdict-narration)
+        // Three rows, and the whole of what a failed survey is written down as:
+        // the verdict that stopped it, the phase it latched into, and the script
+        // it then declined. The verdict comes first because it explains the row
+        // after it; the rest of the survey's evidence stays in the state slot,
+        // which does not reach this stream.
         check::narration(
             run,
             &[
+                ReportKindWire::COMMISSION_FAILED,
                 ReportKindWire::PHASE_CHANGED,
                 ReportKindWire::SCRIPT_REFUSED,
             ],
             failures,
         );
+        check_the_verdict_names_the_missing_servo(run, failures);
         check::stands_still(
             run,
             FIRST_CYCLE,
@@ -131,6 +133,50 @@ fn check_the_script_meets_a_parked_machine(failures: &mut Vec<String>) {
             end_cycle(),
             script_sent_cycle(),
             hold_timeout_cycles()
+        ));
+    }
+}
+
+/// The verdict row says which failure stopped the survey, and at which servo.
+///
+/// The whole point of the row: a reader of the report stream learns that a servo
+/// did not answer its ping and which one, without the state slot the rest of the
+/// verdict lives in. This scenario silences exactly one crank, so the headline
+/// is one absent servo and the id is that crank's.
+fn check_the_verdict_names_the_missing_servo(run: &Run, failures: &mut Vec<String>) {
+    let verdicts: Vec<&TimelineEntryWire> = run
+        .reports
+        .iter()
+        .map(|logged| &logged.message)
+        .filter(|report| report.kind() == ReportKindWire::COMMISSION_FAILED)
+        .collect();
+    let [verdict] = verdicts.as_slice() else {
+        failures.push(format!(
+            "the session narrated {} commission verdicts, and a survey that refused the machine \
+             stops once and says so once",
+            verdicts.len()
+        ));
+        return;
+    };
+    let absent = u32::from(SeqFailureKindWire::ABSENT_SERVOS.0);
+    if verdict.a() != absent {
+        failures.push(format!(
+            "the verdict is failure kind {}, and this run's survey stops on a ping nothing \
+             answered ({absent})",
+            verdict.a()
+        ));
+    }
+    let silent = u32::from(SERVO_IDS[joints::row(absent_joint()).expect("a crank has a bus row")]);
+    if verdict.b() != silent {
+        failures.push(format!(
+            "the verdict names servo {}, and the servo this run silences is {silent}",
+            verdict.b()
+        ));
+    }
+    if (verdict.detail() - 1.0).abs() > f64::EPSILON {
+        failures.push(format!(
+            "the verdict counts {} absent servos, and this run unplugs one",
+            verdict.detail()
         ));
     }
 }

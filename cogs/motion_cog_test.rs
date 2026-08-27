@@ -4827,8 +4827,14 @@ impl Bus {
                 msg.set_value_kind(ValueShapeWire::from(held.shape()));
                 msg.set_value(held.bits());
             }
-            AuxOpKindWire::WRITE_REG_VERIFIED => match asked.reg {
+            // The pin sweep, which takes no read-back: the goal register mirrors
+            // the present position while torque is off, so there is nothing to
+            // answer with but the acknowledgement.
+            AuxOpKindWire::WRITE_REG => match asked.reg {
                 RegIdWire::GOAL_POSITION => {}
+                other => panic!("the pin sweep writes one register, not {other:?}"),
+            },
+            AuxOpKindWire::WRITE_REG_VERIFIED => match asked.reg {
                 // The value says which write this is: an arming enables torque
                 // and a release writes the zero, and the two are answered by
                 // different halves of a case.
@@ -4847,7 +4853,7 @@ impl Bus {
                         msg.set_value(1);
                     }
                 }
-                other => panic!("the engagement writes two registers, not {other:?}"),
+                other => panic!("the verified writes are torque, not {other:?}"),
             },
             other => panic!("neither sequence asks for {other:?}"),
         }
@@ -5002,7 +5008,7 @@ fn the_watch_and_the_engagement_take_the_machine_active() {
     );
     expected(
         3 * JOINT_COUNT,
-        AuxOpKindWire::WRITE_REG_VERIFIED,
+        AuxOpKindWire::WRITE_REG,
         RegIdWire::GOAL_POSITION,
     );
     expected(

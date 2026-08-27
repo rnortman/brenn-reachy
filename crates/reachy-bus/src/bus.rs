@@ -24,6 +24,13 @@
 //! exception reads the servo's Torque Enable first and refuses unless it is
 //! off, because a servo holding torque ignores such a write and acknowledges it
 //! anyway.
+//!
+//! A unicast write comes in two: verified, which reads the register back and
+//! compares it count-exact, and unverified, which stops at the servo's
+//! acknowledgement. Both go out through one piece of code, so the width,
+//! encoding and non-volatile refusals are identical and only the read-back
+//! differs. Unverified is for a register the platform mirrors from elsewhere,
+//! whose read-back answers with its own state rather than the write.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -423,14 +430,30 @@ impl<P: BusPort> Bus<P> {
         reg: Reg,
         value: &RawValue,
     ) -> Result<(), XactError> {
-        // TODO(provisioning-repair): the guarded path below writes the one
-        // non-volatile register this project provisions itself. Repairing a
-        // vendor-provisioned register — a homing offset, a travel limit — is
-        // still refused here and still undecided.
-        if reg.is_eeprom() {
-            return Err(XactError::EepromRefused { id, addr: reg.addr });
-        }
+        refuse_nonvolatile(id, reg)?;
         self.write_and_verify(id, reg, value)
+    }
+
+    /// Writes `value` to `reg` on `id` and takes the acknowledgement, reading
+    /// nothing back.
+    ///
+    /// For a register the platform mirrors from elsewhere, whose read-back
+    /// answers with its own state rather than the write.
+    ///
+    /// Refuses non-volatile registers exactly as the verified path does: such a
+    /// write is ignored by a servo holding torque and acknowledged anyway, so an
+    /// unverified one could never be told from a no-op.
+    ///
+    /// The exception rather than the default: every write in this tree but the
+    /// pin sweep goes through [`Self::write_reg_verified`].
+    pub fn write_reg_unverified(
+        &mut self,
+        id: u8,
+        reg: Reg,
+        value: &RawValue,
+    ) -> Result<(), XactError> {
+        refuse_nonvolatile(id, reg)?;
+        self.write_only(id, reg, value)
     }
 
     /// Writes `value` to a non-volatile `reg` on `id`, having established that
@@ -459,9 +482,12 @@ impl<P: BusPort> Bus<P> {
         self.write_and_verify(id, reg, value)
     }
 
-    /// The write itself: put it on the wire, take the acknowledgement, read the
-    /// register back and compare it count-exact.
-    fn write_and_verify(&mut self, id: u8, reg: Reg, value: &RawValue) -> Result<(), XactError> {
+    /// The write itself: put it on the wire and take the acknowledgement.
+    ///
+    /// Where both write paths meet, so the width check, the encoding and the
+    /// acknowledgement are one piece of code and neither path can drift into
+    /// admitting what the other refuses.
+    fn write_only(&mut self, id: u8, reg: Reg, value: &RawValue) -> Result<(), XactError> {
         if value.len() != usize::from(reg.len) {
             return Err(XactError::ValueWidth {
                 id,
@@ -478,8 +504,12 @@ impl<P: BusPort> Bus<P> {
         // A write is acknowledged with no parameters at all. Anything else is
         // some other exchange's reply, and accepting it would count a write as
         // acknowledged that no servo has answered for.
-        check_length(id, 0, reply.len)?;
+        check_length(id, 0, reply.len)
+    }
 
+    /// The write, and then the register read back and compared count-exact.
+    fn write_and_verify(&mut self, id: u8, reg: Reg, value: &RawValue) -> Result<(), XactError> {
+        self.write_only(id, reg, value)?;
         let read_back = self.read_reg(id, reg)?;
         if read_back != *value {
             return Err(XactError::VerifyMismatch {
@@ -774,6 +804,25 @@ impl<P: BusPort> Bus<P> {
     fn record_retry(&mut self) {
         self.counters.retries += 1;
     }
+}
+
+/// Refuses a non-volatile register, for both of the paths that write one
+/// unguarded.
+///
+/// One place, because the refusal is one policy: `write_eeprom_verified` is the
+/// only path that writes a non-volatile register, and it establishes torque-off
+/// first. Written once so the two guarded paths cannot come to differ, and so
+/// the open decision below is where the work is rather than beside one of them.
+///
+/// TODO(provisioning-repair): the guarded path writes the one non-volatile
+/// register this project provisions itself. Repairing a vendor-provisioned
+/// register — a homing offset, a travel limit — is still refused here and still
+/// undecided.
+fn refuse_nonvolatile(id: u8, reg: Reg) -> Result<(), XactError> {
+    if reg.is_eeprom() {
+        return Err(XactError::EepromRefused { id, addr: reg.addr });
+    }
+    Ok(())
 }
 
 /// Checks a reply's parameter count against the request that earned it.
@@ -1183,6 +1232,61 @@ mod tests {
         bus.write_reg_verified(11, TORQUE_ENABLE, &value)
             .expect("the read-back matched");
         assert_eq!(bus.port.writes.len(), 2, "a write and its read-back");
+    }
+
+    /// The unverified write stops at the acknowledgement: one exchange on the
+    /// wire, and nothing read back to compare.
+    #[test]
+    fn an_unverified_write_takes_the_acknowledgement_and_reads_nothing_back() {
+        let mut bus = bus_over(&[status(11, 0, &[])]);
+        let value = RawValue::new(&[1]).expect("one byte");
+        bus.write_reg_unverified(11, TORQUE_ENABLE, &value)
+            .expect("the servo acknowledged the write");
+        assert_eq!(bus.port.writes.len(), 1, "the write and no read-back");
+    }
+
+    /// A servo answering a write with parameters is answering some other
+    /// exchange, and taking it would count a write nobody acknowledged. The
+    /// unverified path checks that as the verified one does -- it is the only
+    /// check it has.
+    #[test]
+    fn an_unverified_write_answered_with_parameters_is_not_an_acknowledgement() {
+        let mut bus = bus_over(&[status(11, 0, &[1])]);
+        let value = RawValue::new(&[1]).expect("one byte");
+        let failure = bus
+            .write_reg_unverified(11, TORQUE_ENABLE, &value)
+            .expect_err("a write is acknowledged with nothing");
+        assert!(matches!(failure, XactError::LongReply { id: 11, .. }));
+    }
+
+    /// The two writes decline identically: a non-volatile register and a value
+    /// of the wrong width are refused before anything reaches the wire.
+    #[test]
+    fn the_unverified_write_declines_what_the_verified_one_declines() {
+        let mut bus = bus_over(&[]);
+        let value = RawValue::new(&[4]).expect("one byte");
+        let failure = bus
+            .write_reg_unverified(17, OPERATING_MODE, &value)
+            .expect_err("a non-volatile register takes no unverified write");
+        assert!(matches!(
+            failure,
+            XactError::EepromRefused { id: 17, addr: 11 }
+        ));
+
+        let wide = RawValue::new(&[1, 2, 3, 4]).expect("four bytes");
+        let failure = bus
+            .write_reg_unverified(11, TORQUE_ENABLE, &wide)
+            .expect_err("four bytes are not that register");
+        assert!(matches!(
+            failure,
+            XactError::ValueWidth {
+                id: 11,
+                expected: 1,
+                actual: 4,
+                ..
+            }
+        ));
+        assert!(bus.port.writes.is_empty(), "nothing reached the wire");
     }
 
     #[test]

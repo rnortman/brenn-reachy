@@ -39,6 +39,7 @@ use reachy_bus::value_kind;
 use reachy_driver::{AuxSlot, GoalGate, TorqueOffConfirm};
 use reachy_motion::arm::{SERVO_IDS, row_of_id};
 use reachy_motion::joints::{flags, joint_ref, row, set_angle};
+use reachy_motion::txn::{self, WriteAnswer};
 use reachy_motion::value::{self, Value};
 
 use crate::sim_regs::{self, Regs};
@@ -201,19 +202,34 @@ pub fn answer(state: &mut SimState, nominal: i64, corr: u32, request: &Request) 
             Ok(held) => Answer::value(corr, held),
             Err(_) => Answer::refused(corr),
         },
-        AuxOpKind::WriteRegVerified => write_verified(state, nominal, corr, row, request),
+        AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => {
+            run_write(state, nominal, corr, row, request)
+        }
     }
 }
 
-/// Write one register and read it back, so the answer is what the modelled
-/// servo holds rather than what was sent.
-fn write_verified(
+/// Write one register, taking the answer the request's own operation names.
+///
+/// One path for both writes: the write reaches the cell and the plant
+/// identically, and only what counts as the answer differs.
+///
+/// Which answer to take is read off `request.op` through
+/// [`txn::write_answer`] — the same classification the real driver reads, so
+/// the modelled bus cannot come to a different view of which writes are read
+/// back.
+fn run_write(
     state: &mut SimState,
     nominal: i64,
     corr: u32,
     row: usize,
     request: &Request,
 ) -> Answer {
+    // An operation that is not a write reaches this only from a dispatch arm
+    // that grew one without classifying it, which is a request the modelled
+    // driver cannot run rather than one it should guess at.
+    let Some(answer) = txn::write_answer(request.op) else {
+        return Answer::refused(corr);
+    };
     let Ok(shape) = value_kind(request.reg) else {
         return Answer::refused(corr);
     };
@@ -232,7 +248,7 @@ fn write_verified(
             let Some(enable) = held.as_u8() else {
                 return Answer::refused(corr);
             };
-            enable_write(state, nominal, row, joint, enable != 0);
+            enable_write(state, nominal, row, joint, enable != 0, answer);
         }
         RegId::GoalPosition => {
             let Some(angle) = held.as_radians() else {
@@ -261,6 +277,12 @@ fn write_verified(
     {
         return Answer::refused(corr);
     }
+    if answer == WriteAnswer::Acknowledgement {
+        // Nothing is read back, so the answer carries no value: a value here
+        // would be the modelled driver reporting its own send as the machine's
+        // state.
+        return Answer::bare(corr, AuxStatus::Ok);
+    }
     match sim_regs::read(&state.regs, row, request.reg) {
         Ok(read_back) if read_back == held => Answer::value(corr, read_back),
         // The cell does not hold what was written to it. Nothing in this
@@ -274,22 +296,37 @@ fn write_verified(
     }
 }
 
-/// Energise or de-energise one row, as a verified torque-enable write.
+/// Energise or de-energise one row, as a torque-enable write.
 ///
 /// The whole of what arming this machine is: the plant's bits move, the
-/// driver's belief moves with them because the write was verified, and a fresh
+/// driver's belief moves with them when the write was read back, and a fresh
 /// arming grants the dead-man a new window and ends both the torque-off latch
 /// and the confirmation pass that was reading it back. A de-energised row
 /// forgets what it was holding -- these gearboxes do not back-drive, so it
 /// stands where it stands -- and a machine with nothing left energised is a
 /// machine holding nothing at all.
-fn enable_write(state: &mut SimState, nominal: i64, row: usize, joint: JointRef, enabled: bool) {
+///
+/// Only a read-back moves the belief and the gate, which is the rule the real
+/// driver runs on: a belief built out of a bare acknowledgement would have the
+/// dead-man measuring the driver's own sends rather than what the servo holds.
+/// The plant moves either way -- the servo took the instruction.
+fn enable_write(
+    state: &mut SimState,
+    nominal: i64,
+    row: usize,
+    joint: JointRef,
+    enabled: bool,
+    answer: WriteAnswer,
+) {
     let bit = flags::bit(joint);
     if enabled {
         state.torqued |= bit;
     } else {
         state.torqued = flags::without(state.torqued, bit);
         state.has_target = flags::without(state.has_target, bit);
+    }
+    if answer != WriteAnswer::ReadBack {
+        return;
     }
     AuxSlot::over(&mut state.aux)
         .belief()

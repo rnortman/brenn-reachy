@@ -58,7 +58,7 @@ Before anything that arms, moves or de-torques, the binding rules are in
 | `.local/records/` | fetched self-test records, and wherever you park retrieved traces |
 | `target/bench-arm64/release/reachy-bench` | the device binary `bench-build` produces |
 | `target/motion-arm64/release/` | the motion payload `motion-build` stages: both binaries and every configuration file the three processes read, laid out the way their relative paths expect |
-| `.local/motion-logs/` | fetched run logs, one directory per fetch |
+| `.local/motion-logs/` | fetched run logs, one directory per fetch, each holding the writer's run directory and a `provenance.txt` naming the build that recorded it, and `<fetch>.console` beside each one: the launcher's per-process console files, and for a run also its own console stream and the unit's clock discipline read either side of it |
 | `crates/reachy-motion/fixtures/traces/` | recorded runs kept as test data |
 
 On the device, and all in RAM — nothing a dev cycle pushes touches the eMMC:
@@ -92,6 +92,21 @@ the contract described here is one thing rather than two that agree today. For
 the bench that question gates the run, because the probe and the run share one
 ssh invocation; for the motion deploy it is advisory, because the push is a
 second connection and the run is started by hand afterwards.
+
+`deploy-motion.sh --run` appends three codes of its own to that remote chain,
+and they are part of the same contract. Two of them fire before anything is
+emptied: **5** — the payload on the unit carries no `provenance.txt`, so the
+run's records could not name their build, and the fix is another `--push`; **6**
+— the stamp is there but copying it to its staging path failed, which is a full
+or read-only payload store. On both, nothing was started and nothing was
+emptied, so the previous run's records are still on the unit and still
+fetchable. **7** — one of the steps that run after the wipe began failed: the log
+root's own `mkdir`, the stamp's move into it, the launcher console directory's
+wipe and recreate, or the `cd` into the release. Treat a previous run's
+unfetched records as gone; the launcher was not started. All three miss
+`timeout`'s codes (124–127, 137) and ssh's 255; a launcher chain that exits with
+exactly 5, 6 or 7 is read as the refusal instead, which fails the run either
+way.
 
     ssh root@"$REACHY_HOST" systemctl stop reachy-motiond.service
     # ... the session ...
@@ -302,12 +317,15 @@ lives in the cog system, so a motion test on a unit is a run of that system.
 
 **The motion payload has completed runs on `reachy00`, and every verdict so far
 is red.** The runs are real — the launcher comes up, the driver holds its grid,
-the logger writes, and the analyzer judges — and the report says the machine did
-not do what the gesture asked. That verdict is a standing human-review item, not
-a target to make green: what follows is the procedure and the gates for the run
-that moves the machine, and the bring-up rule applies — an unexpected reading
-goes to a person before anything is changed to accommodate it. What has been
-seen so far is under **Open observations**, "the first motion runs end red".
+the logger writes, and the analyzer judges. Two of the four moved the machine
+through the whole gesture and released it stowed with no fault firing; every red
+mark in all four came from the analyzer rather than from the machine, and some
+of those marks were the report reading the wrong instant. That verdict is still
+a standing human-review item and not a target to make green: what follows is the
+procedure and the gates for the run that moves the machine, and the bring-up
+rule applies — an unexpected reading goes to a person before anything is changed
+to accommodate it. What has been seen so far, and what of it has since been
+settled, is under **Open observations**, "the first motion runs end red".
 
 **Before the first motion run on a unit, run the `watchdog` self-test** (above)
 and then power-cycle. Not to pass it — on this hardware it fails, and that
@@ -386,6 +404,37 @@ timestamped name, and runs `first_motion_report` over the run directory it
 brought back. **The target's verdict is the report's.** Nothing about the run is
 judged by the clock — the budget only has to be long enough for the gesture.
 
+**Every fetched records directory says which build recorded it.** The build
+records the commit it staged the payload from, inside the payload; the push turns
+that into a stamp — the commit, which of the two answered (`commit_source=build`
+is the payload's own record, `commit_source=push` the pushing tree's HEAD because
+the payload named none), the pushing tree's HEAD as `pushed_from`, whether the
+tree was dirty, and whether the age check was skipped. The stamp travels in the
+payload, so it lands on the unit's tmpfs with what it describes, and the run
+copies it into the log root, so it comes home at the root of the records as
+`provenance.txt`. A log is readable by the build that wrote it and no other, so
+reading an older run is
+`git switch --detach $(sed -n 's/^commit=//p' <fetch>/provenance.txt)`. What the
+other fields cost: `dirty=yes` means uncommitted edits at push time, so the
+commit does not fully describe what ran; `dirty=unknown` means the repository
+would not answer that question at all; `age_unchecked=yes` means `--stale-ok`
+skipped the freshness refusal, so the payload may predate the commit; a
+`pushed_from` different from `commit` means the tree moved between the build and
+the push, and `commit` is the one that built. A push that cannot state its commit
+refuses, and so does a run that finds no stamp in the payload — push again. That
+refusal happens before the log root is emptied, so an unfetched previous run is
+still there to fetch.
+
+A run brings back more than the records. The launcher's whole console directory
+lands in `<fetch>.console` beside them, the streamed console is teed into
+`run-console.log` there, and the unit's time-daemon state is read into
+`clock-before.txt` and `clock-after.txt` either side of the run. The driver's
+console is evidence about the *log* rather than about the machine: it counts the
+datagrams the driver took off its own socket, so the report is handed it with
+`--console` and says so when the recorded trail is shorter than what the driver
+counted. A console that does not come back costs the cross-check and never the
+run.
+
 `motion-run` chains `motion-deploy`, which chains `motion-build`, so the blessed
 entry point cannot run a payload older than your tree. `make motion-deploy` and
 `make motion-fetch` are still there for the manual path — a run you start by hand
@@ -410,8 +459,12 @@ what you want off with the run.
 it fetches and judges is that run's records and nothing else. The logger writes a
 directory per run under that root, and the report reads the newest one: left to
 accumulate, a run that wrote nothing would be judged — and passed — on an earlier
-run's log. The cost is that a run refused before its fetch leaves its records for
-the next run's clear; `make motion-fetch` them first if you want them.
+run's log. It empties `/run/brenn-app/logs/launch` for the same reason: the
+launcher numbers its files per run and never overwrites, so a directory left to
+accumulate holds several runs' `motord_N.log` and the console can no longer be
+attributed to the run it came with. The cost is that a run refused before its
+fetch leaves its records for the next run's clear; `make motion-fetch` them
+first if you want them.
 
 ### Starting, watching, stopping
 
@@ -431,9 +484,16 @@ The launcher redirects each process's console into its own file under
 `/run/brenn-app/logs/launch` on the unit — `motord_0.log`, `proc_0.log`,
 `logger_proc_0.log`, a second run in the same log directory writing
 `motord_1.log` and so on. What streams into your terminal is the launcher's own
-output; the per-process files stay on the unit, and a `tail -f` on one of them
-from a second shell is how you watch the driver's bus survey while the machine is
-still.
+output; the per-process files are written on the unit and fetched with the run,
+and a `tail -f` on one of them from a second shell is how you watch a process
+while the machine is still.
+
+**What the driver's console holds is counters, not narration.** It prints a
+`key=value` summary every five seconds — datagrams taken off its socket, aux
+offers refused, confirmation misses — and nothing about which transaction did
+what. The commissioning survey's verdict is not there and never was; it is the
+`commission_failed` report row that says why a session parked, and the driver's
+counters are how the analyzer decides whether the recorded trail is complete.
 
 Aborting `make motion-run` with Ctrl-C leaves the machine safe — the driver winds
 down on the signal — and fetches nothing. Re-run it.
@@ -486,38 +546,70 @@ Expect the first dozen seconds to look like nothing happening. Commissioning is
 about five seconds of bus transactions with the machine still, and the wake lead
 — `lead_ms` in `cogs/wake_params.textproto`, eight seconds — is deliberate room
 for that survey to finish before the first step opens. A motionless machine in
-that window is the normal shape of a good run, not a wedged one; the survey is
-visible meanwhile in the driver's log, which is what the `tail` above is for.
+that window is the normal shape of a good run, not a wedged one. Nothing narrates
+the survey while it runs — a `tail` on the driver's console shows its five-second
+counters and no more — and a survey that fails ends the session `PARKED` with a
+`commission_failed` row in the log saying which kind, which servo, and the one
+number that decided it.
 
 Watch for it with your eyes on the machine and your verdict from the log.
 `first_motion_report` over the fetched records is the verdict: the phase
-sequence in order, zero tick faults, no `bus_failure` and no `cycle_skipped`, a
-release with evidence, and the measured half printed either way — per-cycle
-jitter, read losses, tracking lags beside the replay suite's pinned headroom,
-the health rotation's readings, and a per-channel census. It prints the
-measurements whether it passes or fails, because a first run that fails is
-exactly the run whose numbers somebody needs. Its own test runs it over the S1
-scenario's deterministic log, so the analyzer was proved before any hardware log
-existed.
+sequence in order, zero tick faults, no `bus_failure` and no missed cycle slot, a
+release with evidence, every aux transaction back `OK`, and the measured half
+printed either way — per-cycle jitter, the driver's own per-cycle work and
+aux-exchange spans, read losses, tracking lags beside the replay suite's pinned
+headroom, the antennas where they were at the end of the schedule, the health
+rotation's readings, and a per-channel census. It prints the measurements whether
+it passes or fails, because a first run that fails is exactly the run whose
+numbers somebody needs. Its own test runs it over the S1 scenario's deterministic
+log, so the analyzer was proved before any hardware log existed.
 
-File the report and the log with the run record. Four things to check on the unit
-the first time, none of which any test here can answer. Two of them `reachy00`
+**A finding is one fact, and it says which one.** Missed cycle slots are one
+finding for the run — total, rate, the worst report, what the cycle before it
+spent, and how many of the skips followed a cycle carrying out-of-band bus work —
+and a heartbeat gap a skip accounts for is not counted a second time. The latched
+error byte is one finding naming the servos. A refused or mismatched transaction
+is printed with its identity: correlation number, operation, servo, register, and
+the value in the register's own units. **No budget is folded into any of this**:
+one missed slot still makes the run red, and `TODO(cycle-skip-budget)` is where a
+measured, reviewed, explained rate would go if the answer turns out to be that
+one is acceptable.
+
+The antennas are judged where the machine was let go of — the last valid pose at
+or before the first verified torque-off write — and not where the script's
+schedule ran out. Those are different instants: the profiled antenna motion is
+still finishing when the schedule ends, and the wind-down closes it out. The
+schedule-end deviation is printed as a note every run and judged never. A run
+with no verified release in the log falls back to the schedule's end *and* raises
+the missing release as its own finding, because a moving run with no release
+evidence is the worse fact.
+
+File the report and the log with the run record, and check that the records
+directory names the commit: `cat <fetch>/provenance.txt`. That is what makes the
+log readable later — a `dirty=yes`, `dirty=unknown` or `age_unchecked=yes` stamp,
+or a `pushed_from` that differs from `commit`, is worth writing down beside the
+run record, because the commit alone then does not say what ran.
+
+Four things to check on the unit the first time, none of which any test here can
+answer. Two of them `reachy00`
 has now answered: the log directory's filesystem accepts direct I/O on that
 kernel — the writer opens every file `O_DIRECT | O_DSYNC`, a refusal is a failed
 open at the first file, and it has written records on this unit — and the
 aarch64 binaries run at all, which executed runs settle for this unit and
 `make check-device` half-answers for a build (it asserts their instruction set is
-this CPU's, but executes nothing). Two are live. That the arrival tolerances the
-report judges by are the ones you want —
-`ARRIVAL_OFFSET_M`, `ARRIVAL_TURN_RAD` and `ARRIVAL_ANTENNA_RAD` in
+this CPU's, but executes nothing). One is live, and one is now recorded for you
+to read. Live: that the arrival tolerances the report judges by are the ones you
+want — `ARRIVAL_OFFSET_M`, `ARRIVAL_TURN_RAD` and `ARRIVAL_ANTENNA_RAD` in
 `cogs/first_motion_report.rs` were sized from the mechanism on paper by an agent
-and nobody has measured this machine. That one is load-bearing now rather than a
-footnote: the red verdict's off-stow findings turn on `ARRIVAL_ANTENNA_RAD`, so
-confirming or resetting the three is part of reviewing the verdict, and a
-tolerance is reset because it was measured, never because a verdict wanted it
-wider. And that the unit's time
-daemon is configured to slew rather than step while a session runs — unrecorded
-either way on this unit. A backwards step of
+and nobody has measured this machine. The recorded runs no longer press on
+`ARRIVAL_ANTENNA_RAD` — judged at the release, both moving runs came in inside a
+twentieth of it — so it is a footnote again rather than the thing a verdict turns
+on, and it is confirmed or reset because somebody measured the mechanism, never
+because a verdict wanted it wider. Recorded: whether the unit's time
+daemon is configured to slew rather than step while a session runs. A run now
+captures the daemon's state either side of itself into `clock-before.txt` and
+`clock-after.txt`, so the answer arrives with the records; read it, because a
+capture nobody reads settles nothing. A backwards step of
 `CLOCK_REALTIME` is loss of the driver's time base: every timer that can
 de-torque the machine is a difference against the clock that just moved, so the
 driver answers a step by latching torque off, and nothing clears that latch but
@@ -566,7 +658,28 @@ while the unit is still up.
 Then bring the records back and judge them:
 
     make motion-fetch
-    bazel run //cogs:first_motion_report -- .local/motion-logs/<fetch>/<run>
+    bazel run //cogs:first_motion_report -- \
+        --console .local/motion-logs/<fetch>.console \
+        .local/motion-logs/<fetch>/<run>
+
+`motion-fetch` brings the launcher's console directory back beside the records,
+and `--console` is what lets the report cross-check the recorded trail against
+the driver's own counters. Drop the flag if no driver console came back — the
+report refuses a console path holding none, and it refuses one holding several
+driver logs, which is what a launch directory left to accumulate across runs
+looks like. A hand-started run has to empty `/run/brenn-app/logs/launch` itself
+to avoid that; `make motion-run` does it for you. It also copies the push's
+provenance stamp into the log root, which a hand-started run has to do itself if
+the fetched records are to name their build:
+
+    cp /run/brenn-app/releases/motion/provenance.txt \
+        /run/brenn-app/logs/motion/provenance.txt
+
+A driver console that came back
+holding no counter summary — a run that ended before the driver's first
+five-second line — is not a refusal: the report says the cross-check was not
+made and judges the log anyway, because those are exactly the runs worth
+reading.
 
 ## The recorded traces
 
@@ -620,23 +733,126 @@ that the next person to see one knows it is not new.
   case is the tripwire: it reads each antenna's count from the resting sweep
   and fails by name outside one turn. If it ever fails, that is this
   observation recurring — take it to a person and do not widen the bound.
-- **The first motion runs end red.** Every `make motion-run` on `reachy00` so
-  far has produced a red report, in two shapes and with no diagnosis here. The
-  first shape is a session that parks at the start: `STARTING → PARKED` rather
-  than `RESTING`, zero motion scripts reaching the session, one aux transaction
-  back `REFUSED`, and nothing ever energised — zero samples carrying both a
-  reading and a setpoint, head and antenna lag 0.0000 rad. Those runs also
-  carried bus-timing readings: 59 heartbeat gaps of one cycle each, evenly about
-  0.5 s apart, and read jitter worst 8.672 ms, mean 4.771 ms, against a 20 ms
-  grid. The second shape is a session that commissions, wakes and moves, and
-  still ends red: `AntennaRight` ended 0.3217 rad from where stow puts it,
-  `AntennaLeft` 0.1115 rad, with per-cycle 20 ms-late slots through the run and
-  the standing `0x01` byte on all nine servos. The gap and jitter figures above
-  were recorded only for the parked runs; whether those anomalies persist under
-  motion is unrecorded either way. The tripwire is the report itself — every run
-  reproduces the verdict, and `make motion-run` exits on it. A change in the
-  shape goes to a person, and no arrival tolerance is resized to make a run
-  green.
+- **The first motion runs end red.** The four `make motion-run` runs on
+  `reachy00` on 2026-08-26 all produced a red report, in two shapes. The first
+  shape is a session that parks at the start: `STARTING → PARKED` rather than
+  `RESTING`, zero motion scripts reaching the session, one aux transaction back
+  `REFUSED`, and nothing ever energised — zero samples carrying both a reading
+  and a setpoint, head and antenna lag 0.0000 rad. The second shape is a session
+  that commissions, wakes and moves: it reached both targets, stowed to within
+  0.0261 rad on the worst of nine joints, and confirmed torque off on all nine
+  rows, and was called red by the report anyway. **No fault fired in any of the
+  four** — every red mark came from the analyzer, not from the machine.
+
+  What has since been settled, and what has not:
+
+  - *Why the parked runs parked is unrecoverable, and the refusal is not what it
+    was first read as.* No verdict was recorded at the time. The refused
+    transaction in each was recovered by identity: corr 0, `PING` servo 10, the
+    first transaction of the commissioning survey. For *that* identity the
+    driver has no pre-bus decline that can fire — servo 10 is an addressed id
+    (`crates/reachy-motion/src/arm.rs`, `SERVO_IDS`), a ping reaches neither the
+    value-shape nor the register refusals
+    (`crates/reachy-motord/src/aux.rs`), and of the bus layer's declining arms
+    only `Encode` is on the ping path, which fails for a non-unicast id or a
+    too-small buffer and neither holds (`crates/dxl-proto/src/encode.rs`). So
+    the lone logged `REFUSED` reads as the busy-slot answer to a delivery
+    re-issue that arrived while the original still sat in the driver's slot
+    (`crates/reachy-motord/src/tick.rs`) — slot pacing, the transport doing its
+    job. The evidence differs per run: `144512Z`'s log records the re-issue
+    byte for byte; `144804Z`'s lost the duplicate to the head truncation, and
+    its corroboration is the driver's counters (`session_cmds=2, taken=2,
+    aux_refused=1` — two datagrams offered, one refused, and a logged outcome
+    that per the counter semantics only the busy answer produces). Those
+    counters carry the shortfall caveat the next observation states.
+
+    A delivery retry re-issues only an *unanswered* datagram, so what this
+    points at is the survey's **first ping drawing no answer in time** in two of
+    four runs on the same unit — an open question about the bus and servo 10,
+    not a driver-side decline. What parked the session is still unrecoverable:
+    each run's log is short of the driver's own datagram count at the front
+    (`TODO(olog-head-capture)`), so the transaction that decided the park may be
+    one the log never held. `commission_failed` now narrates the verdict, so the
+    next parked run says why itself.
+  - *The antennas did reach stow.* The bit-identical 0.3217 rad `AntennaRight`
+    figure in both moving runs is the deterministic endpoint of the profiled
+    antenna motion at the moment the script's schedule ran out, which is where
+    the report used to judge it. Measured at the release instead, the two runs
+    read 0.0050 / 0.0057 rad and 0.0004 / 0.0026 rad against a 0.1 rad
+    tolerance. Not an anomaly; what remains open is that the antennas need
+    longer than the scripted 3 s stow step, with the servo profile behind that
+    still unmeasured (`TODO(session-servo-profile)`).
+  - *The gap and jitter anomalies persist under motion.* 132–134 one-slot skips
+    per moving run and one two-slot skip, against 59 per parked run; worst read
+    jitter 8.63 ms, mean 4.771 ms, against a 20 ms grid. The suspicion is
+    out-of-band bus work pushing a cycle past its slot — the parked runs' skips
+    arrive on the 500 ms health-poll cadence — but nothing in those four runs
+    measured a cycle, so the suspicion is unconfirmed. The driver now measures
+    per-cycle work and aux-exchange spans and publishes them; a run taken with
+    that in place is what sizes `TODO(cycle-skip-budget)`, and until a person
+    reviews such a run, one missed slot is still red.
+
+  The tripwire is the report itself — every run reproduces its verdict, and
+  `make motion-run` exits on it. A change in the shape goes to a person, and no
+  arrival tolerance is resized to make a run green.
+- **The pin sweep's write read back one quantum different — settled.** Once, in
+  the last moving run: corr 131, servo 15 `GOAL_POSITION`, wrote -1.0032 rad and
+  read back -1.0017 rad, a difference of 0.0015 rad, which is one servo position
+  count (0.088°). The mechanism is the engage sequence's pin sweep: it writes
+  each joint's measured angle to the goal register **while torque is off**, and
+  with torque off this platform's goal register mirrors the present position —
+  so the read-back is the servo's own count at that instant, not the write. The
+  sweep neither depends on the write sticking nor judges the answer, so at some
+  nonzero rate the mirrored count differs from the one written and a read-back
+  that nobody reads reports a mismatch.
+
+  The earlier reading of this — "an angle whose commanded value fell between two
+  counts" — was impossible: the comparison is count-exact on the same rounded
+  count on both sides, so a value between counts cannot produce a difference.
+  The resolution is in the transaction vocabulary rather than in the report or
+  the comparison: the pin sweep now asks for the unverified write
+  (`AuxOpKind::write_reg` — value on the wire, acknowledgement taken, nothing
+  read back), which is the transaction a sequence that documents it will not
+  judge a read-back should be issuing. The verified write's count-exact
+  comparison did not move and no tolerance was introduced anywhere; the report
+  still calls any `VERIFY_MISMATCH` a failure, and after this change every
+  verified `GOAL_POSITION` write is gone from the command paths, so that rule
+  has no by-design exception left to fire on.
+- **The recorded trail is shorter than the run.** In all four runs the `.olog`
+  holds fewer `SessionCmdChan` datagrams than the driver counted taking off its
+  own socket — one short in each parked run, ten and four short in the moving
+  runs — and each moving run also holds an outcome whose request is missing. The
+  mechanism is confirmed in the pinned Clockwork drop's source, and it is the
+  start of the run that is lost: the supervisor starts the logger and the payload
+  processes in no particular order and waits for no readiness, the logger opens
+  its subscriptions lazily on a poll after it opens the log, and on attaching to
+  a channel of the kind every channel here is, the observer snaps its cursor to
+  the write head — skipping whatever the ring is still holding. Enlarging the
+  ring therefore recovers nothing: retention is not the limit, the attach
+  position is. Tracked as `TODO(olog-head-capture)`, which is where the two
+  routes out of it are written down. The report cross-checks its joined totals
+  against the driver's counters and calls a shortfall a finding **against the
+  log, not against the run**; that check is the tripwire, and it is why
+  `--console` is worth handing it. Reading a truncated trail as a complete one is
+  the failure this guards against.
+- **A log recorded before a schema append cannot be read by a build after it.**
+  Not an anomaly — a determination, recorded here because it costs a run's
+  evidence, and the limit is this *reader's* rather than the log format's. The
+  `.olog` does store each channel's full serialized schema, and the upstream C++
+  and Python readers of the pinned drop decode an older recording through an
+  upgrader keyed on evolution declarations in the `.clk` grammar. The Rust reader
+  this repo analyses logs with binds none of that: byte-equality of the schema
+  definition plus an exact-size decode are its only schema facilities, and no
+  schema in this tree declares an evolution history. So an appended enum value
+  fails the binding check and an appended field additionally changes the wire
+  size, and no relaxation of the check could decode an old payload without a
+  decode engine behind it. The four runs above predate the `reports.clk`,
+  `driver/health.clk` and `motion/bus_txn.clk` appends and need a build from
+  before them to read. Analyze a run's records with the build that recorded them,
+  or before you append — and `provenance.txt` at the root of a fetched records
+  directory is what names that build. Closing the gap instead would take an
+  upstream ask plus history declarations in these schemas; nothing here forecloses
+  it, and nothing here has designed it.
 - **The chronic `0x01` input-voltage latch.** All nine servos latch the
   input-voltage bit during ordinary running. A `reboot` clears them to `0x00`
   and running re-latches them. The suspicion is a supply dip under load, and

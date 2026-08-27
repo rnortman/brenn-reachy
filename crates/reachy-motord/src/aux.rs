@@ -30,6 +30,7 @@ use dxl_proto::regs::{
 use reachy_bus::{Bus, BusPort, RawValue, ServoMap, XactError, named_reg, value_kind};
 use reachy_motion::arm::row_of_id;
 use reachy_motion::joints::ROW_COUNT;
+use reachy_motion::txn::{self, WriteAnswer};
 use reachy_motion::value::{self, Value};
 
 /// One transaction, copied out of the record the slot holds.
@@ -143,11 +144,17 @@ impl Answer {
 
 /// Run one host transaction against the machine.
 ///
-/// The three transactions the vocabulary has: does something at this id answer,
-/// read one register, write one register and read it back. The last is the only
-/// one that changes anything, and it is verified by the bus layer itself — an
-/// unverified write says nothing about a machine, and a belief built out of one
-/// would make the dead-man measure the driver's own sends.
+/// The four transactions the vocabulary has: does something at this id answer,
+/// read one register, write one register and read it back, and write one
+/// register taking only the acknowledgement. The two writes are the only ones
+/// that change anything.
+///
+/// The verified write is what a belief about the machine is built out of: the
+/// bus layer's own read-back is the evidence, and a belief built out of a bare
+/// acknowledgement would make the dead-man measure the driver's own sends. The
+/// unverified one is admitted through the same checks and answers `ok` on the
+/// acknowledgement, carrying no value — it exists for a caller that documents
+/// it does not judge the read-back, and nothing here turns it into evidence.
 pub fn answer<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
@@ -174,7 +181,9 @@ pub fn answer<P: BusPort>(
             Err(failure) => failed(corr, map, row, request.reg, &failure),
         },
         AuxOpKind::ReadReg => read_reg(bus, map, corr, row, request),
-        AuxOpKind::WriteRegVerified => write_verified(bus, map, corr, row, request),
+        AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => {
+            run_write(bus, map, corr, row, request)
+        }
     }
 }
 
@@ -201,15 +210,30 @@ fn read_reg<P: BusPort>(
     }
 }
 
-/// Write one register and read it back, so the answer is what the servo holds
-/// rather than what was sent.
-fn write_verified<P: BusPort>(
+/// Write one register, taking the answer the request's own operation names.
+///
+/// One admission path for both writes: the register's value shape, the shape the
+/// host built, the encoding and the bus layer's own declining arms are checked
+/// identically, and only what counts as the answer differs. A second path would
+/// be a second set of gates to drift apart.
+///
+/// Which answer to take is read off `request.op` through
+/// [`txn::write_answer`], not passed in: the request already carries the
+/// operation, and a caller restating it is a second source of truth for one
+/// fact.
+fn run_write<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
     corr: u32,
     row: usize,
     request: &Request,
 ) -> Answer {
+    // An operation that is not a write reaches this only from a dispatch arm
+    // that grew one without classifying it, which is a request this driver
+    // cannot run rather than one it should guess at.
+    let Some(answer) = txn::write_answer(request.op) else {
+        return Answer::refused(corr);
+    };
     let Ok(shape) = value_kind(request.reg) else {
         return Answer::refused(corr);
     };
@@ -230,10 +254,23 @@ fn write_verified<P: BusPort>(
         // command.
         return Answer::refused(corr);
     };
-    match bus.write_reg_verified(request.id, reg, &raw) {
+    let (outcome, answered) = match answer {
         // The bus layer's own read-back matched what went out, so what the
         // servo holds is the value the request carried.
-        Ok(()) => Answer::value(corr, held),
+        WriteAnswer::ReadBack => (
+            bus.write_reg_verified(request.id, reg, &raw),
+            Answer::value(corr, held),
+        ),
+        // The servo took the instruction. Nothing was read back, so the answer
+        // carries no value: a value here would be the driver reporting its own
+        // send as the machine's state.
+        WriteAnswer::Acknowledgement => (
+            bus.write_reg_unverified(request.id, reg, &raw),
+            Answer::bare(corr, AuxStatus::Ok),
+        ),
+    };
+    match outcome {
+        Ok(()) => answered,
         Err(failure) => failed(corr, map, row, request.reg, &failure),
     }
 }
@@ -414,11 +451,13 @@ mod tests {
     use brenn_reachy__driver__health_clk_rs::AuxStatus;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKind;
-    use dxl_proto::{EncodeError, FrameError, StatusError};
+    use dxl_proto::frame::{HEADER, INST_READ, INST_STATUS, INST_WRITE};
+    use dxl_proto::{EncodeError, FrameError, StatusError, crc16};
     use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, XactError};
     use reachy_motion::arm::SERVO_IDS;
     use reachy_motion::value;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::io;
     use std::rc::Rc;
     use std::time::Instant;
@@ -449,6 +488,75 @@ mod tests {
     #[derive(Clone, Default)]
     struct Recorder {
         sent: Rc<Cell<usize>>,
+    }
+
+    /// A port that acknowledges every write and answers every read with zeros,
+    /// keeping the instruction byte of each frame it was given.
+    ///
+    /// What a case about the two writes needs: the answer alone cannot tell a
+    /// write that was read back from one that was not, and the instructions on
+    /// the wire can.
+    #[derive(Clone, Default)]
+    struct Servo {
+        instructions: Rc<RefCell<Vec<u8>>>,
+        out: Rc<RefCell<VecDeque<u8>>>,
+    }
+
+    impl Servo {
+        /// A status frame carrying `params`, as a servo puts one on the wire.
+        fn reply(&mut self, id: u8, params: &[u8]) {
+            let mut frame = Vec::from(HEADER);
+            frame.push(id);
+            let len = u16::try_from(params.len() + 4).expect("a fixture reply is short");
+            frame.extend_from_slice(&len.to_le_bytes());
+            frame.push(INST_STATUS);
+            frame.push(0);
+            frame.extend_from_slice(params);
+            frame.extend_from_slice(&crc16(&frame).to_le_bytes());
+            self.out.borrow_mut().extend(frame);
+        }
+    }
+
+    impl BusPort for Servo {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            let id = buf[4];
+            let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
+            let instruction = buf[7];
+            let params = &buf[8..8 + len - 3];
+            self.instructions.borrow_mut().push(instruction);
+            match instruction {
+                // A write is acknowledged with no parameters at all.
+                INST_WRITE => self.reply(id, &[]),
+                INST_READ => {
+                    let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
+                    self.reply(id, &vec![0u8; width]);
+                }
+                // Silence, so a case about an instruction this path should not
+                // send fails on a timeout rather than on a helpful fixture.
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn read_some(&mut self, buf: &mut [u8], _deadline: Instant) -> io::Result<usize> {
+            let mut taken = 0;
+            let mut out = self.out.borrow_mut();
+            while taken < buf.len() {
+                match out.pop_front() {
+                    Some(byte) => {
+                        buf[taken] = byte;
+                        taken += 1;
+                    }
+                    None => break,
+                }
+            }
+            Ok(taken)
+        }
+
+        fn discard_input(&mut self) -> io::Result<()> {
+            self.out.borrow_mut().clear();
+            Ok(())
+        }
     }
 
     impl BusPort for Recorder {
@@ -548,6 +656,78 @@ mod tests {
             assert_eq!(answer.status, AuxStatus::Refused, "{what}");
             assert_eq!(answer.value_kind, ValueShape::None, "{what}");
             assert_eq!(answer.value, 0, "{what}");
+            assert_eq!(sent, 0, "{what}: nothing reached the wire");
+        }
+    }
+
+    /// The instructions each write puts on the wire, and the answer each one
+    /// comes back with.
+    ///
+    /// The unverified write is one frame and answers `ok` carrying nothing: the
+    /// driver was told the servo took the instruction and knows nothing about
+    /// the register, so an answer carrying a value would be the driver reporting
+    /// its own send as the machine's state. The verified write is two frames and
+    /// answers with the value.
+    #[test]
+    fn the_unverified_write_takes_the_acknowledgement_and_asks_for_no_read_back() {
+        let cases = [
+            (AuxOpKind::WriteReg, vec![INST_WRITE], ValueShape::None, 0),
+            (
+                AuxOpKind::WriteRegVerified,
+                vec![INST_WRITE, INST_READ],
+                ValueShape::U8,
+                0,
+            ),
+        ];
+        for (op, expected, shape, bits) in cases {
+            let port = Servo::default();
+            let instructions = Rc::clone(&port.instructions);
+            let mut bus = Bus::new(port, BusTiming::default());
+            let request = asking(op, SERVO_IDS[ROW], RegId::TorqueEnable, value::u8(0));
+            let answer = answer(&mut bus, &map(), CORR, &request);
+            assert_eq!(answer.corr, CORR, "{op:?}");
+            assert_eq!(answer.status, AuxStatus::Ok, "{op:?}");
+            assert_eq!(answer.value_kind, shape, "{op:?}");
+            assert_eq!(answer.value, bits, "{op:?}");
+            assert_eq!(*instructions.borrow(), expected, "{op:?}");
+        }
+    }
+
+    /// Both writes are admitted by the same checks, so a request the verified
+    /// one refuses before the wire is refused unverified too.
+    #[test]
+    fn the_unverified_write_is_admitted_by_the_checks_the_verified_one_is() {
+        let cases = [
+            (
+                "a write naming no register",
+                asking(AuxOpKind::WriteReg, SERVO_IDS[0], RegId::None, value::u8(1)),
+            ),
+            (
+                "a value in a shape the register does not take",
+                asking(
+                    AuxOpKind::WriteReg,
+                    SERVO_IDS[0],
+                    RegId::TorqueEnable,
+                    value::radians(0.5),
+                ),
+            ),
+            (
+                "an angle no servo count reaches",
+                asking(
+                    AuxOpKind::WriteReg,
+                    SERVO_IDS[0],
+                    RegId::GoalPosition,
+                    value::radians(f64::from(i32::MAX)),
+                ),
+            ),
+            (
+                "an id this machine does not have",
+                asking(AuxOpKind::WriteReg, 200, RegId::GoalPosition, value::u8(1)),
+            ),
+        ];
+        for (what, request) in cases {
+            let (answer, sent) = ran(&request);
+            assert_eq!(answer.status, AuxStatus::Refused, "{what}");
             assert_eq!(sent, 0, "{what}: nothing reached the wire");
         }
     }

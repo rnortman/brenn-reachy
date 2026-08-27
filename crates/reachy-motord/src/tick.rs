@@ -235,6 +235,11 @@ pub struct TickCounts {
 }
 
 impl TickCounts {
+    /// The label the refused-offer count is printed under. A `pub const` for
+    /// the reason [`crate::inbound::Counts::SESSION_CMDS`] is: the offline
+    /// report reads this number back out of the driver's summary line.
+    pub const AUX_REFUSED: &str = "aux_refused";
+
     /// Every count, as labelled numbers for a log line.
     #[must_use]
     pub fn read(&self) -> [(&'static str, u64); 12] {
@@ -246,12 +251,51 @@ impl TickCounts {
             ("write_failures", self.write_failures),
             ("blind_cycles", self.blind_cycles),
             ("events_dropped", self.events_dropped),
-            ("aux_refused", self.aux_refused),
+            (Self::AUX_REFUSED, self.aux_refused),
             ("aux_deferred", self.aux_deferred),
             ("health_reports", self.health_reports),
             ("health_misses", self.health_misses),
             ("confirm_misses", self.confirm_misses),
         ]
+    }
+}
+
+/// The out-of-band work a cycle actually runs: an [`AuxTask`] with the
+/// do-nothing one answered.
+///
+/// It exists so that "there is nothing to run" is said exactly once. A cycle
+/// with no transaction leaves before the two clock reads that bracket the
+/// exchange, and a `match` that still carried an arm for it would read as if the
+/// no-op were handled in both places -- with the guard the live one and the arm
+/// dead, which is a shape the next reader has to prove to themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuxRun {
+    /// Execute the host transaction the slot holds under this `corr`.
+    Host {
+        /// The host's correlation number, which the outcome echoes.
+        corr: u32,
+    },
+    /// Read this row's torque-enable register back.
+    ConfirmTorqueOff {
+        /// The bus row.
+        row: u8,
+    },
+    /// Read this row's status registers and publish a health report.
+    Health {
+        /// The bus row.
+        row: u8,
+    },
+}
+
+impl AuxRun {
+    /// The work `task` names, or nothing where it names none.
+    fn of(task: AuxTask) -> Option<Self> {
+        match task {
+            AuxTask::Nothing => None,
+            AuxTask::Host { corr } => Some(AuxRun::Host { corr }),
+            AuxTask::ConfirmTorqueOff { row } => Some(AuxRun::ConfirmTorqueOff { row }),
+            AuxTask::Health { row } => Some(AuxRun::Health { row }),
+        }
     }
 }
 
@@ -270,6 +314,11 @@ pub struct CycleReport {
     pub outcome: Option<AuxOutcomeWire>,
     /// The health rotation's report, on the cycles it read a servo.
     pub health: Option<HealthReportWire>,
+    /// How long this cycle's out-of-band transaction took, on the cycles that
+    /// ran one. Measured across the exchange itself and nothing else, so it is
+    /// the cost of the one piece of a cycle whose duration is otherwise only
+    /// ever guessed at.
+    pub aux_span_ns: Option<i64>,
 }
 
 /// The bus half of the driver: a port, the servo map, and the decisions' state.
@@ -288,6 +337,8 @@ pub struct Tick<P: BusPort> {
     pending: Option<Event>,
     /// The answer this cycle will publish.
     answer: Option<Answer>,
+    /// How long this cycle's out-of-band exchange took, where it ran one.
+    aux_span_ns: Option<i64>,
     counts: TickCounts,
 }
 
@@ -309,6 +360,7 @@ impl<P: BusPort> Tick<P> {
             blind_run: 0,
             pending: None,
             answer: None,
+            aux_span_ns: None,
             counts: TickCounts::default(),
         }
     }
@@ -450,6 +502,7 @@ impl<P: BusPort> Tick<P> {
 
     /// Run one cycle at grid instant `nominal_ns`, and answer what to publish.
     pub fn run(&mut self, nominal_ns: i64) -> CycleReport {
+        self.aux_span_ns = None;
         let read = self.read_positions();
         // The one clock read of a cycle, taken the moment the proprioception
         // came back: `sample_time - nominal_time` is then the cycle's jitter,
@@ -479,6 +532,7 @@ impl<P: BusPort> Tick<P> {
             event,
             outcome,
             health,
+            aux_span_ns: self.aux_span_ns,
         }
     }
 
@@ -579,9 +633,15 @@ impl<P: BusPort> Tick<P> {
             }
             AuxTask::Nothing
         };
-        match task {
-            AuxTask::Nothing => None,
-            AuxTask::Host { corr } => {
+        let task = AuxRun::of(task)?;
+        // The one part of a cycle whose cost is measured rather than budgeted
+        // for, and the bracket is around the exchange alone: what `aux_fits`
+        // spends its bounds on is the transaction, so the transaction is what
+        // the bounds are answerable to. Two clock reads, and only on the cycles
+        // that run one.
+        let started_ns = now_ns();
+        let report = match task {
+            AuxRun::Host { corr } => {
                 // The record stays in the slot and the transaction runs from a
                 // copy of it: running it writes the state the record lives in.
                 let (_, slot) = self.state.decide();
@@ -595,7 +655,7 @@ impl<P: BusPort> Tick<P> {
                 }
                 None
             }
-            AuxTask::ConfirmTorqueOff { row } => {
+            AuxRun::ConfirmTorqueOff { row } => {
                 let id = self.map.id_at(usize::from(row));
                 // A row with no servo behind it reads as still holding, for the
                 // reason an unanswered read does: nothing has been seen to go
@@ -608,7 +668,7 @@ impl<P: BusPort> Tick<P> {
                 self.state.confirming().observed(row, torqued);
                 None
             }
-            AuxTask::Health { row } => {
+            AuxRun::Health { row } => {
                 let mut message = HealthReportWire::new();
                 if aux::health(
                     &mut self.bus,
@@ -628,7 +688,9 @@ impl<P: BusPort> Tick<P> {
                     None
                 }
             }
-        }
+        };
+        self.aux_span_ns = Some(now_ns().saturating_sub(started_ns));
+        report
     }
 
     /// Move the belief a verified torque-enable write earns.
@@ -1765,6 +1827,42 @@ mod tests {
         assert_eq!(tick.counts().health_reports, 1);
     }
 
+    /// A cycle that ran an out-of-band transaction says what the exchange
+    /// cost, and one that ran none says nothing rather than zero.
+    ///
+    /// The span is the only measured number a cycle produces about its own bus
+    /// work, and what the loop's window is built out of. A cycle report that
+    /// stopped answering with one -- a task the run path no longer recognises,
+    /// a bracket that moved -- would leave the window permanently empty and the
+    /// report reading "an unmeasured span" for the life of every run, with
+    /// nothing else in the tree objecting.
+    #[test]
+    fn a_cycle_that_ran_a_transaction_says_what_the_exchange_cost() {
+        let (mut tick, _machine) = driver(Machine::at(2048));
+
+        let read = tick.run(T0);
+        assert!(
+            read.health.is_some(),
+            "the rotation reads a servo on the first cycle"
+        );
+        let span = read
+            .aux_span_ns
+            .expect("a cycle that ran a transaction measured it");
+        assert!(
+            span >= 0,
+            "a clock nobody stepped measures no negative span"
+        );
+
+        // The next cycle is well inside the rotation's period and has nothing
+        // else to run.
+        let idle = tick.run(T0 + reachy_driver::NOMINAL_CYCLE_NS);
+        assert!(idle.health.is_none(), "the rotation is not due again");
+        assert_eq!(
+            idle.aux_span_ns, None,
+            "a cycle with nothing to run measured nothing, which is not a span of zero"
+        );
+    }
+
     #[test]
     fn a_servo_that_answers_nothing_gets_no_health_report_at_all() {
         let mut machine = Machine::at(2048);
@@ -2142,6 +2240,64 @@ mod tests {
             .iter()
             .filter(|(_, addr, _)| *addr == TORQUE_ENABLE.addr)
             .count()
+    }
+
+    #[test]
+    fn an_unverified_torque_write_is_admitted_and_earns_no_belief() {
+        let (mut tick, machine) = driver(Machine::at(2048));
+        // A standing latch, so both halves an arming ends are there to be
+        // wrongly ended: the belief, and the latch with the pass reading it back.
+        tick.offer_session_cmd(asked(&command(SessionCmdKind::TorqueOffNow)), T0);
+        tick.run(T0);
+
+        let ask = request(
+            5,
+            AuxOpKind::WriteReg,
+            SERVO_IDS[0],
+            RegId::TorqueEnable,
+            value::u8(1),
+        );
+        tick.offer_session_cmd(asked(&ask), T0 + 20_000_000);
+        let report = tick.run(T0 + 20_000_000);
+        assert_eq!(
+            report
+                .outcome
+                .expect("the write is answered")
+                .validate()
+                .expect("an outcome this cycle wrote")
+                .status,
+            AuxStatus::Ok,
+            "the write is admitted: it is the belief it does not earn",
+        );
+        assert_eq!(
+            machine.borrow().get(SERVO_IDS[0], TORQUE_ENABLE),
+            Some(&[1][..]),
+            "and the servo took it",
+        );
+
+        // What an acknowledgement is not evidence of. The driver read nothing
+        // back, so this is its own send: crediting it would have the dead-man
+        // measuring the driver rather than the machine, and would end a latch
+        // on the strength of it.
+        assert_eq!(
+            tick.state
+                .aux
+                .validate()
+                .expect("a slot this driver wrote")
+                .believed_torqued,
+            JointFlags::NONE,
+            "nothing is believed holding",
+        );
+        assert!(
+            bool::from(
+                report
+                    .sample
+                    .validate()
+                    .expect("a sample every cycle")
+                    .torque_off_latched
+            ),
+            "and the latch stands",
+        );
     }
 
     #[test]

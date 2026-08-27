@@ -109,6 +109,9 @@ struct Outcome {
     status: AuxStatus,
     /// The answer's bits, whatever shape they are in.
     value: u64,
+    /// The shape those bits are in, which is `none` for an answer that carries
+    /// no value at all.
+    value_kind: ValueShapeWire,
     /// The model number a ping answered with.
     model: u16,
 }
@@ -310,6 +313,7 @@ impl Sim {
                 corr: outcome.corr,
                 status: outcome.status,
                 value: outcome.value,
+                value_kind: ValueShapeWire::from(outcome.value_kind),
                 model: outcome.model,
             }
         });
@@ -1756,6 +1760,101 @@ fn a_verified_goal_write_reaches_a_limp_servo() {
         rows_of(&slot.positions)[8],
         stow_rows()[8],
         "and it has not moved, because nothing is holding it",
+    );
+}
+
+/// The pin sweep's write, which asks for no read-back: the register takes it and
+/// the answer carries nothing at all. The modelled driver has to answer that
+/// transaction the way the real one does, because the sweep is the one place a
+/// sequence issues it.
+#[test]
+fn an_unverified_goal_write_reaches_the_servo_and_answers_with_no_value() {
+    let mut sim = Sim::new();
+    sim.step();
+    let target = stow_rows()[8] + 0.25;
+
+    sim.transact(
+        6,
+        &transaction(
+            AuxOpKindWire::WRITE_REG,
+            18,
+            RegIdWire::GOAL_POSITION,
+            Some(value::radians(target)),
+        ),
+    );
+    let outcome = sim.step().outcome.expect("the write was answered");
+    assert_eq!(outcome.status, AuxStatus::Ok);
+    assert_eq!(
+        outcome.value_kind,
+        ValueShapeWire::NONE,
+        "an acknowledgement is not a reading of anything",
+    );
+    assert_eq!(outcome.value, 0);
+
+    let slot = sim.slot();
+    assert_eq!(
+        rows_of(&slot.targets)[8],
+        target,
+        "the write reached the cell, which is the half that does not change",
+    );
+    assert!(flags::contains(slot.has_target, JointRef::AntennaLeft));
+    assert_eq!(
+        sim_regs::read(&slot.regs, 8, RegId::GoalPosition),
+        Ok(value::radians(target)),
+    );
+}
+
+/// An unverified torque-enable write energises the plant and moves nothing the
+/// driver believes: the answer is the driver's own send, and a dead-man measured
+/// against that would be watching the driver rather than the machine. The real
+/// driver refuses the credit for exactly that reason, and a simulator that
+/// granted it would let a test of the dead-man pass against a driver that does
+/// the opposite.
+#[test]
+fn an_unverified_torque_write_energises_the_plant_and_not_the_belief() {
+    let mut sim = Sim::new();
+    sim.step();
+    assert_eq!(
+        sim.slot().aux.believed_torqued,
+        JointFlags::NONE,
+        "nothing is believed holding to begin with",
+    );
+    // A standing torque-off latch, which is the other thing an arming ends.
+    let mut off = SessionCmdWire::new();
+    off.set_kind(SessionCmdKindWire::TORQUE_OFF_NOW);
+    sim.ask(&off);
+    sim.step();
+    assert!(sim.gate().latched.get());
+
+    sim.transact(
+        3,
+        &transaction(
+            AuxOpKindWire::WRITE_REG,
+            18,
+            RegIdWire::TORQUE_ENABLE,
+            Some(value::u8(1)),
+        ),
+    );
+    let cycle = sim.step();
+    assert_eq!(
+        cycle.outcome.expect("the write was answered").status,
+        AuxStatus::Ok,
+        "the write is admitted -- it is the belief that is not earned",
+    );
+
+    let slot = sim.slot();
+    assert!(
+        flags::contains(slot.torqued, JointRef::AntennaLeft),
+        "the servo took the instruction, so the plant is energised",
+    );
+    assert_eq!(
+        slot.aux.believed_torqued,
+        JointFlags::NONE,
+        "and the driver believes nothing, because nothing was read back",
+    );
+    assert!(
+        slot.gate.latched.get(),
+        "and the latch stands, because nothing read back says the row is holding",
     );
 }
 

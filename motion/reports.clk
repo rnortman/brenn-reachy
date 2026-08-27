@@ -79,6 +79,22 @@ enum ReportKind
         // A group-scoped de-torque finished writing: `a` the response that
         // called for it, `b` the rows released.
         #13 degrade_released { underlying_value: 13; }
+        // The commissioning survey refused the machine, which is the whole
+        // reason a session parks out of starting: `a` the sequencer failure
+        // kind, `b` the servo it names by bus id -- zero where the failure
+        // names no single one -- and `detail` that kind's one headline number.
+        // Which number that is, is the kind's: the status code a servo refused
+        // with, the hardware-error bits it latched, the value a verified or
+        // provisioned read gave back, the lowest supply reading, the count of
+        // servos that did not answer, the model a servo claims, the angle that
+        // places nothing, the first of the two numbers a solve failure carries
+        // -- and zero for the failures whose evidence is that nothing came back
+        // at all. It is a headline, not the verdict: the whole of it stays in
+        // the session's state slot, where a live debugger reads it. Where the
+        // kind is `verdict_unreadable` the slot itself did not read back, and
+        // `detail` is the refusal's own small number instead -- which of the
+        // ways a slot fails to name a failure this was.
+        #14 commission_failed { underlying_value: 14; }
     }
 }
 

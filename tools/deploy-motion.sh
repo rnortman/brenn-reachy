@@ -9,7 +9,9 @@
 #   --push       rsync the payload into the unit's RAM and create the directory
 #                the logger writes into. Refuses a payload older than the newest
 #                commit to the workspace, and refuses while anything else on the
-#                unit holds the servo bus.
+#                unit holds the servo bus. Stamps the workspace's commit beside
+#                the payload, which is what a fetched run's records name their
+#                build by; a push that cannot state its own commit refuses.
 #   --stale-ok   push the old payload anyway.
 #   --run        empty the unit's log root, start the pushed payload on it for a
 #                fixed budget, stream its console here, then fetch the records
@@ -23,6 +25,16 @@
 #                under a name stamped with the moment they were fetched so a
 #                session's runs accumulate rather than overwrite. Refuses a fetch
 #                that brought no records rather than reporting over nothing.
+#
+# A fetch brings back two things under one stamp: `motion-log-<stamp>`, the
+# records the analyzer judges — with `provenance.txt` at its root naming the
+# build that recorded them — and `motion-log-<stamp>.console` beside it,
+# holding the console output of everything the launcher started. A run adds its
+# own console stream and the unit's clock discipline, read before and after, to
+# the second of those. None of it says anything about the machine: the driver's
+# console counts what it took off its socket, which is what the recorded trail
+# is cross-checked against, and the clock captures say whether the time base the
+# whole log is stamped in could have stepped underneath it.
 #
 # A motion run is **three OS processes**, not one: `reachy_motord` (the servo
 # bus), and two `robot_clk_exe` processes over the one synthesized executable
@@ -38,10 +50,11 @@
 #
 # Two device paths, both in RAM — nothing a dev cycle pushes touches the eMMC:
 #
-#   /run/brenn-app/releases/motion  the payload. A tmpfs, and mounted exec where
-#       /run itself is not, so a binary has to live here to run at all. The
-#       processes are started with this as their working directory, because every
-#       configuration file in the payload is named by a path relative to it.
+#   /run/brenn-app/releases/motion  the payload, in the /run/brenn-app tmpfs
+#       submount, which is mounted exec where /run itself is not, so a binary
+#       has to live here to run at all. The processes are started with this as
+#       their working directory, because every configuration file in the payload
+#       is named by a path relative to it.
 #
 #   /run/brenn-app/logs/motion  where the logger writes. Read out of the staged
 #       payload's own cogs/robot_logger.textproto rather than stated here,
@@ -78,7 +91,7 @@ logger_config="${payload}/cogs/robot_logger.textproto"
 # left to say about them.
 #
 # The log directory is on the same tmpfs as the payload and the records; the
-# launcher creates it.
+# launcher creates it, a run empties it first, and a fetch brings it back.
 launch_config=robotcpu.textproto
 launch_logs="${store_mount}/logs/launch"
 
@@ -104,6 +117,31 @@ build_flags=()
 # One directory, reused. Nothing on this path activates a release, so nothing
 # prunes the store either; rsync --delete is what makes reuse idempotent.
 release="${store_mount}/releases/motion"
+
+# The name the push's account of which build the payload is goes by, at the root
+# of the payload and at the root of a run's log root. Part of the payload: it is
+# written into the staged directory before the push, so the one rsync that
+# delivers the payload delivers the stamp with it and a stamp on the unit
+# describes the payload beside it by construction. The build stages that
+# directory from scratch, so nothing stale is left there to push. The copy in the
+# log root comes home with the records under the fetch's own name, with no
+# fetch-side logic to put it there.
+provenance_name=provenance.txt
+
+# Where a run parks its copy of the stamp while the log root is being emptied.
+#
+# Under the payload store and outside both the log root and the launcher's
+# console directory, so the wipe cannot take it, and on the same tmpfs as the log
+# root (`store_mount` is one mount, `tools/lib.sh`), so moving it in afterwards is
+# a rename within one filesystem rather than a copy that can fail on a full
+# tmpfs. That is the point of staging it: a copy made after the wipe is a
+# failure that has already destroyed the previous run's records.
+#
+# "Outside the log root" is a check and not a hope: the log root comes out of the
+# payload's logger configuration, and a value naming this path would have the run
+# stage the stamp and then wipe the stage. The `--run` validation below refuses
+# that configuration before anything on the unit is touched.
+staged_provenance="${store_mount}/motion-provenance.staged"
 
 # The payload runs as root, unlike a bench run: the control process needs
 # `/dev/shm` shared with the logger and the driver needs the serial node, and the
@@ -194,7 +232,7 @@ fetch_records() {
 	# refusal instead. A leftover .part is refused for the same
 	# reason: rsync would merge into it.
 	local existing
-	for existing in "$out" "$part"; do
+	for existing in "$out" "${out}.console" "$part"; do
 		if [ -e "$existing" ]; then
 			die "${existing} already exists, so this fetch has nowhere of its own to land." \
 				"Fetches are stamped to the second. Move it aside, or wait a second and fetch again."
@@ -226,8 +264,157 @@ fetch_records() {
 	fi
 
 	mv -- "$part" "$out"
+
+	# The consoles of everything the launcher started, beside the records
+	# rather than inside them. Beside, because `run_directory` takes the
+	# newest *directory* under the fetched root as the run: a directory of
+	# console files landing there would be taken as the run and the fetch
+	# would end in a refusal about a missing .olog.
+	#
+	# The whole directory, never a list of names: the launcher numbers its
+	# files per run and adds its own, so a spelled-out set silently misses
+	# whatever it did not know about.
+	#
+	# Best-effort throughout. What these files carry is the driver's own
+	# counters, which are evidence about the log rather than about the
+	# machine, and a run that produced records is worth reporting on whether
+	# or not its consoles came back.
+	local console="${out}.console"
+	mkdir -p -- "$console"
+	if rsync -a -e "ssh -o BatchMode=yes" \
+		"root@${host}:${launch_logs}/" "${console}/"; then
+		if [ -z "$(find "$console" -type f -print -quit)" ]; then
+			echo "${prog}: ${launch_logs} on ${host} held no console files" >&2
+		fi
+	else
+		echo "${prog}: no console logs fetched from ${host}:${launch_logs}" >&2
+	fi
+
 	echo "${prog}: ${out}" >&2
 	echo "$out"
+}
+
+# What build a run's records came off, into the file a run carries home.
+#
+#   stamp_provenance <file> <yes|no: was the payload's age left unchecked>
+#
+# The log reader binds each channel's schema byte for byte, so a run's records
+# are read with the build that recorded them and a records directory that cannot
+# name its build is one nobody can decode after the next `.clk` append. Nothing
+# else in a fetch says which build it was.
+#
+# What it can honestly claim is narrow, and it claims exactly that. The push-time
+# facts are weaker than they look: the freshness refusal compares the payload's
+# age against the newest commit and does not catch uncommitted edits, and
+# --stale-ok skips it altogether. And the pushing tree's HEAD is not by itself
+# the commit the binaries came from: a payload built at one commit can be pushed
+# from a checkout at any other, and the age refusal only turns away a payload
+# that is too old — an older checkout passes it and would be stamped with a
+# commit that never produced the binaries. So the commit the stamp names is the
+# one the build recorded in the payload (`build_commit_name`, lib.sh) whenever
+# the payload carries it, `commit_source` says which of the two answered, and
+# `pushed_from` keeps the pushing tree's HEAD beside it so a tree that moved
+# between the build and the push is visible rather than averaged away.
+#
+# The rest is the same honesty: whether the tree had uncommitted changes when it
+# was pushed, and whether the age was checked at all — a dirty or stale push says
+# so on its face instead of lying by omission, and a clean fresh one makes
+# reading the log a `git switch --detach`.
+#
+# A tree that cannot state its commit is a push refusal, not a stamp saying
+# nothing: the whole point of the file is that a fetched log names its build.
+stamp_provenance() {
+	local into=$1 age_unchecked=$2
+	local pushed_from dirty built commit commit_source
+	pushed_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || pushed_from=
+	[ -n "$pushed_from" ] ||
+		die "this tree cannot state its own commit, so a push from it could not say which build ran." \
+			"Every fetched records directory carries that commit, because a log is only" \
+			"readable by the build that recorded it. Push from a checkout with history."
+	built=
+	if [ -f "${payload}/${build_commit_name}" ]; then
+		built=$(sed -n 's/^commit=//p' -- "${payload}/${build_commit_name}")
+	fi
+	case $built in
+	'' | unknown)
+		# A payload staged by a build that recorded nothing — an older
+		# build script, or a build in a tree with no history. The
+		# pushing tree's HEAD is the only answer left, and the field
+		# below says that is what it is.
+		commit=$pushed_from
+		commit_source=push
+		;;
+	*)
+		commit=$built
+		commit_source=build
+		;;
+	esac
+	if ! dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
+		dirty=unknown
+	elif [ -n "$dirty" ]; then
+		dirty=yes
+	else
+		dirty=no
+	fi
+	cat >"$into" <<STAMP
+# Which build recorded the records beside this file. Written by ${prog} when the
+# payload was pushed and copied here by the run.
+#
+# The log reader binds a channel's schema byte for byte, so read these records
+# with the build that wrote them:
+#     git switch --detach ${commit}
+#
+# commit_source=build means the payload itself recorded that commit when it was
+# staged, which is the build the binaries came out of. commit_source=push means
+# the payload recorded none and this is the pushing tree's HEAD instead, which
+# describes the binaries only if that tree had not moved since the build.
+# pushed_from is that HEAD either way: where it differs from commit, the tree
+# moved between the build and the push and commit is the one that built.
+#
+# dirty=yes means the workspace held uncommitted changes at push time, so that
+# commit does not fully describe what ran. dirty=unknown means the repository
+# would not answer the status question at push time, so whether there were any is
+# not known. age_unchecked=yes means the push skipped the refusal that compares
+# the payload's age against the newest commit, so the payload may predate that
+# commit.
+commit=${commit}
+commit_source=${commit_source}
+pushed_from=${pushed_from}
+dirty=${dirty}
+age_unchecked=${age_unchecked}
+pushed=$(date -u +%Y%m%dT%H%M%SZ)
+STAMP
+	echo "${prog}: provenance: commit ${commit} (${commit_source}), pushed from ${pushed_from}," \
+		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
+}
+
+# The unit's clock discipline, into a file of its own.
+#
+#   capture_clock <file>
+#
+# What a run's timestamps mean depends on whether the time daemon slews or
+# steps: a backwards CLOCK_REALTIME step is the loss of the driver's time base,
+# and nothing in a run's records says whether the daemon can take one. Captured
+# before and after a run, so a step during it shows up as two readings that
+# disagree.
+#
+# Best-effort in every direction: whichever daemon is installed answers,
+# whatever is absent says so, and a unit that answers nothing leaves a file
+# saying that rather than failing a run that has already happened.
+capture_clock() {
+	local into=$1
+	local probe
+	probe='timedatectl show 2>&1; timedatectl timesync-status 2>&1'
+	probe="${probe}; for unit in systemd-timesyncd chronyd ntpd ntpsec; do"
+	probe="${probe} systemctl is-active --quiet \$unit &&"
+	probe="${probe} systemctl status --no-pager --lines=0 \$unit 2>&1; done"
+	probe="${probe}; command -v chronyc >/dev/null && chronyc tracking 2>&1"
+	probe="${probe}; true"
+	{
+		echo "# ${host} clock state, $(date -u +%Y%m%dT%H%M%SZ)"
+		ssh -o BatchMode=yes "root@${host}" "$probe" 2>&1 ||
+			echo "# ${host} answered nothing about its clock"
+	} >"$into"
 }
 
 host=${1:-}
@@ -246,8 +433,10 @@ case "$mode" in
 				"Rebuild it: make motion-build"
 		done
 
+		age_unchecked=no
 		if [ "${1:-}" = "--stale-ok" ]; then
 			shift
+			age_unchecked=yes
 			echo "${prog}: --stale-ok: the payload's age is not being checked" >&2
 			[ $# -eq 0 ] || usage
 		else
@@ -263,6 +452,12 @@ case "$mode" in
 		fi
 
 		log_root=$(config_string log_root_dir)
+
+		# Into the staged payload, so the one rsync below carries it and
+		# the stamp on the unit can only describe the payload it landed
+		# with. Written before anything reaches the unit, so a tree that
+		# cannot state its commit refuses without having touched it.
+		stamp_provenance "${payload}/${provenance_name}" "$age_unchecked"
 
 		# The bus question is asked before anything is pushed, in the
 		# same remote invocation that makes the two directories — so a
@@ -372,19 +567,108 @@ case "$mode" in
 				"so it has to be inside the payload store."
 			;;
 		esac
+		# The staging path the stamp waits at while the log root is
+		# emptied has to survive that wipe, and the log root is a
+		# configured value: one naming the stage, or a directory under
+		# it, would have the run stage the stamp into the very path it is
+		# about to remove and then fail the move in -- a
+		# records-are-gone refusal caused by a name collision, with
+		# nothing in the message pointing at it.
+		case $log_root in
+		"${staged_provenance}" | "${staged_provenance}"/*)
+			die "${logger_config}'s log_root_dir is '${log_root}', which is where a run stages its provenance stamp." \
+				"The stamp is put there before the log root is emptied and moved in afterwards," \
+				"so the log root has to be somewhere else under ${store_mount}."
+			;;
+		esac
+		# The payload the launcher runs out of is under the store too, and
+		# a log root naming the release directory -- or any directory
+		# holding it -- would have the run delete the binaries it is
+		# about to start. Every check ahead of the wipe passes, the wipe
+		# takes the payload, and the failure surfaces two steps later as
+		# the `cd` into a release that is no longer there: a
+		# records-are-gone refusal blaming the store for a payload this
+		# run removed, when the fix is a push.
+		case $release in
+		"${log_root}" | "${log_root}"/*)
+			die "${logger_config}'s log_root_dir is '${log_root}', which holds the payload at ${release}." \
+				"A run empties that directory on the unit as root before it starts, so this one" \
+				"would delete the binaries it then tries to run; the log root has to be somewhere" \
+				"else under ${store_mount}."
+			;;
+		esac
+		# This chain's own exit codes, named where they are emitted and
+		# read by name in the status `case` below, so an emit and its
+		# refusal cannot drift apart in two places 120 lines from each
+		# other. 3 and 4 are bus_probe's, 255 is ssh's, and timeout's are
+		# 124-127/137, so a code added here has to miss all of those; the
+		# runbook documents this set beside the probe's.
+		rc_no_stamp=5
+		rc_stamp_unstaged=6
+		rc_post_wipe=7
 		remote="$(bus_probe)"
-		remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit 1"
+		# The stamp is asked about before the log root is emptied, not
+		# after: this refusal fires on a payload pushed by an older
+		# script or landed before a reboot cleared the tmpfs, and the
+		# previous run's records are often still sitting in that log root
+		# unfetched. A refusal that had already destroyed them would cost
+		# an operator the only copy of a run's .ologs to say that this run
+		# could not name its build.
+		#
+		# The stamp is part of the payload, so a payload carrying none
+		# was put there by something else, and a run of it would record a
+		# log nobody can say the schema of. Refused rather than skipped,
+		# because a records directory that cannot name its build is the
+		# whole failure this closes.
+		remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
+		# The stamp is copied to its staging path before the wipe, for
+		# the same reason the probe runs before it: a copy that fails
+		# here has emptied nothing, so the refusal can send the operator
+		# to fetch the previous run's records rather than tell them about
+		# records that no longer exist.
+		remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
+		# Everything from here on runs with the log root already emptied,
+		# and every one of these steps answers with the one code that
+		# says so.
+		remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
+		# The push's stamp, into the log root the fetch brings home, so
+		# the records name the build that recorded them without the
+		# fetch having to know anything. A rename within the store's own
+		# tmpfs, so full-tmpfs and permission failures cannot reach it.
+		remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
+		# TODO(olog-head-capture): the payload's first publishes are
+		# started here, and this is where a fixed capture is verified —
+		# every recorded run's .olog is short at the front, so the
+		# commissioning traffic that says why a session parked is
+		# missing from the log.
+		# The launcher's console directory is emptied with the log root,
+		# for the reason the log root is: the launcher numbers its files
+		# per run and never overwrites, so a directory left to
+		# accumulate holds several runs' driver consoles and nothing
+		# afterwards can say which run's counters are which. It is a
+		# script constant under the payload store, not a configured
+		# value, so it needs none of the checks above.
+		remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
 		# The trailing `exit $?` keeps the remote shell in front of the
 		# launcher: bash execs a final simple command in place of itself,
 		# and a command that dies by a signal makes ssh report its own
 		# 255 — the code that means "ssh failed" here, so a payload binary
 		# that faults would come back as an unreachable host. With a shell
 		# still there the status is 128+signal and says what happened.
-		remote="${remote}; cd ${release} || exit 1"
+		remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
 		remote="${remote}; timeout --signal=INT --kill-after=10"
 		remote="${remote} ${run_seconds} ./simplelaunch ${launch_config}"
 		remote="${remote} --logdir ${launch_logs}"
 		remote="${remote}; exit \$?"
+
+		# Where the host-side evidence waits until there is a fetched
+		# records directory to file it beside: the clock captures and
+		# the console stream are made before that directory exists, and
+		# a run that never reaches its fetch has nothing for them to
+		# belong to.
+		aside=$(mktemp -d)
+		trap 'rm -rf -- "$aside"' EXIT
+		capture_clock "${aside}/clock-before.txt"
 
 		echo "${prog}: running on ${host} for ${run_seconds}s; eyes on the machine" >&2
 		rc=0
@@ -403,7 +687,39 @@ case "$mode" in
 			echo "${prog}: will not reach the unit: the run stops at the ${run_seconds}s budget," >&2
 			echo "${prog}: and stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'." >&2
 		fi
-		ssh -t -o BatchMode=yes "root@${host}" "$remote" || rc=$?
+		# Teed as well as printed: what scrolls past an operator is the
+		# only place the launcher's own bookkeeping and the driver's
+		# counter summaries appear live, and a terminal scrollback is
+		# not a record. The pty is unaffected — ssh decides on one by
+		# this stdin, not by where its stdout goes.
+		#
+		# `pipefail` is off across the pipeline so that a failing run
+		# does not fail the script here: the status wanted is ssh's own,
+		# read out of PIPESTATUS before anything else resets it.
+		#
+		# Both statuses are taken in the same breath, on either branch of
+		# the AND-OR list, for two reasons: `set -e` does not act on a
+		# command that is part of one, and the console copy must not be
+		# able to end the run's records. With `pipefail` off the
+		# pipeline's own status is `tee`'s, so a `tee` that fails -- the
+		# records filling mid-stream is the realistic way -- would
+		# otherwise exit the script after the run had happened and
+		# before the fetch, with the only copy of the records still on
+		# the unit's tmpfs.
+		set +o pipefail
+		ran=()
+		ssh -t -o BatchMode=yes "root@${host}" "$remote" 2>&1 |
+			tee -- "${aside}/run-console.log" &&
+			ran=("${PIPESTATUS[@]}") || ran=("${PIPESTATUS[@]}")
+		set -o pipefail
+		rc=${ran[0]}
+		if [ "${ran[1]:-0}" -ne 0 ]; then
+			echo "${prog}: the console copy failed (tee exited ${ran[1]}): the run itself" >&2
+			echo "${prog}: is unaffected and its records are fetched below, but" >&2
+			echo "${prog}: ${aside}/run-console.log is short or missing." >&2
+		fi
+
+		capture_clock "${aside}/clock-after.txt"
 
 		# 3 and 4 are the probe's, and 255 is ssh's own. A launcher chain
 		# that itself died with exactly 3, 4 or 255 before the budget is
@@ -428,6 +744,49 @@ case "$mode" in
 			die "the launcher exited before the ${run_seconds}s budget was up, so the gesture did not finish." \
 				"Its console and the three processes' output are under ${launch_logs} on ${host}."
 			;;
+		"$rc_no_stamp")
+			# The probe above, before the launcher was reached. Same
+			# accepted collision as 3, 4 and 255: a launcher chain
+			# that exited with exactly this code reads as this
+			# instead, and either reading fails the run.
+			die "${host}'s payload carries no provenance stamp, so this run's records could not name their build." \
+				"Nothing was started and nothing was emptied. The push writes that stamp, so push again:" \
+				"    ${prog} ${host} --push"
+			;;
+		"$rc_stamp_unstaged")
+			# The stamp is there — the probe proved it one command
+			# earlier — and staging it failed. Staging runs before
+			# the wipe, so this refusal has destroyed nothing. Same
+			# accepted collision as the other codes: a launcher chain
+			# that exited with exactly this code reads as this
+			# instead, and either reading fails the run.
+			die "${host}'s payload carries its provenance stamp, but copying it to ${staged_provenance} failed," \
+				"so this run's records could not have named their build. A full tmpfs or a" \
+				"permission on the payload store is the usual cause; ${host}'s own error is above." \
+				"Nothing was started and nothing was emptied, so this run's log root still holds" \
+				"whatever the previous run left there:" \
+				"    ${prog} ${host} --fetch <records-dir>"
+			;;
+		"$rc_post_wipe")
+			# One of the four steps that run after the wipe began:
+			# the log root's own mkdir, the stamp's move into it, the
+			# launcher console directory's wipe and recreate, or the
+			# cd into the release. What they have in common is the
+			# only thing this arm can say, and it is the thing the
+			# operator needs: the previous run's records are gone.
+			# Same accepted collision as the other codes: a launcher
+			# chain that exited with exactly this code reads as this
+			# instead, and either reading fails the run.
+			#
+			# It does not send anybody to the launcher's console
+			# directory: on one of these paths that directory is what
+			# could not be made, and on the others the launcher never
+			# ran to write anything into it.
+			die "preparing ${host} for the run failed after the log root wipe had begun (exit ${rc})." \
+				"Treat the previous run's unfetched records on the unit as gone." \
+				"The launcher was not started, so nothing moved." \
+				"${host}'s own error is above; a full or read-only payload store is the usual cause."
+			;;
 		137)
 			die "the launcher did not stop on SIGINT and was killed (exit ${rc})." \
 				"That is a launcher wedged in its own shutdown; its output is under ${launch_logs} on ${host}."
@@ -440,6 +799,24 @@ case "$mode" in
 
 		out=$(fetch_records "$dest" "$log_root")
 
+		# The host-side evidence joins the device's own, under the one
+		# name that says which fetch it belongs to. One file at a time
+		# and per-file best-effort: each of these is captured
+		# best-effort in the first place, and a run's records are not
+		# worth losing over a capture that did not land.
+		console="${out}.console"
+		mkdir -p -- "$console"
+		for captured in clock-before.txt clock-after.txt run-console.log; do
+			[ -e "${aside}/${captured}" ] || {
+				echo "${prog}: no ${captured} to file with the records" >&2
+				continue
+			}
+			mv -- "${aside}/${captured}" "$console" || {
+				echo "${prog}: ${captured} could not be filed with the records" >&2
+			}
+		done
+		echo "${prog}: console ${console}"
+
 		# The records are judged here, not on the unit: the analyzer is a
 		# host tool and the fetched copy is the one that outlives the
 		# tmpfs. No jitter band — a hardware log sits on an absolute
@@ -449,8 +826,19 @@ case "$mode" in
 			"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
 		echo "${prog}: log  ${run_dir}"
 
-		# The report's verdict is this script's.
-		report_verdict "$run_dir"
+		# The report's verdict is this script's. The console goes with
+		# the log where the driver's own came back: the analyzer reads
+		# its counters and says so when the recorded trail is shorter
+		# than what the driver counted. Offered only when a driver
+		# console is actually there — the analyzer refuses a console
+		# path holding none, and a run that produced records is not
+		# failed over a console that did not come back.
+		if [ -n "$(find "$console" -name 'motord*' -print -quit)" ]; then
+			report_verdict "$run_dir" --console "$console"
+		else
+			echo "${prog}: no driver console came back, so the log's own trail is uncross-checked" >&2
+			report_verdict "$run_dir"
+		fi
 		;;
 
 	--fetch)
@@ -458,7 +846,7 @@ case "$mode" in
 		[ -n "$dest" ] || usage
 		log_root=$(config_string log_root_dir)
 		out=$(fetch_records "$dest" "$log_root")
-		echo "${prog}: read it: bazel run //cogs:first_motion_report -- ${out}/<run>"
+		echo "${prog}: read it: bazel run //cogs:first_motion_report -- --console ${out}.console ${out}/<run>"
 		;;
 
 	*) usage ;;
