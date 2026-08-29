@@ -53,7 +53,7 @@ use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegIdWire, ValueShapeWire};
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
-use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
+use brenn_reachy__motion__reports_clk_rs::{RefusalReason, RefusalReasonWire, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use dxl_proto::HardwareError;
@@ -787,6 +787,45 @@ fn narration(run: &Run, report: &mut Report) -> Option<(i64, i64)> {
     }
 }
 
+/// A refusal as this report says it.
+///
+/// An adapter rather than the variant's own identifier: the identifier is a
+/// Rust name that a rename would rewrite this report with, and what a reader
+/// holding the robot wants is the sentence. The `match` is wildcard-free, so a
+/// reason the vocabulary grows is a compile error here rather than a line that
+/// says nothing.
+struct ReasonName(RefusalReason);
+
+impl std::fmt::Display for ReasonName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            RefusalReason::None => "no refusal at all",
+            RefusalReason::Parked => "the machine is parked",
+            RefusalReason::NotResting => "the machine was busy with a session",
+            RefusalReason::TooManySteps => "more steps than a schedule holds",
+            RefusalReason::TooManyOverlays => "more overlay windows than a schedule holds",
+            RefusalReason::BadTimes => "times that are not a timeline",
+            RefusalReason::UnknownMotion => "a motion index no library could hold",
+            RefusalReason::Undecodable => "a datagram that is not a script",
+            RefusalReason::Stale => "a number no higher than the running engagement's",
+            RefusalReason::TooLong => "a schedule reaching past the session's horizon",
+        })
+    }
+}
+
+/// A refusal reason by name, or by number where this build has no name for it.
+///
+/// A reason this vocabulary does not declare is a log written by a build that
+/// refuses scripts for reasons this one has never heard of, and saying so beats
+/// printing a bare number that looks like one of the reasons here.
+fn refusal_name(reason: u32) -> String {
+    let wire = RefusalReasonWire(u8::try_from(reason).unwrap_or(u8::MAX));
+    match wire.to_known() {
+        Some(known) => format!("{}", ReasonName(known)),
+        None => format!("reason {reason}, which this build does not name"),
+    }
+}
+
 /// A commissioning failure by name, or by number where this build has no name
 /// for it.
 ///
@@ -872,8 +911,16 @@ fn what_the_session_said(run: &Run, report: &mut Report) {
                 )),
             },
             ReportKindWire::SCRIPT_REFUSED => report.fail(format!(
-                "the session refused script {a} at {at}, reason {b}: nothing moved, and nothing \
-                 retries"
+                "the session refused script {a} at {at}, {}: nothing moved, and nothing retries",
+                refusal_name(b)
+            )),
+            // A gesture publishes one script and never a second, so a schedule
+            // swapped in under the running one is a different run from this
+            // one -- and the row is read out rather than left to the catch-all,
+            // because what it says about the run is which script took over.
+            ReportKindWire::SCRIPT_REPLACED => report.fail(format!(
+                "the session replaced its schedule with script {a} at {at}, epoch {b}: the wake \
+                 gesture asks once and holds what it asked for"
             )),
             ReportKindWire::FAULT_RECORDED => report.fail(format!(
                 "the session recorded fault {a} at {at} on servo {b}, magnitude {detail}"
@@ -2530,14 +2577,17 @@ mod tests {
     use super::{
         ARRIVAL_ANTENNA_RAD, AUX_OUT_CHANNEL, AuxOpKindWire, AuxOutcomeWire, AuxStatusWire,
         CHANNELS, DriverEventWire, DriverStatusWire, EventKindWire, Grid, HealthReportWire, Logged,
-        POSE_CHANNEL, PoseEstimateWire, PoseSampleWire, REPORT_CHANNEL, RETENTION, RegIdWire,
-        Report, ReportKindWire, Retention, Run, SCHEDULE_CHANNEL, SESSION_CMD_CHANNEL,
+        POSE_CHANNEL, PoseEstimateWire, PoseSampleWire, REPORT_CHANNEL, RETENTION, ReasonName,
+        RegIdWire, Report, ReportKindWire, Retention, Run, SCHEDULE_CHANNEL, SESSION_CMD_CHANNEL,
         STATUS_CHANNEL, SeqFailureKindWire, SessionCmdKindWire, SessionCmdWire, SessionPhaseWire,
         TickFaultWire, TimelineEntryWire, ValueShapeWire, analyze, joint_set_of, judge_antennas,
         neutral_targets, record, row, stow_pose_targets,
     };
+    use std::collections::BTreeSet;
+
     use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
     use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
+    use brenn_reachy__motion__reports_clk_rs::{RefusalReason, RefusalReasonWire};
     use clockwork_rs::{Duration, SyncTime};
     use log_read::Channel;
     use nalgebra::{Isometry3, UnitQuaternion, Vector3};
@@ -3448,6 +3498,58 @@ mod tests {
         );
     }
 
+    /// Every reason the vocabulary declares says something of its own.
+    ///
+    /// Two reasons sharing a sentence, or one rendering as a token, would be
+    /// invisible until the run that turned on which refusal it was. The guard
+    /// comes with the adapter because the adapter's words are the whole content
+    /// of the line a refusal prints.
+    #[test]
+    fn every_refusal_reason_is_distinct_and_says_something() {
+        let mut seen = BTreeSet::new();
+        for reason in RefusalReason::VARIANTS {
+            let said = ReasonName(reason).to_string();
+            assert!(said.len() > 3, "{reason:?} renders as {said:?}");
+            assert!(seen.insert(said), "{reason:?} shares a sentence");
+        }
+        assert_eq!(seen.len(), RefusalReason::VARIANTS.len());
+    }
+
+    /// A refusal says its reason by name, and by number where this build has no
+    /// name for it.
+    ///
+    /// The reason is the whole of what a refusal tells a reader, and a bare
+    /// number is a lookup into a vocabulary that is not in front of them. A
+    /// number this build's vocabulary does not declare is said as itself: it is
+    /// a log written by a build that refuses scripts for reasons this one has
+    /// never heard of, and guessing at it would be worse than saying so.
+    #[test]
+    fn a_refusal_names_the_reason_it_carries() {
+        for (reason, said_as) in [
+            (
+                u32::from(RefusalReasonWire::STALE.0),
+                "a number no higher than the running engagement's",
+            ),
+            (
+                u32::from(RefusalReasonWire::TOO_LONG.0),
+                "a schedule reaching past the session's horizon",
+            ),
+            (200, "reason 200, which this build does not name"),
+        ] {
+            let report = analyze(&Run {
+                samples: heartbeat(10),
+                reports: vec![said(4, ReportKindWire::SCRIPT_REFUSED, 1, reason)],
+                ..Run::default()
+            });
+            assert_eq!(
+                findings_about(&report, said_as),
+                1,
+                "reason {reason}: {:?}",
+                report.findings
+            );
+        }
+    }
+
     /// Every kind the session's narration can carry, on the same terms.
     ///
     /// The phase changes have their own cases; this is every other kind, which
@@ -3481,6 +3583,10 @@ mod tests {
             (
                 said(4, ReportKindWire::BUS_FAILURE_DECLARED, 0, 0),
                 "declared the bus failed",
+            ),
+            (
+                said(4, ReportKindWire::SCRIPT_REPLACED, 8, 3),
+                "replaced its schedule with script 8",
             ),
             (
                 said(4, ReportKindWire::from(200), 0, 0),

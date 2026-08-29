@@ -7,9 +7,12 @@
 //! from wherever the machine happens to be rather than from a posture it is
 //! standing in.
 //!
-//! One schedule and one epoch. A session mid-engagement refuses a fresh script
-//! rather than replacing what it is running, so what redirects a machine inside
-//! one session is a step boundary, and that is what this run is written on.
+//! One schedule and one epoch, and that is what makes it this scenario. A
+//! session mid-engagement will also take a replacement script, which redirects
+//! the machine by swapping the schedule and bumping the epoch; here nothing
+//! arrives at all. What turns the machine round is a step boundary inside the
+//! one schedule it was given, so the retarget is proved on the path that has no
+//! epoch change to explain it.
 //!
 //! Three things have to hold across that, and each of them is a way the loop
 //! could break quietly. The goal stream must not gap: a retarget is a new

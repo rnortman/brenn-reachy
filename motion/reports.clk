@@ -95,6 +95,13 @@ enum ReportKind
         // `detail` is the refusal's own small number instead -- which of the
         // ways a slot fails to name a failure this was.
         #14 commission_failed { underlying_value: 14; }
+        // A running schedule was wholly replaced by a script accepted
+        // mid-session: `a` the new script's id, `b` the epoch the replacement
+        // was written under, `detail` how many steps it asked for. Distinct
+        // from `script_accepted` because nothing was engaged by it -- the
+        // machine was already under command and stayed under command, and a
+        // reader counting engagements must not count this one.
+        #15 script_replaced { underlying_value: 15; }
     }
 }
 
@@ -132,5 +139,19 @@ enum RefusalReason
         #6 unknown_motion { underlying_value: 6; }
         // The datagram was not a script at all.
         #7 undecodable { underlying_value: 7; }
+        // A replacement numbered no higher than the script the running
+        // engagement is already on. Strictly-greater is what makes a
+        // re-delivered replacement harmless: the duplicate is refused instead
+        // of re-planned. Said only mid-session -- a machine at rest takes
+        // whatever number it is offered, because a session's numbering is the
+        // sender's and leniency at rest must not depend on a sender keeping
+        // its own promise about them.
+        #8 stale { underlying_value: 8; }
+        // A schedule reaching further into the future than the session will
+        // hold one open for. The horizon is the dead-man on the sender: a
+        // schedule that runs out concludes the session, and an unbounded one
+        // would turn a sender that died into an indefinitely torqued machine.
+        // A refusal and never a truncation.
+        #9 too_long { underlying_value: 9; }
     }
 }

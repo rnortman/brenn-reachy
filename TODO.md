@@ -173,6 +173,15 @@ questions the bridge cannot avoid: who owns the bus and the ports when
 `reachy-motiond` is also deployed on the unit, and what an intent is on the wire
 — a `Script`, or something the bridge compiles into one.
 
+One requirement beside those questions is already settled: the bridge stamps
+each script's `arrival` with this machine's clock at the moment it receives it,
+and never forwards a stamp made on the sender's. The session's span ceiling is
+measured from the wake that reads a script as well as from that stamp, and the
+ceiling is the same ten minutes as the sender's own longest schedule, so a
+forwarded stamp from a clock running even slightly ahead gets every
+maximum-length script refused. Stamping locally makes the skew term zero.
+Marked at the ceiling's comment in `cogs/session_params.textproto`.
+
 When that bridge lands, the wake-gesture cog that stands in for it is deleted
 rather than kept: it exists only so the box has a closed-loop intent source for
 bring-up, and two intent sources is one too many. Deleting it is `cogs/wake.clk`,

@@ -2925,6 +2925,14 @@ const PROFILE_VELOCITY: u32 = 50;
 /// session refuses to commission on.
 const BUS_WATCHDOG: u32 = 10;
 
+/// How far ahead a script may schedule anything, milliseconds: the ceiling
+/// `cogs/session_params.textproto` ships.
+///
+/// Restated for the reason the timing figures above are: a case asserting that
+/// a horizon exactly at the ceiling is taken and one millisecond past it is
+/// refused has to name the ceiling it cut both scripts from.
+const SCRIPT_SPAN_CAP_MS: u32 = 600_000;
+
 /// The environment variable naming the shipped session configuration, relative
 /// to the runfiles root, which is a test's working directory.
 const SESSION_PARAMS_ENV: &str = "SESSION_PARAMS";
@@ -2967,6 +2975,7 @@ fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() 
         ("profile_acceleration", PROFILE_ACCELERATION.to_string()),
         ("profile_velocity", PROFILE_VELOCITY.to_string()),
         ("bus_watchdog", BUS_WATCHDOG.to_string()),
+        ("script_span_cap_ms", SCRIPT_SPAN_CAP_MS.to_string()),
     ] {
         assert_eq!(
             shipped_session_figure(field),
@@ -3010,6 +3019,7 @@ fn session_params() -> SessionParamsWire {
     params.set_profile_acceleration(PROFILE_ACCELERATION);
     params.set_profile_velocity(PROFILE_VELOCITY);
     params.set_bus_watchdog(u8::try_from(BUS_WATCHDOG).expect("the watchdog count is one byte"));
+    params.set_script_span_cap_ms(SCRIPT_SPAN_CAP_MS);
     params
 }
 
@@ -3518,9 +3528,14 @@ fn an_accepted_script_carries_its_overlay_windows() {
     assert_eq!(window.speed(), 1.0);
 }
 
-/// Every reason a script is refused for, one case each: the reason is the whole
-/// of what a sender is told, so a screen that answered the wrong one would send
-/// somebody to fix a script that was fine.
+/// The answer a script gets at a machine that is doing something else: the
+/// default non-resting one, which is what every phase but `active` and `parked`
+/// gives. The phase table those two make is
+/// `the_phases_between_the_two_that_take_a_script_still_refuse`'s.
+///
+/// The reason is the whole of what a sender is told, so a screen that answered
+/// the wrong one would send somebody to fix a script that was fine. Each reason
+/// wants its own case for that.
 #[test]
 fn a_script_outside_resting_is_refused_with_the_phase_it_found() {
     let mut cog = session();
@@ -3544,6 +3559,7 @@ fn a_script_arriving_at_a_parked_machine_is_refused_as_parked() {
 
     cog.publish_script(&one_step_script(1, T0), SyncTime::from_nanos(T0));
     let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
     assert_eq!(report.b, u32::from(RefusalReasonWire::PARKED.0));
 }
 
@@ -6617,6 +6633,800 @@ fn a_session_that_is_over_publishes_a_schedule_nobody_is_engaged_on() {
         "one schedule, disengaged, under a fresh epoch: the steps are still \
          there because what changed is that nobody is running them",
     );
+}
+
+// Replacement: a script accepted while the machine is already under command.
+
+/// Where the engagement's one step ends: the horizon a refresh has to beat.
+///
+/// Derived from `engagement`: one step half a second after `T0`, for two
+/// seconds, so the schedule runs out here.
+const ENGAGED_SCHEDULE_END: i64 = T0 + 2_500_000_000;
+
+/// The instant the cases below hand the session a replacement: under command,
+/// and well inside the running schedule.
+const REPLACED_AT: i64 = FIRST_WAKE + 400 * 1_000_000;
+
+/// A session under command, with everything the arming said read past.
+///
+/// Driven through the real engagement rather than written into the slot: a
+/// replacement is asserted against a schedule that was actually published, an
+/// epoch a consumer has already seen, and torque that is actually on.
+fn active_session(bus: &mut Bus) -> SessionTestWrapper {
+    let mut cog = resting_session();
+    engagement(&mut cog, bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "the engagement was expected to take hold",
+    );
+    caught_up(&mut cog);
+    let _ = publishes(&mut cog);
+    cog
+}
+
+/// A one-step script that stands the machine up from its own arrival.
+fn hold_script(script_id: u32, arrival_ns: i64, duration_ms: u32) -> ScriptWire {
+    script_msg(
+        script_id,
+        arrival_ns,
+        &[Step {
+            after_ms: 0,
+            duration_ms,
+            kind: StepKindWire::BASE_POSTURE,
+            posture: PostureWire::UP,
+        }],
+        &[],
+    )
+}
+
+/// A script accepted under command replaces the schedule whole and moves no
+/// phase.
+///
+/// The engagement is not re-run: torque is already on and the mover is already
+/// streaming, so what a replacement costs is one epoch and one datagram. The
+/// `engaged` flag never passes through false, which is the load-bearing half --
+/// a pause in the goal stream is what the driver's dead-man is measuring.
+#[test]
+fn a_script_accepted_under_command_replaces_the_running_schedule() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let report = wake(&mut cog, REPLACED_AT + 1).expect("a replacement is narrated");
+    let published = publishes(&mut cog);
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REPLACED);
+    assert_eq!(report.a, 8, "the script that took over");
+    assert_eq!(report.b, before + 1, "under the epoch it was written at");
+    assert!(
+        (report.detail - 1.0).abs() < f64::EPSILON,
+        "and how many steps it asked for: {report:?}",
+    );
+
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::ACTIVE,
+        "a replacement arms nothing, so no phase moves",
+    );
+    assert_eq!(state.script_id(), 8);
+    assert_eq!(
+        state.active_script_id(),
+        8,
+        "and it is what the next one must beat"
+    );
+    assert_eq!(state.scripts_accepted(), 2);
+    assert_eq!(state.scripts_refused(), 0);
+
+    let schedule = state.schedule();
+    assert!(
+        schedule.engaged(),
+        "the machine was under command throughout",
+    );
+    assert_eq!(schedule.epoch(), before + 1, "bumped exactly once");
+    assert_eq!(
+        schedule.steps().len(),
+        1,
+        "the new schedule is the whole of it"
+    );
+    let step = schedule.steps().get(0).expect("the one step");
+    assert_eq!(step.start().as_nanos(), REPLACED_AT);
+    assert_eq!(step.end().as_nanos(), REPLACED_AT + 3_000_000_000);
+
+    assert_eq!(
+        published,
+        vec![Published {
+            engaged: true,
+            epoch: before + 1,
+            steps: 1,
+        }],
+        "one publish, engaged throughout, under the epoch the row names",
+    );
+}
+
+/// The old schedule's overlay windows go with the old schedule.
+///
+/// Replacement is whole and never a merge: what the session holds afterwards is
+/// the new script and nothing of the one before it, which is the seam semantics
+/// a presence sender compiles its refreshes from.
+#[test]
+fn a_replacement_carries_its_own_windows_and_none_of_the_old_ones() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    cog.state_sess_mut()
+        .schedule_mut()
+        .overlays_mut()
+        .try_grow()
+        .expect("a window the old schedule was running");
+
+    cog.publish_script(
+        &script_msg(
+            8,
+            REPLACED_AT,
+            &[Step {
+                after_ms: 0,
+                duration_ms: 3_000,
+                kind: StepKindWire::BASE_POSTURE,
+                posture: PostureWire::UP,
+            }],
+            &[Overlay {
+                motion_id: 4,
+                after_ms: 100,
+                duration_ms: 500,
+            }],
+        ),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    wake(&mut cog, REPLACED_AT + 1).expect("a replacement is narrated");
+
+    let state = cog.state_sess();
+    let overlays = state.schedule().overlays();
+    assert_eq!(overlays.len(), 1, "the new script's window and only it");
+    let window = overlays.get(0).expect("the one window");
+    assert_eq!(window.motion_id(), 4);
+    assert_eq!(window.start().as_nanos(), REPLACED_AT + 100_000_000);
+}
+
+/// A replacement numbered no higher than the engagement's own script is
+/// refused, and refusing it moves nothing.
+///
+/// Strictly greater, so a re-delivered replacement is harmless: the channel
+/// this arrives on will sit across a link that duplicates, and a duplicate
+/// re-planned would be a second epoch for a schedule already running.
+#[test]
+fn a_replacement_that_does_not_beat_the_running_script_is_refused_as_stale() {
+    for (id, what) in [(7, "the same number"), (6, "a lower one")] {
+        let mut bus = Bus::healthy();
+        let mut cog = active_session(&mut bus);
+        let before = cog.state_sess().schedule().epoch();
+
+        cog.publish_script(
+            &hold_script(id, REPLACED_AT, 3_000),
+            SyncTime::from_nanos(REPLACED_AT),
+        );
+        let report = wake(&mut cog, REPLACED_AT + 1).expect("a refusal is narrated");
+        let published = publishes(&mut cog);
+
+        assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED, "{what}");
+        assert_eq!(report.a, id);
+        assert_eq!(report.b, u32::from(RefusalReasonWire::STALE.0), "{what}");
+
+        let state = cog.state_sess();
+        assert_eq!(state.active_script_id(), 7, "a refusal advances nothing");
+        assert_eq!(state.script_id(), 7);
+        assert_eq!(state.schedule().epoch(), before, "and republishes nothing");
+        assert_eq!(state.scripts_refused(), 1);
+        assert!(published.is_empty(), "{what}: nothing went out");
+    }
+}
+
+/// Nothing orders a script arriving at a resting machine.
+///
+/// The high-water mark is scoped to the engagement it belongs to. Kept across
+/// engagements it would be a lockout: a sender that reset its counter -- which
+/// is a sender breaking its own contract, but a real shape -- could never raise
+/// the machine again without an operator restarting the process.
+#[test]
+fn a_lower_number_after_a_session_is_over_is_accepted() {
+    let mut cog = resting_session();
+
+    cog.publish_script(&one_step_script(9, T0), SyncTime::from_nanos(T0));
+    let first = wake(&mut cog, T0 + 1).expect("an acceptance is narrated");
+    assert_eq!(first.kind, ReportKindWire::SCRIPT_ACCEPTED);
+    assert_eq!(cog.state_sess().active_script_id(), 9);
+
+    // Back to rest without ever going through an engagement: what this case is
+    // about is the screen, and the phase is the whole of its input.
+    cog.state_sess_mut().set_phase(SessionPhaseWire::RESTING);
+    // The phase the first acceptance moved to is read past: what this case is
+    // about is the answer to the second script.
+    caught_up(&mut cog);
+    let at = T0 + 2 * LAPSE_NS;
+    cog.publish_script(&one_step_script(2, at), SyncTime::from_nanos(at));
+    let second = wake(&mut cog, at + 1).expect("the second answer");
+
+    assert_eq!(
+        second.kind,
+        ReportKindWire::SCRIPT_ACCEPTED,
+        "a session beginning takes whatever number it is offered",
+    );
+    assert_eq!(cog.state_sess().active_script_id(), 2);
+}
+
+/// A schedule reaching further ahead than the session will hold one open for is
+/// refused, in either phase that takes a script.
+///
+/// The horizon is the dead-man on the sender: past the end of the last schedule
+/// it accepted, the machine stows and lets go. A ceiling is what stops a sender
+/// that died from leaving it torqued indefinitely, and it is a refusal rather
+/// than a truncation -- a schedule cut to fit is a schedule nobody asked for.
+#[test]
+fn a_script_reaching_past_the_span_cap_is_refused_at_rest() {
+    let mut cog = resting_session();
+
+    cog.publish_script(
+        &hold_script(1, T0, SCRIPT_SPAN_CAP_MS + 1),
+        SyncTime::from_nanos(T0),
+    );
+    let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::TOO_LONG.0));
+    assert_eq!(
+        cog.state_sess().schedule().epoch(),
+        0,
+        "and nothing was written",
+    );
+}
+
+/// A horizon exactly at the ceiling is inside it: the cap is what a script may
+/// reach, not what it must stay under.
+#[test]
+fn a_script_reaching_exactly_to_the_span_cap_is_accepted() {
+    let mut cog = resting_session();
+
+    cog.publish_script(
+        &hold_script(1, T0, SCRIPT_SPAN_CAP_MS),
+        SyncTime::from_nanos(T0),
+    );
+    let report = wake(&mut cog, T0 + 1).expect("an acceptance is narrated");
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_ACCEPTED);
+}
+
+/// An overlay window is horizon too: a script whose steps are short and whose
+/// window runs past the ceiling reaches past it.
+#[test]
+fn an_overlay_window_past_the_span_cap_is_refused() {
+    let mut cog = resting_session();
+
+    cog.publish_script(
+        &script_msg(
+            1,
+            T0,
+            &[Step {
+                after_ms: 0,
+                duration_ms: 1_000,
+                kind: StepKindWire::BASE_POSTURE,
+                posture: PostureWire::UP,
+            }],
+            &[Overlay {
+                motion_id: 1,
+                after_ms: SCRIPT_SPAN_CAP_MS,
+                duration_ms: 1,
+            }],
+        ),
+        SyncTime::from_nanos(T0),
+    );
+    let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::TOO_LONG.0));
+}
+
+/// The ceiling holds mid-session too, and the running schedule survives the
+/// refusal.
+#[test]
+fn a_replacement_reaching_past_the_span_cap_is_refused_under_command() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT, SCRIPT_SPAN_CAP_MS + 1),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let report = wake(&mut cog, REPLACED_AT + 1).expect("a refusal is narrated");
+    let published = publishes(&mut cog);
+
+    // The kind before the reason: `b` means something different in every row
+    // kind, and an epoch that happened to equal the reason's number would read
+    // as this assertion passing on an accepted replacement.
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::TOO_LONG.0));
+    let state = cog.state_sess();
+    assert_eq!(state.schedule().epoch(), before, "the old schedule stands");
+    assert_eq!(state.active_script_id(), 7);
+    assert!(published.is_empty());
+}
+
+/// How far ahead of this machine's clock the cases below stamp a script.
+///
+/// Twice the ceiling, so a script carrying a horizon well inside the ceiling
+/// still reaches past it measured from the wake that reads it.
+const STAMPED_AHEAD_NS: i64 = 2 * (SCRIPT_SPAN_CAP_MS as i64) * 1_000_000;
+
+/// A script stamped ahead of this machine's clock cannot buy reach with the
+/// skew, at rest.
+///
+/// The ceiling is a bound on the machine's committed future, so it is measured
+/// from the wake as well as from the sender's own stamp. A script stamped an
+/// hour out with a three-second horizon would otherwise arm the head and hold
+/// it for an hour: nothing in the schedule is due, so nothing ends the session
+/// and no watchdog is measuring anything -- the head is simply up, torqued, for
+/// as long as the stamp said.
+#[test]
+fn a_script_stamped_far_ahead_of_the_clock_is_refused_at_rest() {
+    let mut cog = resting_session();
+
+    cog.publish_script(
+        &hold_script(1, T0 + STAMPED_AHEAD_NS, 3_000),
+        SyncTime::from_nanos(T0),
+    );
+    let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::TOO_LONG.0));
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::RESTING,
+        "and no engagement was opened on it",
+    );
+    assert_eq!(cog.state_sess().schedule().epoch(), 0);
+}
+
+/// The same, mid-session: a refresh stamped far ahead extends nothing.
+///
+/// This is the shape that matters most for a presence session, because every
+/// refresh re-opens the horizon: a sender whose clock runs ahead would hold the
+/// machine past the ceiling for as long as it kept refreshing, and each refresh
+/// would push the end further out.
+#[test]
+fn a_replacement_stamped_far_ahead_of_the_clock_is_refused() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT + STAMPED_AHEAD_NS, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let report = wake(&mut cog, REPLACED_AT + 1).expect("a refusal is narrated");
+    let published = publishes(&mut cog);
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::TOO_LONG.0));
+    let state = cog.state_sess();
+    assert_eq!(state.schedule().epoch(), before, "the old schedule stands");
+    assert_eq!(state.active_script_id(), 7);
+    assert!(published.is_empty());
+}
+
+/// A replacement the screen cannot turn into a schedule leaves the one running
+/// exactly as it was.
+///
+/// All-or-nothing, mid-session as much as at rest: the plan is built beside the
+/// slot and only a whole one is written, so a refused refresh costs the sender
+/// its refresh and the machine nothing.
+#[test]
+fn a_replacement_that_is_no_timeline_leaves_the_running_schedule_alone() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+    let steps = cog.state_sess().schedule().steps().len();
+
+    cog.publish_script(
+        &no_timeline_script(8, REPLACED_AT),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let report = wake(&mut cog, REPLACED_AT + 1).expect("a refusal is narrated");
+    let published = publishes(&mut cog);
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.b, u32::from(RefusalReasonWire::BAD_TIMES.0));
+    let state = cog.state_sess();
+    assert_eq!(state.schedule().epoch(), before, "the epoch did not move");
+    assert_eq!(state.schedule().steps().len(), steps);
+    assert!(state.schedule().engaged());
+    assert_eq!(
+        state.script_id(),
+        7,
+        "and the session is on the script it had"
+    );
+    assert!(published.is_empty());
+}
+
+/// Every phase that is neither resting nor active still refuses.
+///
+/// A machine mid-arm-sequence, being carried down out of a fault, or being let
+/// go of finishes what it is doing. Intent never preempts a fault maneuver, and
+/// a sender that still wants the machine raises it again from rest.
+#[test]
+fn the_phases_between_the_two_that_take_a_script_still_refuse() {
+    for phase in [
+        SessionPhaseWire::STARTING,
+        SessionPhaseWire::ENGAGING,
+        SessionPhaseWire::WINDING_DOWN,
+        SessionPhaseWire::STOPPING,
+    ] {
+        let mut cog = session();
+        cog.state_sess_mut().set_phase(phase);
+
+        cog.publish_script(&one_step_script(1, T0), SyncTime::from_nanos(T0));
+        let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+
+        assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED, "in {phase:?}");
+        assert_eq!(
+            report.b,
+            u32::from(RefusalReasonWire::NOT_RESTING.0),
+            "in {phase:?}",
+        );
+    }
+}
+
+/// A wake that both answers a park-class fault and screens a refresh takes the
+/// response and refuses the script.
+///
+/// The order is the deliberate one: evidence is weighed before intake, so the
+/// script is answered against the phase this same wake left the machine in. A
+/// refresh accepted onto a machine already parked would be an acceptance its
+/// sender acts on for a session that is over.
+#[test]
+fn a_replacement_arriving_with_a_park_class_fault_is_refused() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+
+    cog.publish_evt(
+        &event(EventKindWire::BUS_FAILURE, REPLACED_AT),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let asked = drive(&mut cog, REPLACED_AT + 1).expect("the release goes out at once");
+
+    assert_eq!(asked.kind, SessionCmdKindWire::TORQUE_OFF_NOW);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
+    let told: Vec<Said> = said(&mut cog)
+        .into_iter()
+        .chain(everything(&mut cog, REPLACED_AT + 1 + LAPSE_NS))
+        .collect();
+    let refused = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REFUSED)
+        .expect("the script was answered");
+    assert_eq!(refused.b, u32::from(RefusalReasonWire::PARKED.0));
+    assert!(
+        !told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::SCRIPT_REPLACED),
+        "nothing was replaced: {told:?}",
+    );
+    assert_eq!(cog.state_sess().active_script_id(), 7);
+}
+
+/// A replacement arriving while an antenna pair is being let go of is taken,
+/// and the pair still goes limp.
+///
+/// The one fault response that leaves the session in a phase that takes a
+/// script: a pair going limp while the head keeps its presence is a fault
+/// answered, not a session ended, so the machine is still under command and a
+/// refresh still lands. Both halves are the point. The refresh is answered as a
+/// replacement, and nothing about it gates the de-torquing underneath -- the
+/// two verified writes go out in the same order and the same count as they
+/// would have with no script in the wake at all.
+#[test]
+fn a_replacement_during_an_antenna_degrade_is_taken_and_the_pair_still_goes_limp() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+    let right = SERVO_IDS[usize::from(JointRefWire::ANTENNA_RIGHT.0) - 1];
+    let left = SERVO_IDS[usize::from(JointRefWire::ANTENNA_LEFT.0) - 1];
+
+    cog.publish_readings(
+        &reading(right, 0x20, REPLACED_AT),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let first = drive(&mut cog, REPLACED_AT).expect("the first row is told to let go");
+    let mut told: Vec<Said> = Vec::new();
+    while let Some(row) = said(&mut cog) {
+        told.push(row);
+    }
+    let published = publishes(&mut cog);
+    let mut ran = sweep(&mut cog, &mut bus, REPLACED_AT, first);
+
+    let replaced = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REPLACED)
+        .unwrap_or_else(|| panic!("the refresh was taken: {told:?}"));
+    assert_eq!(replaced.a, 8);
+    assert_eq!(replaced.b, before + 1, "under the epoch it was written at");
+    assert_eq!(
+        published,
+        vec![Published {
+            engaged: true,
+            epoch: before + 1,
+            steps: 1,
+        }],
+        "the replacement went out engaged, on the wake it was taken",
+    );
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "a degrade moves no phase and neither does a replacement",
+    );
+
+    assert_eq!(
+        ran.asks.len(),
+        2,
+        "one verified write per antenna and nothing else: {:?}",
+        ran.asks,
+    );
+    for (asked, id) in ran.asks.iter().zip([right, left]) {
+        assert_eq!(
+            (asked.op, asked.reg, asked.value, asked.id),
+            (
+                AuxOpKindWire::WRITE_REG_VERIFIED,
+                RegIdWire::TORQUE_ENABLE,
+                value::u8(0).bits(),
+                id,
+            ),
+            "the pair in bus order, each write read back",
+        );
+    }
+    ran.told
+        .extend(everything(&mut cog, REPLACED_AT + 2 * LAPSE_NS));
+    assert!(
+        ran.told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::DEGRADE_RELEASED),
+        "the drain finished: {:?}",
+        ran.told,
+    );
+    assert_eq!(
+        cog.state_sess().degrade_release(),
+        JointFlagsWire::from(JointFlags::NONE),
+        "and nothing is still owed",
+    );
+    assert!(
+        !cog.state_sess().degrade_pending(),
+        "the accept did not leave the drain waiting on the aux path",
+    );
+}
+
+/// A refresh arriving on the wake the running schedule expires wins the race.
+///
+/// Intake runs before the bus half, so the refresh is screened while the phase
+/// is still active and the extended horizon means the schedule has not run out
+/// by the time anything asks. The session continues with no stow and no
+/// re-engagement -- and correctness does not depend on the race: a refresh that
+/// misses the wake finds the session concluded and raises it again from rest.
+#[test]
+fn a_refresh_on_the_expiry_wake_keeps_the_session_running() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+
+    cog.publish_script(
+        &hold_script(8, ENGAGED_SCHEDULE_END, 2_000),
+        SyncTime::from_nanos(ENGAGED_SCHEDULE_END),
+    );
+    let report = wake(&mut cog, ENGAGED_SCHEDULE_END).expect("the refresh is answered");
+
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REPLACED);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "the session runs on the horizon the refresh gave it",
+    );
+    let told: Vec<Said> = said(&mut cog).into_iter().collect();
+    assert!(
+        !told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::SESSION_ENDED),
+        "nothing ended: {told:?}",
+    );
+    assert!(cog.state_sess().schedule().engaged());
+}
+
+/// Every row this wake said, the one [`wake`] answers with included.
+fn all_of_it(cog: &mut SessionTestWrapper, at_ns: i64) -> Vec<Said> {
+    let mut told: Vec<Said> = wake(cog, at_ns).into_iter().collect();
+    while let Some(row) = said(cog) {
+        told.push(row);
+    }
+    told
+}
+
+/// Two replacements in one intake window share the wake's one epoch, and it is
+/// the epoch that goes out.
+///
+/// The channel is latest-wins and the slot holds one schedule, so the later
+/// script is what the session runs. What must not happen is a row naming an
+/// epoch no consumer ever saw: the timeline is the durable account of a run, and
+/// an operator reconciling the mover's answered epochs against the session's
+/// published ones cannot tell a bookkeeping artefact from a dropped datagram.
+/// A sender refreshing on a cadence across a link that duplicates is exactly the
+/// traffic that puts two in one window.
+#[test]
+fn two_replacements_in_one_window_share_the_epoch_that_goes_out() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+
+    cog.publish_script(
+        &hold_script(8, REPLACED_AT, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    cog.publish_script(
+        &hold_script(9, REPLACED_AT, 4_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    let told = all_of_it(&mut cog, REPLACED_AT + 1);
+    let published = publishes(&mut cog);
+
+    let replaced: Vec<&Said> = told
+        .iter()
+        .filter(|row| row.kind == ReportKindWire::SCRIPT_REPLACED)
+        .collect();
+    assert_eq!(replaced.len(), 2, "both were answered: {told:?}");
+    assert_eq!(replaced[0].a, 8);
+    assert_eq!(replaced[1].a, 9);
+    assert_eq!(replaced[0].b, before + 1, "one epoch, opened once");
+    assert_eq!(replaced[1].b, before + 1);
+
+    let sent: Vec<&Said> = told
+        .iter()
+        .filter(|row| row.kind == ReportKindWire::SCHEDULE_PUBLISHED)
+        .collect();
+    assert_eq!(sent.len(), 1, "one publish for the wake: {told:?}");
+    assert_eq!(sent[0].a, before + 1, "and the rows name what went out");
+
+    let state = cog.state_sess();
+    assert_eq!(state.script_id(), 9, "the later script is what runs");
+    assert_eq!(state.active_script_id(), 9);
+    assert_eq!(state.schedule().epoch(), before + 1);
+    let step = state.schedule().steps().get(0).expect("the one step");
+    assert_eq!(step.end().as_nanos(), REPLACED_AT + 4_000_000_000);
+    assert_eq!(
+        published,
+        vec![Published {
+            engaged: true,
+            epoch: before + 1,
+            steps: 1,
+        }],
+        "one datagram, carrying the later script",
+    );
+}
+
+/// A replacement whose schedule was already over ends the session on the same
+/// wake, in one datagram.
+///
+/// A stamp behind the clock is not what the horizon screen catches: the
+/// wake-relative measure only ever tightens the bound, so a schedule already
+/// behind `now` is bounded by its own offsets and passes. What it leaves is a
+/// schedule with no future.
+///
+/// The bus half ends it on the wake it arrived on, and because the wake
+/// publishes once and bumps once, the machine being let go of and the
+/// replacement are one epoch on the channel rather than a row for a schedule
+/// nobody received.
+#[test]
+fn a_replacement_that_was_already_over_ends_the_session_in_one_publish() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    let before = cog.state_sess().schedule().epoch();
+    let stamped = REPLACED_AT - 3_000_000_000;
+
+    cog.publish_script(
+        &hold_script(8, stamped, 1_000),
+        SyncTime::from_nanos(stamped),
+    );
+    let told = all_of_it(&mut cog, REPLACED_AT + 1);
+    let published = publishes(&mut cog);
+
+    let replaced = told
+        .iter()
+        .find(|row| row.kind == ReportKindWire::SCRIPT_REPLACED)
+        .expect("the replacement was answered");
+    assert_eq!(replaced.b, before + 1, "the epoch this wake opened");
+
+    let sent: Vec<&Said> = told
+        .iter()
+        .filter(|row| row.kind == ReportKindWire::SCHEDULE_PUBLISHED)
+        .collect();
+    assert_eq!(sent.len(), 1, "one publish for the wake: {told:?}");
+    assert_eq!(sent[0].a, before + 1, "and it is the epoch the row names");
+
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::STOPPING,
+        "a schedule with no future is a session over",
+    );
+    assert_eq!(
+        published,
+        vec![Published {
+            engaged: false,
+            epoch: before + 1,
+            steps: 1,
+        }],
+        "one datagram, saying nobody is running it",
+    );
+}
+
+/// The schedule's script and the engagement's admission floor never disagree.
+///
+/// They are written together and mean different things -- one names the script
+/// the schedule was built from, the other is what a replacement must beat -- and
+/// the stale screen is only sound while they agree. A path that re-anchored one
+/// alone would move replacement admission with nothing at the site saying so.
+#[test]
+fn the_schedule_s_script_and_the_admission_floor_never_disagree() {
+    fn agree(cog: &mut SessionTestWrapper, after: &str) {
+        let state = cog.state_sess();
+        assert_eq!(state.script_id(), state.active_script_id(), "after {after}",);
+    }
+
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+    agree(&mut cog, "the script that opened the engagement");
+
+    cog.publish_script(
+        &hold_script(7, REPLACED_AT, 3_000),
+        SyncTime::from_nanos(REPLACED_AT),
+    );
+    wake(&mut cog, REPLACED_AT + 1).expect("a refusal is narrated");
+    agree(&mut cog, "a refusal, which moves neither");
+
+    let at = REPLACED_AT + LAPSE_NS;
+    cog.publish_script(&hold_script(8, at, 3_000), SyncTime::from_nanos(at));
+    wake(&mut cog, at + 1).expect("a replacement is narrated");
+    agree(&mut cog, "a replacement, which moves both");
+
+    let (_, ended_at) = ending(&mut cog, &mut bus, at + LAPSE_NS);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::RESTING,
+        "the schedule was expected to run out",
+    );
+    agree(&mut cog, "the session ending, which resets neither");
+
+    // And the floor a concluded engagement left behind is no floor at all: the
+    // machine that just ran a session numbered 8 is raised again by a 2. Driven
+    // through the real ending rather than by putting the phase back, because
+    // what would lock the machine out is exactly a path that ended a session
+    // while leaving the floor standing.
+    caught_up(&mut cog);
+    let again = ended_at + LAPSE_NS;
+    cog.publish_script(&hold_script(2, again, 3_000), SyncTime::from_nanos(again));
+    let raised = wake(&mut cog, again + 1).expect("the answer to the low number");
+    assert_eq!(
+        raised.kind,
+        ReportKindWire::SCRIPT_ACCEPTED,
+        "a sender that reset its counter can still raise a machine at rest",
+    );
+    assert_eq!(cog.state_sess().active_script_id(), 2);
+    agree(&mut cog, "the engagement the low number opened");
 }
 
 // The stow maneuvers: the two responses that carry the machine down under

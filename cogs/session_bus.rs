@@ -44,6 +44,7 @@
 
 use core::time::Duration;
 
+use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
 use brenn_reachy__cogs__session_clk_rs::{AuxPendingWire, SessionPhaseWire, SessionStateWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::{
     RegId, RegIdWire, ValueShape, ValueShapeWire,
@@ -477,8 +478,23 @@ pub fn ended(slot: &mut SessionStateWire, now_ns: i64) -> Option<Entered> {
     if !matches!(slot.phase(), SessionPhaseWire::ACTIVE) {
         return None;
     }
-    let schedule = slot.schedule();
-    let last = schedule
+    // The ends are exclusive, so an instant at one is an instant the interval no
+    // longer owns.
+    match last_instant(slot.schedule()) {
+        Some(end) if now_ns < end => None,
+        _ => Some(enter(slot, SessionPhaseWire::STOPPING)),
+    }
+}
+
+/// The last instant `schedule` owns, or `None` for a schedule that asks for
+/// nothing at all.
+///
+/// The end of its last step or its last overlay window, whichever is later, and
+/// the one place that is worked out: a schedule is over when nothing in it has a
+/// future, and a row kind the vocabulary grows has to be answered here once
+/// rather than wherever a caller happened to scan. The ends are exclusive.
+pub fn last_instant(schedule: &SessionScheduleWire) -> Option<i64> {
+    schedule
         .steps()
         .iter()
         .map(|step| step.end().as_nanos())
@@ -488,13 +504,7 @@ pub fn ended(slot: &mut SessionStateWire, now_ns: i64) -> Option<Entered> {
                 .iter()
                 .map(|window| window.end().as_nanos()),
         )
-        .max();
-    // The ends are exclusive, so an instant at one is an instant the interval no
-    // longer owns.
-    match last {
-        Some(end) if now_ns < end => None,
-        _ => Some(enter(slot, SessionPhaseWire::STOPPING)),
-    }
+        .max()
 }
 
 /// Which sequence the phase this slot is in drives, or that it drives none.

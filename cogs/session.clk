@@ -361,5 +361,24 @@ schema SessionState
         // read against the same total at the top of an execution, what says
         // whether this wake had anything to add to the story.
         #38 reports_narrated: UInt64;
+
+        // The id of the script the current engagement is on: the one that
+        // opened it, or the last one to replace it. What a replacement's
+        // number must be strictly greater than, compared only while the
+        // machine is under command. Zero before any script has been accepted,
+        // and never compared at rest -- a session beginning takes whatever
+        // number it is offered, so a sender that reset its counter can still
+        // raise the machine.
+        //
+        // Written together with `script_id` and equal to it at every instant a
+        // reader can observe, and a separate field because they answer
+        // different questions: `script_id` says which script the schedule was
+        // built from, for a report that names it, and this one is the
+        // admission floor the ordering screen tests against. A path that ever
+        // re-anchors one without the other -- a wind-down that rebuilds the
+        // schedule, a session ending that tidies the floor away -- would move
+        // replacement admission, so their agreement is asserted as an
+        // invariant rather than assumed.
+        #39 active_script_id: UInt32;
     }
 }

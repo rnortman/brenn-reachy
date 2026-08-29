@@ -1124,6 +1124,32 @@ scenario_suite(
     ],
 )
 
+# S7, conversational presence: the same four cogs S1 runs on, with a sender
+# that refreshes what it wants of the machine while the machine is holding it,
+# so one engagement carries three scripts and the schedule under it is replaced
+# twice without torque being touched.
+scenario_suite(
+    name = "s7",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":schedule_clk_rs",
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+    ],
+)
+
 # S8, a head servo in trouble: the same four cogs S1 runs on, with one head
 # servo made to complain about itself and the cranks held while the head is
 # being carried down.

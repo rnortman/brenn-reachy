@@ -164,6 +164,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
 
     let params: &SessionParams = configured(dial.configs.params, "the session's");
     let budgets = Budgets::of(params);
+    let screens = Screens::of(params);
     let timing = Timing {
         aux_timeout_ns: params.aux_timeout_ns,
         aux_retries: params.aux_retries,
@@ -200,7 +201,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     // the evidence of this same wake leaves the machine in: a wake that both
     // accepted a script and parked the machine would have narrated an
     // acceptance its sender will act on for a session that is already over.
-    screen_scripts(dial, &mut counters, now);
+    let replaced = screen_scripts(dial, &mut counters, now, &screens);
     // One datagram, decided in one place. A release owed supersedes any bus
     // work: nothing gates de-torquing, and a sequence stepped into a slot whose
     // datagram was then overwritten would leave a transaction recorded as
@@ -212,8 +213,11 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     run_bus(dial, &mut counters, now, &timing, &budgets);
     // After the bus, because the phase this wake leaves the machine in is what
     // decides whether it is under command, and every path that moves the phase
-    // has run by here.
-    publish_schedule(dial, &mut counters, now);
+    // has run by here. A replacement taken this wake is published from here for
+    // that same reason: a schedule that was already over when it arrived is one
+    // the bus half has by now ended, and the machine being let go of and the
+    // replacement are then one change on the channel rather than two.
+    publish_schedule(dial, &mut counters, now, replaced);
     say_unconfirmed(dial, &mut counters, now, &budgets);
     publish_timeline(dial, &mut counters, before.reports_narrated);
 
@@ -229,7 +233,24 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
 /// datagram in the window, and a script accepted after a refused one is the
 /// session's answer to the request it could run. The slot and the message
 /// window are separate borrows, so each decision is written where it is made.
-fn screen_scripts(dial: &mut SessionDial<'_>, counters: &mut SessionCounters, now: i64) {
+///
+/// Answers whether a replacement was taken, which the wake's one publish is
+/// owed. Nothing is published from here: the output and the input window are one
+/// borrow of the dial apiece and the loop holds the input one, and the wake
+/// publishes once, at one site, after every path that could move the phase.
+///
+/// The channel is latest-wins and the slot holds one schedule, so a window
+/// carrying two replacements runs the later one: the first is answered as the
+/// acceptance it was and its plan is then overwritten by the next. They share
+/// the wake's one epoch, which is the epoch that goes out -- a row here never
+/// names an epoch no consumer saw.
+fn screen_scripts(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    now: i64,
+    screens: &Screens,
+) -> bool {
+    let mut replaced = false;
     for message in dial.inputs.script.new_msgs() {
         // Bytes that describe no script name no times and no motions, so there
         // is nothing to screen. The boundary refusal is this one call, and the
@@ -243,13 +264,18 @@ fn screen_scripts(dial: &mut SessionDial<'_>, counters: &mut SessionCounters, no
                     entered: None,
                 }
             }
-            Ok(script) => decide(dial.states.sess, script, counters, now),
+            Ok(script) => decide(dial.states.sess, script, counters, now, screens, replaced),
         };
+        // What a replacement is, said once: the row it narrates. A second flag
+        // beside it could disagree with it, and a replacement that published
+        // nothing would strand the mover on the schedule before it.
+        replaced |= answer.report.kind == ReportKind::ScriptReplaced;
         narrate(dial.states.sess, counters, &answer.report);
         if let Some(entered) = answer.entered {
             narrate(dial.states.sess, counters, &phase_report(&entered, now));
         }
     }
+    replaced
 }
 
 /// What one script was answered with: the story of the answer, and the phase the
@@ -263,43 +289,174 @@ struct Answer {
 
 /// Answer one script: the schedule it became, or the reason it was refused.
 ///
-/// All-or-nothing and in this order: the phase first, because a script the
-/// machine cannot take now is refused whatever it says; then the numbers,
+/// All-or-nothing and in this order: the intake screens first, because a script
+/// the machine cannot take now is refused whatever it says; then the numbers,
 /// because a schedule is built from them. An acceptance is the schedule the
 /// session holds from here, which is why the last accepted script in a window
 /// wins and why they are answered in arrival order.
+///
+/// Two shapes of acceptance, and which one it is depends only on the phase the
+/// script arrived in. From `resting` it opens an engagement: the schedule is
+/// written with nothing engaged and the arming sequence begins. From `active`
+/// it replaces the schedule of an engagement already running: the machine is
+/// already torqued and already being streamed goals, so nothing arms, no phase
+/// moves, and what changes is the whole of the commanded future.
 fn decide(
     slot: &mut SessionStateWire,
     script: &Script,
     counters: &mut SessionCounters,
     now: i64,
+    screens: &Screens,
+    bumped: bool,
 ) -> Answer {
-    let outcome = match phase_refusal(slot.phase()) {
+    let phase = slot.phase();
+    let outcome = match intake_refusal(phase, slot, script) {
         Some(reason) => Err(reason),
-        None => plan_of(script),
+        None => screened_plan(script, now, screens),
     };
     match outcome {
         Ok(plan) => {
-            let epoch = store(slot, script.script_id, &plan);
+            let replacing = phase == SessionPhaseWire::ACTIVE;
+            // One bump per wake: a second replacement in one window lands under
+            // the epoch the first opened, because that is the one epoch this
+            // wake publishes.
+            let epoch = store(slot, script.script_id, &plan, replacing, !bumped);
+            slot.set_active_script_id(script.script_id);
             counters.scripts_accepted += 1;
-            Answer {
-                report: Report {
-                    time_ns: now,
-                    kind: ReportKind::ScriptAccepted,
-                    a: script.script_id,
-                    b: u32::try_from(plan.steps().len()).unwrap_or(u32::MAX),
-                    detail: f64::from(epoch),
-                },
-                // An accepted script is a machine to take hold of, so the
-                // engagement begins on this wake: the resting watch's first read
-                // is the datagram this same execution publishes.
-                entered: Some(session_bus::enter(slot, SessionPhaseWire::ENGAGING)),
+            let steps = u32::try_from(plan.steps().len()).unwrap_or(u32::MAX);
+            if replacing {
+                Answer {
+                    report: Report {
+                        time_ns: now,
+                        kind: ReportKind::ScriptReplaced,
+                        a: script.script_id,
+                        b: epoch,
+                        detail: f64::from(steps),
+                    },
+                    entered: None,
+                }
+            } else {
+                Answer {
+                    report: Report {
+                        time_ns: now,
+                        kind: ReportKind::ScriptAccepted,
+                        a: script.script_id,
+                        b: steps,
+                        detail: f64::from(epoch),
+                    },
+                    // An accepted script is a machine to take hold of, so the
+                    // engagement begins on this wake: the resting watch's first
+                    // read is the datagram this same execution publishes.
+                    entered: Some(session_bus::enter(slot, SessionPhaseWire::ENGAGING)),
+                }
             }
         }
         Err(reason) => Answer {
             report: refusal(script.script_id, reason, counters, now),
             entered: None,
         },
+    }
+}
+
+/// Why the session will not take `script` at all, or that it will consider it.
+///
+/// Decided before anything in the script is read but its number: the phase it
+/// found, and the number it carries against the engagement it would replace.
+/// The phase comes first because a machine that cannot take a script now is not
+/// asking about its contents. What the script says -- its times, its motions,
+/// how far ahead it reaches -- is [`screened_plan`]'s, because those are
+/// screened as the schedule is built rather than by reading the rows twice.
+///
+/// `phase` is the caller's read of the slot, so one wake's answer is decided
+/// against one phase.
+fn intake_refusal(
+    phase: SessionPhaseWire,
+    slot: &SessionStateWire,
+    script: &Script,
+) -> Option<RefusalReasonWire> {
+    if let Some(reason) = phase_refusal(phase) {
+        return Some(reason);
+    }
+    // Ordering only mid-session: at rest the session takes whatever number it
+    // is offered. A high-water mark kept across engagements would let one
+    // sender that reset its counter lock the machine out until an operator
+    // restarted the process, and defending a resting machine against a stale
+    // delivery belongs at the edge that received it.
+    //
+    // Against the engagement's own number and not the slot's `script_id`: the
+    // two are written together today, and this reads the one whose meaning is
+    // "what a replacement must beat".
+    if phase == SessionPhaseWire::ACTIVE && script.script_id <= slot.active_script_id() {
+        return Some(RefusalReasonWire::STALE);
+    }
+    None
+}
+
+/// The schedule `script` asks for, screened against what the session will hold
+/// open, or why it is no schedule this session will run.
+///
+/// The horizon is measured off the plan rather than off the script's own
+/// offsets, so there is one scan of "the last instant a schedule owns" in the
+/// session and a row kind the vocabulary grows is inside it the day the planner
+/// writes it.
+///
+/// Measured twice, against two different origins, and the further of the two
+/// decides. From the script's own arrival, which is exactly the offsets it
+/// wrote: what the sender asked for is bounded whatever its clock says. And
+/// from this wake, which is what the ceiling is actually for: the schedule is
+/// the machine's committed future, the session lets go when it runs out, and
+/// what a sender that stops talking may leave behind is that long and no
+/// longer. The two differ by the sender's skew, and a stamp reading ahead of
+/// this machine is the direction that matters -- a script stamped an hour out
+/// with in-cap offsets would otherwise commit the head for an hour past the
+/// ceiling, with the session concluding nothing until it got there.
+///
+/// # Errors
+///
+/// [`plan_of`]'s reasons for a script that is no timeline, and
+/// [`RefusalReasonWire::TOO_LONG`] for one reaching further ahead than the
+/// session will hold a schedule open for.
+fn screened_plan(
+    script: &Script,
+    now: i64,
+    screens: &Screens,
+) -> Result<SessionScheduleWire, RefusalReasonWire> {
+    let plan = plan_of(script)?;
+    let arrival = script.arrival.as_nanos();
+    let horizon_ns = session_bus::last_instant(&plan).map_or(0, |end| {
+        // Saturating because both origins are numbers off the wire: a stamp no
+        // clock could hold is a refusal rather than arithmetic that wrapped.
+        end.saturating_sub(arrival).max(end.saturating_sub(now))
+    });
+    if horizon_ns > screens.span_cap_ns {
+        return Err(RefusalReasonWire::TOO_LONG);
+    }
+    Ok(plan)
+}
+
+/// What the intake screens are configured with, copied off the configuration
+/// once per execution.
+///
+/// A plain value beside [`Budgets`] and for the same reason: a screen writes
+/// the slot, and the configuration is a borrow of the dial that holds it. A
+/// struct rather than loose arguments because the screens are a set that grows,
+/// and the next one is a field here rather than a signature everywhere.
+#[derive(Clone, Copy)]
+struct Screens {
+    /// How far ahead a script may schedule anything, nanoseconds: from its own
+    /// arrival stamp and from the wake that reads it, whichever leaves the
+    /// further horizon.
+    span_cap_ns: i64,
+}
+
+impl Screens {
+    /// The numbers the screens are held to, off the session's configuration.
+    fn of(params: &SessionParams) -> Self {
+        Self {
+            // Every millisecond a `UInt32` holds is a count of nanoseconds an
+            // `i64` holds, so the widening is the whole of the arithmetic.
+            span_cap_ns: i64::from(params.script_span_cap_ms) * MS_NS,
+        }
     }
 }
 
@@ -322,12 +479,21 @@ fn refusal(
 
 /// Why a script arriving in `phase` cannot be taken at all, or that it can.
 ///
-/// Parked is its own reason: nothing engages a parked machine until an operator
-/// has been, and a sender told "busy" would keep asking. Every other phase that
-/// is not resting is busy with a session, and scripts are never queued.
+/// Two phases take one. `resting` opens an engagement, and `active` replaces
+/// the schedule of one already running: a session that means to hold a
+/// conversation is refreshed by its sender as it goes, and answering each
+/// refresh with a disarm and a fresh engagement would cycle torque on the head
+/// for every one of them.
+///
+/// The rest refuse, and the two reasons say different things to a sender.
+/// Parked is latched: nothing engages a parked machine until an operator has
+/// been, and a sender told "busy" would keep asking. Every other phase is
+/// mid-something -- arming, being carried down out of a fault, being let go of
+/// -- and finishes what it is doing; a sender that still wants the machine
+/// raises it again from rest. Scripts are never queued.
 fn phase_refusal(phase: SessionPhaseWire) -> Option<RefusalReasonWire> {
     match phase {
-        SessionPhaseWire::RESTING => None,
+        SessionPhaseWire::RESTING | SessionPhaseWire::ACTIVE => None,
         SessionPhaseWire::PARKED => Some(RefusalReasonWire::PARKED),
         _ => Some(RefusalReasonWire::NOT_RESTING),
     }
@@ -449,17 +615,37 @@ fn span_of(
 /// the epoch it was written under.
 ///
 /// One statement, so a schedule is never half replaced: what a reader finds is
-/// the schedule it had or the schedule it has. `engaged` stays false: an
+/// the schedule it had or the schedule it has.
+///
+/// `bump` is whether this write opens a fresh epoch, and it is the caller's
+/// because the epoch belongs to the wake rather than to the write: a wake
+/// publishes once, so it bumps once, and a second acceptance inside one intake
+/// window lands under the epoch the first opened. The bump is what makes a
+/// change observable when the steps happen to look the same.
+///
+/// `engaged` is the caller's, and it is the whole difference between the two
+/// shapes of acceptance. A script that opens an engagement leaves it false: an
 /// accepted script says what the machine is to do and not that it is under
-/// command, and what makes it engaged is the arming that follows. The epoch is
-/// bumped whatever else changed, because it is what makes a change observable
-/// when the steps happen to look the same.
-fn store(slot: &mut SessionStateWire, script_id: u32, plan: &SessionScheduleWire) -> u32 {
+/// command, and what makes it engaged is the arming that follows. A script that
+/// replaces one leaves it true: the machine is under command throughout, and a
+/// pass through false would pause the goal stream the driver's dead-man is fed
+/// by.
+///
+/// Whole and not merged: the new plan is the entire commanded future, so
+/// overlay windows the old schedule still had open end with the old epoch.
+fn store(
+    slot: &mut SessionStateWire,
+    script_id: u32,
+    plan: &SessionScheduleWire,
+    engaged: bool,
+    bump: bool,
+) -> u32 {
     slot.set_script_id(script_id);
-    let epoch = slot.schedule().epoch().wrapping_add(1);
+    let held = slot.schedule().epoch();
+    let epoch = if bump { held.wrapping_add(1) } else { held };
     let schedule = slot.schedule_mut();
     *schedule = plan.clone();
-    schedule.set_engaged(false);
+    schedule.set_engaged(engaged);
     schedule.set_epoch(epoch);
     epoch
 }
@@ -825,20 +1011,38 @@ fn phase_report(entered: &Entered, now: i64) -> Report {
 ///
 /// A stow the wind-down commands is the one republish while the machine stays
 /// engaged, and it is `run_winddown`'s: what changed there is the schedule
-/// rather than whether anybody is running one.
-fn publish_schedule(dial: &mut SessionDial<'_>, counters: &mut SessionCounters, now: i64) {
+/// rather than whether anybody is running one. A wind-down is never a wake that
+/// took a replacement -- a machine being carried down out of a fault refuses
+/// scripts -- so the two never publish on one wake.
+///
+/// `replaced` is a schedule this wake's intake swapped out, which is a change
+/// the edge cannot see: the machine was under command before it and stays under
+/// command after it. That accept opened this wake's epoch already, so what
+/// happens here is the send and not a second bump -- one epoch, one datagram,
+/// and the row intake narrated names the schedule that went out. A replacement
+/// whose schedule was already over arrives here with the edge fired too, and
+/// then the same one datagram carries the machine being let go of.
+fn publish_schedule(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    now: i64,
+    replaced: bool,
+) {
     let commanded = matches!(
         dial.states.sess.phase(),
         SessionPhaseWire::ACTIVE | SessionPhaseWire::WINDING_DOWN
     );
-    if dial.states.sess.schedule().engaged() == commanded {
+    let edge = dial.states.sess.schedule().engaged() != commanded;
+    if !edge && !replaced {
         return;
     }
     {
         let schedule = dial.states.sess.schedule_mut();
-        let epoch = schedule.epoch().wrapping_add(1);
+        if !replaced {
+            let epoch = schedule.epoch().wrapping_add(1);
+            schedule.set_epoch(epoch);
+        }
         schedule.set_engaged(commanded);
-        schedule.set_epoch(epoch);
     }
     send_schedule(dial, counters, now);
 }

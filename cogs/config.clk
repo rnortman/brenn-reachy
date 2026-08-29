@@ -133,6 +133,16 @@ schema SessionParams
         // no servo could hold is a file this cannot parse rather than a number
         // narrowed somewhere downstream.
         #8 bus_watchdog: UInt8;
+
+        // How far into the future a script may schedule anything,
+        // milliseconds, to the end of its last step or overlay window. Measured
+        // from the script's own arrival stamp and from the wake that reads it,
+        // whichever leaves the further horizon, so a stamp ahead of this
+        // machine's clock buys no extra reach. A script past it is refused
+        // whole -- never truncated to fit. The horizon is what concludes a
+        // session whose sender stopped talking: the schedule runs out, the
+        // machine stows and de-torques, and this is the longest that can take.
+        #9 script_span_cap_ms: UInt32;
     }
 }
 

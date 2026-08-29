@@ -84,3 +84,22 @@ profile_velocity: 50
 # same 200 ms as the driver's own `hold_timeout_ns`, which is the same judgment
 # about the same silence made one layer up.
 bus_watchdog: 10
+
+# Ten minutes of schedule horizon, the furthest ahead a script may put anything.
+# A conversational sender holds the head up by refreshing its schedule on a
+# cadence far under this; what the ceiling bounds is the sender that stops
+# refreshing, whose last schedule is then the whole of the machine's committed
+# future. Past its end the session stows and de-torques on its normal path, so
+# this is the longest a dead sender can leave the machine engaged -- measured
+# from the wake that took the script as well as from the script's own stamp,
+# because a sender whose clock runs ahead would otherwise stretch that bound by
+# its skew.
+#
+# Must be at least the longest schedule horizon a publisher can construct, as
+# measured on this machine's clock at the wake that takes the script. The
+# publisher's own ceiling is this same ten minutes, so the two numbers being
+# equal leaves no room for a stamp from a clock running ahead: the invariant
+# holds exactly when a script's arrival stamp is this machine's receive time.
+# Any publisher here must stamp arrival with this machine's clock, never
+# forward the sender's. TODO(reachy-pod-motion-integration)
+script_span_cap_ms: 600000

@@ -160,6 +160,15 @@ pub const PROFILE_VELOCITY: i64 = 50;
 /// finds both on the wire, in that order.
 pub const BUS_WATCHDOG: i64 = 10;
 
+/// How far ahead a script may schedule anything, milliseconds: from its own
+/// arrival stamp and from the wake that reads it, whichever is further.
+///
+/// Mirrors the deployed `SessionParams.script_span_cap_ms`. What it bounds is
+/// the sender that stops refreshing: its last schedule runs out inside this,
+/// and the session concludes on its normal path rather than holding the machine
+/// torqued indefinitely.
+pub const SCRIPT_SPAN_CAP_MS: i64 = 600_000;
+
 /// How long the session may go without executing: the floor its wake condition
 /// puts under a run where nothing arrives, nanoseconds.
 ///
@@ -700,6 +709,7 @@ pub fn check_params(
             ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
             ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
             ("bus_watchdog", Value::Int(BUS_WATCHDOG)),
+            ("script_span_cap_ms", Value::Int(SCRIPT_SPAN_CAP_MS)),
         ],
         &mut failures,
     );
