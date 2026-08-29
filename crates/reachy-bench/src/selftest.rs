@@ -25,6 +25,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,10 @@ use thiserror::Error;
 
 use dxl_proto::conv::COUNTS_PER_REV;
 use dxl_proto::{HardwareError, counts_to_rad, volts_from_raw};
-use reachy_bus::{Bus, BusPort, BusTiming, RawValue, ServoMap, with_retry};
+use reachy_bus::{
+    Bus, BusPort, BusTiming, CYCLE_HOST_ALLOWANCE, ExchangeSpans, RawValue, ServoMap,
+    SyncReadOutcome, named_reg, with_retry,
+};
 use reachy_kin::{
     EnvelopeConfig, FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose,
     stow_head_pose,
@@ -42,7 +46,7 @@ use reachy_motion::joints::{LEG_COUNT, ROW_COUNT, ROWS, group_of, leg_index};
 use reachy_motion::reg::{self, Name as RegName};
 use reachy_motion::{
     ArmRecord, EXPECTED_MODELS, JointGroup, JointVector, ProvisionExpect, ProvisionTable, RegId,
-    Shown, VENDOR_HOMING_OFFSETS, Value,
+    Shown, VENDOR_HOMING_OFFSETS, Value, value,
 };
 
 use crate::bare;
@@ -110,6 +114,8 @@ pub enum Case {
     Temperature,
     /// Nothing is latched in a hardware error status byte.
     Health,
+    /// An exchange costs what a control cycle budgets for it.
+    BusExchangeTiming,
     /// Where the platform is resting, recorded.
     RestPose,
     /// Every limp servo reports its goal as its present position, which is what
@@ -127,7 +133,7 @@ pub enum Case {
 
 impl Case {
     /// Every case, in run order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::PortOpen,
         Self::Presence,
         Self::Identity,
@@ -136,6 +142,7 @@ impl Case {
         Self::Voltage,
         Self::Temperature,
         Self::Health,
+        Self::BusExchangeTiming,
         Self::RestPose,
         Self::GoalShadow,
         Self::Datum,
@@ -155,6 +162,7 @@ impl Case {
             Self::Voltage => "voltage",
             Self::Temperature => "temperature",
             Self::Health => "health",
+            Self::BusExchangeTiming => "bus-exchange-timing",
             Self::RestPose => "rest-pose",
             Self::GoalShadow => "goal-shadow",
             Self::Datum => "datum",
@@ -501,6 +509,158 @@ impl SelftestRecord {
     }
 }
 
+/// Exchanges of each kind [`Case::BusExchangeTiming`] measures.
+///
+/// Two hundred is enough for a ninety-ninth percentile to mean something — at
+/// this count the nearest rank is the 198th of the sorted two hundred, the
+/// third-worst — and small enough that the case costs a few seconds of a
+/// read-only run.
+const TIMING_EXCHANGES: usize = 200;
+
+/// A measured distribution, at the four places a person reads one at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SpanStats {
+    min: Duration,
+    median: Duration,
+    p99: Duration,
+    max: Duration,
+}
+
+impl SpanStats {
+    /// The four places of `spans`, which arrive in whatever order they were
+    /// measured.
+    ///
+    /// Nearest-rank percentiles over the sorted spans: no interpolation, so
+    /// every figure printed is a span some exchange actually took. An empty set
+    /// reads as zeroes, which is what a case that measured nothing has to say.
+    fn of(spans: &[Duration]) -> Self {
+        let mut sorted: Vec<Duration> = spans.to_vec();
+        sorted.sort_unstable();
+        let at = |quantile: f64| -> Duration {
+            if sorted.is_empty() {
+                return Duration::ZERO;
+            }
+            // The rank of a quantile over n spans, as an index: at least the
+            // first and never past the last. Not a bound on anything commanded
+            // — it is where in a sorted list to look.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a rank over at most a few hundred spans is a small positive integer"
+            )]
+            let rank = (quantile * sorted.len() as f64).ceil() as usize;
+            sorted[rank.max(1).min(sorted.len()) - 1]
+        };
+        Self {
+            min: at(0.0),
+            median: at(0.5),
+            p99: at(0.99),
+            max: at(1.0),
+        }
+    }
+}
+
+impl fmt::Display for SpanStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}/{}",
+            millis(self.min),
+            millis(self.median),
+            millis(self.p99),
+            millis(self.max)
+        )
+    }
+}
+
+/// A span in milliseconds, as every span in this module prints.
+fn millis(span: Duration) -> String {
+    format!("{:.3}", span.as_secs_f64() * 1e3)
+}
+
+/// One kind of exchange, measured against the budget it has to fit.
+#[derive(Clone, Debug)]
+struct TimingRun {
+    /// What was exchanged, for the line the case prints.
+    what: &'static str,
+    /// What one of these may cost inside a control cycle.
+    bound: Duration,
+    spans: Vec<ExchangeSpans>,
+}
+
+impl TimingRun {
+    fn new(what: &'static str, bound: Duration) -> Self {
+        Self {
+            what,
+            bound,
+            spans: Vec::with_capacity(TIMING_EXCHANGES),
+        }
+    }
+
+    fn note(&mut self, spans: ExchangeSpans) {
+        self.spans.push(spans);
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Exchanges whose total ran past the budget. The assertion the case makes,
+    /// counted rather than stopped at the first: how many of them overran is
+    /// the difference between a stall and a bus that is simply this slow.
+    fn overruns(&self) -> usize {
+        self.spans
+            .iter()
+            .filter(|spans| spans.total() > self.bound)
+            .count()
+    }
+
+    /// The distribution of one of the three spans.
+    fn stats(&self, pick: impl Fn(&ExchangeSpans) -> Duration) -> SpanStats {
+        let spans: Vec<Duration> = self.spans.iter().map(pick).collect();
+        SpanStats::of(&spans)
+    }
+}
+
+impl fmt::Display for TimingRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} x{} against {} ms, min/median/p99/max ms: total {}, write {}, wait {}",
+            self.what,
+            self.len(),
+            millis(self.bound),
+            self.stats(ExchangeSpans::total),
+            self.stats(|spans| spans.send),
+            self.stats(|spans| spans.wait)
+        )
+    }
+}
+
+/// What the two measured runs say about this bus.
+///
+/// Separate from the reads that took them so the verdict is assertable without
+/// running a bus: the case exists to fail, and a verdict wired to the wrong
+/// budget or to neither count would report a pass on a bus that overruns by
+/// several times over, which is exactly the reading a person is waiting for.
+/// Both distributions are printed whichever way it went.
+fn timing_verdict(unicast: &TimingRun, grouped: &TimingRun, short: usize) -> CaseResult {
+    let detail = format!("{unicast}; {grouped}");
+    let over = unicast.overruns() + grouped.overruns();
+    if over == 0 && short == 0 {
+        CaseResult::pass(Case::BusExchangeTiming, detail)
+    } else {
+        CaseResult::fail(
+            Case::BusExchangeTiming,
+            format!(
+                "{over} of {} exchanges ran past the cycle's budget and {short} grouped reads \
+                 came back short; {detail}",
+                unicast.len() + grouped.len()
+            ),
+        )
+    }
+}
+
 /// The band a resting servo's present temperature has to read inside, degrees
 /// Celsius.
 ///
@@ -514,6 +674,19 @@ impl SelftestRecord {
 /// Wide on purpose: an unexpected value gets a person's review before this range
 /// moves (bring-up rule, `CLAUDE.md`).
 const RESTING_TEMP_BAND_C: core::ops::RangeInclusive<u8> = 5..=55;
+
+/// The counts an antenna at rest may read: the turn a fold leaves, and half a
+/// turn of slack on each side of it.
+///
+/// The slack is where a session's wind-down rests. Stow's count
+/// representatives — a few counts above zero on one antenna and a few below on
+/// the other — sit on the fold turn's own boundary, so a unit read after a
+/// session rather than after a power cycle lands either side of it for a fully
+/// explained reason. Half a turn each way is generous room around that and
+/// still less than the 8250 counts of the recorded 545° anomaly, which is what
+/// the case exists to catch.
+const FOLD_WINDOW: core::ops::Range<i32> =
+    (-COUNTS_PER_REV / 2)..(COUNTS_PER_REV + COUNTS_PER_REV / 2);
 
 /// The slack every leg-fence bound is allowed, counts.
 ///
@@ -612,6 +785,43 @@ pub fn margin_verdict(min_margin: f64, floor: Option<f64>, detail: &str) -> Case
     }
 }
 
+/// Servo ids as a refusal names them: `11, 12, 17`.
+fn ids_listed(ids: &[u8]) -> String {
+    ids.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+}
+
+/// A second value a provisioned register legitimately holds at rest, beside the
+/// baseline [`ProvisionTable`] checks it against.
+///
+/// Lives here rather than in the compare loop so the loop stays
+/// register-agnostic.
+///
+/// A register in this list is expected to read one value or the other on *every*
+/// servo. A mix of the two is nothing at rest left behind, so it fails.
+#[derive(Clone, Debug)]
+struct RestingAlternate {
+    /// The register whose second reading this is.
+    reg: RegId,
+    /// The value that reading holds.
+    value: Value,
+    /// What writes it, as a refusal names it: "expected 0 or the 10 <this>".
+    written_by: &'static str,
+    /// What every servo at the provisioned baseline says about the machine.
+    all_baseline: &'static str,
+    /// What every servo at [`RestingAlternate::value`] says about it.
+    all_alternate: &'static str,
+    /// What a mix of the two says — the text of the failure it produces.
+    mixed: &'static str,
+}
+
+/// How many servos read each of a [`RestingAlternate`]'s two accepted values,
+/// and which.
+#[derive(Debug, Default)]
+struct AlternateTally {
+    baseline: Vec<u8>,
+    alternate: Vec<u8>,
+}
+
 /// Everything the read-only registry needs that is not the machine.
 ///
 /// Built from a configuration file, which records no datum: this registry is
@@ -625,6 +835,9 @@ pub struct Registry {
     timing: BusTiming,
     map: ServoMap,
     expected: ProvisionTable,
+    /// The registers with a second legitimate reading at rest. One entry today,
+    /// the Bus Watchdog.
+    resting: Vec<RestingAlternate>,
     geom: HeadGeometry,
     fk: FkOptions,
     env: EnvelopeConfig,
@@ -644,6 +857,21 @@ impl Registry {
             timing: cfg.bus_timing()?,
             map: ServoMap::new(ids),
             expected: cfg.provision_table(),
+            // The watchdog is the one provisioned register a motion session
+            // writes and nothing clears short of power-on, so at rest it reads
+            // either the provisioned baseline or what that session armed. A
+            // session arms all nine; the bench's own `watchdog` command arms
+            // one servo and disarms it again, so a mix is that disarm having
+            // failed, or a session's commissioning sweep stopping part-way.
+            resting: vec![RestingAlternate {
+                reg: RegId::BusWatchdog,
+                value: value::u8(cfg.resting_bus_watchdog()?),
+                written_by: "a session arms",
+                all_baseline: "no session since power-on",
+                all_alternate: "a session has run this power cycle",
+                mixed: "nothing at rest leaves the register in two states: a session that armed \
+                        part of the roster, or a `watchdog` command whose disarm did not take",
+            }],
             geom: HeadGeometry::default(),
             fk: FkOptions::default(),
             // The defaults and not a table in this file: the fence case compares
@@ -708,6 +936,7 @@ impl Registry {
         self.voltage(&mut bus, report);
         self.temperature(&mut bus, report);
         self.health(&mut bus, report);
+        self.bus_exchange_timing(&mut bus, report);
         let Some(counts) = self.rest_pose(&mut bus, report) else {
             return;
         };
@@ -801,6 +1030,11 @@ impl Registry {
         let mut recorded = 0usize;
         let mut wrong = Vec::new();
         let mut readings = Vec::new();
+        let mut tallies: Vec<AlternateTally> = self
+            .resting
+            .iter()
+            .map(|_| AlternateTally::default())
+            .collect();
         let mut fences: LegFences = [[None; 2]; LEG_COUNT];
 
         for reg in reg::named() {
@@ -833,13 +1067,36 @@ impl Registry {
                 match expect {
                     ProvisionExpect::Check(expected) => {
                         checked += 1;
-                        if value != expected {
-                            wrong.push(format!(
+                        // The refusal names only the states this register has,
+                        // so a value that is another register's alternate is
+                        // never offered as if it were this one's.
+                        let alternate = self
+                            .resting
+                            .iter()
+                            .position(|entry| entry.reg == reg)
+                            .map(|index| (index, &self.resting[index]));
+                        match alternate {
+                            Some((index, entry)) if value == entry.value => {
+                                tallies[index].alternate.push(*id);
+                            }
+                            Some((index, _)) if value == expected => {
+                                tallies[index].baseline.push(*id);
+                            }
+                            Some((_, entry)) => wrong.push(format!(
+                                "servo {id} {}: expected {} or the {} {}, read {}",
+                                RegName(reg),
+                                Shown(expected),
+                                Shown(entry.value),
+                                entry.written_by,
+                                Shown(value)
+                            )),
+                            None if value != expected => wrong.push(format!(
                                 "servo {id} {}: expected {}, read {}",
                                 RegName(reg),
                                 Shown(expected),
                                 Shown(value)
-                            ));
+                            )),
+                            None => {}
                         }
                     }
                     ProvisionExpect::Record => recorded += 1,
@@ -851,8 +1108,43 @@ impl Registry {
             }
         }
 
+        // Which of its two states a resting-alternate register was in is a
+        // reading a person wants beside every other register on the sweep: for
+        // the watchdog it is the whole record of whether this unit has run a
+        // session since it was last powered on. A roster split across both
+        // states records nothing of the sort, and is a failure.
+        let mut states = String::new();
+        for (entry, tally) in self.resting.iter().zip(&tallies) {
+            match (tally.baseline.as_slice(), tally.alternate.as_slice()) {
+                ([], []) => {}
+                (baseline, []) => states.push_str(&format!(
+                    "; {} at the provisioned baseline on {} servos: {}",
+                    RegName(entry.reg),
+                    baseline.len(),
+                    entry.all_baseline
+                )),
+                ([], alternate) => states.push_str(&format!(
+                    "; {} at the {} {} on {} servos: {}",
+                    RegName(entry.reg),
+                    Shown(entry.value),
+                    entry.written_by,
+                    alternate.len(),
+                    entry.all_alternate
+                )),
+                (baseline, alternate) => wrong.push(format!(
+                    "{}: at the provisioned baseline on servos {} and at the {} {} on servos {} \
+                     — {}",
+                    RegName(entry.reg),
+                    ids_listed(baseline),
+                    Shown(entry.value),
+                    entry.written_by,
+                    ids_listed(alternate),
+                    entry.mixed
+                )),
+            }
+        }
         let summary = format!(
-            "{checked} checked, {recorded} recorded: {}",
+            "{checked} checked, {recorded} recorded{states}: {}",
             readings.join("; ")
         );
         if wrong.is_empty() {
@@ -1135,6 +1427,76 @@ impl Registry {
         }
     }
 
+    /// What an exchange on this bus actually costs, against what a control
+    /// cycle budgets for one.
+    ///
+    /// Two kinds, because the cycle runs both and they are budgeted apart: the
+    /// unicast register read the out-of-band slot spends its transactions on,
+    /// and the grouped read that gathers nine positions and is the cycle's most
+    /// expensive exchange. Every exchange is timed on both sides of its write,
+    /// so an overrun says whether the host was waiting for its own bytes to
+    /// leave or for a servo to answer.
+    ///
+    /// The exchanges run under the *configured* deadline, which is the generous
+    /// one, and are judged against the cycle's. A measurement taken under the
+    /// deadline it is judged by could only ever report the deadline.
+    ///
+    /// Nothing is retried: a retry's second attempt would replace the reading
+    /// the case exists to take. A servo that will not answer fails the case by
+    /// name, and a grouped read that came back short says which slots.
+    fn bus_exchange_timing<P: BusPort>(&self, bus: &mut Bus<P>, report: &mut Report) {
+        let budget = BusTiming {
+            host_allowance: CYCLE_HOST_ALLOWANCE,
+            ..self.timing
+        };
+        let error_status = named_reg(RegId::HardwareErrorStatus);
+        let position = named_reg(RegId::PresentPosition);
+        let id = self.ids[0];
+
+        let mut unicast = TimingRun::new(
+            "unicast read",
+            budget.read_reg_bound(usize::from(error_status.len)),
+        );
+        for _ in 0..TIMING_EXCHANGES {
+            if let Err(error) = bus.read_reg(id, error_status) {
+                report.push(CaseResult::fail(
+                    Case::BusExchangeTiming,
+                    format!(
+                        "servo {id} stopped answering after {} reads: {error}",
+                        unicast.len()
+                    ),
+                ));
+                return;
+            }
+            unicast.note(bus.last_spans());
+        }
+
+        let mut grouped = TimingRun::new(
+            "grouped read",
+            budget.sync_read_bound(self.ids.len(), usize::from(position.len)),
+        );
+        let mut outcome = SyncReadOutcome::new();
+        let mut short = 0;
+        for _ in 0..TIMING_EXCHANGES {
+            if let Err(error) = bus.sync_read(&self.ids, position, &mut outcome) {
+                report.push(CaseResult::fail(
+                    Case::BusExchangeTiming,
+                    format!(
+                        "the grouped read failed after {} of them: {error}",
+                        grouped.len()
+                    ),
+                ));
+                return;
+            }
+            grouped.note(bus.last_spans());
+            if !outcome.all_ok() {
+                short += 1;
+            }
+        }
+
+        report.push(timing_verdict(&unicast, &grouped, short));
+    }
+
     /// Where the platform is resting, as counts.
     ///
     /// Counts rather than angles: a count is what the servo said, and the
@@ -1296,8 +1658,9 @@ impl Registry {
         }
     }
 
-    /// Each antenna's resting count against the single turn a boot fold leaves
-    /// it in.
+    /// Each antenna's resting count against the turn a boot fold leaves it in,
+    /// with half a turn of slack either side for where a session's wind-down
+    /// rests.
     ///
     /// The antennas are the two joints in extended position mode, so their
     /// position register counts turns rather than wrapping: a sweep past the
@@ -1310,15 +1673,26 @@ impl Registry {
     /// happened, and a sweep planned from a count several turns out is a sweep
     /// several turns long.
     ///
+    /// The slack is the wind-down, not a travel cap — nothing caps an antenna
+    /// short of representability. A session leaves its antennas at stow, whose
+    /// count representatives sit within a few counts of the fold turn's own
+    /// boundary, so a unit read after a session rather than after a power cycle
+    /// legitimately rests a little either side of it. Half a turn each way is
+    /// generous slack around that rest, and the downstream requirement — a
+    /// resting count that is not several turns out — survives it.
+    ///
     /// Read off the resting-pose sweep rather than asked for again — this is a
     /// second question about the counts that case already recorded, and the
     /// antennas are free rotors nothing is holding still between two reads.
     ///
     /// One reading of 545° immediately after a hard power cycle is on record
-    /// and unexplained. If this case fails, that observation has recurred, and
-    /// it is a person's to look at: the count frame is the datum every antenna
+    /// and unexplained. 545° is 8250 counts, more than half a turn past this
+    /// window, so if that observation recurs this case still fails and it is
+    /// still a person's to look at: the count frame is the datum every antenna
     /// command is planned in, and a bound widened to admit an unfolded reading
-    /// would launder the anomaly into accepted behaviour.
+    /// would launder the anomaly into accepted behaviour. Normalising the count
+    /// modulo a turn before comparing would be exactly that laundering, and is
+    /// not done.
     fn antenna_fold(&self, counts: &[i32; ROW_COUNT], report: &mut Report) {
         let mut readings = Vec::new();
         let mut unfolded = Vec::new();
@@ -1329,16 +1703,19 @@ impl Registry {
             let (id, count) = (self.ids[row], counts[row]);
             let degrees = counts_to_rad(count).to_degrees();
             readings.push(format!("{id}: {count} counts ({degrees:.3} deg)"));
-            if !(0..COUNTS_PER_REV).contains(&count) {
+            if !FOLD_WINDOW.contains(&count) {
                 unfolded.push(format!(
                     "servo {id}: {count} counts, {degrees:.3} deg, is outside the turn a fold \
-                     leaves"
+                     leaves and the half-turn of wind-down slack either side"
                 ));
             }
         }
 
         let detail = format!(
-            "against the {COUNTS_PER_REV}-count turn a fold leaves: {}",
+            "against counts {}..{} — the {COUNTS_PER_REV}-count turn a fold leaves, with half a \
+             turn of wind-down slack either side: {}",
+            FOLD_WINDOW.start,
+            FOLD_WINDOW.end,
             readings.join("; ")
         );
         if unfolded.is_empty() {
@@ -1490,7 +1867,7 @@ pub fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod runner_tests {
-    use dxl_proto::frame::{INST_PING, INST_READ};
+    use dxl_proto::frame::{INST_PING, INST_READ, INST_SYNC_READ};
     use reachy_motion::joints::Name;
 
     use super::*;
@@ -1510,19 +1887,31 @@ mod runner_tests {
     /// (servo, register address).
     type Watched = (Report, Vec<(u8, u8)>, Vec<(u8, u16)>);
 
+    /// A watched run and, with it, every servo a grouped read named.
+    type WatchedGrouped = (Report, Vec<(u8, u8)>, Vec<(u8, u16)>, Vec<u8>);
+
     /// The same run, carrying the register each unicast read asked for as well
     /// as the instructions — which is the only record of *which* register a case
     /// put on the wire, and how often.
     fn run_watched(cfg: &BenchConfig, machine: FakeMachine) -> Watched {
+        let (report, instructions, asked, _) = run_watched_grouped(cfg, machine);
+        (report, instructions, asked)
+    }
+
+    /// The same run again, carrying the servos the grouped reads named — the
+    /// only record of who a broadcast frame actually asked.
+    fn run_watched_grouped(cfg: &BenchConfig, machine: FakeMachine) -> WatchedGrouped {
         let registry = Registry::from_config(cfg).expect("the configuration converts");
         let spy = Spy::new(machine);
         let log = spy.log();
         let reads = spy.reads();
+        let sync_ids = spy.sync_ids();
         let mut report = Report::new();
         registry.run(Ok::<Spy, String>(spy), &mut report);
         let instructions = log.borrow().clone();
         let asked = reads.borrow().clone();
-        (report, instructions, asked)
+        let grouped = sync_ids.borrow().clone();
+        (report, instructions, asked, grouped)
     }
 
     /// What one case said about itself.
@@ -1539,9 +1928,173 @@ mod runner_tests {
             .unwrap_or_else(|| panic!("{case:?} left no result in {report}"))
     }
 
+    /// What a run over the fake machine may assert about the timing case: that
+    /// it ran, that it printed all three distributions over the exchanges it
+    /// says it took, and that anything it failed on was the wall-clock budget
+    /// and nothing else.
+    ///
+    /// Not the pass/fail verdict. That verdict is a statement about a machine —
+    /// over a fake port the medians are microseconds, but the maximum belongs
+    /// to the host's scheduler, and one descheduling of the test thread in 400
+    /// exchanges runs past a serial bus's budget. The verdict arithmetic is
+    /// pinned deterministically over synthetic spans in `timing_verdict`'s own
+    /// tests, and the pass direction on a real bus is the hardware registry's
+    /// to hold.
+    fn assert_timing_case_ran_clean(report: &Report) {
+        let outcome = report.outcome(Case::BusExchangeTiming);
+        assert_ne!(outcome, Outcome::NotRun, "the timing case ran: {report}");
+        let detail = detail_of(report, Case::BusExchangeTiming);
+        for expected in [
+            format!("unicast read x{TIMING_EXCHANGES}"),
+            format!("grouped read x{TIMING_EXCHANGES}"),
+            "total ".to_string(),
+            "write ".to_string(),
+            "wait ".to_string(),
+        ] {
+            assert!(detail.contains(&expected), "{detail}");
+        }
+        if outcome != Outcome::Pass {
+            assert!(
+                detail.contains("0 grouped reads came back short"),
+                "a fake port answers every slot: {detail}"
+            );
+            assert!(
+                !detail.contains("servo "),
+                "a fake port's servos all answer: {detail}"
+            );
+        }
+    }
+
+    /// The bus watchdog reads one of two things on a machine at rest: the
+    /// provisioned zero on a unit power-cycled since its last session, and the
+    /// timeout a session arms on one that has run since. Both pass, and the
+    /// sweep's line says which was read — that is the whole record of whether a
+    /// session has run this power cycle.
+    #[test]
+    fn the_watchdog_row_accepts_the_baseline_and_the_value_a_session_arms() {
+        let cfg = example_config();
+        let (report, _) = run(&cfg, machine_at(&cfg, &stow_legs()));
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Pass);
+        assert!(
+            report.to_string().contains("no session since power-on"),
+            "{report}"
+        );
+
+        let mut machine = machine_at(&cfg, &stow_legs());
+        for id in cfg.servo_ids().expect("the roster") {
+            machine.set(
+                id,
+                named_reg(RegId::BusWatchdog),
+                &[cfg.provision.bus_watchdog_armed],
+            );
+        }
+        let (report, _) = run(&cfg, machine);
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Pass);
+        assert!(
+            report
+                .to_string()
+                .contains("a session has run this power cycle"),
+            "{report}"
+        );
+    }
+
+    /// Both accepted readings are the *roster's*, not a servo's. A unit split
+    /// across them is neither state and records nothing about whether a session
+    /// has run: a session's commissioning sweep arms all nine, power-on clears
+    /// all nine, and the one thing that arms a single servo — the bench's own
+    /// `watchdog` command — disarms it again on the way out. A mix is that
+    /// disarm having failed or an arm that stopped part-way, which is exactly
+    /// the state a person needs to see.
+    #[test]
+    fn a_roster_split_across_both_rest_states_fails_naming_the_servos() {
+        let cfg = example_config();
+        let ids = cfg.servo_ids().expect("the roster");
+        let mut machine = machine_at(&cfg, &stow_legs());
+        for id in ids.iter().skip(1) {
+            machine.set(
+                *id,
+                named_reg(RegId::BusWatchdog),
+                &[cfg.provision.bus_watchdog_armed],
+            );
+        }
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(
+            report.outcome(Case::ProvisionSweep),
+            Outcome::Fail,
+            "one servo at the baseline and eight armed is neither rest state"
+        );
+        let printed = report.to_string();
+        assert!(
+            printed.contains(&format!("on servos {}", ids[0])),
+            "the odd servo out is named: {printed}"
+        );
+        assert!(
+            printed.contains("whose disarm did not take"),
+            "and the line says what leaves a roster split: {printed}"
+        );
+        assert!(
+            !printed.contains("a session has run this power cycle"),
+            "a split roster is not the record that a session ran: {printed}"
+        );
+    }
+
+    /// Anything else in the register fails the sweep by name, a latched trip
+    /// (0xFF) among them: a watchdog that tripped and stayed tripped across the
+    /// end of a session is an unexplained event, not a state something left
+    /// behind on purpose.
+    #[test]
+    fn the_watchdog_row_fails_on_any_third_reading() {
+        let cfg = example_config();
+        for reading in [0xFFu8, 5] {
+            let mut machine = machine_at(&cfg, &stow_legs());
+            machine.set(11, named_reg(RegId::BusWatchdog), &[reading]);
+            let (report, _) = run(&cfg, machine);
+
+            assert_eq!(
+                report.outcome(Case::ProvisionSweep),
+                Outcome::Fail,
+                "{reading} is neither the baseline nor what a session arms"
+            );
+            let printed = report.to_string();
+            assert!(printed.contains("servo 11"), "{printed}");
+            assert!(
+                printed.contains("a session arms"),
+                "the refusal names both accepted states: {printed}"
+            );
+        }
+    }
+
+    /// Only the watchdog has a second accepted state. Every other provisioned
+    /// register refuses a wrong reading with a line naming the one value it
+    /// wanted — the reading a person is handed as the evidence, so it must not
+    /// offer an alternative that register would have failed on anyway. The
+    /// value a session arms the watchdog with is the sharp case: read back from
+    /// Drive Mode it is simply wrong, and the refusal has to say so.
+    #[test]
+    fn a_non_watchdog_register_fails_naming_only_its_own_expectation() {
+        let cfg = example_config();
+        let armed = cfg.provision.bus_watchdog_armed;
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine.set(11, named_reg(RegId::DriveMode), &[armed]);
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::ProvisionSweep), Outcome::Fail);
+        let printed = report.to_string();
+        assert!(printed.contains("servo 11"), "{printed}");
+        assert!(
+            !printed.contains("a session arms"),
+            "the watchdog's second state is not on offer for Drive Mode: {printed}"
+        );
+    }
+
     /// A machine holding what it should, resting at the stow pose, passes every
     /// case the registry has — the clearance among them, since the floor is a
     /// reviewed number and a correct machine clears it.
+    ///
+    /// Every case but the timing one, which judges wall-clock spans against a
+    /// serial bus's budget and so answers about the host running the test
+    /// rather than about the machine; it is asserted to have run clean instead.
     #[test]
     fn a_correct_machine_passes_every_case() {
         let cfg = example_config();
@@ -1549,6 +2102,10 @@ mod runner_tests {
         let (report, _) = run(&cfg, machine);
 
         for case in Case::ALL {
+            if case == Case::BusExchangeTiming {
+                assert_timing_case_ran_clean(&report);
+                continue;
+            }
             assert_eq!(
                 report.outcome(case),
                 Outcome::Pass,
@@ -1560,7 +2117,14 @@ mod runner_tests {
                     .map_or_else(|| "no verdict".to_string(), ToString::to_string)
             );
         }
-        assert!(report.all_passed(), "every case passed");
+        assert!(
+            report
+                .results()
+                .iter()
+                .filter(|result| result.case != Case::BusExchangeTiming)
+                .all(|result| result.outcome.passed()),
+            "every case but the timing one passed: {report}"
+        );
 
         let record = report.into_record(1);
         assert!(record.rest_counts.is_some());
@@ -1574,20 +2138,36 @@ mod runner_tests {
     /// does nothing else. This is the property that makes it safe to run on an
     /// unknown machine — and the presence case prints it as a statement of
     /// fact, so both halves are asserted here rather than only the instruction.
+    ///
+    /// The grouped read is the one request that does not wear one address: it
+    /// goes to the broadcast id and carries its roster in its parameters. It is
+    /// still a read and still asks only configured servos, which is what is
+    /// asserted of it here — the frame's own id is exempted, the servos it
+    /// names are not.
     #[test]
     fn the_registry_only_ever_pings_and_reads_its_own_roster() {
         let cfg = example_config();
         let machine = machine_at(&cfg, &stow_legs());
         let ids = cfg.servo_ids().expect("the roster is nine servos");
-        let (_, instructions) = run(&cfg, machine);
+        let (_, instructions, _, grouped) = run_watched_grouped(&cfg, machine);
 
         assert!(!instructions.is_empty());
         let mut seen = Vec::new();
         for (id, instruction) in &instructions {
             assert!(
-                *instruction == INST_PING || *instruction == INST_READ,
+                *instruction == INST_PING
+                    || *instruction == INST_READ
+                    || *instruction == INST_SYNC_READ,
                 "servo {id} was sent instruction {instruction:#04x}"
             );
+            if *instruction == INST_SYNC_READ {
+                assert_eq!(
+                    *id,
+                    dxl_proto::BROADCAST_ID,
+                    "a grouped read is addressed to the broadcast id and to nothing else"
+                );
+                continue;
+            }
             assert_ne!(
                 *id,
                 dxl_proto::BROADCAST_ID,
@@ -1600,6 +2180,14 @@ mod runner_tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, ids.to_vec(), "every configured servo, and only those");
+
+        assert!(!grouped.is_empty(), "the timing case runs grouped reads");
+        for id in &grouped {
+            assert!(
+                ids.contains(id),
+                "a grouped read named {id}, not on the roster"
+            );
+        }
     }
 
     /// A clearance floor the configuration cannot stand behind refuses before
@@ -1624,6 +2212,53 @@ mod runner_tests {
             assert_eq!(key, "arm.min_arm_voltage");
             assert_eq!(value.to_bits(), bad.to_bits(), "{bad}");
         }
+    }
+
+    /// A second rest state that cannot be told from the first refuses before
+    /// the registry is built.
+    ///
+    /// The sweep matches the alternate before the baseline, so a configuration
+    /// whose two accepted readings are the same value would tally a virgin,
+    /// power-cycled unit as armed and print "a session has run this power
+    /// cycle" over a machine that has run none — the one line the case exists
+    /// to produce, inverted, on a green sweep. Refused rather than ordered
+    /// around, because a split roster would be undetectable under it either
+    /// way.
+    #[test]
+    fn a_rest_state_equal_to_the_baseline_refuses_the_registry() {
+        let mut cfg = example_config();
+        cfg.provision.bus_watchdog_armed = cfg.provision.bus_watchdog;
+        let Err(refusal) = Registry::from_config(&cfg) else {
+            panic!("the two rest states are one value, and a registry was built on it");
+        };
+        assert_eq!(
+            refusal,
+            ConfigError::RestingStatesCollide {
+                alternate: "provision.bus_watchdog_armed",
+                baseline: "provision.bus_watchdog",
+                value: cfg.provision.bus_watchdog,
+            },
+            "{refusal}"
+        );
+    }
+
+    /// The tripped reading is what the sweep fails on, so it cannot also be
+    /// configured as a state the machine legitimately rests in.
+    #[test]
+    fn a_rest_state_that_is_the_tripped_reading_refuses_the_registry() {
+        let mut cfg = example_config();
+        cfg.provision.bus_watchdog_armed = crate::bare::WATCHDOG_LATCHED;
+        let Err(refusal) = Registry::from_config(&cfg) else {
+            panic!("a latched trip is not a rest state, and a registry accepted it as one");
+        };
+        assert_eq!(
+            refusal,
+            ConfigError::RestingStateIsATrip {
+                key: "provision.bus_watchdog_armed",
+                value: crate::bare::WATCHDOG_LATCHED,
+            },
+            "{refusal}"
+        );
     }
 
     /// A port that does not open fails the first case and runs nothing after it.
@@ -1700,6 +2335,97 @@ mod runner_tests {
         let printed = report.to_string();
         assert!(printed.contains("servo 13"), "{printed}");
         assert!(printed.contains("operating mode"), "{printed}");
+    }
+
+    /// The timing case measures both kinds of exchange and says what each
+    /// cost, whichever way the assertion went.
+    ///
+    /// Over a fake port the medians are microseconds, the maximum is the host
+    /// scheduler's, and the pass/fail verdict is therefore not this test's to
+    /// assert — the deterministic verdict arithmetic is pinned in
+    /// `timing_verdict`'s own tests. What is asserted here is that the case ran
+    /// the exchanges it says it ran and printed all three distributions,
+    /// because the printed breakdown is the whole product of the case on a run
+    /// where it fails.
+    #[test]
+    fn the_timing_case_prints_what_each_kind_of_exchange_cost() {
+        let cfg = example_config();
+        let machine = machine_at(&cfg, &stow_legs());
+        let (report, _, reads) = run_watched(&cfg, machine);
+
+        assert_timing_case_ran_clean(&report);
+        let detail = detail_of(&report, Case::BusExchangeTiming);
+
+        let status = named_reg(RegId::HardwareErrorStatus).addr;
+        let asked = reads
+            .iter()
+            .filter(|(id, addr)| *id == 10 && *addr == status)
+            .count();
+        assert!(
+            asked >= TIMING_EXCHANGES,
+            "the case reads servo 10's error status {TIMING_EXCHANGES} times; saw {asked}"
+        );
+
+        // The budget printed is the cycle's, not the configured deadline the
+        // exchanges ran under: judged by the generous one the case could never
+        // fail, whatever the bus cost.
+        let registry = Registry::from_config(&cfg).expect("the configuration converts");
+        let cycle = BusTiming {
+            host_allowance: CYCLE_HOST_ALLOWANCE,
+            ..registry.timing
+        };
+        let width = usize::from(named_reg(RegId::HardwareErrorStatus).len);
+        assert!(
+            detail.contains(&format!(
+                "against {} ms",
+                millis(cycle.read_reg_bound(width))
+            )),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains(&format!(
+                "against {} ms",
+                millis(registry.timing.read_reg_bound(width))
+            )),
+            "the configured allowance is not what an exchange is judged by: {detail}"
+        );
+    }
+
+    /// A grouped read that comes back missing a servo fails the timing case and
+    /// says so, rather than passing on a distribution over partial readings.
+    #[test]
+    fn a_grouped_read_that_comes_back_short_fails_the_timing_case() {
+        let cfg = example_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        let registry = Registry::from_config(&cfg).expect("the configuration converts");
+        machine
+            .deaf
+            .insert((registry.ids[4], named_reg(RegId::PresentPosition).addr));
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::BusExchangeTiming), Outcome::Fail);
+        let detail = detail_of(&report, Case::BusExchangeTiming);
+        assert!(detail.contains("came back short"), "{detail}");
+        assert!(
+            detail.contains(&format!("{TIMING_EXCHANGES} grouped reads came back short")),
+            "every one of them was short: {detail}"
+        );
+    }
+
+    /// A servo that stops answering fails the timing case by name rather than
+    /// leaving a distribution over the exchanges that did answer.
+    #[test]
+    fn a_servo_that_stops_answering_fails_the_timing_case_by_name() {
+        let cfg = example_config();
+        let mut machine = machine_at(&cfg, &stow_legs());
+        machine
+            .deaf
+            .insert((10, named_reg(RegId::HardwareErrorStatus).addr));
+        let (report, _) = run(&cfg, machine);
+
+        assert_eq!(report.outcome(Case::BusExchangeTiming), Outcome::Fail);
+        let detail = detail_of(&report, Case::BusExchangeTiming);
+        assert!(detail.contains("servo 10"), "{detail}");
     }
 
     /// An antenna still in single-turn position mode fails the sweep by name.
@@ -2120,8 +2846,8 @@ mod runner_tests {
         );
     }
 
-    /// An antenna resting outside the turn a boot fold leaves it in fails the
-    /// fold case, naming that servo and its reading.
+    /// An antenna resting outside the fold window fails the fold case, naming
+    /// that servo and its reading.
     ///
     /// 8250 counts is the 545° one antenna reported immediately after a hard
     /// power cycle on the bench — the one observation on record that says the
@@ -2185,20 +2911,25 @@ mod runner_tests {
         );
     }
 
-    /// The turn's two edges are where the case turns over, counted exactly.
+    /// The window's two edges are where the case turns over, counted exactly.
     ///
-    /// The whole case is a boundary — a fold leaves a count in `[0, one turn)`
-    /// and anything else says the fold did not happen — so an off-by-one at
-    /// either end is the case admitting the reading it exists to catch. One
-    /// count past the turn is the shape the 545° anomaly took; one count below
-    /// zero is the same reading from the other side.
+    /// The whole case is a boundary — a fold leaves a count in the turn, a
+    /// wind-down leaves one within half a turn of it, and anything further out
+    /// says the fold did not happen — so an off-by-one at either end is the
+    /// case admitting the reading it exists to catch. The turn's own edges are
+    /// inside it, and the count a session's wind-down actually left on servo 18
+    /// (−64) with it.
     #[test]
-    fn the_fold_case_turns_over_at_the_edges_of_the_turn() {
+    fn the_fold_case_turns_over_at_the_edges_of_the_window() {
         for (count, expected) in [
             (0, Outcome::Pass),
+            (-64, Outcome::Pass),
             (COUNTS_PER_REV - 1, Outcome::Pass),
-            (-1, Outcome::Fail),
-            (COUNTS_PER_REV, Outcome::Fail),
+            (COUNTS_PER_REV, Outcome::Pass),
+            (FOLD_WINDOW.start, Outcome::Pass),
+            (FOLD_WINDOW.start - 1, Outcome::Fail),
+            (FOLD_WINDOW.end - 1, Outcome::Pass),
+            (FOLD_WINDOW.end, Outcome::Fail),
         ] {
             let cfg = example_config();
             let mut machine = machine_at(&cfg, &stow_legs());
@@ -2208,7 +2939,7 @@ mod runner_tests {
             assert_eq!(
                 report.outcome(Case::AntennaFold),
                 expected,
-                "{count} counts against the {COUNTS_PER_REV}-count turn"
+                "{count} counts against the fold window"
             );
         }
     }
@@ -2222,12 +2953,12 @@ mod runner_tests {
         machine.set(
             17,
             named_reg(RegId::PresentPosition),
-            &6000i32.to_le_bytes(),
+            &9000i32.to_le_bytes(),
         );
         machine.set(
             18,
             named_reg(RegId::PresentPosition),
-            &(-100i32).to_le_bytes(),
+            &(-3000i32).to_le_bytes(),
         );
         let (report, _) = run(&cfg, machine);
 
@@ -2237,8 +2968,8 @@ mod runner_tests {
             .lines()
             .find(|line| line.starts_with(Case::AntennaFold.slug()))
             .expect("the fold case printed a line");
-        assert!(line.contains("servo 17: 6000 counts"), "{line}");
-        assert!(line.contains("servo 18: -100 counts"), "{line}");
+        assert!(line.contains("servo 17: 9000 counts"), "{line}");
+        assert!(line.contains("servo 18: -3000 counts"), "{line}");
     }
 
     /// The clearance case reads the resting counts under the bare conversion and
@@ -2511,6 +3242,124 @@ mod tests {
             VENDOR_HOMING_OFFSETS,
         ));
         report.into_record(1_754_000_000)
+    }
+
+    /// The four places are places in the measured set, not interpolations
+    /// between them: every figure printed is a span some exchange took.
+    #[test]
+    fn a_distribution_names_four_spans_that_were_measured() {
+        let spans: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        let stats = SpanStats::of(&spans);
+        assert_eq!(stats.min, Duration::from_millis(1));
+        assert_eq!(stats.median, Duration::from_millis(50));
+        assert_eq!(stats.p99, Duration::from_millis(99));
+        assert_eq!(stats.max, Duration::from_millis(100));
+        assert_eq!(format!("{stats}"), "1.000/50.000/99.000/100.000");
+
+        let one = SpanStats::of(&[Duration::from_micros(1500)]);
+        assert_eq!(one.min, one.max, "one span is all four places");
+        assert_eq!(one.p99, Duration::from_micros(1500));
+
+        assert_eq!(SpanStats::of(&[]), SpanStats::default());
+
+        // At the count the case actually measures, the nearest rank is the
+        // 198th of 200 -- the third-worst, which is what its comment says and
+        // what a person reads the measurement off.
+        let at_the_count: Vec<Duration> = (1..=TIMING_EXCHANGES)
+            .map(|ms| Duration::from_millis(u64::try_from(ms).expect("a small count")))
+            .collect();
+        let two_hundred = SpanStats::of(&at_the_count);
+        assert_eq!(two_hundred.p99, Duration::from_millis(198));
+        assert_eq!(two_hundred.max, Duration::from_millis(200));
+    }
+
+    /// The verdict is what the case exists for: a bus that overran anything, or
+    /// a grouped read that came back short, fails and says how many of each.
+    #[test]
+    fn the_timing_verdict_fails_on_an_overrun_and_on_a_short_grouped_read() {
+        let bound = Duration::from_millis(3);
+        let inside = ExchangeSpans {
+            send: Duration::from_millis(1),
+            wait: Duration::from_millis(1),
+        };
+        let past = ExchangeSpans {
+            send: Duration::from_millis(8),
+            wait: Duration::from_millis(1),
+        };
+
+        let mut fits = TimingRun::new("unicast read", bound);
+        fits.note(inside);
+        let mut also_fits = TimingRun::new("grouped read", bound);
+        also_fits.note(inside);
+        let clean = timing_verdict(&fits, &also_fits, 0);
+        assert_eq!(clean.outcome, Outcome::Pass);
+        assert!(clean.detail.contains("unicast read x1"), "{clean:?}");
+        assert!(clean.detail.contains("grouped read x1"), "{clean:?}");
+
+        let mut overran = TimingRun::new("unicast read", bound);
+        overran.note(past);
+        overran.note(inside);
+        let slow = timing_verdict(&overran, &also_fits, 0);
+        assert_eq!(slow.outcome, Outcome::Fail);
+        assert!(
+            slow.detail.starts_with("1 of 3 exchanges ran past"),
+            "{slow:?}"
+        );
+        assert!(
+            slow.detail.contains("write 1.000/1.000/8.000/8.000"),
+            "the distribution is printed on the failing side too: {slow:?}"
+        );
+
+        let short = timing_verdict(&fits, &also_fits, 4);
+        assert_eq!(short.outcome, Outcome::Fail);
+        assert!(
+            short.detail.contains("4 grouped reads came back short"),
+            "{short:?}"
+        );
+    }
+
+    /// The assertion is a count over the exchanges, not a verdict on the worst
+    /// of them: how many overran is what says whether a bus stalls now and then
+    /// or is simply this slow.
+    #[test]
+    fn a_timing_run_counts_every_exchange_that_ran_past_its_budget() {
+        let bound = Duration::from_millis(3);
+        let mut run = TimingRun::new("unicast read", bound);
+        for (send, wait) in [(1, 1), (2, 2), (1, 1), (3, 1)] {
+            run.note(ExchangeSpans {
+                send: Duration::from_millis(send),
+                wait: Duration::from_millis(wait),
+            });
+        }
+        assert_eq!(run.len(), 4);
+        assert_eq!(run.overruns(), 2, "4 ms and 4 ms are past a 3 ms budget");
+
+        // The budget itself is not an overrun: an exchange that fits exactly
+        // fits.
+        let mut exact = TimingRun::new("unicast read", bound);
+        exact.note(ExchangeSpans {
+            send: bound,
+            wait: Duration::ZERO,
+        });
+        assert_eq!(exact.overruns(), 0);
+
+        let printed = format!("{run}");
+        assert!(
+            printed.starts_with("unicast read x4 against 3.000 ms"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("write 1.000/1.000/3.000/3.000"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("wait 1.000/1.000/2.000/2.000"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("total 2.000/2.000/4.000/4.000"),
+            "{printed}"
+        );
     }
 
     /// Every case is named exactly once, and the names are distinct and

@@ -85,6 +85,12 @@ pub struct Answer {
     pub value: u64,
     /// The model number a ping answered with, and zero for everything else.
     pub model: u16,
+    /// Which transaction this answers, echoed from the request.
+    pub op: AuxOpKind,
+    /// Which servo the request named, as its bus id.
+    pub id: u8,
+    /// Which register the request named, or the no-register zero.
+    pub reg: RegId,
 }
 
 impl Answer {
@@ -97,7 +103,25 @@ impl Answer {
             value_kind: ValueShape::None,
             value: 0,
             model: 0,
+            op: AuxOpKind::None,
+            id: 0,
+            reg: RegId::None,
         }
+    }
+
+    /// The same answer, saying which transaction it is about.
+    ///
+    /// Stamped once at the end of the one function that runs a request rather
+    /// than passed through every constructor below: an outcome that names no
+    /// transaction is readable only by the host holding the request it answers,
+    /// and every path out of here has to carry the identity for that to stop
+    /// being true.
+    #[must_use]
+    pub fn about(mut self, request: &Request) -> Self {
+        self.op = request.op;
+        self.id = request.id;
+        self.reg = request.reg;
+        self
     }
 
     /// The driver declining to run a transaction, so nothing reached the bus.
@@ -111,24 +135,25 @@ impl Answer {
         Self::bare(corr, AuxStatus::Refused)
     }
 
-    /// The driver turning a request away because one is already pending.
+    /// The driver turning a request away because it holds another one.
     ///
     /// Against the turned-away request's own correlation number, so the host
     /// learns which of its two requests was not run rather than having to work
-    /// it out from a silence.
+    /// it out from a silence. Its own status rather than a decline's: nothing
+    /// about the transaction was judged, and a reader of the log that had to
+    /// tell the two apart could otherwise only guess.
     #[must_use]
-    pub fn busy(corr: u32) -> Self {
-        Self::bare(corr, AuxStatus::Refused)
+    pub fn busy(corr: u32, request: &Request) -> Self {
+        Self::bare(corr, AuxStatus::Busy).about(request)
     }
 
     /// A value read off a register.
     fn value(corr: u32, held: Value) -> Self {
         Self {
-            corr,
             status: AuxStatus::Ok,
             value_kind: held.shape(),
             value: held.bits(),
-            model: 0,
+            ..Self::bare(corr, AuxStatus::Ok)
         }
     }
 
@@ -139,6 +164,9 @@ impl Answer {
         out.value_kind = self.value_kind;
         out.value = self.value;
         out.model = self.model;
+        out.op = self.op;
+        out.id = self.id;
+        out.reg = self.reg;
     }
 }
 
@@ -155,6 +183,10 @@ impl Answer {
 /// unverified one is admitted through the same checks and answers `ok` on the
 /// acknowledgement, carrying no value — it exists for a caller that documents
 /// it does not judge the read-back, and nothing here turns it into evidence.
+///
+/// Every answer out of here names the transaction it is about, whichever way it
+/// went, so an outcome read out of a log says what was asked without the
+/// request beside it.
 pub fn answer<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
@@ -166,9 +198,9 @@ pub fn answer<P: BusPort>(
         // wire: the map is the machine's own wiring, and a transaction naming
         // something else is a request about a different machine — nothing
         // reached the bus, which is what a refusal says.
-        return Answer::refused(corr);
+        return Answer::refused(corr).about(request);
     };
-    match request.op {
+    let ran = match request.op {
         // A slot nothing wrote asks for no transaction, and putting a datagram
         // on the bus for it would be commanding a machine on the strength of
         // unwritten memory.
@@ -184,7 +216,8 @@ pub fn answer<P: BusPort>(
         AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => {
             run_write(bus, map, corr, row, request)
         }
-    }
+    };
+    ran.about(request)
 }
 
 /// Read one register and answer with what it holds.
@@ -904,12 +937,28 @@ mod tests {
 
     #[test]
     fn a_turned_away_request_answers_against_its_own_number() {
-        let busy = Answer::busy(CORR);
+        let request = Request {
+            op: AuxOpKind::ReadReg,
+            id: SERVO_IDS[ROW],
+            reg: RegId::PresentPosition,
+            value_kind: ValueShape::None,
+            value: 0,
+        };
+        let busy = Answer::busy(CORR, &request);
 
-        assert_eq!(busy.status, AuxStatus::Refused);
+        assert_eq!(
+            busy.status,
+            AuxStatus::Busy,
+            "the slot was full, which is not a decline of the transaction"
+        );
         assert_eq!(busy.corr, CORR, "which of the two requests was not run");
         assert_eq!(busy.value_kind, ValueShape::None);
         assert_eq!(busy.model, 0);
+        assert_eq!(
+            (busy.op, busy.id, busy.reg),
+            (request.op, request.id, request.reg),
+            "a turned-away answer names the transaction it turned away"
+        );
     }
 
     #[test]
@@ -933,6 +982,22 @@ mod tests {
         assert!(
             bounds.read_ns + bounds.write_ns + bounds.aux_ns < reachy_driver::NOMINAL_CYCLE_NS,
             "an ordinary cycle has room for one transaction: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn the_startup_budget_covers_the_sweep_on_a_bus_that_answers_nothing() {
+        let timing = crate::tick::cycle_timing(reachy_bus::DEFAULT_BAUD);
+        let bounds = CycleBounds::of(&timing);
+
+        // Charged at the bound rather than at a healthy bus's cost: the budget
+        // has to hold on the start where nothing answers and every exchange
+        // runs to its deadline.
+        assert!(
+            bounds.sweep_ns < reachy_driver::STARTUP_INIT_BUDGET_NS,
+            "the sweep's worst case is {} ns against a stated {} ns of driver init",
+            bounds.sweep_ns,
+            reachy_driver::STARTUP_INIT_BUDGET_NS
         );
     }
 

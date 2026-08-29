@@ -10,6 +10,9 @@
 //! carrier's, and the two are deliberately different numbers in these cases so
 //! that one standing in for the other fails.
 
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+
 use brenn_reachy__cogs__config_clk_rs::{
     ClipLibraryConfigWire, MoverParamsWire, SessionParamsWire,
 };
@@ -34,12 +37,13 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointRefWi
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqKindWire;
 use brenn_reachy__motion__tick_state_clk_rs::{MotionMode, MotionSnap, MotionSnapWire};
-use brenn_reachy__motion__timeline_clk_rs::WindDownOutcomeWire;
+use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
 use clockwork_rs::{Clear as _, Duration as SlotDuration, SyncTime};
 use nalgebra::Isometry3;
 use reachy_clips::config::write_clip;
 use reachy_clips::format::{Channel as ClipChannel, Clip, ClipDoc, FrameDoc};
 use reachy_clips::speed::ClipLimits;
+use reachy_driver::{NOMINAL_CYCLE_NS, STARTUP_INIT_BUDGET_NS};
 use reachy_kin::{
     HeadGeometry, LegAngles, default_geometry, inverse_kinematics, neutral_head_pose,
     rest_head_pose, stow_head_pose, wrap_to_pi,
@@ -2884,6 +2888,26 @@ const AUX_RETRIES: u32 = 3;
 /// which clock it was cut from.
 const STOW_BUDGET_NS: i64 = 4_000_000_000;
 
+/// How long the session waits for the driver's first sample before declaring the
+/// bus failed, nanoseconds. The number `cogs/session_params.textproto` states,
+/// restated here for the same reason: a case asserting when the declaration
+/// lands has to say which budget it was cut from. The shipped figure covers the
+/// skew between two process starts the supervisor orders in no particular way,
+/// the driver's port open and its nine-write release, and its first cycle.
+const STARTUP_GRACE_NS: i64 = 2_000_000_000;
+
+/// The budget for the skew between the two process starts the supervisor orders
+/// in no particular way, nanoseconds.
+///
+/// A budget and not a measurement: the adverse ordering it exists for -- the
+/// session up first, the driver late -- has not been observed. What the runs
+/// `docs/bench-runbook.md` records do show is the opposite ordering, the
+/// control process last by up to ~275 ms behind the driver's first logged line.
+/// One second is ~3.6x that, deliberately wide because the term is a scheduler
+/// property with no derivable ceiling and the observation bounds a healthy unit
+/// in the benign direction only.
+const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
+
 /// The servo-side profile the commissioning sweep writes, register units: the
 /// pair `cogs/session_params.textproto` ships.
 ///
@@ -2901,13 +2925,86 @@ const PROFILE_VELOCITY: u32 = 50;
 /// session refuses to commission on.
 const BUS_WATCHDOG: u32 = 10;
 
+/// The environment variable naming the shipped session configuration, relative
+/// to the runfiles root, which is a test's working directory.
+const SESSION_PARAMS_ENV: &str = "SESSION_PARAMS";
+
+/// What the shipped configuration states for `field`.
+///
+/// Panics on a missing file or a missing field — either is a broken test
+/// target or a name that has moved, not a case.
+fn shipped_session_figure(field: &str) -> String {
+    let path = std::env::var(SESSION_PARAMS_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{SESSION_PARAMS_ENV} is unset: the test target has to name the file beside the data \
+             attribute that supplies it"
+        )
+    });
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("{SESSION_PARAMS_ENV} names {path}, which does not read: {error}")
+    });
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim() == field)
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_else(|| panic!("{path} states no {field}: the name has moved"))
+}
+
+/// Every figure this file restates is the figure the deployment ships.
+///
+/// Without it the whole suite can stay green against a session no unit runs.
+/// One figure is load-bearing across two processes: the grace has to outlast
+/// everything the driver does before its first sample.
+#[test]
+fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() {
+    for (field, restated) in [
+        ("aux_timeout_ns", AUX_TIMEOUT_NS.to_string()),
+        ("aux_retries", AUX_RETRIES.to_string()),
+        ("sample_stale_after", "5".to_string()),
+        ("startup_grace_ns", STARTUP_GRACE_NS.to_string()),
+        ("stow_budget_ns", STOW_BUDGET_NS.to_string()),
+        ("torque_off_confirm_budget_ns", 500_000_000_i64.to_string()),
+        ("profile_acceleration", PROFILE_ACCELERATION.to_string()),
+        ("profile_velocity", PROFILE_VELOCITY.to_string()),
+        ("bus_watchdog", BUS_WATCHDOG.to_string()),
+    ] {
+        assert_eq!(
+            shipped_session_figure(field),
+            restated,
+            "cogs/session_params.textproto states another {field} than the cases here run on"
+        );
+    }
+}
+
+/// The grace outlasts every term the driver spends before its first sample.
+///
+/// A relation between stated budgets, not a live measurement. Fails on a grace
+/// cut below the sum or any allowance forced up past it -- most usefully, a hold
+/// put back in front of the driver's first cycle, which is spent out of the
+/// driver's own `STARTUP_INIT_BUDGET_NS` and cannot be accounted for honestly
+/// without growing it. Both driver-side figures are the driver crate's own,
+/// imported rather than restated, so the editor who grows either is in the file
+/// this relation reads -- and the two periods are charged at the driver's grid
+/// rather than the host's, because the alignment and the first cycle are the
+/// driver's to spend.
+#[test]
+fn the_startup_grace_covers_the_start_skew_the_driver_init_and_the_first_cycle() {
+    let covered = START_SKEW_ALLOWANCE_NS + STARTUP_INIT_BUDGET_NS + 2 * NOMINAL_CYCLE_NS;
+    assert!(
+        STARTUP_GRACE_NS >= covered,
+        "the session's {STARTUP_GRACE_NS} ns grace is under the {covered} ns it has to cover: \
+         {START_SKEW_ALLOWANCE_NS} ns of start skew, {STARTUP_INIT_BUDGET_NS} ns of driver \
+         init, and two {NOMINAL_CYCLE_NS} ns cycles for grid alignment and the first cycle"
+    );
+}
+
 /// The session's timing, as the config slot carries it.
 fn session_params() -> SessionParamsWire {
     let mut params = SessionParamsWire::new();
     params.set_aux_timeout_ns(AUX_TIMEOUT_NS);
     params.set_aux_retries(AUX_RETRIES);
     params.set_sample_stale_after(5);
-    params.set_startup_grace_ns(2_000_000_000);
+    params.set_startup_grace_ns(STARTUP_GRACE_NS);
     params.set_stow_budget_ns(STOW_BUDGET_NS);
     params.set_torque_off_confirm_budget_ns(500_000_000);
     params.set_profile_acceleration(PROFILE_ACCELERATION);
@@ -2924,6 +3021,7 @@ fn session_params() -> SessionParamsWire {
 /// execution, and the first one is where a session decides to start commissioning
 /// the machine.
 fn session() -> SessionTestWrapper {
+    story_reset();
     let mut cog = SessionTestWrapper::new();
     cog.input_script_set_num_slots(4);
     cog.input_fault_set_num_slots(4);
@@ -2971,10 +3069,7 @@ const FIRST_WAKE: i64 = T0 + LAPSE_NS;
 /// A case about that declaration is a case that stops calling this.
 fn drive(cog: &mut SessionTestWrapper, at_ns: i64) -> Option<Asked> {
     heartbeat(cog, at_ns);
-    assert!(
-        cog.execute(SyncTime::from_nanos(at_ns)),
-        "the session was expected to wake",
-    );
+    assert!(stepped(cog, at_ns), "the session was expected to wake",);
     asked(cog)
 }
 
@@ -3118,15 +3213,106 @@ struct Said {
     detail: f64,
 }
 
-/// What one execution said, or `None` where it said nothing.
-fn said(cog: &mut SessionTestWrapper) -> Option<Said> {
-    cog.try_next_report().map(|msg| Said {
-        time_ns: msg.time().as_nanos(),
-        kind: msg.kind(),
-        a: msg.a(),
-        b: msg.b(),
-        detail: msg.detail(),
-    })
+/// One row of a published story, copied out of the message.
+fn read_said(row: &TimelineEntryWire) -> Said {
+    Said {
+        time_ns: row.time().as_nanos(),
+        kind: row.kind(),
+        a: row.a(),
+        b: row.b(),
+        detail: row.detail(),
+    }
+}
+
+// The rows of the story a case has been handed already, the ones it has not, and
+// the newest story whole.
+//
+// The session publishes its whole story every time it adds a row, so each
+// message repeats what the case has already read. These hold the new rows only,
+// oldest first -- which is the shape every case below is written in: one report
+// a call, and nothing where there is nothing new. A case's thread is its own,
+// and `session` resets them, so a second session in one case is a second story.
+thread_local! {
+    static UNREAD: RefCell<VecDeque<Said>> = const { RefCell::new(VecDeque::new()) };
+    static STORY_READ: Cell<u64> = const { Cell::new(0) };
+    static NEWEST: RefCell<Option<(u32, Vec<Said>)>> = const { RefCell::new(None) };
+}
+
+/// Forget whatever story was being read: a fresh session tells its own.
+fn story_reset() {
+    UNREAD.with(|unread| unread.borrow_mut().clear());
+    STORY_READ.with(|read| read.set(0));
+    NEWEST.with(|newest| *newest.borrow_mut() = None);
+}
+
+/// Take the rows of `message` the case has not been handed yet.
+///
+/// A message says how many rows the ring dropped off the front, so a row's place
+/// in the whole story is its position plus that count -- which is what says
+/// where the reading left off, across a ring that wrapped. A total shorter than
+/// what has been read is a ring that was cleared under the reader, and the story
+/// starts again from what the message holds.
+fn take_unread(dropped: u32, rows: &[Said]) {
+    let dropped = u64::from(dropped);
+    let total = dropped + rows.len() as u64;
+    STORY_READ.with(|read| {
+        if total < read.get() {
+            read.set(dropped);
+        }
+        let first = read.get().max(dropped);
+        if total > first {
+            let from = usize::try_from(first - dropped).expect("a story fits a ring");
+            UNREAD.with(|unread| unread.borrow_mut().extend(rows[from..].iter().copied()));
+            read.set(total);
+        }
+    });
+}
+
+/// Run one execution of the session at `at_ns`, and keep up with its story.
+///
+/// The report output carries what the execution that ran last put there and
+/// nothing else, so an execution nobody looked at is a story nobody can read
+/// afterwards -- and the story is published only by the executions that added
+/// to it.
+fn stepped(cog: &mut SessionTestWrapper, at_ns: i64) -> bool {
+    let ran = cog.execute(SyncTime::from_nanos(at_ns));
+    if let Some(msg) = cog.try_next_report() {
+        let dropped = msg.dropped();
+        let rows: Vec<Said> = msg.entries().iter().map(read_said).collect();
+        take_unread(dropped, &rows);
+        NEWEST.with(|newest| *newest.borrow_mut() = Some((dropped, rows)));
+    }
+    ran
+}
+
+/// The next thing the session said that this case has not read, or `None` where
+/// it has read the whole story.
+///
+/// Does not read the output itself: [`stepped`] takes the story off the output
+/// at the execution that published it, because that is the only instant it is
+/// there to be taken.
+fn said(_cog: &mut SessionTestWrapper) -> Option<Said> {
+    UNREAD.with(|unread| unread.borrow_mut().pop_front())
+}
+
+/// Read past whatever the session has said up to here.
+///
+/// The story is cumulative and nothing drains it, so a case that drove the
+/// session through a stretch it is not asserting about would otherwise be handed
+/// those rows first. This says the case has read them: what [`said`] answers
+/// next is what the session says after this call.
+fn caught_up(_cog: &mut SessionTestWrapper) {
+    UNREAD.with(|unread| unread.borrow_mut().clear());
+}
+
+/// The newest story the session has published, whole: what it says was dropped
+/// and every row it holds.
+///
+/// For the cases that are about the story itself rather than about what one
+/// execution said. Kept by [`stepped`] as it goes past, for the same reason the
+/// unread rows are.
+fn whole_story(_cog: &mut SessionTestWrapper) -> Option<(u32, Vec<Said>)> {
+    NEWEST.with(|newest| newest.borrow().clone())
 }
 
 /// Run one execution at `at_ns`, asserting that it happened, and answer with
@@ -3135,18 +3321,11 @@ fn said(cog: &mut SessionTestWrapper) -> Option<Said> {
 /// The heartbeat is fed here too, for the reason [`drive`] states.
 fn wake(cog: &mut SessionTestWrapper, at_ns: i64) -> Option<Said> {
     heartbeat(cog, at_ns);
-    assert!(
-        cog.execute(SyncTime::from_nanos(at_ns)),
-        "the session was expected to wake",
-    );
+    assert!(stepped(cog, at_ns), "the session was expected to wake",);
     said(cog)
 }
 
-/// Everything one execution said, in the order it said it.
-///
-/// One report leaves per execution, so a wake that had several things to say
-/// needs several wakes to say them. A case that wants the whole story drives
-/// until the ring runs dry.
+/// Everything the session has left to say, in the order it said it.
 fn everything(cog: &mut SessionTestWrapper, from_ns: i64) -> Vec<Said> {
     let mut told = Vec::new();
     let mut at = from_ns;
@@ -3179,15 +3358,15 @@ fn a_lapse_wakes_a_session_nothing_arrived_at() {
     let mut cog = session();
 
     assert!(
-        !cog.execute(SyncTime::from_nanos(T0 + LAPSE_NS - 1)),
+        !stepped(&mut cog, T0 + LAPSE_NS - 1),
         "a wake before the floor is not owed",
     );
-    assert!(cog.execute(SyncTime::from_nanos(T0 + LAPSE_NS)));
+    assert!(stepped(&mut cog, T0 + LAPSE_NS));
     assert!(
-        !cog.execute(SyncTime::from_nanos(T0 + LAPSE_NS + 1)),
+        !stepped(&mut cog, T0 + LAPSE_NS + 1),
         "and the floor is measured from the execution, not from start-up",
     );
-    assert!(cog.execute(SyncTime::from_nanos(T0 + 2 * LAPSE_NS)));
+    assert!(stepped(&mut cog, T0 + 2 * LAPSE_NS));
 }
 
 /// Either message class wakes it inside the floor, and a raise nobody has to
@@ -3198,7 +3377,7 @@ fn a_script_and_a_raise_each_wake_it_inside_the_floor() {
     let mut cog = session();
 
     cog.publish_script(&one_step_script(1, T0), SyncTime::from_nanos(T0));
-    assert!(cog.execute(SyncTime::from_nanos(T0 + 1)));
+    assert!(stepped(&mut cog, T0 + 1));
 
     cog.publish_fault(
         &raise(
@@ -3209,7 +3388,7 @@ fn a_script_and_a_raise_each_wake_it_inside_the_floor() {
         ),
         SyncTime::from_nanos(T0 + 2),
     );
-    assert!(cog.execute(SyncTime::from_nanos(T0 + 3)));
+    assert!(stepped(&mut cog, T0 + 3));
 }
 
 /// A script accepted while resting becomes the schedule the session holds:
@@ -3500,15 +3679,15 @@ fn a_datagram_that_is_no_script_is_refused_as_undecodable() {
     assert_eq!(cog.state_sess().scripts_refused(), 1);
 }
 
-/// Reports leave at one per execution, oldest first: the ring is what carries a
-/// burst across the executions that drain it.
+/// A burst of reports goes out in one story, oldest first: the ring is what
+/// carries the order, and the message carries the ring.
 ///
 /// A burst of refusals rather than of acceptances, because accepting one is the
 /// machine beginning to arm and every script after it is answered against that.
-/// What is asserted is the egress order, which is the same whatever the rows
-/// say.
+/// What is asserted is the order the story holds, which is the same whatever the
+/// rows say.
 #[test]
-fn a_burst_of_reports_leaves_one_per_execution_oldest_first() {
+fn a_burst_of_reports_goes_out_in_one_story_oldest_first() {
     let mut cog = resting_session();
 
     for nth in 1..=3u32 {
@@ -3517,16 +3696,23 @@ fn a_burst_of_reports_leaves_one_per_execution_oldest_first() {
     let first = wake(&mut cog, T0 + 1).expect("the first of the three");
     assert_eq!(first.a, 1);
     assert_eq!(cog.state_sess().scripts_refused(), 3, "all three screened");
-
-    let second = wake(&mut cog, T0 + 1 + LAPSE_NS).expect("the second");
-    assert_eq!(second.a, 2);
-    let third = wake(&mut cog, T0 + 1 + 2 * LAPSE_NS).expect("the third");
-    assert_eq!(third.a, 3);
-    assert!(
-        wake(&mut cog, T0 + 1 + 3 * LAPSE_NS).is_none(),
-        "and then the ring is empty",
+    assert_eq!(
+        cog.state_sess().reports_published(),
+        1,
+        "and one story carried all three away",
     );
-    assert_eq!(cog.state_sess().reports_published(), 3);
+
+    let second = said(&mut cog).expect("the second");
+    assert_eq!(second.a, 2);
+    let third = said(&mut cog).expect("the third");
+    assert_eq!(third.a, 3);
+    assert!(said(&mut cog).is_none(), "and the story is read out");
+    assert!(
+        wake(&mut cog, T0 + 1 + LAPSE_NS).is_none(),
+        "a wake with nothing to add publishes nothing",
+    );
+    assert_eq!(cog.state_sess().reports_published(), 1);
+    assert_eq!(cog.state_sess().reports_narrated(), 3);
     assert_eq!(cog.state_sess().reports_dropped(), 0);
 }
 
@@ -3621,7 +3807,7 @@ fn a_slot_that_is_no_session_is_answered_by_letting_go_and_parking() {
 
     cog.publish_script(&one_step_script(4, T0), SyncTime::from_nanos(T0));
     heartbeat(&mut cog, T0 + 1);
-    assert!(cog.execute(SyncTime::from_nanos(T0 + 1)));
+    assert!(stepped(&mut cog, T0 + 1));
 
     assert_eq!(cog.state_sess().refused_state(), 1);
     assert_eq!(
@@ -3788,16 +3974,15 @@ fn overlay_weights_cross_the_screen_as_they_arrived() {
     assert_eq!(window.speed(), -1.0);
 }
 
-/// A ring with nowhere left to put a report loses its oldest unpublished one and
-/// says so: reports are made faster than they leave -- four scripts in a window
-/// against one publication a wake -- so the count is the only evidence a story
-/// was lost, and the drain resumes from the oldest row that survived rather
-/// than from the one that did not.
+/// A ring with nowhere left to put a report loses its oldest one and says so:
+/// the story is bounded and a run that narrates past the bound keeps its newest
+/// rows, so the count of what went is the only evidence the older ones were
+/// ever told.
 #[test]
-fn a_full_ring_drops_its_oldest_unpublished_report_and_counts_it() {
+fn a_full_ring_drops_its_oldest_report_and_counts_it() {
     let mut cog = resting_session();
     assert_eq!(
-        TIMELINE_LEN, 32,
+        TIMELINE_LEN, 64,
         "the arithmetic below is this ring's length",
     );
 
@@ -3805,38 +3990,72 @@ fn a_full_ring_drops_its_oldest_unpublished_report_and_counts_it() {
     // also the machine beginning to arm, which is a second row and a phase that
     // answers every script after it.
     //
-    // Eleven wakes of four screenings each against one publication a wake. The
-    // appends of a wake happen before its publication, so the last wake's four
-    // met a ring thirty deep: two of them filled it and two dropped the oldest
-    // report still waiting, which are the eleventh and twelfth ever made.
-    let mut published = Vec::new();
-    for wake_nth in 0..11i64 {
+    // Twenty wakes of four screenings each: eighty rows into a ring of
+    // sixty-four, so the sixteen oldest are dropped off the front.
+    for wake_nth in 0..20i64 {
         let at = T0 + 1 + wake_nth * LAPSE_NS;
         for nth in 1..=4u32 {
-            let script_id = u32::try_from(wake_nth).expect("eleven fits") * 4 + nth;
+            let script_id = u32::try_from(wake_nth).expect("twenty fits") * 4 + nth;
             cog.publish_script(&no_timeline_script(script_id, T0), SyncTime::from_nanos(T0));
         }
-        published.push(wake(&mut cog, at).expect("each wake carries one report away"));
+        assert!(stepped(&mut cog, at), "every wake ran");
     }
 
+    let (dropped, story) = whole_story(&mut cog).expect("the story went out");
     let state = cog.state_sess();
-    assert_eq!(state.scripts_refused(), 44, "all forty-four were screened");
-    assert_eq!(state.reports_published(), 11, "one a wake");
+    assert_eq!(state.scripts_refused(), 80, "all eighty were screened");
+    assert_eq!(state.reports_narrated(), 80, "and each left a row");
+    assert_eq!(state.reports_published(), 20, "one story a wake");
     assert_eq!(
         state.reports_dropped(),
-        2,
-        "and the two the full ring could not hold",
+        16,
+        "and the sixteen the full ring could not keep",
     );
-    let ids: Vec<u32> = published.iter().map(|said| said.a).collect();
+    assert_eq!(
+        dropped, 16,
+        "which the message says, because a reader cannot work it out from the rows",
+    );
+    let ids: Vec<u32> = story.iter().map(|said| said.a).collect();
     assert_eq!(
         ids,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13],
-        "oldest first, and the drain resumes past the two that were dropped \
-         rather than repeating them",
+        (17..=80).collect::<Vec<u32>>(),
+        "and the newest ring's worth is what it carries, oldest first",
     );
 }
 
-/// Cursors describing a ring this build does not have are the slot gone wrong,
+/// What a story says was dropped is what the ring in front of the reader lost,
+/// and not what the run has lost all told. The two are different numbers exactly
+/// across a clear: the session keeps a lifetime count for its signal, and a ring
+/// cleared for damage has dropped nothing of the story it now holds. A reader of
+/// the message can only be told about the rows it was handed.
+#[test]
+fn a_story_says_what_its_own_ring_dropped_and_not_what_the_run_has() {
+    let mut cog = resting_session();
+    {
+        let slot = cog.state_sess_mut();
+        // Sixteen rows lost earlier in the run, and a head no sequence of
+        // appends produces: the next execution clears the ring under itself.
+        slot.set_reports_dropped(16);
+        slot.set_timeline_head(TIMELINE_LEN + 8);
+    }
+
+    cog.publish_script(&no_timeline_script(3, T0), SyncTime::from_nanos(T0));
+    assert!(stepped(&mut cog, T0 + 1), "the wake ran");
+
+    let (dropped, story) = whole_story(&mut cog).expect("the refusal still goes out");
+    assert_eq!(story.len(), 1, "the one row the cleared ring holds");
+    assert_eq!(
+        dropped, 0,
+        "the ring the message describes has dropped none of it",
+    );
+    assert_eq!(
+        cog.state_sess().reports_dropped(),
+        16,
+        "and the run's own total is untouched by the clear",
+    );
+}
+
+/// A timeline describing a ring this build does not have is the slot gone wrong,
 /// and the execution that finds it still gets its own story told: the ring is
 /// cleared and the report that could not be placed is written into the empty
 /// one, because what that execution did is worth more than the rows it cannot
@@ -3846,10 +4065,9 @@ fn a_timeline_this_build_cannot_read_is_cleared_and_the_execution_still_speaks()
     let mut cog = resting_session();
     {
         let slot = cog.state_sess_mut();
-        // More waiting than the ring holds: no sequence of appends produces
-        // this, so it is memory nobody wrote.
+        // More appended than the ring ever held, with nothing dropped: no
+        // sequence of appends produces this, so it is memory nobody wrote.
         slot.set_timeline_head(TIMELINE_LEN + 8);
-        slot.set_timeline_published(0);
     }
 
     cog.publish_script(&no_timeline_script(3, T0), SyncTime::from_nanos(T0));
@@ -3865,7 +4083,55 @@ fn a_timeline_this_build_cannot_read_is_cleared_and_the_execution_still_speaks()
         1,
         "one report in a ring that was cleared under it",
     );
-    assert_eq!(state.timeline_published(), 1, "and it went out");
+    assert_eq!(
+        state.timeline_dropped(),
+        0,
+        "and the clear took that with it"
+    );
+}
+
+/// A row inside a story of legal length that names no report is the same damage,
+/// found half-way through writing the message out.
+///
+/// The other damaged shape: the head says a number of rows the ring could hold,
+/// and one of the rows it points at holds nothing. It is not the head that is
+/// refused but the row, so the refusal lands after part of the story has been
+/// written into the output. What that half-written message must not do is go
+/// out: it is published on a persistent channel, so the wake cog and the
+/// analyzer would read a truncated story as the whole of the session's
+/// narration.
+#[test]
+fn a_story_with_a_row_that_names_no_report_publishes_nothing() {
+    let mut cog = resting_session();
+    {
+        let slot = cog.state_sess_mut();
+        // One row narrated, into a ring whose rows are all still cleared: the
+        // head is a number a run reaches, and the row under it is not.
+        slot.set_timeline_head(1);
+    }
+
+    cog.publish_script(&no_timeline_script(3, T0), SyncTime::from_nanos(T0));
+    assert!(stepped(&mut cog, T0 + 1), "the wake ran");
+
+    assert!(
+        whole_story(&mut cog).is_none(),
+        "half a story is not published as a whole one",
+    );
+    let state = cog.state_sess();
+    assert_eq!(state.refused_state(), 1, "counted where a bad slot is");
+    assert_eq!(state.reports_published(), 0);
+    assert_eq!(
+        (state.timeline_head(), state.timeline_dropped()),
+        (0, 0),
+        "the ring is cleared under the execution that found it",
+    );
+
+    // And the session is still running: the next report goes out normally,
+    // which is what says the clear left a working ring.
+    cog.publish_script(&no_timeline_script(6, T0), SyncTime::from_nanos(T0));
+    let report = wake(&mut cog, T0 + LAPSE_NS).expect("the next report goes out");
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(report.a, 6);
 }
 
 /// The same damage found with nothing to say: the ring is cleared and counted
@@ -3878,7 +4144,6 @@ fn a_timeline_this_build_cannot_read_publishes_nothing() {
     {
         let slot = cog.state_sess_mut();
         slot.set_timeline_head(TIMELINE_LEN + 8);
-        slot.set_timeline_published(0);
     }
 
     assert!(
@@ -3947,6 +4212,41 @@ fn the_first_wake_pings_the_first_servo_and_records_the_ask() {
         "the timeout is measured from when it went out",
     );
     assert_eq!(pending.retries(), 0);
+}
+
+/// A session that has never heard a sample asks the driver for nothing, however
+/// many times it wakes. What a driver that never publishes one leads to is the
+/// start-up grace, unchanged and pinned by its own case below.
+///
+/// The driver's loop starts on a grid instant and its sockets are bound before
+/// then, so a survey issued into the gap waits in a buffer nobody is serving:
+/// the delivery timeout expires, the re-issue lands beside the original in the
+/// driver's first cycle, and the session parks on an answer it cannot tell from
+/// a decline. The sample is the evidence that there is a loop to answer.
+#[test]
+fn a_session_that_has_not_heard_from_its_driver_asks_it_for_nothing() {
+    let mut cog = session();
+
+    let mut at = FIRST_WAKE;
+    for _ in 0..4 {
+        assert!(stepped(&mut cog, at), "the session woke");
+        assert_eq!(asked(&mut cog), None, "and it asked for nothing at {at}");
+        at += LAPSE_NS;
+    }
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::STARTING,
+        "still waiting, and nothing has failed",
+    );
+    assert!(
+        !cog.state_sess().aux().active(),
+        "nothing is outstanding to time out",
+    );
+
+    let asked = drive(&mut cog, at).expect("the survey's first transaction");
+    assert_eq!(asked.op, AuxOpKindWire::PING);
+    assert_eq!(asked.id, SERVO_IDS[0]);
+    assert_eq!(asked.corr, 0, "the session's first number");
 }
 
 /// An answer advances the survey: the next execution asks the next servo, under
@@ -4073,6 +4373,77 @@ fn an_answer_nothing_is_waiting_on_is_dropped() {
     assert_eq!(state.aux_strays(), 1);
     assert!(state.aux().active(), "and it is still waiting on it");
     assert_eq!(state.aux().corr(), first.corr);
+}
+
+/// A busy answer parks the session, like any other transaction the driver put
+/// nothing on the bus for.
+///
+/// This cog issues one transaction at a time and waits for its outcome, so a
+/// driver holding a request under another number is a disagreement about what is
+/// outstanding. Nothing is retried over it: a re-issue of a request the driver
+/// is already acting on is answered by that request's own outcome, and anything
+/// else here would be recovering from a refusal.
+#[test]
+fn a_driver_that_says_it_is_busy_parks_the_session() {
+    let mut cog = session();
+    let first = drive(&mut cog, FIRST_WAKE).expect("the first ping");
+
+    let mut busy = AuxOutcomeWire::new();
+    busy.set_corr(first.corr);
+    busy.set_status(AuxStatusWire::BUSY);
+    cog.publish_aux_out(&busy, SyncTime::from_nanos(FIRST_WAKE + 2));
+
+    assert_eq!(
+        drive(&mut cog, FIRST_WAKE + 3),
+        None,
+        "a refusal is not something to ask again over",
+    );
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
+}
+
+/// A cycle that turned a request away sends two outcomes at once, and the one
+/// the survey is waiting on is the one it reads.
+///
+/// The pair arriving in one window must leave the survey moving in either
+/// order, since nothing about which datagram the loop publishes first is the
+/// session's to depend on.
+#[test]
+fn a_pair_of_outcomes_in_one_window_answers_the_one_the_survey_asked() {
+    for busy_first in [false, true] {
+        let mut cog = session();
+        let first = drive(&mut cog, FIRST_WAKE).expect("the first ping");
+
+        let served = pinged(first.corr, 1200);
+        let mut busy = AuxOutcomeWire::new();
+        busy.set_corr(first.corr.wrapping_add(1));
+        busy.set_status(AuxStatusWire::BUSY);
+
+        let at = SyncTime::from_nanos(FIRST_WAKE + 2);
+        if busy_first {
+            cog.publish_aux_out(&busy, at);
+            cog.publish_aux_out(&served, at);
+        } else {
+            cog.publish_aux_out(&served, at);
+            cog.publish_aux_out(&busy, at);
+        }
+
+        let second = drive(&mut cog, FIRST_WAKE + 3).expect("the next ping");
+        assert_eq!(
+            (second.op, second.id),
+            (AuxOpKindWire::PING, SERVO_IDS[1]),
+            "the served answer advanced the survey (busy published first: {busy_first})",
+        );
+        assert_eq!(
+            cog.state_sess().phase(),
+            SessionPhaseWire::STARTING,
+            "and the collision the session was not waiting on parked nothing",
+        );
+        assert_eq!(
+            cog.state_sess().aux_strays(),
+            1,
+            "the busy answer named a number nothing was waiting on, and is counted as one",
+        );
+    }
 }
 
 /// A survey no servo answers ends the process's engagement with the machine: the
@@ -4407,7 +4778,7 @@ fn the_voltage_bit_on_its_own_is_not_a_condition() {
 #[test]
 fn a_driver_that_never_produces_a_cycle_is_declared_dead_after_the_grace() {
     let mut cog = session();
-    let grace_ns = 2_000_000_000;
+    let grace_ns = STARTUP_GRACE_NS;
 
     // Every wake inside the grace, and no sample at any of them: nothing is
     // declared, because a process comes up with its cogs in an order nothing
@@ -4415,12 +4786,12 @@ fn a_driver_that_never_produces_a_cycle_is_declared_dead_after_the_grace() {
     // is the only instant it has to measure from.
     let mut at = FIRST_WAKE;
     while at <= FIRST_WAKE + grace_ns {
-        assert!(cog.execute(SyncTime::from_nanos(at)));
+        assert!(stepped(&mut cog, at));
         assert_eq!(cog.state_sess().phase(), SessionPhaseWire::STARTING);
         at += LAPSE_NS;
     }
 
-    assert!(cog.execute(SyncTime::from_nanos(at)));
+    assert!(stepped(&mut cog, at));
     assert_eq!(
         cog.state_sess().phase(),
         SessionPhaseWire::PARKED,
@@ -4437,8 +4808,13 @@ fn a_driver_that_never_produces_a_cycle_is_declared_dead_after_the_grace() {
         .iter()
         .find(|report| report.kind == ReportKindWire::BUS_FAILURE_DECLARED)
         .expect("the declaration");
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a budget in whole seconds, read as one"
+    )]
+    let grace_s = (grace_ns as f64) / 1e9;
     assert!(
-        declared.detail > 2.0,
+        declared.detail > grace_s,
         "and it says how long the silence was: {}",
         declared.detail,
     );
@@ -4457,7 +4833,7 @@ fn a_sample_stream_that_stops_is_declared_dead_after_its_window() {
     for _ in 0..3 {
         assert!(!cog.state_sess().torque_off_pending());
         heartbeat(&mut cog, at);
-        assert!(cog.execute(SyncTime::from_nanos(at)));
+        assert!(stepped(&mut cog, at));
         at += LAPSE_NS;
     }
     let last_fed = at - LAPSE_NS;
@@ -4470,13 +4846,13 @@ fn a_sample_stream_that_stops_is_declared_dead_after_its_window() {
     // The stream stops. The window is five nominal periods, which is one wake
     // floor exactly, so the wake at the window's edge is inside it and the one
     // after that is past it.
-    assert!(cog.execute(SyncTime::from_nanos(last_fed + window_ns)));
+    assert!(stepped(&mut cog, last_fed + window_ns));
     assert_eq!(
         cog.state_sess().phase(),
         SessionPhaseWire::STARTING,
         "the window closes past it and not at it",
     );
-    assert!(cog.execute(SyncTime::from_nanos(last_fed + window_ns + LAPSE_NS)));
+    assert!(stepped(&mut cog, last_fed + window_ns + LAPSE_NS));
     assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
 }
 
@@ -4534,7 +4910,7 @@ fn a_release_that_goes_unconfirmed_is_said_once_per_budget() {
     let mut at = FIRST_WAKE + LAPSE_NS;
     while at <= FIRST_WAKE + 2 * budget_ns {
         heartbeat(&mut cog, at);
-        assert!(cog.execute(SyncTime::from_nanos(at)));
+        assert!(stepped(&mut cog, at));
         assert_eq!(
             asked(&mut cog).expect("every wake owes the release").kind,
             SessionCmdKindWire::TORQUE_OFF_NOW,
@@ -4583,15 +4959,15 @@ fn a_stale_sample_does_not_move_the_freshness_anchor_back() {
     // The wakes are the floor's, because a sample is read by this cog and never
     // triggers it: the stream runs at fifty times the rate the session wakes at.
     heartbeat(&mut cog, FIRST_WAKE);
-    assert!(cog.execute(SyncTime::from_nanos(FIRST_WAKE)));
+    assert!(stepped(&mut cog, FIRST_WAKE));
     heartbeat(&mut cog, FIRST_WAKE + LAPSE_NS);
-    assert!(cog.execute(SyncTime::from_nanos(FIRST_WAKE + LAPSE_NS)));
+    assert!(stepped(&mut cog, FIRST_WAKE + LAPSE_NS));
     let freshest = cog.state_sess().last_sample_time().as_nanos();
     assert_eq!(freshest, FIRST_WAKE + LAPSE_NS);
 
     // A cycle from before the freshest one, arriving after it.
     heartbeat(&mut cog, FIRST_WAKE - 5 * period);
-    assert!(cog.execute(SyncTime::from_nanos(FIRST_WAKE + 2 * LAPSE_NS)));
+    assert!(stepped(&mut cog, FIRST_WAKE + 2 * LAPSE_NS));
     assert_eq!(
         cog.state_sess().last_sample_time().as_nanos(),
         freshest,
@@ -5151,6 +5527,9 @@ fn an_engagement_that_fails_under_torque_commands_the_release_and_parks() {
     at += LAPSE_NS;
     cog.publish_script(&one_step_script(9, at), SyncTime::from_nanos(at));
     at += LAPSE_NS;
+    // What the engagement and the release had to say is read past: the story is
+    // cumulative, and what this case is about is the refusal after it.
+    caught_up(&mut cog);
     drive(&mut cog, at);
     let refused = said(&mut cog).expect("the refusal is narrated on the wake that screened it");
     assert_eq!(refused.kind, ReportKindWire::SCRIPT_REFUSED);
@@ -6297,10 +6676,7 @@ fn reads(cog: &mut SessionTestWrapper, at_ns: i64, present: &[f64; JOINT_COUNT],
 /// Run one execution at `at_ns` with the machine reading as folded.
 fn wake_folded(cog: &mut SessionTestWrapper, at_ns: i64) {
     folded(cog, at_ns);
-    assert!(
-        cog.execute(SyncTime::from_nanos(at_ns)),
-        "the session was expected to wake",
-    );
+    assert!(stepped(cog, at_ns), "the session was expected to wake",);
 }
 
 /// Drive `wakes` executions at the wake floor, keeping everything they said,
@@ -6345,10 +6721,7 @@ fn coast_reading(
     let mut at = from_ns;
     for _ in 0..wakes {
         reads(cog, at, present, missing);
-        assert!(
-            cog.execute(SyncTime::from_nanos(at)),
-            "the session was expected to wake",
-        );
+        assert!(stepped(cog, at), "the session was expected to wake",);
         ran.asks.extend(asked(cog));
         ran.told.extend(said(cog));
         ran.published.extend(publishes(cog));

@@ -43,10 +43,15 @@ use motion::timeline;
 // gesture, and is finished.
 //
 // Woken by the reports rather than by a timer. Per-message waking keeps the gap
-// between commissioning and the greeting at one scheduling hop -- which is the
-// window `lead_ms` is sized against -- and means a view of eight over a
-// thirty-two deep channel cannot be lapped between one publication and the read
-// that follows it.
+// between commissioning and the greeting at one scheduling hop, which is the
+// window `lead_ms` is sized against. Being lapped costs nothing here: every
+// message carries the whole story, so the newest one holds the transition this
+// cog is waiting for however many were published while it was not looking.
+// Wrapping does cost: a session that narrates past its ring before this cog
+// first runs drops the transition off the front of the story and it is in no
+// later message either. The cog counts what the story says it has lost, which
+// is what turns a machine that silently never woke into a number on the run's
+// own dashboard.
 //
 // Scaffolding: when the intent bridge lands, this cog and its configuration go
 // with it. TODO(reachy-pod-motion-integration)
@@ -80,14 +85,12 @@ cog Wake
 
     inputs
     {
-        // The session's narration. Sized to see every report rather than the
-        // latest one: the transition this cog waits for is one row among a
-        // burst of them, and a row superseded before it was read is a
-        // commissioning nobody heard about.
-        reports: Tappy<timeline::TimelineEntry>
-        {
-            max_msgs: 8;
-        }
+        // The session's narration. A view of one is the whole of it: every
+        // message carries the story so far, so the transition this cog waits
+        // for is in the newest message whether or not this cog was awake for
+        // the one that first carried it -- for as long as the story has not
+        // wrapped, which the message's own dropped count says.
+        reports: Tappy<timeline::Timeline>;
     }
 
     outputs
@@ -97,9 +100,9 @@ cog Wake
 
     execution
     {
-        // Every report, no skips: the bound equals the view's size, so the
-        // count is the window's length and never a clamp of it.
-        condition got: new_message(reports, max=8);
+        // The newest story, and nothing behind it: the view is one message
+        // deep, which is the default and the whole of the story either way.
+        condition got: new_message(reports);
 
         execute when: got;
     }

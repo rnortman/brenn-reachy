@@ -26,6 +26,26 @@ sample_stale_after: 5
 # nothing here fixes, and the driver's first cycle waits on its own execution
 # condition; the machine is limp and uncommanded throughout, so the grace costs
 # nothing but the delay in noticing a driver that never started.
+#
+# What it has to cover is the skew between two process starts the supervisor
+# orders in no particular way, plus the driver's own init -- opening its port and
+# writing the minimum risk condition, nine verified writes -- plus its first
+# cycle. The ceiling on that init is the driver's own figure and is stated once,
+# as `reachy_driver::STARTUP_INIT_BUDGET_NS`, in the crate whose startup path
+# spends it. Nothing in the driver waits for anything else before it publishes:
+# there is no hold and no gate in front of that first cycle.
+#
+# That sum is checked: `cogs/motion_cog_test.rs` asserts this figure against a
+# skew allowance, the driver's init budget and two grid periods, so a grace cut
+# under the terms it has to cover, or a driver that grows what it does before
+# its first cycle, fails at `make check`. The driver-side terms are figures the
+# tree states; the skew allowance is a budget, wider than any spread the
+# 2026-08-29 launcher consoles show, and `docs/bench-runbook.md` records those.
+#
+# Only the first sample is budgeted here. Once samples are flowing,
+# `sample_stale_after` above is what declares a driver that died, and it is
+# untouched by any of this: a driver that stops mid-run is noticed as fast as it
+# ever was.
 startup_grace_ns: 2000000000
 
 # Four seconds for a wind-down's one clock. Long enough for the configured stow

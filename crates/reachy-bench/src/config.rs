@@ -80,6 +80,28 @@ pub enum ConfigError {
         id: u8,
     },
 
+    /// The two readings the sweep accepts for one register at rest are the
+    /// same value, so nothing could tell the two rest states apart.
+    #[error("{alternate} must differ from {baseline}; both are {value}")]
+    RestingStatesCollide {
+        /// The key holding the second accepted reading.
+        alternate: &'static str,
+        /// The key holding the provisioned baseline.
+        baseline: &'static str,
+        /// The value both keys hold.
+        value: u8,
+    },
+
+    /// A second accepted reading is the value the register holds once it has
+    /// tripped, which is a reading the sweep exists to refuse.
+    #[error("{key} must not be {value}: that is what the register reads once it has tripped")]
+    RestingStateIsATrip {
+        /// The configuration key, in `table.key` form.
+        key: &'static str,
+        /// What the file said.
+        value: u8,
+    },
+
     /// A count could not cross the joint/wire boundary.
     #[error(transparent)]
     Map(#[from] MapError),
@@ -200,10 +222,29 @@ pub struct ProvisionSection {
     /// Drive Mode, all nine.
     pub drive_mode: u8,
     /// Bus Watchdog, all nine. The provisioned baseline of 0, the disabled
-    /// register: a motion session arms it per commissioning sweep, and the
-    /// register resets to 0 at power-on, so this is exact over a unit that has
-    /// been power-cycled since its last session.
+    /// register: what a unit power-cycled since its last session reads.
     pub bus_watchdog: u8,
+    /// Bus Watchdog, all nine, as a motion session leaves it: the timeout the
+    /// session's commissioning sweep arms. It must track
+    /// `cogs/session_params.textproto`'s `bus_watchdog`, because this is the
+    /// second reading the sweep accepts and a figure that drifted from the
+    /// session's would accept a register nothing wrote.
+    ///
+    /// The register is RAM-resident and resets to 0 at power-on, so a sweep run
+    /// after a session reads this and a sweep run after a power cycle reads the
+    /// baseline. Both are the machine at rest and both pass; anything else,
+    /// including a latched trip, fails.
+    ///
+    /// The default is asserted equal to `bare::WATCHDOG_COUNTS`, the figure the
+    /// bench's own `watchdog` command arms, so the two in-crate copies cannot
+    /// drift. The cog system's `bus_watchdog` is in another process's
+    /// configuration and nothing here can read it: that coupling is checked by
+    /// a person changing one and grepping for the other, and by the sweep going
+    /// red on a machine whose session armed something else.
+    ///
+    /// A figure equal to `bus_watchdog`, or the tripped `0xFF`, refuses the
+    /// registry: see [`BenchConfig::resting_bus_watchdog`].
+    pub bus_watchdog_armed: u8,
     /// Temperature Limit, all nine.
     pub temperature_limit: u8,
     /// Maximum Voltage Limit, all nine, in tenths of a volt.
@@ -230,6 +271,7 @@ impl Default for ProvisionSection {
             return_delay_time: 0,
             drive_mode: 0,
             bus_watchdog: 0,
+            bus_watchdog_armed: 10,
             temperature_limit: 70,
             max_voltage_limit: 70,
             min_voltage_limit: 35,
@@ -284,6 +326,32 @@ impl BenchConfig {
             retry_attempts: section.retry_attempts,
             retry_spacing: Duration::from_millis(section.retry_spacing_ms),
         })
+    }
+
+    /// The Bus Watchdog reading a motion session leaves behind, checked for
+    /// being a reading the sweep can act on.
+    ///
+    /// Two configurations say something impossible and are refused rather than
+    /// worked around: a value equal to the provisioned baseline, which would
+    /// make every servo's reading ambiguous and turn the sweep's record of
+    /// whether a session ran into a coin toss; and the tripped value, which the
+    /// sweep is there to fail on and cannot also accept.
+    pub fn resting_bus_watchdog(&self) -> Result<u8, ConfigError> {
+        let armed = self.provision.bus_watchdog_armed;
+        if armed == self.provision.bus_watchdog {
+            return Err(ConfigError::RestingStatesCollide {
+                alternate: "provision.bus_watchdog_armed",
+                baseline: "provision.bus_watchdog",
+                value: armed,
+            });
+        }
+        if armed == crate::bare::WATCHDOG_LATCHED {
+            return Err(ConfigError::RestingStateIsATrip {
+                key: "provision.bus_watchdog_armed",
+                value: armed,
+            });
+        }
+        Ok(armed)
     }
 
     /// The nine servo IDs, checked for being addressable and distinct.
@@ -636,6 +704,45 @@ mod tests {
                 "row {row}"
             );
         }
+    }
+
+    /// The armed watchdog figure is a key with a default rather than something
+    /// the sweep infers: it has to track what the session arms, and a
+    /// deployment whose session is configured otherwise says so in its own
+    /// file.
+    ///
+    /// The default is pinned against `bare::WATCHDOG_COUNTS` and not against a
+    /// fresh literal: the bench's `watchdog` command arms that constant, so the
+    /// one in-tree copy of this figure the crate can reach is the one this
+    /// default must not drift from. The cog system's copy is in another
+    /// process's configuration and is out of a unit test's reach.
+    #[test]
+    fn the_armed_watchdog_value_defaults_to_what_the_session_arms() {
+        assert_eq!(
+            minimal().provision.bus_watchdog_armed,
+            crate::bare::WATCHDOG_COUNTS,
+            "the sweep's second rest state is the value the bench itself arms"
+        );
+        assert_eq!(
+            parse(EXAMPLE)
+                .expect("the shipped example parses")
+                .provision
+                .bus_watchdog_armed,
+            crate::bare::WATCHDOG_COUNTS,
+            "and the example ships the same figure the session's parameters hold"
+        );
+
+        let other =
+            parse(&format!("{MINIMAL}\n[provision]\nbus_watchdog_armed = 4\n")).expect("parses");
+        assert_eq!(other.provision.bus_watchdog_armed, 4);
+        // The baseline is untouched by it: the two readings are separate keys,
+        // and the table still checks the provisioned zero.
+        assert_eq!(other.provision.bus_watchdog, 0);
+        let column = ProvisionTable::column(RegId::BusWatchdog).expect("provisioned");
+        assert_eq!(
+            other.provision_table().at(0, column),
+            Some(ProvisionExpect::Check(value::u8(0)))
+        );
     }
 
     /// The two profile registers are read and reported, never compared.

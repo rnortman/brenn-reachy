@@ -1,10 +1,10 @@
 //! The one mapping between the session's own values and the schema fields its
 //! slot holds them in.
 //!
-//! This module owns the report timeline — one row per report, the ring's two
-//! cursors. A report has no second form: the row is the report, and what this
-//! module owns is the ring around it, which row a cursor names and what a cursor
-//! pair may say.
+//! This module owns the report timeline — one row per report, the ring's head
+//! and what it has dropped. A report has no second form: the row is the report,
+//! and what this module owns is the ring around it, which row a count names and
+//! how much of the story the slot's two numbers say is written.
 //!
 //! The four sequencers and the wind-down keep their state in the schema itself,
 //! so there is nothing to map there either: a host validates the slot once and
@@ -46,24 +46,19 @@ pub enum SessionSlotError {
     /// boundary rather than at every field that would have narrowed one.
     #[error("the slot does not hold what its schema declares: {0}")]
     Invalid(#[from] Invalid),
-    /// Timeline cursors that describe a ring this build does not have: more
-    /// reports waiting than the ring holds. Refused rather than clamped.
-    #[error("{unpublished} reports are waiting in a ring of {TIMELINE_LEN}")]
-    TimelineCursors {
-        /// How many the two cursors say are waiting.
-        unpublished: u8,
+    /// A timeline saying more was appended than the ring ever held, with nothing
+    /// recorded as dropped. Refused rather than clamped.
+    #[error("{appended} reports were appended to a ring of {TIMELINE_LEN} and none dropped")]
+    TimelineCount {
+        /// How many the head says were appended.
+        appended: u8,
     },
-    /// A publication marked on a timeline with nothing waiting. The cursor is not
-    /// advanced past the appends: a report the ring never held cannot be counted
-    /// as published, and the next real report would be skipped if it were.
-    #[error("nothing is waiting in the timeline to publish")]
-    NothingUnpublished,
 }
 
 /// Leave the row holding no report at all.
 ///
 /// A slot is reused memory, so a row that carries nothing has to say so: the
-/// zero kind is the one [`oldest_unpublished`] refuses, and the numbers beside it
+/// zero kind is the one [`report_row`] refuses, and the numbers beside it
 /// go with it so a later reader cannot mistake a cleared row for a report whose
 /// kind was lost.
 pub fn clear_timeline_entry(out: &mut TimelineEntryWire) {
@@ -71,10 +66,10 @@ pub fn clear_timeline_entry(out: &mut TimelineEntryWire) {
 }
 
 /// How many rows the report timeline holds.
-pub const TIMELINE_LEN: u8 = 32;
+pub const TIMELINE_LEN: u8 = 64;
 
-// The cursors are counts of reports rather than row numbers, and they wrap with
-// their own width. That is only sound while the width is a whole number of ring
+// The head is a count of reports rather than a row number, and it wraps with its
+// own width. That is only sound while the width is a whole number of ring
 // lengths: otherwise the row a count names would jump at the wrap, and a story
 // would be read out of order exactly once every two hundred and fifty-six
 // reports.
@@ -85,56 +80,57 @@ fn timeline_row(cursor: u8) -> usize {
     (cursor % TIMELINE_LEN) as usize
 }
 
-/// How many reports are appended and not yet published.
+/// How many rows the story holds.
 ///
-/// The difference between the two cursors, which is a count of reports and not a
-/// distance between rows: both cursors are totals modulo their own width, so the
-/// wrapping subtraction is the answer whether or not either has wrapped.
+/// The ring is full exactly while something has been dropped off its front, so
+/// the two numbers the slot carries say between them how much of it is written:
+/// nothing dropped means the head is the count, and anything dropped means every
+/// row is a row of the story.
 ///
 /// # Errors
 ///
-/// [`SessionSlotError::TimelineCursors`] for a pair of cursors saying more is
-/// waiting than the ring holds.
-pub fn unpublished_reports(state: &SessionStateWire) -> Result<u8, SessionSlotError> {
-    let unpublished = state
-        .timeline_head()
-        .wrapping_sub(state.timeline_published());
-    if unpublished > TIMELINE_LEN {
-        return Err(SessionSlotError::TimelineCursors { unpublished });
+/// [`SessionSlotError::TimelineCount`] for a head past the ring's length with
+/// nothing dropped, which is a slot describing a ring this build has not got.
+pub fn held_reports(state: &SessionStateWire) -> Result<u8, SessionSlotError> {
+    if state.timeline_dropped() > 0 {
+        return Ok(TIMELINE_LEN);
     }
-    Ok(unpublished)
+    let head = state.timeline_head();
+    if head > TIMELINE_LEN {
+        return Err(SessionSlotError::TimelineCount { appended: head });
+    }
+    Ok(head)
 }
 
-/// Append a report — `write` fills the claimed row — and say whether an
-/// unpublished one was dropped to make room.
+/// Append a report -- `write` fills the claimed row -- and say whether the
+/// oldest row of the story was dropped to make room.
 ///
 /// The row is handed to `write` cleared rather than handed back to the caller:
-/// the cursors move with the append, so a row claimed and left unwritten would
-/// be a report the ring counts and no reader can narrate, wedging the drain
-/// until enough further appends wrapped past it. Passing the writing in is what
-/// makes the claim and the write one act.
+/// the head moves with the append, so a row claimed and left unwritten would be
+/// a row the story counts and no reader can narrate. Passing the writing in is
+/// what makes the claim and the write one act.
 ///
-/// The ring is bounded and the append never blocks — a full ring loses its
-/// oldest unpublished report, which a caller counts rather than reacts to.
+/// The ring is bounded and the append never blocks -- a full ring loses its
+/// oldest row and counts it, which is the one thing a reader of the story cannot
+/// work out from the rows it was handed.
 ///
 /// # Errors
 ///
-/// [`SessionSlotError::TimelineCursors`] for cursors describing a ring this build
-/// does not have. On a refusal the slot is left exactly as it was — nothing is
+/// [`SessionSlotError::TimelineCount`] for a slot describing a ring this build
+/// does not have. On a refusal the slot is left exactly as it was -- nothing is
 /// appended over rows whose place in the story is unknown, and `write` is not
 /// called.
 pub fn push_report(
     state: &mut SessionStateWire,
     write: impl FnOnce(&mut TimelineEntryWire),
 ) -> Result<bool, SessionSlotError> {
-    let dropped = unpublished_reports(state)? == TIMELINE_LEN;
+    let dropped = held_reports(state)? == TIMELINE_LEN;
     let head = state.timeline_head();
     state.set_timeline_head(head.wrapping_add(1));
     if dropped {
-        // The row about to be written is the row the drain cursor was on, so the
-        // cursor moves with it: a reader that stayed put would hand out the
-        // newest report as the oldest.
-        state.set_timeline_published(state.timeline_published().wrapping_add(1));
+        // The row about to be written is the oldest row of the story, so the
+        // count of what the story has lost moves with it.
+        state.set_timeline_dropped(state.timeline_dropped().saturating_add(1));
     }
     let row = &mut state.timeline_mut()[timeline_row(head)];
     clear_timeline_entry(row);
@@ -142,59 +138,50 @@ pub fn push_report(
     Ok(dropped)
 }
 
-/// The row the oldest unpublished report stands in and the kind it narrates, or
-/// `None` where none is waiting.
+/// The `nth` row of the story, oldest first, and the kind it narrates -- or
+/// `None` past the end of it.
 ///
-/// A peek rather than a take: the cursor advances only on [`mark_published`], so
-/// a caller that could not publish leaves the report in place. The kind comes
-/// out with the row because it was read to hand the row over at all: a caller
-/// therefore has the narratable kind in hand and no second reading of it to
-/// answer for.
+/// The oldest row is row zero until the ring has wrapped, and the row the head
+/// is about to be written to after that: a full ring's oldest row is the one the
+/// next append will take.
 ///
 /// # Errors
 ///
-/// [`SessionSlotError::TimelineCursors`] for cursors describing a ring this build
-/// does not have, and [`SessionSlotError::NoSuchReportKind`] for a row the
-/// cursors call a report and which narrates none — the zero kind an unwritten row
-/// holds included, which is what makes an empty ring readable rather than a ring
-/// of reports about nothing.
-pub fn oldest_unpublished(
+/// [`SessionSlotError::TimelineCount`] for a slot describing a ring this build
+/// does not have, and [`SessionSlotError::NoSuchReportKind`] for a row the story
+/// holds that narrates nothing -- the zero kind an unwritten row carries
+/// included, which is what makes a damaged ring refuse rather than read as a
+/// story about nothing.
+pub fn report_row(
     state: &SessionStateWire,
+    nth: u8,
 ) -> Result<Option<(&TimelineEntryWire, ReportKind)>, SessionSlotError> {
-    if unpublished_reports(state)? == 0 {
+    let held = held_reports(state)?;
+    if nth >= held {
         return Ok(None);
     }
-    let row = &state.timeline()[timeline_row(state.timeline_published())];
+    let oldest = if held == TIMELINE_LEN {
+        state.timeline_head()
+    } else {
+        0
+    };
+    let row = &state.timeline()[timeline_row(oldest.wrapping_add(nth))];
     match known_nonzero(row.kind().to_known()) {
         None => Err(SessionSlotError::NoSuchReportKind(row.kind().0)),
         Some(kind) => Ok(Some((row, kind))),
     }
 }
 
-/// Record that the oldest unpublished report has gone out.
+/// Leave the timeline holding no story at all: every row cleared, the head at
+/// the start and nothing recorded as dropped.
 ///
-/// # Errors
-///
-/// [`SessionSlotError::TimelineCursors`] for cursors describing a ring this build
-/// does not have, and [`SessionSlotError::NothingUnpublished`] where nothing was
-/// waiting: a cursor advanced past the appends would skip the next real report.
-pub fn mark_published(state: &mut SessionStateWire) -> Result<(), SessionSlotError> {
-    if unpublished_reports(state)? == 0 {
-        return Err(SessionSlotError::NothingUnpublished);
-    }
-    state.set_timeline_published(state.timeline_published().wrapping_add(1));
-    Ok(())
-}
-
-/// Leave the timeline holding no story at all: every row cleared and both cursors
-/// at the start.
-///
-/// The rows go with the cursors so a later reader cannot find a report in a ring
-/// that says it is empty.
+/// The rows go with the head so a later reader cannot find a report in a ring
+/// that says it is empty. The dropped count goes too: it is what says whether
+/// the ring has wrapped, and a cleared ring has not.
 pub fn clear_timeline(state: &mut SessionStateWire) {
     for row in state.timeline_mut() {
         clear_timeline_entry(row);
     }
     state.set_timeline_head(0);
-    state.set_timeline_published(0);
+    state.set_timeline_dropped(0);
 }

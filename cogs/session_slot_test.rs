@@ -15,11 +15,11 @@ use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, AuxOpKindWire};
 use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
 use brenn_reachy__motion__reports_clk_rs::{ReportKind, ReportKindWire as ReportKindSlot};
 use brenn_reachy__motion__seq_clk_rs::SeqKindWire;
-use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
+use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use clockwork_rs::SyncTime;
 use session_slots::{
-    SessionSlotError, TIMELINE_LEN, clear_timeline, clear_timeline_entry, mark_published,
-    oldest_unpublished, push_report, unpublished_reports,
+    SessionSlotError, TIMELINE_LEN, clear_timeline, clear_timeline_entry, held_reports,
+    push_report, report_row,
 };
 
 /// An instant far from zero, so a dropped or defaulted timestamp reads as
@@ -41,9 +41,9 @@ fn a_cleared_row_holds_no_report_and_no_numbers() {
     assert_eq!(row.b(), 0);
     assert_eq!(row.time().as_nanos(), 0);
     assert_eq!(
-        oldest_unpublished(&state),
+        report_row(&state, 0),
         Err(SessionSlotError::NoSuchReportKind(0)),
-        "and the row the cursors still call a report is refused"
+        "and the row the head still calls a report is refused"
     );
 }
 
@@ -57,7 +57,7 @@ fn a_report_kind_this_build_cannot_narrate_is_refused() {
     state.timeline_mut()[0].set_kind(ReportKindSlot(99));
 
     assert_eq!(
-        oldest_unpublished(&state),
+        report_row(&state, 0),
         Err(SessionSlotError::NoSuchReportKind(99))
     );
 }
@@ -149,7 +149,7 @@ reachy_motion::vocab_numbering! {
     /// pins one of these numbers; the rest are pinned here. The zero is `ok`,
     /// which is a number like any other.
     the_aux_status_numbering_is_the_one_written_down:
-        AuxStatus as AuxStatusSlot, past the end 7 {
+        AuxStatus as AuxStatusSlot, past the end 8 {
         AuxStatus::Ok => 0,
         AuxStatus::Timeout => 1,
         AuxStatus::DecodeError => 2,
@@ -157,6 +157,7 @@ reachy_motion::vocab_numbering! {
         AuxStatus::Refused => 4,
         AuxStatus::ServoError => 5,
         AuxStatus::VerifyMismatch => 6,
+        AuxStatus::Busy => 7,
     }
 }
 
@@ -205,58 +206,57 @@ fn numbered(row: &TimelineEntryWire) -> u32 {
     n
 }
 
-/// The number of the oldest unpublished report, or `None` where none is waiting.
-fn oldest_number(state: &SessionStateWire) -> Result<Option<u32>, SessionSlotError> {
-    Ok(oldest_unpublished(state)?.map(|(row, _)| numbered(row)))
+/// The whole story the slot holds, oldest first, every row's fields asserted.
+fn story(state: &SessionStateWire) -> Result<Vec<u32>, SessionSlotError> {
+    let mut told = Vec::new();
+    for nth in 0..TIMELINE_LEN {
+        match report_row(state, nth)? {
+            Some((row, _)) => told.push(numbered(row)),
+            None => break,
+        }
+    }
+    Ok(told)
 }
 
 #[test]
 fn a_report_appended_to_the_timeline_comes_back_out_of_it() {
     let mut state = SessionStateWire::new();
-    assert_eq!(unpublished_reports(&state), Ok(0));
-    assert_eq!(oldest_unpublished(&state), Ok(None));
+    assert_eq!(held_reports(&state), Ok(0));
+    assert_eq!(story(&state), Ok(vec![]));
 
     assert_eq!(
         push_numbered(&mut state, 9),
         Ok(false),
         "a ring with room drops nothing"
     );
-    assert_eq!(unpublished_reports(&state), Ok(1));
-    assert_eq!(oldest_number(&state), Ok(Some(9)));
+    assert_eq!(held_reports(&state), Ok(1));
+    assert_eq!(story(&state), Ok(vec![9]));
     assert_eq!(
-        oldest_number(&state),
-        Ok(Some(9)),
-        "a peek twice is the same report: the cursor moves on the mark, not the read"
+        story(&state),
+        Ok(vec![9]),
+        "a story read twice is the same story: nothing is drained by reading it"
     );
-
-    assert_eq!(mark_published(&mut state), Ok(()));
-    assert_eq!(unpublished_reports(&state), Ok(0));
-    assert_eq!(oldest_unpublished(&state), Ok(None));
 }
 
 #[test]
-fn reports_leave_in_the_order_they_arrived() {
+fn the_story_is_in_the_order_the_reports_arrived() {
     let mut state = SessionStateWire::new();
     for n in 0..8 {
         assert_eq!(push_numbered(&mut state, n), Ok(false));
     }
-    assert_eq!(unpublished_reports(&state), Ok(8));
-
-    for n in 0..8 {
-        assert_eq!(
-            oldest_number(&state),
-            Ok(Some(n)),
-            "the oldest unpublished report is the {n}th appended"
-        );
-        assert_eq!(mark_published(&mut state), Ok(()));
-    }
-    assert_eq!(oldest_unpublished(&state), Ok(None));
+    assert_eq!(held_reports(&state), Ok(8));
+    assert_eq!(story(&state), Ok((0..8).collect()));
+    assert_eq!(
+        state.timeline_dropped(),
+        0,
+        "a story shorter than the ring loses nothing",
+    );
 }
 
-/// The ring holds its own length of unpublished reports and the append past that
-/// drops the oldest rather than refusing the newest.
+/// The ring holds its own length and the append past that drops the oldest row
+/// rather than refusing the newest, counting what it cost.
 #[test]
-fn an_append_past_the_ring_drops_the_oldest_unpublished_report() {
+fn an_append_past_the_ring_drops_the_oldest_row_and_counts_it() {
     let mut state = SessionStateWire::new();
     for n in 0..u32::from(TIMELINE_LEN) {
         assert_eq!(
@@ -265,8 +265,8 @@ fn an_append_past_the_ring_drops_the_oldest_unpublished_report() {
             "the ring is not full until it holds its own length"
         );
     }
-    assert_eq!(unpublished_reports(&state), Ok(TIMELINE_LEN));
-    assert_eq!(oldest_number(&state), Ok(Some(0)));
+    assert_eq!(held_reports(&state), Ok(TIMELINE_LEN));
+    assert_eq!(story(&state), Ok((0..u32::from(TIMELINE_LEN)).collect()));
 
     assert_eq!(
         push_numbered(&mut state, TIMELINE_LEN.into()),
@@ -274,85 +274,61 @@ fn an_append_past_the_ring_drops_the_oldest_unpublished_report() {
         "and the one past it says what it cost"
     );
     assert_eq!(
-        unpublished_reports(&state),
+        held_reports(&state),
         Ok(TIMELINE_LEN),
         "the ring still holds exactly its length"
     );
     assert_eq!(
-        oldest_number(&state),
-        Ok(Some(1)),
-        "with the second report at the front: the first is what was dropped"
+        story(&state),
+        Ok((1..=u32::from(TIMELINE_LEN)).collect()),
+        "the second report is at the front and the newest at the back: the first was dropped"
     );
-
-    // And the tail is the newest, not the row it overwrote.
-    for n in 1..=u32::from(TIMELINE_LEN) {
-        assert_eq!(oldest_number(&state), Ok(Some(n)));
-        assert_eq!(mark_published(&mut state), Ok(()));
-    }
-    assert_eq!(oldest_unpublished(&state), Ok(None));
+    assert_eq!(
+        state.timeline_dropped(),
+        1,
+        "which is the one thing a reader of the story cannot work out from it",
+    );
 }
 
-/// The cursors are counts of reports modulo their own width, and the width is a
-/// whole number of ring lengths -- so a story longer than the width reads in
-/// order across the wrap. Three hundred reports drained one at a time is what
-/// crosses it.
+/// The head is a count of reports modulo its own width, and the width is a whole
+/// number of ring lengths -- so a story longer than the width reads in order
+/// across the wrap. Three hundred reports into a full ring is what crosses it.
 #[test]
-fn a_timeline_drained_as_it_fills_survives_the_cursors_wrapping() {
+fn a_story_longer_than_the_head_s_own_width_still_reads_in_order() {
     let mut state = SessionStateWire::new();
     for n in 0..300 {
-        assert_eq!(push_numbered(&mut state, n), Ok(false));
-        assert_eq!(oldest_number(&state), Ok(Some(n)));
-        assert_eq!(mark_published(&mut state), Ok(()));
+        push_numbered(&mut state, n).expect("a ring takes every report");
     }
-    assert_eq!(unpublished_reports(&state), Ok(0));
-    assert_eq!(oldest_unpublished(&state), Ok(None));
-}
-
-/// A full ring that wraps mid-story, which is the arrangement a burst produces:
-/// the cursors are near the end of their width when the ring fills.
-#[test]
-fn a_full_ring_that_wraps_mid_story_keeps_its_order() {
-    let mut state = SessionStateWire::new();
-    // A cursor pair a run of two hundred and fifty reports would have left.
-    state.set_timeline_head(250);
-    state.set_timeline_published(250);
-
-    for n in 0..u32::from(TIMELINE_LEN) {
-        assert_eq!(push_numbered(&mut state, n), Ok(false));
-    }
+    assert_eq!(held_reports(&state), Ok(TIMELINE_LEN));
     assert_eq!(
-        state.timeline_head(),
-        250_u8.wrapping_add(TIMELINE_LEN),
-        "the append cursor wrapped through its width"
+        story(&state),
+        Ok((300 - u32::from(TIMELINE_LEN)..300).collect()),
+        "the newest ring's worth, oldest first, across two wraps of the head",
     );
-    assert_eq!(unpublished_reports(&state), Ok(TIMELINE_LEN));
-
-    for n in 0..u32::from(TIMELINE_LEN) {
-        assert_eq!(oldest_number(&state), Ok(Some(n)));
-        assert_eq!(mark_published(&mut state), Ok(()));
-    }
-    assert_eq!(oldest_unpublished(&state), Ok(None));
+    assert_eq!(
+        state.timeline_dropped(),
+        300 - u32::from(TIMELINE_LEN),
+        "and every row that went is counted",
+    );
 }
 
 #[test]
-fn cursors_describing_a_longer_ring_than_this_build_has_are_refused() {
+fn a_head_past_the_ring_with_nothing_dropped_is_refused() {
     let mut state = SessionStateWire::new();
     push_numbered(&mut state, 3).expect("an empty ring takes a report");
-    state.set_timeline_published(state.timeline_head().wrapping_sub(TIMELINE_LEN + 1));
+    state.set_timeline_head(TIMELINE_LEN + 1);
 
-    let refusal = SessionSlotError::TimelineCursors {
-        unpublished: TIMELINE_LEN + 1,
+    let refusal = SessionSlotError::TimelineCount {
+        appended: TIMELINE_LEN + 1,
     };
-    assert_eq!(unpublished_reports(&state), Err(refusal));
-    assert_eq!(oldest_unpublished(&state), Err(refusal));
+    assert_eq!(held_reports(&state), Err(refusal));
+    assert_eq!(report_row(&state, 0), Err(refusal));
 
     let head = state.timeline_head();
-    let published = state.timeline_published();
     assert_eq!(push_numbered(&mut state, 4), Err(refusal));
-    assert_eq!(mark_published(&mut state), Err(refusal));
     assert_eq!(
-        (state.timeline_head(), state.timeline_published()),
-        (head, published),
+        (state.timeline_head(), state.timeline_dropped()),
+        (head, 0),
         "a refused ring is left exactly as it was found"
     );
     assert_eq!(
@@ -362,39 +338,34 @@ fn cursors_describing_a_longer_ring_than_this_build_has_are_refused() {
     );
 }
 
-#[test]
-fn a_publication_with_nothing_waiting_is_refused() {
-    let mut state = SessionStateWire::new();
-    assert_eq!(
-        mark_published(&mut state),
-        Err(SessionSlotError::NothingUnpublished)
-    );
-    assert_eq!(
-        (state.timeline_head(), state.timeline_published()),
-        (0, 0),
-        "a cursor past the appends would skip the next real report"
-    );
-
-    push_numbered(&mut state, 1).expect("an empty ring takes a report");
-    mark_published(&mut state).expect("one appended is one to publish");
-    assert_eq!(
-        mark_published(&mut state),
-        Err(SessionSlotError::NothingUnpublished),
-        "and a drained ring is empty again"
-    );
-}
-
-/// The cursors say a row is a report and the row says it is none. Refused, which
+/// The head says a row is a report and the row says it is none. Refused, which
 /// is the whole reason a cleared row reads as no report: this is memory nobody
 /// wrote being called a story.
 #[test]
-fn a_row_the_cursors_call_a_report_and_which_holds_none_is_refused() {
+fn a_row_the_head_calls_a_report_and_which_holds_none_is_refused() {
     let mut state = SessionStateWire::new();
     state.set_timeline_head(1);
-    assert_eq!(unpublished_reports(&state), Ok(1));
+    assert_eq!(held_reports(&state), Ok(1));
     assert_eq!(
-        oldest_unpublished(&state),
+        report_row(&state, 0),
         Err(SessionSlotError::NoSuchReportKind(0))
+    );
+}
+
+/// The message that carries a story holds a row per row of the ring.
+///
+/// The publish writes every row the ring holds into one message and can do
+/// nothing with a row that will not fit, so the two lengths are one number
+/// declared in two files. Growing the ring past the message is what this
+/// refuses: it would be a panic in a cog's execute body, which ends the control
+/// process, reached by a change that looks free.
+#[test]
+fn the_story_message_holds_a_row_for_every_row_of_the_ring() {
+    let mut message = TimelineWire::new();
+    assert_eq!(
+        message.entries_mut().capacity(),
+        usize::from(TIMELINE_LEN),
+        "the ring and the message that carries it are the same length"
     );
 }
 
@@ -407,21 +378,21 @@ fn a_cleared_timeline_holds_no_story_at_all() {
     clear_timeline(&mut state);
 
     assert_eq!(state.timeline_head(), 0);
-    assert_eq!(state.timeline_published(), 0);
-    assert_eq!(unpublished_reports(&state), Ok(0));
-    assert_eq!(oldest_unpublished(&state), Ok(None));
+    assert_eq!(state.timeline_dropped(), 0);
+    assert_eq!(held_reports(&state), Ok(0));
+    assert_eq!(report_row(&state, 0), Ok(None));
     for row in state.timeline() {
         assert_eq!(
             row.kind(),
             ReportKindSlot::NONE,
-            "every row went with the cursors"
+            "every row went with the head"
         );
     }
 }
 
 /// The ring's length is written in two places -- this crossing's constant and the
-/// schema's own array -- and the cursor arithmetic is sound only while the
-/// cursor's width is a whole number of that length.
+/// schema's own array -- and the head arithmetic is sound only while the head's
+/// width is a whole number of that length.
 #[test]
 fn the_ring_is_as_long_as_the_slot_that_holds_it() {
     assert_eq!(
@@ -430,7 +401,7 @@ fn the_ring_is_as_long_as_the_slot_that_holds_it() {
     );
     assert!(
         (usize::from(u8::MAX) + 1).is_multiple_of(usize::from(TIMELINE_LEN)),
-        "otherwise the row a cursor names would jump at the wrap"
+        "otherwise the row the head names would jump at the wrap"
     );
 }
 
@@ -459,7 +430,8 @@ fn a_session_slot_nobody_wrote_is_a_session_that_has_not_begun() {
     assert_eq!(state.schedule().steps().len(), 0);
     assert_eq!(state.schedule().overlays().len(), 0);
 
-    assert_eq!(unpublished_reports(&state), Ok(0));
+    assert_eq!(held_reports(&state), Ok(0));
+    assert_eq!(state.timeline_dropped(), 0);
     assert_eq!(state.next_corr(), 0);
     assert_eq!(
         state.degrade_release(),

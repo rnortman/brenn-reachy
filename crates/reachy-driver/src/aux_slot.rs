@@ -25,7 +25,7 @@
 
 use brenn_reachy__driver__aux_clk_rs::{AuxSlotState, AuxSlotStateWire};
 use brenn_reachy__motion__bus_txn_clk_rs::BusTxn;
-use clockwork_rs::SyncTime;
+use clockwork_rs::{SyncTime, as_raw, blob_as_bytes};
 
 use crate::JOINT_COUNT;
 use crate::state::DriverStateError;
@@ -65,11 +65,22 @@ pub enum AuxTask {
 pub enum AuxOffer {
     /// Held, and named by the next [`AuxSlot::take`].
     Accepted,
+    /// The request already pending, offered again: same correlation number,
+    /// same transaction, byte for byte.
+    ///
+    /// A delivery re-issue on a lossy transport, which is the host repeating
+    /// itself rather than asking for a second thing. Nothing is held that was
+    /// not held already, and the pending request's own outcome answers both
+    /// copies — so an answer against this offer would be a second answer under
+    /// a number the host is still waiting on one for.
+    Duplicate,
     /// Refused: a request is already pending.
     ///
     /// The queue is one deep because the host that fills it is serial by
     /// construction — it issues one transaction and waits for its outcome — so
-    /// a second request arriving is a host that is not what it claims to be. The
+    /// a *different* request arriving is a host that is not what it claims to
+    /// be: a fresh correlation number while one is pending, or the pending
+    /// number carrying a payload that is not the pending one's. The
     /// refusal is loud on purpose: it comes back as an outcome with a refused
     /// status, against the `corr` of the request that was turned away, rather
     /// than being absorbed into a deeper queue where the two would silently
@@ -158,15 +169,30 @@ impl<'a> AuxSlot<'a> {
     /// Offer a host request to the slot, under the host's correlation number.
     ///
     /// The record is copied in rather than borrowed: the state outlives the
-    /// cycle that offered it, and a re-issue must be the same transaction.
+    /// cycle that offered it, and a re-issue must be the same transaction —
+    /// which is what makes one recognisable while the original is still
+    /// pending. The comparison is the whole record's bytes, so two offers are
+    /// the same request only where every field of them is.
     pub fn offer(&mut self, corr: u32, request: &BusTxn) -> AuxOffer {
         if self.state.has_pending.get() {
+            if self.state.corr == corr && Self::same_request(&self.state.pending, request) {
+                return AuxOffer::Duplicate;
+            }
             return AuxOffer::RefusedBusy;
         }
         crate::copy_whole(&mut self.state.pending, request);
         self.state.corr = corr;
         self.state.has_pending = true.into();
         AuxOffer::Accepted
+    }
+
+    /// Whether two records are the same transaction: the same bytes.
+    ///
+    /// Byte equality rather than a field-by-field comparison, because the
+    /// record is a buffer and every byte of it is part of what was asked for —
+    /// a field this build does not read is still a field the servo would see.
+    fn same_request(held: &BusTxn, offered: &BusTxn) -> bool {
+        blob_as_bytes(as_raw(held)) == blob_as_bytes(as_raw(offered))
     }
 
     /// The transaction taken under `corr`, or `None` where the slot no longer
@@ -479,6 +505,62 @@ mod tests {
             "and it is the first request's transaction, not the second's"
         );
         assert_eq!(slot.offer(2, as_txn(&read_request(2))), AuxOffer::Accepted);
+    }
+
+    /// The delivery re-issue: the same number carrying the same bytes while the
+    /// original is still in the slot. It is the host repeating itself on a lossy
+    /// transport, so it is neither held again nor turned away.
+    #[test]
+    fn the_pending_request_offered_again_verbatim_is_a_duplicate() {
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
+        let request = read_request(1);
+        assert_eq!(slot.offer(4, as_txn(&request)), AuxOffer::Accepted);
+        assert_eq!(slot.offer(4, as_txn(&request)), AuxOffer::Duplicate);
+        assert!(
+            same_txn(Some(&slot.state.pending), &request),
+            "the record the slot holds is untouched"
+        );
+        assert_eq!(
+            slot.take(T0 + PERIOD, i64::MAX, None),
+            AuxTask::Host { corr: 4 },
+            "one request was held and it runs once"
+        );
+        assert_eq!(slot.take(T0 + 2 * PERIOD, i64::MAX, None), AuxTask::Nothing);
+    }
+
+    /// The same number with different bytes is not a re-issue of anything: two
+    /// transactions were asked for under one identity, and answering the second
+    /// under it would put a register write nobody can attribute on the bus.
+    #[test]
+    fn the_pending_number_carrying_another_payload_is_refused() {
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
+        assert_eq!(slot.offer(4, as_txn(&read_request(1))), AuxOffer::Accepted);
+        assert_eq!(
+            slot.offer(4, as_txn(&read_request(2))),
+            AuxOffer::RefusedBusy
+        );
+        assert!(
+            same_txn(Some(&slot.state.pending), &read_request(1)),
+            "and the request that was held is still the one that was held"
+        );
+    }
+
+    /// A re-issue that arrives after the original was served is a fresh request
+    /// and runs again: the slot no longer holds anything to recognise it
+    /// against, and the transactions the host re-issues are idempotent.
+    #[test]
+    fn a_re_issue_after_the_original_was_taken_is_accepted() {
+        let mut fixture = Fixture::new();
+        let mut slot = rotated(&mut fixture, T0);
+        let request = read_request(1);
+        slot.offer(4, as_txn(&request));
+        assert_eq!(
+            slot.take(T0 + PERIOD, i64::MAX, None),
+            AuxTask::Host { corr: 4 }
+        );
+        assert_eq!(slot.offer(4, as_txn(&request)), AuxOffer::Accepted);
     }
 
     #[test]

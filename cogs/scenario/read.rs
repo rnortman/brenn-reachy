@@ -24,8 +24,8 @@ use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::DriverEventWire;
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
-use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
-use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
+use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
+use log_read::{Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed};
 use motion_channels::{
     CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL,
     SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL, SIM_CMD_CHANNEL,
@@ -48,7 +48,8 @@ pub struct Run {
     pub events: Vec<Logged<DriverEventWire>>,
     /// What the decision tick raised.
     pub faults: Vec<Logged<TickFaultWire>>,
-    /// What the session said about all of it.
+    /// What the session said about all of it: the rows of the newest story it
+    /// published, which is the whole of its narration.
     pub reports: Vec<Logged<TimelineEntryWire>>,
     /// What the session asked the driver for.
     pub datagrams: Vec<Logged<SessionCmdWire>>,
@@ -102,8 +103,15 @@ const CHANNELS: [Bound<Run>; 10] = [
     },
     Bound {
         name: REPORT_CHANNEL,
-        check: binding::<TimelineEntryWire>,
-        route: |run, message| typed(message, &mut run.reports, &mut run.complaints),
+        check: binding::<TimelineWire>,
+        route: |run, message| {
+            cumulative(
+                message,
+                &mut run.reports,
+                &mut run.complaints,
+                |story: &TimelineWire, rows| rows.extend(story.entries().iter().cloned()),
+            );
+        },
     },
     Bound {
         name: SESSION_CMD_CHANNEL,

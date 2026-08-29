@@ -123,6 +123,11 @@ assert_no_file() {
 	fi
 }
 
+# The checkout this harness lives in, whatever directory a run started from.
+checkout_root() {
+	(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+}
+
 # A motion-run harness's budget against the wake lead it is mostly made of.
 #
 #   assert_run_budget_covers_lead <harness script in the checkout>
@@ -137,11 +142,14 @@ assert_no_file() {
 # margin each harness carries above this is deliberately excluded — that is for
 # a loaded workstation or a serial bus that retries, and each script's own
 # comment says which.
+#
+# Both harnesses spend the same terms: neither driver waits for anything before
+# its first cycle.
 assert_run_budget_covers_lead() {
 	local script=$1
 	local label="${script##*/}'s run budget covers the shipped wake lead and the phases around it"
 	local checkout lead budget phases needed
-	checkout=$(cd -- "$(dirname -- "$script")/.." && pwd)
+	checkout=$(checkout_root)
 	phases=14
 	lead=$(sed -n 's/^lead_ms:[[:space:]]*\([0-9]*\).*/\1/p' \
 		-- "${checkout}/cogs/wake_params.textproto")
@@ -149,7 +157,7 @@ assert_run_budget_covers_lead() {
 	if [ -z "$lead" ] || [ -z "$budget" ]; then
 		fail "$label" \
 			"read no lead_ms from cogs/wake_params.textproto or no run_seconds from" \
-			"${script} — one of the two names has moved"
+			"${script} — one of the names has moved"
 		return
 	fi
 	needed=$((lead / 1000 + phases))

@@ -50,3 +50,9 @@ pub const AUX_OUT_CHANNEL: &str = "DriverAuxOut";
 
 /// What the driver's health rotation read.
 pub const HEALTH_CHANNEL: &str = "DriverHealth";
+
+/// Everything the driver knows about its own run, republished on a cadence.
+///
+/// Cumulative: the newest message is the whole account, so a reader that saw
+/// only one of them has read the run.
+pub const STATUS_CHANNEL: &str = "DriverStatus";

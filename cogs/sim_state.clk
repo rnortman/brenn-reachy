@@ -285,5 +285,76 @@ schema SimState
         // against. Kept apart from the asks the driver turned away because the
         // two send a reader to different places.
         #23 undecodable_inbound: UInt64;
+
+        // When this process released the machine it met, which is the first
+        // thing the first execution does and the last time it is done unasked.
+        // The real driver's process-start sweep, modelled: a driver cannot know
+        // what a predecessor left energised, so it de-torques before it does
+        // anything else. Zero only before the first execution has run.
+        #24 swept_at: SyncTime;
+
+        // When the first pose sample went out, and zero until one has. Every
+        // cycle publishes one, so this is the first cycle's instant on any run
+        // that has had a cycle.
+        #25 first_pose: SyncTime;
+
+        // When the first of the host's datagrams was taken off the input, and
+        // zero until one has been. Read on the same clock as `first_pose`, and
+        // the datagrams are taken before the sample goes out, so a host that
+        // commanded the machine on the cycle that first showed it one ties
+        // rather than following.
+        #26 first_session_cmd: SyncTime;
+
+        // How many cycles have run since the last status record was published.
+        // The cadence is counted in cycles rather than measured against a clock
+        // so that it is a simulated second under any grid the scenario sets.
+        #27 cycles_since_status: UInt32;
+
+        // How many cycles have run, all run.
+        #28 cycles: UInt64;
+
+        // How many grid points passed without a cycle running, all run. An
+        // execution that covers more than one cycle of plant motion is a
+        // process that lost the CPU, and the points it stepped over are points
+        // no cycle attended.
+        #29 skipped_cycles: UInt64;
+
+        // How many of the host's datagrams have been taken off the input, all
+        // run -- every one of them, including the ones no ask could be read out
+        // of. What the census of the channel they arrived on counts.
+        #30 session_cmds_taken: UInt64;
+
+        // How many setpoints have been taken off the goal input, all run, on
+        // the same terms.
+        #31 goals_taken: UInt64;
+
+        // How many messages this cog has published, all run: the samples, the
+        // events, the outcomes, the health reports and the status records.
+        #32 published: UInt64;
+
+        // How many delivery re-issues the aux slot recognised, all run: the
+        // same correlation number carrying the same bytes as the request it
+        // already holds. Not a refusal -- the pending request's own outcome
+        // answers both copies.
+        #33 aux_duplicates: UInt64;
+
+        // How many health reports have gone out, all run.
+        #34 health_reports: UInt64;
+
+        // How many of the rotation's reads answered nothing, all run: a blind
+        // cycle, or a servo off the bus. No report goes out for one.
+        #35 health_misses: UInt64;
+
+        // How many cycles the bus answered nothing on, all run. The total,
+        // where `blind_cycles` above is the run of them the driver is standing
+        // in right now: the first is what an outage cost a run, the second is
+        // what says the bus is gone.
+        #36 blind_cycles_total: UInt64;
+
+        // How many of the confirmation pass's read-backs answered nothing, all
+        // run. Each one counts as a row still holding torque, because a
+        // de-torquing credited to silence is the one report a driver must never
+        // make.
+        #37 confirm_misses: UInt64;
     }
 }

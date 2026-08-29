@@ -40,21 +40,14 @@ schema MotordParams
         // schedule.
         #2 health_poll_period_ns: Int64;
 
-        // How long after start the driver waits for its first goal or session
-        // command before de-torquing the machine, nanoseconds. A driver that
-        // came up next to a machine nobody is commanding -- a restart, a
-        // half-started system -- reaches the minimum risk condition on its own
-        // rather than leaving whatever the servos were doing in place.
-        #3 startup_window_ns: Int64;
-
         // The serial device the servo bus is on. A path rather than an index:
         // the node is fixed by the board, and a driver that guessed which port
         // it had would be a driver that can address the wrong machine.
-        #4 bus_device: VarString<256>;
+        #3 bus_device: VarString<256>;
 
         // The bus baud rate. Both ends of a serial link have to have been told
         // the same number and neither can discover it, so it is configuration
         // and not a probe.
-        #5 bus_baud: UInt32;
+        #4 bus_baud: UInt32;
     }
 }

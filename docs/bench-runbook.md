@@ -133,7 +133,13 @@ have, the bench prints its usage, which lists them all. The ones worth knowing
 before the first session:
 
 - `selftest` — read-only. Presence, registers, the legs' travel fences, voltage,
-  temperature, health, the resting pose, the antennas' fold. Writes a state file
+  temperature, health, the exchange timing, the resting pose, the antennas'
+  fold. The `bus-exchange-timing` case measured the drain that caused the cycle
+  overruns and is expected green now that the drain is gone; its printed
+  distributions are still the point of running it, and a total back in the
+  milliseconds is a regression to take to a person. The whole registry is
+  expected green over a unit that has just run a motion session as well as over
+  a power-cycled one. Writes a state file
   that `bench-fetch` retrieves. The temperature case has never been run against a
   unit: the register is untried here, so a reading outside `5..=55 °C` is a
   person's to review before the band moves. The `leg-fence` case reads each leg
@@ -142,12 +148,15 @@ before the first session:
   and prints both windows in counts and degrees, and is a mis-provisioned unit
   rather than something to widen the tolerance for.
   A diagnostic and a regression guard; it gates nothing.
-  **Power-cycle the unit before a sweep**, or run it before anything else in a
-  session: the Bus Watchdog register is RAM-resident and resets to 0 at
-  power-on, and the sweep checks it against that provisioned 0. A session — or
-  the `watchdog` command below — leaves 10 in it, and a sweep taken afterwards
-  fails on that register and nothing else. That failure is exact and benign, and
-  the check stays hard rather than tolerating stale session state.
+  No power cycle is needed first. The Bus Watchdog register is RAM-resident and
+  resets to 0 at power-on, and the sweep accepts either reading a machine at
+  rest has — the provisioned 0, or the 10 a session arms — and names which it
+  read, so the line is the record of whether a session has run this power cycle.
+  Both readings are the whole roster's: nine at 0 or nine at 10. A split roster
+  fails and names the servos on each side, because nothing at rest leaves the
+  register in two states — a session arms all nine, power-on clears all nine,
+  and the `watchdog` command below arms one servo and disarms it again. Any
+  third reading, a latched 0xFF among them, fails as it always did.
 - `provision` — writes the antennas' operating mode. Torque must be off on
   both; it moves nothing.
 - `off` — writes torque off on every servo on the roster. It gates on nothing
@@ -243,8 +252,9 @@ arm, so neither path can leave a session running on stale ones.
 The antennas turn freely and are in extended-position mode, so their reported
 angle can accumulate past a turn while the machine runs. Both paths fold that
 count back into a single turn; the self-test's `antenna-fold` case is what
-asserts it, and a reading outside one turn is a finding for a person, never a
-bound to widen. See the open observations at the end.
+asserts it, over that turn plus half a turn of slack either side for where a
+session's wind-down rests. A reading outside that window is a finding for a
+person, never a bound to widen. See the open observations at the end.
 
 ## The `watchdog` self-test
 
@@ -306,9 +316,13 @@ policy-level finding awaiting its own cycle, and a test edited to pass is that
 finding retracted. Until then the thing that actually de-torques on a controlled
 exit is the driver's own SIGINT/SIGTERM wind-down.
 
-Run this **before the first motion run**, and power-cycle afterwards if a
-read-only sweep comes next: this command leaves the register at 0 on the servo it
-addressed, but a session leaves 10 on all nine.
+Run this **before the first motion run**. No power cycle is needed before the
+next read-only sweep: this command disarms the register on the servo it
+addressed on the way out, and the sweep accepts both readings a machine at rest
+has — the provisioned 0 and the 10 a session arms — naming which it read. Check
+the disarm took: this command arms the same 10 a session does, so one servo left
+armed among eight at 0 splits the roster across the two accepted states, and the
+sweep fails on the mix and names the servo.
 
 ## The motion test
 
@@ -428,12 +442,12 @@ still there to fetch.
 A run brings back more than the records. The launcher's whole console directory
 lands in `<fetch>.console` beside them, the streamed console is teed into
 `run-console.log` there, and the unit's time-daemon state is read into
-`clock-before.txt` and `clock-after.txt` either side of the run. The driver's
-console is evidence about the *log* rather than about the machine: it counts the
-datagrams the driver took off its own socket, so the report is handed it with
-`--console` and says so when the recorded trail is shorter than what the driver
-counted. A console that does not come back costs the cross-check and never the
-run.
+`clock-before.txt` and `clock-after.txt` either side of the run. None of it is
+read by the analyzer: the driver republishes everything its console counts into
+the log itself, so the report is handed the records and nothing else, and a
+console that does not come back costs the verdict nothing. What the console is
+for is a person reading a run that went wrong — a process that never started, a
+launcher that refused, a panic with a backtrace.
 
 `motion-run` chains `motion-deploy`, which chains `motion-build`, so the blessed
 entry point cannot run a payload older than your tree. `make motion-deploy` and
@@ -491,17 +505,22 @@ while the machine is still.
 **What the driver's console holds is counters, not narration.** It prints a
 `key=value` summary every five seconds — datagrams taken off its socket, aux
 offers refused, confirmation misses — and nothing about which transaction did
-what. The commissioning survey's verdict is not there and never was; it is the
-`commission_failed` report row that says why a session parked, and the driver's
-counters are how the analyzer decides whether the recorded trail is complete.
+what. It is for a person at a terminal: the analyzer never opens it. The same
+counters ride the `DriverStatus` record the driver republishes into the log, and
+that is what the report cross-checks the recorded trail against. The
+commissioning survey's verdict is in neither; it is the `commission_failed`
+report row that says why a session parked.
 
 Aborting `make motion-run` with Ctrl-C leaves the machine safe — the driver winds
 down on the signal — and fetches nothing. Re-run it.
 
 **There is no start order to get right, and none to get wrong.** The launcher
 spawns all three at once, in whatever order it happens to walk them, and each is
-safe alone: a driver with nobody talking to it reaches the minimum risk
-condition inside its startup window and says so; a control loop whose driver is
+safe alone: a driver writes the minimum risk condition as its first act on the
+bus, before it waits for anything, and every status copy it publishes carries
+the instant it did — which is what the report's start-up note reads, since the
+`STARTUP_MRC_WRITE` event itself rides a stream whose head the logger usually
+misses; a control loop whose driver is
 not up yet finds the servos absent — its first presence ping has an 800 ms
 delivery budget against a port bound milliseconds after the fork — and parks the
 session without ever writing torque, which is a dead run and never a hazard; a
@@ -564,16 +583,44 @@ it passes or fails, because a first run that fails is exactly the run whose
 numbers somebody needs. Its own test runs it over the S1 scenario's deterministic
 log, so the analyzer was proved before any hardware log existed.
 
+**The tracking lag lines are notes, and on the shipped servo profile they read
+about a radian.** Expect a worst head lag near 1 rad and a worst antenna lag near
+2.5 rad on the wake gesture. The printed pins beside them — 0.245 rad and
+1.38 rad — come from `crates/reachy-motion/fixtures/traces`, which the bench
+recorded under its trial-validated 400 / 600 servo profile, and a live session
+arms 20 / 50 instead (`cogs/session_params.textproto`), so **the two numbers are
+not commensurable**: the pins are the recordings' own worst lags, not a budget
+this run was measured against. The arithmetic behind the expectation: the
+gesture's commanded peaks are about 3.34 rad/s of leg crank and 7.55 rad/s of
+antenna (the figures the replay suite pins over `trace-verify2.csv`), while 50
+register units is a 1.20 rad/s cap and 400 was 9.59, so both peaks are
+rate-limited on a live run and neither was on the recordings. A joint
+held at the cap while its min-jerk goal runs ahead falls about 0.72 rad behind on
+leg 2's span and about 2.44 rad on the antennas' arc, which is what the runs
+measure. The report derives no verdict from these lines, and the tracking fault
+is a progress test rather than a distance one, so a large lag on its own is not a
+problem — the machine reaches upright and stow within 0.05 rad in the same runs.
+
+What makes it a person's problem: a lag reading *with* a tracking fault beside
+it, or one that grows run over run under an unchanged profile. Both the
+expectation and the fixtures' provenance are decided by the same future hardware
+session, `session-servo-profile` in `TODO.md`, which is where the profile is
+measured rather than assumed.
+
 **A finding is one fact, and it says which one.** Missed cycle slots are one
 finding for the run — total, rate, the worst report, what the cycle before it
-spent, and how many of the skips followed a cycle carrying out-of-band bus work —
-and a heartbeat gap a skip accounts for is not counted a second time. The latched
-error byte is one finding naming the servos. A refused or mismatched transaction
+spent, and how many of the skips followed a cycle carrying a health reading and
+how many one carrying a host transaction —
+and a heartbeat gap a skip accounts for is not counted a second time. A latched
+error byte is one finding naming the servos, except the input-voltage bit on its
+own: that is this machine's expected reading, and it prints as one note naming
+the set (the anomaly entry below). Any bit beyond it is the finding, and the byte
+is named whole. A refused or mismatched transaction
 is printed with its identity: correlation number, operation, servo, register, and
 the value in the register's own units. **No budget is folded into any of this**:
-one missed slot still makes the run red, and `TODO(cycle-skip-budget)` is where a
-measured, reviewed, explained rate would go if the answer turns out to be that
-one is acceptable.
+one missed slot makes the run red, and there is nothing to argue about, because
+the cycle now fits its grid with an order of magnitude to spare. A skip is a new
+fact about the machine, and it goes to a person rather than into a tolerance.
 
 The antennas are judged where the machine was let go of — the last valid pose at
 or before the first verified torque-off write — and not where the script's
@@ -658,17 +705,14 @@ while the unit is still up.
 Then bring the records back and judge them:
 
     make motion-fetch
-    bazel run //cogs:first_motion_report -- \
-        --console .local/motion-logs/<fetch>.console \
-        .local/motion-logs/<fetch>/<run>
+    bazel run //cogs:first_motion_report -- .local/motion-logs/<fetch>/<run>
 
-`motion-fetch` brings the launcher's console directory back beside the records,
-and `--console` is what lets the report cross-check the recorded trail against
-the driver's own counters. Drop the flag if no driver console came back — the
-report refuses a console path holding none, and it refuses one holding several
-driver logs, which is what a launch directory left to accumulate across runs
-looks like. A hand-started run has to empty `/run/brenn-app/logs/launch` itself
-to avoid that; `make motion-run` does it for you. It also copies the push's
+The report takes a log directory and nothing else. `motion-fetch` brings the
+launcher's console directory back beside the records all the same, for a person
+to read; a launch directory left to accumulate across runs holds several runs'
+consoles and nothing afterwards can say which is which, so a hand-started run
+has to empty `/run/brenn-app/logs/launch` itself. `make motion-run` does it for
+you. It also copies the push's
 provenance stamp into the log root, which a hand-started run has to do itself if
 the fetched records are to name their build:
 
@@ -731,7 +775,9 @@ that the next person to see one knows it is not new.
   and two other power-on observations plus every observed `reboot` do exactly
   that. Nothing explains the one that did not. The self-test's `antenna-fold`
   case is the tripwire: it reads each antenna's count from the resting sweep
-  and fails by name outside one turn. If it ever fails, that is this
+  and fails by name outside the turn a fold leaves, plus half a turn of slack
+  either side for where a session's wind-down rests. 545° is 8250 counts, more
+  than half a turn beyond that window, so if it ever fails, that is this
   observation recurring — take it to a person and do not widen the bound.
 - **The first motion runs end red.** The four `make motion-run` runs on
   `reachy00` on 2026-08-26 all produced a red report, in two shapes. The first
@@ -744,36 +790,137 @@ that the next person to see one knows it is not new.
   rows, and was called red by the report anyway. **No fault fired in any of the
   four** — every red mark came from the analyzer, not from the machine.
 
+  Two more runs on 2026-08-27 reproduced both shapes on one afternoon and are
+  what settled the first of them: which shape a run takes is decided by where in
+  the wall-clock second the session and the driver happen to start, and nothing
+  else. The parked shape is a startup race, described below and now fixed. The
+  moving shape was red on the skips; the exchange measurement below has since
+  found what caused them, and the cause has been removed.
+
+  **On 2026-08-28 the run came back clean for the first time — superseded by the
+  2026-08-29 record below, which is the baseline to read a run against.** Three
+  consecutive `make motion-run`s exited 0 with zero findings. The one thing that
+  record holds and the current one does not is what the timed hold bought: with a
+  hold in front of the driver's first cycle, every logged channel began at
+  sequence 0 and the driver's datagram count matched the log's exactly. The hold
+  is gone — a logger is never a precondition for driving motors, and the driver
+  now releases the machine and starts cycling immediately — so stream heads are
+  lost again on every run and are printed as the measured notes they are, and the
+  log is verified from its durable carriers instead (the entry on it below).
+  Sequence 0 on every channel is therefore no longer the expected reading. Its
+  timing figures are folded into the observed envelope recorded below.
+
+  **On 2026-08-29 the run came back clean again, on the durable carriers.**
+  Three consecutive `make motion-run`s exited 0 with zero findings over a driver
+  that holds nothing and waits for nothing: the wake gesture whole, a log
+  holding 1484–1485 `DriverPose` samples over as many cycles — one per cycle,
+  after the 13 lost off the front at the logger's attach, so the run published
+  13 more than the log kept — worst cycle 3.81–4.09 ms against the 20.000 ms
+  grid, worst exchange 1.81–1.90 ms, worst single write 0.11–0.14 ms, read
+  jitter mean 1.93 ms, the release written before anything else at every start,
+  every session ending with torque off on nine rows read back and worst
+  deviation from stow 0.0066 rad. The timing line counts a third population
+  again: 29 whole closed windows over 1450 cycles, the run's last partial window
+  not being censused, so its cycle count sits below the sample count by
+  construction and a run whose two numbers differ is not short of anything. The
+  read-only registry is green over the same unit at the same HEAD, every case.
+  This is the current baseline record; the
+  2026-08-28 entry above is superseded by it. A healthy run prints four kinds of
+  line that are **notes and not findings**, all four expected:
+
+  - the head-loss note per regular stream (13 `DriverPose`, 13 `Estimates`,
+    9 `SessionCmdChan`, 8 `DriverAuxOut` messages ahead of the attach on these
+    runs — a figure of the launch, not of the run's health);
+  - the datagram cross-check charging exactly that loss and nothing more
+    (194 counted, 185 held, 9 lost off the front);
+  - the last-status hedge, as the entry on the short trail below describes: a
+    hardware run ends on a periodic copy of the driver's final `DriverStatus`
+    essentially always, so the counters the report read can be one status window
+    older than the log. A *finding* here would be a missing carrier, which is a
+    different line;
+  - the chronic `0x01` error byte, as the entry on it below describes.
+
+  None of those figures is a pass criterion. What fails a run is the report's own
+  bounds: a window whose worst cycle ran past the 20.000 ms grid, a worst single
+  write past the 1 ms a write that only hands its bytes to the kernel can account
+  for, a negative span, and every other finding the analysis raises. The figures
+  above are observations from three runs, and the envelope this unit has actually
+  produced since the drain came out of the write path is wider than those three:
+  worst cycle 3.81–5.63 ms, worst exchange 1.81–1.94 ms, worst single write
+  0.053–0.307 ms. Nobody has attributed the spread in the write figure to a code
+  change — the write path has not moved since — and it is read as variance:
+  three of the nine recorded runs sit under a tenth of the 1 ms floor, the other
+  six between a tenth and a third of it, and the worst reading recorded is about
+  a third. A third is the margin to reason with; the typical reading is not. A
+  reading inside that envelope is normal; one outside it but still inside the
+  report's bounds is worth a look and is not on its own a reason to wake
+  anybody.
+
+  **Startup timing, read off the same three runs.** Who starts when is recorded
+  in the `motion-log-<stamp>.console/` directory every `--fetch` brings home:
+  `simplelaunch_*.log`'s first line is the launcher coming up, `motord_0.log`'s
+  first line names the driver's grid anchor, `proc_0.log`'s first line is the
+  control process's publishers accepting the logger, and the run report prints
+  the driver's minimum-risk-condition write from `DriverStatus.sweep_time`. On
+  the unit's one clock, measured from the launcher's first line:
+
+  | run | launcher up (unit clock, s) | sweep | grid 0 | control proc alive by |
+  |---|---|---|---|---|
+  | 001320Z | 1787962366.836999 | +5.2 ms | +23.0 ms | +290 ms |
+  | 001415Z | 1787962422.325775 | +5.1 ms | +14.2 ms | +288 ms |
+  | 001458Z | 1787962465.333633 | +5.5 ms | +26.4 ms | +294 ms |
+
+  The driver's port open plus its nine verified writes finish about 5 ms in —
+  one twentieth of the 100 ms `reachy_driver::STARTUP_INIT_BUDGET_NS` budgets
+  for them. The grid anchors at the next 20 ms boundary, so the first
+  sample lands within ~47 ms of the launcher on the worst of the three. The
+  control process, whose first session-cog execution is what the session's
+  startup grace runs from, was the laggard on all three at ~290 ms, so the grace
+  spent on the driver was effectively nil against its shipped two seconds. The
+  adverse ordering the grace exists for — session up instantly, driver late —
+  was not observed and cannot be bounded by observation, which is why the
+  relation `cogs/motion_cog_test.rs` now asserts gives the start skew a budget
+  (one second) rather than a measurement. The "control proc alive by" column is
+  a ceiling and not a start instant: nothing in the tree prints the session
+  cog's own `started_at`.
+
   What has since been settled, and what has not:
 
-  - *Why the parked runs parked is unrecoverable, and the refusal is not what it
-    was first read as.* No verdict was recorded at the time. The refused
-    transaction in each was recovered by identity: corr 0, `PING` servo 10, the
-    first transaction of the commissioning survey. For *that* identity the
-    driver has no pre-bus decline that can fire — servo 10 is an addressed id
-    (`crates/reachy-motion/src/arm.rs`, `SERVO_IDS`), a ping reaches neither the
-    value-shape nor the register refusals
-    (`crates/reachy-motord/src/aux.rs`), and of the bus layer's declining arms
-    only `Encode` is on the ping path, which fails for a non-unicast id or a
-    too-small buffer and neither holds (`crates/dxl-proto/src/encode.rs`). So
-    the lone logged `REFUSED` reads as the busy-slot answer to a delivery
-    re-issue that arrived while the original still sat in the driver's slot
-    (`crates/reachy-motord/src/tick.rs`) — slot pacing, the transport doing its
-    job. The evidence differs per run: `144512Z`'s log records the re-issue
-    byte for byte; `144804Z`'s lost the duplicate to the head truncation, and
-    its corroboration is the driver's counters (`session_cmds=2, taken=2,
-    aux_refused=1` — two datagrams offered, one refused, and a logged outcome
-    that per the counter semantics only the busy answer produces). Those
-    counters carry the shortfall caveat the next observation states.
+  - *Why the parked runs parked — settled. It is a startup race between the two
+    processes, and it is fixed.* The session's commissioning survey used to go
+    out at process start plus 100 ms with nothing consulted about the driver.
+    The driver binds its inbox before its grid starts and then idles until the
+    top of the next whole second, so anything up to a second of datagrams queued
+    with nobody serving them. The survey's first ping sat in that queue; the
+    session's delivery retry re-issued the identical datagram 299 ms later; the
+    driver's first cycle drained both, accepted the first and turned the second
+    away as busy, and the busy refusal took the cycle's single outcome slot, so
+    the ping's real answer was discarded. The session saw `REFUSED`, which it
+    could not tell from a decline, and parked. Whether a run moved depended on
+    where in the wall-clock second the two processes happened to start: the
+    moving run's control process came up 102 ms *after* grid instant 0, the
+    driver was already cycling, no re-issue happened, and `aux_refused=0`.
 
-    A delivery retry re-issues only an *unanswered* datagram, so what this
-    points at is the survey's **first ping drawing no answer in time** in two of
-    four runs on the same unit — an open question about the bus and servo 10,
-    not a driver-side decline. What parked the session is still unrecoverable:
-    each run's log is short of the driver's own datagram count at the front
-    (`TODO(olog-head-capture)`), so the transaction that decided the park may be
-    one the log never held. `commission_failed` now narrates the verdict, so the
-    next parked run says why itself.
+    Four changes close it. The session commissions only once the driver has
+    shown it a validated sample. The driver's slot recognises a verbatim
+    re-issue of the request it is holding as the same transaction and answers it
+    with that request's own outcome. A turned-away request no longer evicts a
+    served one's answer, and it is answered `busy` on the wire rather than
+    `refused`, so the log says which happened. The driver's grid starts at the
+    next 20 ms period boundary instead of the next second, which shortens the
+    unserved window from up to a second to under one cycle. This retires what
+    was recorded here as an open question about the bus and servo 10: servo 10
+    is simply the first transaction of the survey and nothing about the bus was
+    implicated. The 2026-08-26 parked runs have the same explanation — `144512Z`
+    holds the re-issue byte for byte, and `144804Z` lost the duplicate to the
+    head truncation and is corroborated by its counters (`session_cmds=2,
+    taken=2, aux_refused=1`).
+
+    The report is the tripwire in three places now: a `SessionCmdChan` datagram
+    logged before the driver's first `DriverPose` sample is a finding (the
+    survey did not wait), a `busy` outcome is a finding that says which request
+    the slot was holding, and a `refused` outcome is read as a driver-side
+    decline with no inference behind it.
   - *The antennas did reach stow.* The bit-identical 0.3217 rad `AntennaRight`
     figure in both moving runs is the deterministic endpoint of the profiled
     antenna motion at the moment the script's schedule ran out, which is where
@@ -782,15 +929,65 @@ that the next person to see one knows it is not new.
     tolerance. Not an anomaly; what remains open is that the antennas need
     longer than the scripted 3 s stow step, with the servo profile behind that
     still unmeasured (`TODO(session-servo-profile)`).
-  - *The gap and jitter anomalies persist under motion.* 132–134 one-slot skips
-    per moving run and one two-slot skip, against 59 per parked run; worst read
-    jitter 8.63 ms, mean 4.771 ms, against a 20 ms grid. The suspicion is
-    out-of-band bus work pushing a cycle past its slot — the parked runs' skips
-    arrive on the 500 ms health-poll cadence — but nothing in those four runs
-    measured a cycle, so the suspicion is unconfirmed. The driver now measures
-    per-cycle work and aux-exchange spans and publishes them; a run taken with
-    that in place is what sizes `TODO(cycle-skip-budget)`, and until a person
-    reviews such a run, one missed slot is still red.
+  - *The gap and jitter anomalies persist under motion, and every skip sits on
+    an out-of-band cycle.* The 2026-08-27 pair pinned the coincidence: the
+    parked run's 59 skips are 59 skips on a cycle that ran the health triple,
+    against 60 health reports in the run; the moving run's 123 skip reports are
+    51 on a health-triple cycle and 72 on a host-transaction cycle, disjoint,
+    with none unattributed. The converse does not hold — that run carried 221
+    out-of-band cycles against 123 skip reports, and its commissioning window
+    ran fifty host exchanges without a skip. What the exchange costs is the
+    thing: the measured `exchange` span is 23.95–27.99 ms on a run whose only
+    out-of-band work is the health triple, for three unicast reads whose wire
+    time is 0.79 ms and whose budgeted worst case is 9.79 ms — roughly 8 ms
+    apiece, 2.4× the budget and 30× the wire time. The a-priori cycle budget
+    sums to 19.96 ms against a 20 ms period, so an exchange over its bound
+    overruns the cycle by construction, and the moving run's two
+    `GOAL_STALE_OR_OUT_OF_ORDER` events sit exactly on its two 40 ms cycles.
+
+    The cause was measured, and it was the bus layer's own blocking call. The
+    bench self-test `bus-exchange-timing` in the read-only registry — 200
+    unicast reads and 200 grouped reads, each judged against the driver's own
+    worst-case bound, printing min / median / p99 / max of the total, the write
+    and the reply wait — put the whole overrun on the write: a 7.98 ms median
+    unicast exchange against a 3.26 ms budget, of which 7.98 ms is the write and
+    18 µs the reply wait, on frames whose wire time is under 0.2 ms. A cluster
+    that tight at ~8 ms with a max at ~12 ms is a `tcdrain` sleeping in whole
+    timer ticks, not a descheduled thread and not a slow servo: the servo's
+    answer was already in the kernel's buffer before the drain returned.
+
+    So the drain is gone. `SerialBusPort::write_all` returns once the kernel has
+    the bytes, and every exchange's deadline is now taken *before* the write, so
+    a write that costs time is spent out of the exchange's own budget instead of
+    being invisible to it. The arithmetic still covers the request's own wire
+    time — `worst_exchange(tx, rx)` includes `tx` — and the only write that can
+    start behind bytes still leaving is the one after a broadcast, which nothing
+    answers: a single frame, well under a millisecond, inside the next
+    exchange's host allowance. `bus-exchange-timing` stays in the registry as
+    the regression guard, expected green now rather than red, and the driver
+    still reports its worst single `write_all` span per window beside the
+    exchange span — over every write its cycles made, not over the exchanges
+    alone, so the two headline numbers can come off different cycles and the
+    write is not a share of the exchange beside it. That column should read
+    microseconds; a reading past 1 ms is a **finding** the report raises by
+    itself, naming the write — the drain back in some form, whether or not it
+    is large enough to miss a slot. A
+    run's fetched console directory carries the unit's kernel facts
+    (`host-facts.txt`) the numbers are read against.
+
+    Three `make motion-run`s on 2026-08-28 confirmed it and are the numbers to
+    read a future run against: **zero** `CYCLE_SKIPPED` and zero
+    `GOAL_STALE_OR_OUT_OF_ORDER` in every one, worst cycle 3.85 / 4.04 / 5.63 ms
+    against the 20 ms grid, worst exchange 1.83–1.94 ms, worst single write
+    0.19–0.31 ms, read jitter mean 1.93 ms where it was 4.79 ms, and 1485
+    samples over 1485 cycles — the driver attended every slot of the run. The
+    read-only registry is green over the same unit, `bus-exchange-timing`
+    included: unicast median total 0.36 ms against a 3.26 ms budget, of which
+    the write is 19 µs, and grouped median 1.80 ms against 4.58 ms.
+
+    A skip after this is a **new** finding and not an accepted residual: it
+    would mean the cycle budget is dishonest for some other reason, and that
+    goes to a person. One missed slot is still red.
 
   The tripwire is the report itself — every run reproduces its verdict, and
   `make motion-run` exits on it. A change in the shape goes to a person, and no
@@ -818,23 +1015,49 @@ that the next person to see one knows it is not new.
   still calls any `VERIFY_MISMATCH` a failure, and after this change every
   verified `GOAL_POSITION` write is gone from the command paths, so that rule
   has no by-design exception left to fire on.
-- **The recorded trail is shorter than the run.** In all four runs the `.olog`
-  holds fewer `SessionCmdChan` datagrams than the driver counted taking off its
-  own socket — one short in each parked run, ten and four short in the moving
-  runs — and each moving run also holds an outcome whose request is missing. The
-  mechanism is confirmed in the pinned Clockwork drop's source, and it is the
-  start of the run that is lost: the supervisor starts the logger and the payload
-  processes in no particular order and waits for no readiness, the logger opens
-  its subscriptions lazily on a poll after it opens the log, and on attaching to
-  a channel of the kind every channel here is, the observer snaps its cursor to
-  the write head — skipping whatever the ring is still holding. Enlarging the
-  ring therefore recovers nothing: retention is not the limit, the attach
-  position is. Tracked as `TODO(olog-head-capture)`, which is where the two
-  routes out of it are written down. The report cross-checks its joined totals
-  against the driver's counters and calls a shortfall a finding **against the
-  log, not against the run**; that check is the tripwire, and it is why
-  `--console` is worth handing it. Reading a truncated trail as a complete one is
-  the failure this guards against.
+- **The recorded trail is short at the front of every stream, on every run —
+  settled, and no longer a defect.** A run's `.olog` holds fewer `DriverPose`
+  samples and `SessionCmdChan` datagrams than the run published, and the loss is
+  always at the front. The mechanism is confirmed in the pinned Clockwork drop's
+  source: the supervisor starts the logger and the payload processes in no
+  particular order and waits for no readiness, the logger opens its subscriptions
+  lazily on a poll after it opens the log, and on attaching to a `regular`
+  channel the observer snaps its cursor to the write head — skipping whatever the
+  ring is still holding. Enlarging the ring recovers nothing: retention is not the
+  limit, the attach position is. Making the driver wait is not an acceptable
+  answer either — a logger is never a precondition for driving motors, and a
+  timed hold in front of the first cycle is a fail-safe deferred for the length
+  of the hold.
+
+  So the loss stands as a property of the system and the log is built to
+  tolerate it. Anything critical to log is republished periodically or retained
+  on a persistent channel, so the newest copy is the whole account whenever the
+  logger arrives: the driver republishes `DriverStatus` — its start-up release,
+  its first-contact instants and every counter its console line prints — once a
+  second and once more on its way out; the session republishes its whole story on
+  `ReportsOut`; `ScheduleChan` is persistent; and an out-of-band outcome names
+  the transaction it answers, so an answer whose request went with a lost head is
+  still readable. What you will see in a healthy run's report, therefore, is a
+  per-channel note saying how many messages predate the attach — nonzero on the
+  50 Hz streams, and that is the expected reading — and no finding. What is loud
+  is a log holding **no** `DriverStatus` or **no** `ReportsOut` message: those
+  are the carriers the verification reads, and their absence is a run that could
+  not be verified. Session datagrams missing beyond the measured head loss are a
+  finding too: that is loss mid-run, which the attach does not explain.
+
+  The tail is lossy for the mirror-image reason, and the report notes that too.
+  The wind-down's `wound_down` copy is published while the whole launch is being
+  stopped by one signal, so the relay and the logger are going down as it is
+  sent: a hardware run ends on a periodic copy essentially always, and the note
+  bounds what that costs — the counters read can be up to one status window
+  older than the log, that window being the driver's status cadence and not a
+  figure chosen here: one second on the shipped 20 ms grid. Cumulative content
+  is what makes that cheap; the copy before it already carried the whole
+  account.
+
+  The analyzer reads the log alone. It opens no console and takes no `--console`;
+  the console that comes back with a run is for a person reading a run that went
+  wrong.
 - **A log recorded before a schema append cannot be read by a build after it.**
   Not an anomaly — a determination, recorded here because it costs a run's
   evidence, and the limit is this *reader's* rather than the log format's. The
@@ -853,15 +1076,25 @@ that the next person to see one knows it is not new.
   directory is what names that build. Closing the gap instead would take an
   upstream ask plus history declarations in these schemas; nothing here forecloses
   it, and nothing here has designed it.
-- **The chronic `0x01` input-voltage latch.** All nine servos latch the
-  input-voltage bit during ordinary running. A `reboot` clears them to `0x00`
-  and running re-latches them. The suspicion is a supply dip under load, and
-  nothing here confirms or refutes it: no rail measurement is owed or awaited,
-  so this stays a reading nobody has explained. The bit is deliberately
-  excluded from the health predicate — the engage-time supply gate is what owns
-  supply — so this does not stop anything today; it is an unexplained reading
-  on a machine whose other readings are trusted. `reboot` is the tripwire on the
-  clearing half of it: the command fails on any byte a servo still holds after
-  its restart, this bit included, so a `0x01` that ever survives a reboot is a
-  non-zero exit naming the servo rather than a line printed past. That is this
-  observation recurring — take it to a person and do not carve the bit out.
+- **The chronic `0x01` input-voltage latch — reviewed 2026-08-28, and this
+  machine's expected reading.** All nine servos latch the input-voltage bit
+  during ordinary running. A `reboot` clears them to `0x00` and running
+  re-latches them. The explanation of record is the one this tree has always
+  carried in `crates/dxl-proto/src/conv.rs`: the servo bus rail is specified
+  above the highest Max Voltage Limit the register accepts, so a perfectly
+  healthy robot sets that bit by arithmetic. The maintainer has ruled that no
+  rail measurement will be made on this unit — the vendor built the hardware and
+  we do not instrument it — so this is a determination, not an open anomaly.
+  Everything that judges the byte judges it through
+  `HardwareError::healthy_or_voltage_only`: the bench registry's `health` case,
+  the driver's health predicate, and — since 2026-08-28 — the run report, which
+  prints a voltage-only latch as a note naming the set instead of failing the
+  run on it. The bit is never filtered away: every servo's byte prints on every
+  run either way.
+
+  The tripwires that survive, unchanged. Any bit beyond input-voltage, on any
+  servo, is still a finding and the byte is named whole — a voltage bit riding
+  beside an overload launders nothing. `reboot` still fails on any byte a servo
+  holds after its restart, this bit included, and there is no carve-out there: a
+  `0x01` at that instant is a live condition, not the chronic latch. The
+  engage-time supply gate still owns supply.

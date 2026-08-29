@@ -40,6 +40,10 @@ pub struct Event {
     /// How many of the cycles a windowed kind counted ran an out-of-band
     /// transaction.
     pub out_of_band: u32,
+    /// The longest single write call the cycles a windowed kind counted spent,
+    /// where something measured it. Nothing in this crate does, for the reason
+    /// `work_ns` states.
+    pub drain_ns: i64,
     /// The servos the kind names, where it names a set of them.
     pub rows: JointFlags,
     /// The one servo the kind names, as its bus id.
@@ -60,6 +64,7 @@ impl Event {
             exchange_ns: 0,
             count: 0,
             out_of_band: 0,
+            drain_ns: 0,
             rows: JointFlags::NONE,
             id: 0,
         }
@@ -79,6 +84,7 @@ impl Event {
         out.rows = self.rows;
         out.count = self.count;
         out.out_of_band = self.out_of_band;
+        out.drain = Duration::from_nanos(self.drain_ns);
         out.id = self.id;
     }
 }
@@ -132,7 +138,7 @@ pub fn count_blind(run: &mut u32, blind: bool, nominal_ns: i64) -> Option<Event>
 mod tests {
     use super::{Event, count_blind, raise};
     use crate::BLIND_CYCLES_BEFORE_BUS_FAILURE;
-    use brenn_reachy__driver__health_clk_rs::EventKind;
+    use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKind};
 
     /// A round instant, so a number read out of the wrong field is visible.
     const T0: i64 = 1_700_000_000_000_000_000;
@@ -142,6 +148,32 @@ mod tests {
             kind,
             ..Event::at(T0)
         }
+    }
+
+    /// Every field, in the field the schema names it: a span written into a
+    /// neighbouring slot would read as a plausible number about the wrong
+    /// question.
+    #[test]
+    fn an_event_writes_each_of_its_spans_where_the_schema_names_it() {
+        let event = Event {
+            kind: EventKind::CycleStats,
+            work_ns: 24_000_000,
+            exchange_ns: 8_000_000,
+            drain_ns: 7_500_000,
+            count: 50,
+            out_of_band: 3,
+            ..Event::at(T0)
+        };
+        let mut message = DriverEventWire::new();
+        event.write(message.clear_valid());
+        let written = message.validate().expect("every field was written");
+
+        assert_eq!(written.time.as_nanos(), T0);
+        assert_eq!(written.work.as_nanos(), 24_000_000);
+        assert_eq!(written.exchange.as_nanos(), 8_000_000);
+        assert_eq!(written.drain.as_nanos(), 7_500_000);
+        assert_eq!(written.count, 50);
+        assert_eq!(written.out_of_band, 3);
     }
 
     #[test]

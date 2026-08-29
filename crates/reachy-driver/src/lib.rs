@@ -147,6 +147,30 @@ pub const TORQUE_OFF_CONFIRM_BUDGET_NS: i64 = 300_000_000;
 
 const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > JOINT_COUNT as i64 * NOMINAL_CYCLE_NS);
 
+/// What a driver process may spend between its own start and its first cycle,
+/// nanoseconds.
+///
+/// Everything a process does before it joins the grid: taking the port, and the
+/// startup minimum-risk sweep, which is [`JOINT_COUNT`] verified writes. Stated
+/// here, beside the budgets above, because it is the number a host's own
+/// waiting is sized against — a control process gives the driver a startup
+/// grace covering this, the skew between the two process starts, and the first
+/// cycle, and `cogs/motion_cog_test.rs` asserts that sum against the shipped
+/// grace. Anything new put in front of the first cycle is spent out of this,
+/// and raising it is what makes the host's side of the relation fail.
+///
+/// A ceiling and not a measurement, and the healthy cost is nowhere near the
+/// worst one. On a bus that answers, the sweep costs about 5 ms
+/// (`docs/bench-runbook.md` records the runs). On a bus that answers nothing
+/// every one of its eighteen exchanges -- a write and a read-back per row --
+/// runs to the cycle deadline instead, and the sweep's own stated bound is
+/// 58.5 ms -- over half of this figure rather than a tenth of it. `crates/reachy-motord`
+/// asserts this budget clears that bound, so the two cannot drift apart.
+///
+/// The port open in front of the sweep is not in the arithmetic: it is a local
+/// device open, and nothing in this tree bounds it.
+pub const STARTUP_INIT_BUDGET_NS: i64 = 100_000_000;
+
 /// How many cycles in a row the bus may answer nothing before the driver says
 /// its bus is gone.
 ///

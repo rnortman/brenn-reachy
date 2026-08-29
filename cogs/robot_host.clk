@@ -6,13 +6,13 @@
 // descriptions, the shared-memory namespace, the log writer's own open -- has no
 // way to be exercised without a powered unit, so every one of those facts is
 // first tried at a machine that can move. This module closes that gap: the same
-// `robot::RobotBox`, unmodified, talking over the same six loopback ports to the
+// `robot::RobotBox`, unmodified, talking over the same loopback ports to the
 // simulated plant the deterministic scenarios already prove, all of it under the
 // same launcher. A run either produces a log that shows the wake gesture or it
 // names the configuration that is wrong, on a workstation, for free.
 //
 // The plant is `sim::MotorSim` as it stands. It consumes and produces exactly
-// the six subjects the seam carries, and the seam's wire format is each schema's
+// the seven subjects the seam carries, and the seam's wire format is each schema's
 // Tachyon bytes at their own size -- which is what a `udp_socket` declaration
 // reads and writes. So the stand-in for `reachy-motord` here is not a program of
 // its own: it is that cog, in a process of its own, with sockets where `SimBox`
@@ -112,6 +112,15 @@ channel HostHealthChan
     max_num_messages: 16;
 }
 
+// What the plant says about the whole run so far, on its way out. Small: every
+// message is the whole account, so a reader that saw one has read the run and
+// depth is slack for a busy consumer rather than a rate anything follows.
+channel HostStatusChan
+{
+    message_type: Tachyon<health::DriverStatus>;
+    max_num_messages: 8;
+}
+
 // The plant's injection channel, with nothing in it, ever.
 //
 // A scenario reaches the modelled world through this channel: jam a joint, write
@@ -142,7 +151,7 @@ channel HostSimCmdChan
 // Loopback, and the trust that comes with it is the seam's own, stated once at
 // `robot.clk`'s sockets and unchanged by anything here: nothing off this machine
 // can reach these ports, any process on it can. On a workstation the sockets are
-// also the reason two runs cannot share a host -- both would bind the same six
+// also the reason two runs cannot share a host -- both would bind the same
 // ports -- which is the same refusal the launcher makes first, by name.
 udp_socket HostGoalIn
 {
@@ -166,12 +175,16 @@ udp_socket HostSessionIn
 // `HostSimCmdChan` names above, where the reason that channel must have one is
 // stated.
 //
-// It is deliberately not one of the seam's six: a datagram on this seam is
+// It is deliberately not one of the seam's subjects: a datagram on this seam is
 // identified by the port it arrived on, and this subject exists in no driver.
+// Which is also why its number has to stay clear of every port
+// `crates/reachy-motord/src/ports.rs` names: this composition puts the control
+// box's incoming ports and the plant's on one loopback, so a number the seam
+// uses is a number two processes here would bind.
 udp_socket HostSimCmdIn
 {
     address: 127.0.0.1;
-    port: 7407;
+    port: 7408;
     direction: incoming;
     message_type: Tachyon<sim_state::SimCmd>;
 }
@@ -212,6 +225,15 @@ udp_socket HostHealthOut
     port: 7405;
     direction: outgoing;
     message_type: Tachyon<health::HealthReport>;
+}
+
+// What the plant says about its whole run, leaving.
+udp_socket HostStatusOut
+{
+    address: 127.0.0.1;
+    port: 7407;
+    direction: outgoing;
+    message_type: Tachyon<health::DriverStatus>;
 }
 
 // The driver's half, hosted: the modelled plant with the seam's own sockets on
@@ -269,6 +291,10 @@ box SimDriver
     connect plant.health_out to HostHealthChan;
     new health_out: HostHealthOut;
     connect HostHealthChan to health_out;
+
+    connect plant.status to HostStatusChan;
+    new status_out: HostStatusOut;
+    connect HostStatusChan to status_out;
 }
 
 // What writes a host run down: the framework's two writer cogs, in a process of

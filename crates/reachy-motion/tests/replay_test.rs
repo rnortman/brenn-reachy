@@ -28,7 +28,7 @@ use reachy_motion::{
     stow_targets,
 };
 
-use replay_trace::{ARRIVED_TOLERANCE_RAD, Run, Sample, fixture};
+use replay_trace::{ARRIVED_TOLERANCE_RAD, Run, Sample, Trace, fixture};
 
 /// The rate the recordings were driven at and the shipped floors are derived
 /// at.
@@ -168,6 +168,68 @@ fn the_runs_that_went_well_raise_nothing() {
         head_lag < cfg.tracking.threshold_rad,
         "the healthy head lag {head_lag:.4} rad now reaches the {:.4} rad threshold",
         cfg.tracking.threshold_rad
+    );
+}
+
+/// Guard 1. The lag-and-speed pairs the shipped tracking comment quotes are
+/// what the recordings hold.
+///
+/// Not a fault case: nothing here crosses a threshold. It is the documentation
+/// guard behind `TrackingFaultConfig`'s argument that lag scales with commanded
+/// speed — a leg and an antenna each pinned as a lag beside the speed of the
+/// goal it was chasing, so a re-recording or a shaper change moves the comment
+/// rather than leaving its figures standing as folklore. Both figures of a pair
+/// come from one joint: a lag read against a speed some other joint was
+/// commanded at would support nothing.
+#[test]
+fn the_lag_and_speed_figures_the_tracking_comment_quotes_are_what_the_recordings_hold() {
+    let verify2 = fixture("trace-verify2");
+    // Leg 2 as the bus numbers the servos, which is the second leg row.
+    let leg = verify2.run(0).joint(JointRef::Leg1);
+    assert!(
+        (leg.worst_lag - 0.245).abs() < 5e-3,
+        "leg 2's lag on the validated gesture is {:.4} rad",
+        leg.worst_lag
+    );
+    assert!(
+        (leg.peak_goal_speed - 3.34).abs() < 5e-3,
+        "the goal leg 2 was following peaks at {:.4} rad/s",
+        leg.peak_goal_speed
+    );
+
+    let worst_antenna = |trace: &Trace| {
+        [JointRef::AntennaRight, JointRef::AntennaLeft]
+            .into_iter()
+            .map(|joint| trace.run(0).joint(joint))
+            .max_by(|left, right| left.worst_lag.total_cmp(&right.worst_lag))
+            .expect("the pair is not empty")
+    };
+    let antenna = worst_antenna(&verify2);
+    assert!(
+        (antenna.worst_lag - 0.82).abs() < 5e-3,
+        "the antennas' lag on the validated gesture is {:.4} rad",
+        antenna.worst_lag
+    );
+    assert!(
+        (antenna.peak_goal_speed - 7.55).abs() < 5e-3,
+        "the goal that antenna was following peaks at {:.4} rad/s",
+        antenna.peak_goal_speed
+    );
+
+    // The fast sweep's own pair. The 855°/s the comment names is what the joint
+    // reached, pinned by the speed-record case below; what it was asked for is
+    // half again as fast, and that is the speed its 1.38 rad of lag is read
+    // against.
+    let fast_antenna = worst_antenna(&fixture("trace-fast4"));
+    assert!(
+        (fast_antenna.worst_lag - RECORDED_WORST_ANTENNA_LAG_RAD).abs() < 5e-3,
+        "the fast sweep's worst antenna lag is {:.4} rad",
+        fast_antenna.worst_lag
+    );
+    assert!(
+        (fast_antenna.peak_goal_speed - deg(1123.0)).abs() < deg(2.0),
+        "the goal that antenna was following peaks at {:.1} deg/s",
+        fast_antenna.peak_goal_speed.to_degrees()
     );
 }
 

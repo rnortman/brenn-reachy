@@ -91,6 +91,10 @@ impl Request {
 /// Held as ordinary Rust for the reason the cycle's event is: a cycle decides
 /// what to publish and then publishes it once, rather than writing a slot as it
 /// goes.
+///
+/// The same record the real driver's `aux` module holds, kept in step by hand
+/// and by nothing else.
+// TODO(sim-aux-answer-record)
 #[derive(Clone, Copy)]
 pub struct Answer {
     /// The correlation number of the request this answers.
@@ -104,6 +108,12 @@ pub struct Answer {
     pub value: u64,
     /// The model number a ping answered with, and zero for everything else.
     pub model: u16,
+    /// Which transaction this answers, echoed from the request.
+    pub op: AuxOpKind,
+    /// Which servo the request named, as its bus id.
+    pub id: u8,
+    /// Which register the request named, or the no-register zero.
+    pub reg: RegId,
 }
 
 impl Answer {
@@ -115,7 +125,23 @@ impl Answer {
             value_kind: ValueShape::None,
             value: 0,
             model: 0,
+            op: AuxOpKind::None,
+            id: 0,
+            reg: RegId::None,
         }
+    }
+
+    /// The same answer, saying which transaction it is about.
+    ///
+    /// Stamped once where a request is run rather than passed through every
+    /// constructor: an outcome that names no transaction can only be read by
+    /// the host still holding the request it answers.
+    #[must_use]
+    pub fn about(mut self, request: &Request) -> Self {
+        self.op = request.op;
+        self.id = request.id;
+        self.reg = request.reg;
+        self
     }
 
     /// The driver declining to run a transaction, so nothing reached the bus.
@@ -129,24 +155,24 @@ impl Answer {
         Self::bare(corr, AuxStatus::Refused)
     }
 
-    /// The driver turning a request away because one is already pending.
+    /// The driver turning a request away because it holds another one.
     ///
     /// Against the turned-away request's own correlation number, so the host
     /// learns which of its two requests was not run rather than having to work
-    /// it out from a silence.
+    /// it out from a silence. Its own status rather than a decline's: nothing
+    /// about the transaction was judged.
     #[must_use]
-    pub fn busy(corr: u32) -> Self {
-        Self::bare(corr, AuxStatus::Refused)
+    pub fn busy(corr: u32, request: &Request) -> Self {
+        Self::bare(corr, AuxStatus::Busy).about(request)
     }
 
     /// A value read off a cell.
     fn value(corr: u32, held: Value) -> Self {
         Self {
-            corr,
             status: AuxStatus::Ok,
             value_kind: held.shape(),
             value: held.bits(),
-            model: 0,
+            ..Self::bare(corr, AuxStatus::Ok)
         }
     }
 
@@ -157,6 +183,9 @@ impl Answer {
         out.value_kind = self.value_kind;
         out.value = self.value;
         out.model = self.model;
+        out.op = self.op;
+        out.id = self.id;
+        out.reg = self.reg;
     }
 }
 
@@ -171,14 +200,14 @@ pub fn answer(state: &mut SimState, nominal: i64, corr: u32, request: &Request) 
         // than a refusal: the datagram went out and the window closed on
         // silence, which is exactly what a real bus does with an id nobody
         // holds.
-        return Answer::bare(corr, AuxStatus::Timeout);
+        return Answer::bare(corr, AuxStatus::Timeout).about(request);
     };
     if is_absent(state, row) {
         // A servo that says nothing also does nothing: a write to an absent
         // row must not reach the cell or the plant.
-        return Answer::bare(corr, AuxStatus::Timeout);
+        return Answer::bare(corr, AuxStatus::Timeout).about(request);
     }
-    match request.op {
+    let ran = match request.op {
         // A slot nothing wrote asks for no transaction, and putting a datagram
         // on the bus for it would be commanding a machine on the strength of
         // unwritten memory.
@@ -205,7 +234,8 @@ pub fn answer(state: &mut SimState, nominal: i64, corr: u32, request: &Request) 
         AuxOpKind::WriteRegVerified | AuxOpKind::WriteReg => {
             run_write(state, nominal, corr, row, request)
         }
-    }
+    };
+    ran.about(request)
 }
 
 /// Write one register, taking the answer the request's own operation names.

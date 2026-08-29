@@ -1958,8 +1958,16 @@ pub fn latch_from(run: &Run, fired: Option<i64>, failures: &mut Vec<String>) {
 pub fn signal_groups(run: &Run, failures: &mut Vec<String>) {
     for cog in COGS {
         let wanted = format!("{REPORT_GROUP_PREFIX}{cog}/{REPORT_GROUP}/");
-        if !run.census.iter().any(|(name, _)| name.starts_with(&wanted)) {
-            let carried: Vec<&str> = run.census.iter().map(|(name, _)| name.as_str()).collect();
+        if !run
+            .census
+            .iter()
+            .any(|channel| channel.name.starts_with(&wanted))
+        {
+            let carried: Vec<&str> = run
+                .census
+                .iter()
+                .map(|channel| channel.name.as_str())
+                .collect();
             failures.push(format!(
                 "the log carries no channel named {wanted}*, so {cog}'s {REPORT_GROUP} group did \
                  not reach it; the channels it does carry are {carried:?}"

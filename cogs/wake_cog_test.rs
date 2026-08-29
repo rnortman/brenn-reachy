@@ -23,7 +23,7 @@ use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__wake_clk_rs_test::WakeTestWrapper;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
-use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
+use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use clockwork_rs::SyncTime;
 use motion_slots::MS_NS;
 
@@ -119,6 +119,21 @@ fn report(kind: ReportKindWire, a: u32, b: u32) -> TimelineEntryWire {
     msg
 }
 
+/// The session's story as it goes out: every row it has narrated, in one
+/// message.
+fn story(rows: &[TimelineEntryWire]) -> TimelineWire {
+    let mut msg = TimelineWire::new();
+    {
+        let mut entries = msg.entries_mut();
+        for row in rows {
+            *entries
+                .try_grow()
+                .expect("a story of no more rows than the message holds") = row.clone();
+        }
+    }
+    msg
+}
+
 /// The narration of commissioning having finished: entering `resting` from
 /// `starting`.
 fn commissioned() -> TimelineEntryWire {
@@ -136,9 +151,7 @@ fn drive(
     at_ns: i64,
     reports: &[TimelineEntryWire],
 ) -> Option<Published> {
-    for entry in reports {
-        cog.publish_reports(entry, SyncTime::from_nanos(REPORTED));
-    }
+    cog.publish_reports(&story(reports), SyncTime::from_nanos(REPORTED));
     assert!(
         cog.execute(SyncTime::from_nanos(at_ns)),
         "a report is this cog's only execution condition",
@@ -326,6 +339,43 @@ fn the_transition_is_found_in_a_burst() {
     ];
     let asked = drive(&mut cog, WAKE, &burst).expect("the gesture");
     assert_eq!(asked.script_id, SCRIPT_ID);
+}
+
+/// A story that has wrapped may no longer carry the transition, and no later
+/// message will bring it back: the wake never happens, and the count of what the
+/// story said it had lost is the only thing that says why. A machine that
+/// silently did not move is the failure this counter exists to name.
+#[test]
+fn a_story_that_dropped_its_front_is_counted_and_wakes_nothing() {
+    let mut cog = shipped();
+    let mut wrapped = story(&[report(ReportKindWire::SCHEDULE_PUBLISHED, 1, 2)]);
+    wrapped.set_dropped(9);
+    cog.publish_reports(&wrapped, SyncTime::from_nanos(REPORTED));
+    assert!(
+        cog.execute(SyncTime::from_nanos(WAKE)),
+        "the report woke it"
+    );
+
+    assert_eq!(published(&mut cog), None, "the transition is not in it");
+    assert!(!recorded(&cog));
+    assert_eq!(cog.state_sent().lost_story(), 9);
+
+    // The newest reading, not a sum: the next story carries the same losses and
+    // says so once.
+    let mut later = story(&[report(ReportKindWire::SCHEDULE_PUBLISHED, 3, 4)]);
+    later.set_dropped(11);
+    cog.publish_reports(&later, SyncTime::from_nanos(REPORTED));
+    assert!(cog.execute(SyncTime::from_nanos(WAKE + 100_000_000)));
+    assert_eq!(cog.state_sent().lost_story(), 11);
+}
+
+/// A story that has lost nothing says so, and the gesture goes out: the counter
+/// above is a reading of the message and not a state of this cog.
+#[test]
+fn a_whole_story_leaves_the_count_at_nothing() {
+    let mut cog = shipped();
+    drive(&mut cog, WAKE, &[commissioned()]).expect("the gesture");
+    assert_eq!(cog.state_sent().lost_story(), 0);
 }
 
 #[test]

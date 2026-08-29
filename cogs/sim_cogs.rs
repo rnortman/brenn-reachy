@@ -21,6 +21,17 @@
 //! registers, and a second route from the plant to what the machine reports
 //! about itself is a second thing to keep in step.
 //!
+//! The first execution is the process starting, and its first act is releasing
+//! the machine: a driver that has just come up cannot know what a predecessor
+//! left energised, so every row goes limp before anything else happens. That is
+//! the real driver's process-start sweep, and it is here for the reason the
+//! gate is hosted rather than re-implemented -- two drivers that disagree about
+//! start of life are two contracts.
+//!
+//! What this driver says about its own run goes out on a cadence, whole: the
+//! newest status record is the account of the run so far, which is what makes a
+//! log verifiable however late its logger attached.
+//!
 //! Nothing here holds state of its own. The plant, the register file, the gate
 //! and the run's totals are the state slot's own fields, read and written
 //! through the validated view the cycle opens once at the top.
@@ -29,7 +40,7 @@ use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKind;
 use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSignals};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
-use brenn_reachy__driver__health_clk_rs::EventKind;
+use brenn_reachy__driver__health_clk_rs::{DriverStatus, DriverStatusWire, EventKind};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use clockwork_rs::SyncTime;
@@ -69,6 +80,21 @@ const MAX_CATCHUP_CYCLES: i64 = 8;
 /// modelling a bus running at a rate nobody asked for.
 const TIMER_PERIOD_NS: i64 = 20_000_000;
 
+/// How long between status records, nanoseconds.
+///
+/// The real driver publishes one per window of cycle statistics, which is a
+/// second, and this is that second.
+const STATUS_PERIOD_NS: i64 = 1_000_000_000;
+
+/// The same, in cycles, which is how it is counted.
+///
+/// A constant and not a division of the configured period: `check_params`
+/// refuses a scenario whose grid is not [`TIMER_PERIOD_NS`], so there is no
+/// other grid for this to be worked out against. Computing it per execution
+/// would say the opposite -- that this cog tolerates a period a scenario chose
+/// -- which is the belief that refusal exists to refuse.
+const STATUS_CYCLES: u32 = (STATUS_PERIOD_NS / TIMER_PERIOD_NS) as u32;
+
 /// The simulated grid is the one the driver layer's budgets are sized against.
 ///
 /// The constants both hosts share are counts of cycles — a confirm budget, a
@@ -89,6 +115,15 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     // are plain numbers whatever else the slot holds, and the clear below would
     // lose them.
     let before = Counters::read(dial.states.sim);
+    let carried = StatusTotals::read(dial.states.sim);
+    // The two instants the record names go back too, and for the same reason a
+    // total does: each says when something first happened in this run, and a
+    // run whose first sample went out a minute ago did not have its first
+    // sample at the restart. The sweep instant is the exception and is not
+    // carried -- the restart runs the release again, so the record of when this
+    // state's release ran is the restart's own.
+    let first_pose = dial.states.sim.first_pose();
+    let first_session_cmd = dial.states.sim.first_session_cmd();
     let mut refused_state = 0;
     if dial.states.sim.validate_mut().is_err() {
         // Bytes that did not read as a state. This cog is the slot's only
@@ -98,6 +133,9 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
         // de-torque a machine does not get to panic over its own memory.
         dial.states.sim.clear_valid();
         before.store(dial.states.sim);
+        carried.store(dial.states.sim);
+        dial.states.sim.set_first_pose(first_pose);
+        dial.states.sim.set_first_session_cmd(first_session_cmd);
         refused_state = 1;
     }
     let Ok(state) = dial.states.sim.validate_mut() else {
@@ -121,17 +159,16 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
         // process has just met is a correctly provisioned one, and a scenario
         // that wants otherwise says so with an injection.
         Regs::over(&mut state.regs).init();
-        // Torqued only where this is the process starting. A restart from a slot
-        // the cycle could not read is not that: whatever arming the run had is
-        // in the bytes that were refused, and the dead-man may have latched the
-        // machine off. So the modelled machine comes back de-torqued and waits
-        // to be armed, rather than energising itself out of a memory fault --
-        // the one transition the latch exists to prevent.
+        // What the process met, where a scenario says it met an energised
+        // machine. A restart from a slot the cycle could not read is not a
+        // process start: whatever arming the run had is in the bytes that were
+        // refused, so nothing is re-energised out of a memory fault -- the one
+        // transition the latch exists to prevent.
         if bool::from(params.start_torqued) && refused_state == 0 {
             state.torqued = flags::all();
             believe(state, flags::all(), true);
-            GoalGate::over(&mut state.gate).note_liveness(nominal);
         }
+        release(state, nominal);
     }
 
     for cmd in dial.inputs.cmds.new_msgs() {
@@ -151,6 +188,10 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     // the host is alive, whichever kind it is: the dead-man measures silence,
     // and a host with nothing to ask still owes the driver a word.
     for cmd in dial.inputs.session_cmds.new_msgs() {
+        // Counted before it is read, and counted whatever it turns out to say:
+        // this is what arrived on the channel, which is the number a reader of
+        // that channel's census can check against.
+        state.session_cmds_taken += 1;
         let Ok(cmd) = cmd.validate() else {
             // A datagram this build cannot read. Counted as the boundary failure
             // it is -- a schema-version mismatch, not an ask this driver would
@@ -160,6 +201,16 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             state.undecodable_inbound += 1;
             continue;
         };
+        // Stamped on every datagram that decodes, including one this cycle turns
+        // away, and on no datagram that does not. The real driver's seam refuses
+        // an unreadable datagram before its loop ever sees one, so a stamp taken
+        // ahead of the reading here would put this driver's first-contact
+        // instant somewhere the other driver's could never be -- and the
+        // ordering the report reads off it would be proven against the wrong
+        // machine.
+        if state.first_session_cmd.as_nanos() == 0 {
+            state.first_session_cmd = SyncTime::from_nanos(nominal);
+        }
         if cmd.kind == SessionCmdKind::None {
             // A datagram asking nothing is a slot nothing wrote, published. Same
             // treatment for the same reason.
@@ -190,20 +241,31 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
                 TorqueOffConfirm::over(&mut state.confirm).begin(nominal);
             }
             SessionCmdKind::Aux => {
-                if AuxSlot::over(&mut state.aux).offer(cmd.corr, &cmd.txn) == AuxOffer::RefusedBusy
-                {
-                    // The host that fills this slot is serial by construction,
-                    // so a second request is a host that is not what it claims
-                    // to be. Loud both ways: an outcome against the turned-away
-                    // request's own number, and a count.
-                    state.aux_refused += 1;
-                    report.answer(Answer::busy(cmd.corr));
+                match AuxSlot::over(&mut state.aux).offer(cmd.corr, &cmd.txn) {
+                    AuxOffer::Accepted => {}
+                    // A verbatim re-issue of the request the slot holds: the
+                    // transport repeating itself, which the pending request's
+                    // own outcome answers. Nothing goes back for it, and it is
+                    // not a refusal.
+                    AuxOffer::Duplicate => state.aux_duplicates += 1,
+                    AuxOffer::RefusedBusy => {
+                        // The host that fills this slot is serial by
+                        // construction, so a request under another number, or
+                        // under this one carrying other bytes, is a host that
+                        // is not what it claims to be. Loud both ways: an
+                        // outcome against the turned-away request's own number,
+                        // and a count.
+                        state.aux_refused += 1;
+                        report.answer(Answer::busy(cmd.corr, &Request::of(&cmd.txn)));
+                    }
                 }
             }
         }
     }
 
     for setpoint in dial.inputs.goals.new_msgs() {
+        // Counted before it is read, for the reason a session datagram is.
+        state.goals_taken += 1;
         // A setpoint naming rows this build does not know is not a setpoint:
         // the bits mean something to whoever wrote them and this driver does
         // not know which servos they are, so there is nothing to queue and
@@ -297,6 +359,13 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     } else {
         elapsed_cycles(since_last_ns, period_ns)
     };
+    state.cycles += 1;
+    state.cycles_since_status = state.cycles_since_status.saturating_add(1);
+    // Grid points this execution stepped over. An execution that covers more
+    // than one cycle of plant motion is a process that lost the CPU, and the
+    // points behind it are points no cycle attended -- which is the same
+    // reading the real driver's loop makes of a slot it missed.
+    state.skipped_cycles += u64::try_from(cycles - 1).unwrap_or(0);
     advance(params, state, cycles);
 
     // A cycle in which the bus answers nothing at all. Decided before anything
@@ -331,8 +400,11 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
 /// The other two are the aux path's. At most one transaction runs per cycle, so
 /// the outcome slot collides only when a request was turned away in the same
 /// cycle one was served; the first answer wins and the displaced one comes back
-/// to the host as a silence, which is the case its own re-issue exists for. A
-/// health report cannot collide at all: the rotation names at most one row.
+/// to the host as a silence. The real driver carries a second slot and publishes
+/// both, so a scenario that overlaps two requests in one cycle sees a sim that
+/// diverges from its subject. A health report cannot collide at all: the
+/// rotation names at most one row.
+// TODO(sim-aux-turned-away)
 #[derive(Default)]
 struct Report {
     /// What will be published, if anything.
@@ -469,6 +541,9 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
 /// state slot carries: the fault a driver raises about itself has to mean the
 /// same thing from either host.
 fn count_blind(state: &mut SimState, blind: bool, nominal: i64, report: &mut Report) {
+    if blind {
+        state.blind_cycles_total += 1;
+    }
     if let Some(event) = report::count_blind(&mut state.blind_cycles, blind, nominal) {
         report.raise(&mut state.events_dropped, event);
     }
@@ -608,15 +683,50 @@ fn run_aux(
         }
         AuxTask::ConfirmTorqueOff { row } => {
             let torqued = blind || sim_aux::reads_torqued(state, usize::from(row));
+            if blind {
+                // A read-back nothing answered, counted as a row still holding:
+                // a de-torquing credited to silence is the one report this
+                // driver must never make.
+                state.confirm_misses += 1;
+            }
             TorqueOffConfirm::over(&mut state.confirm).observed(row, torqued);
         }
         // A servo off the bus reports nothing, so the rotation's read of it goes
         // out as no report at all rather than as a report of zeroes about a
         // machine nobody heard from. The cadence was stamped when the read was
         // named, so the rotation walks on to the next row either way.
-        AuxTask::Health { row } if blind || sim_aux::is_absent(state, usize::from(row)) => {}
-        AuxTask::Health { row } => report.health_row = Some(row),
+        AuxTask::Health { row } if blind || sim_aux::is_absent(state, usize::from(row)) => {
+            state.health_misses += 1;
+        }
+        AuxTask::Health { row } => {
+            state.health_reports += 1;
+            report.health_row = Some(row);
+        }
     }
+}
+
+/// Release the machine this process met, and record that it did.
+///
+/// The simulated driver's answer to the same question the real one answers
+/// first on the bus: a process that has just started cannot know what a
+/// predecessor left energised, so it de-torques before it does anything else.
+/// Every row goes limp, the belief goes with it, and the gate stands in its
+/// never-commanded state -- no latch, because the release is verified as it is
+/// written and there is nothing left to keep reaching for.
+///
+/// The real sweep is nine verified writes and can leave rows it could not read
+/// back. This one cannot: it is the observable machine that is modelled here,
+/// and the plant has no write that fails -- the scenario's injections are read
+/// after this, so nothing has yet put a servo off the bus or cut the replies.
+/// So the record it stamps has no failed rows, and where a failed row is a
+/// question -- the latch, the confirmation pass, the report's reading of them --
+/// the answer is proven over the real driver's own bus.
+fn release(state: &mut SimState, nominal: i64) {
+    state.torqued = JointFlags::NONE;
+    state.has_target = JointFlags::NONE;
+    believe(state, flags::all(), false);
+    GoalGate::over(&mut state.gate).clear_commanded();
+    state.swept_at = SyncTime::from_nanos(nominal);
 }
 
 /// Record what a verified torque-enable write would have said about these rows.
@@ -763,7 +873,7 @@ fn write_sample(sample: &mut PoseSample, state: &SimState, blind: bool, nominal:
 /// its own.
 fn publish(
     outputs: &mut MotorSimOutputs<'_>,
-    state: &SimState,
+    state: &mut SimState,
     blind: bool,
     nominal: i64,
     report: &Report,
@@ -771,17 +881,23 @@ fn publish(
     let out = &mut outputs.pose;
     write_sample(out.msg_mut().clear_valid(), state, blind, nominal);
     out.mark_for_publish();
+    state.published += 1;
+    if state.first_pose.as_nanos() == 0 {
+        state.first_pose = SyncTime::from_nanos(nominal);
+    }
 
     if let Some(event) = report.event.as_ref() {
         let out = &mut outputs.evt;
         event.write(out.msg_mut().clear_valid());
         out.mark_for_publish();
+        state.published += 1;
     }
 
     if let Some(answer) = report.outcome.as_ref() {
         let out = &mut outputs.aux_out;
         answer.write(out.msg_mut().clear_valid());
         out.mark_for_publish();
+        state.published += 1;
     }
 
     if let Some(row) = report.health_row {
@@ -793,7 +909,105 @@ fn publish(
             out.msg_mut().clear_valid(),
         );
         out.mark_for_publish();
+        state.published += 1;
     }
+
+    if status_due(state) {
+        let out = &mut outputs.status;
+        write_status(out.msg_mut().clear_valid(), state, nominal);
+        out.mark_for_publish();
+        state.published += 1;
+        state.cycles_since_status = 0;
+    }
+}
+
+/// Whether this cycle is one the status record goes out on.
+///
+/// The first cycle, so the release this process wrote is on the wire from the
+/// first instant, and then one cycle in every simulated second. Counted in
+/// cycles rather than measured against the clock: the grid is pinned, so the
+/// count and the duration are the same statement, and it is the real driver's
+/// own cadence -- the window its cycle statistics ride.
+fn status_due(state: &SimState) -> bool {
+    if state.cycles <= 1 {
+        return true;
+    }
+    state.cycles_since_status >= STATUS_CYCLES
+}
+
+/// The record's own size, which is what says it has not grown.
+///
+/// The mapping below is hand-written, and so is the real driver's
+/// `publish_status`: two compositions of one record out of different state, with
+/// nothing in either language joining them. A field added to the schema is
+/// therefore a field one side can write and the other silently leave zero -- and
+/// the analyzer that verifies a run reads whichever copy the log carries. The
+/// size is the cheapest thing that changes when the record does; it fails the
+/// build here, where the second mapping is, rather than passing a scenario log
+/// that certifies less than it claims.
+const _: () = assert!(size_of::<DriverStatusWire>() == 280);
+
+/// The whole run so far, in the record the real driver publishes.
+///
+/// Cumulative and complete, which is the point of it: a reader that has seen
+/// one copy has read the run, so it does not matter which copy it saw. Every
+/// number here is this driver's own honest count. The fields naming a failure
+/// an in-process channel cannot have -- a datagram of the wrong length, a queue
+/// that overflowed, a reader thread that stopped, a send the operating system
+/// refused -- read zero because none of them happened, which is what the schema
+/// says a zero there means.
+fn write_status(status: &mut DriverStatus, state: &SimState, nominal: i64) {
+    status.time = SyncTime::from_nanos(nominal);
+    status.sweep_time = state.swept_at;
+    // The release wrote every row and cannot have left one behind: see
+    // [`release`].
+    status.sweep_failed_rows = JointFlags::NONE;
+    status.torque_latched = state.gate.latched;
+    status.first_pose = state.first_pose;
+    status.first_session_cmd = state.first_session_cmd;
+
+    let seam = &mut status.seam;
+    // What reached a cycle. In this driver the seam is a channel and a cycle
+    // reads it directly, so the datagrams handed to a cycle are the datagrams
+    // that arrived.
+    seam.queued = state.session_cmds_taken + state.goals_taken;
+    seam.goals = state.goals_taken;
+    seam.session_cmds = state.session_cmds_taken;
+    // Datagrams that arrived whole and did not read as anything this build
+    // knows. The other seam failures below are the transport's, and this
+    // transport has none of them.
+    seam.invalid = state.undecodable_inbound;
+
+    let cycle = &mut status.cycle;
+    cycle.goals_executed = state.goals_executed;
+    cycle.goals_dropped = state.goals_dropped;
+    cycle.hold_timeouts = state.hold_timeouts;
+    // A cycle either reads every row's registers or reads none of them: the
+    // outage this plant models is the wire's, so there is no partial answer to
+    // a grouped read and no write that fails to land.
+    cycle.blind_cycles = state.blind_cycles_total;
+    cycle.events_dropped = state.events_dropped;
+    cycle.aux_refused = state.aux_refused;
+    cycle.aux_duplicates = state.aux_duplicates;
+    cycle.health_reports = state.health_reports;
+    cycle.health_misses = state.health_misses;
+    cycle.confirm_misses = state.confirm_misses;
+
+    let looped = &mut status.loop_counts;
+    looped.cycles = state.cycles;
+    looped.skipped = state.skipped_cycles;
+    // Once, on the first execution, as it is on every run of the real driver.
+    looped.startup_mrc = 1;
+    looped.taken = state.session_cmds_taken + state.goals_taken;
+
+    // The record's own publication is not in this: it has not happened yet.
+    status.published = state.published;
+    // A wind-down is a thing the process this cog stands in for does on its way
+    // out. Nothing winds this one down -- the deterministic runner and the host
+    // run both end by stopping the process -- so no copy of this record ever
+    // says one happened, and a reader of one of these logs is reading a run
+    // that did not finish one.
+    status.wound_down = false.into();
 }
 
 counters! {
@@ -841,5 +1055,39 @@ counters! {
         /// Host datagrams this build could not read at all: a schema-version
         /// mismatch at the boundary rather than an ask the driver refused.
         undecodable_inbound / set_undecodable_inbound,
+    }
+}
+
+counters! {
+    /// The run's totals that only the status record reads.
+    ///
+    /// Separate from [`Counters`] because nothing reports these as signals: the
+    /// record is where they are read, and putting them in the signal group would
+    /// publish every one of them twice. They are carried across a refused state
+    /// slot for the reason the reported totals are -- the record says of itself
+    /// that it is cumulative since the process started, so a reader that has
+    /// seen one copy has read the run, and a counter that went backwards
+    /// mid-run would let a real loss read as a full account.
+    StatusTotals of SimStateWire, crossing the_status_totals_cross_the_slot {
+        /// Cycles run.
+        cycles / set_cycles,
+        /// Grid points the runner passed over without a cycle.
+        skipped_cycles / set_skipped_cycles,
+        /// Host datagrams taken off the input, whatever they said.
+        session_cmds_taken / set_session_cmds_taken,
+        /// Setpoints taken off the input.
+        goals_taken / set_goals_taken,
+        /// Messages this driver has published.
+        published / set_published,
+        /// Delivery re-issues the slot recognised.
+        aux_duplicates / set_aux_duplicates,
+        /// Health reports published.
+        health_reports / set_health_reports,
+        /// Rotation turns the modelled bus did not answer.
+        health_misses / set_health_misses,
+        /// Cycles in which the modelled bus answered nothing.
+        blind_cycles_total / set_blind_cycles_total,
+        /// Torque-off read-backs nothing answered.
+        confirm_misses / set_confirm_misses,
     }
 }

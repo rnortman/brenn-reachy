@@ -615,6 +615,7 @@ pub(crate) struct Spy {
     machine: Rc<RefCell<FakeMachine>>,
     log: Rc<RefCell<Vec<(u8, u8)>>>,
     reads: Rc<RefCell<Vec<(u8, u16)>>>,
+    sync_ids: Rc<RefCell<Vec<u8>>>,
 }
 
 impl Spy {
@@ -633,6 +634,7 @@ impl Spy {
             machine,
             log: Rc::new(RefCell::new(Vec::new())),
             reads: Rc::new(RefCell::new(Vec::new())),
+            sync_ids: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -655,6 +657,16 @@ impl Spy {
     pub(crate) fn reads(&self) -> Rc<RefCell<Vec<(u8, u16)>>> {
         Rc::clone(&self.reads)
     }
+
+    /// Every servo a grouped read named, in the order the frames named them.
+    ///
+    /// A grouped frame is addressed to the broadcast id and carries its roster
+    /// in its parameters, so [`Self::log`] cannot say who it reached. This is
+    /// what keeps the roster property assertable over a request that does not
+    /// wear one address.
+    pub(crate) fn sync_ids(&self) -> Rc<RefCell<Vec<u8>>> {
+        Rc::clone(&self.sync_ids)
+    }
 }
 
 impl BusPort for Spy {
@@ -664,6 +676,14 @@ impl BusPort for Spy {
             self.reads
                 .borrow_mut()
                 .push((buf[4], u16::from_le_bytes([buf[8], buf[9]])));
+        }
+        if buf[7] == INST_SYNC_READ {
+            // Parameters are the address and the width, two bytes each, and
+            // then one byte per servo asked.
+            let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
+            self.sync_ids
+                .borrow_mut()
+                .extend_from_slice(&buf[12..8 + len - 3]);
         }
         self.machine.borrow_mut().write_all(buf)
     }

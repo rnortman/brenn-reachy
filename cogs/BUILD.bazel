@@ -285,10 +285,10 @@ rust_binary(
         ":script_clk_rs",
         ":session_clk_rs",
         ":session_cmd_clk_rs",
+        "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
-        "//crates/reachy-motord:reachy_motord_lib",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -348,10 +348,22 @@ sh_test(
 
 # A binary's root is its own crate, so the library targets never see the
 # reading, the checks or the printer.
+#
+# The two online systems' logging policies ride in as runfiles: the analyzer
+# restates which channels are retained, and one case reads the policies back to
+# say the restatement is what they declare.
 rust_test(
     name = "first_motion_report_test",
     size = "small",
     crate = ":first_motion_report",
+    data = [
+        "system_host.clk",
+        "system_robot.clk",
+    ],
+    env = {
+        "SYSTEM_ROBOT_CLK": "cogs/system_robot.clk",
+        "SYSTEM_HOST_CLK": "cogs/system_host.clk",
+    },
 )
 
 # The clip library asset's emitter, run as
@@ -517,20 +529,29 @@ rust_clk_module(
     deps = clk_module_deps(MOTION_MODULES).rs,
 )
 
+# The shipped session configuration rides in as a runfile: the cases here cut
+# their expectations from figures the deployment states, and one case reads the
+# file back to say the two are the same number.
 rust_test(
     name = "motion_cog_test",
     size = "small",
     srcs = ["motion_cog_test.rs"],
+    data = ["session_params.textproto"],
     edition = "2024",
+    env = {
+        "SESSION_PARAMS": "cogs/session_params.textproto",
+    },
     deps = [
         ":config_clk_rs",
         ":motion_clk_rs_test",
+        ":motion_cogs",
         ":schedule_clk_rs",
         ":script_clk_rs",
         ":session_clk_rs",
         ":session_cmd_clk_rs",
         ":session_slots",
         "//crates/reachy-clips:reachy_clips",
+        "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:goal_clk_rs",
@@ -1255,6 +1276,26 @@ clk_schema_module(
     imports = SCRIPT_MODULES,
 )
 
+# The seam's port numbers, as the compositions type them and as the driver names
+# them. The two `.clk` files ride in as runfiles; the driver's own list comes
+# from its library, which is the artifact whose disjointness assert cannot see a
+# composition.
+rust_test(
+    name = "seam_ports_test",
+    size = "small",
+    srcs = ["seam_ports_test.rs"],
+    data = [
+        "robot.clk",
+        "robot_host.clk",
+    ],
+    edition = "2024",
+    env = {
+        "ROBOT_CLK": "cogs/robot.clk",
+        "ROBOT_HOST_CLK": "cogs/robot_host.clk",
+    },
+    deps = ["//crates/reachy-motord:reachy_motord_lib"],
+)
+
 # What the session keeps between one execution and the next, in a module of its
 # own because a cog member's type is an interface instantiation and the compiler
 # resolves one only against a module the cog's module imports. It reaches the
@@ -1507,6 +1548,7 @@ clk(
         ":motion_clk",
         ":robot_host_clk",
         "@clockwork//clockwork/logging:channel_policy_clk",
+        "@clockwork//clockwork/logging:channel_type_clk",
         "@clockwork//clockwork/logging/writers:logger_channel_policies_clk",
     ],
 )
@@ -1532,6 +1574,7 @@ clk(
         ":motion_clk",
         ":robot_clk",
         "@clockwork//clockwork/logging:channel_policy_clk",
+        "@clockwork//clockwork/logging:channel_type_clk",
         "@clockwork//clockwork/logging/writers:logger_channel_policies_clk",
     ],
 )
@@ -1557,6 +1600,7 @@ clk(
         ":motion_clk",
         ":sim_clk",
         "@clockwork//clockwork/logging:channel_policy_clk",
+        "@clockwork//clockwork/logging:channel_type_clk",
     ],
 )
 

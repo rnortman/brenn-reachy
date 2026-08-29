@@ -201,6 +201,45 @@ pub struct BusCounters {
     pub alerts: u64,
 }
 
+/// The per-exchange allowance a control cycle can afford.
+///
+/// The default allowance is ten milliseconds, which is a sensible timeout for a
+/// host commanding whole moves and an unusable one inside a twenty-millisecond
+/// cycle: two exchanges under it already overrun the period. Three milliseconds
+/// is what a cycle can afford — the grouped read, the write and one out-of-band
+/// pair fit inside the period with the loop's own margin still unspent.
+///
+/// Named here rather than in the loop that runs on it, because a bench
+/// measuring whether an exchange fits a cycle has to measure it against the same
+/// figure the cycle budgets with, and two spellings of that figure would let the
+/// measurement pass a bus the driver cannot use.
+pub const CYCLE_HOST_ALLOWANCE: Duration = Duration::from_millis(3);
+
+/// What one exchange spent, split where the request left the host.
+///
+/// Two spans rather than a total, because the total on its own cannot say what
+/// to change. `send` is the write call and nothing else — on a real port that
+/// is the kernel taking the bytes and nothing waiting on them leaving the
+/// UART. `wait` starts when the write returns and ends when
+/// the reply decodes or the deadline passes, so it is the servo's turnaround
+/// and the read path. An exchange that overruns its budget is one or the other,
+/// and a caller that only knows the sum has to guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExchangeSpans {
+    /// The write call's own wall time.
+    pub send: Duration,
+    /// From the write returning to the reply or the deadline.
+    pub wait: Duration,
+}
+
+impl ExchangeSpans {
+    /// What the exchange cost end to end.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.send + self.wait
+    }
+}
+
 /// A register value as bytes, in control-table order.
 ///
 /// Wide enough for the position-gain span, which is the widest entry in the
@@ -331,6 +370,10 @@ pub struct Bus<P: BusPort> {
     decoder: StatusDecoder,
     tx: [u8; MAX_INSTR_FRAME],
     counters: BusCounters,
+    /// What the most recent exchange spent on each side of its write.
+    last_spans: ExchangeSpans,
+    /// The longest write call since a caller last took it.
+    worst_send: Duration,
 }
 
 impl<P: BusPort> Bus<P> {
@@ -342,7 +385,27 @@ impl<P: BusPort> Bus<P> {
             decoder: StatusDecoder::new(),
             tx: [0; MAX_INSTR_FRAME],
             counters: BusCounters::default(),
+            last_spans: ExchangeSpans::default(),
+            worst_send: Duration::ZERO,
         }
+    }
+
+    /// What the exchange that just ran spent.
+    ///
+    /// The last one only: a caller measuring a distribution reads this after
+    /// every call rather than asking the bus to keep a history it would have to
+    /// bound.
+    #[must_use]
+    pub fn last_spans(&self) -> ExchangeSpans {
+        self.last_spans
+    }
+
+    /// The longest write call since this was last asked, and start again.
+    ///
+    /// Taken rather than read so a caller that reports per window — the driver
+    /// reports per cycle — gets that window's worst and not the run's.
+    pub fn take_worst_send(&mut self) -> Duration {
+        std::mem::replace(&mut self.worst_send, Duration::ZERO)
     }
 
     /// The deadline and retry policy in force.
@@ -557,26 +620,36 @@ impl<P: BusPort> Bus<P> {
             },
         )?;
         out.begin(ids);
-        self.send(BROADCAST_ID, tx_len)?;
+        // As in `exchange`: the deadline runs from the instant the write began,
+        // because the write returns with the request's bytes still leaving and
+        // `worst_exchange` already covers them.
+        let requested = self.send(BROADCAST_ID, tx_len)?;
 
         let Self {
             port,
             timing,
             decoder,
             counters,
+            last_spans,
             ..
         } = self;
 
-        let deadline = timing.deadline(Instant::now(), tx_len, sync_read_rx(out.len(), width));
+        let started = Instant::now();
+        let deadline = timing.deadline(requested, tx_len, sync_read_rx(out.len(), width));
         let mut chunk = [0u8; MAX_FRAME_BUF];
         let mut answered = 0;
         while answered < out.len() {
-            let read = port
-                .read_some(&mut chunk, deadline)
-                .map_err(|source| XactError::Io {
+            let read = port.read_some(&mut chunk, deadline).map_err(|source| {
+                // The wait is recorded on this way out as on every other:
+                // an exchange that hung and then failed is the most
+                // expensive one there is, and leaving it at zero would read
+                // the bus as instantaneous exactly where it stalled.
+                last_spans.wait = started.elapsed();
+                XactError::Io {
                     id: BROADCAST_ID,
                     source,
-                })?;
+                }
+            })?;
             if read == 0 {
                 // At least one servo is still silent, or the loop would have
                 // ended; the slots left waiting stay `Timeout`.
@@ -618,6 +691,7 @@ impl<P: BusPort> Bus<P> {
                                 // register too wide to carry, not a servo that
                                 // answered short.
                                 None => {
+                                    last_spans.wait = started.elapsed();
                                     return Err(XactError::RegisterTooWide {
                                         id: BROADCAST_ID,
                                         addr: reg.addr,
@@ -643,6 +717,7 @@ impl<P: BusPort> Bus<P> {
                 }
             }
         }
+        last_spans.wait = started.elapsed();
         Ok(())
     }
 
@@ -690,12 +765,9 @@ impl<P: BusPort> Bus<P> {
             id: BROADCAST_ID,
             source,
         })?;
-        self.port
-            .write_all(&self.tx[..tx_len])
-            .map_err(|source| XactError::Io {
-                id: BROADCAST_ID,
-                source,
-            })
+        // Nothing answers a broadcast write, so the instant the write began is
+        // of no use to this caller: there is no reply window to open.
+        self.write_timed(BROADCAST_ID, tx_len).map(|_| ())
     }
 
     /// Clear the line, then put `tx[..tx_len]` on it.
@@ -704,14 +776,44 @@ impl<P: BusPort> Bus<P> {
     /// from the port and from the decoder's half-read frame before anything new
     /// goes out, so a stale reply can never be read as this request's answer.
     /// `id` names whoever the failure is reported against.
-    fn send(&mut self, id: u8, tx_len: usize) -> Result<(), XactError> {
+    ///
+    /// Hands back the instant [`Bus::write_timed`] took immediately before the
+    /// write, which is the one an exchange's deadline runs from: the input
+    /// flush above it is an `ioctl` that touches no outgoing byte, so the time
+    /// it costs is not the reply's to spend.
+    fn send(&mut self, id: u8, tx_len: usize) -> Result<Instant, XactError> {
         self.port
             .discard_input()
             .map_err(|source| XactError::Io { id, source })?;
         self.decoder.reset();
-        self.port
+        self.write_timed(id, tx_len)
+    }
+
+    /// Put `tx[..tx_len]` on the line, timing the call, and hand back the
+    /// instant the write began.
+    ///
+    /// Every request in this crate leaves through here, so what a write costs
+    /// is measured on the grouped write that is acknowledged by nothing as well
+    /// as on the exchanges that wait for an answer. The bracket is the write
+    /// call alone — the kernel taking the bytes, with nothing waiting on them
+    /// leaving the UART. A write costing more than that is the reading this
+    /// span exists for.
+    ///
+    /// The returned instant is the single authority for when an exchange began:
+    /// the deadline is computed from it, so however this function grows, the
+    /// window a reply is waited over starts at the write and nowhere else.
+    fn write_timed(&mut self, id: u8, tx_len: usize) -> Result<Instant, XactError> {
+        let started = Instant::now();
+        let result = self
+            .port
             .write_all(&self.tx[..tx_len])
-            .map_err(|source| XactError::Io { id, source })
+            .map_err(|source| XactError::Io { id, source });
+        self.last_spans = ExchangeSpans {
+            send: started.elapsed(),
+            wait: Duration::ZERO,
+        };
+        self.worst_send = self.worst_send.max(self.last_spans.send);
+        result.map(|()| started)
     }
 
     /// The common core: send `tx[..tx_len]`, wait for `id` to answer.
@@ -722,25 +824,38 @@ impl<P: BusPort> Bus<P> {
         expect_params: usize,
         params: &mut [u8; MAX_STATUS_PARAMS],
     ) -> Result<Reply, XactError> {
-        self.send(id, tx_len)?;
+        // The deadline runs from the instant the write began, which `send`
+        // hands back. The port returns once the kernel has the bytes, so the
+        // request's own wire time is still ahead of the reply when the write
+        // comes back, and `worst_exchange` covers `tx` as well as `rx` —
+        // measuring from after the write would hand the reply a window that
+        // has already been partly spent by the request.
+        let requested = self.send(id, tx_len)?;
 
         let Self {
             port,
             timing,
             decoder,
             counters,
+            last_spans,
             ..
         } = self;
 
         let started = Instant::now();
-        let deadline = timing.deadline(started, tx_len, STATUS_OVERHEAD + expect_params);
+        // The wait is recorded on every way out of the loop below, so an
+        // exchange's span is the whole of its wait however the wait ended: a
+        // timeout and a rejected frame cost time too, and counting only the
+        // answered ones would read the bus as faster than it is.
+        let deadline = timing.deadline(requested, tx_len, STATUS_OVERHEAD + expect_params);
         let mut chunk = [0u8; MAX_FRAME_BUF];
         loop {
-            let read = port
-                .read_some(&mut chunk, deadline)
-                .map_err(|source| XactError::Io { id, source })?;
+            let read = port.read_some(&mut chunk, deadline).map_err(|source| {
+                last_spans.wait = started.elapsed();
+                XactError::Io { id, source }
+            })?;
             if read == 0 {
                 counters.timeouts += 1;
+                last_spans.wait = started.elapsed();
                 return Err(XactError::Timeout {
                     id,
                     waited: started.elapsed(),
@@ -764,6 +879,7 @@ impl<P: BusPort> Bus<P> {
                         // disagreement, so a truncated copy is never read.
                         let copied = view.params.len().min(MAX_STATUS_PARAMS);
                         params[..copied].copy_from_slice(&view.params[..copied]);
+                        last_spans.wait = started.elapsed();
                         return Ok(Reply {
                             error: view.error,
                             len: view.params.len(),
@@ -776,7 +892,10 @@ impl<P: BusPort> Bus<P> {
                     // read-only runs over nine servos saw every exchange clean
                     // from the first ping — so a non-status frame here is a
                     // genuine anomaly and not traffic to be skipped past.
-                    DecodeStep::Corrupt(cause) => return Err(XactError::Corrupt { id, cause }),
+                    DecodeStep::Corrupt(cause) => {
+                        last_spans.wait = started.elapsed();
+                        return Err(XactError::Corrupt { id, cause });
+                    }
                 }
             }
         }
@@ -932,6 +1051,7 @@ mod tests {
         /// Every deadline an exchange handed to a read, so a case can compare
         /// the deadline the bus enforced against the bound a caller budgeted.
         deadlines: Vec<Instant>,
+        honour_deadlines: bool,
     }
 
     impl FakePort {
@@ -946,7 +1066,17 @@ mod tests {
                 fail_read: None,
                 fail_discard: None,
                 deadlines: Vec::new(),
+                honour_deadlines: false,
             }
+        }
+
+        /// Hands back nothing once the deadline a read was given has passed,
+        /// the way a real port does. Opt-in, because most cases script a reply
+        /// and never look at the clock, and one that has already gone past its
+        /// deadline before the first read would then get nothing.
+        fn honouring_deadlines(mut self) -> Self {
+            self.honour_deadlines = true;
+            self
         }
 
         /// Hands back at most `n` bytes per read, so a reply arrives split the
@@ -995,6 +1125,9 @@ mod tests {
 
         fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
             self.deadlines.push(deadline);
+            if self.honour_deadlines && Instant::now() >= deadline {
+                return Ok(0);
+            }
             if let Some(kind) = self.fail_read.take() {
                 return Err(io::Error::from(kind));
             }
@@ -1966,5 +2099,264 @@ mod tests {
         let empty = RawValue::new(&[]).expect("no bytes");
         assert!(empty.is_empty());
         assert_eq!(format!("{empty}"), "");
+    }
+
+    /// A port that costs a known amount of wall time on each side of an
+    /// exchange, so a case can say which side a span was attributed to rather
+    /// than only that the two add up.
+    struct SlowPort {
+        inner: FakePort,
+        write_cost: Duration,
+        read_cost: Duration,
+        discard_cost: Duration,
+    }
+
+    impl BusPort for SlowPort {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            std::thread::sleep(self.write_cost);
+            self.inner.write_all(buf)
+        }
+
+        fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+            std::thread::sleep(self.read_cost);
+            self.inner.read_some(buf, deadline)
+        }
+
+        fn discard_input(&mut self) -> io::Result<()> {
+            std::thread::sleep(self.discard_cost);
+            self.inner.discard_input()
+        }
+    }
+
+    /// The port is handed in rather than built here, so a case can dress the
+    /// underlying [`FakePort`] — a chopped reply, a failing read, a port that
+    /// honours its deadlines — and still charge wall time for a side of the
+    /// exchange.
+    fn slow_bus(port: FakePort, write_cost: Duration, read_cost: Duration) -> Bus<SlowPort> {
+        Bus::new(
+            SlowPort {
+                inner: port,
+                write_cost,
+                read_cost,
+                discard_cost: Duration::ZERO,
+            },
+            quick(),
+        )
+    }
+
+    /// The same port, charging its wall time to the input flush that opens an
+    /// exchange rather than to either side of the measurement.
+    fn flush_heavy_bus(port: FakePort, discard_cost: Duration) -> Bus<SlowPort> {
+        Bus::new(
+            SlowPort {
+                inner: port,
+                write_cost: Duration::ZERO,
+                read_cost: Duration::ZERO,
+                discard_cost,
+            },
+            quick(),
+        )
+    }
+
+    /// The split is the point of the measurement: a span that only said what an
+    /// exchange cost in total could not tell a slow write from a slow servo.
+    ///
+    /// Which side carried the cost is asserted by putting the whole cost on one
+    /// side at a time and comparing the two spans against each other. A bound
+    /// on one span in terms of the other's sleep would be a race against
+    /// scheduler overshoot, and this says the same thing without one.
+    #[test]
+    fn an_exchange_says_what_its_write_cost_and_what_its_wait_cost() {
+        let cost = Duration::from_millis(20);
+
+        let mut slow_write = slow_bus(
+            FakePort::new(&[status(11, 0, &[7, 0, 0, 0])]),
+            cost,
+            Duration::ZERO,
+        );
+        slow_write
+            .read_reg(11, PRESENT_POSITION)
+            .expect("the servo answered");
+        let spans = slow_write.last_spans();
+        assert!(
+            spans.send >= cost,
+            "the write carries its own cost: {spans:?}"
+        );
+        assert!(spans.send > spans.wait, "{spans:?}");
+        assert_eq!(spans.total(), spans.send + spans.wait);
+
+        let worst = slow_write.take_worst_send();
+        assert!(worst >= cost, "{worst:?}");
+        assert_eq!(
+            slow_write.take_worst_send(),
+            Duration::ZERO,
+            "taking the worst starts the next window at nothing"
+        );
+
+        let mut slow_reply = slow_bus(
+            FakePort::new(&[status(11, 0, &[7, 0, 0, 0])]),
+            Duration::ZERO,
+            cost,
+        );
+        slow_reply
+            .read_reg(11, PRESENT_POSITION)
+            .expect("the servo answered");
+        let spans = slow_reply.last_spans();
+        assert!(
+            spans.wait >= cost,
+            "the wait carries its own cost: {spans:?}"
+        );
+        assert!(spans.wait > spans.send, "{spans:?}");
+        assert_eq!(spans.total(), spans.send + spans.wait);
+    }
+
+    /// An exchange nobody answered is the one whose cost most wants recording:
+    /// it spent the whole deadline.
+    #[test]
+    fn an_exchange_that_timed_out_still_says_what_it_waited() {
+        let read_cost = Duration::from_millis(3);
+        let mut bus = slow_bus(FakePort::new(&[Vec::new()]), Duration::ZERO, read_cost);
+        let refused = bus
+            .read_reg(11, PRESENT_POSITION)
+            .expect_err("nothing answered");
+        assert!(matches!(refused, XactError::Timeout { .. }));
+        assert!(bus.last_spans().wait >= read_cost, "{:?}", bus.last_spans());
+    }
+
+    /// The grouped read is the cycle's most expensive exchange, and it is timed
+    /// on the same two spans as a unicast one.
+    #[test]
+    fn a_grouped_read_is_timed_like_any_other_exchange() {
+        let write_cost = Duration::from_millis(5);
+        let read_cost = Duration::from_millis(5);
+        let mut replies = Vec::new();
+        for id in 11u8..=13 {
+            replies.extend(status(id, 0, &[1, 0, 0, 0]));
+        }
+        let mut bus = slow_bus(FakePort::new(&[replies]), write_cost, read_cost);
+        let mut out = SyncReadOutcome::new();
+        bus.sync_read(&[11, 12, 13], PRESENT_POSITION, &mut out)
+            .expect("the frame went out");
+        let spans = bus.last_spans();
+        assert!(spans.send >= write_cost, "{spans:?}");
+        assert!(
+            spans.wait >= read_cost,
+            "the reply the servos took to arrive is the grouped read's wait: {spans:?}"
+        );
+        assert_eq!(spans.total(), spans.send + spans.wait);
+        assert!(bus.take_worst_send() >= write_cost);
+    }
+
+    /// The exchange's deadline is taken before the write, so a write that
+    /// spends the whole budget leaves nothing for the reply and the exchange
+    /// ends in its typed timeout.
+    ///
+    /// A deadline taken after the write would hand the reply a full budget
+    /// however long the request took, and an exchange that overran its cycle
+    /// by an order of magnitude would come back a success.
+    ///
+    /// The port honours its deadlines and the reply is queued by the write, so
+    /// the only thing that can have kept the read from it is the write's own
+    /// cost.
+    #[test]
+    fn a_write_that_spends_the_budget_times_the_unicast_exchange_out() {
+        let cost = quick().host_allowance * 3;
+        let mut bus = slow_bus(
+            FakePort::new(&[status(11, 0, &[7, 0, 0, 0])]).honouring_deadlines(),
+            cost,
+            Duration::ZERO,
+        );
+        let refused = bus
+            .read_reg(11, PRESENT_POSITION)
+            .expect_err("the budget was gone before the reply was read");
+        assert!(
+            matches!(refused, XactError::Timeout { id: 11, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(bus.counters().timeouts, 1);
+        assert!(
+            bus.last_spans().send >= cost,
+            "and the write is where it went: {:?}",
+            bus.last_spans()
+        );
+    }
+
+    /// The grouped read takes its deadline the same way: it is the cycle's
+    /// widest exchange, so a slow write there is the one most able to hide.
+    #[test]
+    fn a_write_that_spends_the_budget_times_the_grouped_read_out() {
+        let cost = quick().host_allowance * 3;
+        let mut replies = Vec::new();
+        for id in 11u8..=13 {
+            replies.extend(status(id, 0, &[1, 0, 0, 0]));
+        }
+        let mut bus = slow_bus(
+            FakePort::new(&[replies]).honouring_deadlines(),
+            cost,
+            Duration::ZERO,
+        );
+        let mut out = SyncReadOutcome::new();
+        bus.sync_read(&[11, 12, 13], PRESENT_POSITION, &mut out)
+            .expect("the frame went out");
+        assert!(!out.all_ok(), "no servo was read inside the budget");
+        assert_eq!(out.get(11), Some(IdOutcome::Timeout));
+        assert_eq!(bus.counters().timeouts, 1);
+        assert!(bus.last_spans().send >= cost, "{:?}", bus.last_spans());
+    }
+
+    /// The window a reply is waited over starts at the write, not at the input
+    /// flush that precedes it: the flush touches no outgoing byte, so what it
+    /// costs is not the reply's to spend.
+    ///
+    /// Asserted by making the flush alone cost more than the whole budget. The
+    /// exchange must still succeed on both paths; taking the instant before the
+    /// flush would leave the deadline expired by the time anything was written,
+    /// and every exchange on a real port would lose whatever `tcflush` costs
+    /// out of its reply window.
+    #[test]
+    fn what_the_input_flush_costs_is_not_charged_to_the_reply() {
+        let cost = quick().host_allowance * 3;
+
+        let mut bus = flush_heavy_bus(
+            FakePort::new(&[status(11, 0, &[7, 0, 0, 0])]).honouring_deadlines(),
+            cost,
+        );
+        let position = bus
+            .read_reg(11, PRESENT_POSITION)
+            .expect("the flush is not the reply's cost");
+        assert_eq!(position.i32(), Some(7));
+        assert_eq!(bus.counters().timeouts, 0);
+
+        let mut replies = Vec::new();
+        for id in 11u8..=13 {
+            replies.extend(status(id, 0, &[1, 0, 0, 0]));
+        }
+        let mut bus = flush_heavy_bus(FakePort::new(&[replies]).honouring_deadlines(), cost);
+        let mut out = SyncReadOutcome::new();
+        bus.sync_read(&[11, 12, 13], PRESENT_POSITION, &mut out)
+            .expect("the frame went out");
+        assert!(
+            out.all_ok(),
+            "every servo answered inside the budget: {out:?}"
+        );
+        assert_eq!(bus.counters().timeouts, 0);
+    }
+
+    /// A grouped read that dies on the port after waiting still says what it
+    /// waited: the exchange that hung is the one the measurement is about.
+    #[test]
+    fn a_grouped_read_that_fails_on_the_port_still_says_what_it_waited() {
+        let read_cost = Duration::from_millis(5);
+        let mut bus = slow_bus(
+            FakePort::new(&[Vec::new()]).failing_read(io::ErrorKind::TimedOut),
+            Duration::ZERO,
+            read_cost,
+        );
+        let mut out = SyncReadOutcome::new();
+        let failed = bus
+            .sync_read(&[11, 12, 13], PRESENT_POSITION, &mut out)
+            .expect_err("the port refused the read");
+        assert!(matches!(failed, XactError::Io { .. }));
+        assert!(bus.last_spans().wait >= read_cost, "{:?}", bus.last_spans());
     }
 }

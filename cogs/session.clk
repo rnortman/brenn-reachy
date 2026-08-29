@@ -242,11 +242,11 @@ schema SessionState
         // anchor needs a flag exactly as the sample anchor beside it does.
         #16 started: Bool;
 
-        // The report timeline: a ring of thirty-two, read through the two
-        // cursors below. Reports leave at one datagram per execution and are
-        // raised faster than that in a burst, so the ring is what carries a
-        // story across the executions that drain it.
-        #17 timeline: FixedArray<timeline_vocab::TimelineEntry, 32>;
+        // The report timeline: a ring of sixty-four, holding the whole story
+        // rather than the part of it still waiting to go out. The message that
+        // carries it carries every row, so nothing is drained out of here --
+        // what leaves the ring leaves it because a newer row needed the room.
+        #17 timeline: FixedArray<timeline_vocab::TimelineEntry, 64>;
 
         // How many reports have been appended, all run, modulo the count's own
         // width. The row a report is written to is this number modulo the ring's
@@ -254,11 +254,15 @@ schema SessionState
         // arithmetic survives the wrap.
         #18 timeline_head: UInt8;
 
-        // How many reports have been published, likewise. The difference
-        // between the two cursors is how many are waiting, and it is bounded by
-        // the ring's length -- a larger difference is a slot describing a ring
-        // that never existed.
-        #19 timeline_published: UInt8;
+        // How many rows were dropped off the front of *this* ring to make room.
+        // It is also what says whether the ring has wrapped: nothing has been
+        // dropped exactly while the story is shorter than the ring, so a head
+        // past the ring's length with nothing dropped is a slot describing a
+        // ring that never existed. Cleared with the rows, because a ring that
+        // holds no story has dropped none of it -- which is what makes this the
+        // number a published story carries and `reports_dropped` below the
+        // lifetime one.
+        #19 timeline_dropped: UInt32;
 
         // The correlation number the next aux request carries. Monotonic, so a
         // late duplicate of a request already answered is recognisable as one.
@@ -291,12 +295,20 @@ schema SessionState
         // what it meant.
         #28 aux_failures: UInt64;
 
-        // How many report datagrams went out, all run.
+        // How many story datagrams went out, all run. One per execution that
+        // added a row, and each one carries the whole story rather than the row
+        // that prompted it.
         #29 reports_published: UInt64;
 
-        // How many reports were dropped from the ring before they could be
-        // published, all run. A rise says narration was lost, never a record:
-        // what mattered about a fault travelled on the channel that raised it.
+        // How many reports were dropped off the front of the ring to make room,
+        // all run. A rise says narration was lost, never a record: what mattered
+        // about a fault travelled on the channel that raised it.
+        //
+        // The lifetime figure, for the signal: it counts every eviction this
+        // session made, including ones from a ring since cleared, so it and the
+        // `timeline_dropped` above it differ across a clear. What a published
+        // story carries is that one -- the number about the rows in front of the
+        // reader -- and this one is what a reader of the signal totals.
         #30 reports_dropped: UInt64;
 
         // How many inbound datagrams the codec refused, all run -- scripts,
@@ -343,5 +355,11 @@ schema SessionState
         // this is what says whose answer an outcome is: the drain settles its
         // own write, and a sequence is stepped by no wake that is draining.
         #37 degrade_pending: Bool;
+
+        // How many reports were appended to the timeline, all run. The rows a
+        // story datagram carries plus the ones it says were dropped -- and,
+        // read against the same total at the top of an execution, what says
+        // whether this wake had anything to add to the story.
+        #38 reports_narrated: UInt64;
     }
 }

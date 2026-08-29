@@ -57,16 +57,15 @@ fn the_shipped_configuration_is_the_one_the_driver_runs() {
         "the dead-man the simulated driver runs, so a scenario's evidence about it carries"
     );
     assert_eq!(shipped.health_poll_period_ns, 500_000_000);
-    assert_eq!(shipped.startup_window_ns, 2_000_000_000);
     assert_eq!(
         shipped.bus_device.as_str(),
         "/dev/ttyAMA3",
         "the servo bus node on the board"
     );
     assert_eq!(shipped.bus_baud, 1_000_000);
-    // The relations between these — a dead-man of whole cycles, longer than one,
-    // inside a longer startup window — are the parser's own refusals and are
-    // pinned there, over every file rather than over this one.
+    // The relations between these — a dead-man of whole cycles, longer than one —
+    // are the parser's own refusals and are pinned there, over every file rather
+    // than over this one.
 }
 
 #[test]

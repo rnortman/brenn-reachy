@@ -31,10 +31,11 @@
 # build that recorded them — and `motion-log-<stamp>.console` beside it,
 # holding the console output of everything the launcher started. A run adds its
 # own console stream and the unit's clock discipline, read before and after, to
-# the second of those. None of it says anything about the machine: the driver's
-# console counts what it took off its socket, which is what the recorded trail
-# is cross-checked against, and the clock captures say whether the time base the
-# whole log is stamped in could have stepped underneath it.
+# the second of those. The analyzer reads none of it: the log is self-contained,
+# and everything the driver counts about itself is republished into it. The
+# console is for a person reading a run that went wrong, and the clock captures
+# say whether the time base the whole log is stamped in could have stepped
+# underneath it.
 #
 # A motion run is **three OS processes**, not one: `reachy_motord` (the servo
 # bus), and two `robot_clk_exe` processes over the one synthesized executable
@@ -96,15 +97,15 @@ launch_config=robotcpu.textproto
 launch_logs="${store_mount}/logs/launch"
 
 # How long the run is given before the launcher is stopped. Commissioning is
-# about five seconds of bus transactions, the wake lead is eight, the raise-hold-
-# stow gesture about five, the release about four: the same sum the host harness
-# budgets twenty-seven for, with a few seconds more of margin because this one is
-# talking to a real serial bus whose transactions retry. Nothing about the run is
-# judged by the clock — the analyzer reads the records — so the budget only has
-# to be long enough. The lead is a number in another file, so the sum is checked
-# against the shipped one by tools/deploy-motion.test.sh: a lead that grows
-# without this following it is red there rather than a launcher stopped
-# mid-gesture.
+# about five seconds of bus transactions, the wake lead is eight, the
+# raise-hold-stow gesture about five, the release about four: the host harness
+# budgets twenty-seven for the same sum, and this one carries a few seconds more
+# of margin because it is talking to a real serial bus whose transactions retry.
+# Nothing about the run is judged by the clock — the analyzer reads the records —
+# so the budget only has to be long enough. The lead is a number in another file,
+# so the sum is checked against the shipped one by tools/deploy-motion.test.sh:
+# a lead growing without this following it is red there rather than a launcher
+# stopped mid-gesture.
 run_seconds=30
 
 # The bazel that runs the analyzer, whose label and invocation are lib.sh's
@@ -388,6 +389,29 @@ STAMP
 		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
 }
 
+# One read-only probe of the unit, into a file of its own.
+#
+#   capture_probe <file> <headline> <subject> <probe>
+#
+# The wrapper every capture shares, so the invariants live in one place: the ssh
+# is BatchMode (a unit that wants a password is a unit that answers nothing, not
+# a prompt nobody is at), stderr is captured into the record because what a
+# probe could not read is part of the reading, and a unit that answers nothing
+# leaves a file saying so rather than failing a run that has already happened.
+#
+# <subject> completes "answered nothing about its ...".
+capture_probe() {
+	local into=$1
+	local headline=$2
+	local subject=$3
+	local probe=$4
+	{
+		echo "# ${host} ${headline}, $(date -u +%Y%m%dT%H%M%SZ)"
+		ssh -o BatchMode=yes "root@${host}" "$probe" 2>&1 ||
+			echo "# ${host} answered nothing about its ${subject}"
+	} >"$into"
+}
+
 # The unit's clock discipline, into a file of its own.
 #
 #   capture_clock <file>
@@ -398,9 +422,8 @@ STAMP
 # before and after a run, so a step during it shows up as two readings that
 # disagree.
 #
-# Best-effort in every direction: whichever daemon is installed answers,
-# whatever is absent says so, and a unit that answers nothing leaves a file
-# saying that rather than failing a run that has already happened.
+# Best-effort in every direction: whichever daemon is installed answers and
+# whatever is absent says so, over the wrapper that never fails a run.
 capture_clock() {
 	local into=$1
 	local probe
@@ -410,11 +433,43 @@ capture_clock() {
 	probe="${probe} systemctl status --no-pager --lines=0 \$unit 2>&1; done"
 	probe="${probe}; command -v chronyc >/dev/null && chronyc tracking 2>&1"
 	probe="${probe}; true"
-	{
-		echo "# ${host} clock state, $(date -u +%Y%m%dT%H%M%SZ)"
-		ssh -o BatchMode=yes "root@${host}" "$probe" 2>&1 ||
-			echo "# ${host} answered nothing about its clock"
-	} >"$into"
+	capture_probe "$into" "clock state" "clock" "$probe"
+}
+
+# The kernel facts a bus timing measurement is read against, into a file of its
+# own.
+#
+#   capture_host_facts <file>
+#
+# A serial exchange that takes milliseconds for microseconds of wire time is
+# either the port blocking or the loop thread being descheduled, and which one it
+# is depends on things no record of a run carries: the timer tick the kernel
+# sleeps in units of, whether it runs tickless, the kernel itself, and which
+# driver is behind the serial ports. Captured once per run beside the clock
+# readings, because the unit is re-flashed and re-booted between sessions and a
+# measurement filed without them cannot be compared with the next one.
+#
+# Every serial port the unit has, rather than the one the driver opens: naming
+# that one here would restate a value the driver's own configuration holds, and
+# the whole set is two lines of output.
+#
+# Read-only and best-effort in every direction, like the clock capture: a kernel
+# built without its configuration exposed says so, over the wrapper that never
+# fails a run.
+capture_host_facts() {
+	local into=$1
+	local probe
+	probe='uname -srvm'
+	probe="${probe}; if [ -r /proc/config.gz ]; then zcat /proc/config.gz |"
+	probe="${probe} grep -E '^CONFIG_(HZ|HZ_[0-9]+|NO_HZ[A-Z_]*|HIGH_RES_TIMERS|PREEMPT[A-Z_]*)=';"
+	probe="${probe} else echo '# no /proc/config.gz: this kernel does not publish its configuration';"
+	probe="${probe} fi"
+	probe="${probe}; for tty in /sys/class/tty/ttyAMA* /sys/class/tty/ttyS*; do"
+	probe="${probe} [ -e \"\$tty\" ] || continue;"
+	probe="${probe} echo \"\$tty driver \$(basename \"\$(readlink -f \"\$tty/device/driver\" 2>/dev/null)\" 2>&1)\";"
+	probe="${probe} done"
+	probe="${probe}; true"
+	capture_probe "$into" "kernel facts" "kernel" "$probe"
 }
 
 host=${1:-}
@@ -636,11 +691,19 @@ case "$mode" in
 		# fetch having to know anything. A rename within the store's own
 		# tmpfs, so full-tmpfs and permission failures cannot reach it.
 		remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
-		# TODO(olog-head-capture): the payload's first publishes are
-		# started here, and this is where a fixed capture is verified —
-		# every recorded run's .olog is short at the front, so the
-		# commissioning traffic that says why a session parked is
-		# missing from the log.
+		# The payload's first publishes are started here, and the front
+		# of each stream is whatever the logger was late for: it opens
+		# its subscriptions on a poll after it opens the log and attaches
+		# to a channel at the write head. Nothing in the payload waits
+		# for it, looks for it, or knows about it -- a logger is never a
+		# precondition for driving motors -- so how much of a stream's
+		# head a run holds is the logger's attach time and nothing the
+		# driver decides. The log is self-contained anyway: every fact
+		# the report judges is republished periodically by the driver or
+		# retained on a persistent channel, so a late attach costs the
+		# log stream redundancy and no fact. The report measures the
+		# loss per channel and fails a run that is missing one of those
+		# carriers outright.
 		# The launcher's console directory is emptied with the log root,
 		# for the reason the log root is: the launcher numbers its files
 		# per run and never overwrites, so a directory left to
@@ -669,6 +732,7 @@ case "$mode" in
 		aside=$(mktemp -d)
 		trap 'rm -rf -- "$aside"' EXIT
 		capture_clock "${aside}/clock-before.txt"
+		capture_host_facts "${aside}/host-facts.txt"
 
 		echo "${prog}: running on ${host} for ${run_seconds}s; eyes on the machine" >&2
 		rc=0
@@ -806,7 +870,7 @@ case "$mode" in
 		# worth losing over a capture that did not land.
 		console="${out}.console"
 		mkdir -p -- "$console"
-		for captured in clock-before.txt clock-after.txt run-console.log; do
+		for captured in clock-before.txt clock-after.txt host-facts.txt run-console.log; do
 			[ -e "${aside}/${captured}" ] || {
 				echo "${prog}: no ${captured} to file with the records" >&2
 				continue
@@ -826,19 +890,11 @@ case "$mode" in
 			"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
 		echo "${prog}: log  ${run_dir}"
 
-		# The report's verdict is this script's. The console goes with
-		# the log where the driver's own came back: the analyzer reads
-		# its counters and says so when the recorded trail is shorter
-		# than what the driver counted. Offered only when a driver
-		# console is actually there — the analyzer refuses a console
-		# path holding none, and a run that produced records is not
-		# failed over a console that did not come back.
-		if [ -n "$(find "$console" -name 'motord*' -print -quit)" ]; then
-			report_verdict "$run_dir" --console "$console"
-		else
-			echo "${prog}: no driver console came back, so the log's own trail is uncross-checked" >&2
-			report_verdict "$run_dir"
-		fi
+		# The report's verdict is this script's, and it is read off the
+		# log alone: the driver republishes its whole account of the run
+		# into it, so the analyzer needs no console and a console that
+		# did not come back costs the verdict nothing.
+		report_verdict "$run_dir"
 		;;
 
 	--fetch)
@@ -846,7 +902,7 @@ case "$mode" in
 		[ -n "$dest" ] || usage
 		log_root=$(config_string log_root_dir)
 		out=$(fetch_records "$dest" "$log_root")
-		echo "${prog}: read it: bazel run //cogs:first_motion_report -- --console ${out}.console ${out}/<run>"
+		echo "${prog}: read it: bazel run //cogs:first_motion_report -- ${out}/<run>"
 		;;
 
 	*) usage ;;

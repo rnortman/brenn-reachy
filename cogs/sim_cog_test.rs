@@ -98,6 +98,93 @@ struct Cycle {
     outcome: Option<Outcome>,
     /// The health report, if the rotation was due.
     health: Option<Health>,
+    /// The whole run so far, if this cycle was one the record goes out on.
+    status: Option<Status>,
+}
+
+/// One published status record, copied for the reason [`Sample`] is.
+///
+/// Every field of the record, and not the subset a case happens to read: the
+/// whole value is asserted at once by
+/// [`the_record_this_driver_composes_is_this_one_whole`], which is what makes a
+/// field added to the schema and left unwritten here visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Status {
+    /// When the record was composed.
+    time_ns: i64,
+    /// When the process released the machine it met.
+    sweep_time_ns: i64,
+    /// The rows whose release did not take, as the bits the schema holds.
+    sweep_failed_rows: u16,
+    /// Whether the gate stands in a torque-off latch.
+    torque_latched: bool,
+    /// When the first sample went out, and zero until one has.
+    first_pose_ns: i64,
+    /// When the first of the host's datagrams was taken, and zero until one
+    /// has been.
+    first_session_cmd_ns: i64,
+    /// Datagrams handed to a cycle.
+    queued: u64,
+    /// Setpoints that arrived.
+    goals: u64,
+    /// Host datagrams that arrived, whatever they turned out to say.
+    session_cmds: u64,
+    /// Datagrams that arrived whole and read as nothing this build knows.
+    invalid: u64,
+    /// Datagrams the transport delivered at the wrong length.
+    wrong_size: u64,
+    /// Datagrams a full queue lost.
+    overflowed: u64,
+    /// Datagrams the sender could not deliver.
+    undelivered: u64,
+    /// Receives the transport refused.
+    recv_errors: u64,
+    /// Cycles run with a reader thread stopped.
+    readers_stopped: u64,
+    /// Goals written to the modelled servos.
+    goals_executed: u64,
+    /// Goals a cycle would not act on.
+    goals_dropped: u64,
+    /// Cycles the dead-man expired on.
+    hold_timeouts: u64,
+    /// Reads that came back short.
+    read_misses: u64,
+    /// Writes that did not land.
+    write_failures: u64,
+    /// Events a full slot lost.
+    events_dropped: u64,
+    /// Host datagrams turned away as asks the driver could not act on.
+    aux_refused: u64,
+    /// Delivery re-issues the slot recognised.
+    aux_duplicates: u64,
+    /// Transactions a cycle had no room for.
+    aux_deferred: u64,
+    /// Health reports published.
+    health_reports: u64,
+    /// Rotation turns the bus did not answer.
+    health_misses: u64,
+    /// Torque-off read-backs nothing answered.
+    confirm_misses: u64,
+    /// Cycles in which the bus answered nothing.
+    blind_cycles: u64,
+    /// Cycles run.
+    cycles: u64,
+    /// Grid points passed over without a cycle running.
+    skipped: u64,
+    /// Times the process-start release was written.
+    startup_mrc: u64,
+    /// Cycles a stopped reader was answered with a release on.
+    wire_failures: u64,
+    /// Datagrams taken off the seam.
+    taken: u64,
+    /// Times the clock stepped under the loop.
+    clock_steps: u64,
+    /// Messages this driver has published.
+    published: u64,
+    /// Publishes the transport refused.
+    publish_failures: u64,
+    /// Whether this is the copy a wind-down published on its way out.
+    wound_down: bool,
 }
 
 /// One published aux outcome, copied out of the message for the reason
@@ -208,18 +295,31 @@ struct Sim {
 impl Sim {
     /// A simulated driver at stow, de-torqued, on the default parameters.
     fn new() -> Self {
-        Self::with(false)
+        Self::with_params(|_| {})
     }
 
-    /// The same, starting energised -- what a scenario that arms the machine
-    /// before the process starts would find.
-    fn with(start_torqued: bool) -> Self {
-        Self::with_params(start_torqued, |_| {})
+    /// The same, energised before its first cycle ends.
+    ///
+    /// By injection, which is the vocabulary an arming sequencer's hand on this
+    /// machine has: the process itself releases every row as its first act, so
+    /// a machine that is energised when a case starts asserting is one that
+    /// something else energised. The injection is queued before the first
+    /// execution and read in it, after the release.
+    fn armed() -> Self {
+        let mut sim = Self::new();
+        sim.inject(SimOpWire::TORQUE_ON, flags::all());
+        sim
+    }
+
+    /// The same, meeting a machine a predecessor left energised. What a case
+    /// built this way asserts is the release, not the arming.
+    fn met_torqued() -> Self {
+        Self::with_params(|params| params.start_torqued = true.into())
     }
 
     /// The same, with the scenario's parameters altered before the cog reads
     /// them -- which is how a case says what a badly configured scenario is.
-    fn with_params(start_torqued: bool, edit: impl FnOnce(&mut SimParams)) -> Self {
+    fn with_params(edit: impl FnOnce(&mut SimParams)) -> Self {
         let mut cog = MotorSimTestWrapper::new();
         cog.input_goals_set_num_slots(8);
         cog.input_cmds_set_num_slots(8);
@@ -235,7 +335,6 @@ impl Sim {
         let params = message.clear_valid();
         params.period_ns = PERIOD;
         params.hold_timeout_ns = HOLD_TIMEOUT;
-        params.start_torqued = start_torqued.into();
         params.slew_legs_rad = SLEW_LEGS;
         params.slew_body_yaw_rad = SLEW_LEGS;
         params.slew_antennas_rad = SLEW_ANTENNAS;
@@ -338,6 +437,49 @@ impl Sim {
             }
         });
 
+        let status = self.cog.try_next_status().map(|published| {
+            let status = published.validate().expect("a status the driver wrote");
+            Status {
+                time_ns: status.time.as_nanos(),
+                sweep_time_ns: status.sweep_time.as_nanos(),
+                sweep_failed_rows: JointFlagsWire::from(status.sweep_failed_rows).0,
+                torque_latched: status.torque_latched.into(),
+                first_pose_ns: status.first_pose.as_nanos(),
+                first_session_cmd_ns: status.first_session_cmd.as_nanos(),
+                queued: status.seam.queued,
+                goals: status.seam.goals,
+                session_cmds: status.seam.session_cmds,
+                invalid: status.seam.invalid,
+                wrong_size: status.seam.wrong_size,
+                overflowed: status.seam.overflowed,
+                undelivered: status.seam.undelivered,
+                recv_errors: status.seam.recv_errors,
+                readers_stopped: status.seam.readers_stopped,
+                goals_executed: status.cycle.goals_executed,
+                goals_dropped: status.cycle.goals_dropped,
+                hold_timeouts: status.cycle.hold_timeouts,
+                read_misses: status.cycle.read_misses,
+                write_failures: status.cycle.write_failures,
+                events_dropped: status.cycle.events_dropped,
+                aux_refused: status.cycle.aux_refused,
+                aux_duplicates: status.cycle.aux_duplicates,
+                aux_deferred: status.cycle.aux_deferred,
+                health_reports: status.cycle.health_reports,
+                health_misses: status.cycle.health_misses,
+                confirm_misses: status.cycle.confirm_misses,
+                blind_cycles: status.cycle.blind_cycles,
+                cycles: status.loop_counts.cycles,
+                skipped: status.loop_counts.skipped,
+                startup_mrc: status.loop_counts.startup_mrc,
+                wire_failures: status.loop_counts.wire_failures,
+                taken: status.loop_counts.taken,
+                clock_steps: status.loop_counts.clock_steps,
+                published: status.published,
+                publish_failures: status.publish_failures,
+                wound_down: status.wound_down.into(),
+            }
+        });
+
         // The self-loop, which a box would have made: the sample the cog reads
         // its own last publication back from.
         self.cog
@@ -349,6 +491,7 @@ impl Sim {
             event,
             outcome,
             health,
+            status,
         }
     }
 
@@ -432,6 +575,318 @@ fn the_machine_starts_stowed_de_torqued_and_saying_so() {
     assert_eq!(rows_of(&slot.positions), stow_rows());
 }
 
+/// The process releases the machine it met, before its first cycle ends.
+///
+/// The real driver's first act on the bus, modelled: a driver that has just
+/// started cannot know what a predecessor left energised. `start_torqued` says
+/// the process met an energised machine, and what this asserts is that it does
+/// not stay that way -- rows limp, belief released, gate never commanded, and
+/// the release stamped in the record every status copy carries.
+#[test]
+fn the_process_releases_the_machine_it_met_before_its_first_cycle_ends() {
+    let mut sim = Sim::met_torqued();
+
+    let cycle = sim.step();
+
+    let slot = sim.slot();
+    assert_eq!(
+        slot.torqued,
+        JointFlags::NONE,
+        "the machine the process met is limp by the end of the first cycle",
+    );
+    assert_eq!(slot.has_target, JointFlags::NONE);
+    assert_eq!(
+        slot.aux.believed_torqued,
+        JointFlags::NONE,
+        "the belief goes with the rows: the release is verified as it is written",
+    );
+    let gate = sim.gate();
+    assert!(!gate.latched.get(), "a verified release latches nothing");
+    assert!(!gate.has_held.get());
+    assert!(!gate.has_accepted.get(), "the gate has commanded nothing");
+    assert!(!cycle.sample.torque_off_latched);
+
+    let status = cycle.status.expect("the first cycle publishes a status");
+    assert_eq!(
+        status.sweep_time_ns, cycle.nominal,
+        "the release ran in the first execution",
+    );
+    assert_eq!(
+        status.sweep_failed_rows, 0,
+        "the modelled release has no write that can fail",
+    );
+    assert!(!status.torque_latched);
+    assert_eq!(status.startup_mrc, 1, "written once, on every run");
+}
+
+/// A machine armed after that release stays armed.
+///
+/// The other half of the case above: the injection is read in the same
+/// execution, after the release, so an arming sequencer's hand still lands.
+#[test]
+fn a_machine_armed_after_the_release_is_energised_at_the_end_of_the_first_cycle() {
+    let mut sim = Sim::armed();
+
+    sim.step();
+
+    assert_eq!(
+        sim.slot().torqued,
+        flags::all(),
+        "the injection is read after the release, not before it",
+    );
+    assert_eq!(sim.slot().aux.believed_torqued, flags::all());
+    assert!(!sim.gate().latched.get());
+}
+
+/// The status record goes out on the first cycle and once a simulated second.
+///
+/// Cumulative and complete, which is the whole point of it: a reader that has
+/// seen one copy has read the run. So the cadence only decides how much
+/// redundancy a log holds, and the first cycle publishes one so that the
+/// release is on the wire from the first instant.
+#[test]
+fn a_status_record_goes_out_on_the_first_cycle_and_once_a_simulated_second() {
+    let mut sim = Sim::new();
+
+    let first = sim.step().status.expect("the first cycle publishes one");
+    assert_eq!(first.cycles, 1);
+    assert_eq!(first.time_ns, T0 + PERIOD);
+    assert!(!first.wound_down, "nothing winds this driver down");
+
+    let cadence = usize::try_from(1_000_000_000 / PERIOD).expect("a second of cycles");
+    let between = sim.quiet(cadence - 1);
+    assert!(
+        between.iter().all(|cycle| cycle.status.is_none()),
+        "one copy a simulated second, and not one a cycle",
+    );
+
+    let second = sim
+        .quiet(1)
+        .pop()
+        .expect("a cycle")
+        .status
+        .expect("a copy a second after the first");
+    assert_eq!(
+        second.time_ns - first.time_ns,
+        1_000_000_000,
+        "the cadence is a simulated second",
+    );
+    assert_eq!(second.cycles, u64::try_from(cadence).expect("a count") + 1);
+    assert!(
+        second.published > first.published,
+        "every count is the run's total at the copy's instant",
+    );
+    assert!(!second.wound_down);
+}
+
+/// The whole record, field for field, over one known run.
+///
+/// `DriverStatus` is composed twice -- once by the real driver's `publish_status`
+/// and once by this cog's `write_status` -- as two hand-written mappings out of
+/// different state, and the analyzer that verifies a run reads whichever the log
+/// carries. Nothing in either language joins them. So the value is asserted
+/// whole rather than field by field: a field added to the schema, or one this
+/// driver quietly stops writing, changes this literal and has to be answered
+/// here.
+///
+/// The zeros are the justified set, and each says why it is one. They are the
+/// fields naming something an in-process channel cannot do -- a datagram of the
+/// wrong length, a queue that overflowed, a reader thread that stopped, a send
+/// or a write the transport refused -- plus the states this run did not reach.
+/// A zero appearing beside a *new* field is what this case exists to make
+/// somebody look at.
+#[test]
+fn the_record_this_driver_composes_is_this_one_whole() {
+    let mut sim = Sim::new();
+    sim.keep_alive();
+    let first = sim.step().status.expect("the first cycle publishes one");
+
+    assert_eq!(
+        first,
+        Status {
+            // The first execution's own instant, written out rather than read
+            // off the value under test: four fields carry it, and asserting
+            // each against itself would pass any clock the driver stamped them
+            // from so long as it stamped all four from the same one.
+            time_ns: T0 + PERIOD,
+            sweep_time_ns: T0 + PERIOD,
+            // The modelled release writes every row and cannot leave one
+            // behind, and a verified release latches nothing.
+            sweep_failed_rows: 0,
+            torque_latched: false,
+            first_pose_ns: T0 + PERIOD,
+            first_session_cmd_ns: T0 + PERIOD,
+            queued: 1,
+            goals: 0,
+            session_cmds: 1,
+            invalid: 0,
+            // The seam here is a channel: no length, no queue, no reader
+            // thread and no send of its own to fail.
+            wrong_size: 0,
+            overflowed: 0,
+            undelivered: 0,
+            recv_errors: 0,
+            readers_stopped: 0,
+            goals_executed: 0,
+            goals_dropped: 0,
+            hold_timeouts: 0,
+            // A cycle either reads every row or reads none: there is no short
+            // read and no write that fails to land.
+            read_misses: 0,
+            write_failures: 0,
+            events_dropped: 0,
+            aux_refused: 0,
+            aux_duplicates: 0,
+            // One transaction a cycle, and the slot is never asked twice.
+            aux_deferred: 0,
+            // The rotation visits a servo on the first cycle.
+            health_reports: 1,
+            health_misses: 0,
+            confirm_misses: 0,
+            blind_cycles: 0,
+            cycles: 1,
+            skipped: 0,
+            // Once, on the first execution, as it is on every run of the real
+            // driver.
+            startup_mrc: 1,
+            // The wire this driver's fail-safes measure cannot fail, and the
+            // clock is the runner's.
+            wire_failures: 0,
+            taken: 1,
+            clock_steps: 0,
+            // The sample and the health report. The record's own publication
+            // is not in it: it has not happened yet.
+            published: 2,
+            // An in-process publish is a slot write.
+            publish_failures: 0,
+            // Nothing winds this driver down: the runner stops the process.
+            wound_down: false,
+        },
+    );
+}
+
+/// Every counter the status carries is this driver's own honest count.
+///
+/// The record is what a run is verified from, so each number has to be the one
+/// the thing it names actually did: a goal written, an ask turned away, a
+/// delivery re-issue recognised, a health report published, a cycle the bus
+/// answered nothing on, and a grid point no cycle attended.
+#[test]
+fn the_status_counts_what_this_driver_did() {
+    let mut sim = Sim::armed();
+    sim.step();
+
+    // A goal, executed at its instant.
+    let mut asked = stow_rows();
+    asked[0] += 0.05;
+    sim.commanded_step(&asked, JointFlagsWire::from(flags::all()).0);
+    sim.quiet(3);
+
+    // A datagram asking nothing at all: an ask the driver turned away.
+    sim.ask(&SessionCmdWire::new());
+    // Two copies of one transaction in one cycle: the second is the transport
+    // repeating itself, which the first one's outcome answers.
+    let txn = transaction(AuxOpKindWire::PING, 10, RegIdWire::NONE, None);
+    sim.transact(31, &txn);
+    sim.transact(31, &txn);
+    sim.step();
+
+    // A cycle whose replies were all lost, and an execution that stepped over
+    // two grid points on its way.
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::DROP_REPLIES);
+    cmd.set_count(1);
+    sim.inject_full(&cmd);
+    sim.step();
+    sim.step_by(3);
+
+    let cadence = usize::try_from(1_000_000_000 / PERIOD).expect("a second of cycles");
+    let status = sim
+        .quiet(cadence)
+        .into_iter()
+        .filter_map(|cycle| cycle.status)
+        .next_back()
+        .expect("a copy within a second of cycles");
+    assert_eq!(status.goals_executed, 1);
+    assert_eq!(status.aux_refused, 1, "the datagram that asked nothing");
+    assert_eq!(status.aux_duplicates, 1, "the second copy of one request");
+    assert!(
+        status.health_reports > 0,
+        "the rotation has come round by now",
+    );
+    assert_eq!(status.blind_cycles, 1);
+    assert_eq!(status.skipped, 2, "the two grid points nothing attended");
+}
+
+/// The two first-contact instants are stamped once, and a host that commanded
+/// the machine on the cycle that first showed it one ties.
+///
+/// What the run report reads to know the session waited for a sample before it
+/// commissioned. Both are the driver's own clock, and the datagrams are taken
+/// before the sample goes out, so the tie is what a session commanding on the
+/// first cycle looks like from here.
+#[test]
+fn the_first_sample_and_the_first_host_datagram_are_stamped_once() {
+    let mut sim = Sim::new();
+
+    sim.keep_alive();
+    let first = sim.step().status.expect("the first cycle publishes one");
+    assert_eq!(first.first_pose_ns, first.time_ns);
+    assert_eq!(
+        first.first_session_cmd_ns, first.first_pose_ns,
+        "a datagram taken on the cycle that published the first sample ties",
+    );
+
+    let cadence = usize::try_from(1_000_000_000 / PERIOD).expect("a second of cycles");
+    sim.keep_alive();
+    let later = sim
+        .quiet(cadence)
+        .pop()
+        .expect("a cycle")
+        .status
+        .expect("the next copy");
+    assert_eq!(later.first_pose_ns, first.first_pose_ns);
+    assert_eq!(
+        later.first_session_cmd_ns, first.first_session_cmd_ns,
+        "the instants are the first ones, not the latest",
+    );
+    assert!(later.session_cmds > first.session_cmds);
+}
+
+/// What the status counts of the seam is what arrived on it.
+///
+/// Including the datagrams no ask could be read out of: this driver's transport
+/// is the channel itself, so the census of that channel counts them and a count
+/// that did not could not be checked against it.
+#[test]
+fn the_status_counts_every_datagram_that_arrived_including_the_unreadable() {
+    let mut sim = Sim::new();
+    sim.step();
+
+    // A kind past the vocabulary: bytes that describe no datagram.
+    let mut cmd = SessionCmdWire::new();
+    cmd.set_kind(SessionCmdKindWire(9));
+    sim.ask(&cmd);
+    sim.keep_alive();
+    sim.send_goal(&setpoint(sim.now + PERIOD, 0, stow_rows()));
+
+    let cadence = usize::try_from(1_000_000_000 / PERIOD).expect("a second of cycles");
+    let status = sim
+        .quiet(cadence)
+        .pop()
+        .expect("a cycle")
+        .status
+        .expect("the next copy");
+    assert_eq!(status.session_cmds, 2, "both of them arrived");
+    assert_eq!(status.invalid, 1, "one of them read as nothing");
+    assert_eq!(status.goals, 1);
+    assert_eq!(
+        status.queued,
+        status.session_cmds + status.goals,
+        "a cycle reads the channels directly: what arrived is what reached it",
+    );
+}
+
 #[test]
 fn a_sample_goes_out_every_cycle_stamped_with_the_cycle_it_is_for() {
     let mut sim = Sim::new();
@@ -453,7 +908,7 @@ fn a_sample_goes_out_every_cycle_stamped_with_the_cycle_it_is_for() {
 /// asked to move.
 #[test]
 fn a_partial_mask_commands_only_its_own_rows() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let stow = stow_rows();
     let mut asked = stow;
     for row in &mut asked {
@@ -487,7 +942,7 @@ fn a_partial_mask_commands_only_its_own_rows() {
 
 #[test]
 fn a_goal_is_written_at_its_instant_and_not_before() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[0] += 0.05;
 
@@ -528,7 +983,7 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
 
 #[test]
 fn a_servo_moves_no_further_than_its_slew_in_one_cycle() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     // Further than any servo can travel in a cycle, so every cycle is a
     // full-rate one and the rate is what is asserted.
     let mut targets = stow_rows();
@@ -564,7 +1019,7 @@ fn a_servo_moves_no_further_than_its_slew_in_one_cycle() {
 
 #[test]
 fn a_partial_mask_moves_only_its_own_rows() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let start = stow_rows();
     let mut targets = start;
     for row in &mut targets {
@@ -593,7 +1048,7 @@ fn a_partial_mask_moves_only_its_own_rows() {
 
 #[test]
 fn a_jammed_servo_holds_while_the_rest_of_the_machine_tracks() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let start = stow_rows();
     let mut targets = start;
     for row in &mut targets {
@@ -670,7 +1125,7 @@ fn a_teleport_puts_the_servos_where_the_scenario_says() {
 
 #[test]
 fn a_cycle_whose_replies_were_lost_says_so_and_the_machine_keeps_moving() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 10.0;
 
@@ -708,7 +1163,7 @@ fn a_cycle_whose_replies_were_lost_says_so_and_the_machine_keeps_moving() {
 
 #[test]
 fn silence_de_torques_the_machine_and_is_announced_exactly_once() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 0.05;
     sim.commanded_step(&targets, JOINT_MASK_ALL);
@@ -814,7 +1269,7 @@ fn arming_ends_a_latch_and_grants_a_fresh_window() {
 /// de-torquing is part of it.
 #[test]
 fn a_machine_re_armed_after_a_stall_moves_nothing_until_it_is_told_to() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 10.0;
     for _ in 0..(LAG + 2) {
@@ -870,7 +1325,7 @@ fn a_machine_re_armed_after_a_stall_moves_nothing_until_it_is_told_to() {
 /// the gate rewriting to servos that are holding a position under torque.
 #[test]
 fn a_partial_disarm_keeps_the_setpoint_the_rest_of_the_machine_is_holding() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 0.05;
     for _ in 0..(LAG + 2) {
@@ -906,7 +1361,7 @@ fn a_partial_disarm_keeps_the_setpoint_the_rest_of_the_machine_is_holding() {
 
 #[test]
 fn a_confirmed_disarm_forgets_the_setpoint_without_latching() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 0.05;
     for _ in 0..(LAG + 2) {
@@ -934,7 +1389,7 @@ fn a_confirmed_disarm_forgets_the_setpoint_without_latching() {
 
 #[test]
 fn a_sender_overrunning_the_queue_is_dropped_and_told() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let targets = stow_rows();
 
     // More goals in one cycle than the queue holds, all stamped far enough
@@ -968,7 +1423,7 @@ fn a_sender_overrunning_the_queue_is_dropped_and_told() {
 
 #[test]
 fn a_goal_stamped_for_an_instant_already_past_is_taken_and_warned() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let goal = setpoint(T0 - PERIOD, JOINT_MASK_ALL, stow_rows());
     sim.send_goal(&goal);
     let cycle = sim.step();
@@ -992,7 +1447,7 @@ fn a_goal_stamped_for_an_instant_already_past_is_taken_and_warned() {
 /// same outcome covers.
 #[test]
 fn a_goal_merely_out_of_order_says_it_is_late_by_nothing() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let targets = stow_rows();
     let later = setpoint(sim.now + 5 * PERIOD, JOINT_MASK_ALL, targets);
     let earlier = setpoint(sim.now + 3 * PERIOD, JOINT_MASK_ALL, targets);
@@ -1021,7 +1476,7 @@ fn a_goal_merely_out_of_order_says_it_is_late_by_nothing() {
 /// has to see, and the goal event is the one that is counted instead.
 #[test]
 fn the_dead_mans_latch_takes_the_slot_from_a_goal_event_raised_first() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let targets = stow_rows();
     // Far enough ahead that none of them ever becomes due and drains a slot.
     fn overrun(sim: &mut Sim, targets: &[f64; JOINT_COUNT]) {
@@ -1113,7 +1568,7 @@ fn a_refused_arming_does_not_end_a_latch() {
 /// how a scenario runs green with part of its hand on the machine discarded.
 #[test]
 fn an_injection_naming_servos_this_build_does_not_know_is_refused_whole() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut cmd = SimCmdWire::new();
     cmd.set_op(SimOpWire::DROP_REPLIES);
     cmd.set_mask(JointFlagsWire(1 << JOINT_COUNT));
@@ -1132,7 +1587,7 @@ fn an_injection_naming_servos_this_build_does_not_know_is_refused_whole() {
 /// The same operation with a set this build can read is carried out.
 #[test]
 fn an_injection_this_build_can_read_whole_is_carried_out() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut cmd = SimCmdWire::new();
     cmd.set_op(SimOpWire::DROP_REPLIES);
     cmd.set_count(2);
@@ -1149,7 +1604,7 @@ fn an_injection_this_build_can_read_whole_is_carried_out() {
 /// one field of the slot was damaged.
 #[test]
 fn a_state_this_build_cannot_read_is_cleared_and_counted() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut goal = setpoint(T0 + PERIOD, JOINT_MASK_ALL, stow_rows());
     goal.set_mask(JointFlagsWire(1 << 15));
     sim.send_goal(&goal);
@@ -1183,13 +1638,103 @@ fn a_state_this_build_cannot_read_is_cleared_and_counted() {
     assert!(cycle.sample.present_valid, "and the cycle still reported");
 }
 
+/// The last status record a run of cycles carried, where one of them did.
+///
+/// Which cycle of a window publishes it depends on where the cadence's count
+/// stood when the window opened, and a case about what a copy says is not a case
+/// about that.
+fn newest_status(cycles: Vec<Cycle>) -> Option<Status> {
+    cycles.into_iter().rev().find_map(|cycle| cycle.status)
+}
+
+/// A restart from a slot this build could not read still reports the whole run.
+///
+/// The record says of itself that it is cumulative since the process started, so
+/// a reader that has seen one copy has read the run -- and the analyzer reads
+/// the newest copy. A restart that took the counters back to zero would make
+/// every copy after it undercount in the one direction the drift check forgives,
+/// so a log that really did lose messages would balance. The two first-instants
+/// go the same way: they name when something first happened in the run, and the
+/// survey ordering is decided from them.
+///
+/// The sweep instant is the exception, and is asserted as one: the restart runs
+/// the release again, so what it reports is when this state's release ran.
+#[test]
+fn a_restart_from_a_refused_slot_still_reports_the_whole_run() {
+    let mut sim = Sim::new();
+    sim.keep_alive();
+    let first = sim.step().status.expect("the first cycle publishes one");
+
+    let cadence = usize::try_from(1_000_000_000 / PERIOD).expect("a second of cycles");
+    let before = newest_status(sim.quiet(cadence)).expect("a copy a simulated second on");
+    assert!(before.cycles > 1, "the case rests on a run worth losing");
+
+    // A bit above the ninth bus row, which no build of this cog wrote: what a
+    // slot written by a machine with more servos would look like from here.
+    sim.cog
+        .state_sim_mut()
+        .set_torqued(JointFlagsWire(1 << JOINT_COUNT));
+    let restart = sim.step();
+    let swept_again = sim.now;
+    assert!(
+        restart.status.is_none(),
+        "a restart is not a process start: the run's first copy already went out",
+    );
+
+    let after = newest_status(sim.quiet(cadence)).expect("a copy a simulated second on");
+
+    assert_eq!(sim.slot().refused_state_fields, 1, "counted once");
+    assert_eq!(
+        after.sweep_time_ns, swept_again,
+        "the release ran again, and the record says when",
+    );
+    assert_eq!(
+        (after.first_pose_ns, after.first_session_cmd_ns),
+        (first.first_pose_ns, first.first_session_cmd_ns),
+        "the run's first sample and first datagram are still the run's first",
+    );
+    for (name, then, now) in [
+        ("cycles", before.cycles, after.cycles),
+        ("skipped", before.skipped, after.skipped),
+        ("session_cmds", before.session_cmds, after.session_cmds),
+        ("taken", before.taken, after.taken),
+        ("published", before.published, after.published),
+        (
+            "health_reports",
+            before.health_reports,
+            after.health_reports,
+        ),
+        ("health_misses", before.health_misses, after.health_misses),
+        (
+            "aux_duplicates",
+            before.aux_duplicates,
+            after.aux_duplicates,
+        ),
+        ("blind_cycles", before.blind_cycles, after.blind_cycles),
+        (
+            "confirm_misses",
+            before.confirm_misses,
+            after.confirm_misses,
+        ),
+    ] {
+        assert!(
+            now >= then,
+            "{name} went backwards across the restart: {then} then {now}",
+        );
+    }
+    assert!(
+        after.cycles > before.cycles,
+        "and the run carried on counting from where it was",
+    );
+}
+
 /// A slot damaged while the dead-man holds the machine off does not re-energise
 /// it. The latch is in the bytes the cycle refused, so the restart cannot know
 /// whether it stands -- and a modelled machine that torqued itself out of a
 /// memory fault would certify the one transition the latch exists to prevent.
 #[test]
 fn a_slot_damaged_while_the_dead_man_is_latched_comes_back_de_torqued() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut targets = stow_rows();
     targets[1] += 0.05;
     sim.commanded_step(&targets, JOINT_MASK_ALL);
@@ -1222,7 +1767,7 @@ fn a_slot_damaged_while_the_dead_man_is_latched_comes_back_de_torqued() {
 
 #[test]
 fn a_goal_naming_servos_this_build_does_not_know_is_counted_and_nothing_else() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let mut goal = setpoint(T0 + PERIOD, JOINT_MASK_ALL, stow_rows());
     // A bit above the ninth bus row: a set this build cannot read, which is
     // what a machine with more servos than this one would publish.
@@ -1246,7 +1791,7 @@ fn a_goal_naming_servos_this_build_does_not_know_is_counted_and_nothing_else() {
 /// other one read twice.
 #[test]
 fn two_events_separated_by_quiet_cycles_each_name_their_own_cycle() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     let stale = setpoint(T0 - PERIOD, JOINT_MASK_ALL, stow_rows());
     sim.send_goal(&stale);
     let first = sim.step();
@@ -1269,7 +1814,7 @@ fn two_events_separated_by_quiet_cycles_each_name_their_own_cycle() {
 
 #[test]
 fn a_late_cycle_makes_up_whole_cycles_of_motion_and_no_more() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     // Further than any catch-up covers, so every cycle asserted here is a
     // full-rate one and the rate is what is being counted.
     let mut targets = stow_rows();
@@ -1296,7 +1841,7 @@ fn a_late_cycle_makes_up_whole_cycles_of_motion_and_no_more() {
 
 #[test]
 fn an_injection_this_build_cannot_carry_out_is_counted_and_does_nothing() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
 
     // A set naming a tenth bus row, which no machine has: refused rather than
     // masked down to the nine it does have.
@@ -1341,7 +1886,7 @@ fn an_injection_this_build_cannot_carry_out_is_counted_and_does_nothing() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.period_ns = PERIOD / 2);
+    let mut sim = Sim::with_params(|params| params.period_ns = PERIOD / 2);
     sim.step();
 }
 
@@ -1350,7 +1895,7 @@ fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_servos_have_no_rate_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.slew_antennas_rad = 0.0);
+    let mut sim = Sim::with_params(|params| params.slew_antennas_rad = 0.0);
     sim.step();
 }
 
@@ -1361,7 +1906,7 @@ fn a_scenario_whose_servos_have_no_rate_is_refused() {
 #[test]
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_dead_man_allows_no_silence_is_refused() {
-    let mut sim = Sim::with_params(true, |params| params.hold_timeout_ns = 0);
+    let mut sim = Sim::with_params(|params| params.hold_timeout_ns = 0);
     sim.step();
 }
 
@@ -1901,11 +2446,18 @@ fn a_second_transaction_in_one_cycle_is_refused_against_its_own_number() {
 
     let outcome = cycle.outcome.expect("the refusal is an answer");
     assert_eq!(outcome.corr, 12, "the second request is the refused one");
-    assert_eq!(outcome.status, AuxStatus::Refused);
+    assert_eq!(
+        outcome.status,
+        AuxStatus::Busy,
+        "the slot was full, which is not a decline of the transaction"
+    );
     assert_eq!(sim.slot().aux_refused, 1);
 
     // The first request was accepted and run; its answer lost the cycle's one
-    // outcome slot to the refusal, which is what the host's own re-issue is for.
+    // outcome slot to the refusal. The real driver keeps both and publishes
+    // both, so this is the simulated host's single slot showing and not a
+    // behaviour to carry back to it.
+    // TODO(sim-aux-turned-away)
     assert!(!sim.slot().aux.has_pending.get());
 }
 
@@ -1967,7 +2519,7 @@ fn a_datagram_asking_nothing_is_refused_and_is_not_liveness() {
 /// has stopped and torque is still on.
 #[test]
 fn keep_alives_hold_the_dead_man_off_with_no_goal_stream() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     sim.step();
 
     // Twice the hold timeout, with nothing but keep-alives.
@@ -1993,7 +2545,7 @@ fn keep_alives_hold_the_dead_man_off_with_no_goal_stream() {
 /// nobody read back is one the dead-man must keep running over.
 #[test]
 fn a_commanded_torque_off_is_swept_and_then_confirmed() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     sim.step();
 
     let mut cmd = SessionCmdWire::new();
@@ -2039,7 +2591,7 @@ fn a_commanded_torque_off_is_swept_and_then_confirmed() {
 /// pass down first. It is `TorqueOffConfirm`'s own case.
 #[test]
 fn a_fresh_arming_stands_the_confirmation_pass_down() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     sim.step();
 
     let mut cmd = SessionCmdWire::new();
@@ -2377,7 +2929,7 @@ fn a_servo_off_the_bus_makes_no_health_report_and_the_rotation_walks_on() {
 /// cycle and the belief still stands, because nothing gates de-torquing.
 #[test]
 fn a_de_torquing_is_not_confirmed_while_a_servo_is_off_the_bus() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     sim.step();
     sim.inject(SimOpWire::ABSENT_SERVO, flags::bit(JointRef::Leg3));
     sim.step();
@@ -2550,7 +3102,7 @@ fn a_release_commanded_after_a_request_abandons_it() {
 /// would credit a de-torquing to a read-back that never happened.
 #[test]
 fn a_blind_cycle_answers_nothing_on_any_path() {
-    let mut sim = Sim::with(true);
+    let mut sim = Sim::armed();
     sim.step();
     let held = sim_regs::read(&sim.slot().regs, 8, RegId::TorqueEnable);
     assert_eq!(held, Ok(value::u8(1)), "the machine came up energised");

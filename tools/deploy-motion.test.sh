@@ -113,6 +113,7 @@ export GIT_STATUS_FAILS=no
 # case can read what the file says rather than only that the payload was sent.
 export PUSHED_PROVENANCE="${work}/pushed-provenance"
 export SSH_PREPARE_STATUS=0
+export SSH_PROBE_STATUS=0
 export SSH_RUN_STATUS=124
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
@@ -128,6 +129,10 @@ printf 'ssh %s\n' "$*" >>"$CALLS"
 # than the probe's, so the two are separate knobs: a case can hold the bus for a
 # push and answer 124 for a run.
 case " $* " in
+	# The read-only captures are their own knob: what a probe does when the
+	# unit will not answer it is a property of the run, not of the push that
+	# preceded it.
+	*timedatectl*|*/proc/config.gz*) exit "${SSH_PROBE_STATUS:-0}" ;;
 	*" -t "*) exit "${SSH_RUN_STATUS:-124}" ;;
 esac
 exit "${SSH_PREPARE_STATUS:-0}"
@@ -506,7 +511,7 @@ assert_contains "the records are fetched from the configured log root" "$ran" \
 assert_lacks "the log root is read, not retyped" "$ran" "/decoy"
 assert_lacks "and read out of the payload, not out of the tree" "$ran" "fromthetree"
 assert_contains "the analyzer judges the run directory that was discovered" "$ran" \
-	"bazel run -- //cogs:first_motion_report --console ${run_dest}/motion-log-"
+	"bazel run -- //cogs:first_motion_report ${run_dest}/motion-log-"
 assert_contains "and the directory it names is the writer's own" "$ran" \
 	"run-20260825T120000Z"
 assert_lacks "a hardware log is read with no jitter band" "$ran" "--grid-jitter-ns"
@@ -535,10 +540,39 @@ assert_eq "so did the run's own console stream" 1 \
 	"$(find "$console_dir" -name 'run-console.log' | wc -l)"
 assert_eq "and the clock was read on both sides of the run" 2 \
 	"$(find "$console_dir" -name 'clock-*.txt' | wc -l)"
+assert_eq "and the kernel facts a bus measurement is read against came back" 1 \
+	"$(find "$console_dir" -name 'host-facts.txt' | wc -l)"
+assert_contains "the kernel facts ask what the timer tick is" "$ran" \
+	"CONFIG_(HZ|HZ_[0-9]+|NO_HZ"
+assert_contains "and say so where the kernel publishes no configuration" "$ran" \
+	"this kernel does not publish its configuration"
+assert_contains "and ask which driver is behind the serial ports" "$ran" \
+	"/sys/class/tty/ttyAMA*"
+assert_lacks "without naming the port the driver opens" "$ran" "ttyAMA3"
 assert_contains "the clock reading asks the time daemon what it does" "$ran" \
 	"timedatectl show"
 assert_contains "and asks whichever NTP service the unit runs" "$ran" \
 	"systemd-timesyncd"
+
+# A probe is a diagnostic taken after the run, and the records it sits beside
+# exist only on a tmpfs until the fetch. So a unit that answers nothing about
+# its kernel or its clock leaves a file saying so and the run still reports:
+# losing a completed run over a reading that did not land would be the whole
+# point of the wrapper going the wrong way.
+SSH_PROBE_STATUS=255
+silent_dest="${work}/run-silent-probes"
+result=$(deploy unit --run "$silent_dest")
+assert_status "a run whose probes answered nothing still reports" 0 \
+	"$(status_of "$result")"
+silent_console=$(find "$silent_dest" -mindepth 1 -maxdepth 1 -type d -name '*.console')
+assert_eq "and the kernel facts still came back as a file" 1 \
+	"$(find "$silent_console" -name 'host-facts.txt' | wc -l)"
+assert_contains "saying the unit answered nothing about its kernel" \
+	"$(cat -- "${silent_console}/host-facts.txt")" "answered nothing about its kernel"
+assert_contains "and the clock capture says the same about its clock" \
+	"$(cat -- "$(find "$silent_console" -name 'clock-before.txt')")" \
+	"answered nothing about its clock"
+SSH_PROBE_STATUS=0
 
 # The console is beside the records rather than under them for a reason worth
 # pinning: the run directory is the newest *directory* under the fetched root,
@@ -547,8 +581,7 @@ assert_eq "nothing but run directories sits under the fetched records" 0 \
 	"$(find "${run_dest}"/motion-log-*/ -mindepth 1 -maxdepth 1 -type d \
 		! -name 'run-*' | wc -l)"
 
-assert_contains "the console the analyzer is handed is the one that was fetched" "$ran" \
-	"--console ${console_dir} "
+assert_lacks "the analyzer is handed nothing but the log" "$ran" "--console"
 
 # The push's stamp is copied into the log root before the launcher starts, so it
 # comes home at the root of the records with no fetch-side logic having placed it
@@ -577,16 +610,16 @@ assert_contains "and the console that did land was filed" "$(output_of "$result"
 	"no run-console.log to file with the records"
 TEE_STATUS=0
 
-# A launcher directory that came back without the driver's own console is not a
-# failed run: the analyzer refuses a console path holding no driver log, so it
-# is offered one only when there is one.
+# A launcher directory that came back without the driver's own console costs the
+# verdict nothing: the driver republishes its whole account of the run into the
+# log, so the analyzer reads no console at all.
 RSYNC_CONSOLE=nodriver
 result=$(deploy unit --run "${work}/run-nodriverconsole")
 assert_status "a run whose driver console did not come back still reports" 0 \
 	"$(status_of "$result")"
-assert_contains "and says the trail went uncross-checked" "$(output_of "$result")" \
-	"uncross-checked"
-assert_lacks "and the analyzer is offered no console" "$(calls)" "--console"
+assert_contains "and the analyzer still judged the run" "$(calls)" \
+	"//cogs:first_motion_report"
+assert_lacks "and it was handed no console" "$(calls)" "--console"
 
 RSYNC_CONSOLE=none
 result=$(deploy unit --run "${work}/run-noconsole")
@@ -666,7 +699,7 @@ stage_logger_config
 rel_dest=$(basename -- "${work}")/run-records-relative
 result=$(cd -- "$(dirname -- "${work}")" && deploy unit --run "$rel_dest")
 assert_status "a relative records directory runs" 0 "$(status_of "$result")"
-assert_contains "and the analyzer is handed an absolute path" "$(calls)" 	"bazel run -- //cogs:first_motion_report --console ${work}/run-records-relative/motion-log-"
+assert_contains "and the analyzer is handed an absolute path" "$(calls)" 	"bazel run -- //cogs:first_motion_report ${work}/run-records-relative/motion-log-"
 
 # The report's verdict is the wrapper's: a green run over a log the analyzer
 # fails is a failed run.
@@ -865,8 +898,8 @@ assert_status "a fetch succeeds" 0 "$(status_of "$result")"
 assert_contains "the fetch reads the log root out of the configuration" "$(calls)" \
 	"root@unit:/run/brenn-app/logs/testing/"
 assert_contains "the fetch names the analyzer" "$(output_of "$result")" "first_motion_report"
-assert_contains "and hands it the console beside the records" "$(output_of "$result")" \
-	"--console ${dest}/motion-log-"
+assert_contains "and hands it the records and nothing else" "$(output_of "$result")" \
+	"first_motion_report -- ${dest}/motion-log-"
 fetched=$(find "$dest" -mindepth 1 -maxdepth 1 -type d ! -name '*.console' | wc -l)
 if [ "$fetched" = 1 ]; then
 	pass "the fetch lands in one stamped directory"

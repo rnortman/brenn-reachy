@@ -71,9 +71,12 @@ fn usage() -> String {
          holding torque, so the assertion that it releases fails: that failure is the\n\
          standing record of an unresolved policy defect and is not to be made green. The\n\
          command's own make-safe disarms the register and releases torque on the way out,\n\
-         whichever way it ends. Run it at rest, never with the head up, and\n\
-         power-cycle before the next read-only sweep: the register is RAM-resident and the\n\
-         sweep expects the provisioned zero.\n\
+         whichever way it ends. Run it at rest, never with the head up. No power cycle is\n\
+         needed before the next read-only sweep: the sweep accepts both readings a machine\n\
+         at rest has, the provisioned zero and the value a session arms. Check that the\n\
+         disarm took, though — this command arms the same value a session does, so one\n\
+         servo left armed among eight at zero splits the roster across the two and the\n\
+         sweep fails on the mix, naming the servo.\n\
          \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
@@ -179,18 +182,25 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
             args.operands.push(word);
             continue;
         }
-        // Every flag takes a value, so a missing one is an operator typo rather
-        // than shorthand for anything.
-        let value = argv
-            .next()
-            .with_context(|| format!("`{word}` needs a value\n\n{}", usage()))?;
+        // The name is matched before its value is taken, so a flag nobody
+        // defined is refused by name whether or not a word follows it: an
+        // option that used to exist is what an operator most often types, and
+        // "needs a value" would send them looking for the value instead of for
+        // the flag. Every flag this program does define takes a value, so a
+        // missing one is an operator typo rather than shorthand for anything.
         match word.as_str() {
-            "--config" => args.config = PathBuf::from(value),
-            "--record" => args.record = Some(PathBuf::from(value)),
+            "--config" => args.config = PathBuf::from(value_for(&word, &mut argv)?),
+            "--record" => args.record = Some(PathBuf::from(value_for(&word, &mut argv)?)),
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
     Ok(args)
+}
+
+/// The word after a flag, or a refusal naming the flag that wanted it.
+fn value_for(flag: &str, argv: &mut impl Iterator<Item = String>) -> anyhow::Result<String> {
+    argv.next()
+        .with_context(|| format!("`{flag}` needs a value\n\n{}", usage()))
 }
 
 /// Refuse an invocation carrying words this command has no use for.
@@ -555,9 +565,28 @@ mod tests {
         assert_eq!(optional_id(&args).expect("11 is an id"), Some(11));
     }
 
-    /// A word that is not a servo ID is refused as one, rather than reaching
-    /// the roster check as an ID nobody configured.
-    ///
+    /// An invocation carrying `--no-drain` is refused by name rather than
+    /// quietly ignored: an operator running the timing case with it would
+    /// otherwise believe they had measured two different ports.
+    #[test]
+    fn the_drain_switch_is_no_longer_an_option() {
+        // Both shapes: the flag with a word after it, and the flag last, which
+        // is what an operator running the timing case actually types. A parser
+        // that took the value before matching the name refused the second with
+        // "needs a value", which reads as a flag that still exists.
+        for invocation in [&["--no-drain", "11"][..], &["--no-drain"][..]] {
+            let refusal = parse_args(argv(invocation)).expect_err("it is not an option");
+            assert!(
+                refusal.to_string().contains("unknown option `--no-drain`"),
+                "the refusal names the flag: {refusal}"
+            );
+        }
+        assert!(
+            !usage().contains("--no-drain"),
+            "and the usage text does not offer it"
+        );
+    }
+
     /// `256` is the case that matters: it is a number, and it is not an ID, so
     /// a refusal that only checked for digits would send it to the roster and
     /// report it as a servo this machine does not carry — which is true of

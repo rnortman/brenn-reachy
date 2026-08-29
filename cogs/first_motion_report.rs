@@ -7,13 +7,21 @@
 //! the read jitter was, how far the machine lagged its own goals, what the
 //! health rotation saw, and how many messages every channel carried.
 //!
-//! It reads records and nothing else. No process is started and no clock on
-//! this machine is consulted, so a run that happened on a unit last week is
-//! judged the same way as one that finished a second ago. Nothing about the
-//! *machine* is taken from a console either: the driver's console log, when a
-//! run's records carry one, is read for the counters it prints and those are
-//! used against the log itself -- a recorded trail shorter than what the driver
-//! counted is a trail every other check here is reading too little of.
+//! It reads the log and nothing else. No process is started, no clock on this
+//! machine is consulted and no file beside the log is opened, so a run that
+//! happened on a unit last week is judged the same way as one that finished a
+//! second ago.
+//!
+//! What makes that possible is that the log is self-contained by construction.
+//! The logger attaches to each channel lazily and at the write head, so the
+//! front of every stream is whatever it was late for; a run therefore loses
+//! stream heads as a matter of course, and this tool measures that loss rather
+//! than judging it. Every fact a verdict here turns on rides a carrier that
+//! survives a late attach instead: the driver republishes its whole account of
+//! the run on `DriverStatus`, the session republishes its whole story on
+//! `ReportsOut`, and an out-of-band outcome names the transaction it answers.
+//! A log missing one of those carriers is a run that cannot be verified, and
+//! that is a finding of its own.
 //!
 //! The channel set is the one both systems declare, so the same binary reads a
 //! hardware log and a scenario log. That is what makes it testable without a
@@ -38,7 +46,8 @@ use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::{SessionCmdKindWire, SessionCmdWire};
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::{
-    AuxOutcomeWire, AuxStatusWire, DriverEventWire, EventKindWire, HealthReportWire,
+    AuxOutcomeWire, AuxStatusWire, DriverEventWire, DriverStatusWire, EventKindWire,
+    HealthReportWire,
 };
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegIdWire, ValueShapeWire};
@@ -46,11 +55,13 @@ use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
-use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
-use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
+use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
+use dxl_proto::HardwareError;
+use log_read::{Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed};
 use motion_channels::{
     AUX_OUT_CHANNEL, CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL,
     POSE_CHANNEL, REPORT_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL,
+    STATUS_CHANNEL,
 };
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
@@ -63,9 +74,6 @@ use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, TrackingFaultConfig,
 };
 use reachy_motion::value;
-use reachy_motord::inbound::Counts as SeamCounts;
-use reachy_motord::loop_ctl::WoundDown;
-use reachy_motord::tick::TickCounts as CycleCounts;
 
 /// How far the head may be from the posture it was sent to, in metres, and still
 /// count as having arrived.
@@ -124,8 +132,15 @@ struct Run {
     events: Vec<Logged<DriverEventWire>>,
     /// What the decision tick raised.
     faults: Vec<Logged<TickFaultWire>>,
-    /// What the session said about all of it.
+    /// What the session said about all of it: the rows of the newest story it
+    /// published, which is the whole of its narration.
     reports: Vec<Logged<TimelineEntryWire>>,
+    /// How many rows the newest story says fell off the front of its ring.
+    ///
+    /// The one fact about that story which the rows it holds cannot be made to
+    /// say: a reader handed sixty-four rows has no way to tell whether they are
+    /// the whole narration or its tail.
+    story_dropped: u32,
     /// What the session asked the driver for.
     datagrams: Vec<Logged<SessionCmdWire>>,
     /// Where the head was.
@@ -134,6 +149,11 @@ struct Run {
     outcomes: Vec<Logged<AuxOutcomeWire>>,
     /// What the health rotation read.
     readings: Vec<Logged<HealthReportWire>>,
+    /// The driver's own account of its run, republished on a cadence and
+    /// cumulative: each copy is the whole of it, so the last one is the run's
+    /// last word and any one of them would have said the same about everything
+    /// that had already happened.
+    statuses: Vec<Logged<DriverStatusWire>>,
     /// Every channel the log carries and how many messages each held: a channel
     /// with no Rust type bound to it still says whether anything travelled on
     /// it.
@@ -154,22 +174,6 @@ struct Run {
     /// stamps a sample with is when it actually ran. That jitter is the runner's,
     /// not the system's, and a run of it says so on the command line.
     grid_jitter_ns: i64,
-    /// What the driver process counted for itself, where the run's records
-    /// include its console log.
-    ///
-    /// The one thing this tool reads that is not the log, and it is read as
-    /// evidence about the log rather than about the machine: nothing here
-    /// judges the run by a console, and a run whose records carry no console is
-    /// judged the same way.
-    counters: Option<DriverCounters>,
-    /// A console the run's records carried that holds no counter summary, by
-    /// path.
-    ///
-    /// The driver prints its first summary five seconds in, so a console without
-    /// one is a run that ended before then -- which is a short run, not a broken
-    /// invocation. The cross-check cannot be made and the report says so rather
-    /// than leaving a reader to notice that a line is missing.
-    console_without_summary: Option<String>,
 }
 
 impl Streams for Run {
@@ -195,7 +199,7 @@ impl Streams for Run {
 /// Bindings are strict: a log recorded under an older schema revision is
 /// refused, not read approximately. Reading such a log means building this
 /// tool at the revision the log was recorded under. See [`log_read::binding`].
-const CHANNELS: [Bound<Run>; 11] = [
+const CHANNELS: [Bound<Run>; 12] = [
     Bound {
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
@@ -228,8 +232,22 @@ const CHANNELS: [Bound<Run>; 11] = [
     },
     Bound {
         name: REPORT_CHANNEL,
-        check: binding::<TimelineEntryWire>,
-        route: |run, message| typed(message, &mut run.reports, &mut run.complaints),
+        check: binding::<TimelineWire>,
+        route: |run, message| {
+            cumulative(
+                message,
+                &mut run.reports,
+                &mut run.complaints,
+                |story: &TimelineWire, rows| rows.extend(story.entries().iter().cloned()),
+            );
+            // Taken off the same message a second time, because it is the one
+            // thing the rows cannot say: the routing helper deals in rows, and
+            // what a story lost off its front is a number beside them. A message
+            // that did not decode has already been complained about.
+            if let Ok(story) = message.to_message::<TimelineWire>() {
+                run.story_dropped = story.dropped();
+            }
+        },
     },
     Bound {
         name: SESSION_CMD_CHANNEL,
@@ -251,7 +269,62 @@ const CHANNELS: [Bound<Run>; 11] = [
         check: binding::<HealthReportWire>,
         route: |run, message| typed(message, &mut run.readings, &mut run.complaints),
     },
+    Bound {
+        name: STATUS_CHANNEL,
+        check: binding::<DriverStatusWire>,
+        route: |run, message| typed(message, &mut run.statuses, &mut run.complaints),
+    },
 ];
+
+/// What a log keeps of a channel, which is the logging policy the online
+/// systems declare over it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Retention {
+    /// A ring the logger joins at the write head: what was published before it
+    /// attached is not in the log.
+    Regular,
+    /// The newest message is retained and handed to a subscriber at attach, so
+    /// a log holds it however late the logger started.
+    Persistent,
+}
+
+/// How each channel above is retained, in the order they are bound.
+///
+/// One row per channel and no shorter list, so a channel added to the table
+/// above has to say which it is rather than being taken for a regular one by
+/// omission; a case pins the two tables against each other and against the
+/// policies the online systems declare, which are the artifacts that decide it.
+///
+/// Two things turn on `Persistent`. A copy missing off the front costs the log
+/// nothing, so the head-loss reading says nothing about those channels; and a
+/// log holding *none* of one of the two carriers is a log missing something the
+/// rest of this report reads, which is a finding.
+const RETENTION: [(&str, Retention); CHANNELS.len()] = [
+    (SCRIPT_CHANNEL, Retention::Regular),
+    (SCHEDULE_CHANNEL, Retention::Persistent),
+    (POSE_CHANNEL, Retention::Regular),
+    (CMD_CHANNEL, Retention::Regular),
+    (EVENT_CHANNEL, Retention::Regular),
+    (FAULT_CHANNEL, Retention::Regular),
+    (REPORT_CHANNEL, Retention::Persistent),
+    (SESSION_CMD_CHANNEL, Retention::Regular),
+    (ESTIMATE_CHANNEL, Retention::Regular),
+    (AUX_OUT_CHANNEL, Retention::Regular),
+    (HEALTH_CHANNEL, Retention::Regular),
+    (STATUS_CHANNEL, Retention::Persistent),
+];
+
+/// Whether `name` is retained, and so whether a late attach can have cost the
+/// log any of it.
+///
+/// A channel the table above does not name reads as regular: this is asked only
+/// of the channels this tool binds, and the case beside `RETENTION` is what
+/// makes that the whole set.
+fn persistent(name: &str) -> bool {
+    RETENTION
+        .iter()
+        .any(|(bound, kept)| *bound == name && *kept == Retention::Persistent)
+}
 
 impl Run {
     /// Read the log under `dir`.
@@ -266,56 +339,39 @@ impl Run {
         read_with(dir, &CHANNELS)
     }
 
-    /// Why the recorded request trail cannot be read as everything the run
-    /// asked for, or nothing where it can.
+    /// The driver's last word about its own run, or nothing where the log holds
+    /// no status record at all.
     ///
-    /// Absence of a request is only evidence when the trail is known whole, and
-    /// on this system it usually is not: the log subscriber attaches after the
-    /// payload's first publishes, so every recorded trail so far is short at the
-    /// front -- which is exactly where a commissioning survey's first
-    /// transactions are. The driver's own datagram count is the one independent
-    /// witness, so a trail is whole only where that count is present and the log
-    /// holds at least as many.
-    ///
-    /// The counter is cumulative and printed on a cadence, so a log holding
-    /// *more* than the last summary counted is ordinary rather than doubt --
-    /// which is also why the witness only counts where the driver wound down.
-    /// A driver killed hard leaves counters up to five seconds behind the log,
-    /// and the datagrams logged after them make up the difference a head
-    /// truncation left, so "the log holds at least as many" stops being
-    /// evidence of anything.
-    fn trail_doubt(&self) -> Option<&'static str> {
-        let wound_down = self
-            .counters
-            .as_ref()
-            .is_some_and(|counters| counters.wound_down);
-        match self.datagram_shortfall() {
-            None => Some("the run's records carry no driver counters to check the trail against"),
-            Some(0) if wound_down => None,
-            Some(0) => Some(
-                "the driver's console holds no wind-down line, so its last five-second counter \
-                 summary can be older than the log",
-            ),
-            Some(_) => Some("the driver counted more datagrams than the log holds"),
-        }
+    /// The last copy rather than the first: every copy is cumulative, so the
+    /// newest is the one that has counted the most of the run. Which copy the
+    /// log's own first one was does not enter into it.
+    fn status(&self) -> Option<&DriverStatusWire> {
+        self.statuses.last().map(|logged| &logged.message)
     }
 
-    /// How many session datagrams the driver counted that the log does not
-    /// hold, or nothing where the run's records carry no counters to check
-    /// against.
+    /// How many messages the log lost off the front of `name`.
     ///
-    /// One reading of the two numbers, because the report states the same
-    /// judgement twice for two purposes -- the headline finding that the trail
-    /// is short, and the hedge on everything read off it -- and two spellings of
-    /// it could disagree. `Some(0)` is a trail the driver's own count says is
-    /// whole, which is a different answer from no witness at all.
-    ///
-    /// The counter is cumulative and printed on a cadence, so a log holding
-    /// *more* than the last summary counted is ordinary rather than a shortfall.
-    fn datagram_shortfall(&self) -> Option<usize> {
-        let counters = self.counters.as_ref()?;
-        let received = usize::try_from(counters.session_cmds).unwrap_or(usize::MAX);
-        Some(received.saturating_sub(self.datagrams.len()))
+    /// The publisher numbers from zero and skips nothing, so the lowest number
+    /// the log holds is exactly the count that went past before the logger
+    /// attached. A channel the log carries nothing of lost nothing that can be
+    /// measured this way, and reads as zero: there is no number to subtract
+    /// from, and the checks that care about an absent channel say so in their
+    /// own terms.
+    fn head_loss(&self, name: &str) -> usize {
+        self.census
+            .iter()
+            .find(|channel| channel.name == name)
+            .and_then(|channel| channel.first_seq)
+            .map_or(0, |seq| usize::try_from(seq).unwrap_or(usize::MAX))
+    }
+
+    /// How many messages the log holds on `name`, whether or not this tool
+    /// binds a type to it.
+    fn held(&self, name: &str) -> usize {
+        self.census
+            .iter()
+            .find(|channel| channel.name == name)
+            .map_or(0, |channel| channel.count)
     }
 }
 
@@ -930,9 +986,13 @@ fn driver_events(run: &Run, report: &mut Report) {
                 "the driver could not confirm the de-torquing at {at}: {} did not read back",
                 flags::Names(joint_set(event.message.rows()).unwrap_or_default())
             )),
+            // The instant itself is read off the status, which every log holds
+            // whenever its logger attached; this stream carries the event only
+            // where the attach was early enough to catch cycle 0, which is rare
+            // and is not something to judge either way.
             EventKindWire::STARTUP_MRC_WRITE => report.note(format!(
-                "the driver wrote the minimum risk condition at start-up, at {at}, after \
-                 {silence:.3} ms of nobody talking to it"
+                "the driver's event stream reaches back to the start-up release at {at}, which is \
+                 the process's first act on the bus"
             )),
             EventKindWire::GOAL_STALE_OR_OUT_OF_ORDER => report.note(format!(
                 "a goal arrived {silence:.3} ms past its instant at {at}, and was executed anyway"
@@ -988,6 +1048,18 @@ fn worst_span(spans: impl Iterator<Item = i64>) -> i64 {
         .unwrap_or_default()
 }
 
+/// Above this, a write call spent its time somewhere other than handing bytes
+/// to the kernel.
+///
+/// A write that only queues its frame costs tens to a few hundred microseconds
+/// on this unit; a write that waits for the bytes to leave the UART costs
+/// milliseconds, because the kernel sleeps in tick-sized units to do it. One
+/// millisecond is above every write span measured on a healthy run and an order
+/// of magnitude below the cheapest sleeping one, so a reading past it is a
+/// blocking call back in the write path -- which a report has to say out loud,
+/// since the cycle it eats need not be large enough to miss a slot.
+const WORST_WRITE_FLOOR_NS: i64 = 1_000_000;
+
 fn cycle_timing(run: &Run, skips: &Skips<'_>, report: &mut Report) {
     let windows: Vec<&Logged<DriverEventWire>> = run
         .events
@@ -1012,19 +1084,38 @@ fn cycle_timing(run: &Run, skips: &Skips<'_>, report: &mut Report) {
         .sum();
     let worst_work = worst_span(windows.iter().map(|w| w.message.work().as_nanos()));
     let worst_aux = worst_span(windows.iter().map(|w| w.message.exchange().as_nanos()));
+    // Beside the exchange rather than inside it: the worst single write any
+    // cycle of the window made, on a cycle that need not be the one the worst
+    // exchange came off. Read as a share of the exchange only where a window's
+    // out-of-band work is what it holds -- a cheap worst write against an
+    // expensive exchange points at the servo or the scheduler, an expensive one
+    // at the port.
+    let worst_drain = worst_span(windows.iter().map(|w| w.message.drain().as_nanos()));
     let over_period = windows
         .iter()
         .filter(|w| w.message.work().as_nanos() > NOMINAL_CYCLE_NS)
         .count();
     report.note(format!(
         "cycle timing: {} windows over {cycles} cycles, {aux_cycles} of them carrying an \
-         out-of-band transaction; worst cycle {}, worst exchange {}, and {over_period} windows \
-         whose worst cycle ran past the {:.3} ms grid",
+         out-of-band transaction; worst cycle {}, worst exchange {}, worst single write on any \
+         cycle {}, and \
+         {over_period} windows whose worst cycle ran past the {:.3} ms grid",
         windows.len(),
         span_of(worst_work),
         span_of(worst_aux),
+        span_of(worst_drain),
         NOMINAL_CYCLE_NS as f64 / 1e6,
     ));
+    if worst_drain > WORST_WRITE_FLOOR_NS {
+        report.fail(format!(
+            "the worst single write on any cycle cost {}, past the {:.3} ms a write that only \
+             hands its bytes to the kernel can account for: something in the write path is \
+             blocking on the bytes leaving, and the cycle it spends is the cycle the grid \
+             wanted for the servos",
+            span_of(worst_drain),
+            WORST_WRITE_FLOOR_NS as f64 / 1e6,
+        ));
+    }
     if worst_work < 0 || worst_aux < 0 {
         report.fail(
             "a cycle span came out negative: the clock the driver measures on moved backwards \
@@ -1081,7 +1172,8 @@ fn cycle_skips(run: &Run, grid: Grid, skips: &Skips<'_>, folded: usize, report: 
         .max()
         .unwrap_or_default();
     let carried = aux_carrying_cycles(run, grid);
-    let mut after_aux = 0_usize;
+    let mut after_health = 0_usize;
+    let mut after_host = 0_usize;
     for event in &skips.events {
         let (cycle, off) = grid.within(event.message.time().as_nanos(), run.grid_jitter_ns);
         if off != 0 {
@@ -1090,21 +1182,27 @@ fn cycle_skips(run: &Run, grid: Grid, skips: &Skips<'_>, folded: usize, report: 
         // The cycle that ran long is the one before the run of points it ran
         // through, and the reporting cycle is the first one attended after them.
         let overlong = cycle - i64::from(event.message.count()) - 1;
-        if carried.contains(&overlong) {
-            after_aux += 1;
+        // A cycle running both is counted as the health one: the triple is
+        // three exchanges against a host request's one, so it is the larger
+        // half of what that cycle spent.
+        if carried.health.contains(&overlong) {
+            after_health += 1;
+        } else if carried.host.contains(&overlong) {
+            after_host += 1;
         }
     }
-    // One finding, and any missed slot still makes the run red: the rate is
-    // printed so a measured, explained one can be argued about, never so that
-    // one passes here.
-    // TODO(cycle-skip-budget)
+    let after_aux = after_health + after_host;
+    // One finding, and any missed slot makes the run red. There is no budget:
+    // a cycle that fits its grid with an order of magnitude to spare has no
+    // explained reason to miss a slot, so the rate is printed to describe a
+    // skip, never to excuse one.
     report.fail(format!(
         "the driver missed {} cycle slots over {seconds:.3} s of run, in {} reports, {rate:.2} \
          slots per second; the worst report names {worst_slots} slots at once, and the cycle \
          before that report spent {}; the longest cycle before any of them spent {}. At least \
-         {after_aux} of the {} follow a cycle the log shows carrying an out-of-band transaction \
-         -- a torque-off confirmation read-back carries one and leaves no record, so that is a \
-         floor",
+         {after_aux} of the {} follow a cycle the log shows carrying out-of-band work: \
+         {after_health} after a health reading and {after_host} after a host transaction. A \
+         torque-off confirmation read-back carries one and leaves no record, so that is a floor",
         skips.slots(),
         skips.events.len(),
         span_of(worst_span),
@@ -1131,7 +1229,7 @@ fn cycle_skips(run: &Run, grid: Grid, skips: &Skips<'_>, folded: usize, report: 
     }
 }
 
-/// The cycles the log shows running an out-of-band transaction.
+/// The cycles the log shows running out-of-band work, kept apart by which kind.
 ///
 /// Two records place one: a health reading, which carries the very
 /// `sample_time` its cycle's pose sample carries and so names its cycle
@@ -1139,7 +1237,19 @@ fn cycle_skips(run: &Run, grid: Grid, skips: &Skips<'_>, folded: usize, report: 
 /// placed on the cycle whose sample was logged nearest it. The second is an
 /// attribution rather than a reading, which is why what is built here is only
 /// ever used to say "at least this many".
-fn aux_carrying_cycles(run: &Run, grid: Grid) -> BTreeSet<i64> {
+///
+/// The two are kept apart because they are different sizes of work -- the
+/// health rotation reads three registers where a host request runs one
+/// exchange -- and a skip count that mixed them would say nothing about which
+/// to measure first.
+struct AuxCycles {
+    /// Cycles a health reading names.
+    health: BTreeSet<i64>,
+    /// Cycles a host transaction's outcome was logged nearest.
+    host: BTreeSet<i64>,
+}
+
+fn aux_carrying_cycles(run: &Run, grid: Grid) -> AuxCycles {
     let mut by_sample_time: BTreeMap<i64, i64> = BTreeMap::new();
     let mut by_log_instant: BTreeMap<i64, i64> = BTreeMap::new();
     for sample in &run.samples {
@@ -1151,15 +1261,18 @@ fn aux_carrying_cycles(run: &Run, grid: Grid) -> BTreeSet<i64> {
         by_sample_time.insert(sample.message.sample_time().as_nanos(), cycle);
         by_log_instant.insert(sample.at_ns, cycle);
     }
-    let mut carried = BTreeSet::new();
+    let mut carried = AuxCycles {
+        health: BTreeSet::new(),
+        host: BTreeSet::new(),
+    };
     for reading in &run.readings {
         if let Some(cycle) = by_sample_time.get(&reading.message.sample_time().as_nanos()) {
-            carried.insert(*cycle);
+            carried.health.insert(*cycle);
         }
     }
     for outcome in &run.outcomes {
         if let Some(cycle) = nearest(&by_log_instant, outcome.at_ns) {
-            carried.insert(cycle);
+            carried.host.insert(cycle);
         }
     }
     carried
@@ -1444,6 +1557,22 @@ impl AuxIdentity {
     }
 }
 
+/// What an outcome says it is about, off its own echo of the request.
+///
+/// Everything the identity has except the value: an outcome carries which
+/// transaction, which servo and which register, which is what an operator needs
+/// to act, and the value it carries is the *answer* rather than what was asked
+/// for. Read only where the request itself is not in the log, so a report never
+/// prefers the echo to the thing it echoes.
+fn echoed(outcome: &AuxOutcomeWire) -> String {
+    format!(
+        "{:?} servo {} {:?}",
+        outcome.op(),
+        outcome.id(),
+        outcome.reg()
+    )
+}
+
 /// One register value as the shape it is tagged with reads it.
 ///
 /// The eight bytes are bits and not a number of anything, so an angle printed as
@@ -1580,37 +1709,6 @@ impl<'a> AuxTraffic<'a> {
             .get(&corr)
             .and_then(|requests| requests.first())
             .map(|request| request.identity)
-    }
-
-    /// Whether a refusal under this number has the shape slot pacing leaves.
-    ///
-    /// The session is serial, so the only way two requests are pending at once
-    /// is a delivery re-issue arriving while the original still sits in the
-    /// driver's slot: the re-issue is turned away against its own number, and
-    /// the original's real answer comes back under the same one. That is a
-    /// duplicate request *and* a second outcome that is a real answer rather
-    /// than another refusal. The request half is read through [`Self::reissue`],
-    /// which is the one classifier of what a number carries on that side. A
-    /// refusal without all three is not the pacing
-    /// shape; what it is instead is read off the rest of the trail by
-    /// [`transactions`], and every one of them is a finding either way.
-    ///
-    /// The real answer is what makes the shape the pacing one. A transaction
-    /// the driver declines before the bus is refused every time it is asked
-    /// for, so a lost answer datagram leaves the log holding two requests and
-    /// two refusals under one number -- multiplicity on both sides and nothing
-    /// pending to have collided with. Reading that as pacing would file the
-    /// driver-side decline this pass exists to surface as a note, and it would
-    /// do it on the runs whose delivery was worst.
-    fn refusal_is_slot_pacing(&self, corr: u32) -> bool {
-        let Some(outcomes) = self.outcomes.get(&corr) else {
-            return false;
-        };
-        matches!(self.reissue(corr), Reissue::Verbatim | Reissue::Differing)
-            && outcomes.len() > 1
-            && outcomes
-                .iter()
-                .any(|outcome| outcome.status() != AuxStatusWire::REFUSED)
     }
 
     /// Every request the log kept under this correlation number, in log order.
@@ -1787,9 +1885,18 @@ fn the_release(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
 /// is a run somebody should look at before the next.
 ///
 /// One finding for the whole set rather than one per servo. A bus-wide condition
-/// -- the input-voltage byte every row latches at once is the standing example --
 /// is one fact about the machine, and nine copies of it bury the rest of the
 /// report. Which servos, and what each of them latched, is in the line.
+///
+/// The input-voltage bit on its own is the exception, and it is not a finding
+/// on this machine: the servo bus rail is specified above the highest Max
+/// Voltage Limit the register accepts, so a healthy unit sets that bit by
+/// arithmetic. `dxl_proto::HardwareError` is the one predicate that says so and
+/// this pass judges through it. The bit is never filtered away -- every servo's
+/// byte is printed, and the set that latched it is named in a note of its own.
+/// Any bit beyond input-voltage, on any servo, is a finding, and the byte is
+/// named whole, so a voltage bit riding alongside an overload
+/// launders nothing.
 fn health(run: &Run, report: &mut Report) {
     let mut latest: BTreeMap<u8, &HealthReportWire> = BTreeMap::new();
     for reading in &run.readings {
@@ -1800,6 +1907,7 @@ fn health(run: &Run, report: &mut Report) {
         return;
     }
     let mut complaining: Vec<String> = Vec::new();
+    let mut voltage_only: Vec<String> = Vec::new();
     for (id, reading) in latest {
         report.note(format!(
             "servo {id}: {:.2} V, {} C, error byte 0x{:02x}",
@@ -1807,9 +1915,21 @@ fn health(run: &Run, report: &mut Report) {
             reading.temp_c(),
             reading.bits()
         ));
-        if reading.bits() != 0 {
+        let latched = HardwareError(reading.bits());
+        if latched.bits_other_than_voltage() != 0 {
             complaining.push(format!("servo {id} (0x{:02x})", reading.bits()));
+        } else if reading.bits() != 0 {
+            voltage_only.push(format!("servo {id}"));
         }
+    }
+    if !voltage_only.is_empty() {
+        report.note(format!(
+            "the input-voltage bit is latched on {} of the servos the health rotation read: {} -- \
+             expected on this machine, where the rail is specified above the register's Max \
+             Voltage Limit, so a healthy unit sets that bit by arithmetic",
+            voltage_only.len(),
+            voltage_only.join(", ")
+        ));
     }
     if !complaining.is_empty() {
         report.fail(format!(
@@ -1821,94 +1941,47 @@ fn health(run: &Run, report: &mut Report) {
     }
 }
 
-/// Why a refusal the pacing rule turned down is a finding, in the terms the
-/// trail can support.
+/// Why a busy answer is a finding, in the terms the trail can support.
 ///
-/// `line` is the identity line the refusal is printed under, `reissue` what else
-/// the correlation number carries on the request side, `doubt` why the trail
-/// cannot be read as whole, where it cannot, and `overlap` the number of another
-/// transaction the log shows still unanswered when this one went out.
+/// `line` is the identity line the answer is printed under, and `reissue` what
+/// else the correlation number carries on the request side.
 ///
-/// The decline reading is the only one that claims something about the driver
-/// rather than about the log, and for some identities the driver has no pre-bus
-/// decline that can fire at all -- a ping of an addressed servo is one -- so it
-/// is printed only where nothing else can account for the refusal: a trail the
-/// driver's own datagram count says is whole, one request under the number, and
-/// no other transaction outstanding at the instant (the driver's slot turns away
-/// whatever arrives while it holds one, whatever number it carries, so a
-/// collision across two numbers leaves this same shape). Everywhere else the
-/// line says what is there and stops -- including the case where what is there
-/// is nothing at all: a refusal whose request the trail never held is the least
-/// attributable of the lot, whatever the counters say about the rest of the run.
-fn refusal_line(line: &str, reissue: Reissue, doubt: Option<&str>, overlap: Option<u32>) -> String {
-    match (reissue, doubt, overlap) {
-        (Reissue::Absent, _, _) => format!(
-            "{line}, and the log holds no request under this number at all -- so there is nothing \
-             to read what refused it off, and the answer it belongs to cannot be attributed"
+/// A busy status is the driver saying its slot already held a request when this
+/// one arrived, so what the trail is read for is which request that was. A
+/// number the log holds once is the ordinary shape: two numbers overlapped,
+/// which the session is serial and is not supposed to do. A number the log
+/// holds twice byte for byte is a different claim entirely -- the driver's slot
+/// answers a verbatim re-issue with the pending request's own outcome, so a
+/// busy status against one is a driver that does not recognise duplicates, and
+/// that is a finding against the build rather than against the run.
+///
+/// A number the log holds no request under at all supports neither reading: the
+/// status still says the slot was full, and a trail missing the request cannot
+/// say whether it was full of another number or of this one carrying other
+/// bytes. The line says exactly that much, which is what a head-truncated log
+/// leaves to say.
+fn busy_line(line: &str, reissue: Reissue) -> String {
+    match reissue {
+        Reissue::Verbatim => format!(
+            "{line}, and the log holds this request twice byte for byte: a verbatim re-issue is \
+             answered by the pending request's own outcome, so a driver that answers it busy is \
+             one built before its slot recognised a duplicate"
         ),
-        (Reissue::Verbatim, _, _) => format!(
-            "{line}, and the log holds the delivery re-issue slot pacing needs but not the real \
-             answer that would decide it, so what refused this cannot be attributed"
+        Reissue::Differing => format!(
+            "{line}, and the log holds another request under this number with a different \
+             payload -- a finding of its own -- so the slot was holding a transaction this \
+             number does not name"
         ),
-        (Reissue::Differing, _, _) => format!(
-            "{line}, and the log holds another request under this number with a different payload \
-             -- a finding of its own -- which the driver's slot can turn away on its own account, \
-             so what refused this cannot be attributed"
+        Reissue::None => format!(
+            "{line}: the driver's slot was holding a request under another number when this one \
+             arrived, and the session issues one at a time"
         ),
-        (Reissue::None, None, Some(other)) => format!(
-            "{line}, and no re-issue of it is in the log -- but corr {other} was still unanswered \
-             when it went out, and the slot turns away whatever arrives while it holds a \
-             transaction, so what refused this cannot be attributed"
-        ),
-        (Reissue::None, None, None) => format!(
-            "{line}, and the log -- whole, by the driver's own datagram count -- shows nothing \
-             pending to have collided with: the driver declined it before anything reached the bus"
-        ),
-        (Reissue::None, Some(doubt), _) => format!(
-            "{line}, and no re-issue of it is in the log -- but {doubt}, and a lone request \
-             answered by a refusal is what slot pacing leaves once the recorded trail loses the \
-             original, so what refused this cannot be attributed"
+        Reissue::Absent => format!(
+            "{line}, and the log holds no request under this number at all: the slot was full \
+             when it arrived, and which request it was holding cannot be read off a trail that \
+             is missing this one"
         ),
     }
-}
-
-/// The correlation number of another transaction the log shows still unanswered
-/// at `at_ns`, or nothing where the log shows none.
-///
-/// The driver's slot turns a request away on `has_pending` alone
-/// (`crates/reachy-driver/src/aux_slot.rs`, `AuxSlot::offer`) and the busy answer
-/// goes out against the *turned-away* request's own number
-/// (`crates/reachy-motord/src/tick.rs`, `offer_session_cmd`). So a request under
-/// a fresh number that arrived while an earlier one was still in the slot draws
-/// a refusal with no duplicate under its own number -- the same shape a pre-bus
-/// decline leaves. The session is serial and is not supposed to produce it; this
-/// is the reading of the log that says whether it did, rather than an invariant
-/// the report assumes.
-///
-/// Unanswered means the log holds no outcome under that number *before* this
-/// instant: an answer published at the very same nanosecond does not establish
-/// which of the two came first, and the decline reading is the one claim in this
-/// report that has to be certain, so a tie reads as still pending. Both
-/// instants are the log's own publish times on the one host, and
-/// the session publishes its next request after the previous answer reaches it,
-/// so ordinary serial traffic never reads as outstanding here.
-fn other_pending(run: &Run, corr: u32, at_ns: i64) -> Option<u32> {
-    let mut answered: BTreeMap<u32, i64> = BTreeMap::new();
-    for outcome in &run.outcomes {
-        answered
-            .entry(outcome.message.corr())
-            .and_modify(|first| *first = (*first).min(outcome.at_ns))
-            .or_insert(outcome.at_ns);
-    }
-    run.datagrams
-        .iter()
-        .filter(|datagram| datagram.message.kind() == SessionCmdKindWire::AUX)
-        .filter(|datagram| datagram.message.corr() != corr && datagram.at_ns < at_ns)
-        .map(|datagram| datagram.message.corr())
-        .find(|other| match answered.get(other) {
-            Some(first) => *first >= at_ns,
-            None => true,
-        })
 }
 
 /// How the out-of-band transactions went, each one named by what it asked for.
@@ -1924,25 +1997,19 @@ fn other_pending(run: &Run, corr: u32, at_ns: i64) -> Option<u32> {
 /// join shows the shape slot pacing leaves -- a re-issue turned away while the
 /// original was still pending, which is the transport doing its job.
 ///
-/// A refusal the pacing rule turns down is a failure whatever the trail says,
-/// but *why* it is one depends on what the trail actually holds, and a trail
-/// that is short at the front cannot be read as proof that nothing was pending.
-/// So the printed reason splits by what the trail holds: a verbatim re-issue
-/// with no real answer beside it holds the request half of the pacing shape and
-/// is short of the answer that would decide it; a differing payload under the
-/// number is a second transaction, which the slot can turn away on its own
-/// account; a lone request on a trail with a shortfall, or with no counters to
-/// check, is exactly what pacing leaves once the head truncation eats the
-/// original; a number the log holds no request under at all says exactly that
-/// and stops; and a lone request whose number was the only one outstanding, on a
-/// trail the driver's own datagram count says is whole, is the one reading that
-/// says "decline".
+/// The two pre-bus statuses are read directly rather than inferred. A refusal is
+/// the driver declining the transaction itself, and a slot that was already full
+/// says so under its own status, so neither reading depends on what else the
+/// trail holds. What the trail is still read for is the busy answer's
+/// companion: which request the slot was holding, per [`busy_line`].
 ///
-/// The join itself is checked in both directions: an outcome under a
-/// correlation number no logged request carries, and a logged request nothing
-/// ever answered, are each a finding. The sequencer's retry and timeout
-/// machinery guarantees every accepted transaction an answer, so silence in the
-/// log is either the log's problem or a new bug, and both are worth a line.
+/// An outcome names its own transaction, so a request that went past before the
+/// logger attached costs the reading nothing: the identity comes off the
+/// request where the log holds it and off the outcome's own echo where it does
+/// not. A logged request nothing ever answered is still a finding -- the
+/// sequencer's retry and timeout machinery guarantees every accepted
+/// transaction an answer, so silence under a number the log *does* hold the
+/// request for is either a lost outcome or a new bug.
 fn transactions(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
     let mut census: BTreeMap<u8, usize> = BTreeMap::new();
     for outcome in &run.outcomes {
@@ -1956,8 +2023,6 @@ fn transactions(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
         report.note(format!("  {:?} x{count}", AuxStatusWire::from(status)));
     }
 
-    // Constant over the run, so it is read once rather than per outcome.
-    let doubt = run.trail_doubt();
     for (corr, outcomes) in &traffic.outcomes {
         let identity = traffic.identity(*corr);
         for outcome in outcomes {
@@ -1965,10 +2030,18 @@ fn transactions(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
             if status == AuxStatusWire::OK {
                 continue;
             }
-            let named = identity.map_or_else(
-                || "no logged request".to_string(),
-                |identity| identity.line(),
-            );
+            let named = identity.map_or_else(|| echoed(outcome), |identity| identity.line());
+            // Where the identity came off the echo, the line says so: the
+            // reading is as good, and a reader comparing this report against
+            // the request stream would otherwise look for a datagram the log
+            // does not hold.
+            let named = if identity.is_none() {
+                format!(
+                    "{named}, named by the outcome itself since the log holds no request under it"
+                )
+            } else {
+                named
+            };
             let line = format!("corr {corr}: {named} answered {status:?}");
             match status {
                 AuxStatusWire::VERIFY_MISMATCH => report.fail(format!(
@@ -1976,27 +2049,14 @@ fn transactions(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
                      holds something other than what the session wrote",
                     value_line(outcome.value_kind(), outcome.value())
                 )),
-                AuxStatusWire::REFUSED if traffic.refusal_is_slot_pacing(*corr) => {
-                    report.note(format!(
-                        "{line}, which is a re-issue turned away while the original was pending"
-                    ))
-                }
-                AuxStatusWire::REFUSED => {
-                    let overlap = traffic
-                        .requests(*corr)
-                        .first()
-                        .and_then(|request| other_pending(run, *corr, request.at_ns));
-                    report.fail(refusal_line(&line, traffic.reissue(*corr), doubt, overlap));
-                }
+                AuxStatusWire::BUSY => report.fail(busy_line(&line, traffic.reissue(*corr))),
+                AuxStatusWire::REFUSED => report.fail(format!(
+                    "{line}: the driver declined the transaction before anything reached the \
+                     bus, and a slot that was already full answers busy instead, so this is a \
+                     judgement on what was asked for"
+                )),
                 _ => report.note(line),
             }
-        }
-        if identity.is_none() {
-            report.fail(format!(
-                "corr {corr} was answered {} times and no request under that number is in the \
-                 log: an outcome with no identity is a trail this report cannot read",
-                outcomes.len()
-            ));
         }
     }
 
@@ -2028,195 +2088,318 @@ fn transactions(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
     }
 }
 
-/// What the driver process counted for itself, off its own console.
+/// The carriers this report verifies the run from are in the log.
 ///
-/// Cumulative since the process started, printed every five seconds, so the last
-/// summary a run's console holds is the run's total for everything that happened
-/// before it. The two numbers this report wants are the datagrams the driver
-/// took off its socket and the offers it refused.
+/// Every other check here reads one of two cumulative records: the driver's
+/// status, which carries what only the process itself observed, and the
+/// session's story, which carries every row it narrated. Both are published
+/// whole on every change and retained for a subscriber that attaches late, so
+/// "the logger was not there yet" is not an innocent explanation for either
+/// being absent -- a log holding none of one of them is a dead socket, a
+/// removed publish, or a recording that stopped before the run began, and in
+/// every case a run this tool cannot verify.
 ///
-/// The labels are the driver's own constants rather than strings spelled here,
-/// so a counter renamed in that crate stops this build instead of quietly
-/// turning the cross-check off.
+/// Said before anything is read off them, and unconditionally: no first-sequence
+/// guard, because the guard would be the excuse this finding exists to refuse.
 ///
-/// The witness is lossy in one direction, which is why only a shortfall is ever
-/// a finding: the driver drops a summary rather than making a cycle wait for
-/// stdout, so "the last summary the console holds" can be older than the last
-/// one the driver produced.
-#[derive(Debug)]
-struct DriverCounters {
-    /// Datagrams from the session the driver decoded, of every kind.
-    session_cmds: u64,
-    /// Offers the driver turned away: one already pending, or a datagram asking
-    /// for nothing at all.
-    aux_refused: u64,
-    /// Where the numbers were read from, so a report says what it cross-checked
-    /// against.
-    source: String,
-    /// Whether the console goes on to say the driver wound down, which is what
-    /// makes these numbers the run's last word.
-    ///
-    /// The summary is printed on a five-second cadence and a stop the driver
-    /// answered prints its own final one, so a console that ends in a wind-down
-    /// line counted everything. A console that does not -- a SIGKILL, a panic, a
-    /// launcher fault -- has counters up to five seconds older than the log, and
-    /// the datagrams logged after them can hide a shortfall by making up the
-    /// difference.
-    wound_down: bool,
-}
-
-impl DriverCounters {
-    /// The counters in the last summary line `text` holds, if it holds one.
-    ///
-    /// The summary is `key=value` pairs on one line and the last one wins:
-    /// earlier summaries are the same counters, smaller.
-    ///
-    /// Whether anything after that line says the driver wound down is read here
-    /// too: a stopping driver prints its last summary and its wind-down line
-    /// together, so the line's presence below the summary is what says these
-    /// counters are the whole run's rather than up to five seconds short of it.
-    fn parse(text: &str, source: String) -> Option<Self> {
-        let label = format!("{}=", SeamCounts::SESSION_CMDS);
-        let (at, line) = text
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains(&label))
-            .last()?;
-        let wound_down = text
-            .lines()
-            .skip(at + 1)
-            .any(|line| line.contains(WoundDown::STOPPING));
-        let field = |name: &str| -> Option<u64> {
-            line.split_whitespace()
-                .filter_map(|pair| pair.split_once('='))
-                .find(|(key, _)| *key == name)
-                .and_then(|(_, value)| value.parse().ok())
-        };
-        Some(Self {
-            session_cmds: field(SeamCounts::SESSION_CMDS)?,
-            aux_refused: field(CycleCounts::AUX_REFUSED)?,
-            source,
-            wound_down,
-        })
-    }
-
-    /// The driver's console log under `path`, which is either that file or a
-    /// directory holding it.
-    ///
-    /// The launcher numbers the files it writes per run, so a directory is
-    /// searched for the driver's own rather than for a name this tool spells.
-    /// Exactly one is expected; a directory holding several is several runs, and
-    /// cross-checking one run against another's counters would be worse than not
-    /// cross-checking at all.
-    ///
-    /// A console that is there and holds no summary yet is `Ok(None)` rather
-    /// than a refusal: that is a fact about the *run* -- a driver that did not
-    /// reach its first five-second summary -- and the runs it describes are the
-    /// short, failed ones this tool exists to explain. Refusing to judge a log
-    /// over it would leave the worst runs the least reported. The refusals here
-    /// are all about the path the caller named.
-    fn read(path: &Path) -> Result<Option<Self>, String> {
-        let file = if path.is_dir() {
-            let mut found: Vec<PathBuf> = std::fs::read_dir(path)
-                .map_err(|err| format!("reading {}: {err}", path.display()))?
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with("motord"))
-                })
-                .collect();
-            found.sort();
-            match found.len() {
-                1 => found.remove(0),
-                0 => {
-                    return Err(format!(
-                        "{} holds no driver console log: the launcher writes the driver's as \
-                         motord_<run>.log",
-                        path.display()
-                    ));
-                }
-                many => {
-                    return Err(format!(
-                        "{} holds {many} driver console logs, which is {many} runs; name the one \
-                         belonging to this log",
-                        path.display()
-                    ));
-                }
-            }
-        } else {
-            path.to_path_buf()
-        };
-        let text = std::fs::read_to_string(&file)
-            .map_err(|err| format!("reading {}: {err}", file.display()))?;
-        Ok(Self::parse(&text, file.display().to_string()))
-    }
-}
-
-/// What the log kept of the out-of-band traffic, against what the driver counted
-/// of it.
-///
-/// The drift guard, and it is a check on the *log* rather than on the run: a
-/// subscriber that attached after the first publish loses the earliest messages
-/// silently, and every conclusion drawn from the trail afterwards is drawn from
-/// a trail nobody knows is short. The driver's counters are the independent
-/// witness, so where they disagree the finding says so in those terms.
-///
-/// Only a shortfall is a finding. The counters are cumulative and printed on a
-/// five-second cadence, so the last summary can predate traffic the log still
-/// caught; a log holding more than the last summary counted is ordinary.
-///
-/// The refusal sides do not correspond one for one and the check does not
-/// pretend they do. A datagram asking for nothing is counted as a refusal and
-/// answered with nothing at all, so the counter can legitimately run ahead of
-/// the logged refusals by exactly the number of those the log holds. A
-/// transaction the driver took and then declined before the bus publishes a
-/// refusal without counting one, so the logged side can legitimately run ahead
-/// too.
-fn counter_cross_check(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
-    let Some(counters) = &run.counters else {
-        if let Some(console) = &run.console_without_summary {
-            report.note(format!(
-                "no cross-check against the driver's own counters: {console} carries no summary \
-                 line, and the driver prints its first five seconds in"
+/// Two questions, asked the same way of both carriers and never conflated. The
+/// census says whether the log holds the channel at all, which is a fact about
+/// the recording; the decoded stream says whether this build could read what it
+/// holds, which is a fact about the schemas. Answering the first out of the
+/// second is how a log recorded under another schema revision gets diagnosed as
+/// a dead socket -- a wrong first hypothesis handed to whoever is at the bench,
+/// and one the complaint list beside it flatly contradicts.
+fn carriers(run: &Run, report: &mut Report) {
+    // A story is published only by an execution that added a row, so a message
+    // on this channel always carries at least that row: no rows decoded out of
+    // messages the log holds means none of them could be read.
+    for (name, held, readable) in [
+        (
+            STATUS_CHANNEL,
+            run.held(STATUS_CHANNEL),
+            !run.statuses.is_empty(),
+        ),
+        (
+            REPORT_CHANNEL,
+            run.held(REPORT_CHANNEL),
+            !run.reports.is_empty(),
+        ),
+    ] {
+        if held == 0 {
+            report.fail(format!(
+                "the log holds no {name} message: it is republished whole and retained for a \
+                 subscriber attaching at any instant, so a log without one was not recording that \
+                 publisher, and what this report reads from it is unreadable"
+            ));
+        } else if !readable {
+            report.fail(format!(
+                "the log holds {held} {name} messages and this build could read none of them: the \
+                 recording is there and the schemas differ, so read the complaints above rather \
+                 than looking for a dead publisher"
             ));
         }
+    }
+}
+
+/// The story the log carries is the whole of the session's narration.
+///
+/// The session narrates into a ring of sixty-four rows and republishes the whole
+/// of it; past that it drops the oldest rows to make room and says how many in
+/// the message. Nothing else can say it -- sixty-four rows read the same whether
+/// they are the whole narration or its tail -- and the rows that go first are
+/// the ones every check below walks in order: the first phase change, the script
+/// the session accepted.
+///
+/// Said before those checks run, so their findings are read in its light: a
+/// wrapped story makes them say the session never made the transitions, when
+/// what happened is that it made more of them than the ring holds.
+fn the_whole_story(run: &Run, report: &mut Report) {
+    if run.story_dropped == 0 {
+        return;
+    }
+    report.fail(format!(
+        "the session's story dropped {} rows off its front: it narrated past the {} rows a story \
+         carries, so the log holds the tail of the narration and the checks below are reading it \
+         as the whole of it",
+        run.story_dropped,
+        run.reports.len(),
+    ));
+}
+
+/// What the driver did to the machine before it did anything else.
+///
+/// The process writes the minimum risk condition as its first act on the bus,
+/// so every run has this instant and a run that does not is a driver that did
+/// not do it. The record is read off the status rather than off the event
+/// stream: the cycle-0 event rides `DriverEvt`, which loses its head to the
+/// logger's attach on essentially every healthy run, while every status copy
+/// carries the same two facts.
+///
+/// A row whose verified write did not read back is judged the way an
+/// unconfirmed de-torquing is judged anywhere else here -- as a finding naming
+/// the rows -- because it is one: the machine was left with a row nobody could
+/// see released.
+fn the_startup_release(run: &Run, report: &mut Report) {
+    let Some(status) = run.status() else {
         return;
     };
-    let logged = run.datagrams.len();
+    let at = status.sweep_time().as_nanos();
+    if at == 0 {
+        report.fail(
+            "the driver's status carries no instant for the minimum risk condition: the process \
+             writes it before anything else it does on the bus, so a run with no instant for it \
+             is a run that cannot say the machine was ever released"
+                .to_string(),
+        );
+        return;
+    }
     report.note(format!(
-        "the driver's console ({}) counted {} datagrams; the log holds {logged}",
-        counters.source, counters.session_cmds
+        "the driver wrote the minimum risk condition at {at}, before waiting for anything, which \
+         is what every start does"
     ));
-    if let Some(short) = run.datagram_shortfall().filter(|short| *short > 0) {
+    match joint_set(status.sweep_failed_rows()) {
+        Ok(failed) if flags::is_empty(failed) => {}
+        Ok(failed) => report.fail(format!(
+            "the driver could not verify the start-up release at {at}: {} did not read back, so \
+             the process joined a machine it could not see let go of",
+            flags::Names(failed)
+        )),
+        Err(err) => report.fail(format!(
+            "the driver's status names the rows its start-up release could not verify as a set \
+             this build has no servos for ({err}), so what it could not release cannot be read"
+        )),
+    }
+}
+
+/// The survey waited for the driver, rather than racing it.
+///
+/// The session's first datagram is the commissioning survey's first
+/// transaction, and it is only worth sending to a driver that is cycling: a
+/// driver still binding its inbox queues whatever arrives and answers the
+/// delivery re-issue rather than the request, which the session reads as a
+/// refusal and parks on. What says the driver is cycling is its sample stream,
+/// so the order of those two firsts is the check.
+///
+/// Both instants are read off the driver's status, which is what makes the
+/// check readable at all: they are stamped by one process on one clock, and
+/// they are in every copy of a record that survives a late attach. Read off the
+/// two streams instead, the answer would be a fact about when the logger
+/// managed to attach to each of them.
+///
+/// A tie fails. The driver drains its inbox before it runs the cycle that
+/// publishes a sample, so a command stamped at the same grid instant as the
+/// first sample was taken *before* that sample existed, which is the race.
+fn the_survey_waited(run: &Run, report: &mut Report) {
+    let Some(status) = run.status() else {
+        return;
+    };
+    let asked = status.first_session_cmd().as_nanos();
+    let sampled = status.first_pose().as_nanos();
+    // Zero is the schema's "has not happened": a run nobody commanded, or one
+    // that published no sample. Neither is an ordering, and the sample-less
+    // case is a run this report has already refused for having no heartbeat.
+    if asked == 0 || sampled == 0 {
+        return;
+    }
+    if asked > sampled {
+        return;
+    }
+    report.fail(format!(
+        "the driver took the session's first command at {asked} and published its first sample at \
+         {sampled}: the survey asked before anything said the driver was cycling, and a driver \
+         that has not started answers the delivery re-issue rather than the request"
+    ));
+}
+
+/// Every channel the log carries, what it held, and where its copy starts.
+///
+/// The sequence number is the publisher's own count, so the lowest one a
+/// channel carries says how much of that channel the log never got. Printed for
+/// every channel, including the ones no Rust type is bound to: a report group
+/// that starts late is the same fact about the recording as a payload stream
+/// that does.
+fn census(run: &Run, report: &mut Report) {
+    for channel in &run.census {
+        match channel.first_seq {
+            Some(seq) => report.note(format!(
+                "channel {}: {} messages, from sequence {seq}",
+                channel.name, channel.count
+            )),
+            None => report.note(format!(
+                "channel {}: {} messages",
+                channel.name, channel.count
+            )),
+        }
+    }
+}
+
+/// What the log lost at the front of each stream this tool reads.
+///
+/// A publisher numbers from zero and skips nothing, so a channel whose lowest
+/// recorded sequence number is not zero was published on before the logger
+/// attached, and exactly that many messages are gone. Said as a number, and
+/// said per channel: the streams do not lose the same amount, and how much each
+/// lost is what the counter cross-check charges the log before it charges the
+/// run.
+///
+/// A note and never a finding. The logger attaches to each channel lazily and
+/// at the write head, and nothing in the payload waits for it -- a logger is
+/// never a precondition for driving motors -- so a run that publishes from
+/// process start loses the front of every stream it feeds, and that is the
+/// expected reading of a healthy run rather than a defect. What is lost is
+/// redundancy: every fact a verdict here turns on rides a cumulative carrier or
+/// a self-describing message instead.
+///
+/// The persistent channels are not read this way at all. One retained message
+/// is their whole content, so where their copy starts says nothing about
+/// completeness; what would be wrong is holding none of one, which is
+/// [`carriers`]'s finding.
+fn head_of_the_log(run: &Run, report: &mut Report) {
+    for name in CHANNELS
+        .iter()
+        .map(|bound| bound.name)
+        .filter(|name| !persistent(name))
+    {
+        let lost = run.head_loss(name);
+        if lost == 0 {
+            continue;
+        }
+        report.note(format!(
+            "{name} begins at sequence {lost}: {lost} messages predate the logger's attach, so \
+             the log holds that much less of the stream than the run published"
+        ));
+    }
+}
+
+/// What the log kept of the session's traffic, against what the driver counted
+/// of it.
+///
+/// The drift guard, and it is a check on the *log* rather than on the run: the
+/// driver counts every datagram it took off its socket and republishes the
+/// count, so a stream the log is short of by more than its measured head loss
+/// is a stream that lost messages mid-run -- a dropped datagram, a logger that
+/// fell behind -- which is a real defect and not the attach.
+///
+/// So the head loss is charged first and the run is charged only with what is
+/// left. Charging it the other way round would make the expected reading of
+/// every healthy run a finding, and a finding every run carries is one nobody
+/// reads.
+///
+/// Only a shortfall is ever a finding. The status is republished on a cadence,
+/// so a log holding more than the last copy counted is ordinary rather than a
+/// deficit, and a run that ended without a wind-down status has counters up to
+/// one window older than the log.
+///
+/// The driver's refusal counter is checked against the *busy* outcomes, which
+/// is what it produces: an offer turned away because the slot held another
+/// request is answered `busy` and counted, and a transaction the driver takes
+/// and then declines before the bus is answered `refused` and counted by
+/// nothing. So a `refused` outcome has no counter to be checked against and
+/// does not enter this arithmetic.
+///
+/// The two sides still do not correspond one for one. A datagram asking for
+/// nothing is counted as a refusal and answered with nothing at all, so the
+/// counter can legitimately run ahead of the logged busy outcomes by exactly
+/// the number of those the log holds.
+fn counter_cross_check(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
+    let Some(status) = run.status() else {
+        return;
+    };
+    if !status.wound_down() {
+        report.note(
+            "the driver's last status is a periodic copy and not a wind-down's, so the run ended \
+             without one and its counters can be up to one window older than the log"
+                .to_string(),
+        );
+    }
+
+    let logged = run.datagrams.len();
+    let lost = run.head_loss(SESSION_CMD_CHANNEL);
+    let counted = usize::try_from(status.seam().session_cmds()).unwrap_or(usize::MAX);
+    report.note(format!(
+        "the driver counted {counted} session datagrams; the log holds {logged} and lost {lost} \
+         off the front"
+    ));
+    if counted > logged + lost {
         report.fail(format!(
-            "the log holds {short} fewer session datagrams than the driver counted ({logged} \
-             against {}): the recorded trail is short, so everything read off it is read off less \
-             than the run produced",
-            counters.session_cmds
+            "the log holds {} fewer session datagrams than the driver counted, over and above \
+             the {lost} its attach cost it ({logged} against {counted}): the trail lost messages \
+             mid-run, so everything read off it is read off less than the run produced",
+            counted - logged - lost
         ));
     }
 
-    let refused = run
+    report.note(format!(
+        "the driver recognised {} offers as a re-issue of the request it was already holding, and \
+         answered each with that request's own outcome",
+        status.cycle().aux_duplicates()
+    ));
+
+    let busy = run
         .outcomes
         .iter()
-        .filter(|outcome| outcome.message.status() == AuxStatusWire::REFUSED)
+        .filter(|outcome| outcome.message.status() == AuxStatusWire::BUSY)
         .count();
-    let counted = usize::try_from(counters.aux_refused).unwrap_or(usize::MAX);
+    let counted = usize::try_from(status.cycle().aux_refused()).unwrap_or(usize::MAX);
+    let lost = run.head_loss(AUX_OUT_CHANNEL);
     report.note(format!(
-        "the driver counted {counted} refused offers; the log holds {refused} refused outcomes"
+        "the driver counted {counted} turned-away offers; the log holds {busy} busy outcomes and \
+         lost {lost} outcomes off the front"
     ));
-    if counted > refused {
-        let deficit = counted - refused;
-        if deficit <= traffic.none_kind {
+    if counted > busy {
+        let deficit = counted - busy;
+        if deficit <= traffic.none_kind + lost {
             report.note(format!(
-                "  {deficit} of them asked for nothing at all, which the driver counts and \
-                 answers with no outcome"
+                "  {deficit} of them are accounted for by the do-nothing datagrams the driver \
+                 counts and answers with no outcome, and by the outcomes the log lost at the front"
             ));
         } else {
             report.fail(format!(
-                "the driver counted {deficit} refused offers the log has neither an outcome nor a \
-                 do-nothing datagram for: the recorded trail is short by that much"
+                "the driver counted {} turned-away offers the log has neither a busy outcome, a \
+                 do-nothing datagram, nor a lost outcome at the front to account for: either the \
+                 trail lost messages mid-run, or a cycle turned away more than one request and \
+                 only the first collision of a cycle leaves an outcome",
+                deficit - traffic.none_kind - lost
             ));
         }
     }
@@ -2250,10 +2433,14 @@ fn analyze(run: &Run) -> Report {
         return report;
     };
     let skips = Skips::of(run, grid);
+    carriers(run, &mut report);
+    the_whole_story(run, &mut report);
+    the_startup_release(run, &mut report);
     let folded = heartbeat(run, grid, &skips, &mut report);
     let engaged = narration(run, &mut report);
     what_the_session_said(run, &mut report);
     the_park_says_why(run, &mut report);
+    the_survey_waited(run, &mut report);
     no_faults(run, &mut report);
     driver_events(run, &mut report);
     cycle_timing(run, &skips, &mut report);
@@ -2266,10 +2453,9 @@ fn analyze(run: &Run) -> Report {
     lags(run, &mut report);
     health(run, &mut report);
     transactions(run, &traffic, &mut report);
+    head_of_the_log(run, &mut report);
     counter_cross_check(run, &traffic, &mut report);
-    for (name, count) in &run.census {
-        report.note(format!("channel {name}: {count} messages"));
-    }
+    census(run, &mut report);
     report
 }
 
@@ -2279,11 +2465,9 @@ fn analyze(run: &Run) -> Report {
 /// can be filed with the run record while the findings are what an operator sees
 /// on the terminal. The exit status is the verdict.
 fn main() -> ExitCode {
-    const USAGE: &str =
-        "usage: first_motion_report [--grid-jitter-ns <n>] [--console <path>] <log-dir>";
+    const USAGE: &str = "usage: first_motion_report [--grid-jitter-ns <n>] <log-dir>";
     let mut args = std::env::args().skip(1);
     let mut jitter_ns = 0_i64;
-    let mut console: Option<PathBuf> = None;
     let mut log_dir: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2299,15 +2483,6 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            "--console" => match args.next() {
-                Some(path) => console = Some(PathBuf::from(path)),
-                None => {
-                    eprintln!(
-                        "--console takes the driver's console log, or the directory it is in"
-                    );
-                    return ExitCode::FAILURE;
-                }
-            },
             _ if log_dir.is_none() && !arg.starts_with("--") => log_dir = Some(arg),
             _ => {
                 eprintln!("{USAGE}");
@@ -2320,23 +2495,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let log_dir = &log_dir;
-    // Read before the log, because a console path the caller named and this tool
-    // cannot resolve is a mistake in the invocation rather than a finding about
-    // the run: reporting it as one would file it beside the run's own problems.
-    // A console it resolves and finds no summary in is the other thing entirely
-    // -- a fact about the run -- and it travels into the report as one.
-    let mut counters = None;
-    let mut console_without_summary = None;
-    if let Some(path) = console.as_deref() {
-        match DriverCounters::read(path) {
-            Ok(Some(read)) => counters = Some(read),
-            Ok(None) => console_without_summary = Some(path.display().to_string()),
-            Err(err) => {
-                eprintln!("{err}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
     let run = match Run::read(&PathBuf::from(log_dir)) {
         Ok(run) => run,
         Err(err) => {
@@ -2346,8 +2504,6 @@ fn main() -> ExitCode {
     };
     let run = Run {
         grid_jitter_ns: jitter_ns,
-        counters,
-        console_without_summary,
         ..run
     };
     let report = analyze(&run);
@@ -2372,16 +2528,18 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        ARRIVAL_ANTENNA_RAD, AuxOpKindWire, AuxOutcomeWire, AuxStatusWire, CHANNELS, CycleCounts,
-        DriverCounters, DriverEventWire, EventKindWire, Grid, HealthReportWire, Logged,
-        PoseEstimateWire, PoseSampleWire, RegIdWire, Report, ReportKindWire, Run, SeamCounts,
-        SeqFailureKindWire, SessionCmdKindWire, SessionCmdWire, SessionPhaseWire, TickFaultWire,
-        TimelineEntryWire, ValueShapeWire, WoundDown, analyze, joint_set_of, judge_antennas,
+        ARRIVAL_ANTENNA_RAD, AUX_OUT_CHANNEL, AuxOpKindWire, AuxOutcomeWire, AuxStatusWire,
+        CHANNELS, DriverEventWire, DriverStatusWire, EventKindWire, Grid, HealthReportWire, Logged,
+        POSE_CHANNEL, PoseEstimateWire, PoseSampleWire, REPORT_CHANNEL, RETENTION, RegIdWire,
+        Report, ReportKindWire, Retention, Run, SCHEDULE_CHANNEL, SESSION_CMD_CHANNEL,
+        STATUS_CHANNEL, SeqFailureKindWire, SessionCmdKindWire, SessionCmdWire, SessionPhaseWire,
+        TickFaultWire, TimelineEntryWire, ValueShapeWire, analyze, joint_set_of, judge_antennas,
         neutral_targets, record, row, stow_pose_targets,
     };
     use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
     use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
     use clockwork_rs::{Duration, SyncTime};
+    use log_read::Channel;
     use nalgebra::{Isometry3, UnitQuaternion, Vector3};
     use reachy_driver::NOMINAL_CYCLE_NS;
     use reachy_motion::joints::{JointRef, ROW_COUNT, flags, write_rows};
@@ -2551,7 +2709,7 @@ mod tests {
             report
                 .measured
                 .iter()
-                .any(|line| line.contains("minimum risk condition")),
+                .any(|line| line.contains("reaches back to the start-up release")),
             "{:?}",
             report.measured
         );
@@ -2567,11 +2725,24 @@ mod tests {
 
     /// One window of the driver's cycle measurements.
     fn stats(n: i64, cycles: u32, aux: u32, work_ns: i64, aux_ns: i64) -> Logged<DriverEventWire> {
+        drained_stats(n, cycles, aux, work_ns, aux_ns, 0)
+    }
+
+    /// A window that also says what its worst write call cost.
+    fn drained_stats(
+        n: i64,
+        cycles: u32,
+        aux: u32,
+        work_ns: i64,
+        aux_ns: i64,
+        drain_ns: i64,
+    ) -> Logged<DriverEventWire> {
         let mut logged = event(n, EventKindWire::CYCLE_STATS);
         logged.message.set_count(cycles);
         logged.message.set_out_of_band(aux);
         logged.message.set_work(Duration::from_nanos(work_ns));
         logged.message.set_exchange(Duration::from_nanos(aux_ns));
+        logged.message.set_drain(Duration::from_nanos(drain_ns));
         logged
     }
 
@@ -2605,6 +2776,32 @@ mod tests {
         assert!(
             measured_about(&report, "the log carries no cycle timing"),
             "a run whose driver measured nothing has to say so: {:?}",
+            report.measured
+        );
+    }
+
+    /// A run that missed no slot says nothing about slots at all.
+    ///
+    /// The whole point of the drain measurement is a run whose cycles fit the
+    /// grid; when one lands, the skip line has to be absent rather than printed
+    /// as a zero, because a skip after that is a new problem and not a residual
+    /// this report has learned to tolerate.
+    #[test]
+    fn a_run_that_missed_no_slot_prints_no_skip_finding() {
+        let report = analyze(&Run {
+            samples: heartbeat(20),
+            events: vec![drained_stats(5, 50, 3, 18_000_000, 2_000_000, 40_000)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "missed"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            measured_about(&report, "worst single write on any cycle 0.040 ms"),
+            "and the write span is there to read: {:?}",
             report.measured
         );
     }
@@ -2769,7 +2966,8 @@ mod tests {
             measured_about(
                 &report,
                 "cycle timing: 2 windows over 100 cycles, 7 of them carrying an out-of-band \
-                 transaction; worst cycle 24.000 ms, worst exchange 9.000 ms, and 1 windows"
+                 transaction; worst cycle 24.000 ms, worst exchange 9.000 ms, worst single \
+                 write on any cycle an unmeasured span, and 1 windows"
             ),
             "{:?}",
             report.measured
@@ -2779,6 +2977,72 @@ mod tests {
             0,
             "{:?}",
             report.findings
+        );
+    }
+
+    /// The write span is the guard against a blocking write coming back, so a
+    /// millisecond in it is a finding and not a number to read.
+    ///
+    /// Both directions, because the guard is only worth having if the healthy
+    /// reading is silent: a write in the microseconds a drainless one costs
+    /// draws nothing, and the ~8 ms a drain costs draws a finding naming the
+    /// write. Nothing else in the report catches this -- a drain small enough
+    /// to fit the cycle misses no slot, and the skip finding stays silent.
+    #[test]
+    fn a_write_that_blocked_on_the_wire_is_a_finding_of_its_own() {
+        let healthy = analyze(&Run {
+            samples: heartbeat(10),
+            events: vec![drained_stats(1, 50, 3, 12_000_000, 4_000_000, 40_000)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&healthy, "worst single write"),
+            0,
+            "a write that only queued its bytes says nothing: {:?}",
+            healthy.findings
+        );
+
+        let blocked = analyze(&Run {
+            samples: heartbeat(10),
+            events: vec![drained_stats(1, 50, 3, 12_000_000, 4_000_000, 8_250_000)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&blocked, "worst single write on any cycle cost 8.250 ms"),
+            1,
+            "{:?}",
+            blocked.findings
+        );
+        assert_eq!(
+            findings_about(&blocked, "missed"),
+            0,
+            "and it is the write that is named, not a slot: {:?}",
+            blocked.findings
+        );
+    }
+
+    /// What the exchanges cost and what the worst single write cost are the two
+    /// halves of the same reading -- the second over every cycle in the window
+    /// rather than over the exchange alone -- and a window carrying only the
+    /// first cannot say whether to look at the port or at the servo.
+    #[test]
+    fn a_window_says_what_the_worst_write_call_in_it_cost() {
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            events: vec![
+                drained_stats(1, 50, 3, 12_000_000, 4_000_000, 3_500_000),
+                drained_stats(2, 50, 4, 24_000_000, 9_000_000, 8_250_000),
+            ],
+            ..Run::default()
+        });
+        assert!(
+            measured_about(
+                &report,
+                "worst exchange 9.000 ms, worst single write on any cycle 8.250 ms, and 1 \
+                 windows"
+            ),
+            "{:?}",
+            report.measured
         );
     }
 
@@ -2806,8 +3070,8 @@ mod tests {
         });
         assert!(
             report.findings.iter().any(|finding| finding.contains(
-                "At least 1 of the 1 follow a cycle the log shows carrying an \
-                           out-of-band transaction"
+                "At least 1 of the 1 follow a cycle the log shows carrying out-of-band \
+                 work: 1 after a health reading and 0 after a host transaction"
             )),
             "{:?}",
             report.findings
@@ -3079,7 +3343,10 @@ mod tests {
             );
         }
         let censused = [
-            (EventKindWire::STARTUP_MRC_WRITE, "minimum risk condition"),
+            (
+                EventKindWire::STARTUP_MRC_WRITE,
+                "reaches back to the start-up release",
+            ),
             (
                 EventKindWire::GOAL_STALE_OR_OUT_OF_ORDER,
                 "past its instant",
@@ -3327,10 +3594,11 @@ mod tests {
         assert!(measured_about(&report, "servo 10: 7.40 V"));
     }
 
-    /// A byte every row latches at once is one fact about the machine, and nine
-    /// copies of it bury the rest of the report. One finding, naming the set.
+    /// The input-voltage bit latched on every row is this machine's expected
+    /// reading, not a finding: the rail sits above the highest limit the
+    /// register accepts. One note names the set, and every byte still prints.
     #[test]
-    fn a_byte_latched_on_every_row_is_one_finding_naming_the_set() {
+    fn the_input_voltage_bit_on_every_row_is_a_note_and_not_a_finding() {
         let readings: Vec<Logged<HealthReportWire>> = (10..19)
             .map(|id| {
                 let mut reading = HealthReportWire::new();
@@ -3346,25 +3614,77 @@ mod tests {
             ..Run::default()
         });
         assert_eq!(
-            findings_about(&report, "error byte latched on 9 of the servos"),
+            findings_about(&report, "error byte latched"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert!(measured_about(
+            &report,
+            "the input-voltage bit is latched on 9 of the servos the health rotation read"
+        ));
+        for id in 10..19 {
+            assert_eq!(findings_about(&report, &format!("servo {id} (0x01)")), 0);
+            assert!(measured_about(&report, &format!("servo {id}: 7.40 V")));
+        }
+    }
+
+    /// A subset of the roster latching the input-voltage bit reads the same way:
+    /// the bit is the machine's, not a row's, so the note names whoever has it.
+    #[test]
+    fn the_input_voltage_bit_on_a_subset_of_rows_is_still_a_note() {
+        let mut clean = HealthReportWire::new();
+        clean.set_id(10);
+        clean.set_volts(7.4);
+        let mut latched = HealthReportWire::new();
+        latched.set_id(11);
+        latched.set_volts(7.4);
+        latched.set_bits(0x01);
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            readings: vec![at(1, clean), at(1, latched)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "error byte latched"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert!(measured_about(
+            &report,
+            "the input-voltage bit is latched on 1 of the servos the health rotation read: servo 11"
+        ));
+    }
+
+    /// The voltage bit launders nothing riding beside it: a byte carrying an
+    /// overload as well is a finding, named whole.
+    #[test]
+    fn a_byte_carrying_more_than_the_voltage_bit_is_a_finding_named_whole() {
+        let mut mixed = HealthReportWire::new();
+        mixed.set_id(12);
+        mixed.set_volts(7.4);
+        mixed.set_bits(0x21);
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            readings: vec![at(1, mixed)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(
+                &report,
+                "latched on 1 of the servos the health rotation read: servo 12 (0x21)"
+            ),
             1,
             "{:?}",
             report.findings
         );
         assert_eq!(
-            findings_about(&report, "0x01"),
-            1,
-            "the nine rows were reported nine times: {:?}",
+            findings_about(&report, "the input-voltage bit is latched"),
+            0,
+            "{:?}",
             report.findings
         );
-        for id in 10..19 {
-            assert_eq!(
-                findings_about(&report, &format!("servo {id} (0x01)")),
-                1,
-                "{:?}",
-                report.findings
-            );
-        }
     }
 
     /// The read census counts a partial read, a blind one and a sample naming a
@@ -4157,19 +4477,29 @@ mod tests {
         );
     }
 
-    /// An outcome under a number no request in the log carries is a trail with
-    /// a hole in it, and the report says so rather than censusing a status it
-    /// cannot attribute.
+    /// An outcome names its own transaction, so a number whose request went
+    /// past before the logger attached is still readable: the identity comes
+    /// off the outcome's echo, and there is nothing left to fail the run for.
     #[test]
-    fn an_outcome_with_no_request_behind_it_is_a_finding() {
-        let report = analyze(&traffic_run(
-            Vec::new(),
-            vec![answered(4, 7, AuxStatusWire::OK)],
-        ));
+    fn an_outcome_with_no_request_behind_it_names_itself() {
+        let mut outcome = answered(4, 7, AuxStatusWire::TIMEOUT);
+        outcome.message.set_op(AuxOpKindWire::READ_REG);
+        outcome.message.set_id(14);
+        outcome.message.set_reg(RegIdWire::PRESENT_POSITION);
+        let report = analyze(&traffic_run(Vec::new(), vec![outcome]));
+        assert!(
+            measured_about(
+                &report,
+                "AuxOpKindWire::READ_REG servo 14 RegIdWire::PRESENT_POSITION, named by the \
+                 outcome itself"
+            ),
+            "{:?}",
+            report.measured
+        );
         assert_eq!(
             findings_about(&report, "no request under that number is in the log"),
-            1,
-            "{:?}",
+            0,
+            "an outcome that says what it answers is not an orphan: {:?}",
             report.findings
         );
     }
@@ -4222,214 +4552,175 @@ mod tests {
         );
     }
 
-    /// The busy answer and the original's real answer share a number, so both
-    /// are kept: a map keeping one of them would drop exactly the pair that says
-    /// the refusal was slot pacing rather than a decline.
+    /// The slot answers a collision with its own status, so a busy answer is
+    /// read for which request the slot was holding rather than inferred from
+    /// what else the trail carries. A number the log holds once is the ordinary
+    /// collision: two numbers overlapped.
     #[test]
-    fn a_refusal_with_a_pending_original_behind_it_is_slot_pacing() {
+    fn a_busy_answer_under_a_number_the_log_holds_once_is_a_collision() {
+        let report = analyze(&traffic_run(
+            vec![
+                asked(3, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
+                asked(4, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
+            ],
+            vec![
+                answered(5, 7, AuxStatusWire::BUSY),
+                answered(6, 6, AuxStatusWire::OK),
+            ],
+        ));
+        assert_eq!(
+            findings_about(&report, "holding a request under another number"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(
+                &report,
+                "declined the transaction before anything reached the bus"
+            ),
+            0,
+            "a busy slot is not a decline: {:?}",
+            report.findings
+        );
+    }
+
+    /// A busy answer to a verbatim re-issue is a finding against the build
+    /// rather than against the run: the slot answers a duplicate with the
+    /// pending request's own outcome, so a driver that turns one away is one
+    /// that does not recognise it.
+    #[test]
+    fn a_busy_answer_to_a_verbatim_re_issue_is_a_finding_against_the_driver() {
         let report = analyze(&traffic_run(
             vec![
                 asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0),
                 asked(4, 7, 21, RegIdWire::TORQUE_ENABLE, 0),
             ],
-            vec![
-                answered(5, 7, AuxStatusWire::REFUSED),
-                answered(6, 7, AuxStatusWire::OK),
-            ],
+            vec![answered(5, 7, AuxStatusWire::BUSY)],
         ));
-        assert!(
-            measured_about(
-                &report,
-                "re-issue turned away while the original was pending"
-            ),
-            "{:?}",
-            report.measured
-        );
         assert_eq!(
-            findings_about(&report, "cannot be attributed"),
-            0,
+            findings_about(&report, "built before its slot recognised a duplicate"),
+            1,
             "{:?}",
             report.findings
         );
     }
 
-    /// The same run's records, with the driver's console counters beside them.
+    /// One status record, as the driver republishes it: a healthy start, the
+    /// two counters a case names, and a wind-down's copy.
+    ///
+    /// The two instants are ordered the way a run that waited orders them --
+    /// the first command taken after the first sample was published -- so a
+    /// case that is not about the survey does not accidentally state a race.
+    fn stated(session_cmds: u64, aux_refused: u64) -> DriverStatusWire {
+        let mut status = DriverStatusWire::new();
+        status.set_sweep_time(when(-1));
+        status.set_first_pose(when(0));
+        status.set_first_session_cmd(when(2));
+        status.set_wound_down(true);
+        status.seam_mut().set_session_cmds(session_cmds);
+        status.cycle_mut().set_aux_refused(aux_refused);
+        status
+    }
+
+    /// The same run's records, with the driver's own account of them beside
+    /// them.
     ///
     /// `session_cmds` is what the driver says it took off its socket, which is
-    /// what decides whether an absent re-issue is evidence of anything. The
-    /// counters are a wound-down driver's, which is what makes them the run's
-    /// last word; [`counted_run_killed`] is the same run without that.
+    /// what the logged trail is cross-checked against. The record is a
+    /// wound-down driver's, which is what makes it the run's last word;
+    /// [`counted_run_killed`] is the same run without that.
     fn counted_run(
         datagrams: Vec<Logged<SessionCmdWire>>,
         outcomes: Vec<Logged<AuxOutcomeWire>>,
         session_cmds: u64,
     ) -> Run {
         Run {
-            counters: Some(DriverCounters {
-                session_cmds,
-                aux_refused: 0,
-                source: "motord_0.log".to_string(),
-                wound_down: true,
-            }),
+            statuses: vec![at(9, stated(session_cmds, 0))],
+            // The census says what the log holds, and a status this fixture
+            // decoded is a status the log held: the two readings are of the
+            // same message, and a run where they disagree is what `carriers`
+            // has its own case for.
+            census: vec![channel(STATUS_CHANNEL, 1, 0)],
             ..traffic_run(datagrams, outcomes)
         }
     }
 
-    /// The same, with counters off a console that stops mid-run: a driver that
-    /// never answered its stop, so its last summary is up to five seconds older
-    /// than the log.
+    /// The same, over a run that ended without a wind-down: the last status is
+    /// a periodic copy, so its counters can be up to one window older than the
+    /// log.
     fn counted_run_killed(
         datagrams: Vec<Logged<SessionCmdWire>>,
         outcomes: Vec<Logged<AuxOutcomeWire>>,
         session_cmds: u64,
     ) -> Run {
         let mut run = counted_run(datagrams, outcomes, session_cmds);
-        if let Some(counters) = run.counters.as_mut() {
-            counters.wound_down = false;
+        for status in &mut run.statuses {
+            status.message.set_wound_down(false);
         }
         run
     }
 
-    /// Two requests and two refusals is not slot pacing, and it is not a decline
-    /// the report can name either.
-    ///
-    /// Pacing needs the original's real answer, so this fails the run. But the
-    /// re-issue pacing needs *is* in the log, which is why the line cannot go on
-    /// to claim nothing was pending: for some identities -- a ping of a servo the
-    /// driver addresses -- no pre-bus decline can fire at all, so the missing
-    /// answer is what the report says is missing.
+    /// A refusal is the driver declining the transaction itself, and the slot
+    /// that was already full says so under its own status. So the reading is
+    /// direct: no counters, no re-issue and no outstanding number enter into
+    /// it.
     #[test]
-    fn two_requests_answered_only_by_refusals_cannot_be_attributed() {
-        let report = analyze(&traffic_run(
-            vec![
-                asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0),
-                asked(4, 7, 21, RegIdWire::TORQUE_ENABLE, 0),
-            ],
-            vec![
-                answered(5, 7, AuxStatusWire::REFUSED),
-                answered(6, 7, AuxStatusWire::REFUSED),
-            ],
-        ));
-        assert_eq!(
-            findings_about(&report, "cannot be attributed"),
-            2,
-            "a refusal with the re-issue in the log was attributed anyway: {:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "delivery re-issue slot pacing needs"),
-            2,
-            "each line names the re-issue it found: {:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-        assert!(
-            !report
-                .measured
-                .iter()
-                .any(|line| line.contains("turned away while the original was pending")),
-            "{:?}",
-            report.measured
-        );
+    fn a_refusal_is_read_as_a_decline_whatever_else_the_trail_holds() {
+        for run in [
+            counted_run(
+                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+                vec![answered(5, 7, AuxStatusWire::REFUSED)],
+                1,
+            ),
+            // A trail the driver counted more datagrams than.
+            counted_run(
+                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+                vec![answered(5, 7, AuxStatusWire::REFUSED)],
+                2,
+            ),
+            // No counters at all.
+            traffic_run(
+                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+                vec![answered(5, 7, AuxStatusWire::REFUSED)],
+            ),
+            // Another number still unanswered when it went out.
+            counted_run(
+                vec![
+                    asked(3, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
+                    asked(4, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
+                ],
+                vec![
+                    answered(5, 7, AuxStatusWire::REFUSED),
+                    answered(6, 6, AuxStatusWire::OK),
+                ],
+                2,
+            ),
+        ] {
+            let report = analyze(&run);
+            assert_eq!(
+                findings_about(
+                    &report,
+                    "declined the transaction before anything reached the bus"
+                ),
+                1,
+                "{:?}",
+                report.findings
+            );
+        }
     }
 
-    /// A lone request answered by a refusal, on a trail the driver's own
-    /// datagram count says is whole, is the one shape that reads as a decline:
-    /// nothing was pending, and the log holding everything the driver took is
-    /// what makes that absence evidence.
+    /// A number carrying two different payloads fails the run on its own, and a
+    /// busy answer beside it says what the slot was holding was not what this
+    /// number names.
     #[test]
-    fn a_lone_refusal_on_a_whole_trail_is_a_decline() {
-        let report = analyze(&counted_run(
-            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-            vec![answered(5, 7, AuxStatusWire::REFUSED)],
-            1,
-        ));
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            1,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// The same shape on a trail the driver counted more datagrams than: a lone
-    /// request plus a refusal is exactly what pacing leaves once the recorded
-    /// trail loses the original, so nothing is attributed. Still a finding.
-    #[test]
-    fn a_lone_refusal_on_a_short_trail_cannot_be_attributed() {
-        let report = analyze(&counted_run(
-            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-            vec![answered(5, 7, AuxStatusWire::REFUSED)],
-            2,
-        ));
-        assert_eq!(
-            findings_about(&report, "cannot be attributed"),
-            1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "counted more datagrams than the log holds"),
-            1,
-            "the line says which doubt it is: {:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// And with no counters at all in the run's records there is nothing to
-    /// establish the trail with, so the same restraint applies: every recorded
-    /// trail so far is short at the front, and a report that read absence as
-    /// evidence would name a decline on the strength of a message the logger
-    /// never picked up.
-    #[test]
-    fn a_lone_refusal_with_no_counters_cannot_be_attributed() {
-        let report = analyze(&traffic_run(
-            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-            vec![answered(5, 7, AuxStatusWire::REFUSED)],
-        ));
-        assert_eq!(
-            findings_about(&report, "cannot be attributed"),
-            1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "carry no driver counters"),
-            1,
-            "the line says which doubt it is: {:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// A number carrying two different payloads already fails the run on its
-    /// own, and the refusal beside it says what is there -- a second transaction
-    /// the slot can turn away on its own account -- rather than claiming a
-    /// decline.
-    #[test]
-    fn a_differing_payload_refusal_says_so_and_names_no_decline() {
+    fn a_busy_answer_under_a_differing_payload_says_which_is_which() {
         let report = analyze(&counted_run(
             vec![
                 asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0),
                 asked(4, 7, 21, RegIdWire::TORQUE_ENABLE, 1),
             ],
-            vec![answered(5, 7, AuxStatusWire::REFUSED)],
+            vec![answered(5, 7, AuxStatusWire::BUSY)],
             2,
         ));
         assert_eq!(
@@ -4439,205 +4730,92 @@ mod tests {
             report.findings
         );
         assert_eq!(
-            findings_about(&report, "no re-issue of it is in the log"),
-            0,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// The busy refusal is not per-correlation-number: the slot turns away
-    /// whatever arrives while it holds a transaction, and answers the number it
-    /// turned away. So a lone request that went out while another number was
-    /// still unanswered is not a decline, whole trail or not -- and reading it as
-    /// one would send an operator into the driver's refusal arms after a host
-    /// that overlapped two transactions.
-    #[test]
-    fn a_lone_refusal_with_another_number_outstanding_cannot_be_attributed() {
-        let report = analyze(&counted_run(
-            vec![
-                asked(3, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
-                asked(4, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
-            ],
-            vec![
-                answered(5, 7, AuxStatusWire::REFUSED),
-                answered(6, 6, AuxStatusWire::OK),
-            ],
-            2,
-        ));
-        assert_eq!(
-            findings_about(&report, "corr 6 was still unanswered when it went out"),
+            findings_about(&report, "retry with perturbed inputs"),
             1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
+            "the two payloads are their own finding: {:?}",
             report.findings
         );
     }
 
-    /// Ordinary serial traffic: a transaction asked and answered before the
-    /// refused one went out. The outstanding-transaction guard is about numbers
-    /// that were *still* unanswered, so a trail of completed ones ahead of the
-    /// refusal leaves the decline reading standing -- which is what a real
-    /// commissioning survey looks like, dozens of finished transactions deep.
+    /// A refusal under a number the log holds no request for is still a
+    /// refusal: the status says what the driver did, and the outcome's own echo
+    /// says what it was about.
     #[test]
-    fn an_answered_transaction_ahead_of_the_refusal_is_not_outstanding() {
-        let report = analyze(&counted_run(
-            vec![
-                asked(1, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
-                asked(3, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
-            ],
-            vec![
-                answered(2, 6, AuxStatusWire::OK),
-                answered(4, 7, AuxStatusWire::REFUSED),
-            ],
-            2,
-        ));
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "still unanswered when it went out"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// The boundary of that guard: an answer published at the very instant the
-    /// refused request went out does not say which came first, so the tie reads
-    /// as still pending and the decline claim is not made.
-    #[test]
-    fn an_answer_at_the_refused_requests_own_instant_reads_as_pending() {
-        let report = analyze(&counted_run(
-            vec![
-                asked(1, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
-                asked(3, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
-            ],
-            vec![
-                answered(3, 6, AuxStatusWire::OK),
-                answered(4, 7, AuxStatusWire::REFUSED),
-            ],
-            2,
-        ));
-        assert_eq!(
-            findings_about(&report, "corr 6 was still unanswered when it went out"),
-            1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// The driver's slot only ever holds an out-of-band transaction, so a pose
-    /// or do-nothing datagram is not something a refusal can have collided
-    /// with. Those carry no outcome by construction, so a guard reading them
-    /// would find every trail overlapping and the decline reading would never
-    /// fire again.
-    #[test]
-    fn a_datagram_that_asks_for_nothing_is_not_an_outstanding_transaction() {
-        let mut nothing = SessionCmdWire::new();
-        nothing.set_kind(SessionCmdKindWire::NONE);
-        nothing.set_corr(6);
-        let report = analyze(&counted_run(
-            vec![at(1, nothing), asked(3, 7, 22, RegIdWire::TORQUE_ENABLE, 0)],
-            vec![answered(4, 7, AuxStatusWire::REFUSED)],
-            2,
-        ));
-        assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            1,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "still unanswered when it went out"),
-            0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// A refusal under a number the log holds no request for is the number the
-    /// trail says the least about, so it is never attributed -- least of all to
-    /// a driver-side decline, which would send an operator into the driver's
-    /// refusal arms on the strength of a missing record.
-    #[test]
-    fn a_refusal_with_no_request_behind_it_names_no_decline() {
+    fn a_refusal_with_no_request_behind_it_is_still_a_decline() {
         let report = analyze(&counted_run(
             Vec::new(),
             vec![answered(4, 7, AuxStatusWire::REFUSED)],
             0,
         ));
         assert_eq!(
-            findings_about(&report, "no request under this number at all"),
+            findings_about(
+                &report,
+                "declined the transaction before anything reached the bus"
+            ),
             1,
             "{:?}",
             report.findings
         );
         assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
-            0,
-            "{:?}",
-            report.findings
-        );
-        assert_eq!(
-            findings_about(&report, "no request under that number is in the log"),
+            findings_about(&report, "named by the outcome itself"),
             1,
-            "the orphan outcome is still its own finding: {:?}",
+            "the identity comes off the echo: {:?}",
             report.findings
         );
     }
 
-    /// The witness only counts where the driver wound down. A driver killed hard
-    /// prints its last cadence summary up to five seconds before the log ends,
-    /// and the datagrams logged after it make up for the ones a head truncation
-    /// ate -- so "the log holds at least as many" establishes nothing and the
-    /// decline reading is not available.
+    /// A busy answer says the slot was full; which request it was full of is
+    /// read off the trail, and a trail holding no request under this number
+    /// cannot say. The line says that much and no more -- the reading that
+    /// separates a collision between two numbers from a slot holding this one
+    /// under other bytes is not available.
     #[test]
-    fn a_lone_refusal_on_a_hard_killed_runs_counters_cannot_be_attributed() {
-        let report = analyze(&counted_run_killed(
-            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-            vec![answered(5, 7, AuxStatusWire::REFUSED)],
-            1,
+    fn a_busy_answer_with_no_request_behind_it_says_what_the_trail_cannot() {
+        let report = analyze(&counted_run(
+            Vec::new(),
+            vec![answered(4, 7, AuxStatusWire::BUSY)],
+            0,
         ));
         assert_eq!(
-            findings_about(&report, "holds no wind-down line"),
+            findings_about(
+                &report,
+                "cannot be read off a trail that is missing this one"
+            ),
             1,
             "{:?}",
             report.findings
         );
         assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
+            findings_about(&report, "was holding a request under another number"),
             0,
-            "{:?}",
+            "the trail does not support that reading: {:?}",
             report.findings
         );
     }
 
-    /// The counter is printed on a cadence, so a log holding *more* than the
-    /// last summary counted is ordinary: no shortfall finding, and the trail
-    /// still reads as whole.
+    /// The status only speaks for the whole run where the driver wound down.
+    /// A run that ended some other way published its last copy on the window
+    /// cadence, so its counters can be a window older than the log and a
+    /// shortfall read off them would be arithmetic about the cadence.
     #[test]
-    fn a_log_holding_more_than_the_counter_is_ordinary_and_not_a_shortfall() {
+    fn a_status_that_is_not_a_wind_downs_says_so() {
+        let report = analyze(&counted_run_killed(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        ));
+        assert!(
+            measured_about(&report, "and not a wind-down's"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The status is republished on a cadence, so a log holding *more* than the
+    /// last copy counted is ordinary: no shortfall finding, and the trail still
+    /// reads as whole.
+    #[test]
+    fn a_log_holding_more_than_the_status_counted_is_ordinary_and_not_a_shortfall() {
         let report = analyze(&counted_run(
             vec![
                 asked(1, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
@@ -4650,13 +4828,610 @@ mod tests {
             1,
         ));
         assert_eq!(
-            findings_about(&report, "the recorded trail is short"),
+            findings_about(&report, "fewer session datagrams than the driver counted"),
             0,
             "{:?}",
             report.findings
         );
         assert_eq!(
-            findings_about(&report, "declined it before anything reached the bus"),
+            findings_about(
+                &report,
+                "declined the transaction before anything reached the bus"
+            ),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The driver counts the offers it turned away, and a turned-away offer is
+    /// answered `busy`. So the counter is checked against the busy outcomes: a
+    /// run holding one of each is whole, and a `refused` outcome -- a decline
+    /// the driver counts nothing for -- neither makes a deficit up nor
+    /// manufactures one.
+    #[test]
+    fn the_refusal_counter_is_checked_against_the_busy_outcomes() {
+        let mut run = counted_run(
+            vec![
+                asked(1, 6, 21, RegIdWire::TORQUE_ENABLE, 0),
+                asked(3, 7, 22, RegIdWire::TORQUE_ENABLE, 0),
+            ],
+            vec![
+                answered(2, 6, AuxStatusWire::BUSY),
+                answered(4, 7, AuxStatusWire::REFUSED),
+            ],
+            2,
+        );
+        run.statuses = vec![at(9, stated(2, 1))];
+        let report = analyze(&run);
+        assert!(
+            measured_about(
+                &report,
+                "the driver counted 1 turned-away offers; the log holds 1 busy outcomes"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            findings_about(&report, "nor a lost outcome at the front to account for"),
+            0,
+            "a busy outcome answers the counted offer: {:?}",
+            report.findings
+        );
+    }
+
+    /// One channel of a log, as the census keeps it.
+    fn channel(name: &str, count: usize, first_seq: u32) -> Channel {
+        Channel {
+            name: name.to_string(),
+            count,
+            first_seq: Some(first_seq),
+        }
+    }
+
+    /// The publisher numbers from zero and skips nothing, so the lowest number
+    /// a channel carries is how much of it the log never got. Printed for every
+    /// channel, and said again as a measured loss for the streams this tool
+    /// reads.
+    #[test]
+    fn the_census_says_where_each_channels_copy_starts() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.census = vec![
+            channel(SESSION_CMD_CHANNEL, 1, 6),
+            channel(POSE_CHANNEL, 10, 0),
+            channel("/logger/status", 3, 4),
+        ];
+        let report = analyze(&run);
+        assert!(
+            measured_about(
+                &report,
+                "channel SessionCmdChan: 1 messages, from sequence 6"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured_about(
+                &report,
+                "SessionCmdChan begins at sequence 6: 6 messages predate the logger's attach"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            findings_about(&report, "SessionCmdChan begins at sequence"),
+            0,
+            "a lost head is what a lazily attaching logger costs every run: {:?}",
+            report.findings
+        );
+        assert!(
+            !measured_about(&report, "DriverPose begins at sequence"),
+            "a channel the log holds from the first publish lost nothing: {:?}",
+            report.measured
+        );
+        assert!(
+            !measured_about(&report, "/logger/status begins at sequence"),
+            "the reading is about the streams this report reads: {:?}",
+            report.measured
+        );
+    }
+
+    /// Every channel this tool binds says how it is retained.
+    ///
+    /// The two tables are one table in two pieces, and the second is what the
+    /// head-loss reading turns on. A channel bound above and forgotten here
+    /// would be read as a regular one by omission, which is a decision nobody
+    /// made.
+    #[test]
+    fn every_bound_channel_says_how_it_is_retained() {
+        let bound: Vec<&str> = CHANNELS.iter().map(|channel| channel.name).collect();
+        let declared: Vec<&str> = RETENTION.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            bound, declared,
+            "the retention table is the channel table, channel for channel and in its order",
+        );
+    }
+
+    /// And what it says is what the systems that write these logs declare.
+    ///
+    /// The logging policy is the artifact that decides it; this table is a copy,
+    /// and a copy of a policy is drift waiting to happen. Both online systems
+    /// are read, because a log this tool judges comes off one or the other and
+    /// they have to agree. The simulated system is deliberately not among them:
+    /// its runner records every message from the first, so it has no attach
+    /// instant for a retained message to be handed at, and its own policy says
+    /// so.
+    #[test]
+    fn the_retention_table_is_what_the_online_systems_declare() {
+        for system in ["SYSTEM_ROBOT_CLK", "SYSTEM_HOST_CLK"] {
+            let text = runfile(system);
+            for (name, kept) in RETENTION {
+                let policy = policy_block(&text, name)
+                    .unwrap_or_else(|| panic!("{system} declares no logging policy for {name}"));
+                let declared = if policy.contains("ChannelType::persistent") {
+                    Retention::Persistent
+                } else {
+                    Retention::Regular
+                };
+                assert_eq!(declared, kept, "{system}, channel {name}");
+            }
+        }
+    }
+
+    /// The environment variable `name` points at, read whole.
+    ///
+    /// Panics rather than answers: a missing runfile is a broken test target,
+    /// not a case.
+    fn runfile(name: &str) -> String {
+        let path = std::env::var(name).unwrap_or_else(|_| {
+            panic!(
+                "{name} is unset: the test target has to name the file beside the data attribute \
+                 that supplies it"
+            )
+        });
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{name} names {path}, which does not read: {error}"))
+    }
+
+    /// The body of the logging policy `text` declares over the channel called
+    /// `channel`, or `None` where it declares none.
+    ///
+    /// Matched on the channel's own name after the module qualifier, which is
+    /// the join key `motion_channels` exists to hold: a channel renamed in one
+    /// artifact and not the other fails as a missing policy.
+    fn policy_block<'a>(text: &'a str, channel: &str) -> Option<&'a str> {
+        let head = format!("policy ChannelLoggingPolicy for motion::{channel}\n");
+        let start = text.find(&head)? + head.len();
+        let rest = &text[start..];
+        let end = rest.find('}')?;
+        Some(&rest[..end])
+    }
+
+    /// One retained message is the whole of a persistent channel, so where its
+    /// copy starts says nothing about completeness and nothing is read off it.
+    /// What would be wrong is holding none, which is the carrier finding.
+    #[test]
+    fn a_persistent_channels_start_is_not_read_as_a_loss() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.census = vec![
+            channel(STATUS_CHANNEL, 1, 27),
+            channel(REPORT_CHANNEL, 1, 9),
+            channel(SCHEDULE_CHANNEL, 1, 3),
+        ];
+        let report = analyze(&run);
+        for (name, _) in RETENTION
+            .iter()
+            .filter(|(_, kept)| *kept == Retention::Persistent)
+        {
+            assert!(
+                !measured_about(&report, &format!("{name} begins at sequence")),
+                "{name}: {:?}",
+                report.measured
+            );
+        }
+        assert_eq!(
+            findings_about(&report, "the log holds no"),
+            0,
+            "both carriers are there: {:?}",
+            report.findings
+        );
+    }
+
+    /// The two carriers are what the rest of this report reads the run from,
+    /// and both are retained for a subscriber that attaches at any instant. So
+    /// a log holding none of one is a run that cannot be verified, and it is
+    /// said unconditionally rather than excused by an attach time.
+    #[test]
+    fn a_log_missing_a_carrier_is_a_finding_naming_it() {
+        let report = analyze(&traffic_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+        ));
+        assert_eq!(
+            findings_about(&report, "the log holds no DriverStatus message"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "the log holds no ReportsOut message"),
+            1,
+            "{:?}",
+            report.findings
+        );
+
+        let mut whole = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        whole.census = vec![channel(STATUS_CHANNEL, 1, 0), channel(REPORT_CHANNEL, 2, 0)];
+        let report = analyze(&whole);
+        assert_eq!(
+            findings_about(&report, "the log holds no"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A story that wrapped is said before the checks that walk its rows.
+    ///
+    /// The rows a wrapped story lost are its oldest, which are the ones those
+    /// checks start from -- so what they say about a wrapped story is that the
+    /// session never made the transitions, when what happened is that it made
+    /// more of them than the ring holds. The count is the only thing that can
+    /// tell the two apart, and it rides the message rather than the rows.
+    #[test]
+    fn a_story_that_dropped_rows_says_so_before_its_rows_are_read() {
+        let mut run = counted_run(vec![], vec![], 0);
+        run.census = vec![channel(STATUS_CHANNEL, 1, 0), channel(REPORT_CHANNEL, 4, 0)];
+        run.reports = vec![phase(
+            1,
+            SessionPhaseWire::ACTIVE,
+            SessionPhaseWire::ENGAGING,
+        )];
+        run.story_dropped = 7;
+
+        let report = analyze(&run);
+
+        assert_eq!(
+            findings_about(&report, "dropped 7 rows off its front"),
+            1,
+            "{:?}",
+            report.findings
+        );
+
+        run.story_dropped = 0;
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "off its front"),
+            0,
+            "a story that lost nothing says nothing: {:?}",
+            report.findings
+        );
+    }
+
+    /// A carrier the log holds and this build could not read is said as that,
+    /// and not as a dead publisher.
+    ///
+    /// The two questions are asked separately because the answers send whoever
+    /// is at the bench in opposite directions: a channel the recording never
+    /// held is a socket or a publish to go and look at, and a channel it held
+    /// whole under another schema revision is this tool built at the wrong
+    /// revision. Conflating them hands out the wrong first hypothesis, which
+    /// the complaint list beside it then flatly contradicts.
+    #[test]
+    fn a_carrier_the_log_holds_and_this_build_cannot_read_says_which_it_is() {
+        let mut run = traffic_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+        );
+        // The recording holds both, and nothing decoded off either.
+        run.census = vec![channel(STATUS_CHANNEL, 3, 0), channel(REPORT_CHANNEL, 2, 0)];
+
+        let report = analyze(&run);
+
+        assert_eq!(
+            findings_about(&report, "could read none of them"),
+            2,
+            "one per carrier: {:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "the log holds no"),
+            0,
+            "a channel the log holds is not also reported as absent: {:?}",
+            report.findings
+        );
+    }
+
+    /// The loss the logger's attach costs a stream is charged to the log before
+    /// the run is charged with anything: a trail short by exactly its measured
+    /// head loss is whole from the first message the log holds.
+    #[test]
+    fn a_trail_short_by_its_head_loss_is_not_short_of_the_run() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            3,
+        );
+        run.census = vec![channel(SESSION_CMD_CHANNEL, 1, 2)];
+        let report = analyze(&run);
+        assert!(
+            measured_about(
+                &report,
+                "counted 3 session datagrams; the log holds 1 and lost 2 off the front"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            findings_about(&report, "over and above the 2 its attach cost it"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Loss beyond the head is loss mid-run -- a dropped datagram, a logger
+    /// that fell behind -- and that is a defect the log's own head cannot
+    /// excuse.
+    #[test]
+    fn a_trail_short_beyond_its_head_loss_is_a_finding() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            5,
+        );
+        run.census = vec![channel(SESSION_CMD_CHANNEL, 1, 2)];
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(
+                &report,
+                "the log holds 2 fewer session datagrams than the driver counted, over and above \
+                 the 2 its attach cost it"
+            ),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The outcome stream loses its head like any other, so the refusal
+    /// arithmetic charges that loss before it charges the run.
+    #[test]
+    fn a_refusal_deficit_the_lost_outcomes_account_for_is_named_not_flagged() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.statuses = vec![at(9, stated(1, 2))];
+        run.census = vec![channel(AUX_OUT_CHANNEL, 1, 2)];
+        let report = analyze(&run);
+        assert!(
+            measured_about(&report, "and by the outcomes the log lost at the front"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            findings_about(&report, "nor a lost outcome at the front to account for"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// One class of refusal is invisible to everything but this cross-check: a
+    /// datagram asking for nothing is counted and answered with nothing at all.
+    /// A deficit of exactly that shape is named rather than read as loss.
+    #[test]
+    fn a_refusal_deficit_the_do_nothing_datagrams_account_for_is_named_not_flagged() {
+        let mut nothing = SessionCmdWire::new();
+        nothing.set_kind(SessionCmdKindWire::NONE);
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0), at(4, nothing)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            2,
+        );
+        run.statuses = vec![at(9, stated(2, 1))];
+        let report = analyze(&run);
+        assert!(
+            measured_about(&report, "the do-nothing datagrams the driver counts"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            findings_about(&report, "nor a lost outcome at the front to account for"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A turned-away offer the driver counted that nothing in the log accounts
+    /// for is a real gap, and the finding names both things that produce one.
+    #[test]
+    fn a_refusal_deficit_nothing_accounts_for_is_a_finding() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.statuses = vec![at(9, stated(1, 2))];
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "nor a lost outcome at the front to account for"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(
+                &report,
+                "only the first collision of a cycle leaves an outcome"
+            ),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The driver counts the re-issues its slot recognised, and the count is in
+    /// every copy of the status, so it is read rather than inferred.
+    #[test]
+    fn the_duplicate_count_is_read_off_the_status() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.statuses[0].message.cycle_mut().set_aux_duplicates(4);
+        let report = analyze(&run);
+        assert!(
+            measured_about(&report, "recognised 4 offers as a re-issue"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A channel the log declared and carried nothing on has no first sequence
+    /// number to say where its copy starts, and is counted rather than left
+    /// out: a report group that reported nothing is what an operator is looking
+    /// for when a group is missing from everything downstream.
+    #[test]
+    fn a_channel_the_log_carried_nothing_on_is_counted_without_a_start() {
+        let mut run = traffic_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+        );
+        run.census = vec![Channel {
+            name: "/logger/status".to_string(),
+            count: 0,
+            first_seq: None,
+        }];
+        let report = analyze(&run);
+        assert!(
+            measured_about(&report, "channel /logger/status: 0 messages"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured_about(&report, "/logger/status: 0 messages, from sequence"),
+            "a channel with nothing on it says nothing about where it starts: {:?}",
+            report.measured
+        );
+    }
+
+    /// The session commissions only once the driver has shown a sample, so a
+    /// command the driver took before it published one is the wait gone: it was
+    /// still starting, and what it answers is the delivery re-issue.
+    #[test]
+    fn a_survey_that_asked_before_the_driver_answered_is_a_finding() {
+        let mut run = counted_run(Vec::new(), Vec::new(), 1);
+        run.statuses[0].message.set_first_session_cmd(when(-1));
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "asked before anything said the driver was cycling"),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The driver drains its inbox before the cycle that publishes a sample, so
+    /// a command stamped at the same instant as the first sample was taken
+    /// before that sample existed. A tie is the race, not a near miss.
+    #[test]
+    fn a_command_taken_on_the_cycle_that_published_the_first_sample_is_the_race() {
+        let mut run = counted_run(Vec::new(), Vec::new(), 1);
+        run.statuses[0].message.set_first_session_cmd(when(0));
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "asked before anything said the driver was cycling"),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Both instants are the driver's own, so the check is made whatever the
+    /// log lost off the front of either stream -- which is the whole reason it
+    /// reads them off the status.
+    #[test]
+    fn the_survey_is_read_off_the_status_and_not_off_the_streams() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.census = vec![
+            channel(POSE_CHANNEL, 10, 4),
+            channel(SESSION_CMD_CHANNEL, 1, 8),
+        ];
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "asked before anything said the driver was cycling"),
+            0,
+            "a run that waited reads as one however much of either stream is gone: {:?}",
+            report.findings
+        );
+
+        run.statuses[0].message.set_first_session_cmd(when(-1));
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "asked before anything said the driver was cycling"),
+            1,
+            "and a run that raced reads as one on the same log: {:?}",
+            report.findings
+        );
+    }
+
+    /// A run nothing has commanded yet has no instant to order against, and a
+    /// made-up one would read as an ordering.
+    #[test]
+    fn a_run_the_host_never_commanded_says_nothing_about_the_survey() {
+        let mut run = counted_run(Vec::new(), Vec::new(), 0);
+        run.statuses[0]
+            .message
+            .set_first_session_cmd(SyncTime::from_nanos(0));
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "asked before anything said the driver was cycling"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The two kinds of out-of-band work are counted apart: a health triple is
+    /// three exchanges where a host request is one, so which kind a run's skips
+    /// follow is what says which to measure first.
+    #[test]
+    fn a_skip_after_a_host_transaction_is_attributed_to_it() {
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            outcomes: vec![answered(3, 7, AuxStatusWire::OK)],
+            events: vec![
+                skip(5, 1, 30_000_000),
+                stats(9, 50, 1, 30_000_000, 8_000_000),
+            ],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(
+                &report,
+                "0 after a health reading and 1 after a host transaction"
+            ),
             1,
             "{:?}",
             report.findings
@@ -4680,276 +5455,90 @@ mod tests {
         );
     }
 
-    /// The driver's summary line, as its console carries it.
-    fn summary(cycle: u32, session_cmds: u64, aux_refused: u64) -> String {
-        format!(
-            "reachy-motord: /dev/ttyAMA3 at 1000000 baud\nreachy-motord: cycle={cycle} skipped=11 \
-             aux_refused={aux_refused} health_reports=11 session_cmds={session_cmds} \
-             recv_errors=0\n"
-        )
-    }
-
-    /// The labels are the driver's own, so a console printed by the driver this
-    /// build was compiled against reads back whatever those labels are called.
+    /// The process writes the minimum risk condition before anything else it
+    /// does on the bus, and the instant rides every status copy -- so the
+    /// startup record is readable off a log whose event stream begins well
+    /// after cycle 0, which is every healthy run.
     #[test]
-    fn the_summary_is_read_under_the_labels_the_driver_prints_it_under() {
-        let line = format!(
-            "reachy-motord: cycle=250 {}=4 {}=2\n",
-            SeamCounts::SESSION_CMDS,
-            CycleCounts::AUX_REFUSED
-        );
-        let counters =
-            DriverCounters::parse(&line, "console".to_string()).expect("the driver's own labels");
-        assert_eq!((counters.session_cmds, counters.aux_refused), (4, 2));
-    }
-
-    /// A console that holds no summary yet is a run that ended before the
-    /// driver's first five seconds -- which is a fact about the run, and exactly
-    /// the run this tool most needs to judge. The cross-check is skipped and
-    /// said to be skipped; nothing else about the log goes unjudged.
-    #[test]
-    fn a_console_with_no_summary_leaves_the_rest_of_the_run_judged() {
-        let run = Run {
-            counters: None,
-            console_without_summary: Some("motord_0.log".to_string()),
-            ..traffic_run(
-                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-                vec![answered(5, 7, AuxStatusWire::OK)],
-            )
-        };
-        let report = analyze(&run);
+    fn the_startup_release_is_read_off_the_status() {
+        let report = analyze(&counted_run(Vec::new(), Vec::new(), 0));
         assert!(
-            measured_about(&report, "no cross-check against the driver's own counters"),
-            "{:?}",
-            report.measured
-        );
-        assert!(
-            measured_about(&report, "1 out-of-band transactions answered"),
-            "the rest of the run is still read: {:?}",
-            report.measured
-        );
-    }
-
-    /// A scratch directory of this case's own, named after `what`.
-    fn console_dir(what: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "first-motion-console-{what}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        dir
-    }
-
-    /// The launcher numbers the driver's console per run, so a directory is
-    /// searched for the driver's own file rather than for a name spelled here.
-    #[test]
-    fn a_console_directory_is_searched_for_the_drivers_own_log() {
-        let dir = console_dir("one");
-        std::fs::write(dir.join("proc_0.log"), "not the driver's").expect("a file");
-        std::fs::write(dir.join("motord_0.log"), summary(250, 4, 2)).expect("a file");
-        let counters = DriverCounters::read(&dir)
-            .expect("a directory holding one driver console")
-            .expect("a console holding a summary");
-        assert_eq!((counters.session_cmds, counters.aux_refused), (4, 2));
-        assert!(
-            counters.source.contains("motord_0.log"),
-            "the report says what it cross-checked against: {}",
-            counters.source
-        );
-        std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
-    }
-
-    /// A named file is read as itself, which is how a hand-recovered console is
-    /// handed to this tool.
-    #[test]
-    fn a_console_named_as_a_file_is_read_as_that_file() {
-        let dir = console_dir("file");
-        let file = dir.join("motord_1.log");
-        std::fs::write(&file, summary(250, 7, 1)).expect("a file");
-        let counters = DriverCounters::read(&file)
-            .expect("a file this tool can read")
-            .expect("a console holding a summary");
-        assert_eq!(counters.session_cmds, 7);
-        std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
-    }
-
-    /// A directory holding no driver console is refused rather than read as a
-    /// run nobody counted: the deploy tool asks this question before it hands
-    /// the path over, and a silent nothing here would answer it wrongly.
-    #[test]
-    fn a_directory_holding_no_driver_console_is_refused() {
-        let dir = console_dir("none");
-        std::fs::write(dir.join("proc_0.log"), "not the driver's").expect("a file");
-        let refusal = DriverCounters::read(&dir).expect_err("no driver console is no cross-check");
-        assert!(refusal.contains("holds no driver console log"), "{refusal}");
-        std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
-    }
-
-    /// Several driver consoles in one directory are several runs, and
-    /// cross-checking one run's log against another run's counters would be
-    /// worse than not cross-checking at all.
-    #[test]
-    fn a_directory_holding_several_driver_consoles_is_refused() {
-        let dir = console_dir("several");
-        std::fs::write(dir.join("motord_0.log"), summary(250, 4, 2)).expect("a file");
-        std::fs::write(dir.join("motord_1.log"), summary(250, 9, 0)).expect("a file");
-        let refusal =
-            DriverCounters::read(&dir).expect_err("two runs' counters are not this run's");
-        assert!(
-            refusal.contains("2 driver console logs, which is 2 runs"),
-            "{refusal}"
-        );
-        std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
-    }
-
-    /// A summary line missing one of the two counters is not half a
-    /// cross-check: the console reads as one holding no summary, which is the
-    /// same answer as a driver that never printed one and leaves the rest of the
-    /// run judged.
-    #[test]
-    fn a_summary_missing_a_counter_reads_as_no_summary_at_all() {
-        let dir = console_dir("partial");
-        std::fs::write(
-            dir.join("motord_0.log"),
-            format!("reachy-motord: cycle=250 {}=4\n", SeamCounts::SESSION_CMDS),
-        )
-        .expect("a file");
-        assert!(
-            DriverCounters::read(&dir)
-                .expect("the path is readable")
-                .is_none(),
-            "half a summary is not a cross-check"
-        );
-        std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
-    }
-
-    /// A stopping driver prints its last summary and its wind-down line
-    /// together, and that line is what says the counters are the run's last
-    /// word. A console that ends in a cadence summary is a driver that never
-    /// answered its stop.
-    #[test]
-    fn counters_are_the_runs_last_word_only_where_the_driver_wound_down() {
-        let killed = DriverCounters::parse(&summary(250, 2, 0), "console".to_string())
-            .expect("a summary is a summary");
-        assert!(
-            !killed.wound_down,
-            "a console ending in a cadence summary did not wind down"
-        );
-        let stopped = format!(
-            "{}reachy-motord: {}\n",
-            summary(250, 2, 0),
-            WoundDown::Confirmed.line()
-        );
-        let stopped = DriverCounters::parse(&stopped, "console".to_string()).expect("a summary");
-        assert!(stopped.wound_down, "the wind-down line is right there");
-    }
-
-    /// The counters are cumulative and printed every five seconds, so the run's
-    /// totals are the last summary's and the earlier ones are the same numbers,
-    /// smaller.
-    #[test]
-    fn the_counters_come_from_the_last_summary_the_console_holds() {
-        let text = format!("{}{}", summary(250, 2, 1), summary(500, 3, 2));
-        let counters = DriverCounters::parse(&text, "console".to_string())
-            .expect("two summaries and the last one wins");
-        assert_eq!(counters.session_cmds, 3);
-        assert_eq!(counters.aux_refused, 2);
-    }
-
-    /// A log holding everything the driver counted is a trail worth reading, and
-    /// the cross-check says so in a number rather than a finding.
-    #[test]
-    fn a_log_holding_what_the_driver_counted_passes_the_cross_check() {
-        let run = Run {
-            counters: DriverCounters::parse(&summary(250, 1, 0), "console".to_string()),
-            ..traffic_run(
-                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-                vec![answered(5, 7, AuxStatusWire::OK)],
-            )
-        };
-        let report = analyze(&run);
-        assert!(
-            measured_about(&report, "counted 1 datagrams; the log holds 1"),
+            measured_about(&report, "wrote the minimum risk condition at"),
             "{:?}",
             report.measured
         );
         assert_eq!(
-            findings_about(&report, "the recorded trail is short"),
+            findings_about(&report, "could not verify the start-up release"),
             0,
             "{:?}",
             report.findings
         );
     }
 
-    /// A subscriber that attached after the first publish loses the earliest
-    /// messages silently, and every conclusion drawn from the trail afterwards
-    /// is drawn from less than the run produced. The driver's own count is what
-    /// catches it, and the finding is against the log.
+    /// A row whose verified write did not read back is a machine the process
+    /// could not see let go of, and that is judged the way an unconfirmed
+    /// de-torquing is judged anywhere else here.
     #[test]
-    fn a_log_short_of_what_the_driver_counted_is_a_finding_against_the_log() {
-        let run = Run {
-            counters: DriverCounters::parse(&summary(250, 3, 0), "console".to_string()),
-            ..traffic_run(
-                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-                vec![answered(5, 7, AuxStatusWire::OK)],
-            )
-        };
+    fn a_start_that_left_a_row_unverified_is_a_finding_naming_it() {
+        let mut run = counted_run(Vec::new(), Vec::new(), 0);
+        run.statuses[0]
+            .message
+            .set_sweep_failed_rows(JointFlagsWire(u16::from(
+                reachy_motion::joints::flags::bit(reachy_motion::joints::JointRef::AntennaLeft),
+            )));
         let report = analyze(&run);
         assert_eq!(
-            findings_about(&report, "2 fewer session datagrams than the driver counted"),
+            findings_about(&report, "could not verify the start-up release"),
             1,
             "{:?}",
             report.findings
         );
     }
 
-    /// One class of refusal is invisible to everything but this cross-check: a
-    /// datagram asking for nothing is counted and answered with nothing at all.
-    /// A deficit of exactly that shape is named rather than read as truncation.
+    /// Every start has this instant, so a status without one is a run that
+    /// cannot say the machine was ever released -- and unlike the event, it
+    /// cannot be blamed on when the logger attached.
     #[test]
-    fn a_refusal_deficit_the_do_nothing_datagrams_account_for_is_named_not_flagged() {
-        let mut nothing = SessionCmdWire::new();
-        nothing.set_kind(SessionCmdKindWire::NONE);
-        let run = Run {
-            counters: DriverCounters::parse(&summary(250, 2, 1), "console".to_string()),
-            ..traffic_run(
-                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0), at(4, nothing)],
-                vec![answered(5, 7, AuxStatusWire::OK)],
-            )
-        };
+    fn a_status_with_no_sweep_instant_is_a_finding() {
+        let mut run = counted_run(Vec::new(), Vec::new(), 0);
+        run.statuses[0]
+            .message
+            .set_sweep_time(SyncTime::from_nanos(0));
+        let report = analyze(&run);
+        assert_eq!(
+            findings_about(&report, "carries no instant for the minimum risk condition"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            !measured_about(&report, "wrote the minimum risk condition at"),
+            "there is no instant to print: {:?}",
+            report.measured
+        );
+    }
+
+    /// The counters are cumulative and every copy is the whole run so far, so
+    /// the last one is the run's totals and the earlier ones are the same
+    /// numbers, smaller.
+    #[test]
+    fn the_counters_come_from_the_last_status_the_log_holds() {
+        let mut run = counted_run(
+            vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
+            vec![answered(5, 7, AuxStatusWire::OK)],
+            1,
+        );
+        run.statuses = vec![at(4, stated(1, 0)), at(9, stated(1, 0))];
+        run.statuses[0].message.seam_mut().set_session_cmds(0);
         let report = analyze(&run);
         assert!(
-            measured_about(&report, "asked for nothing at all"),
+            measured_about(&report, "counted 1 session datagrams; the log holds 1"),
             "{:?}",
             report.measured
         );
         assert_eq!(
-            findings_about(&report, "neither an outcome nor a do-nothing datagram"),
+            findings_about(&report, "fewer session datagrams than the driver counted"),
             0,
-            "{:?}",
-            report.findings
-        );
-    }
-
-    /// A refusal the driver counted that the log has neither an outcome nor a
-    /// do-nothing datagram for is the trail being short again.
-    #[test]
-    fn a_refusal_deficit_nothing_accounts_for_is_a_finding() {
-        let run = Run {
-            counters: DriverCounters::parse(&summary(250, 1, 2), "console".to_string()),
-            ..traffic_run(
-                vec![asked(3, 7, 21, RegIdWire::TORQUE_ENABLE, 0)],
-                vec![answered(5, 7, AuxStatusWire::OK)],
-            )
-        };
-        let report = analyze(&run);
-        assert_eq!(
-            findings_about(&report, "neither an outcome nor a do-nothing datagram"),
-            1,
             "{:?}",
             report.findings
         );

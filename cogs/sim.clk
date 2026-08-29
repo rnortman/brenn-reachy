@@ -253,6 +253,14 @@ cog MotorSim
         evt: Tappy<health::DriverEvent>;
         aux_out: Tappy<health::AuxOutcome>;
         health_out: Tappy<health::HealthReport>;
+
+        // Everything this driver knows about its own run, republished on a
+        // cadence. The real driver publishes one because it is outside
+        // Clockwork and can retain nothing for a reader that arrives late; this
+        // one publishes it because the two drivers report the same record or
+        // they are two contracts, and the analyzer that verifies a run reads
+        // this one.
+        status: Tappy<health::DriverStatus>;
     }
 
     execution
@@ -351,6 +359,10 @@ box SimBox
     // bits are the two kinds of fault evidence the decision tick cannot see.
     connect motor_sim.evt to motion::DriverEvt;
     connect motor_sim.health_out to motion::DriverHealth;
+
+    // What the driver says about the whole run so far. Nothing in this system
+    // reads it: it is here to be logged, and it is what a run is verified from.
+    connect motor_sim.status to motion::DriverStatus;
 }
 
 // The machine the whole loop runs on. One domain: this system is one process by

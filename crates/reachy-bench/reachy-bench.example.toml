@@ -62,14 +62,16 @@ return_delay_time = 0
 # written or enabled. `reachy-bench provision` is what writes the antennas'.
 drive_mode = 0
 # Zero, which is the register disabled -- and the provisioned baseline rather
-# than what a running machine holds. A motion session arms it at its configured
-# timeout on every commissioning sweep; the register lives in RAM and resets to 0
-# at power-on, so this expectation is exact after a power cycle and only then.
-# Hence the read-only sweep's power-cycle precondition: a sweep taken after a
-# motion session without one reads the session's timeout here and fails, and that
-# failure means the precondition was skipped, not that the unit is provisioned
-# wrong.
+# than what a running machine holds. The register lives in RAM and resets to 0 at
+# power-on, so this is what a unit power-cycled since its last session reads.
 bus_watchdog = 0
+# What a motion session leaves the register at: the timeout its commissioning
+# sweep arms. This has to track `cogs/session_params.textproto`'s `bus_watchdog`
+# -- it is the second reading the read-only sweep accepts, so a figure that
+# drifted from the session's would accept a register nothing wrote. The sweep
+# names which of the two states it read, and fails on anything else, a latched
+# trip included.
+bus_watchdog_armed = 10
 temperature_limit = 70
 # Tenths of a volt.
 max_voltage_limit = 70

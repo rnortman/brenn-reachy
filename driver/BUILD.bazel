@@ -98,6 +98,7 @@ clk_schema_module(
     name = "health",
     imports = [
         "//hardware/dynamixel:registers",
+        "//motion:bus_txn",
         "//motion:joints",
     ],
 )
@@ -116,6 +117,7 @@ rust_test(
         ":pose_clk_rs",
         ":wire_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
         "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],

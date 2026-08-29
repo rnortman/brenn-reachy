@@ -346,9 +346,6 @@ fn transcribe(message: &DynamicMessage) -> Result<MotordParamsWire, ParamsErrorK
             "health_poll_period_ns" => {
                 wire.set_health_poll_period_ns(nanos(message, &field, "health_poll_period_ns")?);
             }
-            "startup_window_ns" => {
-                wire.set_startup_window_ns(nanos(message, &field, "startup_window_ns")?);
-            }
             "bus_baud" => {
                 let baud = count(message, &field, "bus_baud")?;
                 if baud == 0 {
@@ -464,7 +461,6 @@ fn text(
 fn agrees(message: &MotordParamsWire) -> Result<(), ParamsErrorKind> {
     let period = message.period_ns();
     let hold = message.hold_timeout_ns();
-    let startup = message.startup_window_ns();
 
     if hold <= period {
         return Err(ParamsErrorKind::Disagreement {
@@ -482,15 +478,6 @@ fn agrees(message: &MotordParamsWire) -> Result<(), ParamsErrorKind> {
             against: "period_ns",
             limit: period,
             why: "the dead-man is counted in cycles, so a timeout has to be a whole number of them",
-        });
-    }
-    if startup <= hold {
-        return Err(ParamsErrorKind::Disagreement {
-            name: "startup_window_ns",
-            value: startup,
-            against: "hold_timeout_ns",
-            limit: hold,
-            why: "a startup window shorter than the dead-man never waits for a first command",
         });
     }
     Ok(())
@@ -512,11 +499,10 @@ mod tests {
     /// schema declares. Not a list the parser consults — the transcription
     /// walks the descriptor — only the material the cases below build text out
     /// of.
-    const FIELDS: [&str; 6] = [
+    const FIELDS: [&str; 5] = [
         "period_ns",
         "hold_timeout_ns",
         "health_poll_period_ns",
-        "startup_window_ns",
         "bus_device",
         "bus_baud",
     ];
@@ -527,7 +513,6 @@ mod tests {
             "period_ns: 20000000",
             "hold_timeout_ns: 200000000",
             "health_poll_period_ns: 500000000",
-            "startup_window_ns: 2000000000",
             "bus_device: \"/dev/ttyAMA3\"",
             "bus_baud: 1000000",
         ]
@@ -574,7 +559,6 @@ mod tests {
         assert_eq!(params.period_ns, 20_000_000);
         assert_eq!(params.hold_timeout_ns, 200_000_000);
         assert_eq!(params.health_poll_period_ns, 500_000_000);
-        assert_eq!(params.startup_window_ns, 2_000_000_000);
         assert_eq!(params.bus_device.as_str(), "/dev/ttyAMA3");
         assert_eq!(params.bus_baud, 1_000_000);
     }
@@ -613,18 +597,18 @@ mod tests {
         // line it was on is the part an operator goes and fixes, so the refusal
         // carries that.
         for (text, number, line) in [
-            (format!("{}\nnonsense\n", whole()), 7, "nonsense"),
-            (with("bus_baud", "bus_baud:"), 6, "bus_baud:"),
+            (format!("{}\nnonsense\n", whole()), 6, "nonsense"),
+            (with("bus_baud", "bus_baud:"), 5, "bus_baud:"),
             (
                 with("bus_device", "bus_device: \"unclosed"),
-                5,
+                4,
                 "bus_device: \"unclosed",
             ),
             // Comments and blanks are lines an operator counts, so the number
             // is counted over the file's lines and not over the fields in it.
             (
                 format!("# a header\n\n{}\nnonsense\n", whole()),
-                9,
+                8,
                 "nonsense",
             ),
         ] {
@@ -650,7 +634,7 @@ mod tests {
         let text = format!("{}\nperiod_ns: 20000000\ngarbage\n", whole());
         assert_eq!(
             refused_at(&text),
-            Some((7, "period_ns: 20000000".to_owned())),
+            Some((6, "period_ns: 20000000".to_owned())),
             "the repeat is the refusal, and the garbage after it is not"
         );
 
@@ -672,7 +656,7 @@ mod tests {
         let with_repeat = format!("{split}bus_baud: 1000000\n");
         assert_eq!(
             refused_at(&with_repeat),
-            Some((8, "bus_baud: 1000000".to_owned())),
+            Some((7, "bus_baud: 1000000".to_owned())),
             "the repeated field, not the continuation line above it"
         );
     }
@@ -711,7 +695,7 @@ mod tests {
             "the refusal names the field: {message}"
         );
         assert!(
-            message.contains(", at line 7: `period_ns: 10000000`"),
+            message.contains(", at line 6: `period_ns: 10000000`"),
             "and which of the two lines it stopped at: {message}"
         );
     }
@@ -866,12 +850,25 @@ mod tests {
     }
 
     #[test]
-    fn a_startup_window_inside_the_dead_man_is_refused() {
-        let text = with("startup_window_ns", "startup_window_ns: 100000000");
-        let Err(ParamsErrorKind::Disagreement { name, against, .. }) = parse(&text) else {
-            panic!("a startup window shorter than the dead-man was accepted");
-        };
-        assert_eq!((name, against), ("startup_window_ns", "hold_timeout_ns"));
+    fn the_startup_timers_are_names_no_configuration_may_carry() {
+        // The release is written at process start and the grid is anchored at
+        // the next period boundary, so a file setting either of these is a
+        // stale copy whose author believes something about this driver that is
+        // no longer true.
+        for retired in [
+            "startup_window_ns: 2000000000",
+            "startup_hold_ns: 3000000000",
+        ] {
+            let text = format!("{}\n{retired}", whole());
+            let Err(kind @ ParamsErrorKind::Text { .. }) = parse(&text) else {
+                panic!("a retired timer was accepted: {retired}");
+            };
+            let said = kind.to_string();
+            assert!(
+                said.contains(retired.split(':').next().expect("a field name")),
+                "the refusal does not name the field it is about: {said}"
+            );
+        }
     }
 
     #[test]
@@ -907,8 +904,8 @@ mod tests {
         // of, so the guard cannot pass against a pipeline the parse no longer
         // uses.
         let grown = super::PARAMS_PROTO.replace(
-            "optional uint32 bus_baud = 6;",
-            "optional uint32 bus_baud = 6;\n    optional uint32 bus_parity = 7;",
+            "optional uint32 bus_baud = 5;",
+            "optional uint32 bus_baud = 5;\n    optional uint32 bus_parity = 6;",
         );
         assert_ne!(
             grown,
@@ -945,15 +942,15 @@ mod tests {
                 "nanoseconds",
             ),
             (
-                "optional uint32 bus_baud = 6;",
-                "optional string bus_baud = 6;",
+                "optional uint32 bus_baud = 5;",
+                "optional string bus_baud = 5;",
                 "bus_baud",
                 "bus_baud: \"1000000\"",
                 "a count",
             ),
             (
-                "optional string bus_device = 5;",
-                "optional uint32 bus_device = 5;",
+                "optional string bus_device = 4;",
+                "optional uint32 bus_device = 4;",
                 "bus_device",
                 "bus_device: 3",
                 "a string",

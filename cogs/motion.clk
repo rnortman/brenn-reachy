@@ -135,20 +135,25 @@ channel ScriptsIn
     max_num_messages: 8;
 }
 
-// What the session says happened, one report per wake. One publisher -- the
-// session.
+// What the session says happened: the whole story so far, republished whenever
+// a row is added to it. One publisher -- the session.
 //
-// The channel carries the session's own timeline row rather than a message
-// shaped for the wire: the row is the report, and a second form of it would be
-// something to hold in step for nothing.
+// The channel carries the session's own timeline rows rather than a form shaped
+// for the wire: a row is the report, and a second form of it would be something
+// to hold in step for nothing.
 //
-// Nothing in this system reads it: a report is logged and a checker reads it out
-// of the log. Thirty-two deep, which is the session's own ring: a reader lapped
-// on this channel has lost exactly what the ring would have dropped.
+// Cumulative because the reader that matters here is a log, and a logger
+// attaches whenever it starts: a row published as its own message before that
+// instant is a row nobody can read afterwards. The newest message is the whole
+// account, so there is no head to lose.
+//
+// Four deep against a view of one. The story is state rather than an event --
+// the newest message is the whole of it -- so a subscriber lapped here has lost
+// nothing it would have acted on.
 channel ReportsOut
 {
-    message_type: Tachyon<timeline::TimelineEntry>;
-    max_num_messages: 32;
+    message_type: Tachyon<timeline::Timeline>;
+    max_num_messages: 4;
 }
 
 // The one thing the session says to the driver: keep the dead-man fed, take
@@ -203,6 +208,23 @@ channel DriverEvt
 {
     message_type: Tachyon<health::DriverEvent>;
     max_num_messages: 16;
+}
+
+// Everything the driver knows about its own run, republished on a cadence and
+// cumulative: the newest message is the whole account of the run so far. One
+// publisher -- the driver.
+//
+// Nothing in either system reads it; like `ReportsOut` it exists to be logged,
+// and it exists because the driver is outside Clockwork and cannot retain
+// anything on a channel for a reader that arrives late. What it carries a
+// reader gets whole from whichever copy it saw first.
+//
+// Eight deep against no view at all: a record a second, and the depth is slack
+// for a logger that was busy rather than a rate anything consumes.
+channel DriverStatus
+{
+    message_type: Tachyon<health::DriverStatus>;
+    max_num_messages: 8;
 }
 
 // Forward kinematics, once per sample.
@@ -626,15 +648,24 @@ cog Session
             multi_instance: true;
         }
 
-        // How many reports went out.
+        // How many story datagrams went out: one per execution that added a
+        // row, each carrying the whole story.
         reports_published: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
 
-        // How many reports were dropped from the ring before they could be
-        // published. A rise says narration was lost, never a record.
+        // How many reports were appended to the timeline. The rows a story
+        // datagram carries plus the ones it says were dropped.
+        reports_narrated: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many reports were dropped off the front of a full ring. A rise
+        // says narration was lost, never a record.
         reports_dropped: signal UInt64
         {
             post_aggregation: ["final_value"];
@@ -747,8 +778,11 @@ cog Session
         // The driver's sample stream, read and never triggering: it arrives at
         // the bus rate and this cog runs at the rate of the decisions it makes,
         // so what a wake wants from it is the freshest instant rather than every
-        // one of them. Which is also all it is read for -- whether the driver is
-        // still alive.
+        // one of them. Which is also all it is read for, on both of the
+        // questions it answers: whether the driver is still alive, and -- for a
+        // session that has not commissioned the machine yet -- whether it ever
+        // was. Nothing is asked of the bus until a sample says a driver is
+        // cycling to answer it.
         sample: Tappy<pose_vocab::PoseSample>;
     }
 
@@ -764,7 +798,10 @@ cog Session
         // history, so one message per change is the whole contract.
         sched: Tappy<schedule::SessionSchedule>;
 
-        report: Tappy<timeline::TimelineEntry>;
+        // The whole story so far, published on every execution that added a row
+        // to it and on no other: a message is the account of the run, so a
+        // reader that saw only the newest one has missed nothing.
+        report: Tappy<timeline::Timeline>;
     }
 
     execution

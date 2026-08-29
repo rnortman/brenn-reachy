@@ -1,10 +1,10 @@
 //! The schedule, as arithmetic.
 //!
 //! The driver's cycles sit on a fixed grid `g(N) = S + N × period` on the
-//! realtime clock, `S` a top of a second. Every wake is computed from the grid
-//! and never from "now plus a period", which is the difference between a loop
-//! that holds its phase for a week and one that drifts by however long each
-//! cycle happened to take.
+//! realtime clock, `S` a whole multiple of the period. Every wake is computed
+//! from the grid and never from "now plus a period", which is the difference
+//! between a loop that holds its phase for a week and one that drifts by
+//! however long each cycle happened to take.
 //!
 //! One rule beyond that, and it is a safety rule rather than a tidiness one: a
 //! cycle that ran long does **not** get run again to catch up. The next wake is
@@ -17,8 +17,8 @@
 //! No clock is read here and nothing sleeps, so every rule above is a function
 //! of two numbers and a test can state it directly.
 
-/// A second, in nanoseconds. What a grid's start is rounded to, and what a
-/// cadence counted in cycles of a grid is measured against.
+/// A second, in nanoseconds. What a cadence counted in cycles of a grid is
+/// measured against.
 pub(crate) const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// A cycle the loop is about to run.
@@ -71,20 +71,38 @@ impl Grid {
         })
     }
 
-    /// The first top of a second at or after `now_ns`.
+    /// The first whole multiple of `period_ns` at or after `now_ns`.
     ///
-    /// Where a grid starts. A round second rather than the instant the process
-    /// happened to finish setting up, so that two runs of this driver on one
+    /// Where a grid starts. A round instant rather than the one the process
+    /// happened to finish setting up on, so that two runs of this driver on one
     /// machine, or a driver and something reading its samples, describe the same
     /// instants: a grid point is then a number a human reading a log can divide.
+    /// A period that divides the second — every period this driver runs — gives
+    /// the same grid points a top of a second would, and the process waits at
+    /// most one period rather than at most one second to reach the first of
+    /// them. What it waits through is time with its inbound sockets bound and
+    /// nothing serving them, so the difference is a host's first datagram
+    /// answered inside a cycle instead of up to a second later.
+    ///
+    /// A period that is not positive answers `now_ns`: it is not a grid's
+    /// spacing, [`Self::new`] is what refuses it, and rounding to it here would
+    /// divide by zero in the process whose other job is to de-torque the
+    /// machine.
+    ///
+    /// The round up saturates: a `now_ns` near the end of the epoch has no
+    /// multiple above it, and a wrapped sum would put the grid before the
+    /// process started.
     #[must_use]
-    pub const fn top_of_second_at(now_ns: i64) -> i64 {
-        let whole = now_ns.div_euclid(NANOS_PER_SECOND);
-        let at = whole * NANOS_PER_SECOND;
+    pub const fn top_of_period_at(now_ns: i64, period_ns: i64) -> i64 {
+        if period_ns <= 0 {
+            return now_ns;
+        }
+        let whole = now_ns.div_euclid(period_ns);
+        let at = whole * period_ns;
         if at == now_ns {
             at
         } else {
-            at + NANOS_PER_SECOND
+            at.saturating_add(period_ns)
         }
     }
 
@@ -107,10 +125,10 @@ impl Grid {
     /// start are cycles this process did not exist for.
     ///
     /// A `now_ns` before the start is the ordinary startup case, not an odd one
-    /// — a grid starts at the next top of a second, so setup finishes up to a
-    /// second early — and it gets index 0 at the start. The alternative is a run
-    /// whose first cycles carry negative indices and whose first wake is not the
-    /// second the grid says it began on.
+    /// — a grid starts at the next whole multiple of the period, so setup
+    /// finishes up to a period early — and it gets index 0 at the start. The
+    /// alternative is a run whose first cycles carry negative indices and whose
+    /// first wake is not the instant the grid says it began on.
     #[must_use]
     pub fn first_from(&self, now_ns: i64) -> Cycle {
         let index = self.index_at_or_after(now_ns).max(0);
@@ -179,13 +197,49 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_starts_at_a_top_of_second() {
-        assert_eq!(Grid::top_of_second_at(S), S, "already one");
-        assert_eq!(Grid::top_of_second_at(S + 1), S + NANOS_PER_SECOND);
+    fn a_grid_starts_at_a_whole_multiple_of_its_period() {
+        assert_eq!(Grid::top_of_period_at(S, PERIOD), S, "already one");
+        assert_eq!(Grid::top_of_period_at(S + 1, PERIOD), S + PERIOD);
+        assert_eq!(Grid::top_of_period_at(S + PERIOD - 1, PERIOD), S + PERIOD);
         assert_eq!(
-            Grid::top_of_second_at(S + NANOS_PER_SECOND - 1),
-            S + NANOS_PER_SECOND
+            Grid::top_of_period_at(S + PERIOD, PERIOD),
+            S + PERIOD,
+            "a boundary is where it already is"
         );
+    }
+
+    /// What the start is for: a driver waits at most one period with its
+    /// sockets bound and nothing serving them, rather than at most one second.
+    #[test]
+    fn a_start_is_at_or_after_now_and_within_one_period_of_it() {
+        for period in [PERIOD, 1_000_000, NANOS_PER_SECOND] {
+            for now in [S, S + 1, S + period - 1, S - 1, S - period - 3] {
+                let start = Grid::top_of_period_at(now, period);
+                assert!(start >= now, "{start} is not a start for {now}");
+                assert!(start - now < period, "{start} is more than a period off");
+                assert_eq!(start % period, 0, "{start} is not a multiple of {period}");
+            }
+        }
+    }
+
+    /// The negative-epoch case, which is a clock that has not been set: the
+    /// arithmetic is a floor and not a truncation, so the start is still at or
+    /// after now.
+    #[test]
+    fn a_clock_before_the_epoch_still_rounds_forward() {
+        assert_eq!(Grid::top_of_period_at(-1, PERIOD), 0);
+        assert_eq!(Grid::top_of_period_at(-PERIOD, PERIOD), -PERIOD);
+        assert_eq!(Grid::top_of_period_at(-PERIOD - 1, PERIOD), -PERIOD);
+    }
+
+    /// A period that is not a spacing is refused where a grid is built, and
+    /// rounding to it answers the instant it was asked about rather than
+    /// dividing by zero.
+    #[test]
+    fn rounding_to_a_period_that_is_not_one_answers_now() {
+        for period in [0, -1, -PERIOD] {
+            assert_eq!(Grid::top_of_period_at(S + 7, period), S + 7);
+        }
     }
 
     #[test]

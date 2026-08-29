@@ -73,6 +73,27 @@ torque-off on a fault. The one act reserved for an operator is restarting a
 process that has parked after a fault. This closes the auto-arm question the
 service-mode work deferred: boot, and every wake after it, may arm.
 
+## A restarted driver releases before it does anything else
+
+The motor driver writes the MRC — a verified torque-off on every row — as its
+first act on the bus, before its grid exists and before it has waited for
+anything. It cannot know what the machine it joined was left doing: a
+predecessor that crashed mid-gesture left the servos torqued, and nothing on
+the bus will say so. De-torquing a predecessor's machine is never gated, on
+anything: not on a host asking, not on a period of silence being measured, not
+on a logger or a supervisor or a clock.
+
+A session in flight over a restarted driver therefore ends as a fault — its
+samples go stale and the ladder declares the bus — and never as a recovery.
+Nothing re-arms without a fresh commissioning.
+
+The residual, stated rather than claimed away: a process killed in the
+milliseconds before the sweep — while it parses its configuration, binds its
+ports, or opens the serial device — exits without writing anything, and the
+machine is left as it was found. The bind comes first deliberately, so a second
+driver starting beside a running one exits without touching a bus it does not
+own.
+
 ## The forbidden response
 
 **Never hold torque as a fault response.** Not frozen in place, not stowed.

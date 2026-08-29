@@ -158,7 +158,8 @@ use clockwork_rs::Duration as SlotDuration;
 pub const RECORDED_WORST_HEAD_LAG_RAD: f64 = 0.245;
 
 /// The worst lag an antenna ran at on the fastest recorded sweep, radians —
-/// 1.38 rad behind an 855°/s command, while following perfectly.
+/// 1.38 rad behind a goal peaking near 1120°/s, on the sweep whose 855°/s of
+/// travel is this machine's speed record, while following perfectly.
 ///
 /// Pinned and read the same way as [`RECORDED_WORST_HEAD_LAG_RAD`]. Well past
 /// the screen below, which is the point: distance alone does not separate a
@@ -177,13 +178,18 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// Distance alone cannot say that. What a servo's integral term closes is a
 /// standing error and not a moving one, so a joint chasing a streamed goal sits
 /// behind it by roughly the commanded velocity times the loop's own time
-/// constant, whatever the gains. At the
-/// bench, leg 2 ran 0.246 rad behind a goal moving near 0.71 rad/s, and the
-/// right antenna 0.430 rad behind one moving near 4.91 rad/s, both while
-/// following perfectly well. Lag scales with commanded speed, so no constant
-/// distance separates a chase from a stall; what separates them is whether the
-/// joint is closing on where its goal lies, which is what `progress_min_rad`
-/// measures.
+/// constant, whatever the gains. On the recordings this crate replays, leg 2
+/// ran 0.245 rad behind a goal peaking at 3.34 rad/s and an antenna 0.82 rad
+/// behind one peaking at 7.55 rad/s, both on `trace-verify2.csv`, and an antenna
+/// ran 1.38 rad behind a goal peaking near 1120°/s on the 855°/s sweep in
+/// `trace-fast4.csv` — every one of them while following perfectly well. Each
+/// lag and the speed it is read against come from one joint of one recording,
+/// and every figure of that here is asserted over those recordings by the
+/// replay suite beside this crate, so a re-recording or a shaper change moves it
+/// there rather than leaving it standing here as folklore. Lag scales with
+/// commanded speed, so no constant distance separates a chase from a stall; what
+/// separates them is whether the joint is closing on where its goal lies, which
+/// is what `progress_min_rad` measures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackingFaultConfig {
     /// How far a joint may sit from its goal without being examined at all,
@@ -221,9 +227,9 @@ impl Default for TrackingFaultConfig {
             // About 6.5 of the servos' 0.088° counts, comfortably above the
             // half-count quantisation floor of 7.7e-4 rad. Over the ten-tick
             // window at the bench's 50 Hz that asks a joint sitting past the
-            // threshold for 0.05 rad/s of closing speed — an order of magnitude
-            // under the 0.71 rad/s the legs were commanded at on the fastest
-            // move so far, and two under the antennas' 4.91 rad/s.
+            // threshold for 0.05 rad/s of closing speed — roughly two orders of
+            // magnitude under the 3.34 rad/s a leg's goal peaks at on the
+            // recorded gesture, and further still under the antennas' 7.55.
             progress_min_rad: 0.01,
             // A fifth of a second at the bench's 50 Hz tick, so a single
             // transient on one read cannot raise it.

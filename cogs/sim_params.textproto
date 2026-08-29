@@ -14,8 +14,10 @@ period_ns: 20000000
 # as one that has stopped.
 hold_timeout_ns: 200000000
 
-# The machine starts cold. Every scenario that wants it energised says so with
-# an injection, which is what an arming sequencer will do on the real machine.
+# The machine this process meets is cold: no predecessor left it energised. It
+# would be released either way -- the driver de-torques every row before it does
+# anything else -- and a scenario that wants an energised machine says so with an
+# injection, which is what an arming sequencer will do on the real machine.
 start_torqued: false
 
 # How far a modelled servo moves in one cycle. These are the motion library's

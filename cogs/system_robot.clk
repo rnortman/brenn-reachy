@@ -33,6 +33,7 @@ use cogs::motion;
 use cogs::robot;
 use @clockwork::clockwork::logging::writers::logger_channel_policies;
 use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy, LogType};
+use @clockwork::clockwork::logging::channel_type::{ChannelType};
 
 // The machine's heartbeat: one sample per cycle, always.
 policy ChannelLoggingPolicy for motion::DriverPose
@@ -78,9 +79,14 @@ policy ChannelLoggingPolicy for motion::ScriptsIn
 
 // What the session made of a script: the schedule the mover streams, whole and
 // once per change.
+//
+// Persistent: the newest message is the whole of what the machine is under
+// command to do, so a logger attaching after the engagement took hold is handed
+// the schedule it missed rather than nothing.
 policy ChannelLoggingPolicy for motion::ScheduleChan
 {
     log_type = LogType::event;
+    channel_type = ChannelType::persistent;
 }
 
 // What the decision tick raised.
@@ -89,10 +95,34 @@ policy ChannelLoggingPolicy for motion::TickFaults
     log_type = LogType::event;
 }
 
-// What the session said about the session: one report per wake, oldest first.
+// What the session said about the session: the whole story so far, republished
+// whenever a row is added to it.
+//
+// Persistent rather than regular, for the same reason the driver's status
+// record is: a logger attaching to a regular channel starts at the write head
+// and reads nothing the ring already holds, so a row published before it
+// attached is lost. On a persistent channel it is handed the newest retained
+// message at attach -- and the newest message here is the whole story, so that
+// one message is the run's narration entire.
 policy ChannelLoggingPolicy for motion::ReportsOut
 {
     log_type = LogType::event;
+    channel_type = ChannelType::persistent;
+}
+
+// What the driver says about its whole run, republished on a cadence.
+//
+// Persistent rather than regular, which is the whole point of the record: a
+// logger attaching to a regular channel starts at the write head and reads
+// nothing the ring already holds, so every fact published before it attached is
+// lost. On a persistent channel it is handed the newest retained message at
+// attach -- and the newest message here is cumulative, so that one message is
+// the run so far. Nothing the run is verified from can then go missing because
+// of when the logger happened to start.
+policy ChannelLoggingPolicy for motion::DriverStatus
+{
+    log_type = LogType::event;
+    channel_type = ChannelType::persistent;
 }
 
 // Where the head was, once per sample.

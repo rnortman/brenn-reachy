@@ -1,13 +1,16 @@
 //! The driver process's entry point: configuration, the port, and the loop.
 //!
-//! Five steps, in this order and for a reason. Read the configuration, because
+//! Six steps, in this order and for a reason. Read the configuration, because
 //! everything below is a number out of it. Bind the two inbound ports, because
 //! a second driver already reading them is the one failure that must stop this
 //! one before it touches the bus. Open the serial port exclusively, because
-//! that is what makes this process the machine's only speaker. Install the stop
-//! flag, because the grid below it is what de-torques the machine on the way out
-//! and a signal arriving before the flag exists is a signal that kills the
-//! process outright. Then run the grid, until a stop is asked for.
+//! that is what makes this process the machine's only speaker. Write the
+//! minimum risk condition, because this process cannot know what the machine it
+//! joined was left doing and a predecessor that crashed left it torqued.
+//! Install the stop flag, because the grid below it is what de-torques the
+//! machine on the way out and a signal arriving before the flag exists is a
+//! signal that kills the process outright. Then run the grid, until a stop is
+//! asked for.
 //!
 //! Every one of those failures is an exit and none of them is retried: a
 //! configuration that does not parse, a port somebody else holds, a device that
@@ -43,9 +46,12 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
 use reachy_bus::{Bus, SerialBusPort};
+use reachy_motion::joints::{ROW_COUNT, flags};
 use reachy_motord::grid::Grid;
 use reachy_motord::inbound::Inbox;
-use reachy_motord::loop_ctl::{Destinations, Driver, Outbound, Ran, RealTime, WoundDown};
+use reachy_motord::loop_ctl::{
+    Destinations, Driver, Outbound, Ran, RealTime, StartupMrc, WoundDown,
+};
 use reachy_motord::params;
 use reachy_motord::tick::{Tick, TickConfig, cycle_timing, now_ns};
 
@@ -204,7 +210,7 @@ fn run(config: &Path) -> Result<(), String> {
     let device = params.bus_device.as_str();
     let port = SerialBusPort::open(device, params.bus_baud).map_err(|error| error.to_string())?;
     let bus = Bus::new(port, cycle_timing(params.bus_baud));
-    let tick = Tick::new(
+    let mut tick = Tick::new(
         bus,
         TickConfig {
             period_ns: params.period_ns,
@@ -213,15 +219,41 @@ fn run(config: &Path) -> Result<(), String> {
         },
     );
 
-    let grid = Grid::new(Grid::top_of_second_at(now_ns()), params.period_ns)
-        .map_err(|error| error.to_string())?;
-    let mut driver = Driver::new(tick, inbox, out, grid, RealTime, params.startup_window_ns);
+    // Before the grid, before the stop flag, before anything this process does
+    // with time: the machine goes limp. Nothing gates it, and a row that would
+    // not read back released latches the gate so the sweep is re-issued every
+    // cycle until it does.
+    //
+    // The port open above and this sweep are the whole of what this process
+    // spends before its first cycle, and `reachy_driver::STARTUP_INIT_BUDGET_NS`
+    // is what a host waiting on the first sample budgets for it. Work added
+    // here is spent out of that figure.
+    let swept_at_ns = now_ns();
+    let failed = tick.startup_mrc_sweep(swept_at_ns);
+
+    let grid = Grid::new(
+        Grid::top_of_period_at(now_ns(), params.period_ns),
+        params.period_ns,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut driver = Driver::new(
+        tick,
+        inbox,
+        out,
+        grid,
+        RealTime,
+        StartupMrc {
+            at_ns: swept_at_ns,
+            failed,
+        },
+    );
     let stop = stop_flag()?;
     let reporting = Reporting::start();
     reporting.say(format!(
-        "{device} at {} baud, {}ms cycle, grid starts at {}",
+        "{device} at {} baud, {}ms cycle, {}, grid starts at {}",
         params.bus_baud,
         params.period_ns / 1_000_000,
+        startup_mrc_line(flags::len(failed)),
         grid.instant(0)
     ));
     loop {
@@ -239,6 +271,18 @@ fn run(config: &Path) -> Result<(), String> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// What the startup line says about the release this process has just written.
+///
+/// A value rather than a branch inside the format, so that the one line an
+/// operator reads before anything else can be read by a case too.
+fn startup_mrc_line(failed_rows: u32) -> String {
+    if failed_rows == 0 {
+        "machine released on every row".to_string()
+    } else {
+        format!("machine released, but {failed_rows} of {ROW_COUNT} rows would not read back")
     }
 }
 
@@ -273,8 +317,8 @@ fn stop_flag() -> Result<Arc<AtomicBool>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONFIG, REPORT_BACKLOG, REPORT_CYCLES, Reporting, parse, stop_report, sync_channel,
-        usage,
+        DEFAULT_CONFIG, REPORT_BACKLOG, REPORT_CYCLES, Reporting, parse, startup_mrc_line,
+        stop_report, sync_channel, usage,
     };
     use reachy_motord::loop_ctl::WoundDown;
     use std::path::PathBuf;
@@ -399,6 +443,21 @@ mod tests {
         assert!(
             !reporting.say("after the reader is gone".to_string()),
             "a printer that has gone is not a reason to wait either"
+        );
+    }
+
+    #[test]
+    fn a_start_that_released_every_row_says_so_and_names_nothing() {
+        let line = startup_mrc_line(0);
+        assert_eq!(line, "machine released on every row");
+    }
+
+    #[test]
+    fn a_start_with_a_row_that_would_not_read_back_says_how_many() {
+        let line = startup_mrc_line(2);
+        assert!(
+            line.contains("2 of 9 rows would not read back"),
+            "an operator reading `{line}` cannot tell a clean start from a bad one"
         );
     }
 }

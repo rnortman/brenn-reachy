@@ -21,9 +21,9 @@
 //! goes out whole when the engagement takes hold and again when what it was
 //! engaged for is over. And the machine's story is
 //! written: a refusal, an acceptance, a fault answered and a phase
-//! entered each leave a row in the report ring, and one row per execution leaves
-//! the cog as a message. What a row means is `motion/reports.clk`'s statement,
-//! and the ring itself is `session_slots`'.
+//! entered each leave a row in the report ring, and every execution that added
+//! a row publishes the whole ring as one message. What a row means is
+//! `motion/reports.clk`'s statement, and the ring itself is `session_slots`'.
 //!
 //! Nothing here holds state of its own and nothing reads a clock: the execution
 //! start time arrives on the dial, and everything the session remembers is in
@@ -55,7 +55,7 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
-use clockwork_rs::SyncTime;
+use clockwork_rs::{Clear as _, SyncTime};
 use motion_slots::{MS_NS, configured, counters};
 use reachy_motion::arm::{ProfileConfig, row_of_id};
 use reachy_motion::fault::{self, FaultKind};
@@ -65,7 +65,7 @@ use reachy_motion::tick::ResponseKind;
 use reachy_motion::value;
 use reachy_motion::verdict::{self, VerdictError};
 use reachy_motion::winddown::Disposition;
-use session_slots::{clear_timeline, mark_published, oldest_unpublished, push_report};
+use session_slots::{clear_timeline, held_reports, push_report, report_row};
 
 /// How many motions a library can hold: `cogs/config.clk`'s capacity for them,
 /// which is what an overlay's motion id indexes.
@@ -90,9 +90,11 @@ counters! {
         /// Raises recorded as faults: the ones the classifier answers with
         /// something.
         faults_recorded / set_faults_recorded,
-        /// Reports that went out.
+        /// Story datagrams that went out: one per execution that added a row.
         reports_published / set_reports_published,
-        /// Reports lost to a full ring before they could go out.
+        /// Reports appended to the timeline.
+        reports_narrated / set_reports_narrated,
+        /// Reports dropped off the front of a full ring.
         reports_dropped / set_reports_dropped,
         /// Inbound datagrams the codec refused.
         undecodable_inbound / set_undecodable_inbound,
@@ -152,9 +154,9 @@ impl Report {
 /// evidence that arrived is weighed, the scripts that arrived are screened
 /// against what it left, a maneuver running takes its step, the bus takes its
 /// turn, what the machine is under
-/// command to do goes out if it changed, and then one report leaves.
-/// Publishing last is what lets a wake that raised the only report also carry it
-/// away.
+/// command to do goes out if it changed, and then the story goes out if this
+/// execution added to it. Publishing last is what lets a wake that raised the
+/// only report of it also carry the story away.
 pub fn execute_session(dial: &mut SessionDial<'_>) {
     let before = SessionCounters::read(dial.states.sess);
     let mut counters = before;
@@ -213,7 +215,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     // has run by here.
     publish_schedule(dial, &mut counters, now);
     say_unconfirmed(dial, &mut counters, now, &budgets);
-    publish_oldest(dial, &mut counters);
+    publish_timeline(dial, &mut counters, before.reports_narrated);
 
     counters.store(dial.states.sess);
     // Untested: no assertion in this repo covers the values a signal carries.
@@ -1291,7 +1293,11 @@ fn result_of(
         },
         AuxStatus::Timeout => BusResult::NoAnswer,
         AuxStatus::DecodeError | AuxStatus::WireError => BusResult::WireCorrupt,
-        AuxStatus::Refused => BusResult::DriverRefused,
+        // Both are the driver putting nothing on the bus, and this cog issues
+        // one transaction at a time — so a busy answer means the driver holds a
+        // request this session does not think it has outstanding, which is a
+        // disagreement about the wire and not something to try again.
+        AuxStatus::Refused | AuxStatus::Busy => BusResult::DriverRefused,
         // The code the servo gave, which is a number and not a register value.
         AuxStatus::ServoError => BusResult::ServoError { code: bits as u8 },
         AuxStatus::VerifyMismatch => BusResult::VerifyMismatch {
@@ -1343,13 +1349,15 @@ fn joint_number(joint: JointRef) -> u8 {
 
 /// Append a report to the ring, and count what the ring said about it.
 ///
-/// A full ring drops its oldest unpublished row, which is narration lost and
-/// never a record: what mattered about a fault travelled on the channel that
-/// raised it. Cursors describing a ring this build does not have are the slot
+/// A full ring drops its oldest row, which is narration lost and never a record:
+/// what mattered about a fault travelled on the channel that raised it. The
+/// count of appends is what tells the publish below that this execution had
+/// something to add. A slot describing a ring this build does not have is the slot
 /// gone wrong: the ring is cleared, counted, and the report is written into the
 /// empty one, because the story of the execution that found the damage is worth
 /// more than the rows it cannot place.
 fn narrate(slot: &mut SessionStateWire, counters: &mut SessionCounters, report: &Report) {
+    counters.reports_narrated += 1;
     match push_report(slot, |row| report.write(row)) {
         Ok(true) => counters.reports_dropped += 1,
         Ok(false) => {}
@@ -1363,49 +1371,88 @@ fn narrate(slot: &mut SessionStateWire, counters: &mut SessionCounters, report: 
     }
 }
 
-/// Publish the oldest unpublished report, if there is one.
+/// Publish the whole story, if this execution added to it.
 ///
-/// One per execution: an output slot carries one message, and the wake floor is
-/// what drains a burst over the executions after it. The cursor advances only on
-/// a publication, so a report the slot could not carry stays where it is.
-fn publish_oldest(dial: &mut SessionDial<'_>, counters: &mut SessionCounters) {
-    let report = match oldest_unpublished(dial.states.sess) {
-        // The kind arrives with the row: the ring hands out a row only where it
-        // narrates something this build knows, so there is one refusal for a
-        // damaged ring rather than a second answer here.
-        Ok(Some((row, kind))) => Report {
-            time_ns: row.time().as_nanos(),
-            kind,
-            a: row.a(),
-            b: row.b(),
-            detail: row.detail(),
-        },
-        Ok(None) => return,
-        Err(_) => {
-            // A ring this build cannot read: cleared and counted, exactly as an
-            // append that found the same damage does. Nothing is published,
-            // because there is no row this cog can say it is publishing.
-            counters.refused_state += 1;
-            clear_timeline(dial.states.sess);
-            return;
-        }
+/// Every message carries every row the timeline holds, so a reader has the
+/// account of the run from whichever copy it saw first and there is no head of
+/// the story to lose. Published only where a row was added: republishing an
+/// unchanged story would be the same bytes over and over for nothing.
+///
+/// The rows are copied out under the ring's own reading, so a ring this build
+/// cannot read publishes nothing and is cleared, exactly as an append that found
+/// the same damage does. That reading happens on every execution, so a slot
+/// describing a ring nobody wrote is found by the first wake after the damage
+/// rather than by the first wake with something to say.
+fn publish_timeline(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    narrated_before: u64,
+) {
+    // How much of a story the slot says it holds is read back on every
+    // execution, whether or not this one added to it: a ring this build has not
+    // got is memory gone wrong, and an execution that says nothing is still an
+    // execution that can find it.
+    let Ok(held) = held_reports(dial.states.sess) else {
+        counters.refused_state += 1;
+        clear_timeline(dial.states.sess);
+        return;
     };
+    if counters.reports_narrated == narrated_before || held == 0 {
+        return;
+    }
 
+    // The slot and the output are separate fields of the dial, so a row is read
+    // and written in one step and nothing is carried between them: no execution
+    // of this cog allocates.
     let out = &mut dial.outputs.report;
     // An output slot is reused memory holding whatever the previous execution
-    // left, so the message starts cleared: a report carrying no measurement says
-    // so in the field rather than leaving an older number standing.
-    let msg = out.msg_mut().clear_valid();
-    msg.time = SyncTime::from_nanos(report.time_ns);
-    msg.kind = report.kind;
-    msg.a = report.a;
-    msg.b = report.b;
-    msg.detail = report.detail;
-    out.mark_for_publish();
-
-    if mark_published(dial.states.sess).is_ok() {
-        counters.reports_published += 1;
+    // left, so the message starts cleared: a story is written from its first row
+    // every time rather than over the rows of the last one.
+    let msg = out.msg_mut();
+    msg.clear();
+    // The number about the ring in front of the reader, not the session's
+    // lifetime total: a ring cleared for damage has dropped nothing of the story
+    // it now holds, and the message describes that story.
+    msg.set_dropped(dial.states.sess.timeline_dropped());
+    let mut damaged = false;
+    {
+        let mut rows = msg.entries_mut();
+        for nth in 0..held {
+            match report_row(dial.states.sess, nth) {
+                // The kind arrives with the row: the ring hands out a row only
+                // where it narrates something this build knows, so there is one
+                // refusal for a damaged ring rather than a second answer here.
+                Ok(Some((row, kind))) => {
+                    let report = Report {
+                        time_ns: row.time().as_nanos(),
+                        kind,
+                        a: row.a(),
+                        b: row.b(),
+                        detail: row.detail(),
+                    };
+                    // The message holds a row per row of the ring, which a case
+                    // beside the ring's own length pins. `try_grow` can fail
+                    // only where the two have been made to differ.
+                    let out_row = rows
+                        .try_grow()
+                        .expect("a story of no more rows than the ring holds");
+                    report.write(out_row);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    damaged = true;
+                    break;
+                }
+            }
+        }
     }
+    if damaged {
+        counters.refused_state += 1;
+        clear_timeline(dial.states.sess);
+        return;
+    }
+    out.mark_for_publish();
+    counters.reports_published += 1;
 }
 
 #[cfg(test)]
@@ -1618,6 +1665,7 @@ mod tests {
             (AuxStatus::DecodeError, BusResult::WireCorrupt),
             (AuxStatus::WireError, BusResult::WireCorrupt),
             (AuxStatus::Refused, BusResult::DriverRefused),
+            (AuxStatus::Busy, BusResult::DriverRefused),
             (AuxStatus::ServoError, BusResult::ServoError { code: 32 }),
             (
                 AuxStatus::VerifyMismatch,

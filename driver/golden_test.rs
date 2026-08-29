@@ -22,11 +22,12 @@
 
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::{
-    AuxOutcomeWire, AuxStatus, DriverEventWire, EventKind, HealthReportWire,
+    AuxOutcomeWire, AuxStatus, DriverEventWire, DriverStatusWire, EventKind, HealthReportWire,
 };
 use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use brenn_reachy__driver__wire_clk_rs::DatagramHeaderWire;
-use brenn_reachy__hardware__dynamixel__registers_clk_rs::ValueShape;
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
+use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKind;
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, Joints};
 use clockwork_rs::{Duration, SyncTime, blob_as_bytes};
 
@@ -128,6 +129,7 @@ fn an_event_is_the_bytes_it_was() {
     event.silence = Duration::from_nanos(250_000_000);
     event.work = Duration::from_nanos(21_500_000);
     event.exchange = Duration::from_nanos(3_250_000);
+    event.drain = Duration::from_nanos(2_125_000);
     event.count = 3;
     event.out_of_band = 7;
     event.rows = JointFlags::LEG_0 | JointFlags::LEG_5;
@@ -136,8 +138,8 @@ fn an_event_is_the_bytes_it_was() {
     pins(
         "DriverEvent",
         blob_as_bytes(&msg),
-        "00002a36fe9c971780b2e60e00000000601048010000000050973100000000000300000007000000\
-         4200012a00000000",
+        "00002a36fe9c971780b2e60e0000000060104801000000005097310000000000c86c20000000000\
+         003000000070000004200012a00000000",
     );
 }
 
@@ -167,11 +169,73 @@ fn an_aux_outcome_is_the_bytes_it_was() {
     outcome.value_kind = ValueShape::Radians;
     outcome.value = 0.25f64.to_bits();
     outcome.model = 0x0708;
+    outcome.op = AuxOpKind::ReadReg;
+    outcome.id = 0x0a;
+    outcome.reg = RegId::PresentPosition;
 
     pins(
         "AuxOutcome",
         blob_as_bytes(&msg),
-        "000000000000d03f0403020108070105",
+        "000000000000d03f04030201080703000105020a00000000",
+    );
+}
+
+#[test]
+fn a_driver_status_is_the_bytes_it_was() {
+    let mut msg = DriverStatusWire::new();
+    let status = msg.clear_valid();
+    status.time = SyncTime::from_nanos(T0_NS);
+    status.sweep_time = SyncTime::from_nanos(T0_NS - 1);
+    status.sweep_failed_rows = JointFlags::LEG_2;
+    status.torque_latched = true.into();
+    status.first_pose = SyncTime::from_nanos(T0_NS + 1);
+    status.first_session_cmd = SyncTime::from_nanos(T0_NS + 2);
+    status.wound_down = true.into();
+    // Distinct in every field, so a pair swapped by a layout change is a
+    // difference in the bytes rather than a coincidence.
+    status.seam.queued = 1;
+    status.seam.goals = 2;
+    status.seam.session_cmds = 3;
+    status.seam.wrong_size = 4;
+    status.seam.invalid = 5;
+    status.seam.overflowed = 6;
+    status.seam.undelivered = 7;
+    status.seam.recv_errors = 8;
+    status.seam.readers_stopped = 9;
+    status.cycle.goals_executed = 10;
+    status.cycle.goals_dropped = 11;
+    status.cycle.hold_timeouts = 12;
+    status.cycle.read_misses = 13;
+    status.cycle.write_failures = 14;
+    status.cycle.blind_cycles = 15;
+    status.cycle.events_dropped = 16;
+    status.cycle.aux_refused = 17;
+    status.cycle.aux_duplicates = 18;
+    status.cycle.aux_deferred = 19;
+    status.cycle.health_reports = 20;
+    status.cycle.health_misses = 21;
+    status.cycle.confirm_misses = 22;
+    status.loop_counts.cycles = 23;
+    status.loop_counts.skipped = 24;
+    status.loop_counts.startup_mrc = 25;
+    status.loop_counts.wire_failures = 26;
+    status.loop_counts.taken = 27;
+    status.loop_counts.clock_steps = 28;
+    status.published = 29;
+    status.publish_failures = 30;
+
+    pins(
+        "DriverStatus",
+        blob_as_bytes(&msg),
+        "0a000000000000000b000000000000000c000000000000000d00000000000000\
+         0e000000000000000f0000000000000010000000000000001100000000000000\
+         1200000000000000130000000000000014000000000000001500000000000000\
+         1600000000000000010000000000000002000000000000000300000000000000\
+         0400000000000000050000000000000006000000000000000700000000000000\
+         0800000000000000090000000000000017000000000000001800000000000000\
+         19000000000000001a000000000000001b000000000000001c00000000000000\
+         00002a36fe9c9717ffff2936fe9c971701002a36fe9c971702002a36fe9c9717\
+         1d000000000000001e000000000000000800010100000000",
     );
 }
 

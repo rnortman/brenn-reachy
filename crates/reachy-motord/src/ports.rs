@@ -1,6 +1,6 @@
 //! The loopback seam: which port carries which schema, and which end binds it.
 //!
-//! Six ports, one per direction per subject, because a datagram on this seam
+//! Seven ports, one per direction per subject, because a datagram on this seam
 //! carries no header — the payload is the schema's own bytes and nothing else,
 //! which is what the socket layer on the control side reads and writes. With no
 //! discriminator in the bytes, the port a datagram arrived on *is* the type, so
@@ -53,17 +53,22 @@ pub const HEALTH_PORT: u16 = 7405;
 /// Session commands, control process to driver. Bound here.
 pub const SESSION_PORT: u16 = 7406;
 
+/// The driver's cumulative status record, driver to control process. Bound
+/// there.
+pub const STATUS_PORT: u16 = 7407;
+
 /// Every port of the seam, one per subject.
 ///
 /// The one list: the disjointness below is over this, so a subject added to the
 /// seam is added in one place and the guard covers it without being remembered.
-pub const ALL: [u16; 6] = [
+pub const ALL: [u16; 7] = [
     GOAL_PORT,
     POSE_PORT,
     EVENT_PORT,
     AUX_OUT_PORT,
     HEALTH_PORT,
     SESSION_PORT,
+    STATUS_PORT,
 ];
 
 const _: () = {

@@ -15,7 +15,7 @@
 // blocking bus work in an execute body spends half the pool; and an input
 // overrun on a slow cog ends the whole process. So the driver is an OS process
 // that is no Clockwork process, composed in no box, and this file's business
-// with it is the six sockets below.
+// with it is the seven sockets below.
 //
 // A socket occupies exactly the slot a cog does: it publishes to a channel or
 // subscribes to one, and a channel does not say what filled it. So each
@@ -69,7 +69,7 @@ use @clockwork::clockwork::logging::writers::logger_status;
 // each cycle's sample here, and this socket is `DriverPose`'s one publisher in
 // this composition.
 //
-// The loopback bind is the whole of what these four incoming sockets trust.
+// The loopback bind is the whole of what these five incoming sockets trust.
 // Nothing off the machine can reach them and a datagram of the wrong size kills
 // this process, but a datagram of the right size from any other process on the
 // unit is indistinguishable from the driver's: machine state, fault evidence and
@@ -116,6 +116,19 @@ udp_socket HealthIn
     message_type: Tachyon<health::HealthReport>;
 }
 
+// Everything the driver knows about its own run, republished on a cadence: the
+// release it wrote at process start, the rows that would not read back, when it
+// first published a sample and first heard from the host, and every counter it
+// keeps. Its own port for the reason each of the others has one -- the arrival
+// port is the discriminator on this seam.
+udp_socket StatusIn
+{
+    address: 127.0.0.1;
+    port: 7407;
+    direction: incoming;
+    message_type: Tachyon<health::DriverStatus>;
+}
+
 // The goal stream, leaving. `port` on an outgoing socket is the destination --
 // the compiler admits `remote_port` only on a bidirectional socket, and the
 // emitter hands this number to the send -- so 7401 is the port
@@ -140,7 +153,7 @@ udp_socket SessionOut
     message_type: Tachyon<session_cmd::SessionCmd>;
 }
 
-// The control loop as it runs on a machine: the core three cogs, six sockets in
+// The control loop as it runs on a machine: the core three cogs, seven sockets in
 // place of the modelled driver, and the wake gesture that starts a session.
 //
 // The topology is `SimBox`'s with two publishers replaced. Where that box puts
@@ -210,6 +223,13 @@ box RobotBox
 
     new health_in: HealthIn;
     connect health_in to motion::DriverHealth;
+
+    // What the driver says about its whole run. Logged only: nothing in this
+    // system reads it, and it exists so that a log written by a logger which
+    // attached whenever it attached still holds every fact the run is verified
+    // from.
+    new status_in: StatusIn;
+    connect status_in to motion::DriverStatus;
 }
 
 // What writes the run down: the framework's two writer cogs, in a process of

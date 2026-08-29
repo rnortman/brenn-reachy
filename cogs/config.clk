@@ -155,8 +155,11 @@ schema SimParams
         // the machine, nanoseconds.
         #1 hold_timeout_ns: Int64;
 
-        // Whether the machine starts energised. False in a scenario that arms
-        // the machine itself, which is what a session does.
+        // Whether the machine this process meets is energised: what a crashed
+        // predecessor would have left behind. The process releases every row as
+        // its first act whatever this says, so a scenario that wants an armed
+        // machine arms it with an injection; what this decides is only what the
+        // release had to answer.
         #2 start_torqued: Bool;
 
         // How far a crank servo moves in one cycle, radians. The plant is

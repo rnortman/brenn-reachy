@@ -163,22 +163,17 @@ pub struct TickConfig {
 
 /// The per-exchange allowance a cycle's bus work runs under.
 ///
-/// The bus layer's own default allowance is ten milliseconds, which is a
-/// sensible timeout for a host commanding whole moves and an unusable one
-/// inside a twenty-millisecond cycle: two exchanges under it already overrun
-/// the period, so a driver waiting that long is a driver stealing the next
-/// cycle to hear about an exchange that has already missed this one. Three
-/// milliseconds is what a cycle can afford — the grouped read, the write and
-/// one out-of-band pair fit inside the period with the margin below still
-/// unspent — and an exchange that has not answered by then is a miss, which is
-/// a reading this driver has somewhere to put.
+/// [`reachy_bus::CYCLE_HOST_ALLOWANCE`] is the figure and says why it is that
+/// figure. What this adds is the driver's reading of an exchange that has not
+/// answered by then: a miss, which is a reading this driver has somewhere to
+/// put, rather than a wait that steals the next cycle.
 ///
 /// The retry fields are inherited and unused: [`reachy_bus::with_retry`] sleeps
 /// and is not reachable from a cycle.
 #[must_use]
 pub fn cycle_timing(baud: u32) -> BusTiming {
     BusTiming {
-        host_allowance: std::time::Duration::from_millis(3),
+        host_allowance: reachy_bus::CYCLE_HOST_ALLOWANCE,
         baud,
         ..BusTiming::default()
     }
@@ -219,9 +214,14 @@ pub struct TickCounts {
     pub blind_cycles: u64,
     /// Events a cycle raised after it already had one to publish.
     pub events_dropped: u64,
-    /// Host transactions turned away because one was already pending, and
-    /// datagrams asking for nothing at all.
+    /// Host transactions turned away because another one was already pending,
+    /// and datagrams asking for nothing at all.
     pub aux_refused: u64,
+    /// Delivery re-issues of the request already in the slot: the same number
+    /// carrying the same bytes. Acted on rather than turned away, and counted
+    /// apart so a run says how much of its traffic was the transport repeating
+    /// itself.
+    pub aux_duplicates: u64,
     /// Cycles that had an out-of-band transaction to run and no time left to
     /// run it in.
     pub aux_deferred: u64,
@@ -240,9 +240,14 @@ impl TickCounts {
     /// report reads this number back out of the driver's summary line.
     pub const AUX_REFUSED: &str = "aux_refused";
 
+    /// The label the duplicate count is printed under, read back out of the
+    /// summary line by the offline report for the reason
+    /// [`Self::AUX_REFUSED`] is.
+    pub const AUX_DUPLICATES: &str = "aux_duplicates";
+
     /// Every count, as labelled numbers for a log line.
     #[must_use]
-    pub fn read(&self) -> [(&'static str, u64); 12] {
+    pub fn read(&self) -> [(&'static str, u64); 13] {
         [
             ("goals_executed", self.goals_executed),
             ("goals_dropped", self.goals_dropped),
@@ -252,6 +257,7 @@ impl TickCounts {
             ("blind_cycles", self.blind_cycles),
             ("events_dropped", self.events_dropped),
             (Self::AUX_REFUSED, self.aux_refused),
+            (Self::AUX_DUPLICATES, self.aux_duplicates),
             ("aux_deferred", self.aux_deferred),
             ("health_reports", self.health_reports),
             ("health_misses", self.health_misses),
@@ -312,6 +318,15 @@ pub struct CycleReport {
     /// The answer to the one out-of-band transaction a cycle ran, where it ran
     /// one a host is waiting on.
     pub outcome: Option<AuxOutcomeWire>,
+    /// The busy answer to a request this cycle turned away, where one was
+    /// turned away.
+    ///
+    /// Its own slot rather than the served transaction's, because the two are
+    /// answers to two different requests: a cycle that both served one and
+    /// turned another away owes the host a word about each, and one slot would
+    /// mean the host learning about the collision instead of about the
+    /// transaction it is waiting on.
+    pub turned_away: Option<AuxOutcomeWire>,
     /// The health rotation's report, on the cycles it read a servo.
     pub health: Option<HealthReportWire>,
     /// How long this cycle's out-of-band transaction took, on the cycles that
@@ -319,6 +334,10 @@ pub struct CycleReport {
     /// the cost of the one piece of a cycle whose duration is otherwise only
     /// ever guessed at.
     pub aux_span_ns: Option<i64>,
+    /// The longest single write call this cycle spent handing a request to the
+    /// port. Every cycle writes something — the grouped read's request at the
+    /// least — so this is a reading on every cycle rather than an option.
+    pub drain_ns: i64,
 }
 
 /// The bus half of the driver: a port, the servo map, and the decisions' state.
@@ -337,6 +356,8 @@ pub struct Tick<P: BusPort> {
     pending: Option<Event>,
     /// The answer this cycle will publish.
     answer: Option<Answer>,
+    /// The busy answer this cycle will publish, where it turned a request away.
+    turned_away: Option<Answer>,
     /// How long this cycle's out-of-band exchange took, where it ran one.
     aux_span_ns: Option<i64>,
     counts: TickCounts,
@@ -360,6 +381,7 @@ impl<P: BusPort> Tick<P> {
             blind_run: 0,
             pending: None,
             answer: None,
+            turned_away: None,
             aux_span_ns: None,
             counts: TickCounts::default(),
         }
@@ -392,6 +414,17 @@ impl<P: BusPort> Tick<P> {
             state.active.get() && !state.said_confirmed.get()
         };
         believed || confirming
+    }
+
+    /// Whether the gate is standing in a torque-off latch.
+    ///
+    /// A reading and not a decision: the latch is re-swept every cycle it
+    /// stands and ends only at a host's verified arming, so what this is for is
+    /// saying in the driver's status record whether that is what the machine is
+    /// doing.
+    pub fn torque_latched(&mut self) -> bool {
+        let (gate, _) = self.state.decide();
+        GoalGate::over(gate).state().latched.get()
     }
 
     /// What the running confirmation pass has said, if it has said anything.
@@ -445,9 +478,15 @@ impl<P: BusPort> Tick<P> {
     /// what the gate's own refusal of an overrun goal queue exists to stop.
     ///
     /// Two kinds are refused here. A datagram asking nothing is a slot nobody
-    /// wrote, published; and an out-of-band request arriving while one is
-    /// already pending is a host that is not the serial one it claims to be.
-    /// Both are counted, and neither is fed to the dead-man.
+    /// wrote, published; and an out-of-band request arriving under a number or
+    /// a payload other than the pending one's is a host that is not the serial
+    /// one it claims to be. Both are counted, and neither is fed to the
+    /// dead-man.
+    ///
+    /// A verbatim re-issue of the pending request is neither: the driver is
+    /// already acting on exactly what it asks for, which is a host that is
+    /// there and a transport that repeated itself. It counts as liveness and
+    /// draws no answer of its own.
     pub fn offer_session_cmd(&mut self, cmd: &SessionCmd, nominal_ns: i64) {
         let accepted = match cmd.kind {
             SessionCmdKind::None => false,
@@ -463,10 +502,18 @@ impl<P: BusPort> Tick<P> {
                     let (_, slot) = self.state.decide();
                     AuxSlot::over(slot).offer(cmd.corr, &cmd.txn)
                 };
-                if offered == AuxOffer::RefusedBusy {
+                match offered {
+                    AuxOffer::Accepted => {}
+                    // The transport repeating itself. Nothing goes back for it:
+                    // the request it duplicates is in the slot and its outcome
+                    // answers both copies, so an answer here would be a second
+                    // one under a number the host has had no first for.
+                    AuxOffer::Duplicate => self.counts.aux_duplicates += 1,
                     // Loud both ways: an outcome against the turned-away
                     // request's own number, and a count.
-                    self.note_answer(Answer::busy(cmd.corr));
+                    AuxOffer::RefusedBusy => {
+                        self.note_turned_away(Answer::busy(cmd.corr, &Request::of(&cmd.txn)));
+                    }
                 }
                 offered != AuxOffer::RefusedBusy
             }
@@ -503,6 +550,10 @@ impl<P: BusPort> Tick<P> {
     /// Run one cycle at grid instant `nominal_ns`, and answer what to publish.
     pub fn run(&mut self, nominal_ns: i64) -> CycleReport {
         self.aux_span_ns = None;
+        // Taken and discarded so the span this cycle reports is this cycle's:
+        // whatever the bus was holding belongs to the cycle before it, which has
+        // already published its own.
+        let _ = self.bus.take_worst_send();
         let read = self.read_positions();
         // The one clock read of a cycle, taken the moment the proprioception
         // came back: `sample_time - nominal_time` is then the cycle's jitter,
@@ -522,17 +573,19 @@ impl<P: BusPort> Tick<P> {
             event.write(message.clear_valid());
             message
         });
-        let outcome = self.answer.take().map(|answer| {
-            let mut message = AuxOutcomeWire::new();
-            answer.write(message.clear_valid());
-            message
-        });
+        let outcome = self.answer.take().map(Self::as_outcome);
+        let turned_away = self.turned_away.take().map(Self::as_outcome);
         CycleReport {
             sample,
             event,
             outcome,
+            turned_away,
             health,
             aux_span_ns: self.aux_span_ns,
+            // Saturating rather than wrapping: a span wider than an i64 of
+            // nanoseconds is a clock that is not measuring, and reporting the
+            // widest span there is says that better than a wrapped small one.
+            drain_ns: i64::try_from(self.bus.take_worst_send().as_nanos()).unwrap_or(i64::MAX),
         }
     }
 
@@ -794,12 +847,12 @@ impl<P: BusPort> Tick<P> {
         rows
     }
 
-    /// Offer an answer for this cycle's one outcome slot.
+    /// Offer an answer for this cycle's one served-transaction slot.
     ///
-    /// At most one transaction runs per cycle, so the slot collides only when a
-    /// request was turned away in the same cycle one was served. The first
-    /// answer wins and the displaced one comes back to the host as a silence,
-    /// which is the case its own re-issue exists for.
+    /// At most one transaction runs per cycle, so this holds the answer to the
+    /// one that did — a request turned away has its own slot and cannot
+    /// displace it. The first answer wins, which under one transaction a cycle
+    /// is every answer there is.
     ///
     /// TODO(driver-host-sample-glue): the same first-answer-wins rule, and the
     /// gate-derived fields of [`Self::write_sample`], are written out a second
@@ -811,6 +864,26 @@ impl<P: BusPort> Tick<P> {
         if self.answer.is_none() {
             self.answer = Some(answer);
         }
+    }
+
+    /// Offer the busy answer to a request this cycle turned away.
+    ///
+    /// One deep and first-wins, like the served slot. A second collision in one
+    /// cycle takes a host holding three overlapping requests inside a period,
+    /// which the serial session this driver is commanded by cannot do; the
+    /// second one is still turned away and still counted, and what it leaves no
+    /// record of is a collision the first one already reported.
+    fn note_turned_away(&mut self, answer: Answer) {
+        if self.turned_away.is_none() {
+            self.turned_away = Some(answer);
+        }
+    }
+
+    /// An answer as the record that carries it over the seam.
+    fn as_outcome(answer: Answer) -> AuxOutcomeWire {
+        let mut message = AuxOutcomeWire::new();
+        answer.write(message.clear_valid());
+        message
     }
 
     /// The cycle's proprioception: one grouped read of the nine present
@@ -897,7 +970,7 @@ impl<P: BusPort> Tick<P> {
                         ..Event::at(nominal_ns)
                     });
                 }
-                self.sweep_torque_off();
+                let _ = self.sweep_torque_off();
                 return true;
             }
             GateAction::WriteGoal => {
@@ -963,6 +1036,33 @@ impl<P: BusPort> Tick<P> {
         }
     }
 
+    /// Write the minimum risk condition before the loop exists, and answer which
+    /// rows would not confirm it.
+    ///
+    /// The first thing this process does on the bus. A driver cannot know what
+    /// the machine it joined was left doing — a predecessor that crashed leaves
+    /// it torqued, and nothing on the bus will say so — so control is untrusted
+    /// at process start and the answer to untrusted control is an immediate
+    /// best-effort release. Nothing gates it and nothing precedes it but taking
+    /// the port.
+    ///
+    /// Every write is verified, which is a read-back of the row taken on the
+    /// spot, so a fully verified sweep is its own confirmation: the belief holds
+    /// every row released, no latch is set, and no confirmation pass is opened —
+    /// there is nothing left to re-read. A row that would not verify is what
+    /// sets the latch, through the same path a host's de-torque takes, so the
+    /// sweep is re-issued every cycle the latch stands and the pass reads back
+    /// what it can.
+    ///
+    /// Answers the rows whose verified write failed, empty on a healthy start.
+    pub fn startup_mrc_sweep(&mut self, now_ns: i64) -> JointFlags {
+        let failed = self.sweep_torque_off();
+        if !flags::is_empty(failed) {
+            self.request_torque_off(now_ns);
+        }
+        failed
+    }
+
     /// Write the minimum risk condition: torque off on every row, verified.
     ///
     /// Nine verified writes, one per row, because the protocol acknowledges a
@@ -972,7 +1072,10 @@ impl<P: BusPort> Tick<P> {
     /// sweep again every cycle, and the confirmation pass keeps reading. Nothing
     /// here is conditional on anything — the sweep runs whatever the bus has
     /// been doing, and whatever else this cycle could not do.
-    fn sweep_torque_off(&mut self) {
+    ///
+    /// Answers the rows whose verified write failed, which is what a caller
+    /// running the sweep outside a cycle has instead of a confirmation pass.
+    fn sweep_torque_off(&mut self) -> JointFlags {
         let off = RawValue::new(&[0]).expect("one byte carries a torque-enable value");
         // The belief is taken once for the whole sweep rather than per row: the
         // state is validated on the way in, and this is the most expensive cycle
@@ -987,18 +1090,23 @@ impl<P: BusPort> Tick<P> {
         } = self;
         let (_, aux) = state.decide();
         let mut belief = AuxSlot::over(aux);
+        let mut failed = JointFlags::NONE;
         for index in 0..ROW_COUNT {
             let Some(id) = map.id_at(index) else {
                 continue;
             };
             if bus.write_reg_verified(id, TORQUE_ENABLE, &off).is_err() {
                 counts.write_failures += 1;
+                if let Some(joint) = joint_ref(index) {
+                    failed |= flags::bit(joint);
+                }
                 continue;
             }
             belief
                 .belief()
                 .verified_write(u8::try_from(index).unwrap_or(u8::MAX), false);
         }
+        failed
     }
 
     /// Count how long the bus has been answering nothing, and say so once the
@@ -1107,13 +1215,13 @@ mod tests {
     use reachy_bus::{Bus, BusPort, ServoMap};
     use reachy_driver::{BLIND_CYCLES_BEFORE_BUS_FAILURE, TORQUE_OFF_CONFIRM_BUDGET_NS};
     use reachy_motion::arm::SERVO_IDS;
-    use reachy_motion::joints::{ROW_COUNT, flags, rows_of, set_angle};
+    use reachy_motion::joints::{ROW_COUNT, flags, joint_ref, rows_of, set_angle};
     use reachy_motion::value::{self, Value};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
     use std::io;
     use std::rc::Rc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// A round instant, so a number read out of the wrong field is visible.
     const T0: i64 = 1_700_000_000_000_000_000;
@@ -1323,6 +1431,36 @@ mod tests {
         fn discard_input(&mut self) -> io::Result<()> {
             self.0.borrow_mut().discard_input()
         }
+    }
+
+    /// A port whose write costs whatever the case is currently charging for
+    /// one, so a cycle's measured write span is a number the case chose.
+    struct Slow(Rc<RefCell<Machine>>, Rc<Cell<Duration>>);
+
+    impl BusPort for Slow {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            std::thread::sleep(self.1.get());
+            self.0.borrow_mut().write_all(buf)
+        }
+
+        fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
+            self.0.borrow_mut().read_some(buf, deadline)
+        }
+
+        fn discard_input(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().discard_input()
+        }
+    }
+
+    /// A driver whose every write costs what the returned cell holds.
+    fn slow_driver(machine: Machine) -> (Tick<Slow>, Rc<Cell<Duration>>) {
+        let shared = Rc::new(RefCell::new(machine));
+        let cost = Rc::new(Cell::new(Duration::ZERO));
+        let bus = Bus::new(
+            Slow(Rc::clone(&shared), Rc::clone(&cost)),
+            cycle_timing(DEFAULT_BAUD),
+        );
+        (Tick::new(bus, config()), cost)
     }
 
     /// A driver over a machine the case still holds, on the timing and the
@@ -1637,6 +1775,93 @@ mod tests {
     }
 
     #[test]
+    fn the_process_start_sweep_releases_every_row_and_latches_nothing() {
+        // The healthy start: every verified write reads back, so the sweep is
+        // its own confirmation — nothing is left to re-reach, and the first
+        // cycle carries no sweep and no read-back traffic.
+        let (mut tick, machine) = driver(Machine::at(2048));
+
+        let failed = tick.startup_mrc_sweep(T0);
+
+        assert!(flags::is_empty(failed), "every row read back released");
+        assert_eq!(tick.counts().write_failures, 0);
+        let held = machine.borrow();
+        for id in SERVO_IDS {
+            assert_eq!(held.get(id, TORQUE_ENABLE), Some(&[0][..]), "servo {id}");
+        }
+        let swept = held
+            .wrote
+            .iter()
+            .filter(|(_, addr, _)| *addr == TORQUE_ENABLE.addr)
+            .count();
+        assert_eq!(swept, ROW_COUNT, "one verified write per row, and no more");
+        drop(held);
+        machine.borrow_mut().wrote.clear();
+        machine.borrow_mut().read.clear();
+
+        let report = tick.run(T0 + 20_000_000);
+        let sample = report.sample.validate().expect("a sample this cycle wrote");
+        assert!(
+            !bool::from(sample.torque_off_latched),
+            "a start with nothing left to reach for does not stand in a latched gate"
+        );
+        let after = machine.borrow();
+        assert!(
+            !after
+                .wrote
+                .iter()
+                .any(|(_, addr, _)| *addr == TORQUE_ENABLE.addr),
+            "no sweep is repeated on a cycle whose start verified every row"
+        );
+        assert!(
+            !after
+                .read
+                .iter()
+                .any(|(_, addr, _)| *addr == TORQUE_ENABLE.addr),
+            "and no confirmation pass is reading rows back"
+        );
+    }
+
+    #[test]
+    fn a_process_start_sweep_that_could_not_verify_a_row_latches_and_keeps_reaching() {
+        let mut machine = Machine::at(2048);
+        // Acknowledged and not stored: the row is written and does not read
+        // back, which is the one case with something left to keep reaching for.
+        machine.ignored.push((SERVO_IDS[5], TORQUE_ENABLE.addr));
+        let (mut tick, machine) = driver(machine);
+
+        let failed = tick.startup_mrc_sweep(T0);
+
+        assert_eq!(
+            flags::len(failed),
+            1,
+            "one row would not confirm, and the sweep says which"
+        );
+        assert!(
+            flags::contains(failed, joint_ref(5).expect("row 5 is a joint")),
+            "the row named is the one the machine ignored"
+        );
+        machine.borrow_mut().wrote.clear();
+
+        let report = tick.run(T0 + 20_000_000);
+        let sample = report.sample.validate().expect("a sample this cycle wrote");
+        assert!(
+            bool::from(sample.torque_off_latched),
+            "a release a row would not confirm latches the gate"
+        );
+        let swept = machine
+            .borrow()
+            .wrote
+            .iter()
+            .filter(|(_, addr, _)| *addr == TORQUE_ENABLE.addr)
+            .count();
+        assert_eq!(
+            swept, ROW_COUNT,
+            "the standing latch re-issues the whole sweep on the next cycle"
+        );
+    }
+
+    #[test]
     fn a_row_whose_release_did_not_read_back_is_counted_and_the_rest_swept() {
         let mut machine = Machine::at(2048);
         // Acknowledged and not stored, which is what a servo that ignored a
@@ -1863,6 +2088,37 @@ mod tests {
         );
     }
 
+    /// The write span a cycle reports is one this cycle's bus work measured,
+    /// and it does not carry into the next one.
+    ///
+    /// Three links of this chain are covered where they live -- the bus's worst
+    /// write, the window's fold, the field the event writes -- and the join is
+    /// here: a report whose `drain_ns` stayed at zero would print as an
+    /// unmeasured span on every run and read as a question about the hardware
+    /// rather than about the wiring.
+    #[test]
+    fn a_cycle_reports_the_worst_write_its_own_bus_work_measured() {
+        let cost = Duration::from_millis(5);
+        let (mut tick, charge) = slow_driver(Machine::at(2048));
+
+        charge.set(cost);
+        let expensive = tick.run(T0);
+        let measured = i64::try_from(cost.as_nanos()).expect("five milliseconds is an i64");
+        assert!(
+            expensive.drain_ns >= measured,
+            "the cycle's own writes cost at least that: {}",
+            expensive.drain_ns
+        );
+
+        charge.set(Duration::ZERO);
+        let cheap = tick.run(T0 + reachy_driver::NOMINAL_CYCLE_NS);
+        assert!(
+            cheap.drain_ns < measured,
+            "the window starts again each cycle: {}",
+            cheap.drain_ns
+        );
+    }
+
     #[test]
     fn a_servo_that_answers_nothing_gets_no_health_report_at_all() {
         let mut machine = Machine::at(2048);
@@ -2003,17 +2259,153 @@ mod tests {
 
         assert_eq!(tick.counts().aux_refused, 1);
         let report = tick.run(T0);
+        let served = report
+            .outcome
+            .as_ref()
+            .expect("the request that was held runs on this cycle")
+            .validate()
+            .expect("an outcome this cycle wrote");
+        // The served transaction's own answer, in the slot the host reads its
+        // answers out of: a request turned away is a fact about the other
+        // request and cannot take the place of this one's reply.
+        assert_eq!((served.corr, served.status), (1, AuxStatus::Ok));
+        let turned_away = report
+            .turned_away
+            .as_ref()
+            .expect("the turned-away request is answered too")
+            .validate()
+            .expect("an outcome this cycle wrote");
+        // Against the number that was refused, and saying that the slot was
+        // full rather than that the driver declined the transaction.
+        assert_eq!((turned_away.corr, turned_away.status), (2, AuxStatus::Busy));
+        assert_eq!(
+            (turned_away.op, turned_away.id, turned_away.reg),
+            (AuxOpKind::ReadReg, SERVO_IDS[1], RegId::PresentPosition),
+            "the turned-away answer names the request it turned away"
+        );
+    }
+
+    /// An outcome says what it is about, so a reader with no copy of the request
+    /// can still tell what was asked -- which is what an answer read out of a log
+    /// is.
+    #[test]
+    fn every_outcome_names_the_transaction_it_answers() {
+        let (mut tick, _machine) = driver(Machine::at(2048));
+        let served = request(
+            7,
+            AuxOpKind::ReadReg,
+            SERVO_IDS[2],
+            RegId::PresentPosition,
+            value::NONE,
+        );
+        tick.offer_session_cmd(asked(&served), T0);
+        let ran = tick.run(T0);
+        let outcome = ran
+            .outcome
+            .as_ref()
+            .expect("a host request is answered on the cycle it runs")
+            .validate()
+            .expect("an outcome this cycle wrote");
+        assert_eq!(
+            (outcome.op, outcome.id, outcome.reg),
+            (AuxOpKind::ReadReg, SERVO_IDS[2], RegId::PresentPosition),
+        );
+
+        // And a request nothing on this machine answers to: refused before the
+        // wire, and still saying what was asked.
+        let absent = request(
+            8,
+            AuxOpKind::WriteRegVerified,
+            99,
+            RegId::TorqueEnable,
+            value::u8(0),
+        );
+        tick.offer_session_cmd(asked(&absent), T0 + reachy_driver::NOMINAL_CYCLE_NS);
+        let refused = tick.run(T0 + reachy_driver::NOMINAL_CYCLE_NS);
+        let outcome = refused
+            .outcome
+            .as_ref()
+            .expect("a refusal is an answer")
+            .validate()
+            .expect("an outcome this cycle wrote");
+        assert_eq!(outcome.status, AuxStatus::Refused);
+        assert_eq!(
+            (outcome.op, outcome.id, outcome.reg),
+            (AuxOpKind::WriteRegVerified, 99, RegId::TorqueEnable),
+            "a transaction the driver would not run is still one a reader can name"
+        );
+    }
+
+    /// The delivery re-issue the session sends when an outcome has not come
+    /// back in time, drained into the same cycle as the original. The driver is
+    /// already acting on exactly what it asks for: the transaction runs once,
+    /// its answer goes back under the one number both copies carry, and nothing
+    /// is refused.
+    #[test]
+    fn a_verbatim_re_issue_drained_with_the_original_runs_once_and_is_not_refused() {
+        let (mut tick, _machine) = driver(Machine::at(2048));
+        let asked_for = request(
+            1,
+            AuxOpKind::ReadReg,
+            SERVO_IDS[0],
+            RegId::PresentPosition,
+            value::NONE,
+        );
+        tick.offer_session_cmd(asked(&asked_for), T0);
+        tick.offer_session_cmd(asked(&asked_for), T0);
+
+        assert_eq!(tick.counts().aux_duplicates, 1);
+        assert_eq!(tick.counts().aux_refused, 0, "nothing was turned away");
+        let report = tick.run(T0);
         let outcome = report
             .outcome
             .as_ref()
-            .expect("the turned-away request is answered")
+            .expect("the one transaction both copies asked for")
             .validate()
             .expect("an outcome this cycle wrote");
-        // Against the number that was refused, and the one that was accepted
-        // runs on this cycle and comes back to a host whose answer the refusal
-        // displaced -- which is what its own re-issue is for.
-        assert_eq!(outcome.corr, 2);
-        assert_eq!(outcome.status, AuxStatus::Refused);
+        assert_eq!((outcome.corr, outcome.status), (1, AuxStatus::Ok));
+        assert!(
+            report.turned_away.is_none(),
+            "a re-issue is not a second request"
+        );
+        // And the slot is empty: one request was held, and the cycle ran it.
+        let next = tick.run(T0 + 20_000_000);
+        assert!(next.outcome.is_none());
+    }
+
+    /// The same correlation number carrying a different transaction is not a
+    /// re-issue of anything: two asks under one identity, and the second is
+    /// turned away like any other request arriving while the slot is full.
+    #[test]
+    fn a_re_issue_under_the_pending_number_with_other_bytes_is_refused() {
+        let (mut tick, _machine) = driver(Machine::at(2048));
+        let first = request(
+            1,
+            AuxOpKind::ReadReg,
+            SERVO_IDS[0],
+            RegId::PresentPosition,
+            value::NONE,
+        );
+        let second = request(
+            1,
+            AuxOpKind::ReadReg,
+            SERVO_IDS[1],
+            RegId::PresentPosition,
+            value::NONE,
+        );
+        tick.offer_session_cmd(asked(&first), T0);
+        tick.offer_session_cmd(asked(&second), T0);
+
+        assert_eq!(tick.counts().aux_refused, 1);
+        assert_eq!(tick.counts().aux_duplicates, 0);
+        let report = tick.run(T0);
+        let turned_away = report
+            .turned_away
+            .as_ref()
+            .expect("the second ask is answered")
+            .validate()
+            .expect("an outcome this cycle wrote");
+        assert_eq!((turned_away.corr, turned_away.status), (1, AuxStatus::Busy));
     }
 
     #[test]
@@ -2430,18 +2822,25 @@ mod tests {
                 "one deferral per cycle that had work and no room for it",
             );
         }
-        // Held, not dropped: the slot still has it, which is why a second
-        // request is refused as busy rather than accepted.
-        tick.offer_session_cmd(asked(&asked_for), T0 + 60_000_000);
+        // Held, not dropped: the slot still has it, which is why another
+        // request is turned away as busy rather than accepted.
+        let other = request(
+            5,
+            AuxOpKind::ReadReg,
+            SERVO_IDS[3],
+            RegId::PresentPosition,
+            value::NONE,
+        );
+        tick.offer_session_cmd(asked(&other), T0 + 60_000_000);
         let report = tick.run(T0 + 60_000_000);
         assert_eq!(
             report
-                .outcome
+                .turned_away
                 .expect("the turned-away request is answered")
                 .validate()
                 .expect("an outcome this cycle wrote")
                 .status,
-            AuxStatus::Refused,
+            AuxStatus::Busy,
         );
         assert_eq!(
             machine

@@ -1,10 +1,15 @@
 // The story a session tells about a fault: one report as its own timeline holds
-// it, and the maneuver it is running while it tells it.
+// it, the whole story as it goes out, and the maneuver it is running while it
+// tells it.
 //
-// Both are state the session keeps rather than messages it sends. A report is
-// raised faster than one datagram per execution can carry it away, so the ring
-// of entries is what holds the story across the executions that drain it; and a
+// The entry and the maneuver are state the session keeps. A report is raised
+// faster than one datagram per execution can carry it away, so the ring of
+// entries is what holds the story across the executions that append to it; and a
 // wind-down runs across executions too, on one clock opened once.
+//
+// The story is what leaves: one message carrying every row the session has
+// narrated, republished whole whenever a row is added, so a reader that arrives
+// late has the whole of it from the first message it sees.
 //
 // They sit together because they are the two halves of the same episode -- what
 // is being done about a fault, and what has been said about it -- and because a
@@ -23,11 +28,11 @@ use motion::reports;
 // One report, as the session's own timeline holds it before it goes out.
 //
 // The same five values the wire's `Report` carries, in the fields a state schema
-// holds them in. It stands here because a report leaves at one datagram per
-// execution and a burst is raised faster than that: the ring is what carries the
-// story across the executions that drain it, and it is bounded because a story is
-// narration -- the classification that mattered already travelled on the channel
-// that raised it.
+// holds them in. It stands here because the session keeps its story in a ring of
+// these and publishes the whole of it, so one row has to be writable into a slot
+// and into a message alike. The ring is bounded because a story is narration --
+// the classification that mattered already travelled on the channel that raised
+// it.
 schema TimelineEntry
 {
     uuid: 22a9d649-3287-41af-8b4b-98ca9efe34d9;
@@ -52,6 +57,36 @@ schema TimelineEntry
         // number included: a report is narration, and a story dropped for an
         // unreadable measurement loses the part that was readable with it.
         #4 detail: Float64;
+    }
+}
+
+// The whole story so far: every report the session has narrated, oldest first.
+//
+// Cumulative rather than one row per message. The reader this crosses to is a
+// log, and a logger attaches to a channel whenever it happens to start -- so a
+// row published as its own message before that instant is a row nobody can read
+// afterwards. A message that carries the whole story has no head to lose: the
+// newest one is the account of the run, whichever copy a reader saw first.
+//
+// Sixty-four rows, which is the ring the session keeps them in, not a multiple
+// of it: this capacity is what bounds that ring, and a ring grown past it would
+// have rows with nowhere to go. The two lengths are pinned against each other by
+// a case beside the ring. A story longer than the ring loses its oldest rows and
+// says how many in `dropped`, which is the one thing a reader cannot work out
+// from the rows it holds.
+schema Timeline
+{
+    uuid: 14b5f331-e3c2-4051-a6bd-6dbc47adb3ff;
+    fields
+    {
+        // The rows, oldest first. Every one of them narrates something: a story
+        // never carries the zero kind an unwritten slot row holds.
+        #0 entries: VarArray<TimelineEntry, 64>;
+
+        // How many rows were dropped off the front to make room, all run. A
+        // rise says narration was lost, never a record: what mattered about a
+        // fault travelled on the channel that raised it.
+        #1 dropped: UInt32;
     }
 }
 

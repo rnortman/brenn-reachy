@@ -2,12 +2,17 @@
 // what its rotating read of the status registers saw, and how one aux
 // transaction turned out.
 //
-// Three records and the status vocabulary one of them speaks, in one module:
+// Four records and the status vocabulary one of them speaks, in one module:
 // all of it is the driver's diagnostic voice, none of it is per-cycle, and a
-// consumer of one record is a consumer of all three -- an operator report, a
+// consumer of one record is a consumer of the rest -- an operator report, a
 // session's bookkeeping, a bench. The per-cycle pose stream is
 // `driver/pose.clk` and stays out, so a change to a health record does not
 // rebuild the control path.
+//
+// Three of the four are published when something happens; the fourth,
+// `DriverStatus`, is published on a cadence and carries the whole run so far,
+// because the driver is outside Clockwork and has no channel that retains
+// anything for a reader who arrives late.
 //
 // The status an aux transaction ended with is declared here because the driver
 // is what writes one: a producer owns the vocabulary its reports are read in,
@@ -23,6 +28,7 @@
 #![cpp(namespace=brenn_reachy::driver)]
 
 use hardware::dynamixel::registers;
+use motion::bus_txn;
 use motion::joints;
 
 // Something the driver did, or refused to do, that is not visible in the pose
@@ -143,6 +149,18 @@ schema DriverEvent
         // transaction. A second count, because a window has two: how many
         // cycles it held and how many of those did out-of-band work.
         #8 out_of_band: UInt32;
+
+        // The longest single write call a windowed kind's cycles spent: the
+        // host handing a request to the kernel and, on a draining port, waiting
+        // for the bytes to leave the UART. Over every write the window's cycles
+        // made -- the grouped read's request and the goal write on each of them,
+        // plus the out-of-band request where one ran -- so it is not a part of
+        // `exchange` and can exceed it or come off a cycle that ran no
+        // out-of-band work at all. It is the part a host can do something
+        // about: a window whose worst write is cheap while its worst exchange
+        // is not points at the servo or the scheduler, and one whose write
+        // carries the time points at the port.
+        #9 drain: Duration;
     }
 }
 
@@ -215,6 +233,11 @@ enum AuxStatus
         // A verified write read back as something else. What it read back is in
         // `value_kind` and `value`.
         #6 verify_mismatch { underlying_value: 6; }
+        // The slot already held a request under another number; nothing
+        // reached the bus. A decline of the request that arrived, and not a
+        // judgement on it: `refused` is the driver saying the transaction
+        // itself is not one it will run.
+        #7 busy { underlying_value: 7; }
     }
 }
 
@@ -254,5 +277,221 @@ schema AuxOutcome
         // with: what a ping proves is that something at this id answers, and
         // what it says about itself is this number.
         #4 model: UInt16;
+
+        // Which transaction this answers, echoed from the request. An outcome
+        // that carries only a correlation number is readable by the host that
+        // issued the request and by nobody else -- a log whose record of the
+        // requests is short holds outcomes nothing can identify. Echoing the
+        // three fields that name the transaction makes an outcome say what it
+        // is about on its own.
+        #5 op: bus_txn::AuxOpKind;
+
+        // Which servo the transaction named, as its bus id, echoed from the
+        // request.
+        #6 id: UInt8;
+
+        // Which register the transaction named, or `none` where it named none,
+        // echoed from the request.
+        #7 reg: registers::RegId;
+    }
+}
+
+// What the driver's seam counted: the datagrams that arrived and what was
+// wrong with the ones it refused.
+//
+// Every field is cumulative since the process started, so a reader of one
+// record is reading the whole run up to that record's instant.
+schema SeamCounts
+{
+    uuid: 0c1cbd7a-4e26-4a6b-8bd1-0af38bcbbcc9;
+    fields
+    {
+        // Datagrams queued for the loop thread.
+        #0 queued: UInt64;
+
+        // Goal setpoints that arrived.
+        #1 goals: UInt64;
+
+        // Session commands that arrived.
+        #2 session_cmds: UInt64;
+
+        // Datagrams whose length was not the schema's.
+        #3 wrong_size: UInt64;
+
+        // Datagrams of the right length that did not validate.
+        #4 invalid: UInt64;
+
+        // Datagrams dropped because the queue behind them was full.
+        #5 overflowed: UInt64;
+
+        // Datagrams the loop thread never took.
+        #6 undelivered: UInt64;
+
+        // Receives the operating system failed.
+        #7 recv_errors: UInt64;
+
+        // Reader threads that stopped, each one a port whose datagrams now
+        // reach nothing.
+        #8 readers_stopped: UInt64;
+    }
+}
+
+// What the driver's cycles counted: what reached the servos, what did not, and
+// what was turned away before it could.
+//
+// Cumulative since process start, for the reason `SeamCounts` states.
+schema CycleCounts
+{
+    uuid: 2a3e4b95-0b60-4d97-9f9a-2f9b4a1e5f28;
+    fields
+    {
+        // Goals that became the held setpoint and were written.
+        #0 goals_executed: UInt64;
+
+        // Goals refused because the queue was full.
+        #1 goals_dropped: UInt64;
+
+        // Times the dead-man latched torque off.
+        #2 hold_timeouts: UInt64;
+
+        // Rows that did not answer a grouped read, summed over cycles.
+        #3 read_misses: UInt64;
+
+        // Transactions the driver could not put on the wire, or could not
+        // verify.
+        #4 write_failures: UInt64;
+
+        // Cycles in which the bus answered nothing at all.
+        #5 blind_cycles: UInt64;
+
+        // Events a cycle raised after it already had one to publish.
+        #6 events_dropped: UInt64;
+
+        // Host transactions turned away because another was pending, and
+        // datagrams asking for nothing at all.
+        #7 aux_refused: UInt64;
+
+        // Delivery re-issues of the request already in the slot: the same
+        // number carrying the same bytes.
+        #8 aux_duplicates: UInt64;
+
+        // Cycles that had an out-of-band transaction to run and no time left
+        // to run it in.
+        #9 aux_deferred: UInt64;
+
+        // Health reports published.
+        #10 health_reports: UInt64;
+
+        // Health reads the machine did not answer, so no report went out.
+        #11 health_misses: UInt64;
+
+        // Confirmation read-backs the machine did not answer. Each one counts
+        // as a row still holding torque.
+        #12 confirm_misses: UInt64;
+    }
+}
+
+// What the driver's loop counted: the grid it kept, the slots it missed, and
+// the releases it wrote about the seam and the clock.
+//
+// Cumulative since process start, for the reason `SeamCounts` states.
+schema LoopCounts
+{
+    uuid: 5f1cf0a2-6bd9-4d4a-9a97-cf9a4b2f7c14;
+    fields
+    {
+        // Cycles run.
+        #0 cycles: UInt64;
+
+        // Grid points passed over without running, summed. Never made up for.
+        #1 skipped: UInt64;
+
+        // Times the process-start release was reported, which is once on every
+        // run: the sweep is the process's first act on the bus, and the first
+        // cycle is the earliest it can be said. Zero only in a copy composed
+        // before that cycle, which no run publishes -- so on the wire this is
+        // the driver saying it released the machine, and the instant it did is
+        // `sweep_time` above.
+        #2 startup_mrc: UInt64;
+
+        // Cycles on which a stopped reader was answered with a release.
+        #3 wire_failures: UInt64;
+
+        // Datagrams taken off the seam and handed to a cycle.
+        #4 taken: UInt64;
+
+        // Times the clock stepped backwards, the machine was let go, and the
+        // grid was re-drawn. Grid instants either side of one do not line up.
+        #5 clock_steps: UInt64;
+    }
+}
+
+// Everything the driver knows about its own run, republished periodically.
+//
+// Cumulative and complete: the newest record is the whole account of the run so
+// far, so a reader that has only ever seen one of these has read the run. That
+// is what it is for -- the driver is outside Clockwork and cannot retain
+// anything on a channel, so the facts a run is verified from are republished
+// rather than published once. A logger that attached late, or a datagram that
+// was lost on the way, costs the log a copy and no fact.
+//
+// It carries what the driver's console summary line carries and what only the
+// process itself observes: when it released the machine, which rows would not
+// read back, and when it first published a sample and first heard from the host
+// that commands it. Nothing here is a per-cycle measurement -- what a window of
+// cycles cost is `DriverEvent`'s `cycle_stats`, which is an event and stays one.
+schema DriverStatus
+{
+    uuid: 9c50ac1b-63be-4b70-9a2f-b1d51a7c8a30;
+    fields
+    {
+        // When this record was composed.
+        #0 time: SyncTime;
+
+        // When the process wrote the minimum risk condition, which is the first
+        // thing it does on the bus. Every record carries it, so a log that
+        // missed the event stream's head still holds the instant.
+        #1 sweep_time: SyncTime;
+
+        // The rows whose verified torque-off write did not read back at that
+        // sweep. Empty on a healthy start.
+        #2 sweep_failed_rows: joints::JointFlags;
+
+        // Whether the gate is standing in a torque-off latch: the sweep goes out
+        // again on every cycle until a host arms the machine.
+        #3 torque_latched: Bool;
+
+        // When the driver published its first pose sample, and zero until it
+        // has. Observed on the driver's own clock, so a host's ordering against
+        // it is an ordering of two instants one process measured.
+        #4 first_pose: SyncTime;
+
+        // When the driver took the first session command off its inbox, and zero
+        // until it has. Observed on the same clock as `first_pose`: a command
+        // taken on or before the cycle that published the first sample is a host
+        // that commanded the machine before the driver showed it one.
+        #5 first_session_cmd: SyncTime;
+
+        // What the seam counted.
+        #6 seam: SeamCounts;
+
+        // What the cycles counted.
+        #7 cycle: CycleCounts;
+
+        // What the loop counted.
+        #8 loop_counts: LoopCounts;
+
+        // Datagrams the driver put on the seam.
+        #9 published: UInt64;
+
+        // Sends the operating system refused. The report they carried is gone;
+        // nothing is re-sent, because a stale sample on a dated stream is worse
+        // than a missing one.
+        #10 publish_failures: UInt64;
+
+        // Whether this is the record a wind-down published on its way out.
+        // False on every periodic copy, so a run whose last record says nothing
+        // about a wind-down is a run that did not finish one.
+        #11 wound_down: Bool;
     }
 }

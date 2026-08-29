@@ -29,6 +29,7 @@ use cogs::sim;
 use cogs::motion;
 use @clockwork::clockwork::logging::channel_policy::{ChannelLoggingPolicy,
     LogReaderPolicy, LogType};
+use @clockwork::clockwork::logging::channel_type::{ChannelType};
 
 // What makes the runner publish these two channels from the input log. No
 // policy carries a `source_name`, so the source is the channel's own name,
@@ -100,10 +101,28 @@ policy ChannelLoggingPolicy for motion::TickFaults
     log_type = LogType::event;
 }
 
-// What the session said about the session: one report per wake, oldest first.
+// What the session said about the session: the whole story so far, republished
+// whenever a row is added to it.
+//
+// Regular, where the two online systems mark it persistent: a deterministic run
+// writes its log offboard and records every message from the first, so there is
+// no attach instant here for a story to be published in front of.
 policy ChannelLoggingPolicy for motion::ReportsOut
 {
     log_type = LogType::event;
+}
+
+// Everything the driver knows about its own run, republished on a cadence.
+//
+// Persistent, as the two online systems have it: the newest message is
+// cumulative, so a logger handed that one message at attach has the run so far.
+// A deterministic run records every message from the first and loses nothing
+// either way, and the policy is the same one here so that the record the
+// analyzer reads is reached the same way in all three systems.
+policy ChannelLoggingPolicy for motion::DriverStatus
+{
+    log_type = LogType::event;
+    channel_type = ChannelType::persistent;
 }
 
 // Where the head was, once per sample.

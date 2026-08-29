@@ -57,7 +57,10 @@ pub mod error;
 pub mod map;
 pub mod port;
 
-pub use bus::{Bus, BusCounters, BusTiming, MAX_SYNC_IDS, PingInfo, RawValue, with_retry};
+pub use bus::{
+    Bus, BusCounters, BusTiming, CYCLE_HOST_ALLOWANCE, ExchangeSpans, MAX_SYNC_IDS, PingInfo,
+    RawValue, with_retry,
+};
 pub use error::{IdOutcome, SyncReadOutcome, XactError};
 pub use map::{MapError, ServoMap, named_reg, reg_for, value_kind};
 pub use port::{BusPort, DEFAULT_BAUD, OpenError, SerialBusPort};

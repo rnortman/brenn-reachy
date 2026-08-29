@@ -1,5 +1,6 @@
 // What the wake cog keeps between executions: how many scripts it has published,
-// which is also whether it has asked, and how many reports it could not read.
+// which is also whether it has asked, how many reports it could not read, and
+// how much of the story it was told had already gone.
 //
 // A module of its own, as every state schema in this system is: a schema a slot
 // is declared over has to be instantiated in a module the cog module imports,
@@ -15,7 +16,7 @@
 // The totals are held here rather than folded in the signal group: a group's
 // fold restarts every time it reports, and these are absolute counts for the run.
 //
-// Nothing outside the wake cog reads or writes any of it, and both fields go
+// Nothing outside the wake cog reads or writes any of it, and every field goes
 // when the intent bridge replaces that cog.
 // TODO(reachy-pod-motion-integration)
 
@@ -35,5 +36,12 @@ schema WakeState
 
         // How many reports could not be read at all.
         #1 refused_reports: UInt64;
+
+        // How many rows the newest story said had been dropped off its front,
+        // as of the last message read. The transition this cog waits for is the
+        // first row of a run, so a non-zero reading is the one way a story can
+        // arrive without it: the run narrated past the ring before this cog
+        // first ran. It is why a machine that never woke did not.
+        #2 lost_story: UInt64;
     }
 }

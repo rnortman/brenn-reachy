@@ -168,11 +168,15 @@ impl SerialBusPort {
 
 impl BusPort for SerialBusPort {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        Write::write_all(&mut self.port, buf)?;
-        // The frame has to be on the wire before the reply can be waited for;
-        // a buffered write would put the transaction's deadline in front of
-        // bytes that have not left yet.
-        self.port.flush()
+        // The write returns once the kernel has the bytes; nothing here waits
+        // for them to leave the UART. The reply is still waited for over a
+        // window that covers them, because the exchange's deadline is taken
+        // before the write and `BusTiming::worst_exchange` includes the
+        // request's own wire time. The one write that can start behind bytes
+        // still draining is the one after a broadcast, which nothing answers:
+        // at most a single frame, sub-millisecond at this baud, well inside the
+        // host allowance the next exchange runs on.
+        Write::write_all(&mut self.port, buf)
     }
 
     fn read_some(&mut self, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {

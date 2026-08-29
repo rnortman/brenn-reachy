@@ -230,6 +230,7 @@ impl Run {
         JointMetrics {
             span: span(&measured),
             peak_speed: peak_rate(&measured),
+            peak_goal_speed: peak_rate(&commanded),
             peak_goal_step: peak_step(&commanded),
             worst_lag: self
                 .samples
@@ -322,6 +323,10 @@ pub struct JointMetrics {
     pub span: f64,
     /// Its fastest measured period, radians per second.
     pub peak_speed: f64,
+    /// The fastest its goal ever moved, radians per second — the commanded
+    /// speed a lag is read against, since what a joint sits behind by is set by
+    /// how fast it is being asked to move.
+    pub peak_goal_speed: f64,
     /// The largest single-period change in the goal, radians — the recorded
     /// command, inflated by whatever lateness the loop had that night. Read the
     /// module's caution before sizing anything against it.

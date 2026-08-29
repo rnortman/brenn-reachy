@@ -504,9 +504,19 @@ pub fn ended(slot: &mut SessionStateWire, now_ns: i64) -> Option<Entered> {
 /// engaging if one has, which is what makes the watch and the engagement one arm
 /// rather than two phases. Resting, active and the two endings drive nothing
 /// over the bus.
+///
+/// A starting session drives nothing until the driver has published a sample it
+/// could read. A transaction issued before then goes to a process whose loop has
+/// not begun, where it waits in a socket buffer with nobody serving it: the
+/// delivery timeout expires, the re-issue lands beside the original in the
+/// driver's first cycle, and what comes back says nothing this session can tell
+/// a decline from. The sample is the evidence the driver is cycling, and this
+/// cog already keeps it for the silence it measures. A driver that never
+/// publishes one is the start-up grace's business, which is where the machine
+/// this session cannot commission is declared absent.
 fn live(slot: &SessionStateWire) -> Option<Live> {
     match slot.phase() {
-        SessionPhaseWire::STARTING => Some(Live::Commission),
+        SessionPhaseWire::STARTING => slot.saw_sample().then_some(Live::Commission),
         SessionPhaseWire::ENGAGING => match slot.seq_kind() {
             SeqKindWire::ENGAGE => Some(Live::Engage),
             _ => Some(Live::Poll),

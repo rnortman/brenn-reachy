@@ -35,7 +35,9 @@ use motion_slots::{MS_NS, configured, counters};
 ///
 /// The transition watched for is the entry into `resting` from `starting`: the
 /// session's own narration of having finished commissioning, which is the first
-/// instant a script can be accepted. Every other report is read and ignored --
+/// instant a script can be accepted. It is looked for over every row of the
+/// story the session publishes, which is why a view of one message is enough.
+/// Every other report is read and ignored --
 /// including a later entry into `resting`, which is a session that *ended*, and
 /// answering that with a fresh gesture would be a machine that wakes itself in
 /// a loop.
@@ -47,19 +49,32 @@ pub fn execute_wake(dial: &mut WakeDial<'_>) {
 
     let mut commissioned = false;
     for message in dial.inputs.reports.new_msgs() {
-        // Bytes that describe no report name no phase. Refused at this one call
+        // Bytes that describe no story name no phase. Refused at this one call
         // rather than at each field below: a narration vocabulary with a kind
         // this build does not know is a session built against a newer tree, and
         // reading its numbers anyway is how a wrong transition gets acted on.
-        let Ok(entry) = message.validate() else {
+        let Ok(story) = message.validate() else {
             counters.refused_reports += 1;
             continue;
         };
-        if entry.kind == ReportKind::PhaseChanged
-            && entry.a == u32::from(SessionPhaseWire::RESTING.0)
-            && entry.b == u32::from(SessionPhaseWire::STARTING.0)
-        {
-            commissioned = true;
+        // What the story says it has already lost. The row this cog waits for
+        // is the first of a run, so a story that dropped rows off its front may
+        // no longer carry it -- and then this cog waits forever over a machine
+        // that commissioned. Nothing here can recover it; the count is what
+        // says, on the run's own dashboard, why nothing woke.
+        counters.lost_story = u64::from(story.dropped);
+        // Every row of it, every time: the message carries the whole story from
+        // wherever it now begins, so the row this cog waits for is in it
+        // whether it arrived on this message or on one published before this
+        // cog first ran. Reading a row twice costs nothing -- the gesture goes
+        // out once, and the slot below is what says so.
+        for entry in story.entries.iter() {
+            if entry.kind == ReportKind::PhaseChanged
+                && entry.a == u32::from(SessionPhaseWire::RESTING.0)
+                && entry.b == u32::from(SessionPhaseWire::STARTING.0)
+            {
+                commissioned = true;
+            }
         }
     }
 
@@ -180,6 +195,10 @@ counters! {
         scripts_published / set_scripts_published,
         /// Reports that failed validation.
         refused_reports / set_refused_reports,
+        /// Rows the newest story said had gone off its front. A latest reading
+        /// rather than a sum: every message carries the whole count, so adding
+        /// them would count the same losses once per message.
+        lost_story / set_lost_story,
     }
 }
 

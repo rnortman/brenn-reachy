@@ -47,25 +47,6 @@ publishes at three fidelities plus a segment-distance test that the envelope
 does not currently carry. Marked at `EnvelopeConfig` in
 `crates/reachy-kin/src/envelope.rs`.
 
-## `cycle-skip-budget`
-
-Decide whether the first-motion report should allow a rate of missed cycle
-slots, and if so what rate. Today any missed slot makes a run red, in one
-aggregate finding that prints the count, the rate and how many of the skips
-followed a cycle carrying out-of-band bus work.
-
-Deferral context: every hardware run so far has missed slots by the hundred —
-132 to 134 in a moving run, 59 in a parked one — and until this cycle nothing
-measured what a cycle actually costs, so there was no evidence to size a budget
-from and nothing to attribute the skips to. The driver now publishes a measured
-work span per skip and a once-a-second window of worst spans, which is the
-input a budget would be sized from. Sizing it is not a code decision: it needs a
-diagnosis run's measurements plus a human's call on whether a nonzero
-steady-state skip rate is acceptable at all, or whether the 20 ms grid is a hard
-guarantee and the cycle's work is re-engineered until nothing misses. Guessing a
-number before that would launder a red run green. Marked at `cycle_skips` in
-`cogs/first_motion_report.rs`.
-
 ## `health-read-budget`
 
 Decide whether a run of health sweeps that fall short should stop the tick loop
@@ -94,36 +75,6 @@ voltage and the present temperature — so a row that answers two of them and no
 the third costs a report the same way a row that answers none does. That widens
 the surface this decision is about without changing it, and the cycle budget the
 three reads are charged against is `CycleBounds::of` beside the marker.
-
-## `olog-head-capture`
-
-Capture the start of a run. Every recorded run's `.olog` holds fewer datagrams
-than the driver counted taking off its own socket, with the loss at the front, so
-the commissioning-window traffic — which is what says why a session parked — is
-missing from the log the report reads. Done is concrete: a run whose report
-cross-check against the driver's counters finds no shortfall.
-
-Deferral context: the mechanism is confirmed in the pinned Clockwork drop's
-source, and it rules out the obvious fix. The supervisor starts the logger and
-the payload processes in no particular order and waits for no readiness; the
-logger opens its subscriptions lazily, on a one-second poll after it opens the
-log; and on attaching to a `regular` channel — which every channel in this repo
-is — the observer snaps its cursor to the write head and skips whatever the ring
-still holds. So **enlarging the ring recovers nothing**: retention is not the
-limit, the attach position is, and the skipped messages are sitting in the ring
-when the logger declines to read them. Ring capacity sized to the startup burst
-is the right companion change only if the attach policy changes with it.
-
-Two routes, and picking between them is the deferred work. Either the payload's
-first publishes are made to postdate every logger subscription — launch ordering,
-or a readiness barrier — which is this repo's to build; or the attach policy
-itself changes upstream (first notify starting at the oldest retained slot, or a
-channel type that replays more than the one newest message a persistent channel
-replays), which is an ask against the pinned drop and needs the ring sizing
-beside it. The report already treats a shortfall as a finding against the log
-rather than against the run, so nothing reads a truncated trail as a complete
-one in the meantime. Marked in `tools/deploy-motion.sh`, where a run prepares
-the log root and starts the payload — the place a fixed capture is verified.
 
 ## `olog-schema-evolution`
 
@@ -450,6 +401,42 @@ value a signal carries — no Rust type binds to a generated report group
 a checker has no way to ask. The assertion is one line per checker once a signal's
 contents are readable. Marked at `read_registers` in `cogs/sim_cogs.rs`.
 
+## `sim-aux-turned-away`
+
+Give the simulated driver a second outcome slot, so a request it turns away
+never displaces the answer of the one it served. The real driver publishes two
+outcome datagrams on such a cycle — the served transaction's and the turned-away
+request's `busy` — and the simulated one publishes whichever it wrote first.
+
+Deferral context: the sim's outcome is a cog output port carrying one message per
+execution, so the second answer needs either a second port or a second execution,
+which is a change to the sim composition's shape rather than to the cog body
+holding it. Until then a scenario that overlaps two out-of-band requests in one
+cycle sees a driver that no longer exists: one answer, the other silent. Nothing
+in the standing scenarios does that — the session is serial and holds one request
+outstanding — so what the divergence costs today is a trap for the next scenario
+that tries it. Marked at `Report` in `cogs/sim_cogs.rs`.
+
+## `sim-aux-answer-record`
+
+Hold the out-of-band answer record in one place. `Answer` — the struct, its
+`op`/`id`/`reg` echo of the request, `bare`, `about`, `refused`, `busy`, `value`
+and `write` — exists twice, in `cogs/sim_aux.rs` and in
+`crates/reachy-motord/src/aux.rs`, with nothing linking the two, and `Request`
+with it. So every status the vocabulary gains, and every field the outcome
+echoes, is two edits in two crates that no compiler joins.
+
+Deferral context: the copies have already drifted. The simulated host counts no
+duplicate offers where the driver does, and it grants liveness before the slot is
+offered the request, so a turned-away offer feeds the simulated dead-man where
+the real one is not fed by it. Both crates already depend on `reachy-driver`, so
+there is an obvious home beside `AuxSlot` — but putting a wire-answer record in
+the crate that holds the driver's *decisions* and nothing of the wire is a
+placement call about what that crate is, and the simulated host's independence
+from the real one is the property that makes it a check on it rather than a
+mirror. Which of those wins is a design question, and the liveness divergence
+wants an answer of its own with it. Marked at `Answer` in `cogs/sim_aux.rs`.
+
 ## `session-servo-profile`
 
 Give the servo-side velocity/acceleration profile the commissioning sweep writes
@@ -470,6 +457,20 @@ decides it is a hardware session — too tight and the servos rate-limit a
 correctly shaped stream, which surfaces as growing tracking error rather than as
 a refusal — which is outside what the deterministic runner can answer. Marked at
 the profile fields in `cogs/config.clk`.
+
+That symptom is now observed. The 2026-08-28 hardware runs of the wake gesture
+report a worst head lag of 0.95–1.02 rad and a worst antenna lag of
+2.47–2.52 rad, against fixture pins of 0.245 rad and 1.38 rad recorded under the
+bench's 400 / 600 profile. Both of the gesture's commanded peaks (about
+3.34 rad/s of leg crank, 7.57 rad/s of antenna) sit above the shipped 50's
+1.20 rad/s cap and under the bench pair's 9.59 rad/s, and a cap-limited joint
+chasing the min-jerk goal predicts roughly the lag that was measured. Consistent
+with the rate limit, not measured as its cause: the session is what decides it,
+and these are the before-numbers its after-numbers are read against — the lag
+collapsing toward the pins under the trial-validated profile is the confirmation.
+Nothing is failing on it: the tracking screen faults on lack of progress rather
+than on distance, no fault fired in any of those runs, and the run report prints
+the lag as a note it derives no verdict from.
 
 ## `aux-pending-carries-bustxn`
 

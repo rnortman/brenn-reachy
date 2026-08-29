@@ -70,14 +70,18 @@ const WATCHDOG_UNIT_MS: u64 = 20;
 
 /// The Bus Watchdog value the test arms, in the register's own units — the same
 /// value a session arms, so what this establishes is what the machine runs.
-const WATCHDOG_COUNTS: u8 = 10;
+///
+/// Visible to the crate because the read-only sweep accepts the same figure as
+/// a register's second rest state, and the two are asserted equal rather than
+/// restated (`config.rs`).
+pub(crate) const WATCHDOG_COUNTS: u8 = 10;
 
 /// The silence an armed servo is meant to tolerate: the counts times the unit.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_millis(WATCHDOG_UNIT_MS * WATCHDOG_COUNTS as u64);
 
 /// What the register reads once the watchdog has tripped: the vendor's -1 in
 /// the byte the register is.
-const WATCHDOG_LATCHED: u8 = 0xFF;
+pub(crate) const WATCHDOG_LATCHED: u8 = 0xFF;
 
 /// Timeouts' worth of traffic each no-trip phase keeps up. Five, so a phase
 /// that passes has spent most of its length past the point a servo that ignored

@@ -34,13 +34,30 @@ use std::path::Path;
 use clockwork_logs::{ChannelMetadata, LogError, LogFormat, LogReader, LoggedMessage};
 use clockwork_rs::{Blob, SchemaMeta};
 
-/// Every channel the log carries, in the order the reader reports them, and how
-/// many messages each held.
+/// Every channel the log carries, in the order the reader reports them.
 ///
 /// A consumer with no Rust type bound to a channel can still say whether
 /// anything travelled on it, which is the difference between a report group that
 /// reported and one that only exists.
-pub type Census = Vec<(String, usize)>;
+pub type Census = Vec<Channel>;
+
+/// One channel of a log: its name, how much of it the log holds, and where in
+/// the publisher's own count the log's copy starts.
+pub struct Channel {
+    /// The channel's name as the log declares it.
+    pub name: String,
+    /// How many messages of it the log holds.
+    pub count: usize,
+    /// The lowest sequence number the log holds on it, or nothing where the log
+    /// holds no message of it at all.
+    ///
+    /// The publisher numbers from zero and never skips, so a channel whose
+    /// lowest recorded number is not zero is a channel the log is short at the
+    /// front of: the subscriber attached after those publishes and they are
+    /// gone. That is a fact about the recording rather than about the run, and
+    /// it is the one thing a count on its own cannot say.
+    pub first_seq: Option<u32>,
+}
 
 /// One channel of a system, and the two things done with it: the binding check
 /// before anything is decoded, and the decode into the stream it belongs to.
@@ -90,7 +107,11 @@ pub fn read_with<R: Streams>(dir: &Path, table: &[Bound<R>]) -> Result<R, LogErr
     let mut run = R::default();
 
     for metadata in &channels {
-        run.census().push((metadata.channel_name.clone(), 0));
+        run.census().push(Channel {
+            name: metadata.channel_name.clone(),
+            count: 0,
+            first_seq: None,
+        });
     }
     for bound in table {
         // A channel an onboard log never carried a message on is a channel that
@@ -112,8 +133,16 @@ pub fn read_with<R: Streams>(dir: &Path, table: &[Bound<R>]) -> Result<R, LogErr
     let mut reader = LogReader::open(dir)?;
     while let Some(message) = reader.read_next()? {
         let name = message.metadata.channel_name.as_str();
-        if let Some(entry) = run.census().iter_mut().find(|(known, _)| known == name) {
-            entry.1 += 1;
+        if let Some(entry) = run.census().iter_mut().find(|channel| channel.name == name) {
+            entry.count += 1;
+            // The lowest rather than the first walked: what is wanted is where
+            // the log's copy of a channel starts, and the reader walks a log in
+            // time order across channels rather than in any one publisher's
+            // order.
+            entry.first_seq = Some(match entry.first_seq {
+                Some(lowest) => lowest.min(message.sequence_number),
+                None => message.sequence_number,
+            });
         }
         if let Some(bound) = table.iter().find(|bound| bound.name == name) {
             (bound.route)(&mut run, &message);
@@ -255,6 +284,38 @@ pub fn typed<T: Blob + SchemaMeta>(
     }
 }
 
+/// Decode one message as the cumulative record its channel carries, and keep the
+/// rows it holds as the whole of that stream.
+///
+/// A cumulative channel republishes its whole content every time it changes, so
+/// the newest message is the account and every earlier one is a prefix of it.
+/// Each message therefore replaces the stream rather than extending it, which is
+/// what makes the stream immune to a reader that attached late: whichever copy
+/// was seen first says everything the ones before it said.
+///
+/// `rows` is what takes the record apart, because which container holds the rows
+/// is the schema's business and not this module's.
+pub fn cumulative<T: Blob + SchemaMeta, U>(
+    message: &LoggedMessage<'_>,
+    out: &mut Vec<Logged<U>>,
+    complaints: &mut Complaints,
+    rows: fn(&T, &mut Vec<U>),
+) {
+    match message.to_message::<T>() {
+        Ok(decoded) => {
+            let mut held = Vec::new();
+            rows(&decoded, &mut held);
+            out.clear();
+            out.extend(held.into_iter().map(|row| Logged {
+                at_ns: message.message_time.as_nanos(),
+                sequence_number: message.sequence_number,
+                message: row,
+            }));
+        }
+        Err(err) => complaints.push(complaint(message, T::SCHEMA_NAME, &err)),
+    }
+}
+
 /// One complaint, in the one shape they all take: which channel, which instant,
 /// what it was expected to be, and what the refusal said.
 ///
@@ -285,7 +346,9 @@ mod tests {
     //! directory. Nothing here is a fixture of a log's bytes: a hand-built file
     //! would be this module's idea of the format rather than the format.
 
-    use super::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
+    use super::{
+        Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed,
+    };
     use clockwork_logs::offboard::{OffboardWriter, OffboardWriterConfig};
     use clockwork_logs::onboard::OnboardWriter;
     use clockwork_logs::{ChannelMetadata, LogError, LoggedMessage, MessageEncoding, MessageFlags};
@@ -438,9 +501,13 @@ mod tests {
         );
         assert_eq!(blob_as_bytes(&run.samples[0].message), payload());
         assert_eq!(
-            run.census,
-            vec![(SPOKEN.to_string(), 1)],
-            "the census names what the log declared and counts what it carried, once"
+            run.census
+                .iter()
+                .map(|channel| (channel.name.as_str(), channel.count, channel.first_seq))
+                .collect::<Vec<_>>(),
+            vec![(SPOKEN, 1, Some(0))],
+            "the census names what the log declared, counts what it carried once, and says \
+             which of the publisher's numbers the log's copy starts at"
         );
     }
 
@@ -554,6 +621,114 @@ mod tests {
         );
         assert!(
             complaints[0].contains(SPOKEN) && complaints[0].contains("1000"),
+            "the complaint names the channel and the instant, like every other one: {complaints:?}"
+        );
+    }
+
+    /// One logged message over `payload`, as a reader hands it to a route.
+    fn logged<'a>(
+        metadata: &'a ChannelMetadata,
+        sequence_number: u32,
+        at_ns: i64,
+        payload: &'a [u8],
+    ) -> LoggedMessage<'a> {
+        LoggedMessage {
+            channel_id: 1,
+            metadata,
+            sequence_number,
+            log_time: SyncTime::from_nanos(at_ns),
+            message_time: SyncTime::from_nanos(at_ns),
+            header: &[],
+            payload: Cow::Borrowed(payload),
+            flags: MessageFlags::default(),
+        }
+    }
+
+    /// The rows a `Sample` holds, for a case about routing: one per nonzero
+    /// byte, so a copy that says more than the one before it is a superset of
+    /// it, which is the shape a cumulative record has.
+    fn nonzero(sample: &Sample, rows: &mut Vec<u8>) {
+        rows.extend(blob_as_bytes(sample).iter().copied().filter(|b| *b != 0));
+    }
+
+    /// Each copy of a cumulative record replaces the stream, and does not extend
+    /// it.
+    ///
+    /// The property the whole retention argument rests on: every copy is the
+    /// account so far, so whichever one a late reader saw first says everything
+    /// the ones before it said. Extending instead would say every row of every
+    /// copy, which over a story republished on each append is every row counted
+    /// as many times as the session went on to speak.
+    #[test]
+    fn each_copy_of_a_cumulative_record_replaces_the_rows_before_it() {
+        let recorded = ChannelMetadata::for_schema::<Sample>(SPOKEN);
+        let first = [1u8, 2, 0, 0, 0, 0, 0, 0];
+        let second = [1u8, 2, 3, 0, 0, 0, 0, 0];
+        let mut kept: Vec<Logged<u8>> = Vec::new();
+        let mut complaints = Complaints::new();
+
+        cumulative::<Sample, u8>(
+            &logged(&recorded, 0, 1_000, &first),
+            &mut kept,
+            &mut complaints,
+            nonzero,
+        );
+        cumulative::<Sample, u8>(
+            &logged(&recorded, 4, 2_000, &second),
+            &mut kept,
+            &mut complaints,
+            nonzero,
+        );
+
+        assert!(complaints.is_empty(), "{complaints:?}");
+        assert_eq!(
+            kept.iter().map(|row| row.message).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the newest copy's rows, and not the two copies concatenated",
+        );
+        assert_eq!(
+            kept.iter()
+                .map(|row| (row.at_ns, row.sequence_number))
+                .collect::<Vec<_>>(),
+            vec![(2_000, 4); 3],
+            "every row is stamped with the copy it was read out of",
+        );
+    }
+
+    /// A copy that will not decode is a complaint, and leaves the rows alone.
+    ///
+    /// The alternative is worse than a missing complaint: rows cleared for a
+    /// record nothing could read would turn a channel recorded under another
+    /// schema revision into an empty story, which reads as a session that never
+    /// said anything.
+    #[test]
+    fn a_cumulative_copy_that_does_not_decode_is_a_complaint_and_keeps_the_rows() {
+        let recorded = ChannelMetadata::for_schema::<Sample>(SPOKEN);
+        let payload = [1u8, 2, 0, 0, 0, 0, 0, 0];
+        let mut kept: Vec<Logged<u8>> = Vec::new();
+        let mut complaints = Complaints::new();
+        cumulative::<Sample, u8>(
+            &logged(&recorded, 0, 1_000, &payload),
+            &mut kept,
+            &mut complaints,
+            nonzero,
+        );
+
+        cumulative::<Widened, u8>(
+            &logged(&recorded, 1, 2_000, &payload),
+            &mut kept,
+            &mut complaints,
+            |_: &Widened, _: &mut Vec<u8>| unreachable!("nothing of another width decodes"),
+        );
+
+        assert_eq!(
+            kept.iter().map(|row| row.message).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the rows the last readable copy carried are still what the stream holds",
+        );
+        assert_eq!(complaints.len(), 1, "{complaints:?}");
+        assert!(
+            complaints[0].contains(SPOKEN) && complaints[0].contains("2000"),
             "the complaint names the channel and the instant, like every other one: {complaints:?}"
         );
     }
