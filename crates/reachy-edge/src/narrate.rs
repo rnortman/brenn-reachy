@@ -23,6 +23,11 @@
 //! thing the line reports. Both are `CLOCK_REALTIME` on the same machine, which
 //! is what makes them comparable at all.
 //!
+//! One builder puts the `edge` envelope together — [`edge_line`] and its
+//! variant carrying a line's own fields — and every process narrating on this
+//! stream renders through it, because a stream defined by a literal per caller
+//! is a stream that grows a field in some of its lines.
+//!
 //! The text in a line is bounded and stripped of control characters. Most of it
 //! is this tree's own words, but not all: a refusal quotes the pod a foreign
 //! script was addressed to, and a decode failure quotes what it could not read.
@@ -76,48 +81,77 @@ pub fn timeline_line(row: &TimelineEntryWire) -> String {
     }))
 }
 
+/// One event of this process's own, as a line on the edge's stream.
+///
+/// The envelope every `edge` line carries — the stream it is on, the machine's
+/// clock at the event, what kind of event it was, and the sentence a person
+/// reads — built in one place. Every process that narrates on this stream goes
+/// through here rather than spelling the object itself, so a field the envelope
+/// grows reaches every line, and so `says` is bounded and stripped of control
+/// characters wherever the text came from.
+#[must_use]
+pub fn edge_line(kind: &str, at: SyncTime, says: &str) -> String {
+    edge_line_with(kind, at, says, &[])
+}
+
+/// The same envelope, carrying the fields that are this line's own.
+///
+/// A field here is what a reader joins on — a script's id, a sender's sequence
+/// number — beside the sentence that spells it out. An envelope field named
+/// again in `fields` overwrites the envelope's, which is a caller's mistake and
+/// not something worth a refusal on a narration path.
+#[must_use]
+pub fn edge_line_with(kind: &str, at: SyncTime, says: &str, fields: &[(&str, Value)]) -> String {
+    let mut value = json!({
+        "stream": "edge",
+        "at_ns": at.as_nanos(),
+        "kind": kind,
+        "says": one_line(says),
+    });
+    let object = value
+        .as_object_mut()
+        .expect("a JSON object, built as one just above");
+    for (name, field) in fields {
+        object.insert((*name).to_string(), field.clone());
+    }
+    line(&value)
+}
+
 /// One body the edge dropped, as a line.
 ///
 /// `at` is this machine's clock at the drop — the same instant the body would
 /// have been stamped with had it been accepted.
 #[must_use]
 pub fn refusal_line(refusal: &Refusal, at: SyncTime) -> String {
-    line(&json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": refusal.kind(),
-        "says": one_line(&refusal.to_string()),
-    }))
+    edge_line(refusal.kind(), at, &refusal.to_string())
 }
 
 /// The story went backwards: the process telling it restarted.
 #[must_use]
 pub fn restart_line(narrated: u64, at: SyncTime) -> String {
-    line(&json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": "story_restarted",
-        "says": format!(
+    edge_line(
+        "story_restarted",
+        at,
+        &format!(
             "the session's story went backwards after {narrated} row(s): the control process \
              restarted, and what follows is the new one from its beginning"
         ),
-    }))
+    )
 }
 
 /// Rows the session narrated that no datagram carried here.
 #[must_use]
 pub fn lost_line(lost: u64, at: SyncTime) -> String {
-    line(&json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": "story_rows_lost",
-        "lost": lost,
-        "says": format!(
+    edge_line_with(
+        "story_rows_lost",
+        at,
+        &format!(
             "{lost} row(s) of the session's story fell off its ring before a datagram carried \
              them: the narration has a hole, and what they classified travelled on the channels \
              that raised it"
         ),
-    }))
+        &[("lost", json!(lost))],
+    )
 }
 
 /// A JSON object as one line. Compact, because the reader is `grep` and a log
@@ -272,13 +306,15 @@ pub(crate) fn refusal_reason(reason: u32) -> String {
 #[cfg(test)]
 mod tests {
     use clockwork_rs::SyncTime;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
     use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
-    use super::{TEXT_LIMIT, lost_line, refusal_line, restart_line, timeline_line};
+    use super::{
+        TEXT_LIMIT, edge_line, edge_line_with, lost_line, refusal_line, restart_line, timeline_line,
+    };
     use crate::intake::Refusal;
 
     /// The host's clock at the moment an edge line reports, distinct from the
@@ -295,6 +331,66 @@ mod tests {
         entry.set_b(b);
         entry.set_detail(detail);
         entry
+    }
+
+    #[test]
+    fn every_edge_line_carries_the_same_envelope() {
+        let line = parsed(&edge_line(
+            "started",
+            at(),
+            "the host answers for this machine",
+        ));
+        assert_eq!(line["stream"], "edge");
+        assert_eq!(line["kind"], "started");
+        assert_eq!(line["at_ns"], at().as_nanos());
+        assert_eq!(line["says"], "the host answers for this machine");
+    }
+
+    #[test]
+    fn a_line_carries_the_fields_that_are_its_own_beside_the_envelope() {
+        let line = parsed(&edge_line_with(
+            "unsent",
+            at(),
+            "script 7 never left",
+            &[("script_id", json!(7)), ("pod", json!("kitchen-reachy"))],
+        ));
+        assert_eq!(line["stream"], "edge");
+        assert_eq!(line["kind"], "unsent");
+        assert_eq!(line["script_id"], 7);
+        assert_eq!(line["pod"], "kitchen-reachy");
+    }
+
+    /// The documented rule for a collision, held by a case: a caller's field
+    /// wins over the envelope's. It holds only because the insert loop runs
+    /// after the literal, and a builder assembled the other way round would
+    /// invert it silently -- with the doc comment left saying something untrue
+    /// about a stream other tools parse.
+    #[test]
+    fn a_field_a_caller_names_again_wins_over_the_envelope_s() {
+        let line = parsed(&edge_line_with(
+            "started",
+            at(),
+            "the host answers for this machine",
+            &[("kind", json!("overridden"))],
+        ));
+        assert_eq!(line["kind"], "overridden");
+        assert_eq!(line["stream"], "edge", "the rest of the envelope stands");
+    }
+
+    /// The envelope bounds and cleans `says` wherever the text came from: the
+    /// reason the builder is shared at all is that a caller holding sender text
+    /// must not be the one deciding this.
+    #[test]
+    fn the_envelope_bounds_and_cleans_what_a_caller_hands_it() {
+        let shouted = format!("a\nb{}", "x".repeat(TEXT_LIMIT));
+        let line = parsed(&edge_line("started", at(), &shouted));
+        let says = line["says"].as_str().expect("a sentence");
+        assert!(!says.contains('\n'), "{says}");
+        assert_eq!(
+            says.chars().count(),
+            TEXT_LIMIT + 1,
+            "bounded, with the mark"
+        );
     }
 
     /// One line, parsed back.

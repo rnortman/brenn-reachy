@@ -921,6 +921,7 @@ merge_simplelaunch_config(
         "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
         "//driver:motord_launch.textproto",
         "//host:host_launch.textproto",
+        "//pod:pod_launch.textproto",
         "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
     ],
     data = [
@@ -940,7 +941,7 @@ merge_simplelaunch_config(
 )
 
 # The harness twin of the launcher config above: the same three composition and
-# driver apps, without the voice host.
+# driver apps, without the voice host and without the audio device.
 #
 # `tools/deploy-motion.sh --run` starts `reachy_ask` itself, ahead of the
 # launcher, because the intent source has to bind the narration port 7410 before
@@ -952,9 +953,15 @@ merge_simplelaunch_config(
 # the bind to. So `--run` names this config instead, and production presence and
 # the motion harness are never live at once.
 #
-# The two rules differ by exactly one src, the host's app entry: everything else
-# a unit runs is the same file in both, so the harness runs the composition it
-# ships rather than a second description of it. `tools/build-motion.sh` stages
+# The audio device is left out for a second reason: a motion run must need no
+# audio hardware, no speech services and nothing streaming off the board, so a
+# unit whose mic array is unplugged or whose credentials have not been pushed
+# still runs the harness exactly as a healthy one does.
+#
+# The two rules differ by exactly two srcs, the host's and the pod's app entries:
+# everything else a unit runs is the same file in both, so the harness runs the
+# composition it ships rather than a second description of it.
+# `tools/build-motion.sh` stages
 # both and holds each to its own expected app list, and
 # `tools/build-motion.test.sh` reads both rules out of this file and holds them
 # to that difference -- the rule above is the updater's to rewrite, so nothing

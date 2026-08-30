@@ -1,0 +1,13 @@
+# Apache-2.0. The audio device's place in the robot's payload: one launcher app
+# entry for a binary this build does not produce.
+#
+# A package with no target that builds anything, because the pod binary is
+# brenn-pod's -- it links libusb and libasound and is compiled in that repo's
+# arm64 container, so nothing here can name it as a Bazel output. What this
+# repo owns is where it runs: the app table entry the production launcher config
+# merges, and the staging `tools/build-motion.sh` does from a prebuilt artifact.
+
+# The pod's entry in the launcher's app table, merged by `cogs/robot.clk`'s
+# `RobotCpu` into the production launcher config and deliberately absent from the
+# harness twin.
+exports_files(["pod_launch.textproto"])

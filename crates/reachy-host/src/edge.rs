@@ -5,16 +5,21 @@
 //! drives a motion run holds exactly the same thing. What is left here is the
 //! part that is this process's own: the surface it writes on.
 //!
-//! With no bus attachment configured, an alert is narration and nothing else.
-//! Nothing is lost by that: the alert table's whole job is to pick out what an
-//! operator should be interrupted for, and a deployment with nothing to
-//! interrupt them through still wants the picking recorded.
+//! An alert is narration and nothing else. That is the whole behaviour for a
+//! host with no bus attachment configured, and it is also all a host with one
+//! does today: the attachment lives inside the composed server, and the seam
+//! that would hand a publish out of it does not exist yet.
+//! TODO(host-alert-publish)
+//!
+//! Nothing is lost by the narration itself: the alert table's whole job is to
+//! pick out what an operator should be interrupted for, and a deployment with
+//! nothing to interrupt them through still wants the picking recorded.
 //!
 //! [`HostEdge`]: reachy_edge::HostEdge
 
 use reachy_edge::{Alert, Surface, alert_line, now};
 
-/// The surface a host with no bus attachment configured runs on.
+/// The surface the host runs on.
 ///
 /// Lines to stdout, and alerts onto the same stream as one more line.
 ///

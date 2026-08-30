@@ -30,7 +30,7 @@ use crate::alerts::{Alert, Alerts, Severity};
 use crate::config::EdgeConfig;
 use crate::intake::{Accepted, Edge};
 use crate::names::MotionTable;
-use crate::narrate::{lost_line, refusal_line, restart_line, timeline_line};
+use crate::narrate::{edge_line, lost_line, refusal_line, restart_line, timeline_line};
 use crate::story::{Story, Update};
 
 /// How long a read on the reports port waits before its caller looks at
@@ -209,15 +209,11 @@ impl HostEdge {
 
 /// A datagram on the reports port that is not a story, as a line.
 fn not_a_story_line(detail: &str, at: SyncTime) -> String {
-    json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": "not_a_story",
-        "says": format!(
-            "a datagram on the reports port is not a story and was dropped unread: {detail}"
-        ),
-    })
-    .to_string()
+    edge_line(
+        "not_a_story",
+        at,
+        &format!("a datagram on the reports port is not a story and was dropped unread: {detail}"),
+    )
 }
 
 #[cfg(test)]

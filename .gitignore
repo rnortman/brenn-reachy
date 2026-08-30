@@ -29,6 +29,12 @@ reachy-bench.state.toml
 *.local.toml
 .local/
 
+# The voice pipeline's own configuration, which the payload build stages into a
+# unit's RAM from here by default. It names a site's speech services, its bus
+# server and token, and a unit's link keys, so every copy of it belongs to
+# whoever runs the machine and none of them is content in this repo.
+/host/speech.toml
+
 # Measured geometry and calibration output. Per-unit fitted numbers belong to a
 # unit, not to the repo.
 calibration/

@@ -35,7 +35,9 @@ rust_library(
         "@brenn_reachy_crates//:prost-reflect",
         "@brenn_reachy_crates//:protox",
         "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:speech-surface",
         "@brenn_reachy_crates//:thiserror",
+        "@brenn_reachy_crates//:tokio",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -49,9 +51,20 @@ rust_library(
 # payload root and a runfiles tree and that root spell the same relative paths.
 #
 # A member of `//bazel/platform:motion_payload`, so a unit stages and starts it
-# and the gate cross-builds it. What it does there is follow the session's story
-# and narrate it: the voice pipeline is not linked in yet.
-# TODO(host-payload-membership)
+# and the gate cross-builds it. The launcher entry there names
+# `--speech-config host/speech.toml`, so what it runs is both halves on a unit
+# whose payload was built with a speech configuration to stage and its edge half
+# alone on one that was not -- that file is a site's own and is staged from
+# outside this tree. The weights the pipeline loads are staged under `models/`,
+# whether or not anything loads them.
+# The speech pipeline links ONNX Runtime as a shared object, so this binary
+# carries a `NEEDED` entry for `libonnxruntime.so.1`. The payload stages that
+# file at its root, beside this binary, and `$ORIGIN` is what makes the loader
+# look there: the runpath Bazel writes names a path inside the build tree, which
+# is nowhere on a unit. `$$` because Bazel expands make variables in this
+# attribute and the loader is the one that must see the dollar sign.
+# `tools/assert-device-isa.sh` asks the built binary whether both halves of that
+# hold, because everything else depending on them only says so in prose.
 rust_binary(
     name = "reachy_host",
     srcs = ["src/main.rs"],
@@ -60,6 +73,7 @@ rust_binary(
         "//host:host_params.textproto",
     ],
     edition = "2024",
+    rustc_flags = ["-Clink-arg=-Wl,-rpath,$$ORIGIN"],
     visibility = ["//visibility:public"],
     deps = [
         ":reachy_host_lib",
@@ -74,9 +88,10 @@ rust_binary(
 # argument grammar, the lines this file renders, or the loop that owns the edge.
 # The loop's cases bind ephemeral loopback ports and send real datagrams between
 # them -- the destination a compiled script goes to is the one thing about the
-# loop a test cannot otherwise see -- so they are not hermetic in the way the
-# library's are. Nothing they bind is a fixed port and nothing leaves the
-# machine.
+# loop a test cannot otherwise see -- and one case composes the voice pipeline
+# over a scratch-directory configuration, which binds an ephemeral listener of
+# its own. So they are not hermetic in the way the library's are. Nothing they
+# bind is a fixed port and nothing leaves the machine.
 rust_test(
     name = "reachy_host_bin_test",
     size = "small",
@@ -84,17 +99,27 @@ rust_test(
     deps = [
         "//cogs:script_clk_rs",
         "//crates/motion-proto:motion_proto",
+        "//crates/reachy-scratch:reachy_scratch",
         ":reachy_host_lib",
+        "@brenn_reachy_crates//:speech-surface",
     ],
 )
 
-# The configuration parse and the intent queue, both hermetic: messages built in
-# memory, an injected instant, no socket and no clock. The one case that touches
-# the filesystem establishes a path's absence.
+# The configuration parse, the intent queue, and the two motion seams the voice
+# pipeline is composed through. Hermetic but for the cases that write into a
+# scratch directory and read back through the loader that reads on a unit, and
+# for the two that compose the server itself: those bind an ephemeral loopback
+# listener and run a tokio runtime, which is the only way what the composition
+# body states about ordering gets exercised at all. The directories come from
+# `//crates/reachy-scratch`, which removes them however a case ended.
 rust_test(
     name = "reachy_host_test",
     size = "small",
     crate = ":reachy_host_lib",
+    deps = [
+        "//crates/motion-proto:motion_proto",
+        "//crates/reachy-scratch:reachy_scratch",
+    ],
 )
 
 # The voice pipeline's third-party closure, linked. Every other target in this

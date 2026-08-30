@@ -1,17 +1,21 @@
 //! The voice host's entry point: configuration, the two loopback ports, and the
 //! loop that owns the edge.
 //!
-//! Four steps, in this order and for a reason. Read the configuration, because
+//! Five steps, in this order and for a reason. Read the configuration, because
 //! the name this machine answers to and every screen below is a value out of
 //! it. Read the clip name table, because an overlay names a motion and only
 //! that file says which index a name has. Bind the reports port, because a
 //! second host already reading it is the one failure that has to stop this one
-//! before anything is asked of the machine. Install the stop flag, and then run
-//! the loop.
+//! before anything is asked of the machine. Install the stop flag. Start the
+//! voice pipeline, where one was configured, with its motion seams pointed at
+//! the gate this loop owns. Then run the loop.
 //!
 //! Every one of those failures is an exit and none of them is retried: a
 //! configuration that does not parse, a name table that is not there, a port
-//! somebody else holds. What supervises this process decides what happens next,
+//! somebody else holds, a speech configuration the pipeline will not run on.
+//! A speech configuration that is not on the machine at all is not among them —
+//! that is how a unit starts, and it runs the edge half and says so.
+//! What supervises this process decides what happens next,
 //! and a host that never comes back is a robot that is deaf and mute — never an
 //! unsafe one. The motion stack owes the host nothing: the schedule already
 //! running concludes at its own horizon, and the machine stows and rests there.
@@ -33,11 +37,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clockwork_rs::SyncTime;
 use reachy_edge::{
     DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
-    Surface, now,
+    Surface, edge_line_with, now,
 };
 use reachy_host::edge::Console;
-use reachy_host::intents::{Waiting, waking_queue};
+use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
+use reachy_host::sinks::Stdout;
+use reachy_host::voice::{NotRunning, Voice, absent_line, composed_line, silent_line};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
@@ -53,12 +59,23 @@ const DEFAULT_CONFIG: &str = "host/host_params.textproto";
 struct Options {
     /// Which configuration to run on.
     config: PathBuf,
+    /// The speech pipeline's own configuration, where the voice half is to run.
+    ///
+    /// Optional, and so is the file it names: a host asked for neither, and a
+    /// host asked for one that is not on the machine, both run the edge half
+    /// alone, which is what narrates the session's story. The second is how a
+    /// unit starts — the launcher entry names the path and the operator's own
+    /// file is a push into RAM. Named separately from `--config` because the
+    /// two are different formats owned by different repositories — this repo's
+    /// textproto for the edge, the pod platform's TOML for the pipeline.
+    speech_config: Option<PathBuf>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             config: PathBuf::from(DEFAULT_CONFIG),
+            speech_config: None,
         }
     }
 }
@@ -66,11 +83,16 @@ impl Default for Options {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-host [--config PATH]\n\
+        "usage: reachy-host [--config PATH] [--speech-config PATH]\n\
          \n\
          Runs the robot's voice host: binds {REPORTS_OUT_PORT} on loopback, follows the\n\
          session's story, and sends compiled scripts to {SCRIPTS_IN_PORT}. One line of JSON\n\
          per row, on stdout.\n\
+         \n\
+         With --speech-config naming a file that is there, the voice pipeline runs in\n\
+         this process too, and the scripter's decisions and the bus's motion channel both\n\
+         meet the gate above. Without the flag, or with a path nothing has been pushed to\n\
+         yet, the host runs its edge half alone and says which of the two it is.\n\
          \n\
          Nothing is retried and nothing is persisted. A configuration that does not parse,\n\
          a clip name table that is not there and a port already held are each a nonzero\n\
@@ -98,29 +120,45 @@ fn main() -> ExitCode {
 
 /// What the invocation asks for.
 ///
-/// One optional flag. A word this does not know is a refusal rather than
-/// something ignored: a host run on the shipped configuration when an operator
-/// meant a unit's own would answer to the wrong pod name.
+/// Two optional flags, each naming a path. A word this does not know is a
+/// refusal rather than something ignored: a host run on the shipped
+/// configuration when an operator meant a unit's own would answer to the wrong
+/// pod name.
+///
+/// One of three copies of this argument-parsing shape; the driver and the
+/// harness carry the others.
+/// TODO(cli-argv-shared)
 fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options::default();
     let mut given = false;
+    let mut speech_given = false;
     let mut args = args;
     while let Some(word) = args.next() {
         match word.as_str() {
             "--config" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("{word} needs the path of a configuration"))?;
-                if given {
-                    return Err(format!("{word} was given twice"));
-                }
-                given = true;
-                options.config = PathBuf::from(value);
+                options.config = PathBuf::from(path_once(&word, args.next(), &mut given)?);
+            }
+            "--speech-config" => {
+                let value = path_once(&word, args.next(), &mut speech_given)?;
+                options.speech_config = Some(PathBuf::from(value));
             }
             other => return Err(format!("`{other}` is not an option this takes")),
         }
     }
     Ok(options)
+}
+
+/// A flag's path value, refused if the flag carried none or was given before.
+///
+/// The value is taken before the repeat is refused, so a repeated flag and a
+/// repeated flag with no value read the same way to whoever wrote them.
+fn path_once(flag: &str, value: Option<String>, given: &mut bool) -> Result<String, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs the path of a configuration"))?;
+    if *given {
+        return Err(format!("{flag} was given twice"));
+    }
+    *given = true;
+    Ok(value)
 }
 
 /// Read the configuration and the name table, hold the ports, run.
@@ -164,17 +202,24 @@ fn run(options: &Options) -> Result<(), String> {
             .map_err(|error| format!("installing the stop flag for signal {signal}: {error}"))?;
     }
 
-    // The sending half is what an intent-authoring task holds. No task holds one
-    // yet: the two that will — the scripter's sink and the bus subscription —
-    // are the wiring this process's other half brings, and until it lands the
-    // loop below narrates the session's story and asks for nothing.
-    // TODO(host-intent-producers)
-    let (_intents, waiting) = waking_queue(Arc::new(nudge));
+    // The sending half is what an intent-authoring task holds: the scripter's
+    // sink and the bus's motion subscription, both inside the pipeline the
+    // voice half composes. With no speech configuration named nothing holds one
+    // and the loop below narrates the session's story and asks for nothing.
+    let (intents, waiting) = waking_queue(Arc::new(nudge));
     let mut host = HostEdge::new(settings.edge.clone(), table);
     let mut surface = Console;
     surface.say(started_line(&settings, &options.config, now()));
 
-    follow(
+    let voice = start_voice(options, &intents, &mut surface)?;
+    // The queue's other sending handle. Dropped here so that the only holders
+    // are the pipeline's two sinks: the loop reads a disconnected queue the same
+    // as an empty one, so a handle kept here would hide nothing, but a queue
+    // whose senders are exactly the two authoring tasks says what this process
+    // is by its own shape.
+    drop(intents);
+
+    let followed = follow(
         &reports,
         &scripts,
         (LOOPBACK, SCRIPTS_IN_PORT).into(),
@@ -182,7 +227,69 @@ fn run(options: &Options) -> Result<(), String> {
         &mut host,
         &mut surface,
         &stop,
-    )
+    );
+
+    // The pipeline is stopped after the loop returns, whichever way it went: a
+    // loop that broke is still a process on its way out, and the pod link's
+    // open segments finalize either way.
+    let stopped = voice.and_then(Voice::stop);
+    outcome(followed, stopped)
+}
+
+/// What the process exits on, from the loop's answer and the pipeline's.
+///
+/// The loop's failure leads when both failed: it is what ended the run, and the
+/// pipeline's is the tidy-up behind it. But it is carried in the same sentence
+/// rather than dropped, because a loop that broke because the machine itself is
+/// unhealthy — descriptors exhausted, memory gone — is exactly the case where
+/// the voice half's own death is part of the diagnosis, and nothing else in
+/// this process would ever mention it.
+fn outcome(followed: Result<(), String>, stopped: Option<String>) -> Result<(), String> {
+    match (followed, stopped) {
+        (Err(loop_error), Some(voice_error)) => Err(format!(
+            "{loop_error} — and stopping the voice pipeline also failed: {voice_error}"
+        )),
+        (Err(loop_error), None) => Err(loop_error),
+        (Ok(()), Some(voice_error)) => Err(voice_error),
+        (Ok(()), None) => Ok(()),
+    }
+}
+
+/// Start the voice pipeline where one was configured, and say which it is.
+///
+/// The sinks it is composed with are handed the queue the loop takes from, so
+/// the scripter's decision and a body off the bus reach one gate. Nothing about
+/// the machine waits on this: a host with no pipeline is deaf and mute, and the
+/// motion stack owes it nothing either way.
+fn start_voice(
+    options: &Options,
+    intents: &Intents,
+    surface: &mut impl Surface,
+) -> Result<Option<Voice>, String> {
+    let Some(path) = &options.speech_config else {
+        surface.say(silent_line(now()));
+        return Ok(None);
+    };
+    // A named configuration that is not on the machine is the shipped state of
+    // a unit: the launcher entry names the path unconditionally and an
+    // operator's own file is a push into RAM, so until that push the file is
+    // simply absent. Said and survived, unlike every other startup failure
+    // here — a file that is there and will not run, or will not even read, is
+    // still an exit, because then somebody pushed something this host cannot
+    // answer for. Absence is the loader's own answer and not a `stat` asked
+    // ahead of it, which cannot tell a file that is not there from one this
+    // process may not look at.
+    match Voice::start(path, intents.clone(), Arc::new(Stdout)) {
+        Ok(voice) => {
+            surface.say(composed_line(path, &voice.listening(), now()));
+            Ok(Some(voice))
+        }
+        Err(NotRunning::Absent) => {
+            surface.say(absent_line(path, now()));
+            Ok(None)
+        }
+        Err(NotRunning::Refused(message)) => Err(message),
+    }
 }
 
 /// The loop: a story datagram, then whatever intent is waiting, until stopped.
@@ -260,34 +367,30 @@ fn names(settings: &HostSettings) -> Result<MotionTable, String> {
 
 /// What this host is, as the first line of its stream.
 fn started_line(settings: &HostSettings, config: &Path, at: SyncTime) -> String {
-    serde_json::json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": "started",
-        "pod": settings.edge.pod(),
-        "says": format!(
+    edge_line_with(
+        "started",
+        at,
+        &format!(
             "the voice host answers for `{}`, configured by {}; reports on {REPORTS_OUT_PORT}, \
              scripts to {SCRIPTS_IN_PORT}",
             settings.edge.pod(),
             config.display(),
         ),
-    })
-    .to_string()
+        &[("pod", serde_json::json!(settings.edge.pod()))],
+    )
 }
 
 /// A compiled script that never left this machine, as a line.
 fn unsent_line(script_id: u32, detail: &str, at: SyncTime) -> String {
-    serde_json::json!({
-        "stream": "edge",
-        "at_ns": at.as_nanos(),
-        "kind": "unsent",
-        "script_id": script_id,
-        "says": format!(
+    edge_line_with(
+        "unsent",
+        at,
+        &format!(
             "script {script_id} compiled and could not be sent to the control process: {detail}. \
              nothing is retried; the sender's next refresh is what recovers"
         ),
-    })
-    .to_string()
+        &[("script_id", serde_json::json!(script_id))],
+    )
 }
 
 #[cfg(test)]
@@ -303,10 +406,11 @@ mod tests {
     use motion_proto::{MotionScript, Posture, Step};
     use reachy_edge::{Alert, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Surface};
     use reachy_host::intents::queue;
+    use reachy_scratch::scratch_dir;
 
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 
-    use super::{DEFAULT_CONFIG, Options, follow, parse, unsent_line};
+    use super::{DEFAULT_CONFIG, Options, follow, outcome, parse, start_voice, unsent_line};
 
     /// The pod the fixture bodies are addressed to.
     const POD: &str = "fixture-reachy";
@@ -469,6 +573,7 @@ mod tests {
             parsed(&[]),
             Ok(Options {
                 config: PathBuf::from(DEFAULT_CONFIG),
+                speech_config: None,
             }),
         );
     }
@@ -479,6 +584,7 @@ mod tests {
             parsed(&["--config", "/run/reachy/host_params.textproto"]),
             Ok(Options {
                 config: PathBuf::from("/run/reachy/host_params.textproto"),
+                speech_config: None,
             }),
         );
     }
@@ -493,6 +599,136 @@ mod tests {
     fn a_configuration_flag_needs_a_path_and_is_given_once() {
         assert!(parsed(&["--config"]).is_err());
         assert!(parsed(&["--config", "a", "--config", "b"]).is_err());
+        assert!(parsed(&["--speech-config"]).is_err());
+        assert!(parsed(&["--speech-config", "a", "--speech-config", "b"]).is_err());
+    }
+
+    #[test]
+    fn a_speech_configuration_is_what_makes_this_host_a_voice() {
+        // Its absence is a host, not a refusal: the edge half runs on a unit
+        // whose payload does not yet carry the pipeline's own inputs.
+        assert_eq!(parsed(&[]).expect("no arguments").speech_config, None);
+        assert_eq!(
+            parsed(&["--speech-config", "/run/reachy/speech.toml"])
+                .expect("a named speech configuration")
+                .speech_config,
+            Some(PathBuf::from("/run/reachy/speech.toml")),
+        );
+    }
+
+    #[test]
+    fn a_speech_configuration_nothing_has_been_pushed_to_is_a_running_host() {
+        // A directory this case owns, so the absence it asserts on is one it
+        // established rather than one it assumed of the machine it runs on.
+        let dir = scratch_dir("reachy-host-start-voice");
+        let path = dir.join("speech.toml");
+        let (intents, _waiting) = queue();
+        let mut said = Recorded::default();
+        let options = Options {
+            speech_config: Some(path.clone()),
+            ..Options::default()
+        };
+        // `is_none()` rather than a match on the value: a running `Voice` owns
+        // a runtime and is deliberately not `Debug`.
+        let started = start_voice(&options, &intents, &mut said).expect("a running host");
+        assert!(started.is_none(), "no pipeline was composed");
+        let line = said.lines.last().expect("a line saying which host this is");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+        assert_eq!(parsed["kind"], "awaiting_speech_config");
+        assert!(
+            parsed["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains(path.to_str().expect("a path this case wrote")),
+            "{line}",
+        );
+    }
+
+    #[test]
+    fn a_speech_configuration_this_host_can_run_composes_the_pipeline() {
+        let dir = scratch_dir("reachy-host-composed-arm");
+        let path = runnable_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let mut said = Recorded::default();
+        let options = Options {
+            speech_config: Some(path.clone()),
+            ..Options::default()
+        };
+        let started = start_voice(&options, &intents, &mut said).expect("a running host");
+        let voice = started.expect("a composed pipeline");
+        let line = said.lines.last().expect("a line saying what was composed");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+        assert_eq!(parsed["kind"], "composed");
+        let says = parsed["says"].as_str().expect("a sentence");
+        let listening = voice.listening();
+        assert!(says.contains(&listening), "{line}");
+        assert!(!listening.ends_with(":0"), "the bound port, not `:0`");
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    /// A speech configuration the pod platform will run, written into `dir`.
+    ///
+    /// Loopback on an ephemeral port, one key, no recording, no wake or
+    /// endpointer table, so nothing here loads a model or touches a network.
+    fn runnable_speech_config(dir: &std::path::Path) -> PathBuf {
+        let keys = dir.join("psk.toml");
+        speech_surface::psk::write_secret_file(
+            &keys,
+            "fixture-pod = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
+        )
+        .expect("a key table");
+        let path = dir.join("speech.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "listen_addr = \"127.0.0.1:0\"\n\
+                 pod_psk_file = {:?}\n\
+                 [record]\nenabled = false\n\
+                 [jsonl]\nsink = \"none\"\n",
+                keys.to_str().expect("a path this case wrote"),
+            ),
+        )
+        .expect("a file");
+        path
+    }
+
+    #[test]
+    fn the_loop_s_failure_is_the_one_the_process_exits_on() {
+        let both = outcome(
+            Err("reading the reports port: bad file descriptor".to_owned()),
+            Some("the voice pipeline's task did not finish: panic".to_owned()),
+        )
+        .expect_err("two failures are a failure");
+        assert!(both.starts_with("reading the reports port"), "{both}");
+        assert!(both.contains("did not finish: panic"), "{both}");
+    }
+
+    #[test]
+    fn a_clean_loop_still_exits_on_a_pipeline_that_would_not_stop() {
+        assert_eq!(
+            outcome(
+                Ok(()),
+                Some("the voice pipeline stopped on an error: x".to_owned())
+            ),
+            Err("the voice pipeline stopped on an error: x".to_owned()),
+        );
+        assert_eq!(outcome(Ok(()), None), Ok(()));
+        assert_eq!(
+            outcome(Err("reading the reports port: x".to_owned()), None),
+            Err("reading the reports port: x".to_owned()),
+        );
+    }
+
+    #[test]
+    fn a_host_asked_for_no_speech_configuration_says_that_instead() {
+        let (intents, _waiting) = queue();
+        let mut said = Recorded::default();
+        let started =
+            start_voice(&Options::default(), &intents, &mut said).expect("a running host");
+        assert!(started.is_none(), "no pipeline was composed");
+        let line = said.lines.last().expect("a line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+        assert_eq!(parsed["kind"], "voiceless");
     }
 
     #[test]

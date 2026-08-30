@@ -8,7 +8,10 @@
 #
 #   --push       rsync the payload into the unit's RAM and create the directory
 #                the logger writes into. Refuses a payload older than the newest
-#                commit to the workspace, and refuses while anything else on the
+#                commit to the workspace, or one whose copy of either
+#                out-of-tree member — the audio device's binary, the site's
+#                speech configuration — is older than the source it was staged
+#                from, and refuses while anything else on the
 #                unit holds the servo bus. Stamps the workspace's commit beside
 #                the payload, which is what a fetched run's records name their
 #                build by; a push that cannot state its own commit refuses.
@@ -75,9 +78,30 @@ payload="${repo_root}/target/motion-arm64/release"
 
 # The payload's binaries, at the paths the run spells, checked before anything is
 # pushed. A payload directory that exists and is missing one of them is a build
-# that failed halfway or a stage somebody edited by hand. Four are the production
-# launcher config's; the fifth is the intent source `--run` starts ahead of it.
-binaries=(reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch)
+# that failed halfway or a stage somebody edited by hand. Five are the production
+# launcher config's; the sixth is the intent source `--run` starts ahead of it.
+#
+# `reachy_pod` is among them on the same terms as the rest, though the build
+# stages it from a prebuilt brenn-pod artifact rather than compiling it: what
+# this list is about is what the launcher will look for on the unit, and the
+# launcher does not care which build produced a file.
+binaries=(
+	reachy_motord
+	reachy_host
+	reachy_pod
+	reachy_ask
+	cogs/robot_clk_exe
+	simplelaunch
+)
+
+# The payload's shared objects: its own class, and not among the binaries,
+# because a refusal that calls a library an executable sends whoever reads it
+# looking for the wrong mistake, and because nothing here has any reason to care
+# what mode the file was staged with. Checked for the same reason the binaries
+# are: the voice host resolves `libonnxruntime.so.1` through an `$ORIGIN`
+# runpath at exec, so a payload without it is a host that dies at start with a
+# loader message and no narration at all.
+shared_objects=(libonnxruntime.so.1)
 
 # The payload's launcher configs, at the payload root, checked with the binaries
 # and for the same reason: `--run` names one of these two below and the launcher
@@ -88,6 +112,48 @@ binaries=(reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch)
 # the unit itself, ahead of the wipe, because a push and a run are separate
 # invocations. Not executables, so what is asked of them is that they are files.
 launch_configs=(robotcpu.textproto robotcpu_harness.textproto)
+
+# The wake and VAD weights, at the payload-relative paths the host's speech
+# configuration names them by. Checked here rather than left to the host,
+# because they are the only payload members the build fetches from the network:
+# a build behind a proxy that answered a download with an error page produces a
+# payload that stages and pushes and a wake gate that fails at its first
+# inference, on a unit, with the operator watching a head that never moves.
+# Files, not executables, and their contents are the build's business -- every
+# one of them is fetched against a digest.
+models=(
+	models/oww/melspectrogram.onnx
+	models/oww/embedding_model.onnx
+	models/oww/hey_jarvis_v0.1.onnx
+	models/silero/silero_vad.onnx
+)
+
+# One class of payload member, checked before anything is pushed.
+#
+#   require_members <noun> <name>...
+#
+# One function rather than a loop per class: the payload grows a class per slice
+# -- four of them now -- and a copied loop is where the noun of the class it was
+# copied from survives into a refusal about something else. The noun is the
+# operator-facing half of that refusal, so it is what a caller states.
+#
+# What is asked of a member follows from its noun: an executable has to be one,
+# and every other class -- a shared object the loader opens, a config, a weight
+# file -- has to be a file and nothing more. Nothing here depends on the mode a
+# member was staged with unless the launcher is going to exec it.
+require_members() {
+	local noun=$1 name path
+	shift
+	for name in "$@"; do
+		path="${payload}/${name}"
+		case "$noun" in
+		executable) [ -x "$path" ] ;;
+		*) [ -f "$path" ] ;;
+		esac || die \
+			"the payload at ${payload} has no ${noun} ${name}" \
+			"Rebuild it: make motion-build"
+	done
+}
 
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
@@ -519,16 +585,10 @@ case "$mode" in
 		[ -d "$payload" ] || die \
 			"no device payload at ${payload}" \
 			"Build one first: make motion-build"
-		for name in "${binaries[@]}"; do
-			[ -x "${payload}/${name}" ] || die \
-				"the payload at ${payload} has no executable ${name}" \
-				"Rebuild it: make motion-build"
-		done
-		for name in "${launch_configs[@]}"; do
-			[ -f "${payload}/${name}" ] || die \
-				"the payload at ${payload} has no launcher config ${name}" \
-				"Rebuild it: make motion-build"
-		done
+		require_members executable "${binaries[@]}"
+		require_members "shared object" "${shared_objects[@]}"
+		require_members "launcher config" "${launch_configs[@]}"
+		require_members model "${models[@]}"
 
 		age_unchecked=no
 		if [ "${1:-}" = "--stale-ok" ]; then
@@ -546,6 +606,14 @@ case "$mode" in
 				"push the old payload deliberately" \
 				"${prog} ${host} --push --stale-ok" \
 				"${workspace_paths[@]}"
+			# The two members no commit to this workspace can date,
+			# asked about separately and by the same override.
+			refuse_if_source_newer "${payload}/reachy_pod" "$pod_binary" \
+				"audio device binary" \
+				"${prog} ${host} --push --stale-ok"
+			refuse_if_source_newer "${payload}/${speech_config_path}" \
+				"$speech_config" "speech configuration" \
+				"${prog} ${host} --push --stale-ok"
 		fi
 
 		log_root=$(config_string log_root_dir)

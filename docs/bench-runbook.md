@@ -29,6 +29,23 @@ Before anything that arms, moves or de-torques, the binding rules are in
   binary today.
 - **ssh as root to the unit**, key-based: every script runs with
   `BatchMode=yes` and will not prompt.
+- **A built audio-device binary**, for `make motion-build` only. `reachy_pod` is
+  brenn-pod's — it links libusb and libasound and is compiled in that repo's
+  arm64 container — so the payload stages it as a prebuilt artifact rather than
+  building it. `make -C ../brenn-pod/firmware reachy-pod` in a sibling checkout
+  puts it where the build looks by default; `REACHY_POD_BINARY=<path>` names it
+  anywhere else. A build with no artifact is refused rather than staging a
+  payload whose launcher would start an app that is not there.
+- **A speech configuration**, for a unit that is to have a voice. It is a
+  site's own file — the STT and TTS endpoints, the Brenn server and its token,
+  this unit's link keys — so it is never in this tree: put it at the gitignored
+  `host/speech.toml`, or name it with `REACHY_SPEECH_CONFIG=<path>`, and the
+  build stages it into the payload at `host/speech.toml`, which is the path the
+  launcher entry's `--speech-config` argument spells. It travels in the payload
+  like every other file, so a re-push replaces it and a payload built without it
+  has none: the host then starts anyway and runs its edge half alone. A motion
+  run needs no speech configuration at all — the harness twin does not start the
+  host.
 - **The unit's hostname**, named once in the gitignored `.local/reachy.conf`:
 
       echo 'REACHY_HOST=reachy00' > .local/reachy.conf
@@ -385,7 +402,7 @@ no band, because a driver computes its instants.
 
 ### What runs
 
-A motion run is four OS processes and a unit at rest is four as well, over four
+A motion run is four OS processes and a unit at rest is five, over five
 binaries, with one supervisor over all but the harness's intent source:
 
 | | |
@@ -394,7 +411,8 @@ binaries, with one supervisor over all but the harness's intent source:
 | `reachy_motord` | the servo bus. Not a cog: it owns the serial port, a 20 ms grid on the real clock, and the driver decisions. Talks to the cogs over six UDP sockets on loopback |
 | `cogs/robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
 | `cogs/robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose` and `Session`, with the intent edge's two sockets where a producer of scripts stands |
-| `reachy_host` | the robot's voice host: the Brenn-bus attachment and the host end of the intent edge, on the far side of the socket seam. A launcher app in `robotcpu.textproto` and deliberately not in the harness twin, because it binds the narration port `reachy_ask` binds and sends scripts to the port the control process binds. Its console is `voice_host_0.log`. What it does today is follow the session's story and narrate it as JSON lines: the voice pipeline is not linked into it yet |
+| `reachy_host` | the robot's voice host: the Brenn-bus attachment and the host end of the intent edge, on the far side of the socket seam. A launcher app in `robotcpu.textproto` and deliberately not in the harness twin, because it binds the narration port `reachy_ask` binds and sends scripts to the port the control process binds. Its console is `voice_host_0.log`. The pod platform's speech pipeline is linked into it and its launcher entry names `--speech-config host/speech.toml`; a payload staged with that file runs both halves, and one without it runs the edge half alone — following the session's story and narrating it as JSON lines, and saying on its first line which of the two this is |
+| `reachy_pod` | the audio device: the mic array over USB and the board's ALSA capture and playback, streaming to the voice host over the loopback audio link. brenn-pod's binary, staged into the payload as a prebuilt artifact rather than built here, and a launcher app in `robotcpu.textproto` only — a motion run needs no audio hardware. It reads `/run/brenn-app/conf/audio.conf`, which is pushed per unit because it holds that unit's link key, and parks re-reading every five seconds while the file is absent. Its console is `pod_0.log` |
 | `reachy_ask` | the harness's intent source, and not a launcher app: it binds the narration port 7410 before the composition starts narrating on it, so `make motion-run` starts it first and stops it with the launcher. It asks once, through the same edge library the voice host uses, and its console is `reachy_ask.log` beside the launcher's |
 
 One executable, two processes: which one it becomes is the process description
@@ -404,16 +422,18 @@ the system module. The twin's *content* is merged from the same rendered sources
 but its build rule is hand-maintained in `cogs/BUILD.bazel` — the updater knows
 of one config here — so changing the harness's app set is an edit to that rule
 and `cogs/robot.clk` has nothing to say about it. Each config names two of the
-apps itself; the driver and the voice host are merged in from
-`driver/motord_launch.textproto` and `host/host_launch.textproto`, because the
-renderer only knows about Clockwork processes.
+apps itself; the driver, the voice host and the audio device are merged in from
+`driver/motord_launch.textproto`, `host/host_launch.textproto` and
+`pod/pod_launch.textproto`, because the renderer only knows about Clockwork
+processes.
 
 **Two launcher configs travel in the payload.** `robotcpu.textproto` is the
-unit's: four apps, the host among them. `robotcpu_harness.textproto` is the same
-without the host, and it is what `make motion-run` starts — because that run
-brings up `reachy_ask`, and the host would bind the narration port 7410 a second
-time and address scripts to 7409 beside it, leaving the run's verdict to
-whichever of them the kernel gave the bind to.
+unit's: five apps, the host and the pod among them. `robotcpu_harness.textproto`
+is the same without either, and it is what `make motion-run` starts — because
+that run brings up `reachy_ask`, and the host would bind the narration port 7410
+a second time and address scripts to 7409 beside it, leaving the run's verdict to
+whichever of them the kernel gave the bind to; and because a motion run must need
+no mic array, no speech services and nothing streaming off the board.
 Production presence and the motion harness are never live at once.
 
 Nothing carries a `--pinion-dir` or a `--pinion-ns`. The rendered config cannot
@@ -514,7 +534,8 @@ unit is for; the verdict comes from the log afterwards.
 
 The launcher redirects each process's console into its own file under
 `/run/brenn-app/logs/launch` on the unit — `motord_0.log`, `proc_0.log`,
-`logger_proc_0.log`, `voice_host_0.log` where the voice host is running, a second run in the
+`logger_proc_0.log`, `voice_host_0.log` and `pod_0.log` where the production
+config is running, a second run in the
 same log directory writing
 `motord_1.log` and so on. What streams into your terminal is the launcher's own
 output; the per-process files are written on the unit and fetched with the run,
@@ -703,7 +724,9 @@ runs in the foreground:
 The harness twin, because the run below is the harness's: `./reachy_ask` in
 another shell on the unit is what asks for the gesture, and the production
 config's host app would bind the same ports. Start `robotcpu.textproto` instead
-when what is wanted is the unit as it runs for a person rather than a motion run.
+when what is wanted is the unit as it runs for a person rather than a motion run:
+that config also starts the audio device, which wants the mic array plugged in
+and `/run/brenn-app/conf/audio.conf` pushed.
 
 Watch it, one per shell:
 
@@ -711,6 +734,7 @@ Watch it, one per shell:
     tail -f /run/brenn-app/logs/launch/proc_0.log          # the control loop
     tail -f /run/brenn-app/logs/launch/logger_proc_0.log   # the logger
     tail -f /run/brenn-app/logs/launch/voice_host_0.log    # the voice host, if started
+    tail -f /run/brenn-app/logs/launch/pod_0.log           # the audio device, if started
 
 Stop it with Ctrl-C in the launcher's terminal, or from anywhere on the unit:
 

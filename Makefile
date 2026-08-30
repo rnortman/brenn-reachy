@@ -389,10 +389,19 @@ bench-fetch: device-host
 # fetch time.
 MOTION_RECORDS ?= .local/motion-logs
 
-# The aarch64 payload: the launcher, both binaries, the launcher config and every
-# configuration file the three processes read, laid out the way the launcher
-# config and those processes' relative paths expect. Needs bazel; needs no
+# The aarch64 payload: the launcher, the binaries, the two launcher configs and
+# every configuration file the unit's processes read, laid out the way those
+# configs and those processes' relative paths expect. Needs bazel; needs no
 # device.
+#
+# It also needs one file this repo does not build: the audio device is
+# brenn-pod's binary, staged from a prebuilt artifact found beside a sibling
+# checkout or named by `REACHY_POD_BINARY`. The script's refusal says so.
+#
+# One more file is optional and is never in this tree: the voice pipeline's own
+# configuration, taken from `host/speech.toml` or from `REACHY_SPEECH_CONFIG`. A
+# payload built without one stages a host that narrates the session and does not
+# listen.
 .PHONY: motion-build
 motion-build:
 	tools/build-motion.sh

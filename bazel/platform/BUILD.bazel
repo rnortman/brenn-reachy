@@ -38,26 +38,47 @@ platform(
 # composition comes up. tools/build-motion.sh builds this, so the payload it
 # stages and the set the gate covers are one set.
 #
-# Two launcher configs, not one: the production config names the host, and the
-# harness twin does not, because `deploy-motion.sh --run` starts the intent
-# source itself, and a second process binding the narration port 7410 and
-# addressing scripts to 7409 in one run is a bind race deciding the verdict.
+# Two launcher configs, not one: the production config names the host and the
+# audio device, and the harness twin names neither, because `deploy-motion.sh
+# --run` starts the intent source itself -- a second process binding the
+# narration port 7410 and addressing scripts to 7409 in one run is a bind race
+# deciding the verdict -- and because a motion run must need no audio hardware.
 # `//cogs:BUILD.bazel` states the rule at the rules.
 #
 # The launcher is C++ from the drop rather than anything of ours, so it is also
 # what makes `make check-device` gate a cross-build of boost, protobuf and
 # abseil for the device.
 #
-# What is deployed and what a unit needs are not yet the same set: the voice
-# host on a unit is a process that follows the session's story and narrates it,
-# because the pod audio device, the speech configuration and the wake and VAD
-# models come from brenn-pod and the pipeline that reads them is not linked into
-# this binary yet. It is staged now because the launcher entry and the harness
-# twin are one indivisible pair, and the twin is what keeps a motion run honest.
-# TODO(host-payload-membership)
+# The one shared object in the payload. The voice host links ONNX Runtime
+# dynamically -- there is no static build to link -- so `libonnxruntime.so.1`
+# has to sit beside the binary for the loader to find through its `$ORIGIN`
+# runpath. Staged whether or not a unit runs the pipeline: a `NEEDED` entry is
+# resolved at exec, not at first inference, so a host without it does not start
+# at all.
+#
+# The wake and VAD weights, which are data and not deployables in any other
+# sense: nothing links them, and the host loads them by the payload-relative
+# paths its speech configuration names. They are fetched by digest rather than
+# committed, so they are members here and nowhere in the tree.
+#
+# One payload member is not here and cannot be: `reachy_pod`, the audio device,
+# is brenn-pod's binary -- it links libusb and libasound and is compiled in that
+# repo's arm64 container -- so `tools/build-motion.sh` stages it from a prebuilt
+# artifact and nothing in this build names it. This filegroup is what the gate
+# cross-builds, and the pod binary's own gate is the repo that produced it.
+#
+# What is deployed and what a unit needs are not quite the same set, and the
+# remaining difference is deliberate: the voice pipeline's own configuration
+# names a site's speech services, its bus server and token, and a unit's link
+# keys, so it is never content in this tree and cannot be a member here.
+# `tools/build-motion.sh` stages whatever `REACHY_SPEECH_CONFIG` names at the
+# path the launcher entry's `--speech-config` argument spells, and a payload
+# built without one runs a host that narrates the session and does not listen.
 filegroup(
     name = "motion_payload",
     srcs = [
+        "//bazel/third_party/models:models",
+        "//bazel/third_party/onnxruntime:shared_object",
         "//cogs:clockwork_prelaunch_sh",
         "//cogs:robot_clk_exe",
         "//cogs:robotcpu.textproto",

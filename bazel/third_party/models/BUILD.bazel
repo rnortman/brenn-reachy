@@ -1,0 +1,36 @@
+# Apache-2.0. The wake and VAD model weights the voice host's pipeline loads,
+# fetched by digest in `MODULE.bazel` and named here as one set the payload
+# stages.
+#
+# Four files, two graphs:
+#
+#   melspectrogram.onnx    openWakeWord: raw audio -> mel spectrogram
+#   embedding_model.onnx   openWakeWord: spectrogram -> embedding
+#   hey_jarvis_v0.1.onnx   openWakeWord: embedding -> wake score for one phrase
+#   silero_vad.onnx        Silero VAD: P(speech) per 512-sample chunk
+#
+# The first three are the wake gate's; only the third is phrase-specific, so
+# changing the wake phrase is one digest here. The fourth is the endpointer's,
+# without which no wake ever fires.
+#
+# **The openWakeWord weights are not redistributed by this repository.** Their
+# code is Apache-2.0 but the pre-trained models are CC BY-NC-SA 4.0, whose
+# NonCommercial term is incompatible with this tree's license -- so they are
+# fetched from upstream at build time and staged into a payload, and no copy of
+# them is committed here. Silero VAD is MIT and is fetched the same way for the
+# simpler reason that a model file is an opaque blob a reviewer cannot read.
+#
+# Data, not code: nothing links these, no target's architecture depends on them,
+# and the device ISA sweep has nothing to ask them. What reaches a unit is a
+# copy at the payload-relative paths the host's speech configuration names, which
+# `tools/build-motion.sh` spells.
+filegroup(
+    name = "models",
+    srcs = [
+        "@oww_embedding//file",
+        "@oww_hey_jarvis//file",
+        "@oww_melspectrogram//file",
+        "@silero_vad//file",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -117,17 +117,65 @@ export HOST_MACHINE=183
 export ASK_MACHINE=183
 export EXE_MACHINE=183
 export LAUNCHER_MACHINE=183
+export ONNX_MACHINE=183
 export DROP_LOGGER_CONFIG=""
+export INFO_STATUS=""
+
+# Where the stub's `info execution_root` points, and where its ONNX Runtime
+# cquery answer is rooted: outside the repository, which is the whole difference
+# between that file and the payload's other members.
+export ONNX_PRESENT=1
+export EXECROOT="${work}/execroot"
+mkdir -p -- "${EXECROOT}/external/onnxruntime_linux_aarch64/lib"
+
+# The model weights, which come out of the same place for the same reason: they
+# are fetched repositories' files, so the subject resolves them against the
+# execution root too. `MODELS_PRESENT` is what a case turns off to stand for a
+# fetch that left nothing behind, and `MODELS_EXTRA` adds a file the payload has
+# no place for -- a model added to the fetch and not to the table that says where
+# it goes.
+export MODELS_PRESENT=1
+export MODELS_EXTRA=""
+export MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx silero_vad.onnx"
+for name in $MODEL_FILES hey_pavlov_v0.1.onnx; do
+	mkdir -p -- "${EXECROOT}/external/model_${name%.onnx}/file"
+done
 
 # What the rendered launcher config calls the control process, and whether the
-# harness twin names the voice host. The subject pins each config's app names
-# because deploy-motion.sh prints a tail command per name and because a host in
-# the twin would be a second owner of the ports the intent source binds; these
-# are how a case renames one and how a case merges the host into the wrong
+# harness twin names the voice host or the audio device. The subject pins each
+# config's app names because deploy-motion.sh prints a tail command per name,
+# because a host in the twin would be a second owner of the ports the intent
+# source binds, and because a pod in it would make a motion run want a mic array;
+# these are how a case renames one and how a case merges either into the wrong
 # config.
 export APP_CONTROL=""
 export HARNESS_HOST=""
+export HARNESS_POD=""
 export CALLS="${work}/calls"
+
+# The audio device's binary: the one payload member the subject does not ask
+# Bazel about. It is brenn-pod's, built in that repo's arm64 container, so what
+# stands in for it here is a file this test writes at the path a sibling checkout
+# would leave it at -- which is what the subject's default resolves to, because
+# `repo_root` is the temporary tree.
+pod_checkout="${work}/brenn-pod/firmware/target/reachy-pod/payload"
+mkdir -p -- "$pod_checkout"
+pod_default="${pod_checkout}/reachy-pod"
+
+# An ELF header plausible enough for the subject's machine read and nothing more,
+# the same shape the bazel stub writes for the binaries it stands in for. Written
+# by the cases rather than on every build, because nothing regenerates this file
+# between builds the way the stub regenerates Bazel's outputs.
+stage_pod_binary() {
+	local at=$1 machine=$2
+	mkdir -p -- "$(dirname -- "$at")"
+	printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000\002\000' >"$at"
+	# shellcheck disable=SC2059  # the format string is built from the machine number
+	printf "$(printf '\\%03o\\%03o' $((machine % 256)) $((machine / 256)))" >>"$at"
+	printf '\001\000\000\000' >>"$at"
+	chmod 0755 -- "$at"
+}
+stage_pod_binary "$pod_default" 183
 
 # The knobs for the three ways Bazel can answer badly: cquery failing outright,
 # cquery succeeding with nothing to say, and a build whose named output is not
@@ -181,6 +229,25 @@ case "$sub" in
 		elf bazel-out/bin/reachy_host "$HOST_MACHINE"
 		elf bazel-out/bin/reachy_ask "$ASK_MACHINE"
 		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
+		# A knob rather than a fixture the case moves aside: this arm runs on
+		# every build, so a file removed between builds would be written back.
+		if [ -n "${ONNX_PRESENT:-}" ]; then
+			elf "${EXECROOT}/external/onnxruntime_linux_aarch64/lib/libonnxruntime.so.1" \
+				"$ONNX_MACHINE"
+		else
+			rm -f -- "${EXECROOT}/external/onnxruntime_linux_aarch64/lib/libonnxruntime.so.1"
+		fi
+		# The weights, in the fetched repositories a digest-pinned download
+		# leaves them in. Bytes rather than an ELF header: nothing links these
+		# and no architecture check is asked of them.
+		for model in $MODEL_FILES ${MODELS_EXTRA:-}; do
+			path="${EXECROOT}/external/model_${model%.onnx}/file/${model}"
+			if [ -n "${MODELS_PRESENT:-}" ]; then
+				echo "weights of ${model}" >"$path"
+			else
+				rm -f -- "$path"
+			fi
+		done
 		cat >bazel-out/bin/robotcpu.textproto <<CONFIG
 app {
   name: "${APP_CONTROL:-proc}"
@@ -197,6 +264,11 @@ app {
 app {
   name: "voice_host"
   executable: "reachy_host"
+}
+app {
+  name: "pod"
+  executable: "reachy_pod"
+  args: "run"
 }
 pre_launch {
   name: "clockwork_prelaunch"
@@ -222,6 +294,15 @@ CONFIG
 app {
   name: "voice_host"
   executable: "reachy_host"
+}
+CONFIG
+		fi
+		if [ -n "${HARNESS_POD:-}" ]; then
+			cat >>bazel-out/bin/robotcpu_harness.textproto <<'CONFIG'
+app {
+  name: "pod"
+  executable: "reachy_pod"
+  args: "run"
 }
 CONFIG
 		fi
@@ -267,8 +348,23 @@ CONFIG
 					echo "$f"
 				done
 				;;
+			*onnxruntime*)
+				# Execroot-relative, as the real cquery answers for a file
+				# inside a fetched repository.
+				echo external/onnxruntime_linux_aarch64/lib/libonnxruntime.so.1
+				;;
+			*third_party/models*)
+				# Execroot-relative for the same reason.
+				for model in $MODEL_FILES ${MODELS_EXTRA:-}; do
+					echo "external/model_${model%.onnx}/file/${model}"
+				done
+				;;
 			*) echo "unstubbed target ${target}" >&2; exit 1 ;;
 		esac
+		;;
+	info)
+		[ -z "${INFO_STATUS:-}" ] || exit "$INFO_STATUS"
+		echo "$EXECROOT"
 		;;
 	*) echo "unstubbed subcommand ${sub}" >&2; exit 1 ;;
 esac
@@ -335,8 +431,15 @@ assert_status "a clean build succeeds" 0 "$(status_of "$result")"
 
 assert_file "the driver is in the payload" "${payload}/reachy_motord"
 assert_file "the voice host is beside it" "${payload}/reachy_host"
+# The one member the subject stages from outside Bazel's outputs, found at the
+# path a sibling brenn-pod checkout leaves it at, with no knob set.
+assert_file "the audio device is beside them" "${payload}/reachy_pod"
 assert_file "the intent source is beside it" "${payload}/reachy_ask"
 assert_file "the launcher is in the payload" "${payload}/simplelaunch"
+# Beside the host and not under a lib directory: the binary's runpath ends in
+# `$ORIGIN`, and the payload root is where that resolves.
+assert_file "the shared object the host needs is beside it" \
+	"${payload}/libonnxruntime.so.1"
 assert_file "its config is beside it, where it is started from" \
 	"${payload}/robotcpu.textproto"
 # Both configs travel: a unit is deployed once and used for production presence
@@ -362,6 +465,20 @@ fi
 for file in "${config_files[@]}"; do
 	assert_file "the payload carries ${file} at that path" "${payload}/${file}"
 done
+# The weights, at the paths a speech configuration names them by — the wake
+# gate's three under one directory and the endpointer's under another, because
+# that is how the configuration that loads them spells the paths.
+assert_file "the wake gate's spectrogram model is staged" \
+	"${payload}/models/oww/melspectrogram.onnx"
+assert_file "its embedding model is beside it" \
+	"${payload}/models/oww/embedding_model.onnx"
+assert_file "the wake phrase's own model is beside them" \
+	"${payload}/models/oww/hey_jarvis_v0.1.onnx"
+assert_file "the endpointer's model is staged" \
+	"${payload}/models/silero/silero_vad.onnx"
+assert_no_file "and none of them is left at the payload root" \
+	"${payload}/silero_vad.onnx"
+
 assert_file "the writer's channel set is staged" \
 	"${payload}/cogs/system_robot.motion_robot.RobotCpu_event_logger_config.tachyon"
 assert_file "the control process description is staged" \
@@ -413,8 +530,17 @@ assert_contains "one cquery names every built output" "$(calls)" \
 	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
 	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto + //host:host_params.textproto"
-assert_eq "and there are two cqueries, not one per target" 2 \
+# Four, not one per file: the shared object and the model set each need one of
+# their own, because their paths are relative to the execution root and the other
+# two listings are not.
+assert_eq "and there are four cqueries, not one per target" 4 \
 	"$(calls | grep -c 'bazel cquery')"
+assert_contains "the shared object is cqueried on its own" "$(calls)" \
+	"//bazel/third_party/onnxruntime:shared_object"
+assert_contains "and the model set on its own" "$(calls)" \
+	"//bazel/third_party/models:models"
+assert_contains "and its path is resolved against the execution root" "$(calls)" \
+	"bazel info --config=device execution_root"
 assert_contains "the report names the payload" "$(output_of "$result")" "$payload"
 
 # The payload's contents come from Bazel, so a config file a composition gains is
@@ -506,6 +632,172 @@ assert_contains "the refusal names that binary" "$(output_of "$result")" \
 assert_unstaged "and that one stages nothing either"
 ASK_MACHINE=183
 
+# The prebuilt member's two refusals. It is the one binary in the payload that
+# was compiled somewhere else, so it is the one where "is this even an aarch64
+# executable" is a real question: brenn-pod builds the same crate for the
+# workstation as well, at a path that looks much like this one.
+mark_payload
+stage_pod_binary "$pod_default" 62
+result=$(build)
+assert_status "an audio device for the wrong machine refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names that binary" "$(output_of "$result")" \
+	"reachy-pod is an ELF"
+assert_unstaged "and that one stages nothing either"
+stage_pod_binary "$pod_default" 183
+
+# Absent, which is the ordinary case in a checkout that has never built the other
+# repo. The production launcher config names the pod app unconditionally, so a
+# payload without the binary is a launcher starting an app that is not there.
+mark_payload
+mv -- "$pod_default" "${pod_default}.aside"
+result=$(build)
+assert_status "an audio-device binary that is not there refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"brenn-pod/firmware/target/reachy-pod/payload/reachy-pod"
+assert_contains "and says whose build produces it" "$(output_of "$result")" \
+	"make -C ../brenn-pod/firmware reachy-pod"
+assert_contains "and names the knob that points elsewhere" "$(output_of "$result")" \
+	"REACHY_POD_BINARY"
+assert_unstaged "and a payload without it is never staged"
+mv -- "${pod_default}.aside" "$pod_default"
+
+# The knob, for a checkout that is not a sibling: what it names is what is
+# staged, and the default is not consulted.
+mark_payload
+elsewhere="${work}/elsewhere/reachy-pod"
+stage_pod_binary "$elsewhere" 183
+mv -- "$pod_default" "${pod_default}.aside"
+REACHY_POD_BINARY="$elsewhere"
+export REACHY_POD_BINARY
+result=$(build)
+assert_status "a build against the knob's artifact succeeds" 0 "$(status_of "$result")"
+assert_file "and the payload carries it" "${payload}/reachy_pod"
+unset REACHY_POD_BINARY
+mv -- "${pod_default}.aside" "$pod_default"
+result=$(build)
+assert_status "and the default is back" 0 "$(status_of "$result")"
+
+# The other member from outside the build, and the only optional one: the voice
+# pipeline's own configuration. It is a site's file -- speech endpoints, a bus
+# token, this unit's link keys -- so it is never in the tree and a payload built
+# without one is the ordinary case. The launcher entry names its path
+# unconditionally, and what makes that safe is that the host survives its
+# absence; what this suite can hold is that the build stages nothing there, says
+# so, and refuses only when somebody asked for a file that is not there.
+speech_default="${repo}/host/speech.toml"
+
+result=$(build)
+assert_status "a build with no speech configuration succeeds" 0 "$(status_of "$result")"
+assert_no_file "and the payload carries none" "${payload}/host/speech.toml"
+assert_contains "and the report says what that host will do" "$(output_of "$result")" \
+	"edge half alone"
+
+printf 'listen_addr = "0.0.0.0:7380"\n' >"$speech_default"
+result=$(build)
+assert_status "a build with one at the default path succeeds" 0 "$(status_of "$result")"
+assert_file "and the payload carries it where the launcher argument names it" \
+	"${payload}/host/speech.toml"
+assert_eq "readable by the account that runs the payload and nobody else" 600 \
+	"$(stat -c %a -- "${payload}/host/speech.toml")"
+assert_contains "and the report says where it came from" "$(output_of "$result")" \
+	"staged from ${speech_default}"
+rm -- "$speech_default"
+
+mark_payload
+REACHY_SPEECH_CONFIG="${work}/nowhere/speech.toml"
+export REACHY_SPEECH_CONFIG
+result=$(build)
+assert_status "a named speech configuration that is not there refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"${work}/nowhere/speech.toml"
+assert_contains "and says a payload without one is a build away" "$(output_of "$result")" \
+	"unset it"
+assert_unstaged "and a build refused for it stages nothing"
+
+REACHY_SPEECH_CONFIG="${work}/elsewhere/speech.toml"
+mkdir -p -- "$(dirname -- "$REACHY_SPEECH_CONFIG")"
+printf 'listen_addr = "0.0.0.0:7380"\n' >"$REACHY_SPEECH_CONFIG"
+result=$(build)
+assert_status "a build against the knob's configuration succeeds" 0 "$(status_of "$result")"
+assert_file "and the payload carries it" "${payload}/host/speech.toml"
+unset REACHY_SPEECH_CONFIG
+result=$(build)
+assert_status "and with the knob unset the default is back" 0 "$(status_of "$result")"
+assert_no_file "which is not there, so neither is the payload's" \
+	"${payload}/host/speech.toml"
+
+mark_payload
+INFO_STATUS=1
+result=$(build)
+assert_status "a bazel that cannot say where its execution root is refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says why that matters" "$(output_of "$result")" \
+	"the fetched shared object cannot be found"
+assert_unstaged "and it stages nothing"
+INFO_STATUS=""
+
+mark_payload
+ONNX_PRESENT=""
+result=$(build)
+assert_status "a shared object the fetch did not leave behind refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"libonnxruntime.so.1 and no file is there"
+assert_unstaged "and that one stages nothing either"
+ONNX_PRESENT=1
+
+mark_payload
+MODELS_PRESENT=""
+result=$(build)
+assert_status "weights the fetch did not leave behind refuse" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"melspectrogram.onnx and no file is there"
+assert_unstaged "and a payload with no weights is never staged"
+MODELS_PRESENT=1
+
+# The other direction, and the one a reader is likelier to cause: a model added
+# to the fetch with nowhere to put it. Silently leaving it out would be a wake
+# phrase that never fires, discovered on a unit.
+mark_payload
+MODELS_EXTRA=hey_pavlov_v0.1.onnx
+result=$(build)
+assert_status "a fetched model the payload has no place for refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names it" "$(output_of "$result")" \
+	"a model called hey_pavlov_v0.1.onnx"
+assert_contains "and says where to give it a place" "$(output_of "$result")" \
+	"model_paths"
+assert_unstaged "and that one stages nothing either"
+MODELS_EXTRA=""
+
+# The third direction: the build names fewer files than the payload has rows for
+# -- a src dropped from the models filegroup, or an `http_file` removed from
+# MODULE.bazel. Nothing else catches it: every file the build did name was
+# resolved and placed, so the only evidence is the count.
+mark_payload
+MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx"
+result=$(build)
+assert_status "a build naming fewer models than the payload wants refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names both counts" "$(output_of "$result")" \
+	"the payload wants 4 model files and the build named 3"
+assert_contains "and says which two lists have to describe one set" \
+	"$(output_of "$result")" "model_paths"
+assert_unstaged "and a payload short a graph is never staged"
+MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx silero_vad.onnx"
+
+mark_payload
+ONNX_MACHINE=62
+result=$(build)
+assert_status "a shared object for the wrong machine refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the shared object" "$(output_of "$result")" \
+	"libonnxruntime.so.1 is an ELF"
+assert_unstaged "and that one stages nothing either"
+ONNX_MACHINE=183
+
 mark_payload
 MOTORD_MACHINE=62
 result=$(build)
@@ -576,9 +868,9 @@ APP_CONTROL=control_proc
 result=$(build)
 assert_status "a launcher config that renamed a process refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal lists what the config names" "$(output_of "$result")" \
-	"names the apps 'control_proc logger_proc motord voice_host'"
+	"names the apps 'control_proc logger_proc motord pod voice_host'"
 assert_contains "and what the run needs" "$(output_of "$result")" \
-	"needs 'logger_proc motord proc voice_host'"
+	"needs 'logger_proc motord pod proc voice_host'"
 assert_contains "and says which config it read" "$(output_of "$result")" \
 	"robotcpu.textproto names the apps"
 assert_contains "and says why the names matter" "$(output_of "$result")" \
@@ -607,6 +899,19 @@ HARNESS_HOST=""
 
 result=$(build)
 assert_status "and the twin without it builds" 0 "$(status_of "$result")"
+
+# The twin's second exclusion: a motion run must need no mic array, no speech
+# services and nothing streaming off the board, so a pod app merged into it is
+# refused for its own reason rather than tolerated as harmless.
+mark_payload
+HARNESS_POD=1
+result=$(build)
+assert_status "a harness twin that names the audio device refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and lists the pod among what it found" "$(output_of "$result")" \
+	"'logger_proc motord pod proc'"
+assert_unstaged "a twin naming the pod stages nothing"
+HARNESS_POD=""
 
 mark_payload
 rm -f -- "${repo}/cogs/mover_params.textproto"
@@ -706,7 +1011,7 @@ labels_of() {
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|host_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|prelaunch_target)=' \
+script_labels=$(grep -E '^(motord_target|host_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|prelaunch_target|onnx_target|models_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
 assert_eq "the payload's members are exactly the labels this script cqueries" \
@@ -718,6 +1023,67 @@ assert_contains "and the gate builds that list" \
 assert_contains "and this script builds the payload filegroup itself" \
 	"$(cat -- "${real_repo}/tools/build-motion.sh")" \
 	"build_target=//bazel/platform:motion_payload"
+
+# A fourth hand-written list, joined here for the same reason: the payload paths
+# this script installs the weights at, and the ones deploy-motion.sh refuses a
+# push without. Two scripts spelling four paths, and a path renamed in one of
+# them is a push that turns away every payload this build stages.
+# Each row is `<downloaded name>\t<payload path>` inside one quoted string, on an
+# indented line, so the tab-separated fields are the empty indent, the name
+# behind its opening quote, and the path in front of its closing one.
+model_targets=$(awk -F'\t' '
+	/^model_paths=\(/ { inside = 1; next }
+	inside && /^\)/ { exit }
+	inside && NF == 3 { print substr($3, 1, length($3) - 1) }
+' "${real_repo}/tools/build-motion.sh" | sort)
+
+deploy_models=$(awk '
+	/^models=\(/ { inside = 1; next }
+	inside && /^\)/ { exit }
+	inside && NF { print $1 }
+' "${real_repo}/tools/deploy-motion.sh" | sort)
+
+assert_eq "the weights are staged at the four paths the push checks for" \
+	"$model_targets" "$deploy_models"
+assert_eq "and there are four of them, so neither list was read as empty" 4 \
+	"$(printf '%s\n' "$model_targets" | grep -c .)"
+
+# The other half of that join, and the half the cases above cannot reach: the
+# fetch set itself. Everything the model section drives runs against
+# `MODEL_FILES`, a list this test invented, so a `model_paths` row naming a file
+# no `http_file` downloads -- or a filegroup src with no row -- is invisible to
+# every case here and to `make check`, which never runs this script's subject.
+# The discovery would be a refused `make motion-build` at the bench, with the
+# operator already standing there. Changing the wake phrase is exactly that
+# edit: one digest, one downloaded name, one row.
+downloaded_names=$(awk '
+	match($0, /downloaded_file_path = "[^"]*"/) {
+		field = substr($0, RSTART, RLENGTH)
+		match(field, /"[^"]*"/)
+		print substr(field, RSTART + 1, RLENGTH - 2)
+	}
+' "${real_repo}/MODULE.bazel" | sort)
+
+fetched_names=$(awk -F'\t' '
+	/^model_paths=\(/ { inside = 1; next }
+	inside && /^\)/ { exit }
+	inside && NF == 3 { print substr($2, 2) }
+' "${real_repo}/tools/build-motion.sh" | sort)
+
+models_srcs=$(awk '
+	index($0, "name = \"models\"") { inside = 1; next }
+	inside && /^\)/ { exit }
+	inside && match($0, /"@[^"]*"/) {
+		print substr($0, RSTART + 1, RLENGTH - 2)
+	}
+' "${real_repo}/bazel/third_party/models/BUILD.bazel" | sort)
+
+assert_eq "every fetched model has a row, and every row a fetch" \
+	"$downloaded_names" "$fetched_names"
+assert_eq "and there are four of each, so neither list was read as empty" 4 \
+	"$(printf '%s\n' "$downloaded_names" | grep -c .)"
+assert_eq "and the filegroup the build asks for names four repositories" 4 \
+	"$(printf '%s\n' "$models_srcs" | grep -c .)"
 
 # ---------------------------------------------------------------------------
 # The two launcher config rules, held to each other
@@ -768,9 +1134,9 @@ assert_contains "and the harness twin's" "$harness_data" ":robot_clk_exe"
 
 assert_eq "the two launcher configs carry the same data" \
 	"$production_data" "$harness_data"
-assert_eq "the twin is the production config less the voice host's app entry" \
+assert_eq "the twin is the production config less the host's and the pod's app entries" \
 	"$(comm -23 <(printf '%s\n' "$production_srcs") <(printf '%s\n' "$harness_srcs"))" \
-	"//host:host_launch.textproto"
+	"$(printf '%s\n%s' //host:host_launch.textproto //pod:pod_launch.textproto)"
 assert_eq "and names no src the production config does not" \
 	"$(comm -13 <(printf '%s\n' "$production_srcs") <(printf '%s\n' "$harness_srcs"))" \
 	""
@@ -802,9 +1168,10 @@ fi
 # ---------------------------------------------------------------------------
 #
 # The cases above screen a launcher config this file wrote, so what they prove is
-# that the screen works. The two app entries a unit actually starts are
+# that the screen works. The three app entries a unit actually starts are
 # hand-written textprotos merged into the rendered config
-# (`host/host_launch.textproto`, `driver/motord_launch.textproto`), and their
+# (`host/host_launch.textproto`, `driver/motord_launch.textproto`,
+# `pod/pod_launch.textproto`), and their
 # join to this script runs only inside `make motion-build`, which needs the
 # device cross-compile. Both halves are read out of this checkout instead: an app
 # renamed here has to be a name `launcher_apps` carries, and an executable
@@ -838,7 +1205,8 @@ staged_binaries=$(printf '%s\n' "$script_src" |
 assert_eq "the paths stage() installs executables at are read out of build-motion.sh" \
 	yes "$(member_of reachy_motord "$staged_binaries")"
 
-for entry in host/host_launch.textproto driver/motord_launch.textproto; do
+for entry in host/host_launch.textproto driver/motord_launch.textproto \
+	pod/pod_launch.textproto; do
 	app_name=$(sed -n 's/^ *name: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
 	app_exe=$(sed -n 's/^ *executable: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
 	if [ -z "$app_name" ] || [ -z "$app_exe" ]; then
@@ -883,6 +1251,26 @@ else
 		yes "$(member_of "$names_path" "$staged_configs")"
 	assert_eq "and the host's default --config is a file the payload stages" \
 		yes "$(member_of "$default_config" "$staged_configs")"
+fi
+
+# The third payload-relative path the host resolves, and the one no build can
+# check for itself: the file `--speech-config` names is a site's own and is
+# staged from outside the tree, so the only join available is the two strings --
+# the argument the launcher entry spells and the path `stage()` installs it at.
+# They disagree and a unit runs a host that says it is waiting for a
+# configuration that is sitting right beside it.
+launch_speech=$(awk -F'"' '
+	/args: "--speech-config"/ { want = 1; next }
+	want && /args: "/ { print $2; exit }
+' "${real_repo}/host/host_launch.textproto")
+staged_speech=$(sed -n 's/^speech_config_path=\(.*\)$/\1/p' \
+	-- "${real_repo}/tools/lib.sh")
+if [ -z "$launch_speech" ] || [ -z "$staged_speech" ]; then
+	fail "the speech configuration's payload path is readable on both sides" \
+		"read launcher argument='${launch_speech}' speech_config_path='${staged_speech}'"
+else
+	assert_eq "the launcher entry names the path the build stages one at" \
+		"$staged_speech" "$launch_speech"
 fi
 
 # ---------------------------------------------------------------------------

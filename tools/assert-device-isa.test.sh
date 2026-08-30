@@ -39,6 +39,9 @@ subject="${repo}/tools/assert-device-isa.sh"
 # claims and the tree does not hold.
 : >"${repo}/bazel-out/bin/simplelaunch"
 : >"${repo}/bazel-out/bin/robot_clk_exe"
+# The voice host, which the subject reads for its loader contract rather than
+# disassembling.
+: >"${repo}/bazel-out/bin/reachy_host"
 
 # The fetched shared object, at the path the stub's `info execution_root` and
 # `cquery` answers put it — outside the repo, which is the whole difference
@@ -87,6 +90,7 @@ cquery)
 		exit 0
 	done
 	echo bazel-out/bin/reachy_motord
+	[ "${CQUERY_DROP:-}" = reachy_host ] || echo bazel-out/bin/reachy_host
 	[ "${CQUERY_DROP:-}" = simplelaunch ] || echo bazel-out/bin/simplelaunch
 	[ "${CQUERY_DROP:-}" = robot_clk_exe ] || echo bazel-out/bin/robot_clk_exe
 	echo cogs/robot.clk
@@ -178,11 +182,31 @@ fixture() {
 	} >"${FIXTURES}/${name}"
 }
 
-# The green set: nothing but the guarded helpers in any of the three.
+# The voice host's dynamic section, as llvm-objdump -p prints one: a runpath
+# whose first entry is the build tree's own -- which is what Bazel writes and
+# what is nowhere on a unit -- and `$ORIGIN` appended after it, then the NEEDED
+# entries. A case chooses what the subject sees by passing the two lines it
+# wants; the default is the contract holding.
+host_fixture() {
+	# shellcheck disable=SC2016 # `$ORIGIN` is the loader's syntax, written out
+	local runpath=${1-'$ORIGIN/../../_solib_local/onnxruntime:$ORIGIN'}
+	local needed=${2-libonnxruntime.so.1}
+	{
+		header reachy_host
+		printf 'Dynamic Section:\n'
+		[ -z "$runpath" ] || printf '  RUNPATH      %s\n' "$runpath"
+		[ -z "$needed" ] || printf '  NEEDED       %s\n' "$needed"
+		printf '  NEEDED       libc.so.6\n'
+	} >"${FIXTURES}/reachy_host"
+}
+
+# The green set: nothing but the guarded helpers in any of the three, and a
+# voice host whose loader contract holds.
 green() {
 	fixture simplelaunch
 	fixture robot_clk_exe
 	fixture libonnxruntime.so.1
+	host_fixture
 }
 
 # ---------------------------------------------------------------------------
@@ -345,7 +369,7 @@ assert_contains "naming the value" "$(output_of "$result")" "no-such-objdump"
 # handful of programs the subject and lib.sh run.
 sanitized="${work}/sanitized-bin"
 mkdir -p -- "$sanitized"
-for tool in bash env cat basename dirname awk sed tail head wc tr; do
+for tool in bash env cat basename dirname awk sed tail head wc tr grep; do
 	ln -sf -- "$(command -v -- "$tool")" "${sanitized}/${tool}"
 done
 ln -sf -- "${stubs}/bazel" "${sanitized}/bazel"
@@ -506,5 +530,76 @@ assert_status "querying the shared object without --config=device is refused" 1 
 	"$(status_of "$result")"
 assert_contains "because what came back is the wrong architecture" \
 	"$(output_of "$result")" "is not an aarch64 binary, so this checked the wrong build"
+
+# ---------------------------------------------------------------------------
+# The voice host's loader contract
+# ---------------------------------------------------------------------------
+#
+# The one payload invariant that decides whether the binary starts at all, and
+# the one nothing else in the tree asks the binary about: three files state it
+# in prose and the payload is laid out around it. What it costs when it breaks
+# is a host that dies at exec with a loader message, on a unit, narrating
+# nothing -- so the red cases are what this section is for.
+
+green
+result=$(run)
+assert_status "a host whose loader contract holds passes" 0 "$(status_of "$result")"
+assert_contains "and the verdict says what it found" "$(output_of "$result")" \
+	"reachy_host: NEEDED libonnxruntime.so.1, runpath carries \$ORIGIN"
+
+# Bazel's own runpath entry is a path inside the build tree and resolves to
+# nothing on a unit, so `$ORIGIN` alone lost from the list is the whole defect:
+# the value still looks populated.
+green
+# shellcheck disable=SC2016 # the loader's syntax again
+host_fixture '$ORIGIN/../../_solib_local/onnxruntime'
+result=$(run)
+assert_status "a runpath without \$ORIGIN is refused" 1 "$(status_of "$result")"
+assert_contains "naming what the runpath does say" "$(output_of "$result")" \
+	"_solib_local/onnxruntime"
+assert_contains "and where the flag that writes it lives" "$(output_of "$result")" \
+	"crates/reachy-host/BUILD.bazel"
+
+# A host with no runpath at all: the same failure, and the message has to be
+# about a runpath rather than about an empty variable.
+green
+host_fixture ''
+result=$(run)
+assert_status "a host with no runpath at all is refused" 1 "$(status_of "$result")"
+assert_contains "saying it has none" "$(output_of "$result")" "it reads 'nothing'"
+
+# A host that resolves ONNX Runtime from somewhere else -- a static link, or a
+# differently named soname -- is not the binary this payload is staged for.
+green
+# shellcheck disable=SC2016 # the loader's syntax again
+host_fixture '$ORIGIN' ''
+result=$(run)
+assert_status "a host with no NEEDED for the shared object is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "naming the entry that is missing" "$(output_of "$result")" \
+	"carries no NEEDED entry for libonnxruntime.so.1"
+
+# Nothing dynamic at all reads as a file the tool could not make sense of, which
+# must not pass as a contract that holds.
+green
+{
+	header reachy_host
+	printf 'Program Header:\n'
+} >"${FIXTURES}/reachy_host"
+result=$(run)
+assert_status "a host with no dynamic section is refused" 1 "$(status_of "$result")"
+assert_contains "saying it links nothing dynamically" "$(output_of "$result")" \
+	"has no dynamic section"
+
+# The host is read out of the same filegroup as everything else here, so a
+# rename upstream is a refusal rather than a check that silently stopped
+# happening.
+green
+CQUERY_DROP=reachy_host
+result=$(run)
+CQUERY_DROP=""
+assert_status "a host missing from the build is refused" 1 "$(status_of "$result")"
+assert_contains "naming what is missing" "$(output_of "$result")" \
+	"the build emits no reachy_host"
 
 tally

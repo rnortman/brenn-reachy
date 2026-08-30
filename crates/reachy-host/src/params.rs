@@ -587,10 +587,8 @@ mod tests {
     fn a_configuration_that_cannot_be_read_is_refused_with_the_path_in_it() {
         // A directory this test makes, so the file's absence is established
         // rather than assumed.
-        let dir = std::env::temp_dir().join(format!("reachy-host-absent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a directory to look in");
+        let dir = reachy_scratch::scratch_dir("reachy-host-params-absent");
         let missing = dir.join("host_params.textproto");
-        std::fs::remove_file(&missing).ok();
         let error = super::load(&missing).expect_err("a path that is not there");
         assert!(matches!(error.kind, ParamsErrorKind::Unreadable { .. }));
         let shown = error.to_string();

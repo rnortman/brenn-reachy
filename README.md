@@ -35,6 +35,12 @@ scripts do is search the machine and, for ONNX Runtime, download; what the
 answers should be is stated in `MODULE.bazel` and checked against the linked
 libraries by `//crates/reachy-host:host_closure_test`.
 
+The weights that runtime evaluates — the wake gate's three openWakeWord graphs
+and the endpointer's Silero graph — are fetched by digest too, and deliberately
+not committed: the openWakeWord models are CC BY-NC-SA 4.0, whose NonCommercial
+term this Apache-2.0 tree cannot redistribute under.
+`//bazel/third_party/models` names them and the deployed payload carries a copy.
+
 An editor wanting a project model gets one from
 `bazel run @rules_rust//tools/rust_analyzer:gen_rust_project`, which writes the
 `rust-project.json` rust-analyzer reads instead of cargo metadata. No gate uses
@@ -97,7 +103,8 @@ The response is uniform and deliberate:
 | `reachy-bench` | Bench binary: a read-only self-test registry and the bare-bus commands. It moves nothing. |
 | `reachy-edge` | The intent edge: a motion script from outside, screened — size, addressee, redelivery — and compiled into the request the session screens. Sans-I/O. |
 | `reachy-ask` | The motion harness's intent source: one pinned gesture through the real intent edge, and the session's narration rendered as JSON lines. |
-| `reachy-host` | The voice host process: the configuration it is built with, the running gate over `reachy-edge`, and the queue both intent sources hand bodies to. |
+| `reachy-host` | The voice host process: the configuration it is built with, the running gate over `reachy-edge`, the queue both intent sources hand bodies to, and the composition of the pod platform's speech pipeline whose two motion seams that gate fills. |
+| `reachy-scratch` | Test support, linked by nothing a unit runs: a scratch directory a case writes into, removed however the case ended. |
 | `reachy-motord` | The driver process: a 20 ms grid on the real clock, the serial port, and `reachy-driver`'s decisions, meeting the cogs over UDP. |
 | `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session` and `MotorSim` cogs, their schemas, the deterministic scenario suite, the online composition and its intent-edge sockets, and the log analyzer. |
 
@@ -169,7 +176,15 @@ logger process, and two loopback sockets where a producer of scripts stands.
 three binaries and the composition they are staged from, plus the bench binary,
 named once as `//bazel/platform:device_deployables` — then
 disassembles the C++ two and refuses any instruction the unit's Cortex-A72 does
-not implement, and CI blocks on both halves;
+not implement, and CI blocks on both halves. One payload member is outside that
+set and always will be: the audio device, `reachy_pod`, is brenn-pod's binary,
+compiled in that repo's arm64 container against the device image's own archive,
+and the payload build stages it from that artifact. One more is outside it and
+is not content here at all: the voice pipeline's configuration names a site's
+speech services, its bus server and token, and a unit's link keys, so the build
+stages whatever `REACHY_SPEECH_CONFIG` names — a payload built without one runs
+a host that narrates the session and does not listen.
+
 `docs/bench-runbook.md` is the procedure for the first run, and
 `//cogs:first_motion_report` is what reads its log.
 

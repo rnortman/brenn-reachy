@@ -5,23 +5,27 @@
 #   tools/build-motion.sh
 #
 # A cross-compile against the hermetic clang sysroot the pinned Clockwork drop
-# brings. A unit is four OS processes — the driver, the logger, the control loop and
-# the voice host — over three binaries, and each of those processes reads
-# configuration by a path relative to its working directory. So the artifact is
-# not a binary but a directory laid out the way those paths expect:
+# brings. A unit is five OS processes — the driver, the logger, the control loop,
+# the voice host and the audio device — over four binaries, and each of those
+# processes reads configuration by a path relative to its working directory. So
+# the artifact is not a binary but a directory laid out the way those paths
+# expect:
 #
 #   target/motion-arm64/release/
 #     simplelaunch                                      the launcher, started by hand
-#     robotcpu.textproto                                the four apps it starts
-#     robotcpu_harness.textproto                        the same without the host
+#     robotcpu.textproto                                the five apps it starts
+#     robotcpu_harness.textproto                        the same without host or pod
 #     clockwork/launch/clockwork_prelaunch.sh            what it runs before them
 #     reachy_motord                                     the driver process
 #     reachy_host                                       the voice host process
+#     reachy_pod                                        the audio device process
 #     reachy_ask                                        the harness's intent source
 #     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
 #     host/host_params.textproto                        the host's configuration
 #     cogs/clip_library.names.json                      the overlay name table it reads
+#     models/oww/*.onnx                                 the wake gate's three graphs
+#     models/silero/silero_vad.onnx                     the endpointer's graph
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
 #     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
@@ -33,11 +37,18 @@
 # other, and the host's two files keep their repository paths because the host's
 # own default and its configuration name them that way.
 #
-# Two launcher configs are staged. The production one names the host; the harness
-# twin does not, because `deploy-motion.sh --run` starts the intent source itself
-# and the host would bind the same narration port and address scripts to the same
-# port the control process binds. Both are staged because a unit is deployed once
-# and used for both.
+# Two launcher configs are staged. The production one names the host and the pod;
+# the harness twin names neither, because `deploy-motion.sh --run` starts the
+# intent source itself and the host would bind the same narration port and
+# address scripts to the same port the control process binds, and because a
+# motion run must need no audio hardware. Both are staged because a unit is
+# deployed once and used for both.
+#
+# One payload member is not built here. `reachy_pod` is brenn-pod's binary — it
+# links libusb and libasound and is compiled in that repo's arm64 container — so
+# it arrives as a prebuilt artifact named by `REACHY_POD_BINARY` below. This
+# script stages it, checks its machine, and reports its digest, exactly as it
+# does for the binaries it did build.
 #
 # Everything under it is copied out of Bazel's outputs rather than symlinked:
 # the freshness contract deploy-motion.sh enforces is about the age of files
@@ -50,7 +61,15 @@
 #
 # Knobs, environment only:
 #
-#   REACHY_BAZEL   the bazel to run (default bazel)
+#   REACHY_BAZEL           the bazel to run (default bazel)
+#   REACHY_POD_BINARY      the prebuilt audio-device binary to stage (default: the
+#                          one a sibling brenn-pod checkout's payload build leaves
+#                          behind)
+#   REACHY_SPEECH_CONFIG   the voice pipeline's own configuration to stage
+#                          (default: the gitignored host/speech.toml of this
+#                          tree; a payload built without one carries no speech
+#                          configuration, which is a host that narrates and does
+#                          not listen)
 
 set -euo pipefail
 
@@ -58,6 +77,12 @@ set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 bazel=${REACHY_BAZEL:-bazel}
+
+# The two payload members whose sources are outside this tree -- the audio
+# device's binary (`pod_binary`) and the site's speech configuration
+# (`speech_config`, staged at `speech_config_path`) -- are named by `lib.sh`:
+# this script stages them and `deploy-motion.sh` asks whether either has changed
+# since, and a knob spelled twice is a knob that answers two ways.
 
 # Every bazel invocation below runs from the workspace root, whatever directory
 # the caller was in: that is where the module lives, and it is what the
@@ -89,6 +114,28 @@ launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:robotcpu.textproto
 harness_config_target=//cogs:robotcpu_harness.textproto
 prelaunch_target=//cogs:clockwork_prelaunch_sh
+# The payload's one shared object. The voice host links ONNX Runtime
+# dynamically, so this file has to be staged beside it at the payload root: the
+# binary's runpath ends in `$ORIGIN`, and a `NEEDED` the loader cannot resolve
+# is a process that never starts.
+onnx_target=//bazel/third_party/onnxruntime:shared_object
+# The wake and VAD weights, fetched by digest rather than committed. One target
+# for all four, because they are staged as a set and none of them is told apart
+# from another by anything this script does.
+models_target=//bazel/third_party/models:models
+
+# Where each of them goes, by the name it was downloaded under. The paths are
+# not this script's choice either: the host's speech configuration names a model
+# by a path relative to the working directory the launcher starts it in, which is
+# the payload root, so this table and that configuration have to spell the same
+# four paths. A model the build fetches and this table has no row for is a
+# refused build rather than a file quietly left out of the payload.
+model_paths=(
+	"melspectrogram.onnx	models/oww/melspectrogram.onnx"
+	"embedding_model.onnx	models/oww/embedding_model.onnx"
+	"hey_jarvis_v0.1.onnx	models/oww/hey_jarvis_v0.1.onnx"
+	"silero_vad.onnx	models/silero/silero_vad.onnx"
+)
 
 # The configuration each process reads by a relative path, named by Bazel rather
 # than by a list here. `//cogs:robot_config_files` is the same target
@@ -139,7 +186,7 @@ logger_config=cogs/robot_logger.textproto
 # The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
 # those are the files an operator tails and the runbook names one by one. The
 # names are the compositions' -- `proc` and `logger_proc` from the `Process`
-# names, and `motord` and `voice_host` from the apps merged in through
+# names, and `motord`, `voice_host` and `pod` from the apps merged in through
 # `simplelaunch_src` -- so a rename in a `.clk` file would leave the documented
 # tails naming files that never appear.
 # This is the join: the names are pinned here against the config actually built,
@@ -151,9 +198,10 @@ logger_config=cogs/robot_logger.textproto
 # Two lists because two configs are staged, and the difference between them is
 # the whole point of the twin: the harness config must not name the host, or a
 # motion run would start a second binder of the narration port `reachy_ask`
-# holds. Asserted per config below, so a host app merged into the harness twin by
+# holds, and it must not name the pod, or a motion run would want a mic array.
+# Asserted per config below, so either app merged into the harness twin by
 # accident is a refused build rather than a bind race on a powered unit.
-launcher_apps=(logger_proc motord proc voice_host)
+launcher_apps=(logger_proc motord pod proc voice_host)
 
 harness_apps=(logger_proc motord proc)
 
@@ -231,6 +279,46 @@ plan() {
 	done
 }
 
+# The model files, as `<absolute source>\t<path under the payload root>`.
+#
+# Resolved the way the shared object is and not the way the configuration is:
+# these are fetched repositories' files, so the paths cquery answers with are
+# relative to the execution root, which the `bazel-out` convenience symlink does
+# not reach. Every file the build names must have a row in `model_paths` and
+# every row must be answered for, in both directions -- a model added to the
+# fetch and not to the table would be silently absent from a unit, and a row
+# nothing answers is a table describing a fetch that no longer happens.
+model_files=()
+
+resolve_models() {
+	local listing entry name want src wanted=0
+	listing=$(bazel_files "$models_target")
+	model_files=()
+
+	while IFS= read -r want; do
+		[ -n "$want" ] || continue
+		name=$(basename -- "$want")
+		src="${execroot}/${want}"
+		[ -f "$src" ] ||
+			die "the build names ${src} and no file is there." \
+				"A model archive pin moved, or its repository was not fetched."
+		for entry in "${model_paths[@]}"; do
+			[ "${entry%%$'\t'*}" = "$name" ] || continue
+			model_files+=("${src}"$'\t'"${entry#*$'\t'}")
+			break
+		done
+		[ ${#model_files[@]} -gt "$wanted" ] ||
+			die "the build fetches a model called ${name} and the payload has no place for it." \
+				"Give it a row in build-motion.sh's model_paths, at the path the host's" \
+				"speech configuration names it by."
+		wanted=${#model_files[@]}
+	done <<<"$listing"
+
+	[ "${#model_files[@]}" -eq "${#model_paths[@]}" ] ||
+		die "the payload wants ${#model_paths[@]} model files and the build named ${#model_files[@]}." \
+			"MODULE.bazel's fetches and build-motion.sh's model_paths describe one set."
+}
+
 # The commit the payload's binaries came out of, into the payload itself.
 #
 #   stamp_build_commit <file>
@@ -284,9 +372,15 @@ stage() {
 
 	install -m 0755 -D -- "$motord_out" "${staging}/reachy_motord"
 	install -m 0755 -D -- "$host_out" "${staging}/reachy_host"
+	# The one binary in the payload this build did not produce: brenn-pod's, at
+	# the payload root under this payload's own naming, which is what the pod's
+	# app entry spells.
+	install -m 0755 -D -- "$pod_binary" "${staging}/reachy_pod"
 	# Not a launcher app: it binds the narration port before the composition is
 	# started, so `--run` starts it itself, ahead of the launcher.
 	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
+	# Beside the host, because that is what its `$ORIGIN` runpath means.
+	install -m 0755 -D -- "$onnx_out" "${staging}/libonnxruntime.so.1"
 	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
 	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
 	install -m 0644 -D -- "$launch_config_out" "${staging}/robotcpu.textproto"
@@ -294,9 +388,16 @@ stage() {
 	install -m 0755 -D -- "$prelaunch_out" \
 		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 
-	for entry in "${plan_files[@]}"; do
+	for entry in "${plan_files[@]}" "${model_files[@]}"; do
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
+
+	# The one member that may be absent, and the one staged 0600: it carries a
+	# bus token and this unit's link keys, so it is readable by the account that
+	# runs the payload and by nobody else on the machine.
+	if [ -f "$speech_config" ]; then
+		install -m 0600 -D -- "$speech_config" "${staging}/${speech_config_path}"
+	fi
 
 	stamp_build_commit "${staging}/${build_commit_name}"
 
@@ -307,14 +408,27 @@ stage() {
 	rm -rf -- "$previous"
 }
 
+# The digests are how a person tells two payloads apart at the bench; for
+# `reachy_pod` they are more than that, because the payload's build stamp records
+# this tree's commit and says nothing about a binary that came out of another
+# repo's container.
 report() {
 	local size
 	size=$(du -sh -- "$payload" | cut -f1)
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
-	for file in reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch; do
+	for file in reachy_motord reachy_host reachy_pod reachy_ask libonnxruntime.so.1 \
+		cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
+	# Said either way, and without a digest: the contents are a site's own, and
+	# what a person needs to know at the bench is whether this payload's host
+	# will listen or only narrate.
+	if [ -f "${payload}/${speech_config_path}" ]; then
+		echo "${prog}: ${speech_config_path}  staged from ${speech_config}"
+	else
+		echo "${prog}: ${speech_config_path}  absent; the voice host will run its edge half alone"
+	fi
 }
 
 require_bazel "device payload"
@@ -332,13 +446,51 @@ launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
 harness_config_out=$(bazel_named_in "$built" robotcpu_harness.textproto)
 prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
+# Resolved on its own and not out of the listing above: the shared object is a
+# fetched repository's file, so the path cquery answers with is relative to the
+# execution root rather than to this workspace, and the `bazel-out` symlink the
+# other outputs resolve through does not reach it. The device ISA sweep reads it
+# the same way.
+execroot=$("$bazel" info "${build_flags[@]}" execution_root \
+	--ui_event_filters=-info --noshow_progress) ||
+	die "bazel cannot say where its execution root is, so the fetched shared object cannot be found."
+onnx_out="${execroot}/$(bazel_files "$onnx_target")"
+[ -f "$onnx_out" ] ||
+	die "the build names ${onnx_out} and no file is there." \
+		"The ONNX Runtime archive pin moved, or its repository was not fetched."
+# The prebuilt member, decided here with the built ones and before anything is
+# staged: a payload missing the pod binary is a launcher that starts an app that
+# is not there, and the app entry is in the production config unconditionally
+# because a unit without a working audio device is still a unit whose pod should
+# be trying.
+[ -f "$pod_binary" ] ||
+	die "there is no audio-device binary at ${pod_binary}." \
+		"It is brenn-pod's to build: run 'make -C ../brenn-pod/firmware reachy-pod'" \
+		"in a checkout of that repo, or name the artifact with REACHY_POD_BINARY."
+# The other member from outside the build, decided in the same place. Only the
+# named case can refuse: an unnamed one that is not there is a payload whose
+# host narrates and does not listen, which is what a unit runs until somebody
+# has a configuration to push.
+if [ -n "$speech_config_named" ] && [ ! -f "$speech_config" ]; then
+	die "there is no speech configuration at ${speech_config}." \
+		"REACHY_SPEECH_CONFIG names the voice pipeline's own TOML, which is a site's" \
+		"file and is never in this tree; unset it to build a payload whose host runs" \
+		"its edge half alone."
+fi
+resolve_models
 check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"
 check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
 verify_aarch64 "$motord_out"
 verify_aarch64 "$host_out"
+# Asked of the prebuilt member the same way, and it is the one where the answer
+# is in doubt: everything else here was cross-compiled by the build that just
+# ran, while this file was compiled elsewhere, and a workstation build of
+# brenn-pod's own pod binary sits at a path that looks just like the arm64 one.
+verify_aarch64 "$pod_binary"
 verify_aarch64 "$ask_out"
 verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
+verify_aarch64 "$onnx_out"
 plan "$built" "$configs"
 stage
 report

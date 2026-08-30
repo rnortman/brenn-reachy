@@ -86,13 +86,19 @@ BUILD_COMMIT=""
 stage_payload() {
 	local when=$1
 	local name
-	for name in reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch; do
+	for name in reachy_motord reachy_host reachy_pod reachy_ask libonnxruntime.so.1 \
+		cogs/robot_clk_exe simplelaunch; do
 		: >"${payload}/${name}"
 		chmod 0755 -- "${payload}/${name}"
 	done
 	: >"${payload}/robotcpu.textproto"
 	: >"${payload}/robotcpu_harness.textproto"
 	: >"${payload}/cogs/session_params.textproto"
+	for name in models/oww/melspectrogram.onnx models/oww/embedding_model.onnx \
+		models/oww/hey_jarvis_v0.1.onnx models/silero/silero_vad.onnx; do
+		mkdir -p -- "$(dirname -- "${payload}/${name}")"
+		: >"${payload}/${name}"
+	done
 	stage_logger_config
 	rm -f -- "${payload}/build-commit.txt"
 	[ -z "$BUILD_COMMIT" ] ||
@@ -294,6 +300,67 @@ assert_contains "--stale-ok says the age went unchecked" "$(output_of "$result")
 	"the payload's age is not being checked"
 assert_contains "--stale-ok still pushes" "$(calls)" "rsync"
 
+# The two payload members no commit to this workspace can date: the prebuilt
+# audio device binary and the site's speech configuration. The commit-time check
+# above cannot see either, so a rebuilt binary or a rotated token would otherwise
+# ship as new under a green verdict.
+stage_payload "$after"
+# The staged copies carry the moment they were installed, so a case dates both
+# sides: the payload's copy at the build's instant, the source relative to it.
+touch -d "@${after}" -- "${payload}/reachy_pod"
+pod_source="${repo}/../brenn-pod/firmware/target/reachy-pod/payload/reachy-pod"
+mkdir -p -- "$(dirname -- "$pod_source")"
+: >"$pod_source"
+touch -d "@${after}" -- "$pod_source"
+result=$(deploy unit --push)
+assert_status "an audio device binary no newer than the staged copy pushes" 0 \
+	"$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "$pod_source"
+result=$(deploy unit --push)
+assert_status "a rebuilt audio device binary refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the member" "$(output_of "$result")" \
+	"audio device binary"
+assert_contains "and says which copy would be shipped" "$(output_of "$result")" \
+	"newer than the copy in the payload"
+assert_contains "and names the rebuild" "$(output_of "$result")" "make motion-build"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok covers the out-of-tree members too" 0 \
+	"$(status_of "$result")"
+rm -f -- "$pod_source"
+
+# The speech configuration, whose staged copy is optional: a source that exists
+# against a payload carrying none is the same mistake, because the file existed
+# nowhere when the payload was staged.
+speech_source="${repo}/host/speech.toml"
+mkdir -p -- "$(dirname -- "$speech_source")"
+printf 'listen_addr = "127.0.0.1:7380"\n' >"$speech_source"
+touch -d "@${after}" -- "$speech_source"
+result=$(deploy unit --push)
+assert_status "a speech configuration the payload never staged refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the payload carries none" "$(output_of "$result")" \
+	"the staged payload carries none"
+assert_lacks "and that one pushes nothing either" "$(calls)" "rsync"
+
+mkdir -p -- "${payload}/host"
+: >"${payload}/host/speech.toml"
+touch -d "@$((after + 60))" -- "${payload}/host/speech.toml"
+result=$(deploy unit --push)
+assert_status "a staged copy newer than the source pushes" 0 "$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "$speech_source"
+result=$(deploy unit --push)
+assert_status "a speech configuration edited since the build refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names that member" "$(output_of "$result")" \
+	"speech configuration"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+rm -f -- "$speech_source" "${payload}/host/speech.toml"
+stage_payload "$after"
+
 # A tree that cannot answer the question is not a stale tree.
 GIT_COMMIT_TIME=""
 result=$(deploy unit --push)
@@ -330,6 +397,49 @@ result=$(deploy unit --push)
 assert_status "a payload missing the voice host refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names the host binary" "$(output_of "$result")" \
 	"no executable reachy_host"
+stage_payload "$after"
+
+# The audio device is a payload binary the build did not compile: it is staged
+# from a prebuilt brenn-pod artifact. What the push checks is the same thing it
+# checks for the rest -- the production launcher config names a `reachy_pod` at
+# the payload root, and a unit whose payload has none is a launcher starting an
+# app that is not there.
+rm -f -- "${payload}/reachy_pod"
+result=$(deploy unit --push)
+assert_status "a payload missing the audio device refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the pod binary" "$(output_of "$result")" \
+	"no executable reachy_pod"
+stage_payload "$after"
+
+# The shared object is a payload member for a reason none of the others share:
+# it is nobody's launcher app, and what needs it is the loader, at the instant
+# the host is exec'd. A payload without it is a host that dies before it can
+# narrate anything.
+rm -f -- "${payload}/libonnxruntime.so.1"
+result=$(deploy unit --push)
+assert_status "a payload missing the shared object refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the shared object" "$(output_of "$result")" \
+	"no shared object libonnxruntime.so.1"
+stage_payload "$after"
+
+# The weights are the one part of the payload the build fetches over a network,
+# so they are the one part a proxy or an outage can leave out of an otherwise
+# complete staging. Refused here, because the symptom on a unit is a wake gate
+# that fails at its first inference rather than a process that never starts.
+rm -f -- "${payload}/models/oww/hey_jarvis_v0.1.onnx"
+result=$(deploy unit --push)
+assert_status "a payload missing the wake phrase's model refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the missing model" "$(output_of "$result")" \
+	"no model models/oww/hey_jarvis_v0.1.onnx"
+stage_payload "$after"
+
+rm -f -- "${payload}/models/silero/silero_vad.onnx"
+result=$(deploy unit --push)
+assert_status "a payload missing the endpointer's model refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names that one too" "$(output_of "$result")" \
+	"no model models/silero/silero_vad.onnx"
 stage_payload "$after"
 
 # The two launcher configs are payload members like the binaries: `--run` names
@@ -1012,13 +1122,14 @@ RSYNC_STATUS=0
 # The stamp cannot be finer than the name it makes, so the collision is refused.
 #
 # The stamp is the subject's own `date`, so the destination is pre-created for
-# this second and the next few: the second can tick between this line and the
+# this second and the next several: the second can tick between this line and the
 # subject's read, and a self-check that fails once an hour is a self-check
-# nobody believes.
+# nobody believes. Ten seconds, because three cases each run a whole fetch and
+# the window is measured under `make check`, where the machine is also building.
 collide="${work}/collide"
 occupy() {
 	local dir=$1 suffix=$2 ahead
-	for ahead in 0 1 2 3; do
+	for ahead in 0 1 2 3 4 5 6 7 8 9; do
 		mkdir -p -- "${dir}/motion-log-$(date -u -d "+${ahead} seconds" +%Y%m%dT%H%M%SZ)${suffix}"
 	done
 }

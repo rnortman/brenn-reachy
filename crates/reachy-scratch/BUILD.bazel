@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Apache-2.0. A scratch directory for tests that have to hand a real path to
+# code which reads a file.
+#
+# `testonly`, so nothing a unit runs can link it: what it does -- make a
+# directory under the machine's temporary directory and remove it again -- is
+# not something a process on the robot has any business doing.
+rust_library(
+    name = "reachy_scratch",
+    testonly = True,
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "reachy_scratch_test",
+    size = "small",
+    crate = ":reachy_scratch",
+)

@@ -338,6 +338,102 @@ refuse_if_stale() {
 }
 
 # ---------------------------------------------------------------------------
+# The payload members that come from outside this tree
+# ---------------------------------------------------------------------------
+#
+# Named here rather than in the build script because two scripts need them: the
+# build stages them, and the push asks whether either has changed since. The
+# commit-time freshness question above cannot see either -- no commit to this
+# workspace touches them -- so they get their own, and a knob spelled once
+# cannot answer the two scripts differently.
+
+# The audio device's binary, which this repo does not build.
+#
+# `reachy-pod` links libusb-1.0 and libasound2 and is compiled natively in
+# brenn-pod's pinned arm64 container, against the same dated Debian archive the
+# device image is bootstrapped from. Nothing in this tree's hermetic sysroot can
+# produce it, and vendoring the sources would be a second copy of a binary
+# brenn-pod already ships — so the payload takes the artifact that build leaves
+# behind.
+#
+# The default is where a sibling checkout puts it, because that is how the two
+# repos are worked on and an inner loop that needs a knob set on every invocation
+# is a knob people set wrong. It is a default and not an assumption: a path that
+# is not there is a refused build naming both the knob and the command in the
+# other repo that produces the file, so a different layout says so once rather
+# than staging something unexpected.
+pod_binary=${REACHY_POD_BINARY:-${repo_root}/../brenn-pod/firmware/target/reachy-pod/payload/reachy-pod}
+
+# The voice pipeline's own configuration, which this repo does not contain and
+# will not.
+#
+# It holds a site's STT and TTS endpoints, its bus server and token, and this
+# unit's link keys, so every copy of it belongs to whoever runs the machine.
+# There is no shipped default: a tree-resident one would either carry somebody's
+# infrastructure into a public repository or name endpoints that answer nobody,
+# and the launcher entry is not the place to discover which.
+#
+# So this is an optional payload member. Named, it must be there -- an operator
+# who said where the configuration is and typed the path wrong wants to hear it
+# now, not from a unit's console. Unnamed, the default is the gitignored
+# `host/speech.toml` of the working tree, and its absence is not a refusal: the
+# host starts either way and says which of the two it is, and a motion run and a
+# bench night need no speech configuration at all.
+speech_config=${REACHY_SPEECH_CONFIG:-${repo_root}/host/speech.toml}
+# Whether an operator named it, which is the whole difference between "not there
+# and that is the shipped state" and "not there and you asked for it".
+speech_config_named=${REACHY_SPEECH_CONFIG:+named}
+
+# Where the speech configuration goes under the payload root: the path
+# `host/host_launch.textproto` spells in the host's `--speech-config` argument.
+# The two have to agree, and `tools/build-motion.test.sh` holds them to each
+# other.
+speech_config_path=host/speech.toml
+
+# Refuse a payload member whose out-of-tree source has moved on since the build
+# staged it.
+#
+#   refuse_if_source_newer <staged> <source> <noun> <stale-ok cmd>
+#
+# The commit-time check above answers for everything this tree builds and for
+# nothing else, and the two members above are the everything else: a rebuilt
+# `reachy-pod`, or a speech configuration whose token or link keys were just
+# rotated, changes nothing any commit to this workspace can date. Pushed without
+# a rebuild, that is the previous binary and the previous credentials shipped
+# under a green freshness verdict — the exact mistake the age check exists to
+# stop, and the credential flavour of it is the one an operator would chase on
+# the unit.
+#
+# A source that is not there says nothing: the pod binary's absence is refused by
+# the build, and a payload built with no speech configuration is the ordinary
+# case. A source that is there against a payload carrying no copy is a refusal
+# for the same reason a newer one is — the file existed nowhere when this payload
+# was staged.
+refuse_if_source_newer() {
+	local staged=$1 source=$2 noun=$3 stale_ok=$4
+	[ -f "$source" ] || return 0
+	local source_at staged_at
+	source_at=$(stat -c %Y -- "$source") ||
+		die "cannot read the age of ${source}"
+	if [ ! -f "$staged" ]; then
+		die "there is a ${noun} at ${source} and the staged payload carries none, so this push would ship a unit without it." \
+			"Rebuild it:" \
+			"    make motion-build" \
+			"or, to push the payload as it stands:" \
+			"    ${stale_ok}"
+	fi
+	staged_at=$(stat -c %Y -- "$staged") ||
+		die "cannot read the age of ${staged}"
+	[ "$staged_at" -lt "$source_at" ] || return 0
+	die "the ${noun} at ${source} is newer than the copy in the payload, so this push would ship the older one." \
+		"Staged $(date -d "@${staged_at}" '+%Y-%m-%d %H:%M:%S'), source $(date -d "@${source_at}" '+%Y-%m-%d %H:%M:%S')." \
+		"Rebuild it:" \
+		"    make motion-build" \
+		"or, to push the copy the payload already carries:" \
+		"    ${stale_ok}"
+}
+
+# ---------------------------------------------------------------------------
 # A run's records
 # ---------------------------------------------------------------------------
 

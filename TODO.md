@@ -792,33 +792,34 @@ Done = an operator on the unit can ask what the head is doing and get an answer
 that does not require reading a log. Marked at the host's console surface in
 `crates/reachy-host/src/edge.rs`.
 
-## `host-intent-producers`
+## `host-alert-publish`
 
-The two tasks that author intent for the voice host's edge: the speech
-pipeline's scripter, and the host's Brenn-bus subscription for remote senders.
+The voice host's alerts go onto its own narration stream and nowhere else. The
+alert plane the design puts them on — fault and park rows as `Critical`, refusals
+as a once-per-run `Warning` — is not reached.
 
-Deferral context: the host holds the receiving half of the intent queue and the
-gate behind it, and both are exercised. Nothing holds the sending half. The
-scripter lives in brenn-pod's `speech-surface` and reaches the edge through a
-sink seam on its `ScriptTask`; the bus deliveries reach it through an optional
-motion-intent subscription on `BridgeDriver`. Both of those are brenn-pod
-changes, and the wiring that injects them into this process arrives with the
-pipeline composition — the half of `reachy-host` that is not the edge. Until
-then the binary follows the session's story, narrates it, and asks for nothing.
+Deferral context: the alert table is built and exercised
+(`crates/reachy-edge/src/alerts.rs`), and the host renders every alert it raises
+as a line. What is missing is the publish. Alerts ride the robot's single bus
+attachment, and that attachment is held inside `speech-surface`'s `Server::run`:
+the composing process supplies the two motion sinks and never sees the
+`BridgeHandle` behind them. So there is no seam to publish through, and inventing
+a second attachment in this process would give the robot two, which the design
+rules out by name.
 
-The queue's own policy — bounded at eight, dropping rather than growing or
-blocking — is sized against a presence refresh cadence no producer in this tree
-runs yet, so the first real producer is also the first measurement of it.
+The seam is a brenn-pod change of the same shape as the two that already exist —
+something the server hands a composing process once its bridge is up — and it is
+a small design question rather than a mechanical one: an alert is fire-and-forget
+on an async handle, and the edge's table raises them from a blocking loop, so
+what crosses the seam is a queue and not a call. Nothing about the machine rests
+on it: an operator alert is a report, and a fault reaches the Minimum Risk
+Condition without one.
 
-The seams alone are not enough: both are reached through `Server::with_sinks`,
-which is newer than the `BRENN_POD_REV` the closure is pinned at, so the wiring
-cannot compile until that constant moves.
-
-Done = a wake word on the unit reaches the motors through this queue, and a
-script published on the bus's motion channel reaches the same gate, with
-`MODULE.bazel`'s `BRENN_POD_REV` moved to a published brenn-pod revision
-carrying `Server::with_sinks`. Marked where the sending half is dropped, in
-`crates/reachy-host/src/main.rs`, and at the pin in `MODULE.bazel`.
+Done = a fault or park row raises a `Critical` on the bus and a refusal a
+once-per-run `Warning`, through the host's own attachment, with the
+narration-only behaviour intact where no bus is configured. Marked at the host's
+console surface in `crates/reachy-host/src/edge.rs` and at the pin in
+`MODULE.bazel`.
 
 ## `motion-proto-two-copies`
 
@@ -826,13 +827,12 @@ Two copies of the motion wire contract compile in this build: `crates/
 motion-proto`, and the one `speech-surface` brings through the pinned host
 closure. `//crates/reachy-host:host_closure_test` links the second.
 
-Deferral context: `speech-surface` takes `motion-proto` as a path dependency
-inside brenn-pod at the currently pinned revision, and at brenn-pod's later
-revisions it takes it from a *historical* brenn-reachy commit — so the fetched
-copy is one publish behind this tree's either way, and re-pinning does not
-dissolve it. Harmless today by construction: both seams the host will use carry
-an encoded body (`ScriptOut.body`, `IntentSink::deliver(&str)`), never a
-`MotionScript` value, so the two types never meet. What it costs is that a
+Deferral context: `speech-surface` takes `motion-proto` from a *historical*
+brenn-reachy commit, so the fetched copy is one publish behind this tree's and
+re-pinning does not dissolve it. Harmless by construction: both seams the host
+composes through carry an encoded body (`ScriptOut.body`,
+`IntentSink::deliver(&str)`), never a `MotionScript` value, so the two types
+never meet. What it costs is that a
 decode-tolerance fix made here is not in the pipeline that produced the bytes,
 and the two definitions can diverge with both repos' gates green.
 
@@ -845,42 +845,6 @@ one-line `data =` it looks like.
 
 Done = `speech-surface` no longer depends on `motion-proto` from outside this
 repo, and the build resolves the crate once. Marked at `BRENN_POD_REV` in
-`MODULE.bazel`.
-
-## `host-payload-membership`
-
-A unit stages and starts `reachy_host`, but what it starts is not yet the voice
-host: the pod audio device, the speech configuration and the wake/VAD model
-files are not in the payload, and the process runs with the voice pipeline
-unlinked.
-
-Deferral context: the binary, its two configuration files and the two launcher
-configs landed together, because the production config naming the host and the
-harness twin that does not are one indivisible pair — a production config naming
-`reachy_host` while `--run` starts `reachy_ask` against it puts both owners of
-7409/7410 in one motion run, and that pairing had no reason to wait. What is
-still missing all comes from brenn-pod or from the pipeline this binary does not
-link yet: the `reachy-pod` audio device as a prebuilt artifact, `speech-surface`'s
-TOML, and the openWakeWord and Silero models. `MODULE.bazel`'s `BRENN_POD_REV`
-has to move to a published revision carrying `Server::with_sinks` before the host
-composes the pipeline at all, so the runtime data it would read has nothing to
-read it.
-
-One thing is the payload's own and waits with them: the host will link ONNX
-Runtime as a *shared* library — Microsoft publishes no static build, and the pyke
-archive `ort` would otherwise fetch is in a container format Bazel cannot extract
-— so `libonnxruntime.so.1` has to be staged beside the binary and found by the
-loader. Nothing else in the payload has a shared-library dependency, so neither
-deploy script has anywhere to put one yet;
-`//bazel/third_party/onnxruntime:shared_object` is the label that names the file
-(the device ISA sweep already reads it there). Staging it before anything loads
-it would be a payload member nothing opens.
-
-Done = the pod device binary, the speech configuration, the model files and
-`libonnxruntime.so.1` are staged beside `reachy_host`, the loader finds the
-shared object, and the production launcher config names the pod app as well as
-the host. Marked at the filegroup in `bazel/platform/BUILD.bazel`, at the binary
-in `crates/reachy-host/BUILD.bazel`, and at the ONNX Runtime archives in
 `MODULE.bazel`.
 
 ## `params-reader-shared`
@@ -918,6 +882,9 @@ same shape — the `main` that dispatches to `parse`/`run` and prints `prog:
 message`, the word loop, a `given` bool per flag, and a `usage()` string. The
 refusal wording is operator-facing and already varies between the three for the
 same mistake, and the per-flag bool scales with the flag count in every copy.
+Two of the three now carry two flags each — `reachy-host` took `--speech-config`
+beside `--config` — so the shape being copied is a loop over flags, not a loop
+around one.
 
 Not done in place for the same reason as `params-reader-shared`: one of the
 three is the driver, which the cycle that made the third copy leaves alone. The
@@ -927,7 +894,8 @@ existing dependency already carries a parser worth adopting.
 
 Done = the three binaries parse their arguments through one helper and refuse
 the same mistake with the same words. Marked at the harness's copy in
-`crates/reachy-ask/src/main.rs`.
+`crates/reachy-ask/src/main.rs` and at the host's in
+`crates/reachy-host/src/main.rs`.
 
 ## `story-restart-discriminator`
 

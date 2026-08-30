@@ -7,12 +7,13 @@
 //! path to the motors must not leave the machine: a bus round trip to a server
 //! that is not in this house is a head that hesitates after somebody speaks.
 //!
-//! What is here is the edge half — the configuration ([`params`]), the surface
-//! its narration lands on ([`edge`]), and the queue both intent sources hand
-//! bodies to ([`intents`]). The gate and the narration themselves are
-//! `reachy-edge`'s, held by the same [`HostEdge`] the harness runs. The speech
-//! pipeline this composes with is a library of the pod platform, and the wiring
-//! that links it is the process's other half.
+//! What is here is both halves. The edge half is the configuration
+//! ([`params`]), the surface its narration lands on ([`edge`]), and the queue
+//! both intent sources hand bodies to ([`intents`]); the gate and the narration
+//! themselves are `reachy-edge`'s, held by the same [`HostEdge`] the harness
+//! runs. The voice half is the pod platform's own server, composed here
+//! ([`voice`]) with its two motion seams filled by this process's gate
+//! ([`sinks`]) instead of by a bus that is not on this machine.
 //!
 //! [`HostEdge`]: reachy_edge::HostEdge
 //!
@@ -34,7 +35,11 @@
 pub mod edge;
 pub mod intents;
 pub mod params;
+pub mod sinks;
+pub mod voice;
 
 pub use edge::Console;
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};
+pub use sinks::{BusIntents, Lines, ScripterIntents, Stdout};
+pub use voice::{Voice, absent_line, composed_line, silent_line};

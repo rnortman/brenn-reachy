@@ -1,0 +1,35 @@
+# The audio device's entry in the launcher's app table, merged into the launcher
+# config `RobotCpu` renders (`cogs/robot.clk`) so that one supervisor starts and
+# stops every process a unit runs.
+#
+# One message of simplelaunch's `AppConfig`. Hand-written for the reason
+# `driver/motord_launch.textproto` and `host/host_launch.textproto` are: the
+# renderer only knows about Clockwork processes, and the pod is not one -- it is
+# brenn-pod's binary, holding the mic array over USB and the board's ALSA
+# devices, and it reaches this repo as a prebuilt artifact rather than as a
+# target of this build.
+#
+# The executable is resolved against the launcher's working directory, which is
+# the payload root -- so this is where `tools/build-motion.sh` stages the pod
+# binary. The argument selects the streaming pipeline; the same binary also
+# carries self-test registries.
+#
+# No configuration argument, because the pod takes none: it reads
+# `/run/brenn-app/conf/audio.conf` by a compiled-in path, which is a per-unit
+# push into RAM because it holds that unit's link key. A pod started before that
+# file is there parks and re-reads rather than exiting, so this app is safe to
+# start on a unit whose credentials have not been pushed yet -- what it does then
+# is wait, in its own console log.
+#
+# Named `pod` because that is this repo's word for the audio device, and the
+# launcher spells each app's console `<name>_<run>.log`.
+#
+# Merged into the production config only. The harness twin
+# (`cogs:robotcpu_harness.textproto`) leaves it out for the same reason it leaves
+# the voice host out: a motion run must need no audio hardware, no speech
+# services and nothing streaming off the board.
+app {
+  name: "pod"
+  executable: "reachy_pod"
+  args: "run"
+}
