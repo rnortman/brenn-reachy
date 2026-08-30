@@ -42,5 +42,10 @@ rust_clk_module(
 )
 
 # The numbers the host ships with, read by the host at startup and by the test
-# that holds this file to the schema.
-exports_files(["host_params.textproto"])
+# that holds this file to the schema; and the host's entry in the launcher's app
+# table, which `cogs/robot.clk`'s `RobotCpu` merges into the production launcher
+# config and the harness twin deliberately leaves out.
+exports_files([
+    "host_launch.textproto",
+    "host_params.textproto",
+])

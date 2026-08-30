@@ -30,25 +30,41 @@ platform(
     visibility = ["//visibility:public"],
 )
 
-# What a motion run on a unit is built out of: the driver binary, the executable
+# What a unit is built out of: the driver binary, the voice host, the executable
 # both cog processes start from, the system target that emits their process
-# descriptions and the writer's channel set, the launcher that starts all three
-# processes, the launcher config naming them, and the harness's intent source --
-# which the launcher does not start, because it binds the narration port before
-# the composition comes up. tools/build-motion.sh builds this, so the payload it
+# descriptions and the writer's channel set, the launcher that starts them, the
+# two launcher configs naming them, and the harness's intent source -- which the
+# launcher does not start, because it binds the narration port before the
+# composition comes up. tools/build-motion.sh builds this, so the payload it
 # stages and the set the gate covers are one set.
+#
+# Two launcher configs, not one: the production config names the host, and the
+# harness twin does not, because `deploy-motion.sh --run` starts the intent
+# source itself, and a second process binding the narration port 7410 and
+# addressing scripts to 7409 in one run is a bind race deciding the verdict.
+# `//cogs:BUILD.bazel` states the rule at the rules.
 #
 # The launcher is C++ from the drop rather than anything of ours, so it is also
 # what makes `make check-device` gate a cross-build of boost, protobuf and
 # abseil for the device.
+#
+# What is deployed and what a unit needs are not yet the same set: the voice
+# host on a unit is a process that follows the session's story and narrates it,
+# because the pod audio device, the speech configuration and the wake and VAD
+# models come from brenn-pod and the pipeline that reads them is not linked into
+# this binary yet. It is staged now because the launcher entry and the harness
+# twin are one indivisible pair, and the twin is what keeps a motion run honest.
+# TODO(host-payload-membership)
 filegroup(
     name = "motion_payload",
     srcs = [
         "//cogs:clockwork_prelaunch_sh",
         "//cogs:robot_clk_exe",
         "//cogs:robotcpu.textproto",
+        "//cogs:robotcpu_harness.textproto",
         "//cogs:system_robot_clk",
         "//crates/reachy-ask:reachy_ask",
+        "//crates/reachy-host:reachy_host",
         "//crates/reachy-motord:reachy_motord",
         "@clockwork//jewels/simplelaunch:simplelaunch",
     ],
@@ -61,17 +77,16 @@ filegroup(
 # else to add it. Membership here is a build claim, not a deploy claim --
 # `motion_payload` above is the only place a *deployed* member is declared.
 #
-# `//crates/reachy-host:reachy_host` is gated but not staged: the four things it
-# needs beside it on a unit -- the pod audio device, the speech configuration,
-# the wake and VAD models, and a launcher config naming the app -- are not here
-# yet, so no payload carries it.
-# TODO(host-payload-membership)
+# One thing `make check-device` cross-builds is deliberately not here:
+# `//crates/reachy-host:host_closure_test`, the only target that links OpenSSL
+# and ONNX Runtime, and so the only proof that the voice pipeline's native
+# libraries resolve for the unit's architecture. It is testonly, which this
+# filegroup cannot carry, so the Makefile names it beside this one.
 filegroup(
     name = "device_deployables",
     srcs = [
         ":motion_payload",
         "//crates/reachy-bench:reachy_bench",
-        "//crates/reachy-host:reachy_host",
     ],
     visibility = ["//visibility:public"],
 )

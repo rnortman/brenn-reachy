@@ -41,18 +41,24 @@ rust_library(
 )
 
 # The process the robot's voice runs in. Cross-compiled for the device with
-# `--platforms=//bazel/platform:reachy-device`. Its configuration travels with
-# it as a runfile, which is the path the binary defaults to.
+# `--platforms=//bazel/platform:reachy-device`.
 #
-# Cross-built on the gate as a member of `//bazel/platform:device_deployables`,
-# but not yet a payload member: `//bazel/platform:motion_payload` -- the one
-# place a deployed member is named -- does not carry it, because no unit stages
-# or starts it yet.
+# Both files it reads by path travel with it: its own configuration, at the path
+# the binary defaults to, and the clip name table that configuration points at.
+# The payload lays both out the same way, because the launcher runs this from the
+# payload root and a runfiles tree and that root spell the same relative paths.
+#
+# A member of `//bazel/platform:motion_payload`, so a unit stages and starts it
+# and the gate cross-builds it. What it does there is follow the session's story
+# and narrate it: the voice pipeline is not linked in yet.
 # TODO(host-payload-membership)
 rust_binary(
     name = "reachy_host",
     srcs = ["src/main.rs"],
-    data = ["//host:host_params.textproto"],
+    data = [
+        "//cogs:clip_library.names.json",
+        "//host:host_params.textproto",
+    ],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -89,6 +95,31 @@ rust_test(
     name = "reachy_host_test",
     size = "small",
     crate = ":reachy_host_lib",
+)
+
+# The voice pipeline's third-party closure, linked. Every other target in this
+# package is pure Rust; this one pulls in OpenSSL and ONNX Runtime, which are
+# native libraries the build supplies rather than the machine, and asks each one
+# what version it is. It is the gate's proof that the closure links and that the
+# `--cfg` flags `MODULE.bazel` states for the two crates whose discovery build
+# scripts are switched off describe the library that actually got linked.
+#
+# All three brenn-pod crates are deps, not just the surface: the closure claim is
+# that every native library any of them carries resolves, and a crate reached
+# only through another's internal edges is a claim about that other crate's
+# current dependency list rather than about this link.
+rust_test(
+    name = "host_closure_test",
+    size = "small",
+    srcs = ["tests/host_closure.rs"],
+    edition = "2024",
+    deps = [
+        "@brenn_reachy_crates//:brenn-bridge",
+        "@brenn_reachy_crates//:openssl",
+        "@brenn_reachy_crates//:ort",
+        "@brenn_reachy_crates//:speech-pipeline",
+        "@brenn_reachy_crates//:speech-surface",
+    ],
 )
 
 # The shipped configuration, read by the parser that will read it on the device.

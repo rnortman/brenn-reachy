@@ -5,27 +5,39 @@
 #   tools/build-motion.sh
 #
 # A cross-compile against the hermetic clang sysroot the pinned Clockwork drop
-# brings. A motion run on a unit is three OS processes — the driver, the logger, and the
-# control loop — over two binaries, and each of those processes reads
+# brings. A unit is four OS processes — the driver, the logger, the control loop and
+# the voice host — over three binaries, and each of those processes reads
 # configuration by a path relative to its working directory. So the artifact is
 # not a binary but a directory laid out the way those paths expect:
 #
 #   target/motion-arm64/release/
 #     simplelaunch                                      the launcher, started by hand
-#     robotcpu.textproto                                the three apps it starts
+#     robotcpu.textproto                                the four apps it starts
+#     robotcpu_harness.textproto                        the same without the host
 #     clockwork/launch/clockwork_prelaunch.sh            what it runs before them
 #     reachy_motord                                     the driver process
+#     reachy_host                                       the voice host process
+#     reachy_ask                                        the harness's intent source
 #     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
+#     host/host_params.textproto                        the host's configuration
+#     cogs/clip_library.names.json                      the overlay name table it reads
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
 #     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
 #
-# The three launcher paths are not this script's choice: the rendered launcher
-# config spells every executable and argument as a path relative to the
-# launcher's working directory, which is the payload root, so where a file goes
-# is what that config already says. `robot_clk_exe` lives under `cogs/` for that
-# reason and no other.
+# The launcher paths are not this script's choice: the rendered launcher config
+# spells every executable and argument as a path relative to the launcher's
+# working directory, which is the payload root, so where a file goes is what that
+# config already says. `robot_clk_exe` lives under `cogs/` for that reason and no
+# other, and the host's two files keep their repository paths because the host's
+# own default and its configuration name them that way.
+#
+# Two launcher configs are staged. The production one names the host; the harness
+# twin does not, because `deploy-motion.sh --run` starts the intent source itself
+# and the host would bind the same narration port and address scripts to the same
+# port the control process binds. Both are staged because a unit is deployed once
+# and used for both.
 #
 # Everything under it is copied out of Bazel's outputs rather than symlinked:
 # the freshness contract deploy-motion.sh enforces is about the age of files
@@ -69,11 +81,13 @@ build_target=//bazel/platform:motion_payload
 # the system target provides the process descriptions and the generated
 # log-writer configuration.
 motord_target=//crates/reachy-motord:reachy_motord
+host_target=//crates/reachy-host:reachy_host
 ask_target=//crates/reachy-ask:reachy_ask
 exe_target=//cogs:robot_clk_exe
 system_target=//cogs:system_robot_clk
 launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:robotcpu.textproto
+harness_config_target=//cogs:robotcpu_harness.textproto
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 
 # The configuration each process reads by a relative path, named by Bazel rather
@@ -84,9 +98,16 @@ prelaunch_target=//cogs:clockwork_prelaunch_sh
 # find it, and the payload follows. A hand-typed copy here would be a second
 # source of truth whose drift is invisible until a process dies at setup on a
 # powered unit.
+#
+# The host's two are named as files rather than through a filegroup because they
+# are all it reads and they live in two packages: its own configuration, and the
+# clip name table that configuration points at, which is generated beside the
+# library it describes and belongs to the cogs.
 config_targets=(
+	//cogs:clip_library.names.json
 	//cogs:robot_config_files
 	//driver:motord_params.textproto
+	//host:host_params.textproto
 )
 
 # The staged payload path. `target/` is a cargo-era naming convention, kept
@@ -118,15 +139,23 @@ logger_config=cogs/robot_logger.textproto
 # The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
 # those are the files an operator tails and the runbook names one by one. The
 # names are the compositions' -- `proc` and `logger_proc` from the `Process`
-# names, and `motord` from the app merged in through `simplelaunch_src` -- so a
-# rename in a `.clk` file would leave the documented tails naming files that
-# never appear.
+# names, and `motord` and `voice_host` from the apps merged in through
+# `simplelaunch_src` -- so a rename in a `.clk` file would leave the documented
+# tails naming files that never appear.
 # This is the join: the names are pinned here against the config actually built,
 # and a rename is a refused build with the two lists side by side. The other
 # half -- that the runbook tails a file for every name in this list -- is
 # asserted by tools/build-motion.test.sh, so the refusal below cites a document
 # a self-check keeps true.
-launcher_apps=(logger_proc motord proc)
+#
+# Two lists because two configs are staged, and the difference between them is
+# the whole point of the twin: the harness config must not name the host, or a
+# motion run would start a second binder of the narration port `reachy_ask`
+# holds. Asserted per config below, so a host app merged into the harness twin by
+# accident is a refused build rather than a bind race on a powered unit.
+launcher_apps=(logger_proc motord proc voice_host)
+
+harness_apps=(logger_proc motord proc)
 
 compile() {
 	"$bazel" build "${build_flags[@]}" -- "$build_target"
@@ -139,6 +168,8 @@ compile() {
 # is the renderer's business and spawn order is hash order regardless.
 check_launcher_apps() {
 	local config=$1 named
+	shift
+	local expected=("$@")
 	named=$(awk '
 		/^[[:space:]]*app[[:space:]]*\{/ { inside = 1 }
 		inside && match($0, /name:[[:space:]]*"[^"]*"/) {
@@ -150,8 +181,8 @@ check_launcher_apps() {
 		/^[[:space:]]*\}/ { inside = 0 }
 	' "$config" | sort | tr '\n' ' ')
 	named=${named% }
-	[ "$named" = "${launcher_apps[*]}" ] || die \
-		"the rendered launcher config names the apps '${named:-nothing}' and the run needs '${launcher_apps[*]}'." \
+	[ "$named" = "${expected[*]}" ] || die \
+		"${config##*/} names the apps '${named:-nothing}' and the run needs '${expected[*]}'." \
 		"Those names are what the launcher calls each process's log file, and" \
 		"docs/bench-runbook.md names one tail command per name. A process renamed in" \
 		"a composition, or an app merged in under another name, has to be renamed there too."
@@ -252,12 +283,14 @@ stage() {
 	mkdir -p -- "$staging"
 
 	install -m 0755 -D -- "$motord_out" "${staging}/reachy_motord"
+	install -m 0755 -D -- "$host_out" "${staging}/reachy_host"
 	# Not a launcher app: it binds the narration port before the composition is
 	# started, so `--run` starts it itself, ahead of the launcher.
 	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
 	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
 	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
 	install -m 0644 -D -- "$launch_config_out" "${staging}/robotcpu.textproto"
+	install -m 0644 -D -- "$harness_config_out" "${staging}/robotcpu_harness.textproto"
 	install -m 0755 -D -- "$prelaunch_out" \
 		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 
@@ -279,7 +312,7 @@ report() {
 	size=$(du -sh -- "$payload" | cut -f1)
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
-	for file in reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch; do
+	for file in reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
 }
@@ -287,18 +320,22 @@ report() {
 require_bazel "device payload"
 check_pinion_defaults "$logger_config"
 compile
-built=$(bazel_files "$(union "$motord_target" "$ask_target" "$exe_target" \
-	"$system_target" "$launcher_target" "$launch_config_target" \
-	"$prelaunch_target")")
+built=$(bazel_files "$(union "$motord_target" "$host_target" "$ask_target" \
+	"$exe_target" "$system_target" "$launcher_target" "$launch_config_target" \
+	"$harness_config_target" "$prelaunch_target")")
 configs=$(bazel_files "$(union "${config_targets[@]}")")
 motord_out=$(bazel_named_in "$built" reachy_motord)
+host_out=$(bazel_named_in "$built" reachy_host)
 ask_out=$(bazel_named_in "$built" reachy_ask)
 exe_out=$(bazel_named_in "$built" robot_clk_exe)
 launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
+harness_config_out=$(bazel_named_in "$built" robotcpu_harness.textproto)
 prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
-check_launcher_apps "$launch_config_out"
+check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"
+check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
 verify_aarch64 "$motord_out"
+verify_aarch64 "$host_out"
 verify_aarch64 "$ask_out"
 verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"

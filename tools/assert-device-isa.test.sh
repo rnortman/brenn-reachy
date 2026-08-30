@@ -40,15 +40,30 @@ subject="${repo}/tools/assert-device-isa.sh"
 : >"${repo}/bazel-out/bin/simplelaunch"
 : >"${repo}/bazel-out/bin/robot_clk_exe"
 
+# The fetched shared object, at the path the stub's `info execution_root` and
+# `cquery` answers put it — outside the repo, which is the whole difference
+# between it and the two above.
+onnx_dir="${work}/fixtures/execroot/external/onnxruntime_linux_aarch64/lib"
+mkdir -p -- "$onnx_dir"
+: >"${onnx_dir}/libonnxruntime.so.1"
+
 stubs="${work}/bin"
 mkdir -p -- "$stubs"
 PATH="${stubs}:${PATH}"
 export PATH
 
-# The bazel stub: one subcommand the subject uses, `cquery`, answering with the
-# listing shape the real one produces — the outputs of the filegroup plus the
-# sources that came along with it, so the subject's basename matching has
-# something to get wrong.
+# The bazel stub: two subcommands the subject uses. `cquery` answers the
+# deployables filegroup with the listing shape the real one produces — the
+# outputs plus the sources that came along with them, so the subject's basename
+# matching has something to get wrong — and the ONNX Runtime target with the one
+# execroot-relative path into the fetched repository the real one prints.
+# `info execution_root` says where that path is rooted.
+#
+# The ONNX Runtime target is an alias over a `select()` on the target CPU, so
+# the real cquery answers it differently depending on whether `--config=device`
+# is on the command line. The stub answers the same way — aarch64 with the flag,
+# x86_64 without it — because a query that lost the flag is the one regression
+# on this subject that would otherwise leave every case here green.
 export CQUERY_STATUS=""
 export CQUERY_DROP=""
 cat >"${stubs}/bazel" <<'STUB'
@@ -56,12 +71,35 @@ cat >"${stubs}/bazel" <<'STUB'
 case $1 in
 cquery)
 	[ -z "${CQUERY_STATUS:-}" ] || exit "$CQUERY_STATUS"
+	device=""
+	for arg in "$@"; do
+		[ "$arg" != --config=device ] || device=1
+	done
+	for arg in "$@"; do
+		[ "$arg" = //bazel/third_party/onnxruntime:shared_object ] || continue
+		if [ "${CQUERY_DROP:-}" != libonnxruntime.so.1 ]; then
+			if [ -n "$device" ]; then
+				echo external/onnxruntime_linux_aarch64/lib/libonnxruntime.so.1
+			else
+				echo external/onnxruntime_linux_x64/lib/libonnxruntime.so.1
+			fi
+		fi
+		exit 0
+	done
 	echo bazel-out/bin/reachy_motord
 	[ "${CQUERY_DROP:-}" = simplelaunch ] || echo bazel-out/bin/simplelaunch
 	[ "${CQUERY_DROP:-}" = robot_clk_exe ] || echo bazel-out/bin/robot_clk_exe
 	echo cogs/robot.clk
 	;;
-info) echo "${FIXTURES}/output_base" ;;
+info)
+	[ -z "${INFO_STATUS:-}" ] || exit "$INFO_STATUS"
+	for arg in "$@"; do
+		case $arg in
+		execution_root) echo "${FIXTURES}/execroot"; exit 0 ;;
+		esac
+	done
+	echo "${FIXTURES}/output_base"
+	;;
 *) echo "unstubbed subcommand $1" >&2; exit 1 ;;
 esac
 exit 0
@@ -72,6 +110,11 @@ chmod 0755 -- "${stubs}/bazel"
 # about, so a case chooses what the subject sees by writing that file. Exits
 # non-zero when a case says to, which is the one failure mode a real objdump has
 # that the subject has to report rather than read past.
+#
+# The two ONNX Runtime archives hold a file of the same name, so the x86_64 one
+# gets its own fixture suffix: a case about which archive was resolved needs the
+# two to disassemble differently, which in reality is the whole difference
+# between them.
 export OBJDUMP_STATUS=""
 export FIXTURES="${work}/fixtures"
 mkdir -p -- "$FIXTURES"
@@ -82,7 +125,11 @@ for arg in "$@"; do
 	case "$arg" in
 	-*) continue ;;
 	esac
-	cat -- "${FIXTURES}/$(basename -- "$arg")"
+	name=$(basename -- "$arg")
+	case "$arg" in
+	*/onnxruntime_linux_x64/*) name="${name}.x64" ;;
+	esac
+	cat -- "${FIXTURES}/${name}"
 done
 STUB
 chmod 0755 -- "${stubs}/stub-objdump"
@@ -131,10 +178,11 @@ fixture() {
 	} >"${FIXTURES}/${name}"
 }
 
-# The green pair: nothing but the guarded helpers in either binary.
+# The green set: nothing but the guarded helpers in any of the three.
 green() {
 	fixture simplelaunch
 	fixture robot_clk_exe
+	fixture libonnxruntime.so.1
 }
 
 # ---------------------------------------------------------------------------
@@ -147,7 +195,7 @@ green() {
 run() {
 	local out status
 	set +e
-	out=$(cd -- "$work" && "$subject" 2>&1)
+	out=$(cd -- "$work" && "${1:-$subject}" 2>&1)
 	status=$?
 	set -e
 	printf '%s\n---status %s\n' "$out" "$status"
@@ -164,6 +212,8 @@ assert_contains "and it says so per binary" "$(output_of "$result")" \
 	"simplelaunch: no unguarded ARMv8.1 atomics."
 assert_contains "including the second one" "$(output_of "$result")" \
 	"robot_clk_exe: no unguarded ARMv8.1 atomics."
+assert_contains "and the prebuilt runtime, which nobody here compiles" \
+	"$(output_of "$result")" "libonnxruntime.so.1: no unguarded ARMv8.1 atomics."
 
 # The LL/SC instructions the guarded fixture also carries — `ldaxr`, `stlxr`,
 # `cbnz` — are what a correctly compiled binary is full of, and none of them is
@@ -366,6 +416,54 @@ assert_status "a missing deployable is refused" 1 "$(status_of "$result")"
 assert_contains "naming what is missing" "$(output_of "$result")" \
 	"the build emits no simplelaunch"
 
+# The prebuilt runtime carrying a straight-line LSE atomic. Its remedy is not
+# the other two's: nothing in this tree chose its -march, so the way out is the
+# pinned archive rather than a compile flag.
+green
+fixture libonnxruntime.so.1 \
+	'0000000000401000 <OrtGetApiBase>:' \
+	'  401000:      	casal	x0, x1, [x2]' \
+	'  401004:      	ret'
+result=$(run)
+assert_status "an unguarded LSE atomic in the prebuilt fails" 1 "$(status_of "$result")"
+assert_contains "naming the object" "$(output_of "$result")" \
+	"libonnxruntime.so.1 carries instructions this unit's CPU does not implement"
+assert_contains "with the remedy that fits a prebuilt" "$(output_of "$result")" \
+	"Pin an ONNX Runtime release whose aarch64 build is not"
+assert_lacks "and not the one that does not" "$(output_of "$result")" \
+	"is still last on the compile"
+
+# A build that names no shared object: the target was renamed or the archive
+# stopped carrying the SONAME copy. A refusal, like a missing deployable.
+green
+CQUERY_DROP=libonnxruntime.so.1
+result=$(run)
+CQUERY_DROP=""
+assert_status "a missing shared object is refused" 1 "$(status_of "$result")"
+assert_contains "naming the query that answered nothing" "$(output_of "$result")" \
+	"bazel named no output file for //bazel/third_party/onnxruntime:shared_object"
+
+# The path the build names and the file system does not hold. The object lives
+# outside the repo, so this is the branch a moved or unfetched external
+# repository lands on.
+green
+mv -- "${onnx_dir}/libonnxruntime.so.1" "${onnx_dir}/moved"
+result=$(run)
+mv -- "${onnx_dir}/moved" "${onnx_dir}/libonnxruntime.so.1"
+assert_status "an unfetched shared object is refused" 1 "$(status_of "$result")"
+assert_contains "saying which build to run" "$(output_of "$result")" \
+	"Run 'make check-device' first"
+
+# bazel unable to say where its execution root is: the one path the subject
+# cannot derive itself.
+green
+export INFO_STATUS=1
+result=$(run)
+unset INFO_STATUS
+assert_status "a failed info is refused" 1 "$(status_of "$result")"
+assert_contains "naming what could not be found" "$(output_of "$result")" \
+	"cannot say where its execution root is"
+
 # bazel itself failing.
 green
 CQUERY_STATUS=1
@@ -374,5 +472,39 @@ CQUERY_STATUS=""
 assert_status "a failed cquery is refused" 1 "$(status_of "$result")"
 assert_contains "naming the query" "$(output_of "$result")" \
 	"bazel cannot name the outputs of //bazel/platform:device_deployables"
+
+# ---------------------------------------------------------------------------
+# The configuration the shared object is resolved in
+# ---------------------------------------------------------------------------
+
+# `//bazel/third_party/onnxruntime:shared_object` is an alias over a `select()`
+# on the target CPU, so which ELF the cquery names is decided entirely by
+# `--config=device` being on the command line — unlike the deployables, whose
+# paths merely move. A regression that queried it in the host configuration
+# would hand the sweep the x86_64 runtime, which is not the object the unit
+# loads and is not built for the CPU under test.
+#
+# The subject with that flag removed is the regression, run as a copy so the
+# real one is untouched. What must not happen is a clean verdict.
+x64_dir="${work}/fixtures/execroot/external/onnxruntime_linux_x64/lib"
+mkdir -p -- "$x64_dir"
+: >"${x64_dir}/libonnxruntime.so.1"
+
+green
+{
+	header libonnxruntime.so.1 elf64-x86-64
+	printf '  401000:      	retq\n'
+} >"${FIXTURES}/libonnxruntime.so.1.x64"
+
+hostwise="${repo}/tools/assert-device-isa-hostwise.sh"
+sed 's/^build_flags=(--config=device)$/build_flags=()/' "$subject" >"$hostwise"
+chmod 0755 -- "$hostwise"
+grep -q '^build_flags=()$' "$hostwise" ||
+	fail "the flag this case removes is no longer spelled that way in the subject"
+result=$(run "$hostwise")
+assert_status "querying the shared object without --config=device is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "because what came back is the wrong architecture" \
+	"$(output_of "$result")" "is not an aarch64 binary, so this checked the wrong build"
 
 tally

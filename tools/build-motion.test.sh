@@ -12,8 +12,9 @@
 # What is worth pinning is the payload's layout, the one file whose contents this
 # script has an opinion about, and its freshness. The layout is not this script's
 # choice: the launcher resolves every executable and argument in its config
-# against its working directory, and the three processes read their configuration
-# by paths relative to the same place, so a payload with a file in the wrong place
+# against its working directory, and every process it starts reads its
+# configuration by paths relative to the same place, so a payload with a file in
+# the wrong place
 # is a launcher that starts nothing or a process that exits at setup on a powered
 # unit. The contents are the two pinion values: nothing a run starts carries a
 # pinion flag, so the logger's configuration has to restate the compiled-in
@@ -44,7 +45,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # ---------------------------------------------------------------------------
 
 repo="${work}/repo"
-mkdir -p -- "${repo}/tools" "${repo}/cogs" "${repo}/driver"
+mkdir -p -- "${repo}/tools" "${repo}/cogs" "${repo}/driver" "${repo}/host"
 cp -- "${script_dir}/build-motion.sh" "${script_dir}/lib.sh" "${repo}/tools/"
 
 subject="${repo}/tools/build-motion.sh"
@@ -56,12 +57,14 @@ payload="${repo}/target/motion-arm64/release"
 # The paths are the ones the compositions spell, because the point of the layout
 # case below is that these paths and the payload's paths are the same paths.
 config_files=(
+	cogs/clip_library.names.json
 	cogs/clip_library.textproto
 	cogs/mover_params.textproto
 	cogs/robot_logger.textproto
 	cogs/robot_logger_rates.textproto
 	cogs/session_params.textproto
 	driver/motord_params.textproto
+	host/host_params.textproto
 )
 for file in "${config_files[@]}"; do
 	echo "# ${file}" >"${repo}/${file}"
@@ -110,15 +113,20 @@ done
 # reads bytes 18 and 19 of the ELF header, so the stub below writes a header
 # plausible enough for that read to be unambiguous and nothing more.
 export MOTORD_MACHINE=183
+export HOST_MACHINE=183
 export ASK_MACHINE=183
 export EXE_MACHINE=183
 export LAUNCHER_MACHINE=183
 export DROP_LOGGER_CONFIG=""
 
-# What the rendered launcher config calls the control process. The subject pins
-# the three app names because deploy-motion.sh prints a tail command per name;
-# this is how a case renames one.
+# What the rendered launcher config calls the control process, and whether the
+# harness twin names the voice host. The subject pins each config's app names
+# because deploy-motion.sh prints a tail command per name and because a host in
+# the twin would be a second owner of the ports the intent source binds; these
+# are how a case renames one and how a case merges the host into the wrong
+# config.
 export APP_CONTROL=""
+export HARNESS_HOST=""
 export CALLS="${work}/calls"
 
 # The knobs for the three ways Bazel can answer badly: cquery failing outright,
@@ -170,6 +178,7 @@ case "$sub" in
 			chmod 0755 -- "$1"
 		}
 		elf bazel-out/bin/reachy_motord "$MOTORD_MACHINE"
+		elf bazel-out/bin/reachy_host "$HOST_MACHINE"
 		elf bazel-out/bin/reachy_ask "$ASK_MACHINE"
 		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
 		cat >bazel-out/bin/robotcpu.textproto <<CONFIG
@@ -185,6 +194,38 @@ app {
   name: "motord"
   executable: "reachy_motord"
 }
+app {
+  name: "voice_host"
+  executable: "reachy_host"
+}
+pre_launch {
+  name: "clockwork_prelaunch"
+  executable: "clockwork/launch/clockwork_prelaunch.sh"
+}
+CONFIG
+		cat >bazel-out/bin/robotcpu_harness.textproto <<CONFIG
+app {
+  name: "${APP_CONTROL:-proc}"
+  executable: "cogs/robot_clk_exe"
+}
+app {
+  name: "logger_proc"
+  executable: "cogs/robot_clk_exe"
+}
+app {
+  name: "motord"
+  executable: "reachy_motord"
+}
+CONFIG
+		if [ -n "${HARNESS_HOST:-}" ]; then
+			cat >>bazel-out/bin/robotcpu_harness.textproto <<'CONFIG'
+app {
+  name: "voice_host"
+  executable: "reachy_host"
+}
+CONFIG
+		fi
+		cat >>bazel-out/bin/robotcpu_harness.textproto <<'CONFIG'
 pre_launch {
   name: "clockwork_prelaunch"
   executable: "clockwork/launch/clockwork_prelaunch.sh"
@@ -208,10 +249,12 @@ CONFIG
 				;;
 			*system_robot_clk*)
 				echo bazel-out/bin/reachy_motord
+				echo bazel-out/bin/reachy_host
 				echo bazel-out/bin/reachy_ask
 				echo bazel-out/bin/robot_clk_exe
 				echo bazel-out/bin/simplelaunch
 				echo bazel-out/bin/robotcpu.textproto
+				echo bazel-out/bin/robotcpu_harness.textproto
 				echo bazel-out/bin/clockwork_prelaunch.sh
 				echo cogs/robot.clk
 				echo cogs/system_robot.clk
@@ -291,10 +334,15 @@ result=$(build)
 assert_status "a clean build succeeds" 0 "$(status_of "$result")"
 
 assert_file "the driver is in the payload" "${payload}/reachy_motord"
+assert_file "the voice host is beside it" "${payload}/reachy_host"
 assert_file "the intent source is beside it" "${payload}/reachy_ask"
 assert_file "the launcher is in the payload" "${payload}/simplelaunch"
 assert_file "its config is beside it, where it is started from" \
 	"${payload}/robotcpu.textproto"
+# Both configs travel: a unit is deployed once and used for production presence
+# and for a motion run, and `--run` names the twin.
+assert_file "the harness twin travels with it" \
+	"${payload}/robotcpu_harness.textproto"
 
 # The three paths the launcher config spells, and the only reason they are these
 # paths: the executable under `cogs/`, the prelaunch script under the directory
@@ -362,9 +410,9 @@ assert_lacks "the configuration is not spelled out here" "$(calls)" \
 assert_contains "the build builds the deployables the gate names" "$(calls)" \
 	"build --config=device -- //bazel/platform:motion_payload"
 assert_contains "one cquery names every built output" "$(calls)" \
-	"//crates/reachy-motord:reachy_motord + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:clockwork_prelaunch_sh"
+	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
-	"//cogs:robot_config_files + //driver:motord_params.textproto"
+	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto + //host:host_params.textproto"
 assert_eq "and there are two cqueries, not one per target" 2 \
 	"$(calls | grep -c 'bazel cquery')"
 assert_contains "the report names the payload" "$(output_of "$result")" "$payload"
@@ -439,6 +487,15 @@ assert_contains "the refusal names the platform flag" "$(output_of "$result")" \
 	"platform flag did not take effect"
 assert_unstaged "a build refused for the wrong machine stages nothing"
 EXE_MACHINE=183
+
+mark_payload
+HOST_MACHINE=62
+result=$(build)
+assert_status "a voice host for the wrong machine refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the host binary" "$(output_of "$result")" \
+	"reachy_host is an ELF"
+assert_unstaged "and that one stages nothing either"
+HOST_MACHINE=183
 
 mark_payload
 ASK_MACHINE=62
@@ -519,9 +576,11 @@ APP_CONTROL=control_proc
 result=$(build)
 assert_status "a launcher config that renamed a process refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal lists what the config names" "$(output_of "$result")" \
-	"names the apps 'control_proc logger_proc motord'"
+	"names the apps 'control_proc logger_proc motord voice_host'"
 assert_contains "and what the run needs" "$(output_of "$result")" \
-	"needs 'logger_proc motord proc'"
+	"needs 'logger_proc motord proc voice_host'"
+assert_contains "and says which config it read" "$(output_of "$result")" \
+	"robotcpu.textproto names the apps"
 assert_contains "and says why the names matter" "$(output_of "$result")" \
 	"tail command per name"
 assert_unstaged "a renamed process stages nothing"
@@ -529,6 +588,25 @@ APP_CONTROL=""
 
 result=$(build)
 assert_status "and the rendered names build" 0 "$(status_of "$result")"
+
+# The twin's whole reason for existing: it must not name the host. `--run`
+# starts the intent source itself, and a host merged into this config would bind
+# 7409 and 7410 alongside it, leaving the run's verdict to the kernel.
+mark_payload
+HARNESS_HOST=1
+result=$(build)
+assert_status "a harness twin that names the host refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the twin" "$(output_of "$result")" \
+	"robotcpu_harness.textproto names the apps"
+assert_contains "and lists the host among what it found" "$(output_of "$result")" \
+	"'logger_proc motord proc voice_host'"
+assert_contains "and what a harness run needs instead" "$(output_of "$result")" \
+	"needs 'logger_proc motord proc'"
+assert_unstaged "a twin naming the host stages nothing"
+HARNESS_HOST=""
+
+result=$(build)
+assert_status "and the twin without it builds" 0 "$(status_of "$result")"
 
 mark_payload
 rm -f -- "${repo}/cogs/mover_params.textproto"
@@ -628,7 +706,7 @@ labels_of() {
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|prelaunch_target)=' \
+script_labels=$(grep -E '^(motord_target|host_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|prelaunch_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
 assert_eq "the payload's members are exactly the labels this script cqueries" \
@@ -640,6 +718,62 @@ assert_contains "and the gate builds that list" \
 assert_contains "and this script builds the payload filegroup itself" \
 	"$(cat -- "${real_repo}/tools/build-motion.sh")" \
 	"build_target=//bazel/platform:motion_payload"
+
+# ---------------------------------------------------------------------------
+# The two launcher config rules, held to each other
+# ---------------------------------------------------------------------------
+#
+# `//cogs:robotcpu.textproto` is rendered by the drop's BUILD updater out of the
+# system module, and `//cogs:robotcpu_harness.textproto` beside it is a
+# hand-written rule repeating its inputs. So the updater edits one of the pair
+# and leaves the other, and nothing else says they agree: a `data` entry lost
+# from the twin costs the target its runfiles, and an `srcs` entry lost from it
+# makes a motion run compose something other than what a unit ships -- discovered
+# on a powered unit during `make motion-run`, which is the expensive place. The
+# two rules are read out of the BUILD file here instead.
+
+rule_attr() {
+	awk -v want="$1" -v attr="$2" '
+		index($0, "name = \"" want "\"") { inside = 1; next }
+		inside && /^\)/ { exit }
+		inside && $0 ~ "^[[:space:]]*" attr " = \\[" { collecting = 1; next }
+		collecting && /^[[:space:]]*\]/ { collecting = 0; next }
+		collecting && match($0, /"[^"]*"/) {
+			print substr($0, RSTART + 1, RLENGTH - 2)
+		}
+	' "${real_repo}/cogs/BUILD.bazel" | sort
+}
+
+production_srcs=$(rule_attr robotcpu.textproto srcs)
+harness_srcs=$(rule_attr robotcpu_harness.textproto srcs)
+
+# The parse itself, so a rule renamed or an attribute restyled is a failure here
+# rather than two empty lists comparing equal.
+assert_contains "the production launcher rule's srcs are read out of cogs/BUILD.bazel" \
+	"$production_srcs" "//driver:motord_launch.textproto"
+assert_contains "and the harness twin's" \
+	"$harness_srcs" "//driver:motord_launch.textproto"
+
+production_data=$(rule_attr robotcpu.textproto data)
+harness_data=$(rule_attr robotcpu_harness.textproto data)
+
+# The same guard the srcs parse carries, for the same reason: `rule_attr` reads a
+# one-entry-per-line list and nothing else, so a restyle -- a single-line list, a
+# `select()`, a renamed attribute -- would hand both sides an empty string and the
+# equality below would pass without having read the attribute it exists to
+# compare.
+assert_contains "the production launcher rule's data is read out of cogs/BUILD.bazel" \
+	"$production_data" ":robot_clk_exe"
+assert_contains "and the harness twin's" "$harness_data" ":robot_clk_exe"
+
+assert_eq "the two launcher configs carry the same data" \
+	"$production_data" "$harness_data"
+assert_eq "the twin is the production config less the voice host's app entry" \
+	"$(comm -23 <(printf '%s\n' "$production_srcs") <(printf '%s\n' "$harness_srcs"))" \
+	"//host:host_launch.textproto"
+assert_eq "and names no src the production config does not" \
+	"$(comm -13 <(printf '%s\n' "$production_srcs") <(printf '%s\n' "$harness_srcs"))" \
+	""
 
 # ---------------------------------------------------------------------------
 # The app names and the log files the runbook tells an operator to tail
@@ -661,6 +795,94 @@ if [ -n "$shipped_apps" ]; then
 else
 	fail "the runbook names every app's log file" \
 		"read no launcher_apps=(...) from tools/build-motion.sh — the name has moved"
+fi
+
+# ---------------------------------------------------------------------------
+# The real app entries, against the names and the paths this script stages
+# ---------------------------------------------------------------------------
+#
+# The cases above screen a launcher config this file wrote, so what they prove is
+# that the screen works. The two app entries a unit actually starts are
+# hand-written textprotos merged into the rendered config
+# (`host/host_launch.textproto`, `driver/motord_launch.textproto`), and their
+# join to this script runs only inside `make motion-build`, which needs the
+# device cross-compile. Both halves are read out of this checkout instead: an app
+# renamed here has to be a name `launcher_apps` carries, and an executable
+# renamed here has to be a file `stage()` installs -- otherwise the launcher
+# starts an app that is not there, on a powered unit, with the runbook tailing a
+# console file that never appears.
+
+script_src=$(cat -- "${real_repo}/tools/build-motion.sh")
+
+# Whether a whole line of a newline-separated list is exactly this string --
+# `yes` or `no`, so the assertion is an equality. Substring matching would let a
+# `voice_host` renamed to `host` pass against the list that still says
+# `voice_host`.
+member_of() {
+	local needle=$1 item
+	while IFS= read -r item; do
+		if [ "$item" = "$needle" ]; then
+			echo yes
+			return
+		fi
+	done <<<"$2"
+	echo no
+}
+
+# The paths `stage()` installs an executable at, relative to the payload root.
+# Continuation lines are folded first, because one of the installs is wrapped.
+staged_binaries=$(printf '%s\n' "$script_src" |
+	sed -e ':a' -e '/\\$/{N;s/\\\n[[:space:]]*//;ba' -e '}' |
+	sed -n 's|^[[:space:]]*install -m 0755 -D -- "[^"]*" "[^"]*}/\([^"]*\)".*$|\1|p' |
+	sort -u)
+assert_eq "the paths stage() installs executables at are read out of build-motion.sh" \
+	yes "$(member_of reachy_motord "$staged_binaries")"
+
+for entry in host/host_launch.textproto driver/motord_launch.textproto; do
+	app_name=$(sed -n 's/^ *name: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
+	app_exe=$(sed -n 's/^ *executable: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
+	if [ -z "$app_name" ] || [ -z "$app_exe" ]; then
+		fail "${entry} states an app name and an executable" \
+			"read name='${app_name}' executable='${app_exe}' -- the field spelling has moved"
+		continue
+	fi
+	assert_eq "${entry}'s app name is one this script expects the config to carry" \
+		yes "$(member_of "$app_name" "$(printf '%s\n' "$shipped_apps" | tr ' ' '\n')")"
+	assert_eq "and its executable is a file stage() installs at the payload root" \
+		yes "$(member_of "$app_exe" "$staged_binaries")"
+done
+
+# ---------------------------------------------------------------------------
+# The paths the voice host resolves against the payload root
+# ---------------------------------------------------------------------------
+#
+# `reachy_host` is a launcher app, started from the payload root, so its
+# default `--config` and the `clip_names_path` inside that configuration are both
+# resolved there. What puts a file at either path is `config_targets` below,
+# whose members are staged at their repo-relative paths. Nothing else joins the
+# two strings to that list: `crates/reachy-host/tests/shipped_params.rs` compares
+# a file name and the cases above stage stubs of this test's own making, so a
+# `clip_names_path` shortened to a bare file name, or a `host_params.textproto`
+# moved in the tree, would pass every gate and die at setup on a powered unit.
+
+# `//pkg:file` -> `pkg/file`, which is where the payload puts it.
+staged_configs=$(sed -n '/^config_targets=(/,/^)/p' -- "${real_repo}/tools/build-motion.sh" |
+	sed -n 's|^[[:space:]]*//\([^:]*\):\(.*\)$|\1/\2|p' | sort)
+assert_eq "the configurations this script stages are read out of build-motion.sh" \
+	yes "$(member_of driver/motord_params.textproto "$staged_configs")"
+
+names_path=$(sed -n 's/^clip_names_path: "\([^"]*\)"$/\1/p' \
+	-- "${real_repo}/host/host_params.textproto")
+default_config=$(sed -n 's/^const DEFAULT_CONFIG: &str = "\([^"]*\)";$/\1/p' \
+	-- "${real_repo}/crates/reachy-host/src/main.rs")
+if [ -z "$names_path" ] || [ -z "$default_config" ]; then
+	fail "the host's two payload-relative paths are readable" \
+		"read clip_names_path='${names_path}' DEFAULT_CONFIG='${default_config}'"
+else
+	assert_eq "the shipped host config names a clip table the payload stages" \
+		yes "$(member_of "$names_path" "$staged_configs")"
+	assert_eq "and the host's default --config is a file the payload stages" \
+		yes "$(member_of "$default_config" "$staged_configs")"
 fi
 
 # ---------------------------------------------------------------------------

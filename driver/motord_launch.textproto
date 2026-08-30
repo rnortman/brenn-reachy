@@ -1,6 +1,6 @@
 # The driver's entry in the launcher's app table, merged into the launcher
 # config `RobotCpu` renders (`cogs/robot.clk`) so that one supervisor starts and
-# stops all three of a run's processes.
+# stops every process a unit runs.
 #
 # One message of simplelaunch's `AppConfig`. Hand-written because the renderer
 # only knows about Clockwork processes, and the driver is not one: it owns a

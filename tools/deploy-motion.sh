@@ -75,9 +75,19 @@ payload="${repo_root}/target/motion-arm64/release"
 
 # The payload's binaries, at the paths the run spells, checked before anything is
 # pushed. A payload directory that exists and is missing one of them is a build
-# that failed halfway or a stage somebody edited by hand. Three are the launcher
-# config's; the fourth is the intent source `--run` starts ahead of it.
-binaries=(reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch)
+# that failed halfway or a stage somebody edited by hand. Four are the production
+# launcher config's; the fifth is the intent source `--run` starts ahead of it.
+binaries=(reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch)
+
+# The payload's launcher configs, at the payload root, checked with the binaries
+# and for the same reason: `--run` names one of these two below and the launcher
+# resolves it against the payload root, so a payload staged by an older build --
+# or edited by hand -- would take a config the launcher cannot find onto a unit.
+# Both are checked on every push, because a deploy without `--run` is what puts
+# the production config on the unit. What `--run` names is asked about again on
+# the unit itself, ahead of the wipe, because a push and a run are separate
+# invocations. Not executables, so what is asked of them is that they are files.
+launch_configs=(robotcpu.textproto robotcpu_harness.textproto)
 
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
@@ -87,15 +97,24 @@ binaries=(reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch)
 # a refusal that says to build one.
 logger_config="${payload}/cogs/robot_logger.textproto"
 
-# The launcher config, at the payload root, and where the launcher puts the
-# console output of everything it starts. Both are named in the start command
-# below and nowhere else here: the config names the processes, their arguments
-# and their working-directory-relative executables, so this script has nothing
-# left to say about them.
+# The launcher config `--run` starts, at the payload root, and where the launcher
+# puts the console output of everything it starts. Both are named in the start
+# command below and nowhere else here: the config names the processes, their
+# arguments and their working-directory-relative executables, so this script has
+# nothing left to say about them.
+#
+# The harness twin, not the production config the payload also carries. `--run`
+# starts `reachy_ask` itself, ahead of the launcher, because the intent source
+# has to hold the narration port before the control process narrates; the voice
+# host binds that same port and addresses scripts to the same one, and the
+# production config names it. Starting both would leave the run's verdict to
+# whichever of them the kernel gave the bind to. A deploy without `--run`
+# pushes both configs and starts neither, which is where the production one
+# is used.
 #
 # The log directory is on the same tmpfs as the payload and the records; the
 # launcher creates it, a run empties it first, and a fetch brings it back.
-launch_config=robotcpu.textproto
+launch_config=robotcpu_harness.textproto
 launch_logs="${store_mount}/logs/launch"
 
 # How long the run is given before the launcher is stopped. Commissioning is
@@ -505,6 +524,11 @@ case "$mode" in
 				"the payload at ${payload} has no executable ${name}" \
 				"Rebuild it: make motion-build"
 		done
+		for name in "${launch_configs[@]}"; do
+			[ -f "${payload}/${name}" ] || die \
+				"the payload at ${payload} has no launcher config ${name}" \
+				"Rebuild it: make motion-build"
+		done
 
 		age_unchecked=no
 		if [ "${1:-}" = "--stale-ok" ]; then
@@ -679,7 +703,16 @@ case "$mode" in
 		rc_no_stamp=5
 		rc_stamp_unstaged=6
 		rc_post_wipe=7
+		rc_no_launch_config=8
 		remote="$(bus_probe)"
+		# The launcher config this run names, on the unit, asked about
+		# before anything is emptied. The push checks the local payload
+		# carries both configs, but a push and a run are separate
+		# invocations and `--run` starts whatever is already there: a
+		# unit still holding a payload staged before the harness twin
+		# existed passes every local check and dies inside `simplelaunch`
+		# with the log root already cleared and the run already stamped.
+		remote="${remote}; [ -f ${release}/${launch_config} ] || exit ${rc_no_launch_config}"
 		# The stamp is asked about before the log root is emptied, not
 		# after: this refusal fires on a payload pushed by an older
 		# script or landed before a reboot cleared the tmpfs, and the
@@ -848,6 +881,19 @@ case "$mode" in
 			die "${host}'s payload carries no provenance stamp, so this run's records could not name their build." \
 				"Nothing was started and nothing was emptied. The push writes that stamp, so push again:" \
 				"    ${prog} ${host} --push"
+			;;
+		"$rc_no_launch_config")
+			# Asked before the stamp and before the wipe, so this
+			# refusal has started nothing and emptied nothing. Same
+			# accepted collision as the other codes: a launcher chain
+			# that exited with exactly this code reads as this
+			# instead, and either reading fails the run.
+			die "${host}'s payload has no ${launch_config}, so this run's launcher config is not on the unit." \
+				"The payload there predates the harness twin — push again:" \
+				"    ${prog} ${host} --push" \
+				"Nothing was started and nothing was emptied, so this unit's log root still holds" \
+				"whatever the previous run left there:" \
+				"    ${prog} ${host} --fetch <records-dir>"
 			;;
 		"$rc_stamp_unstaged")
 			# The stamp is there — the probe proved it one command

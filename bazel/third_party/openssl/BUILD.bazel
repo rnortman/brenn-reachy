@@ -1,0 +1,19 @@
+# Apache-2.0. The two OpenSSL labels `openssl-sys` links against, named from
+# this repo because a crate repository cannot see `@openssl` directly: an
+# annotation's link labels resolve either inside the crate's own repository or in
+# the main one, so the main one is where the module graph's OpenSSL is named.
+#
+# The library itself comes from the Clockwork drop's dependency table, which
+# pins OpenSSL 3.3.1 and builds it for every platform this repo targets.
+
+alias(
+    name = "ssl",
+    actual = "@openssl//:ssl",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "crypto",
+    actual = "@openssl//:crypto",
+    visibility = ["//visibility:public"],
+)

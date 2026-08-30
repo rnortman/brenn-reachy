@@ -319,14 +319,23 @@ box RobotLogger
 // The machine the control loop runs on: the unit's own CPU.
 //
 // The launcher config this domain renders names the two cog processes; the
-// driver is a third OS process on the same machine and is merged in from the
-// hand-written app config the `simplelaunch_src` names, so one launcher starts
-// and stops all three. The renderer emits only a process-description path as a
-// generated app's args, so every process here runs on the compiled-in pinion
-// defaults -- see `robot_logger.textproto`, which restates them.
+// driver and the voice host are two more OS processes on the same machine and
+// are merged in from the hand-written app configs the `simplelaunch_src` lines
+// name, so one launcher starts and stops all four. The renderer emits only a
+// process-description path as a generated app's args, so every process here runs
+// on the compiled-in pinion defaults -- see `robot_logger.textproto`, which
+// restates them.
+//
+// A motion run starts a twin of this config instead, with the host left out:
+// the harness's intent source binds `ReportsOut`'s destination port and sends to
+// `ScriptsIn` for the duration of a run, and the host does both too. The twin is
+// `robotcpu_harness.textproto` in this package's BUILD file, which says so at
+// the rule; its content merges the same rendered sources, and only its rule is
+// hand-maintained, because the build updater knows of one config here.
 cpu_domain RobotCpu
 {
     simplelaunch_src: "//driver:motord_launch.textproto";
+    simplelaunch_src: "//host:host_launch.textproto";
 }
 
 // Two processes on one machine over one executable, wall-clock: the control

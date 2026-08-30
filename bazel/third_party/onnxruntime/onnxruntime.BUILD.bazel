@@ -1,0 +1,48 @@
+# Apache-2.0. Overlay build file for the ONNX Runtime prebuilt release archives
+# fetched in MODULE.bazel, one repository per target CPU.
+#
+# The archive is Microsoft's own linux release: headers plus a versioned shared
+# object with the unversioned `libonnxruntime.so` development symlink beside it.
+# `ort-sys` is built here with its download-and-link build script switched off,
+# so this target is the whole of how the wake-word and VAD inference backend
+# reaches the binary that links it.
+
+# Both file names, deliberately. `libonnxruntime.so` is what the link needs --
+# a `-lonnxruntime` resolves against that name and nothing else -- while the ELF
+# records `libonnxruntime.so.1` as its SONAME, which is the name the loader goes
+# looking for when the binary starts. Naming only one of them yields either a
+# link that fails or a binary that will not start. In the archive the first is a
+# symlink to the second; here they are two staged files.
+cc_library(
+    name = "onnxruntime",
+    srcs = [
+        "lib/libonnxruntime.so",
+        "lib/libonnxruntime.so.1",
+    ],
+    hdrs = glob(["include/**"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+# The shared object alone, for the two consumers that need the file rather than
+# the link: the payload stages it beside the binary, and the device ISA sweep
+# disassembles it. The SONAME copy, because that is the name that ships.
+filegroup(
+    name = "shared_object",
+    srcs = ["lib/libonnxruntime.so.1"],
+    visibility = ["//visibility:public"],
+)
+
+# What the archive says it is, in its own two files: the release number and the
+# commit that release was cut from. Both ship beside the headers in every
+# Microsoft release, and they are the only way to ask an archive fetched by hash
+# which release it holds without running the binary in it -- which nobody can do
+# for the aarch64 one on a workstation.
+filegroup(
+    name = "identity",
+    srcs = [
+        "GIT_COMMIT_ID",
+        "VERSION_NUMBER",
+    ],
+    visibility = ["//visibility:public"],
+)

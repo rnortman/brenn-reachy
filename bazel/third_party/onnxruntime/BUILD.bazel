@@ -1,0 +1,82 @@
+# Apache-2.0. The one ONNX Runtime label the rest of the build names: the
+# prebuilt release for whichever CPU the current configuration targets.
+#
+# Two repositories rather than one because the runtime is a native library and
+# the two lanes here -- a workstation gate on x86_64 and the device cross-build
+# on aarch64 -- need different binaries. The select is on the CPU constraint
+# alone: both lanes are linux, and a configuration for anything else has no
+# ONNX Runtime here and fails at analysis rather than linking the wrong ELF.
+
+alias(
+    name = "onnxruntime",
+    actual = select({
+        "@platforms//cpu:aarch64": "@onnxruntime_linux_aarch64//:onnxruntime",
+        "@platforms//cpu:x86_64": "@onnxruntime_linux_x64//:onnxruntime",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# The same choice over the bare shared object: what the device ISA sweep
+# disassembles, and what a deploy stages beside the binary that loads it.
+alias(
+    name = "shared_object",
+    actual = select({
+        "@platforms//cpu:aarch64": "@onnxruntime_linux_aarch64//:shared_object",
+        "@platforms//cpu:x86_64": "@onnxruntime_linux_x64//:shared_object",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "identity",
+    actual = select({
+        "@platforms//cpu:aarch64": "@onnxruntime_linux_aarch64//:identity",
+        "@platforms//cpu:x86_64": "@onnxruntime_linux_x64//:identity",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# The release this repo means, stated once. `MODULE.bazel` fetches two archives
+# by hash and nothing joins them: an edit to one lane's `urls` or `strip_prefix`
+# alone is a build whose two CPUs run different releases, and the only lane that
+# ever runs an ONNX Runtime is the workstation's.
+ONNXRUNTIME_VERSION = "1.24.2"
+
+ONNXRUNTIME_COMMIT = "058787ceead760166e3c50a0a4cba8a833a6f53f"
+
+# So the archive is asked. This runs at build time in whichever configuration
+# builds it -- the workstation gate reaches the x86_64 archive and
+# `make check-device` reaches the aarch64 one -- so both are held to the same
+# two strings. A build action rather than a test because the device lane builds
+# and never runs: an aarch64 test target would not execute on the machine the
+# gate runs on, and this question needs no aarch64 code to answer.
+genrule(
+    name = "identity_check",
+    srcs = [":identity"],
+    outs = ["identity.checked"],
+    cmd = """
+set -eu
+version=
+commit=
+for f in $(SRCS); do
+	case $$(basename "$$f") in
+	VERSION_NUMBER) version=$$(cat "$$f") ;;
+	GIT_COMMIT_ID) commit=$$(cat "$$f") ;;
+	esac
+done
+[ "$$version" = "{version}" ] || {{
+	echo "the fetched ONNX Runtime says release $$version; this build means {version}." >&2
+	echo "MODULE.bazel's two archives and this constant have to name one release." >&2
+	exit 1
+}}
+[ "$$commit" = "{commit}" ] || {{
+	echo "the fetched ONNX Runtime says commit $$commit; this build means {commit}." >&2
+	exit 1
+}}
+printf '%s %s\\n' "$$version" "$$commit" >$@
+""".format(
+        commit = ONNXRUNTIME_COMMIT,
+        version = ONNXRUNTIME_VERSION,
+    ),
+    visibility = ["//visibility:public"],
+)

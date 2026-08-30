@@ -24,6 +24,17 @@ held to the crate's `BUILD.bazel` by a gate test. The device binary is a
 cross-compile of the same targets
 (`make bench-build`; `docs/bench-runbook.md`).
 
+The voice host's dependencies arrive the same way and are worth naming, because
+they are the only ones that are not plain Rust from crates.io. The pipeline
+libraries come from the brenn-pod repository as git pins at revisions published
+on its public remote — a pin at an unpublished revision resolves for nobody, so
+it is not a pin. Two native libraries come with them: OpenSSL, from the module
+graph's own pinned build, and ONNX Runtime, from a hash-pinned release archive.
+Both crates' discovery build scripts are switched off, because what those
+scripts do is search the machine and, for ONNX Runtime, download; what the
+answers should be is stated in `MODULE.bazel` and checked against the linked
+libraries by `//crates/reachy-host:host_closure_test`.
+
 An editor wanting a project model gets one from
 `bazel run @rules_rust//tools/rust_analyzer:gen_rust_project`, which writes the
 `rust-project.json` rust-analyzer reads instead of cargo metadata. No gate uses
@@ -43,8 +54,11 @@ in. So:
   bus. Everything above it speaks in joint angles and abstract requests.
 - Large results are written into caller-provided output structures rather than
   returned by value, so a control loop can run without allocating.
-- No async runtime. The bus is a blocking loop by design, because that is the
-  shape every candidate host substrate wants at the wire.
+- No async runtime on the control path. The bus is a blocking loop by design,
+  because that is the shape every candidate host substrate wants at the wire,
+  and the motion and control stack holds no runtime at all. The voice host
+  binary is the one exception and is quarantined off that path: it hosts tokio
+  for the network edges it owns, exactly as the driver hosts a serial port.
 
 ## Why it is written defensively
 
@@ -150,10 +164,10 @@ process — a 20 ms grid on the real clock, the serial port, and
 `reachy-driver`'s decisions — and it meets the cogs
 over six UDP sockets on loopback, filling the slots the simulated plant fills in
 the scenario suite. The online composition is that seam plus the control core, a
-logger process, and a wake gesture that asks the machine to raise and stow once.
-`make check-device` cross-compiles everything built for a unit — the motion
-payload's two binaries and the composition it is staged from, plus the bench
-binary and the host, named once as `//bazel/platform:device_deployables` — then
+logger process, and two loopback sockets where a producer of scripts stands.
+`make check-device` cross-compiles everything built for a unit — the payload's
+three binaries and the composition they are staged from, plus the bench binary,
+named once as `//bazel/platform:device_deployables` — then
 disassembles the C++ two and refuses any instruction the unit's Cortex-A72 does
 not implement, and CI blocks on both halves;
 `docs/bench-runbook.md` is the procedure for the first run, and

@@ -192,10 +192,25 @@ check:
 # still carry instructions the device's CPU cannot execute. So the build is
 # followed by a disassembly of what it just produced, asserting the instruction
 # set is the one that unit implements.
+#
+# `host_closure_test` is named beside the filegroup because it is testonly and a
+# filegroup cannot carry that. It is the only target that links OpenSSL and ONNX
+# Runtime, so it is where the voice pipeline's native libraries are proved to
+# resolve for the unit's architecture — the link, and only the link: what the
+# prebuilt ONNX Runtime's own instructions are is the ISA sweep's question, and
+# it reads that object too.
+#
+# `identity_check` is named for the third question about that runtime: which
+# release the aarch64 archive holds. Nothing else asks it — the closure test
+# interrogates the linked library, and the only lane that links one is the
+# workstation's x86_64 build — so without this the two archives could drift to
+# different releases and the gate would stay green.
 .PHONY: check-device
 check-device: require-bazel
 	bazel build --config=device $(BAZEL_FLAGS) -- \
-	    //bazel/platform:device_deployables
+	    //bazel/platform:device_deployables \
+	    //bazel/third_party/onnxruntime:identity_check \
+	    //crates/reachy-host:host_closure_test
 	tools/assert-device-isa.sh
 
 # Auto-fix, which means formatting: rules_rust's rustfmt runner formats every

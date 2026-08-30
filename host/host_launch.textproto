@@ -1,0 +1,32 @@
+# The voice host's entry in the launcher's app table, merged into the launcher
+# config `RobotCpu` renders (`cogs/robot.clk`) so that one supervisor starts and
+# stops every process a unit runs.
+#
+# One message of simplelaunch's `AppConfig`. Hand-written for the reason
+# `driver/motord_launch.textproto` is: the renderer only knows about Clockwork
+# processes, and the host is not one -- it is a plain process outside the
+# composition, on the far side of the socket seam, which is where everything
+# that can be malformed is refused before it reaches a reader that dies on it.
+#
+# The executable is resolved against the launcher's working directory, which is
+# the payload root -- so this is where `tools/build-motion.sh` stages the host
+# binary. No args: the host's default `--config` is `host/host_params.textproto`
+# relative to the same directory, and the payload stages the file there. An
+# operator running a unit's own configuration instead does it by hand, which is
+# what makes a per-unit file a push into RAM rather than an edit to this table.
+#
+# Named `voice_host` rather than `host`: the launcher spells each app's console
+# `<name>_<run>.log` and this repo says "host" for the workstation half of the
+# bench -- `make motion-host-run`, `cogs/robot_host.clk`, `hostcpu.textproto` --
+# so a bare `host_0.log` in a unit's log directory reads as the wrong machine's
+# output.
+#
+# Merged into the production config only. The harness twin
+# (`cogs:robotcpu_harness.textproto`) leaves it out, because `--run` starts
+# `reachy_ask` -- and two processes both binding the narration port 7410 and
+# both addressing scripts to 7409 in one run is exactly the collision the twin
+# exists to prevent.
+app {
+  name: "voice_host"
+  executable: "reachy_host"
+}

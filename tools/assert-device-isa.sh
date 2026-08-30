@@ -37,7 +37,8 @@
 #
 # Reads the two binaries out of the same `//bazel/platform:device_deployables`
 # filegroup `make check-device` builds, so it cannot check a different set than
-# the gate builds or a deploy ships. It builds nothing: run it after that build.
+# the gate builds or a deploy ships, plus the prebuilt ONNX Runtime the voice
+# host loads. It builds nothing: run it after that build.
 #
 # Knobs, environment only:
 #
@@ -69,6 +70,17 @@ cd -- "$repo_root"
 # above, which is what this check has to tolerate rather than what it looks for.
 deployables_target=//bazel/platform:device_deployables
 binaries=(simplelaunch robot_clk_exe)
+
+# The prebuilt ONNX Runtime, checked for the opposite reason: it is a
+# third-party aarch64 object whose -march nobody in this tree chose, fetched by
+# hash and loaded by the voice host at its first inference. Nothing else the
+# unit runs is outside this repo's own compile flags, so it is the one payload
+# member where the SIGILL this check exists to prevent could arrive without any
+# .bazelrc change to explain it. Its path is inside the fetched repository, which
+# is reached through the execution root rather than the bazel-out symlink the
+# deployables resolve through.
+shared_object_target=//bazel/third_party/onnxruntime:shared_object
+shared_object_name=libonnxruntime.so.1
 
 # The LSE atomic families, by mnemonic: compare-and-swap, swap, and the
 # read-modify-write pair (the `st` forms are the same instructions with the
@@ -164,9 +176,25 @@ objdump=$(resolve_objdump)
 
 listing=$(bazel_files "$deployables_target")
 
-status=0
+# Everything to disassemble, as `name<tab>path` rows: the deployables out of the
+# filegroup, then the shared object out of its own target.
+subjects=()
 for name in "${binaries[@]}"; do
-	path=$(bazel_named_in "$listing" "$name")
+	subjects+=("${name}"$'\t'"$(bazel_named_in "$listing" "$name")")
+done
+
+execroot=$("$bazel" info "${build_flags[@]}" execution_root \
+	--ui_event_filters=-info --noshow_progress) ||
+	die "bazel cannot say where its execution root is, so the fetched ${shared_object_name} cannot be found."
+shared_object="${execroot}/$(bazel_files "$shared_object_target")"
+[ -f "$shared_object" ] ||
+	die "the build names ${shared_object} and no file is there." \
+		"Run 'make check-device' first: this reads that build's inputs."
+subjects+=("${shared_object_name}"$'\t'"${shared_object}")
+
+status=0
+for subject in "${subjects[@]}"; do
+	IFS=$'\t' read -r name path <<<"$subject"
 	bad=$(unguarded_lse "$path")
 	if [ -n "$bad" ]; then
 		status=1
@@ -175,9 +203,15 @@ for name in "${binaries[@]}"; do
 		head -5 <<<"$bad" | while IFS=$'\t' read -r at insn; do
 			printf '        %s  %s\n' "$at" "$insn" >&2
 		done
-		echo "    The device configuration compiles above the Cortex-A72 again: check that" >&2
-		echo "    .bazelrc's build:device -march/-mcpu pair is still last on the compile" >&2
-		echo "    line (bazel aquery --config=device 'mnemonic(\"CppCompile\", ...)')." >&2
+		if [ "$name" = "$shared_object_name" ]; then
+			echo "    This one is not compiled here: the pinned prebuilt is built above the" >&2
+			echo "    Cortex-A72. Pin an ONNX Runtime release whose aarch64 build is not, or" >&2
+			echo "    build one (MODULE.bazel names the archives and their hashes)." >&2
+		else
+			echo "    The device configuration compiles above the Cortex-A72 again: check that" >&2
+			echo "    .bazelrc's build:device -march/-mcpu pair is still last on the compile" >&2
+			echo "    line (bazel aquery --config=device 'mnemonic(\"CppCompile\", ...)')." >&2
+		fi
 		echo "    A binary in this state dies with SIGILL on the unit." >&2
 	else
 		echo "${name}: no unguarded ARMv8.1 atomics."

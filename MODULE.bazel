@@ -190,5 +190,205 @@ crate.spec(
     version = "0.9",
 )
 
+# The brenn-pod voice pipeline, which `reachy-host` composes. Three specs
+# rather than the whole closure: a spec exists to produce a label, and these are
+# the three the robot's host states its own wiring in. Everything the pipeline
+# reaches through them is resolved by the same cargo run and pinned by the same
+# lockfile, at the same revision, without a label of its own.
+#
+# `//crates/reachy-host:host_closure_test` names all three in their own right: a
+# crate reached only through the surface's internal edges is proved to link only
+# for as long as that edge exists.
+#
+# Git pins at a revision published on brenn-pod's public remote, never a local
+# hash: a pin at an unpublished revision produces no lockfile, so the gate could
+# not run. The dependency arrow is the ratified one -- brenn-reachy consumes
+# brenn-pod, never the reverse. Move the three together; they are one workspace
+# upstream and their internal path dependencies must agree.
+#
+# What this revision does not yet have: `speech_surface::Sinks` and
+# `Server::with_sinks`, the seam a composition points at this repo's edge. The
+# process that composes the pipeline cannot be written against this pin, so the
+# revision moves with it (TODO(host-intent-producers)).
+#
+# At this revision `speech-surface` still takes `motion-proto` from inside
+# brenn-pod, so the fetched closure carries a second copy of the wire contract
+# beside `//crates/motion-proto` -- and a later revision points it at a
+# historical brenn-reachy instead, which is a copy one publish behind this
+# tree's. TODO(motion-proto-two-copies)
+BRENN_POD_REV = "b943c21c43d4d32877968e1e0956a2491a18e0d4"
+
+# The host library the robot's voice process is a composition of. reachy-host.
+crate.spec(
+    git = "https://github.com/rnortman/brenn-pod.git",
+    package = "speech-surface",
+    rev = BRENN_POD_REV,
+)
+
+# The pipeline stages the surface drives. Named here because the host states
+# its own pipeline wiring. reachy-host.
+crate.spec(
+    git = "https://github.com/rnortman/brenn-pod.git",
+    package = "speech-pipeline",
+    rev = BRENN_POD_REV,
+)
+
+# The bus attachment crate, generic across the fleet and consumed here through
+# the host's own driver: the robot attaches once, from the voice host.
+crate.spec(
+    git = "https://github.com/rnortman/brenn-pod.git",
+    package = "brenn-bridge",
+    rev = BRENN_POD_REV,
+)
+
+# The async runtime the voice host runs on. Quarantined to that binary -- the
+# motion and control stack is sans-I/O and async-free. reachy-host.
+crate.spec(
+    features = [
+        "fs",
+        "io-std",
+        "io-util",
+        "macros",
+        "net",
+        "rt",
+        "rt-multi-thread",
+        "signal",
+        "sync",
+        "time",
+    ],
+    package = "tokio",
+    version = "1",
+)
+
+# The inference backend the wake and VAD stages run on, and the TLS stack the
+# pod link and the bus dial run on. Neither is called from this repo's own code;
+# both are named so that `//crates/reachy-host:host_closure_test` can ask the
+# linked libraries what they are, which is the only way a version pinned in a
+# build file gets checked against the binary that resulted.
+crate.spec(
+    package = "ort",
+    version = "=2.0.0-rc.12",
+)
+
+# Exactly, both of them, for the same reason `ort` is pinned exactly and a
+# stronger one: the two annotations below transcribe these crates' build-script
+# output by hand, and a missing `--cfg` is not an error -- it is silently false,
+# compiling out whatever it guarded. A range would let a lockfile refresh move
+# either crate to a version emitting a different set. `openssl-sys` is named
+# only to pin it; nothing here links it directly.
+crate.spec(
+    package = "openssl",
+    version = "=0.10.81",
+)
+
+crate.spec(
+    package = "openssl-sys",
+    version = "=0.9.117",
+)
+
+# OpenSSL is a Bazel dependency here, not a system one. The pod link is TLS-PSK,
+# which is OpenSSL's, so the two crates that speak it cannot be swapped for a
+# pure-Rust stack; what can be swapped is where the library comes from. The
+# module graph already carries `openssl` (3.3.1, from the Clockwork drop's
+# table) and builds it for both of this repo's platforms, so the two `-sys`
+# build scripts -- which exist to find a system OpenSSL and report what they
+# found -- are switched off and their findings stated here instead.
+#
+# The two cfg lists are what those scripts emit for 3.3.1, and they differ
+# because the crates ask different questions of the same version. `osslconf` is
+# the one configuration macro the drop's build sets that either crate looks for.
+# `//crates/reachy-host:host_closure_test` asks the linked library its version,
+# so a bump in that table reddens the gate rather than miscompiling: the cfg
+# lists below are re-derived by hand when it does.
+#
+# They are bound to the crate versions as well as to OpenSSL 3.3.1, which is why
+# both are pinned exactly above: the questions these scripts ask change between
+# crate releases, and nothing asks the crate its version at runtime.
+crate.annotation(
+    crate = "openssl-sys",
+    gen_build_script = "off",
+    link_deps = [
+        "@@//bazel/third_party/openssl:crypto",
+        "@@//bazel/third_party/openssl:ssl",
+    ],
+    rustc_flags = [
+        "--cfg=openssl",
+        "--cfg=ossl101",
+        "--cfg=ossl102",
+        "--cfg=ossl102f",
+        "--cfg=ossl102h",
+        "--cfg=ossl110",
+        "--cfg=ossl110f",
+        "--cfg=ossl110g",
+        "--cfg=ossl110h",
+        "--cfg=ossl111",
+        "--cfg=ossl111b",
+        "--cfg=ossl111c",
+        "--cfg=ossl111d",
+        "--cfg=ossl300",
+        "--cfg=ossl320",
+        "--cfg=ossl330",
+        "--cfg=osslconf=\"OPENSSL_NO_SSL3_METHOD\"",
+    ],
+)
+
+crate.annotation(
+    crate = "openssl",
+    gen_build_script = "off",
+    rustc_flags = [
+        "--cfg=ossl101",
+        "--cfg=ossl102",
+        "--cfg=ossl110",
+        "--cfg=ossl110g",
+        "--cfg=ossl110h",
+        "--cfg=ossl111",
+        "--cfg=ossl111d",
+        "--cfg=ossl300",
+        "--cfg=ossl310",
+        "--cfg=ossl320",
+        "--cfg=ossl330",
+        "--cfg=osslconf=\"OPENSSL_NO_SSL3_METHOD\"",
+    ],
+)
+
+# ONNX Runtime the same way, and for a stronger reason: `ort-sys`'s build script
+# downloads a prebuilt runtime over the network at build time, which no gate can
+# reproduce and no sandbox permits. Switched off, and the runtime supplied as a
+# Bazel dependency instead -- the release archives fetched below, one per CPU.
+crate.annotation(
+    crate = "ort-sys",
+    gen_build_script = "off",
+    link_deps = ["@@//bazel/third_party/onnxruntime:onnxruntime"],
+)
+
 crate.from_specs(name = "brenn_reachy_crates")
 use_repo(crate, "brenn_reachy_crates")
+
+# The ONNX Runtime the wake-word and VAD models are evaluated by, as Microsoft's
+# own prebuilt linux release: headers and a shared object, one archive per CPU.
+# `ort-sys` would otherwise fetch an equivalent at build time (see its
+# annotation above); pinning the archives by hash makes the same library a
+# reproducible input.
+#
+# 1.24.2 because that is the runtime the pinned `ort` release is built against;
+# the two move together. Shared rather than static because a static build is not
+# among the artifacts Microsoft publishes, which is why the deployed payload has
+# to carry the library beside the binary.
+# TODO(host-payload-membership)
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "onnxruntime_linux_x64",
+    build_file = "//bazel/third_party/onnxruntime:onnxruntime.BUILD.bazel",
+    sha256 = "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+    strip_prefix = "onnxruntime-linux-x64-1.24.2",
+    urls = ["https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz"],
+)
+
+http_archive(
+    name = "onnxruntime_linux_aarch64",
+    build_file = "//bazel/third_party/onnxruntime:onnxruntime.BUILD.bazel",
+    sha256 = "6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e",
+    strip_prefix = "onnxruntime-linux-aarch64-1.24.2",
+    urls = ["https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-aarch64-1.24.2.tgz"],
+)

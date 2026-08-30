@@ -93,20 +93,22 @@ the bench that question gates the run, because the probe and the run share one
 ssh invocation; for the motion deploy it is advisory, because the push is a
 second connection and the run is started by hand afterwards.
 
-`deploy-motion.sh --run` appends three codes of its own to that remote chain,
-and they are part of the same contract. Two of them fire before anything is
-emptied: **5** — the payload on the unit carries no `provenance.txt`, so the
-run's records could not name their build, and the fix is another `--push`; **6**
-— the stamp is there but copying it to its staging path failed, which is a full
-or read-only payload store. On both, nothing was started and nothing was
-emptied, so the previous run's records are still on the unit and still
-fetchable. **7** — one of the steps that run after the wipe began failed: the log
-root's own `mkdir`, the stamp's move into it, the launcher console directory's
-wipe and recreate, or the `cd` into the release. Treat a previous run's
-unfetched records as gone; the launcher was not started. All three miss
-`timeout`'s codes (124–127, 137) and ssh's 255; a launcher chain that exits with
-exactly 5, 6 or 7 is read as the refusal instead, which fails the run either
-way.
+`deploy-motion.sh --run` appends four codes of its own to that remote chain,
+and they are part of the same contract. Three of them fire before anything is
+emptied: **8** — the payload on the unit does not carry the launcher config this
+run names, which is a unit still holding a payload staged before that config
+existed, and the fix is another `--push`; **5** — the payload on the unit carries
+no `provenance.txt`, so the run's records could not name their build, and the fix
+is another `--push`; **6** — the stamp is there but copying it to its staging path
+failed, which is a full or read-only payload store. On all three, nothing was
+started and nothing was emptied, so the previous run's records are still on the
+unit and still fetchable. **7** — one of the steps that run after the wipe began
+failed: the log root's own `mkdir`, the stamp's move into it, the launcher
+console directory's wipe and recreate, or the `cd` into the release. Treat a
+previous run's unfetched records as gone; the launcher was not started. All four
+miss `timeout`'s codes (124–127, 137) and ssh's 255; a launcher chain that exits
+with exactly 5, 6, 7 or 8 is read as the refusal instead, which fails the run
+either way.
 
     ssh root@"$REACHY_HOST" systemctl stop reachy-motiond.service
     # ... the session ...
@@ -383,22 +385,36 @@ no band, because a driver computes its instants.
 
 ### What runs
 
-Four OS processes, three binaries, one supervisor over three of them:
+A motion run is four OS processes and a unit at rest is four as well, over four
+binaries, with one supervisor over all but the harness's intent source:
 
 | | |
 |---|---|
-| `simplelaunch` | the launcher, from the pinned Clockwork drop. Starts all three of its apps from `robotcpu.textproto`, redirects each one's console into its own file, and stops them all together |
+| `simplelaunch` | the launcher, from the pinned Clockwork drop. Starts its apps from the launcher config it is handed, redirects each one's console into its own file, and stops them all together |
 | `reachy_motord` | the servo bus. Not a cog: it owns the serial port, a 20 ms grid on the real clock, and the driver decisions. Talks to the cogs over six UDP sockets on loopback |
 | `cogs/robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
 | `cogs/robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose` and `Session`, with the intent edge's two sockets where a producer of scripts stands |
+| `reachy_host` | the robot's voice host: the Brenn-bus attachment and the host end of the intent edge, on the far side of the socket seam. A launcher app in `robotcpu.textproto` and deliberately not in the harness twin, because it binds the narration port `reachy_ask` binds and sends scripts to the port the control process binds. Its console is `voice_host_0.log`. What it does today is follow the session's story and narrate it as JSON lines: the voice pipeline is not linked into it yet |
 | `reachy_ask` | the harness's intent source, and not a launcher app: it binds the narration port 7410 before the composition starts narrating on it, so `make motion-run` starts it first and stops it with the launcher. It asks once, through the same edge library the voice host uses, and its console is `reachy_ask.log` beside the launcher's |
 
 One executable, two processes: which one it becomes is the process description
-it is started with. `robotcpu.textproto` is not written by hand — the
-compositions render it from `cogs/robot.clk`, and the payload carries it as
-rendered. It names two of the apps itself; the driver is merged into it from
-`driver/motord_launch.textproto`, because the renderer only knows about
-Clockwork processes.
+it is started with. `robotcpu.textproto` is not written by hand: the drop's build updater renders it
+from `cogs/robot.clk`, which is why an edit to the unit's app set is an edit to
+the system module. The twin's *content* is merged from the same rendered sources,
+but its build rule is hand-maintained in `cogs/BUILD.bazel` — the updater knows
+of one config here — so changing the harness's app set is an edit to that rule
+and `cogs/robot.clk` has nothing to say about it. Each config names two of the
+apps itself; the driver and the voice host are merged in from
+`driver/motord_launch.textproto` and `host/host_launch.textproto`, because the
+renderer only knows about Clockwork processes.
+
+**Two launcher configs travel in the payload.** `robotcpu.textproto` is the
+unit's: four apps, the host among them. `robotcpu_harness.textproto` is the same
+without the host, and it is what `make motion-run` starts — because that run
+brings up `reachy_ask`, and the host would bind the narration port 7410 a second
+time and address scripts to 7409 beside it, leaving the run's verdict to
+whichever of them the kernel gave the bind to.
+Production presence and the motion harness are never live at once.
 
 Nothing carries a `--pinion-dir` or a `--pinion-ns`. The rendered config cannot
 express per-process flags, so every process runs on the compiled-in defaults —
@@ -498,7 +514,8 @@ unit is for; the verdict comes from the log afterwards.
 
 The launcher redirects each process's console into its own file under
 `/run/brenn-app/logs/launch` on the unit — `motord_0.log`, `proc_0.log`,
-`logger_proc_0.log`, a second run in the same log directory writing
+`logger_proc_0.log`, `voice_host_0.log` where the voice host is running, a second run in the
+same log directory writing
 `motord_1.log` and so on. What streams into your terminal is the launcher's own
 output; the per-process files are written on the unit and fetched with the run,
 and a `tail -f` on one of them from a second shell is how you watch a process
@@ -680,14 +697,20 @@ On the unit, as root. The launcher resolves every path in its config against its
 working directory, so it is started from the release root and nowhere else. It
 runs in the foreground:
 
-    cd /run/brenn-app/releases/motion && ./simplelaunch robotcpu.textproto \
+    cd /run/brenn-app/releases/motion && ./simplelaunch robotcpu_harness.textproto \
         --logdir /run/brenn-app/logs/launch
+
+The harness twin, because the run below is the harness's: `./reachy_ask` in
+another shell on the unit is what asks for the gesture, and the production
+config's host app would bind the same ports. Start `robotcpu.textproto` instead
+when what is wanted is the unit as it runs for a person rather than a motion run.
 
 Watch it, one per shell:
 
     tail -f /run/brenn-app/logs/launch/motord_0.log        # the driver
     tail -f /run/brenn-app/logs/launch/proc_0.log          # the control loop
     tail -f /run/brenn-app/logs/launch/logger_proc_0.log   # the logger
+    tail -f /run/brenn-app/logs/launch/voice_host_0.log    # the voice host, if started
 
 Stop it with Ctrl-C in the launcher's terminal, or from anywhere on the unit:
 

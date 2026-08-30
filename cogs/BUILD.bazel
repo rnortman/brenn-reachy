@@ -25,10 +25,12 @@ load("//bazel:scenario_suite.bzl", "scenario_suite")
 # `robotcpu.textproto` launcher configs it derives -- carry no comments,
 # because it strips them.
 #
-# `robotcpu.textproto` is the online run's launcher config, shipped in the device
-# payload and consumed exactly as rendered: three apps -- the two cog processes
-# and the driver, merged in through `RobotCpu`'s `simplelaunch_src` -- and
-# upstream's prelaunch. `motioncpu.textproto` is used by nothing: it
+# `robotcpu.textproto` is the unit's launcher config, shipped in the device
+# payload and consumed exactly as rendered: four apps -- the two cog processes,
+# the driver and the voice host, the last two merged in through `RobotCpu`'s
+# `simplelaunch_src` -- and upstream's prelaunch. `robotcpu_harness.textproto`
+# beside it is the same thing without the host, which is what a motion run uses;
+# the rule below it says why. `motioncpu.textproto` is used by nothing: it
 # redirects a child's console into files, which is not what a deterministic run
 # wants. A wildcard build builds it and the TCP bridge it names for nothing, and
 # the updater refuses the `tags = ["manual"]` that would stop that as surely as
@@ -836,8 +838,14 @@ clk(
 # The configuration the online composition's processes read by path at setup,
 # named once. `robot_clk` carries it as `data`, so a host-side `bazel run` finds
 # it in the runfiles, and `tools/build-motion.sh` cqueries this same target to
-# know what to stage into the device payload -- a config file added here reaches
-# both, and there is nowhere else to add it.
+# know what to stage into the device payload -- a config file a cog reads is
+# added here and reaches both.
+#
+# Scoped to what the composition's own processes read. A file in this package
+# that only a process outside the composition reads -- `clip_library.names.json`,
+# which the voice host resolves overlay names through -- does not belong in
+# `robot_clk`'s runfiles and is named directly in `tools/build-motion.sh`'s
+# `config_targets` instead, beside this filegroup.
 filegroup(
     name = "robot_config_files",
     srcs = [
@@ -909,6 +917,54 @@ clk(
 
 merge_simplelaunch_config(
     name = "robotcpu.textproto",
+    srcs = [
+        "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
+        "//driver:motord_launch.textproto",
+        "//host:host_launch.textproto",
+        "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
+    ],
+    data = [
+        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
+        "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
+        "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
+        "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_event_logger_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_metrics_channel_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_signal_metadata_config.tachyon",
+        "system_robot.motion_robot.RobotCpu_telemetry_logger_config.tachyon",
+        "system_robot.motion_robot.diagnostics_database_config.tachyon",
+        ":robot_clk_exe",
+        "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# The harness twin of the launcher config above: the same three composition and
+# driver apps, without the voice host.
+#
+# `tools/deploy-motion.sh --run` starts `reachy_ask` itself, ahead of the
+# launcher, because the intent source has to bind the narration port 7410 before
+# the control process narrates anything. The host binds 7410 too, and both send
+# scripts to 7409, which the control process binds and which admits one
+# publisher. So a motion run started against the production config would put two
+# binders on 7410 -- the loser exits at startup -- and two script senders on
+# 7409, and the run's verdict would be decided by which of them the kernel gave
+# the bind to. So `--run` names this config instead, and production presence and
+# the motion harness are never live at once.
+#
+# The two rules differ by exactly one src, the host's app entry: everything else
+# a unit runs is the same file in both, so the harness runs the composition it
+# ships rather than a second description of it. `tools/build-motion.sh` stages
+# both and holds each to its own expected app list, and
+# `tools/build-motion.test.sh` reads both rules out of this file and holds them
+# to that difference -- the rule above is the updater's to rewrite, so nothing
+# else would say the twin had stopped following it.
+#
+# Hand-written rather than derived: the build updater renders the config above
+# from the system module and knows nothing about a second one, which is also why
+# this rule carries the comment and that one cannot.
+merge_simplelaunch_config(
+    name = "robotcpu_harness.textproto",
     srcs = [
         "system_robot.motion_robot.RobotCpu_simplelaunch_config.textproto",
         "//driver:motord_launch.textproto",

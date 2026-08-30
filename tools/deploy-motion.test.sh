@@ -86,11 +86,12 @@ BUILD_COMMIT=""
 stage_payload() {
 	local when=$1
 	local name
-	for name in reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch; do
+	for name in reachy_motord reachy_host reachy_ask cogs/robot_clk_exe simplelaunch; do
 		: >"${payload}/${name}"
 		chmod 0755 -- "${payload}/${name}"
 	done
 	: >"${payload}/robotcpu.textproto"
+	: >"${payload}/robotcpu_harness.textproto"
 	: >"${payload}/cogs/session_params.textproto"
 	stage_logger_config
 	rm -f -- "${payload}/build-commit.txt"
@@ -321,6 +322,35 @@ assert_status "a payload missing the launcher refuses" 1 "$(status_of "$result")
 assert_contains "the refusal names it" "$(output_of "$result")" "no executable simplelaunch"
 stage_payload "$after"
 
+# The voice host is a payload binary like the driver: the production launcher
+# config names it, so a payload without it is a unit whose launcher starts an app
+# that is not there.
+rm -f -- "${payload}/reachy_host"
+result=$(deploy unit --push)
+assert_status "a payload missing the voice host refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the host binary" "$(output_of "$result")" \
+	"no executable reachy_host"
+stage_payload "$after"
+
+# The two launcher configs are payload members like the binaries: `--run` names
+# the harness twin by name and the launcher resolves it against the payload root,
+# so a payload missing either one is refused here rather than on a powered unit.
+rm -f -- "${payload}/robotcpu_harness.textproto"
+result=$(deploy unit --push)
+assert_status "a payload missing the harness launcher config refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the missing config" "$(output_of "$result")" \
+	"no launcher config robotcpu_harness.textproto"
+stage_payload "$after"
+
+rm -f -- "${payload}/robotcpu.textproto"
+result=$(deploy unit --push)
+assert_status "a payload missing the production launcher config refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names that one too" "$(output_of "$result")" \
+	"no launcher config robotcpu.textproto"
+stage_payload "$after"
+
 rm -f -- "${payload}/cogs/robot_clk_exe"
 result=$(deploy unit --push)
 assert_status "a payload with the executable outside cogs/ refuses" 1 \
@@ -493,7 +523,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; ./reachy_ask --resting-timeout 30 --run-window 30 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; ./reachy_ask --resting-timeout 30 --run-window 30 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -504,6 +534,11 @@ assert_contains "and says what stops the run instead" "$(output_of "$result")" \
 	"pkill -x simplelaunch"
 assert_lacks "no process is started by hand" "$ran" "./robot_clk_exe"
 assert_lacks "not even the driver" "$ran" "./reachy_motord"
+# The twin, not the production config: `--run` already started `reachy_ask` on
+# 7409 and 7410, and the host the production config names owns the same two.
+assert_lacks "a run does not start the config that names the voice host" "$ran" \
+	"./simplelaunch robotcpu.textproto"
+assert_lacks "and the host is not started beside it either" "$ran" "./reachy_host"
 assert_lacks "nothing carries a pinion flag" "$ran" "--pinion-"
 
 assert_contains "the records are fetched from the configured log root" "$ran" \
@@ -786,12 +821,31 @@ assert_lacks "and does not claim the unit was left as it was" "$(output_of "$res
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
 assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
 
+# The launcher config `--run` names is asked about on the unit, before the stamp
+# and before the wipe: the push checks the local payload carries both configs,
+# but a run is a separate invocation against whatever is already there, and a
+# unit still holding a payload staged before the harness twin existed would die
+# inside `simplelaunch` with the log root already cleared.
+SSH_RUN_STATUS=8
+result=$(deploy unit --run "${work}/run-noconfig")
+assert_status "a unit whose payload has no harness config refuses the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the config that is not there" \
+	"$(output_of "$result")" "has no robotcpu_harness.textproto"
+assert_contains "and says the payload predates it" "$(output_of "$result")" \
+	"predates the harness twin"
+assert_contains "and says to push again" "$(output_of "$result")" "--push"
+assert_contains "and says the unit was left as it was" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
+
 # A code the run path does not read at all, which is what the catch-all arm is
 # for.
-SSH_RUN_STATUS=8
+SSH_RUN_STATUS=9
 result=$(deploy unit --run "${work}/run-failed")
 assert_status "any other status refuses" 1 "$(status_of "$result")"
-assert_contains "and carries the code" "$(output_of "$result")" "exit 8"
+assert_contains "and carries the code" "$(output_of "$result")" "exit 9"
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
 
 # A launcher killed by a signal, which the remote shell reports as 128+signal

@@ -810,39 +810,78 @@ The queue's own policy — bounded at eight, dropping rather than growing or
 blocking — is sized against a presence refresh cadence no producer in this tree
 runs yet, so the first real producer is also the first measurement of it.
 
+The seams alone are not enough: both are reached through `Server::with_sinks`,
+which is newer than the `BRENN_POD_REV` the closure is pinned at, so the wiring
+cannot compile until that constant moves.
+
 Done = a wake word on the unit reaches the motors through this queue, and a
-script published on the bus's motion channel reaches the same gate. Marked where
-the sending half is dropped, in `crates/reachy-host/src/main.rs`.
+script published on the bus's motion channel reaches the same gate, with
+`MODULE.bazel`'s `BRENN_POD_REV` moved to a published brenn-pod revision
+carrying `Server::with_sinks`. Marked where the sending half is dropped, in
+`crates/reachy-host/src/main.rs`, and at the pin in `MODULE.bazel`.
+
+## `motion-proto-two-copies`
+
+Two copies of the motion wire contract compile in this build: `crates/
+motion-proto`, and the one `speech-surface` brings through the pinned host
+closure. `//crates/reachy-host:host_closure_test` links the second.
+
+Deferral context: `speech-surface` takes `motion-proto` as a path dependency
+inside brenn-pod at the currently pinned revision, and at brenn-pod's later
+revisions it takes it from a *historical* brenn-reachy commit — so the fetched
+copy is one publish behind this tree's either way, and re-pinning does not
+dissolve it. Harmless today by construction: both seams the host will use carry
+an encoded body (`ScriptOut.body`, `IntentSink::deliver(&str)`), never a
+`MotionScript` value, so the two types never meet. What it costs is that a
+decode-tolerance fix made here is not in the pipeline that produced the bytes,
+and the two definitions can diverge with both repos' gates green.
+
+The real dissolution is the scripter's migration into this repo, which retires
+the back-pin entirely; that is a design cycle of its own. A byte-identity gate
+test over the fetched sources would hold the line until then, and wants a
+mechanism decision first — the fetched crate is a `crate_universe` repository
+with no filegroup over its sources, so reaching them from a test is not the
+one-line `data =` it looks like.
+
+Done = `speech-surface` no longer depends on `motion-proto` from outside this
+repo, and the build resolves the crate once. Marked at `BRENN_POD_REV` in
+`MODULE.bazel`.
 
 ## `host-payload-membership`
 
-`reachy_host` is cross-built on the gate but staged by nothing: it is a member
-of `//bazel/platform:device_deployables`, so `make check-device` cross-builds
-it, but it is in no payload, so no deploy puts it on a unit and no launcher
-config starts it.
+A unit stages and starts `reachy_host`, but what it starts is not yet the voice
+host: the pod audio device, the speech configuration and the wake/VAD model
+files are not in the payload, and the process runs with the voice pipeline
+unlinked.
 
-Deferral context: the host is one of five apps a unit is meant to run, and the
-four things it needs beside it — the pod audio device, the speech
-configuration, the wake/VAD model files, and the launcher config naming the app
-— are this cycle's, taken in the increment that composes the host against the
-pod repo's pipeline libraries; the audio and speech halves come from that repo.
-Staging the binary alone would put a process on the unit that binds the
-narration port, hears nothing, and asks for nothing, ahead of the deploy step
-that completes it.
+Deferral context: the binary, its two configuration files and the two launcher
+configs landed together, because the production config naming the host and the
+harness twin that does not are one indivisible pair — a production config naming
+`reachy_host` while `--run` starts `reachy_ask` against it puts both owners of
+7409/7410 in one motion run, and that pairing had no reason to wait. What is
+still missing all comes from brenn-pod or from the pipeline this binary does not
+link yet: the `reachy-pod` audio device as a prebuilt artifact, `speech-surface`'s
+TOML, and the openWakeWord and Silero models. `MODULE.bazel`'s `BRENN_POD_REV`
+has to move to a published revision carrying `Server::with_sinks` before the host
+composes the pipeline at all, so the runtime data it would read has nothing to
+read it.
 
-One invariant is on hold until it lands, and it is stated where it can be read:
-`motion_payload` is the only place a deployed member is declared.
+One thing is the payload's own and waits with them: the host will link ONNX
+Runtime as a *shared* library — Microsoft publishes no static build, and the pyke
+archive `ort` would otherwise fetch is in a container format Bazel cannot extract
+— so `libonnxruntime.so.1` has to be staged beside the binary and found by the
+loader. Nothing else in the payload has a shared-library dependency, so neither
+deploy script has anywhere to put one yet;
+`//bazel/third_party/onnxruntime:shared_object` is the label that names the file
+(the device ISA sweep already reads it there). Staging it before anything loads
+it would be a payload member nothing opens.
 
-Done = `reachy_host` and its configuration are members of `motion_payload`,
-`tools/build-motion.sh` and `tools/deploy-motion.sh` stage them, the launcher's
-production config names the app, and the harness twin of that config — no host
-app, no pod app — is rendered in the same commit, with `tools/deploy-motion.sh
---run` and `tools/host-motion-run.sh` using the twin. Both halves together: a
-production config naming `reachy_host` while `--run` starts `reachy_ask`
-against it puts both owners of 7409/7410 in one motion run. Marked at the
-filegroup in
-`bazel/platform/BUILD.bazel` and at the binary in
-`crates/reachy-host/BUILD.bazel`.
+Done = the pod device binary, the speech configuration, the model files and
+`libonnxruntime.so.1` are staged beside `reachy_host`, the loader finds the
+shared object, and the production launcher config names the pod app as well as
+the host. Marked at the filegroup in `bazel/platform/BUILD.bazel`, at the binary
+in `crates/reachy-host/BUILD.bazel`, and at the ONNX Runtime archives in
+`MODULE.bazel`.
 
 ## `params-reader-shared`
 
