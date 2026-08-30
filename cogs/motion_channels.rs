@@ -12,7 +12,7 @@
 //! must be able to name one without depending on anything of an operator's.
 
 /// The channel the scripts arrive on, fed from the input log in a scenario and
-/// published by the wake cog on a machine.
+/// from the intent edge's incoming socket on a machine.
 pub const SCRIPT_CHANNEL: &str = "ScriptsIn";
 
 /// The channel the session publishes what it accepted on.

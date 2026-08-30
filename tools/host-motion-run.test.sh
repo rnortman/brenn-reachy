@@ -49,7 +49,6 @@ config_files=(
 	cogs/host_logger.textproto
 	cogs/mover_params.textproto
 	cogs/session_params.textproto
-	cogs/wake_params.textproto
 )
 for file in "${config_files[@]}"; do
 	echo "# ${file}" >"${repo}/${file}"
@@ -123,7 +122,8 @@ case "\$sub" in
 		cp -- "${stubs}/launcher" bazel-out/bin/simplelaunch
 		printf '#!/bin/bash\n' >bazel-out/bin/clockwork_prelaunch.sh
 		printf '#!/bin/bash\n' >bazel-out/bin/robot_host_clk_exe
-		chmod 0755 -- bazel-out/bin/robot_host_clk_exe \\
+		cp -- "${stubs}/ask" bazel-out/bin/reachy_ask
+		chmod 0755 -- bazel-out/bin/robot_host_clk_exe bazel-out/bin/reachy_ask \\
 			bazel-out/bin/clockwork_prelaunch.sh bazel-out/bin/simplelaunch
 		echo 'app { name: "proc" }' >bazel-out/bin/hostcpu.textproto
 		for f in ${generated_files[*]}; do
@@ -138,14 +138,32 @@ case "\$sub" in
 				done
 				;;
 			*)
-				echo bazel-out/bin/robot_host_clk_exe
-				echo bazel-out/bin/simplelaunch
-				echo bazel-out/bin/hostcpu.textproto
-				echo bazel-out/bin/clockwork_prelaunch.sh
-				echo cogs/robot_host.clk
-				for f in bazel-out/bin/*.tachyon; do
-					echo "\$f"
-				done
+				# One output per label the expression actually names, so a
+				# member the subject stages without querying for it is a
+				# \`bazel_named_in\` refusal here rather than in front of an
+				# operator.
+				case "\$target" in *//cogs:robot_host_clk_exe*)
+					echo bazel-out/bin/robot_host_clk_exe ;;
+				esac
+				case "\$target" in *//crates/reachy-ask:reachy_ask*)
+					echo bazel-out/bin/reachy_ask ;;
+				esac
+				case "\$target" in *simplelaunch*)
+					echo bazel-out/bin/simplelaunch ;;
+				esac
+				case "\$target" in *//cogs:hostcpu.textproto*)
+					echo bazel-out/bin/hostcpu.textproto ;;
+				esac
+				case "\$target" in *//cogs:clockwork_prelaunch_sh*)
+					echo bazel-out/bin/clockwork_prelaunch.sh ;;
+				esac
+				case "\$target" in *//cogs:system_host_clk*)
+					echo cogs/robot_host.clk
+					for f in bazel-out/bin/*.tachyon; do
+						echo "\$f"
+					done
+					;;
+				esac
 				;;
 		esac
 		;;
@@ -214,6 +232,44 @@ sys.exit(0)
 STUB
 chmod 0755 -- "${stubs}/launcher"
 
+# The intent source. It records that it was started -- the case that matters is
+# that the subject starts it, and starts it before the launcher -- and then waits
+# for the stop signal the subject sends it, as the real one does when its run
+# window is cut short.
+#
+# Python for the reason the launcher stub is: a background child of a
+# non-interactive shell inherits SIGINT ignored, and a shell script cannot trap a
+# signal that arrived ignored. The real `reachy-ask` registers its own handlers
+# for exactly that, which is what overrides the inherited disposition -- the stub
+# stands in for a binary that does so, not for one that relies on the shell.
+cat >"${stubs}/ask" <<'STUB'
+#!/usr/bin/env python3
+# Stand in for reachy-ask: record the call, then wait to be stopped.
+
+import os
+import signal
+import sys
+import time
+
+with open(os.environ["CALLS"], "a", encoding="utf-8") as calls:
+    calls.write("ask " + " ".join(sys.argv[1:]) + "\n")
+
+stopped = False
+
+
+def stop(_signum, _frame):
+    global stopped
+    stopped = True
+
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while not stopped:
+    time.sleep(0.01)
+sys.exit(0)
+STUB
+chmod 0755 -- "${stubs}/ask"
+
 # pgrep, answering what a case says is running. Exit 1 with nothing found, which
 # is what the real one does and what the subject's `|| true` rests on.
 cat >"${stubs}/pgrep" <<'STUB'
@@ -267,6 +323,9 @@ assert_file "and its config beside it" "${staging}/hostcpu.textproto"
 assert_file "the executable is where the config's apps name it" \
 	"${staging}/cogs/robot_host_clk_exe"
 assert_no_file "and not at the staging root" "${staging}/robot_host_clk_exe"
+# At the root and not under `cogs/`: it is not a launcher app, so nothing
+# resolves it against the config's paths -- the subject starts it itself.
+assert_file "the intent source is at the staging root" "${staging}/reachy_ask"
 assert_file "the prelaunch script is at the path its config names" \
 	"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 for file in "${config_files[@]}"; do
@@ -288,12 +347,31 @@ assert_eq "the staged logger config states one log root, in the scratch tree" \
 assert_contains "and the tree's own copy is untouched" \
 	"$(cat -- "$logger_config")" 'log_root_dir: "/tmp/a-hand-started-run"'
 
+# Every staged member is named in the one cquery that asks where the outputs
+# are. A member staged but never queried for reads as a Bazel naming problem on
+# a developer's machine the first time the gate is used, and nothing before this
+# line would have said so.
+assert_contains "one cquery names every built output" "$(calls)" \
+	"//cogs:robot_host_clk_exe + //crates/reachy-ask:reachy_ask + //cogs:system_host_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:hostcpu.textproto + //cogs:clockwork_prelaunch_sh"
+assert_contains "one cquery names the configuration" "$(calls)" \
+	"-- //cogs:host_config_files"
+assert_eq "and there are two cqueries, not one per target" 2 \
+	"$(calls | grep -c 'bazel cquery')"
+
 assert_contains "the analyzer is run over the log the writer wrote" "$(calls)" \
 	"run -- //cogs:first_motion_report --grid-jitter-ns"
 assert_contains "and the run directory it names is the one under the scratch log root" \
 	"$(calls)" "${logs}/run_000001"
 assert_contains "the launcher is started on a probed control port" "$(calls)" \
 	"launcher hostcpu.textproto --logdir"
+assert_contains "the intent source is started too" "$(calls)" "ask --resting-timeout"
+# The whole reason it is not a launcher app: it binds the narration port, and the
+# control process narrates from its first execution. Read off the subject's own
+# announcements rather than off the two stubs' writes into $CALLS -- both run
+# concurrently once started, so which of them appends first is a race and the
+# claim here is about which the subject starts first.
+assert_eq "and before the launcher" "reachy-ask" \
+	"$(output_of "$result" | sed -n 's/^host-motion-run.sh: \(reachy-ask\|launcher\) pid .*/\1/p' | head -1)"
 assert_contains "the run says where the log is" "$(output_of "$result")" \
 	"${logs}/run_000001"
 

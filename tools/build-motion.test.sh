@@ -61,7 +61,6 @@ config_files=(
 	cogs/robot_logger.textproto
 	cogs/robot_logger_rates.textproto
 	cogs/session_params.textproto
-	cogs/wake_params.textproto
 	driver/motord_params.textproto
 )
 for file in "${config_files[@]}"; do
@@ -111,6 +110,7 @@ done
 # reads bytes 18 and 19 of the ELF header, so the stub below writes a header
 # plausible enough for that read to be unambiguous and nothing more.
 export MOTORD_MACHINE=183
+export ASK_MACHINE=183
 export EXE_MACHINE=183
 export LAUNCHER_MACHINE=183
 export DROP_LOGGER_CONFIG=""
@@ -170,6 +170,7 @@ case "$sub" in
 			chmod 0755 -- "$1"
 		}
 		elf bazel-out/bin/reachy_motord "$MOTORD_MACHINE"
+		elf bazel-out/bin/reachy_ask "$ASK_MACHINE"
 		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
 		cat >bazel-out/bin/robotcpu.textproto <<CONFIG
 app {
@@ -207,6 +208,7 @@ CONFIG
 				;;
 			*system_robot_clk*)
 				echo bazel-out/bin/reachy_motord
+				echo bazel-out/bin/reachy_ask
 				echo bazel-out/bin/robot_clk_exe
 				echo bazel-out/bin/simplelaunch
 				echo bazel-out/bin/robotcpu.textproto
@@ -289,6 +291,7 @@ result=$(build)
 assert_status "a clean build succeeds" 0 "$(status_of "$result")"
 
 assert_file "the driver is in the payload" "${payload}/reachy_motord"
+assert_file "the intent source is beside it" "${payload}/reachy_ask"
 assert_file "the launcher is in the payload" "${payload}/simplelaunch"
 assert_file "its config is beside it, where it is started from" \
 	"${payload}/robotcpu.textproto"
@@ -359,7 +362,7 @@ assert_lacks "the configuration is not spelled out here" "$(calls)" \
 assert_contains "the build builds the deployables the gate names" "$(calls)" \
 	"build --config=device -- //bazel/platform:motion_payload"
 assert_contains "one cquery names every built output" "$(calls)" \
-	"//crates/reachy-motord:reachy_motord + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:clockwork_prelaunch_sh"
+	"//crates/reachy-motord:reachy_motord + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
 	"//cogs:robot_config_files + //driver:motord_params.textproto"
 assert_eq "and there are two cqueries, not one per target" 2 \
@@ -436,6 +439,15 @@ assert_contains "the refusal names the platform flag" "$(output_of "$result")" \
 	"platform flag did not take effect"
 assert_unstaged "a build refused for the wrong machine stages nothing"
 EXE_MACHINE=183
+
+mark_payload
+ASK_MACHINE=62
+result=$(build)
+assert_status "an intent source for the wrong machine refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names that binary" "$(output_of "$result")" \
+	"reachy_ask is an ELF"
+assert_unstaged "and that one stages nothing either"
+ASK_MACHINE=183
 
 mark_payload
 MOTORD_MACHINE=62
@@ -519,13 +531,13 @@ result=$(build)
 assert_status "and the rendered names build" 0 "$(status_of "$result")"
 
 mark_payload
-rm -f -- "${repo}/cogs/wake_params.textproto"
+rm -f -- "${repo}/cogs/mover_params.textproto"
 result=$(build)
 assert_status "a configuration file the tree lost refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names it" "$(output_of "$result")" \
-	"wants cogs/wake_params.textproto"
+	"wants cogs/mover_params.textproto"
 assert_unstaged "a configuration file the tree lost stages nothing"
-echo '# back' >"${repo}/cogs/wake_params.textproto"
+echo '# back' >"${repo}/cogs/mover_params.textproto"
 
 # ---------------------------------------------------------------------------
 # Bazel answering badly. The refusals are lib.sh's and their wording is pinned
@@ -616,7 +628,7 @@ labels_of() {
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|exe_target|system_target|launcher_target|launch_config_target|prelaunch_target)=' \
+script_labels=$(grep -E '^(motord_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|prelaunch_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
 assert_eq "the payload's members are exactly the labels this script cqueries" \

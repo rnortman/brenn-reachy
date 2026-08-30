@@ -101,5 +101,5 @@ bus_watchdog: 10
 # equal leaves no room for a stamp from a clock running ahead: the invariant
 # holds exactly when a script's arrival stamp is this machine's receive time.
 # Any publisher here must stamp arrival with this machine's clock, never
-# forward the sender's. TODO(reachy-pod-motion-integration)
+# forward the sender's.
 script_span_cap_ms: 600000

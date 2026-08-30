@@ -116,9 +116,13 @@ rust_test(
         ":health_clk_rs",
         ":pose_clk_rs",
         ":wire_clk_rs",
+        "//cogs:schedule_clk_rs",
+        "//cogs:script_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
         "//motion:bus_txn_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )

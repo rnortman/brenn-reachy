@@ -128,16 +128,17 @@ checkout_root() {
 	(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 }
 
-# A motion-run harness's budget against the wake lead it is mostly made of.
+# A motion-run harness's budget against the gesture it is mostly made of.
 #
 #   assert_run_budget_covers_lead <harness script in the checkout>
 #
 # Both harnesses — the host one and the device one — stop their launcher on a
-# hand-maintained budget whose largest term, the shipped wake lead, lives in
-# another file and language. A lead that grows without a budget following it is
-# red here rather than a launcher stopped mid-gesture.
+# hand-maintained budget whose largest term is the harness gesture's arming
+# offset, which lives in another file and language: `UP_AFTER_MS` in
+# `crates/reachy-ask/src/gesture.rs`. An offset that grows without a budget
+# following it is red here rather than a launcher stopped mid-gesture.
 #
-# The sum around the lead is stated once, here: commissioning's bus survey
+# The sum around the offset is stated once, here: commissioning's bus survey
 # (~5 s), the raise-hold-stow gesture (~5 s), and the release (~4 s). The
 # margin each harness carries above this is deliberately excluded — that is for
 # a loaded workstation or a serial bus that retries, and each script's own
@@ -147,17 +148,17 @@ checkout_root() {
 # its first cycle.
 assert_run_budget_covers_lead() {
 	local script=$1
-	local label="${script##*/}'s run budget covers the shipped wake lead and the phases around it"
+	local label="${script##*/}'s run budget covers the harness gesture's arming offset and the phases around it"
 	local checkout lead budget phases needed
 	checkout=$(checkout_root)
 	phases=14
-	lead=$(sed -n 's/^lead_ms:[[:space:]]*\([0-9]*\).*/\1/p' \
-		-- "${checkout}/cogs/wake_params.textproto")
+	lead=$(sed -n 's/^pub const UP_AFTER_MS: u64 = \([0-9_]*\);.*/\1/p' \
+		-- "${checkout}/crates/reachy-ask/src/gesture.rs" | tr -d _)
 	budget=$(sed -n 's/^run_seconds=\([0-9]*\).*/\1/p' -- "$script")
 	if [ -z "$lead" ] || [ -z "$budget" ]; then
 		fail "$label" \
-			"read no lead_ms from cogs/wake_params.textproto or no run_seconds from" \
-			"${script} — one of the names has moved"
+			"read no UP_AFTER_MS from crates/reachy-ask/src/gesture.rs or no run_seconds" \
+			"from ${script} — one of the names has moved"
 		return
 	fi
 	needed=$((lead / 1000 + phases))
@@ -166,7 +167,7 @@ assert_run_budget_covers_lead() {
 	else
 		fail "$label" \
 			"the budget is ${budget} s" \
-			"the shipped wake lead is ${lead} ms, and commissioning, the gesture" \
+			"the harness gesture raises at ${lead} ms, and commissioning, the gesture" \
 			"and the release want ${phases} s around it: ${needed} s" \
 			"the launcher would be stopped mid-gesture"
 	fi

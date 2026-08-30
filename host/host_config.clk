@@ -1,0 +1,55 @@
+// What the voice host's intent edge is built with: the name this machine
+// answers to, the durations and caps the edge screens with, and where the clip
+// name table it resolves overlays through is.
+//
+// A module of its own, and in a package of its own, for the same reason the
+// driver's configuration is: a config is authored as protobuf text, so its
+// schema crosses the Protobuf backend as well as the C++ one, and generation is
+// declared per module. Nothing else the host publishes crosses that backend.
+//
+// The host is not Clockwork-hosted -- it is a plain process holding the bus
+// attachment, the audio link and this machine's two loopback ports -- and it is
+// configured this way anyway: one vocabulary for numbers a machine is built
+// with, whichever process reads them. The binary parses the text against the
+// message this schema generates, against a descriptor compiled into it.
+//
+// The speech pipeline's own configuration is not here. It is the pipeline
+// library's TOML, read by the library that owns those numbers; this file is the
+// edge's, and the two are separate because they are owned by different trees.
+
+#![generate(cpp, proto, proto_conv)]
+#![cpp(namespace=brenn_reachy::host)]
+
+// The intent edge's whole configuration.
+schema HostParams
+{
+    uuid: 6c4a1f92-8d37-4b5e-9a10-7e2c3d84b615;
+    fields
+    {
+        // The pod name this machine answers to. A script addressed to another
+        // name is dropped and narrated, which is the whole reason the field
+        // exists: the intent channel is not assumed to carry one machine's
+        // traffic. No default -- an edge that answered to whatever name a body
+        // carried would run another machine's timeline on this head.
+        #0 pod: VarString<64>;
+
+        // How long the stow at the end of a schedule takes, milliseconds. Every
+        // schedule ends stowed, either at a stow the script asked for or at one
+        // the compile appends, and this is how long that step lasts. The
+        // sender's refresh headroom has to exceed it, or a close would be
+        // refused for want of room.
+        #1 stow_duration_ms: UInt32;
+
+        // The largest intent body the edge looks at, bytes. Applied to the
+        // bytes before anything parses them: the cheap screen goes first,
+        // because the expensive one is what an unbounded body makes expensive.
+        #2 body_cap_bytes: UInt32;
+
+        // Where the clip library's name table is, as a path the host reads once
+        // at startup. Overlay steps name a motion and the session takes an
+        // index, so this file is what joins the two -- and it is deployed
+        // beside the library it describes, which is why it is a path rather
+        // than something compiled in.
+        #3 clip_names_path: VarString<256>;
+    }
+}

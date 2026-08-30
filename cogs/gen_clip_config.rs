@@ -181,6 +181,24 @@ struct EmittedAsset {
     name: String,
     /// How many parts it holds — frames for a clip, segments for a motion.
     parts: usize,
+    /// How long invoking it occupies a timeline, for the numberings whose ids a
+    /// script can name. Clips are numbered too and no script names one, so
+    /// theirs is `None`.
+    window: Option<MotionWindow>,
+}
+
+/// How long a motion occupies a timeline, as the sidecar states it.
+///
+/// Two numbers rather than one because an invocation speed divides only the
+/// first: the motion's own clock scales, and the blend-out that follows runs on
+/// the wall clock at any speed, being the ramp that keeps the machine's per-tick
+/// bounds satisfied.
+#[derive(Clone, Copy, Debug)]
+struct MotionWindow {
+    /// The motion's own length at 1.0x, milliseconds.
+    duration_ms: u64,
+    /// The exit ramp, milliseconds.
+    blend_out_ms: u64,
 }
 
 /// One numbering of the emit, and the words it is stated in.
@@ -216,6 +234,7 @@ impl Numbering {
             .map(|(name, parts)| EmittedAsset {
                 name: name.clone(),
                 parts,
+                window: None,
             })
             .collect();
         Self {
@@ -223,6 +242,28 @@ impl Numbering {
             part,
             entries,
         }
+    }
+
+    /// The same numbering with a window against every entry, in id order.
+    ///
+    /// The windows come from the library the emit validated, so what the sidecar
+    /// states about a motion's length is what the player derives from the same
+    /// frames — never a second measurement.
+    ///
+    /// # Panics
+    ///
+    /// If `windows` does not hold one per entry, which would put a window
+    /// against the wrong id.
+    fn windowed(mut self, windows: Vec<MotionWindow>) -> Self {
+        assert_eq!(
+            windows.len(),
+            self.entries.len(),
+            "one window per numbered asset"
+        );
+        for (entry, window) in self.entries.iter_mut().zip(windows) {
+            entry.window = Some(window);
+        }
+        self
     }
 
     /// How many assets it numbers.
@@ -254,6 +295,10 @@ impl Numbering {
                 let mut row = serde_json::Map::new();
                 row.insert(format!("{}_id", self.noun), json!(id));
                 row.insert("name".to_owned(), json!(asset.name));
+                if let Some(window) = asset.window {
+                    row.insert("duration_ms".to_owned(), json!(window.duration_ms));
+                    row.insert("blend_out_ms".to_owned(), json!(window.blend_out_ms));
+                }
                 serde_json::Value::Object(row)
             })
             .collect()
@@ -286,7 +331,9 @@ impl Emitted {
     ///
     /// Two tables, each keyed by its own id space. A schedule resolves names
     /// against the motions; the clips are there because a clip id is what a
-    /// motion's segments name.
+    /// motion's segments name. A motion row also carries its window, which is
+    /// what an edge compiling a `play` step into a timed one needs and cannot
+    /// derive: the assets are not deployed where the compile runs.
     fn names_json(&self) -> String {
         let table = json!({"clips": self.clips.table(), "motions": self.motions.table()});
         format!(
@@ -374,7 +421,7 @@ fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
         motion_names.len(),
         "every motion written has a name"
     );
-    ValidatedLibrary::of(written).map_err(|refusal| {
+    let checked = ValidatedLibrary::of(written).map_err(|refusal| {
         let named = match refusal {
             UnplayableAsset::Clip { clip_id, .. } => format!("clip ({})", names[clip_id]),
             UnplayableAsset::Motion { motion_id, .. } => {
@@ -383,6 +430,20 @@ fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
         };
         anyhow::Error::new(refusal).context(format!("{named} is not playable"))
     })?;
+
+    // The windows are read off the library that just validated, which derives
+    // them from the frames: a script's compiler needs the same numbers the
+    // player will use, and a second derivation is a second opinion.
+    let mut windows = Vec::with_capacity(written.motions.len());
+    for (motion_id, name) in motion_names.iter().enumerate() {
+        let view = checked
+            .playable_motion(motion_id)
+            .with_context(|| format!("motion ({name}) has no window"))?;
+        windows.push(MotionWindow {
+            duration_ms: ms_ceil(view.duration_s()),
+            blend_out_ms: u64::from(view.blend_out_ms()),
+        });
+    }
 
     let clips = Numbering::of(
         "clip",
@@ -395,7 +456,8 @@ fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
         "segment",
         &motion_names,
         motions.iter().map(|motion| motion.segments().len()),
-    );
+    )
+    .windowed(windows);
     Ok(Emitted {
         textproto: print_library(written, &clips, &motions),
         clips,
@@ -476,6 +538,19 @@ fn number(value: f64) -> String {
     format!("{value:?}")
 }
 
+/// Seconds as whole milliseconds, rounded up.
+///
+/// Up, because a window is how long a motion occupies a timeline: rounding down
+/// would state a window the motion is still playing at the end of.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a validated motion's duration is finite, positive, and minutes at most"
+)]
+fn ms_ceil(seconds: f64) -> u64 {
+    (seconds * 1000.0).ceil() as u64
+}
+
 /// Write `text` to `path`, saying which file it was on the way out.
 fn write(path: &Path, text: &str) -> anyhow::Result<()> {
     std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
@@ -543,6 +618,33 @@ mod tests {
     fn the_committed_documents_load_without_a_note() {
         let emitted = emit(&texts()).expect("the checked-in documents emit");
         assert!(emitted.notes.is_empty(), "notes: {:?}", emitted.notes);
+    }
+
+    /// Every motion row states the window the compile of a `play` step needs,
+    /// and the numbers are the library's own derivation from the frames.
+    ///
+    /// The clips carry none: no script names a clip, and a window against an id
+    /// nothing can invoke would be a number nobody reads.
+    #[test]
+    fn a_motion_row_states_the_window_a_play_step_occupies() {
+        let emitted = emit(&texts()).expect("the checked-in documents emit");
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
+        let tour = sidecar["motions"]
+            .as_array()
+            .expect("a motions table")
+            .iter()
+            .find(|row| row["name"] == json!("bench/tour"))
+            .expect("the composed motion is numbered")
+            .clone();
+        assert_eq!(tour["duration_ms"], json!(1701));
+        assert_eq!(tour["blend_out_ms"], json!(200));
+        assert!(
+            sidecar["clips"].as_array().expect("a clips table")[0]
+                .get("duration_ms")
+                .is_none(),
+            "a clip id is not a thing a script can play",
+        );
     }
 
     /// A clip id is an index into the emitted order, which is the order the

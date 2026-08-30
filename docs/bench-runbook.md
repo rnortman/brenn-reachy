@@ -57,7 +57,7 @@ Before anything that arms, moves or de-torques, the binding rules are in
 | `.local/reachy-bench.toml` | the unit's bench configuration. Gitignored: it holds this machine's serial node |
 | `.local/records/` | fetched self-test records, and wherever you park retrieved traces |
 | `target/bench-arm64/release/reachy-bench` | the device binary `bench-build` produces |
-| `target/motion-arm64/release/` | the motion payload `motion-build` stages: both binaries and every configuration file the three processes read, laid out the way their relative paths expect |
+| `target/motion-arm64/release/` | the motion payload `motion-build` stages: every binary and every configuration file the run's processes read, laid out the way their relative paths expect |
 | `.local/motion-logs/` | fetched run logs, one directory per fetch, each holding the writer's run directory and a `provenance.txt` naming the build that recorded it, and `<fetch>.console` beside each one: the launcher's per-process console files, and for a run also its own console stream and the unit's clock discipline read either side of it |
 | `crates/reachy-motion/fixtures/traces/` | recorded runs kept as test data |
 
@@ -66,7 +66,7 @@ On the device, and all in RAM — nothing a dev cycle pushes touches the eMMC:
 | | |
 |---|---|
 | `/run/brenn-app/releases/bench/reachy-bench` | the bench binary. A tmpfs submount, mounted exec where `/run` itself is not. A reboot clears it |
-| `/run/brenn-app/releases/motion/` | the motion payload, and the working directory its three processes are started from |
+| `/run/brenn-app/releases/motion/` | the motion payload, and the working directory every process of a run is started from |
 | `/run/brenn-app/logs/motion/` | where the logger writes a run's `.olog` files, one directory per run |
 | `/var/lib/brenn-app/` | the `app` account's home, mode 0700: the bench's configuration and the self-test state file |
 
@@ -357,9 +357,10 @@ reach it.
 This starts the whole online system here — the real control process, the real
 logger, and the simulated plant in a process of its own behind the same six
 loopback ports `reachy_motord` binds — under the same launcher, from the same
-kind of rendered config, on the same shared-memory defaults. It runs the wake
-gesture, stops, and judges the log with `first_motion_report`, and the target's
-verdict is the report's.
+kind of rendered config, on the same shared-memory defaults, with `reachy_ask`
+outside the composition holding the intent edge. It runs the harness gesture,
+stops, and judges the log with `first_motion_report`, and the target's verdict is
+the report's.
 
 Run it before a bench session and after any change to the compositions or the
 configs. What it catches is everything about the *configuration* that a unit
@@ -382,14 +383,15 @@ no band, because a driver computes its instants.
 
 ### What runs
 
-Three OS processes, two binaries, one supervisor:
+Four OS processes, three binaries, one supervisor over three of them:
 
 | | |
 |---|---|
-| `simplelaunch` | the launcher, from the pinned Clockwork drop. Starts all three processes from `robotcpu.textproto`, redirects each one's console into its own file, and stops them all together |
+| `simplelaunch` | the launcher, from the pinned Clockwork drop. Starts all three of its apps from `robotcpu.textproto`, redirects each one's console into its own file, and stops them all together |
 | `reachy_motord` | the servo bus. Not a cog: it owns the serial port, a 20 ms grid on the real clock, and the driver decisions. Talks to the cogs over six UDP sockets on loopback |
 | `cogs/robot_clk_exe` + the logger process description | writes the run's `.olog` records. Observation only — no channel leaves it into the control loop, so a dead logger costs records and nothing else |
-| `cogs/robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose`, `Session`, and the wake gesture that asks for the one thing this system does unprompted |
+| `cogs/robot_clk_exe` + the control process description | the control loop: `Mover`, `Pose` and `Session`, with the intent edge's two sockets where a producer of scripts stands |
+| `reachy_ask` | the harness's intent source, and not a launcher app: it binds the narration port 7410 before the composition starts narrating on it, so `make motion-run` starts it first and stops it with the launcher. It asks once, through the same edge library the voice host uses, and its console is `reachy_ask.log` beside the launcher's |
 
 One executable, two processes: which one it becomes is the process description
 it is started with. `robotcpu.textproto` is not written by hand — the
@@ -554,17 +556,18 @@ and no new class of exposure.
 
 ### What a good run looks like
 
-The wake gesture, once, and then nothing: commission, engage, raise, hold, stow,
-verified release, `resting`. The machine ends de-torqued and the session ends
-rest-class, which is not a fault — a rest-class ending is the machine at the
+The harness gesture, once, and then nothing: commission, engage, raise, hold,
+stow, verified release, `resting`. The machine ends de-torqued and the session
+ends rest-class, which is not a fault — a rest-class ending is the machine at the
 minimum risk condition, and the next wake is a fresh session rather than a
-recovery. The gesture is `cogs/wake_params.textproto`; it is the same gesture
+recovery. The gesture is `crates/reachy-ask/src/gesture.rs`; it is the same shape
 the S1 scenario runs, so every phase of it is already pinned by a test.
 
 Expect the first dozen seconds to look like nothing happening. Commissioning is
-about five seconds of bus transactions with the machine still, and the wake lead
-— `lead_ms` in `cogs/wake_params.textproto`, eight seconds — is deliberate room
-for that survey to finish before the first step opens. A motionless machine in
+about five seconds of bus transactions with the machine still, and the gesture's
+arming offset — `UP_AFTER_MS` in `crates/reachy-ask/src/gesture.rs`, eight
+seconds — is deliberate room for that survey to finish before the first step
+opens. A motionless machine in
 that window is the normal shape of a good run, not a wedged one. Nothing narrates
 the survey while it runs — a `tail` on the driver's console shows its five-second
 counters and no more — and a survey that fails ends the session `PARKED` with a
@@ -585,7 +588,7 @@ log, so the analyzer was proved before any hardware log existed.
 
 **The tracking lag lines are notes, and on the shipped servo profile they read
 about a radian.** Expect a worst head lag near 1 rad and a worst antenna lag near
-2.5 rad on the wake gesture. The printed pins beside them — 0.245 rad and
+2.5 rad on the harness gesture. The printed pins beside them — 0.245 rad and
 1.38 rad — come from `crates/reachy-motion/fixtures/traces`, which the bench
 recorded under its trial-validated 400 / 600 servo profile, and a live session
 arms 20 / 50 instead (`cogs/session_params.textproto`), so **the two numbers are

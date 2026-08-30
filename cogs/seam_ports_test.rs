@@ -1,20 +1,49 @@
-//! The port numbers on the driver seam, as three artifacts state them.
+//! The port numbers on this machine's two seams, as the artifacts state them.
 //!
-//! `crates/reachy-motord/src/ports.rs` names every subject of the seam and
-//! asserts the numbers are disjoint. It cannot see the compositions: `robot.clk`
-//! and `robot_host.clk` restate the same numbers as bare literals, and a `const`
-//! assert in Rust says nothing about a `.clk` file. This is the join.
+//! Two named sets: the driver seam (`crates/reachy-motord/src/ports.rs`) and the
+//! intent edge (`crates/reachy-edge/src/ports.rs`). Neither can see the other,
+//! and neither can see the compositions: `robot.clk` and `robot_host.clk`
+//! restate the numbers as bare literals, and a `const` assert in Rust says
+//! nothing about a `.clk` file. This is the join, and it is the only place the
+//! whole range is looked at at once.
 //!
-//! Two claims. The seam the control box binds is the seam the driver names, so a
-//! subject added on one side and not the other fails here rather than as a
-//! datagram decoded under the wrong schema. And every port bound anywhere in the
-//! host composition is bound once: that composition puts the control box's
+//! Three claims. No number serves two subjects across both sets, because a
+//! workstation runs the lot on one loopback and a datagram's port is the whole
+//! of its type. The sockets the control box declares are exactly the two sets
+//! together -- the driver seam and the intent edge both terminate in that one
+//! composition -- so a subject added on one side and not the other fails here
+//! rather than as a datagram decoded under the wrong schema. And every port
+//! bound anywhere in the host composition is bound once: that composition puts
+//! the control box's
 //! incoming sockets and the simulated plant's on one loopback, so two of them
 //! sharing a number is two processes binding one port -- a launcher failure on a
 //! workstation, which is what happened the last time a subject was added to the
 //! seam and which nothing but a person caught.
 
 use reachy_motord::ports;
+
+/// Every port either seam names, driver subjects first.
+fn every_named_port() -> Vec<u16> {
+    ports::ALL
+        .iter()
+        .copied()
+        .chain(reachy_edge::ports::ALL)
+        .collect()
+}
+
+#[test]
+fn no_number_serves_two_subjects_across_the_two_seams() {
+    let mut named = every_named_port();
+    let subjects = named.len();
+    named.sort_unstable();
+    named.dedup();
+    assert_eq!(
+        named.len(),
+        subjects,
+        "one number, one subject: the two seams share a loopback and carry no header, so a \
+         number in both sets is a datagram nobody can type",
+    );
+}
 
 /// The environment variables naming the two compositions, relative to the
 /// runfiles root, which is a test's working directory.
@@ -101,33 +130,34 @@ fn sockets(name: &str) -> Vec<Socket> {
 }
 
 #[test]
-fn the_control_box_binds_the_ports_the_driver_names() {
+fn the_control_box_declares_the_ports_both_seams_name() {
     let declared = sockets(ROBOT_CLK);
+    let mut named = every_named_port();
     assert_eq!(
         declared.len(),
-        ports::ALL.len(),
-        "one socket per subject of the seam, and no more: {declared:?}",
+        named.len(),
+        "one socket per subject of the two seams, and no more: {declared:?}",
     );
     let mut numbers: Vec<u16> = declared.iter().map(|socket| socket.port).collect();
     numbers.sort_unstable();
-    let mut named = ports::ALL;
     named.sort_unstable();
     assert_eq!(
-        numbers,
-        named.to_vec(),
-        "the numbers the composition types are the numbers the driver binds",
+        numbers, named,
+        "the numbers the composition types are the numbers the driver binds and the numbers the \
+         edge holds",
     );
 }
 
 #[test]
-fn the_injection_port_is_not_a_port_of_the_seam() {
+fn the_injection_port_is_a_port_of_neither_seam() {
     let injection = sockets(ROBOT_HOST_CLK)
         .into_iter()
         .find(|socket| socket.name == "HostSimCmdIn")
         .expect("the host composition declares the injection socket");
     assert!(
-        !ports::ALL.contains(&injection.port),
-        "the injection subject exists in no driver, so its number must be no subject's: {injection:?}",
+        !every_named_port().contains(&injection.port),
+        "the injection subject exists in no driver and on no edge, so its number must be no \
+         subject's: {injection:?}",
     );
 }
 

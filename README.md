@@ -15,10 +15,13 @@ hosts them, and a bench binary that talks to a real unit's hardware.
 
 Bazel, and only Bazel. `make check` is the whole gate — the shell scripts' own
 self-checks, then `bazel test --config=lint //...` over every crate, every cog
-and every lint aspect. There are no Cargo manifests and nothing here uses
-`cargo` or `rustup`: the compiler, the third-party crates and the C++ sysroot all
-come out of the module graph, so a fresh clone needs bazelisk and shellcheck and
-nothing else. The device binary is a cross-compile of the same targets
+and every lint aspect. Nothing here uses `cargo` or `rustup`: the compiler, the
+third-party crates and the C++ sysroot all come out of the module graph, so a
+fresh clone needs bazelisk and shellcheck and nothing else. One Cargo manifest
+exists, `crates/motion-proto/Cargo.toml`, and it builds nothing here: it is the
+export surface for a Cargo workspace elsewhere that pins that crate by revision,
+held to the crate's `BUILD.bazel` by a gate test. The device binary is a
+cross-compile of the same targets
 (`make bench-build`; `docs/bench-runbook.md`).
 
 An editor wanting a project model gets one from
@@ -71,14 +74,18 @@ The response is uniform and deliberate:
 | Crate | What it owns |
 |---|---|
 | `dxl-proto` | Dynamixel Protocol 2.0 frame codec, X-series register table, unit conversions. No I/O. |
+| `motion-proto` | The motion intent wire contract: the timed script a speech interaction publishes, its decode tolerance and validation refusals, and the publisher's sequence source. No I/O, no clock. |
 | `reachy-kin` | Head kinematics for the parallel platform: inverse and forward solutions, travel envelope, clearance margins. Pure math. |
 | `reachy-motion` | Trajectory shaping, the per-tick control step, and the arm/disarm sequences. Sans-I/O. |
 | `reachy-clips` | Recorded motions as masked per-channel deltas, and how they layer over live motion. Sans-I/O. |
 | `reachy-driver` | A motor driver's decisions with no motors attached: the goal gate and its dead-man, the auxiliary-transaction slot, the torque-off confirmation. Sans-I/O. |
 | `reachy-bus` | The one I/O layer: serial port, transactions, error taxonomy, and the joint-to-servo map. |
 | `reachy-bench` | Bench binary: a read-only self-test registry and the bare-bus commands. It moves nothing. |
+| `reachy-edge` | The intent edge: a motion script from outside, screened — size, addressee, redelivery — and compiled into the request the session screens. Sans-I/O. |
+| `reachy-ask` | The motion harness's intent source: one pinned gesture through the real intent edge, and the session's narration rendered as JSON lines. |
+| `reachy-host` | The voice host process: the configuration it is built with, the running gate over `reachy-edge`, and the queue both intent sources hand bodies to. |
 | `reachy-motord` | The driver process: a 20 ms grid on the real clock, the serial port, and `reachy-driver`'s decisions, meeting the cogs over UDP. |
-| `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session`, `MotorSim` and `Wake` cogs, their schemas, the deterministic scenario suite, the online composition, and the log analyzer. |
+| `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session` and `MotorSim` cogs, their schemas, the deterministic scenario suite, the online composition and its intent-edge sockets, and the log analyzer. |
 
 The edges run one way: `reachy-kin` under `reachy-motion`, and both of those
 plus `dxl-proto` under `reachy-bus`, with `reachy-bench`, `reachy-motord` and
@@ -144,11 +151,11 @@ process — a 20 ms grid on the real clock, the serial port, and
 over six UDP sockets on loopback, filling the slots the simulated plant fills in
 the scenario suite. The online composition is that seam plus the control core, a
 logger process, and a wake gesture that asks the machine to raise and stow once.
-`make check-device` cross-compiles every device deployable — the motion
+`make check-device` cross-compiles everything built for a unit — the motion
 payload's two binaries and the composition it is staged from, plus the bench
-binary, named once as `//bazel/platform:device_deployables` — then disassembles
-the C++ two and refuses any instruction the unit's Cortex-A72 does not
-implement, and CI blocks on both halves;
+binary and the host, named once as `//bazel/platform:device_deployables` — then
+disassembles the C++ two and refuses any instruction the unit's Cortex-A72 does
+not implement, and CI blocks on both halves;
 `docs/bench-runbook.md` is the procedure for the first run, and
 `//cogs:first_motion_report` is what reads its log.
 

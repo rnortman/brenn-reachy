@@ -158,38 +158,6 @@ whose transaction the port refused. Until the word is decided, the arm claims
 the least it can — the rows are missing from the cycle's sample and the write
 that frame would have carried is unconfirmed.
 
-## `reachy-pod-motion-integration`
-
-Bridge the pod's motion intents into the cog system, and settle who owns the
-servo port while two things want it.
-
-Deferral context: the first half of this entry is answered — the four libraries
-are hosted from the cog compositions, and the bench binary that used to host
-them moves nothing. What remains is the edge. Nothing publishes on `ScriptsIn`
-from outside the composition, so the machine has no way to be asked for a
-gesture by the payload that has the reason to ask; the schema names a bridge
-process as the eventual producer and there is none. Beside it sit the two
-questions the bridge cannot avoid: who owns the bus and the ports when
-`reachy-motiond` is also deployed on the unit, and what an intent is on the wire
-— a `Script`, or something the bridge compiles into one.
-
-One requirement beside those questions is already settled: the bridge stamps
-each script's `arrival` with this machine's clock at the moment it receives it,
-and never forwards a stamp made on the sender's. The session's span ceiling is
-measured from the wake that reads a script as well as from that stamp, and the
-ceiling is the same ten minutes as the sender's own longest schedule, so a
-forwarded stamp from a clock running even slightly ahead gets every
-maximum-length script refused. Stamping locally makes the skew term zero.
-Marked at the ceiling's comment in `cogs/session_params.textproto`.
-
-When that bridge lands, the wake-gesture cog that stands in for it is deleted
-rather than kept: it exists only so the box has a closed-loop intent source for
-bring-up, and two intent sources is one too many. Deleting it is `cogs/wake.clk`,
-`cogs/wake_cogs.rs`, `cogs/wake_state.clk`, `cogs/wake_params.textproto`,
-`WakeParams` in `cogs/config.clk`, and the three members it contributes to
-`RobotBox`. Marked at the `ScriptsIn` connect in `cogs/robot.clk`, which is the
-edge the bridge takes over.
-
 ## `session-hold-timeout-evidence`
 
 Decide what the session does about the driver's `hold_timeout_torque_off` event.
@@ -592,6 +560,15 @@ Deferral context: the seam is UDP on `127.0.0.1`, six ports (marked at
 `cogs/robot.clk` for the control box's four). Loopback restricts hosts and
 nothing else, and it costs something different at each end.
 
+The same two ports are marked a third time, at `ScriptsIn` in `cogs/robot.clk`:
+the intent edge's incoming socket, whose sender is trusted for being on this
+machine and built from this tree.
+
+The intent edge's two ports, 7409 and 7410 (marked at
+`crates/reachy-edge/src/ports.rs`), inherit the same boundary and the same
+answer: a script sender that can reach 7409 can open an engagement, and a
+sender on 7410 can narrate a session that is not happening.
+
 Driver-side: any local process under any user can send a session command that
 arms the machine and setpoints that move it, and those setpoints do not pass the
 envelope check -- that check runs in the mover, upstream of the goal port. So
@@ -758,3 +735,184 @@ runs, the bench `watchdog` self-test's standing failure — it asserts a release
 which is what the policy requires, and fails on this hardware by design — is the
 record, and it is not to be made green. Marked at the `bus_watchdog` comment in
 `cogs/session_params.textproto`, where the armed value lives.
+
+## `script-timebase`
+
+Give a motion script an absolute start instant on a timebase both ends share,
+so a step timeline can be written against the audio it accompanies.
+
+Deferral context: step offsets are measured from the moment the receiving
+process stamped the script's arrival (`crates/reachy-edge/src/intake.rs`).
+Speech and motion therefore co-start only as closely as delivery allows —
+whatever the hand-off costs is added to every offset in the timeline. That is
+well inside the ±500 ms coarse coordination accepts, so a raise still reads as
+an acknowledgement and a scheduled stow still lands over the tail of the audio.
+
+It does not survive tighter coupling. Emote and gaze steps computed against the
+audio timeline — a beat on a word, a tilt at a phrase — want the two timelines
+to be one timeline, and offsets-from-receipt cannot express that: the receiver
+has no way to know what instant the sender meant.
+
+The schema already reserves the field. A `base` carrying an absolute start
+instant makes every offset absolute, and what it needs underneath is a timebase
+both ends agree on: a playout beacon pairing the audio sample clock to the
+device's monotonic clock, a cog maintaining that mapping, and a script anchor
+naming the utterance a timeline runs against. Blocked on that cycle rather than
+on any one edit — it is a clock-distribution decision, not a field. Adding
+`base` before there is a clock to interpret it against would put an absolute
+time on the wire that each end reads differently, which is worse than the honest
+offsets.
+
+Done = scripts carry absolute step times on a timebase both ends agree on, the
+executor runs against it, and offsets-from-receipt survive only as the fallback
+when no base is present. Marked at the wire schema in
+`crates/motion-proto/src/script.rs`.
+
+## `host-status-egress`
+
+A durable status surface for the voice host: what an operator reads to find out
+what the machine is doing without following a console stream.
+
+Deferral context: the retired motion daemon wrote a state file under `/run` and
+`reachy-status.sh` read it. Nothing reproduces that. What the host has instead is
+its JSONL narration — every row of the session's story, every body the edge
+dropped, every alert the table raised — going to the launcher's per-app console
+log, plus the alert plane for the few things worth interrupting somebody over.
+That covers "what happened" and "wake me for this"; it does not cover "what is
+the machine doing right now", which is the question a status command asks.
+
+Deliberately narrowed rather than forgotten: a status surface is a decision about
+where the answer lives (a file the host writes, a socket it answers on, a bus
+query) and who reads it, and that decision belongs with the cycle that teaches
+`reachy-status` the five-app payload rather than with the one that built the
+edge. Nothing about the machine's safety rests on it — the session and the mover
+decide everything, and the narration is a reader.
+
+Done = an operator on the unit can ask what the head is doing and get an answer
+that does not require reading a log. Marked at the host's console surface in
+`crates/reachy-host/src/edge.rs`.
+
+## `host-intent-producers`
+
+The two tasks that author intent for the voice host's edge: the speech
+pipeline's scripter, and the host's Brenn-bus subscription for remote senders.
+
+Deferral context: the host holds the receiving half of the intent queue and the
+gate behind it, and both are exercised. Nothing holds the sending half. The
+scripter lives in brenn-pod's `speech-surface` and reaches the edge through a
+sink seam on its `ScriptTask`; the bus deliveries reach it through an optional
+motion-intent subscription on `BridgeDriver`. Both of those are brenn-pod
+changes, and the wiring that injects them into this process arrives with the
+pipeline composition — the half of `reachy-host` that is not the edge. Until
+then the binary follows the session's story, narrates it, and asks for nothing.
+
+The queue's own policy — bounded at eight, dropping rather than growing or
+blocking — is sized against a presence refresh cadence no producer in this tree
+runs yet, so the first real producer is also the first measurement of it.
+
+Done = a wake word on the unit reaches the motors through this queue, and a
+script published on the bus's motion channel reaches the same gate. Marked where
+the sending half is dropped, in `crates/reachy-host/src/main.rs`.
+
+## `host-payload-membership`
+
+`reachy_host` is cross-built on the gate but staged by nothing: it is a member
+of `//bazel/platform:device_deployables`, so `make check-device` cross-builds
+it, but it is in no payload, so no deploy puts it on a unit and no launcher
+config starts it.
+
+Deferral context: the host is one of five apps a unit is meant to run, and the
+four things it needs beside it — the pod audio device, the speech
+configuration, the wake/VAD model files, and the launcher config naming the app
+— are this cycle's, taken in the increment that composes the host against the
+pod repo's pipeline libraries; the audio and speech halves come from that repo.
+Staging the binary alone would put a process on the unit that binds the
+narration port, hears nothing, and asks for nothing, ahead of the deploy step
+that completes it.
+
+One invariant is on hold until it lands, and it is stated where it can be read:
+`motion_payload` is the only place a deployed member is declared.
+
+Done = `reachy_host` and its configuration are members of `motion_payload`,
+`tools/build-motion.sh` and `tools/deploy-motion.sh` stage them, the launcher's
+production config names the app, and the harness twin of that config — no host
+app, no pod app — is rendered in the same commit, with `tools/deploy-motion.sh
+--run` and `tools/host-motion-run.sh` using the twin. Both halves together: a
+production config naming `reachy_host` while `--run` starts `reachy_ask`
+against it puts both owners of 7409/7410 in one motion run. Marked at the
+filegroup in
+`bazel/platform/BUILD.bazel` and at the binary in
+`crates/reachy-host/BUILD.bazel`.
+
+## `params-reader-shared`
+
+One textproto configuration reader, used by every binary that has one, instead
+of a copy per binary.
+
+Deferral context: `reachy-motord` and `reachy-host` each carry the same reader —
+the embedded proto source, the descriptor compile and its cache, `load`/`set`/
+`text`/`count`, the descriptor-walking transcription, and the generic half of
+the refusal taxonomy (unreadable, not text, missing field, too long, schema).
+Around 250 lines, differing only in the field arms and the domain checks. It has
+already drifted once: motord attributes a text refusal to a line number and the
+host does not, so one operator mistake reads two ways depending on which process
+refused it.
+
+Not done in place because the extraction moves `reachy-motord`'s reader, and the
+driver is deliberately untouched by the cycle that made the second copy. What it
+wants is a decision about where the shared piece lives — a crate of its own, or
+a module in one that exists — taken with the third textproto-configured binary
+in view rather than after it.
+
+Done = one reader parameterised by proto source and message name, each binary
+keeping only its field arms and its domain refusals, and the host getting line
+attribution back with it. Marked at the host's copy in
+`crates/reachy-host/src/params.rs`.
+
+## `cli-argv-shared`
+
+One argument grammar for the repo's binaries, instead of a hand-rolled `while
+let Some(word)` loop per binary.
+
+Deferral context: `reachy-motord`, `reachy-host` and `reachy-ask` each spell the
+same shape — the `main` that dispatches to `parse`/`run` and prints `prog:
+message`, the word loop, a `given` bool per flag, and a `usage()` string. The
+refusal wording is operator-facing and already varies between the three for the
+same mistake, and the per-flag bool scales with the flag count in every copy.
+
+Not done in place for the same reason as `params-reader-shared`: one of the
+three is the driver, which the cycle that made the third copy leaves alone. The
+shape wanted is a small table of `(flag, arity)` with once-only enforcement and
+one refusal vocabulary — a decision about a shared home and about whether an
+existing dependency already carries a parser worth adopting.
+
+Done = the three binaries parse their arguments through one helper and refuse
+the same mistake with the same words. Marked at the harness's copy in
+`crates/reachy-ask/src/main.rs`.
+
+## `story-restart-discriminator`
+
+A discriminator on `Timeline` that says which run of the control process a story
+belongs to, so the edge's follower recognises a restart it cannot infer from the
+row count.
+
+Deferral context: the follower detects a restart by the story's total going
+backwards, which is the only evidence a cumulative stream without an identity
+carries. It is sound whenever the first datagram of the new story arrives while
+its total is still below what was already narrated — the ordinary case, because
+the stream publishes a datagram per appended row. It is not sound if enough of
+those datagrams are missed that the new story has already grown past the old
+count: the diff then reads the new story as a continuation, skips rows of it,
+and neither narrates nor classifies them. Rows lost to a ring overrun have the
+same shape, and both now raise the incomplete-narration Warning the alert table
+carries, so the hole is loud rather than silent — but loud is not the same as
+seen, and a fault row inside one still raises no Critical.
+
+Not fixed in place because the fix is a schema field: a boot or epoch number the
+session sets once and the follower compares, on a `.clk` message the cycle that
+added the socket seam deliberately did not touch. Naming it, sizing it, and
+deciding what sets it are a motion-schema decision rather than an edge one.
+
+Done = the story follower tells one run of the control process from the next by
+something the message says, not by arithmetic on its length. Marked at the
+restart test in `crates/reachy-edge/src/story.rs`.

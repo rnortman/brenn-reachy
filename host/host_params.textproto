@@ -1,0 +1,40 @@
+# The voice host's intent edge configuration, loaded once at startup.
+#
+# One message of `brenn_reachy.host.host_config_clk_proto.HostParams`, which the
+# compiler generates from the `HostParams` schema in `host_config.clk`. Read as
+# it is: the host is handed the path and parses the text into the message.
+#
+# Written in the protobuf text format, which is what the host parses it as: the
+# generated message's descriptor is compiled into the binary and every
+# configuration is parsed against it, so an unknown name or a name set twice is
+# the parser's refusal. What `crates/reachy-host/src/params.rs` adds on top is
+# this machine's own rules -- every field required, and every value one the edge
+# can actually screen with.
+#
+# This is the file the payload carries. An operator's variant for a particular
+# unit is pushed into RAM beside it and named on the command line; it is never
+# in this tree, and neither is anything it would carry.
+
+# The name this head answers to. A script addressed to any other name is dropped
+# and narrated: the intent channel is not assumed to carry one machine's
+# traffic, and the scripter that authors presence for this unit addresses it by
+# this name.
+pod: "kitchen-reachy"
+
+# Three seconds for the closing stow. The wake gesture's own stow budget, which
+# is the only measured number available -- it is what the machine has been
+# folding in since the first motion run. The scripter's refresh headroom has to
+# exceed it, and at the shipped pod defaults (5 s) it does.
+stow_duration_ms: 3000
+
+# Eight kilobytes is the most body the edge reads. Comfortably above any script
+# the compile could accept -- sixteen steps and four overlay windows of JSON is
+# a few hundred bytes -- so a body past this is not a large script but a sender
+# doing something else entirely.
+body_cap_bytes: 8192
+
+# The clip library's name table, at the path the payload puts it: overlay steps
+# name a motion and the session takes an index, and this file is the join. It is
+# emitted beside the library it describes by `make clip-config`, so the two
+# cannot disagree about what index a name has.
+clip_names_path: "cogs/clip_library.names.json"

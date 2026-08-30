@@ -37,9 +37,10 @@
 # say whether the time base the whole log is stamped in could have stepped
 # underneath it.
 #
-# A motion run is **three OS processes**, not one: `reachy_motord` (the servo
-# bus), and two `robot_clk_exe` processes over the one synthesized executable
-# (the logger, and the control loop). All three are started by one supervisor —
+# A motion run under the launcher is **three OS processes**, not one:
+# `reachy_motord` (the servo bus), and two `robot_clk_exe` processes over the one
+# synthesized executable (the logger, and the control loop), with `reachy_ask`
+# beside them holding the intent edge. All three are started by one supervisor —
 # `simplelaunch`, from the launcher config the compositions render — so there is
 # one command to start a run and one gesture to stop it, and no ordering for a
 # person to get right. `--run` types that command, on a budget, and stops the run
@@ -72,10 +73,11 @@ set -euo pipefail
 # The payload tools/build-motion.sh stages.
 payload="${repo_root}/target/motion-arm64/release"
 
-# The three binaries, at the paths the launcher config spells, checked before
-# anything is pushed. A payload directory that exists and is missing one of them
-# is a build that failed halfway or a stage somebody edited by hand.
-binaries=(reachy_motord cogs/robot_clk_exe simplelaunch)
+# The payload's binaries, at the paths the run spells, checked before anything is
+# pushed. A payload directory that exists and is missing one of them is a build
+# that failed halfway or a stage somebody edited by hand. Three are the launcher
+# config's; the fourth is the intent source `--run` starts ahead of it.
+binaries=(reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch)
 
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
@@ -97,16 +99,26 @@ launch_config=robotcpu.textproto
 launch_logs="${store_mount}/logs/launch"
 
 # How long the run is given before the launcher is stopped. Commissioning is
-# about five seconds of bus transactions, the wake lead is eight, the
-# raise-hold-stow gesture about five, the release about four: the host harness
-# budgets twenty-seven for the same sum, and this one carries a few seconds more
-# of margin because it is talking to a real serial bus whose transactions retry.
-# Nothing about the run is judged by the clock — the analyzer reads the records —
-# so the budget only has to be long enough. The lead is a number in another file,
-# so the sum is checked against the shipped one by tools/deploy-motion.test.sh:
-# a lead growing without this following it is red there rather than a launcher
-# stopped mid-gesture.
+# about five seconds of bus transactions, the harness gesture's arming offset is
+# eight, the raise-hold-stow gesture about five, the release about four: the host
+# harness budgets twenty-seven for the same sum, and this one carries a few
+# seconds more of margin because it is talking to a real serial bus whose
+# transactions retry. Nothing about the run is judged by the clock — the analyzer
+# reads the records — so the budget only has to be long enough. The offset is a
+# number in another file, so the sum is checked against the shipped one by
+# tools/deploy-motion.test.sh: an offset growing without this following it is red
+# there rather than a launcher stopped mid-gesture.
 run_seconds=30
+
+# The name of the intent source in the payload, and where its console goes.
+#
+# It is not a launcher app and cannot be: it binds the narration port, and the
+# composition starts narrating on its first execution, so it has to be running
+# before the launcher is. Started here, ahead of the launcher, and stopped with
+# it — a run's verdict is the analyzer's over the fetched records, so what this
+# console holds is why a run went the way it did rather than the verdict itself.
+ask_binary=reachy_ask
+ask_console_name=reachy_ask.log
 
 # The bazel that runs the analyzer, whose label and invocation are lib.sh's
 # `report_verdict`. The report is a host tool over a fetched log, so it builds
@@ -117,6 +129,11 @@ build_flags=()
 
 # One directory, reused. Nothing on this path activates a release, so nothing
 # prunes the store either; rsync --delete is what makes reuse idempotent.
+#
+# Coupled to brenn-pod's deploy-reachy-pod.sh, which reads this path and the
+# stamp below to guard against replacing a robot's payload with a pod-only one.
+# A rename here is invisible there, so both names are pinned by a case in this
+# script's self-test; changing either means changing both repos.
 release="${store_mount}/releases/motion"
 
 # The name the push's account of which build the payload is goes by, at the root
@@ -126,7 +143,8 @@ release="${store_mount}/releases/motion"
 # describes the payload beside it by construction. The build stages that
 # directory from scratch, so nothing stale is left there to push. The copy in the
 # log root comes home with the records under the fetch's own name, with no
-# fetch-side logic to put it there.
+# fetch-side logic to put it there. It is also what a pod deploy from brenn-pod
+# reads to recognise a robot — see the note at `release` above.
 provenance_name=provenance.txt
 
 # Where a run parks its copy of the stamp while the log root is being emptied.
@@ -719,10 +737,24 @@ case "$mode" in
 		# that faults would come back as an unreachable host. With a shell
 		# still there the status is 128+signal and says what happened.
 		remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
+		# The intent source, before the launcher and in the
+		# background: it binds the narration port, and the control
+		# process narrates from its first execution, so a bind that
+		# came after the launcher would be a race. Its console goes
+		# beside the launcher's, which the run empties and an operator
+		# reads; its exit status is deliberately not this run's, which
+		# is the analyzer's over the fetched records.
+		remote="${remote}; ./${ask_binary} --resting-timeout ${run_seconds}"
+		remote="${remote} --run-window ${run_seconds}"
+		remote="${remote} >${launch_logs}/${ask_console_name} 2>&1 &"
+		remote="${remote} ask=\$!"
 		remote="${remote}; timeout --signal=INT --kill-after=10"
 		remote="${remote} ${run_seconds} ./simplelaunch ${launch_config}"
 		remote="${remote} --logdir ${launch_logs}"
-		remote="${remote}; exit \$?"
+		remote="${remote}; rc=\$?"
+		remote="${remote}; kill -INT \$ask 2>/dev/null"
+		remote="${remote}; wait \$ask 2>/dev/null"
+		remote="${remote}; exit \$rc"
 
 		# Where the host-side evidence waits until there is a fetched
 		# records directory to file it beside: the clock captures and
@@ -806,7 +838,7 @@ case "$mode" in
 			;;
 		0)
 			die "the launcher exited before the ${run_seconds}s budget was up, so the gesture did not finish." \
-				"Its console and the three processes' output are under ${launch_logs} on ${host}."
+				"Its console and every process's output are under ${launch_logs} on ${host}."
 			;;
 		"$rc_no_stamp")
 			# The probe above, before the launcher was reached. Same
@@ -857,7 +889,7 @@ case "$mode" in
 			;;
 		*)
 			die "the run on ${host} failed (exit ${rc})." \
-				"Its console and the three processes' output are under ${launch_logs} on ${host}."
+				"Its console and every process's output are under ${launch_logs} on ${host}."
 			;;
 		esac
 

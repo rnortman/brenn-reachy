@@ -1,12 +1,14 @@
 // The system that runs on a machine: the control core, the seam to the driver
-// process, and the one thing in the box that asks the machine to do anything.
+// process, and the seam to whatever asks the machine to do something.
 //
 // The same three cogs as the simulated system, over the same channels, with one
 // difference: what stands at the driver's end of the wire. There a cog models
 // the plant; here six UDP sockets carry the driver contract across a process
 // boundary to `reachy-motord`, which owns the serial port and the bus cycle.
 // The core is `motion::MotionCore` in both, stated once, so the two systems
-// cannot drift apart in topology.
+// cannot drift apart in topology. Two more sockets carry the intent edge: a
+// script arriving from the process that asked for it, and the session's
+// narration leaving for that same process.
 //
 // Why the driver is a process and not a cog: it must hold a serial port across
 // executions and block on multi-millisecond bus transactions. A Rust cog's only
@@ -15,7 +17,7 @@
 // blocking bus work in an execute body spends half the pool; and an input
 // overrun on a slow cog ends the whole process. So the driver is an OS process
 // that is no Clockwork process, composed in no box, and this file's business
-// with it is the seven sockets below.
+// with it is the seven sockets it owns of the nine below.
 //
 // A socket occupies exactly the slot a cog does: it publishes to a channel or
 // subscribes to one, and a channel does not say what filled it. So each
@@ -28,22 +30,15 @@
 // seam and no room for one; `driver/wire.clk`'s header belongs to an edge whose
 // far end is not a Clockwork socket.
 //
-// The wake gesture the box carries is `wake.clk`, a module of its own: the Rust
-// generator refuses a `udp_socket` declaration by name, so a module holding the
-// seam's sockets cannot also hold a cog written in Rust.
-//
 // The foot of this file is the composition: the box that closes the loop around
 // the core with sockets, the logger box that records the run, and the two
 // processes that host them. They are here rather than in the system module next
 // door because the grammar admits a `system_target` only in a module that
 // generates nothing, and a process needs a module that generates an executable.
 //
-// Two modules are imported under aliases because a box member below carries a
-// name of its own: the wake cog's instance is `wake` and its slot is
-// `wake_state`. A member name shadows a module name in the enclosing scope,
-// which the compiler refuses as a redefinition. The logger box's members go the
-// other way round -- they are named for what they hold rather than for the
-// module the type comes from -- for the same rule.
+// The logger box's members are named for what they hold rather than for the
+// module their type comes from: a member name shadows a module name in the
+// enclosing scope, which the compiler refuses as a redefinition.
 // (A comment may not sit directly above a `use`, which is why this one is
 // here.)
 
@@ -52,12 +47,12 @@
 
 use [cpp, proto, proto_conv] cogs::config;
 use cogs::motion;
+use cogs::script as script_vocab;
 use cogs::session_cmd;
-use cogs::wake as wake_cog;
-use cogs::wake_state as wake_state_vocab;
 use driver::goal;
 use driver::health;
 use driver::pose;
+use motion::timeline;
 use @clockwork::clockwork::logging::log_writer_config;
 use [cpp, proto, proto_conv] @clockwork::clockwork::logging::writers::channel_message_rates_config;
 use @clockwork::clockwork::logging::writers::logger;
@@ -153,49 +148,69 @@ udp_socket SessionOut
     message_type: Tachyon<session_cmd::SessionCmd>;
 }
 
-// The control loop as it runs on a machine: the core three cogs, seven sockets in
-// place of the modelled driver, and the wake gesture that starts a session.
+// The intent edge, arriving. A script the voice host compiled from what
+// somebody asked for -- in the harness, `reachy-ask`'s one gesture -- and this
+// socket is `ScriptsIn`'s one publisher in this composition.
+//
+// The sender is on this machine and built from this tree, which is the whole of
+// what makes a fixed-size reader safe here: a datagram of the wrong size kills
+// this process, and the process's death is a minimum-risk-condition event. Off
+// this machine nothing can reach the port at all. The rest of the seam's trust
+// story is `PoseIn`'s, unchanged: TODO(motord-seam-trust-boundary)
+//
+// Everything a sender could get wrong about an intent -- an undecodable body, a
+// foreign pod, a redelivery, a schedule that will not fit -- is refused outside
+// this process, at the edge that received it. What crosses this port is already
+// a `Script`.
+udp_socket ScriptsIn
+{
+    address: 127.0.0.1;
+    port: 7409;
+    direction: incoming;
+    message_type: Tachyon<script_vocab::Script>;
+}
+
+// The session's narration, leaving. Cumulative: every publish is the whole
+// story so far, so a reader that started late or restarted is healed by the
+// next one, and this socket needs no retention of its own.
+//
+// `port` on an outgoing socket is the destination, as `GoalOut`'s is, so 7410
+// is the port the voice host binds and not one this process holds.
+udp_socket ReportsOut
+{
+    address: 127.0.0.1;
+    port: 7410;
+    direction: outgoing;
+    message_type: Tachyon<timeline::Timeline>;
+}
+
+// The control loop as it runs on a machine: the core three cogs and nine
+// sockets -- seven in place of the modelled driver, two carrying the intent
+// edge.
 //
 // The topology is `SimBox`'s with two publishers replaced. Where that box puts
 // a cog at the driver's end and reads its scripts out of an input log, this one
-// puts sockets to a process at that end and carries its own intent source.
-// Nothing the core does distinguishes them: a cog reads channels, and a channel
-// does not say what filled it.
+// puts sockets to processes at both ends: the driver's, and the one that asks
+// the machine for something. Nothing the core does distinguishes them: a cog
+// reads channels, and a channel does not say what filled it.
 //
 // Every channel has exactly one publisher here too. The core's own self-loop --
 // the decision tick reading back the goal channel it publishes -- adds a
-// subscriber and no publisher, and the outgoing socket on that same channel is
-// one more subscriber beside it.
+// subscriber and no publisher, and the outgoing sockets on `DriverCmd` and
+// `ReportsOut` are subscribers beside the cogs that read them.
 box RobotBox
 {
     new core: motion::MotionCore;
 
-    new wake: wake_cog::Wake;
+    // The intent edge, both directions. A script arrives already compiled and
+    // already screened, and the session's narration leaves for the process that
+    // sent it: the sender is what tells an operator whether the machine took
+    // the request, and it reads that off this stream.
+    new scripts_in: ScriptsIn;
+    connect scripts_in to motion::ScriptsIn;
 
-    // The wake cog's own slot, written by nothing else. No `init=`, so it is
-    // default-constructed into a buffer the compiler synthesizes.
-    new wake_state: State(representation=Tachyon<wake_state_vocab::WakeState>);
-    connect wake_state to wake.sent;
-
-    // The lead and the gesture, read from checked-in protobuf text before the
-    // first execution. The path resolves against the runfiles of whatever runs
-    // the process, which is why the file is a data dependency of the
-    // executable.
-    new wake_params: SerializedDataFile(
-        representation=Protobuf<config::WakeParams>,
-        path="cogs/wake_params.textproto");
-    connect wake_params to wake.params;
-
-    // What the session said, reaching the only thing in this box that acts on
-    // it. The core publishes this channel and consumes none of it.
-    connect motion::ReportsOut to wake.reports;
-
-    // The intent edge. One publisher on this channel, and for now it is
-    // scaffolding: the pod-side bridge that replaces it -- what carries an
-    // intent across it, which end owns the bus and the ports against
-    // `reachy-motiond`, and deleting this cog when it lands -- is
-    // TODO(reachy-pod-motion-integration).
-    connect wake.script to motion::ScriptsIn;
+    new reports_out: ReportsOut;
+    connect motion::ReportsOut to reports_out;
 
     // The sample stream, arriving from the driver process. The core's two
     // control-rate cogs run on it and the session reads it for one thing only:

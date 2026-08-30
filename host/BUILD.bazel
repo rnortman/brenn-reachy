@@ -1,0 +1,46 @@
+# Apache-2.0. The schemas the voice host is built with: its intent edge's
+# configuration, authored as protobuf text and parsed by the host binary.
+#
+# A package named for the component that writes the types, like every other
+# `.clk` package here, and not `crates/reachy-host/` because a module's `use`
+# path and generated crate name are its path from the repo root verbatim, and a
+# hyphen is legal in neither.
+#
+# Nothing here depends on anything but `clockwork_rs`. No cogs, no runtime, no
+# I/O -- the host process is not Clockwork-hosted, and this is a vocabulary for
+# numbers rather than a channel anything carries.
+
+load("@clockwork//clockwork:rules.bzl", "clk")
+load("//bazel:rust_clk.bzl", "rust_clk_module")
+
+# Spelled out rather than through `clk_schema_module` because it crosses the
+# Protobuf backend -- which is what lets the numbers be authored as text -- and
+# generation is declared per module.
+clk(
+    name = "host_config_clk",
+    srcs = ["host_config.clk"],
+    outs = [
+        "host_config_clk_cc.cc",
+        "host_config_clk_cc.hh",
+        "host_config_clk_cc.inl",
+        "host_config_clk_proto.proto",
+        "host_config_clk_proto_conv.cc",
+        "host_config_clk_proto_conv.hh",
+        "host_config_clk_proto_conv.inl",
+    ],
+    generate = [
+        "cpp",
+        "proto",
+        "proto_conv",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_clk_module(
+    name = "host_config_clk_rs",
+    src = "host_config.clk",
+)
+
+# The numbers the host ships with, read by the host at startup and by the test
+# that holds this file to the schema.
+exports_files(["host_params.textproto"])

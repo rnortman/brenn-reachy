@@ -1,0 +1,48 @@
+# Apache-2.0; see LICENSE and NOTICE at the repository root.
+#
+# The motion intent wire contract: the script a speech interaction publishes and
+# the publisher's sequence source. Sans-I/O and shared by both ends of the
+# channel, so neither end grows protocol logic of its own.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `motion-proto` is not a Rust identifier.
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "motion_proto",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:thiserror",
+    ],
+)
+
+# Decode tolerance, validation refusals, span arithmetic and the sequence
+# source: in-memory documents and integers, no clock and no socket.
+rust_test(
+    name = "motion_proto_test",
+    size = "small",
+    crate = ":motion_proto",
+)
+
+# The join between this file's dependency list and the Cargo manifest kept as the
+# export surface for the downstream Cargo consumer. Two descriptions of one
+# crate drift silently otherwise: a dependency added here builds green in this
+# repo and fails in the consumer's workspace, a long way from the change.
+rust_test(
+    name = "manifest_test",
+    size = "small",
+    srcs = ["manifest_test.rs"],
+    data = [
+        "BUILD.bazel",
+        "Cargo.toml",
+    ],
+    edition = "2024",
+    env = {
+        "BUILD_BAZEL": "crates/motion-proto/BUILD.bazel",
+        "CARGO_MANIFEST": "crates/motion-proto/Cargo.toml",
+    },
+)

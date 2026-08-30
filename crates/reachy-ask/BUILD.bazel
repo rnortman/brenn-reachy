@@ -1,0 +1,47 @@
+# Apache-2.0; see LICENSE and NOTICE at the repository root.
+#
+# The harness's intent source: one gesture, through the real intent edge. It
+# stands where the voice host stands -- outside the composition, holding the two
+# loopback ports -- so a motion run's verdict covers the decode, the screens, the
+# compile, the datagram and the timeline diff rather than a rehearsal of them.
+#
+# A binary and no library: everything it holds is about this one run, and
+# `rust_test(crate = ...)` over a binary is how its own modules are tested.
+#
+# The target name is the binary's name underscored: rules_rust derives the crate
+# name from the target, and `reachy-ask` is not a Rust identifier.
+
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+rust_binary(
+    name = "reachy_ask",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cogs:schedule_clk_rs",
+        "//cogs:session_clk_rs",
+        "//crates/motion-proto:motion_proto",
+        "//crates/reachy-edge:reachy_edge",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:signal-hook",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The gesture's shape and offsets, the commissioning row it waits for, and the
+# argument grammar. Hermetic: the compile runs in memory over an injected
+# instant, and nothing here binds a port or reads a clock.
+#
+# `//cogs:scenario` is a test dependency and only that: the raise's offset has to
+# cover the start-up survey, and the survey's size is derived there from the
+# provisioning table and the gains-and-profile write set. The binary links none
+# of it.
+rust_test(
+    name = "reachy_ask_test",
+    size = "small",
+    crate = ":reachy_ask",
+    deps = ["//cogs:scenario"],
+)

@@ -9,9 +9,17 @@
 # writer's own open — has met a powered unit. This script is the workstation
 # rehearsal of it and the gate before a hardware run: cheap, deterministic, and
 # runnable without the machine. It stages the host composition the way the device
-# payload is staged, starts all three processes under the same launcher a unit
-# uses, lets the wake gesture happen, stops them, and runs the same analyzer a
-# hardware run is judged by over the log the real writer wrote.
+# payload is staged, starts `reachy-ask` on the narration port, starts all three
+# processes under the same launcher a unit uses, lets the gesture happen, stops
+# them, and runs the same analyzer a hardware run is judged by over the log the
+# real writer wrote.
+#
+# The gesture is not the composition's: nothing in the box asks the machine for
+# anything. `reachy-ask` asks, from outside, through the same intent edge the
+# voice host uses -- so a green run covers the decode, the screens, the compile
+# and the datagram as well as the loop that carries them out. It is started
+# before the launcher because it binds 7410 and the composition narrates onto it
+# from its first execution.
 #
 # What passing means: the composition, the configs, the launcher, the seam's wire
 # contract, the writer and the analyzer agree with each other. What it does not
@@ -34,8 +42,9 @@
 #     beside any other flagless Clockwork system. The launcher refuses the second
 #     one by name (it will not start while a process matching a configured
 #     executable's basename is alive), and this script refuses before that.
-#   * The seam is six fixed loopback ports (7401-7406) plus the plant's unfed
-#     injection port. Two runs collide there too.
+#   * The seam is six fixed loopback ports (7401-7406), the intent edge's two
+#     (7409-7410), plus the plant's unfed injection port. Two runs collide there
+#     too.
 #
 # It is a manual target rather than a test: it is wall-clock-long and its
 # flakiness envelope — spawn races between three unordered processes, host load —
@@ -63,12 +72,14 @@ cd -- "$repo_root"
 # and its queries share, and an empty one is this build's answer.
 build_flags=()
 
-# What is built. The executable all three processes are started from, the system
-# target that emits their process descriptions and the writer's channel set, the
-# rendered launcher config, the launcher itself, the prelaunch script the config
-# names, the configuration files the processes read, and the analyzer -- whose
-# label is lib.sh's `report_target`, shared with the device harness.
+# What is built. The executable all three processes are started from, the intent
+# source that drives the run, the system target that emits their process
+# descriptions and the writer's channel set, the rendered launcher config, the
+# launcher itself, the prelaunch script the config names, the configuration files
+# the processes read, and the analyzer -- whose label is lib.sh's
+# `report_target`, shared with the device harness.
 exe_target=//cogs:robot_host_clk_exe
+ask_target=//crates/reachy-ask:reachy_ask
 system_target=//cogs:system_host_clk
 launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:hostcpu.textproto
@@ -122,13 +133,14 @@ logger_config=cogs/host_logger.textproto
 grid_jitter_ns=3000000
 
 # How long the gesture is given before the launcher is stopped. Commissioning is
-# about five seconds of bus transactions, the wake lead is eight, the raise-hold-
-# stow gesture about five, the release about four; twenty-seven leaves margin for
-# a loaded workstation. Nothing about the run is judged by the clock — the
-# analyzer reads the log — so the budget only has to be long enough. The lead is
-# a number in another file, so the sum is checked against the shipped one by
-# host-motion-run.test.sh: a lead that grows without this following it is red
-# there rather than a launcher stopped mid-gesture.
+# about five seconds of bus transactions, the harness gesture's arming offset is
+# eight, the raise-hold-stow gesture about five, the release about four;
+# twenty-seven leaves margin for a loaded workstation. Nothing about the run is
+# judged by the clock — the analyzer reads the log — so the budget only has to be
+# long enough. The offset is a number in another file, so the sum is checked
+# against the shipped one by host-motion-run.test.sh: an offset that grows
+# without this following it is red there rather than a launcher stopped
+# mid-gesture.
 run_seconds=27
 
 # The launcher's HTTP control port. Probed rather than defaulted: 8080 is a port
@@ -150,7 +162,7 @@ pick_port() {
 
 compile() {
 	"$bazel" build "${build_flags[@]}" -- \
-		"$exe_target" "$system_target" "$launcher_target" \
+		"$exe_target" "$ask_target" "$system_target" "$launcher_target" \
 		"$launch_config_target" "$prelaunch_target" "$config_target" \
 		"$report_target"
 }
@@ -160,18 +172,25 @@ compile() {
 # path the config names. The same layout `tools/build-motion.sh` stages for a
 # unit, for the same reason — the rendered config spells every path relative to
 # the launcher's working directory.
+#
+# Every input is read from the enclosing scope by name, and nothing is passed
+# positionally: the payload grows a member per slice, and an unlabelled argument
+# list is a place where two of them can be transposed into a staging that looks
+# right and runs the wrong file.
 stage() {
-	local exe=$1 launcher=$2 launch_config=$3 prelaunch=$4 configs=$5 built=$6
 	local file src
 
 	rm -rf -- "$staging"
 	mkdir -p -- "$logs" "$launch_logs"
 
-	install -m 0755 -D -- "$launcher" "${staging}/simplelaunch"
-	install -m 0644 -D -- "$launch_config" "${staging}/hostcpu.textproto"
-	install -m 0755 -D -- "$prelaunch" \
+	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
+	install -m 0644 -D -- "$launch_config_out" "${staging}/hostcpu.textproto"
+	install -m 0755 -D -- "$prelaunch_out" \
 		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
-	install -m 0755 -D -- "$exe" "${staging}/cogs/robot_host_clk_exe"
+	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_host_clk_exe"
+	# Not a launcher app: it binds the narration port before the composition
+	# comes up, so this script starts it itself, ahead of the launcher.
+	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
 
 	while IFS= read -r file; do
 		[ -n "$file" ] || continue
@@ -201,12 +220,12 @@ stage() {
 # run's launcher too, which the launcher itself does not.
 refuse_leftovers() {
 	local name pids
-	for name in simplelaunch robot_host_clk_exe; do
+	for name in simplelaunch robot_host_clk_exe reachy_ask; do
 		pids=$(pgrep -x -- "$name" 2>/dev/null || true)
 		[ -z "$pids" ] || die \
 			"${name} is already running here (pid ${pids//$'\n'/ }), and a second run cannot share this machine." \
 			"Every process is flagless, so both runs would use the same shared-memory" \
-			"layout, and both would bind the same six loopback ports. Stop it first:" \
+			"layout, and both would bind the same loopback ports. Stop it first:" \
 			"    pkill -x ${name}"
 	done
 }
@@ -216,7 +235,14 @@ refuse_leftovers() {
 # children, the cog processes stop cleanly on it, and a unit's driver winds its
 # torque down on it.
 run() {
-	local port=$1 pid
+	local port=$1 pid ask_pid
+	(
+		cd -- "$staging" &&
+			exec ./reachy_ask --resting-timeout "$run_seconds" \
+				--run-window "$run_seconds"
+	) >"${launch_logs}/reachy_ask.log" 2>&1 &
+	ask_pid=$!
+	echo "${prog}: reachy-ask pid ${ask_pid}, console at ${launch_logs}/reachy_ask.log"
 	(
 		cd -- "$staging" &&
 			exec ./simplelaunch hostcpu.textproto \
@@ -240,21 +266,26 @@ run() {
 	echo "${prog}: stopping the run"
 	kill -INT "$pid" 2>/dev/null || true
 	wait "$pid" || true
+	# The intent source is not judged here: the analyzer over the log is the
+	# verdict, and a run where the gesture never reached the session fails there
+	# with the phases it did see. What its exit says is why, so it is printed.
+	kill -INT "$ask_pid" 2>/dev/null || true
+	wait "$ask_pid" || echo "${prog}: reachy-ask exited nonzero; see ${launch_logs}/reachy_ask.log"
 }
 
 require_bazel "host motion run"
 check_pinion_defaults "$logger_config"
 refuse_leftovers
 compile
-built=$(bazel_files "$(union "$exe_target" "$system_target" "$launcher_target" \
-	"$launch_config_target" "$prelaunch_target")")
+built=$(bazel_files "$(union "$exe_target" "$ask_target" "$system_target" \
+	"$launcher_target" "$launch_config_target" "$prelaunch_target")")
 configs=$(bazel_files "$config_target")
 exe_out=$(bazel_named_in "$built" robot_host_clk_exe)
+ask_out=$(bazel_named_in "$built" reachy_ask)
 launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" hostcpu.textproto)
 prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
-stage "$exe_out" "$launcher_out" "$launch_config_out" "$prelaunch_out" \
-	"$configs" "$built"
+stage
 echo "${prog}: staged  ${staging}"
 run "$(pick_port)"
 # The refusal hints are this staging's: the launcher put every process's console

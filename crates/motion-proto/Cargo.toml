@@ -1,0 +1,22 @@
+# The one Cargo manifest in this tree, and it builds nothing here.
+#
+# This crate is consumed by a Cargo workspace in another repository, which pins
+# it by git revision and needs a manifest to read. In this repo the crate is
+# built by BUILD.bazel like every other, and `crates/motion-proto/manifest_test.rs`
+# holds the two descriptions to the same dependency list so a change made in one
+# cannot pass the gate without the other.
+#
+# Standalone rather than a workspace member: there is no workspace here, so the
+# edition and the licence are stated outright. The edition is the repository's,
+# pinned once in MODULE.bazel.
+
+[package]
+name = "motion-proto"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

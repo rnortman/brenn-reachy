@@ -123,8 +123,8 @@ channel TickFaults
 }
 
 // The scripts somebody asks the machine to run. One publisher: whatever stands
-// at the edge -- the input log in the simulated system, the wake cog online
-// until the intent bridge that replaces it lands.
+// at the edge -- the input log in the simulated system, the incoming socket on
+// 7409 online, filled by the process that holds the intent edge.
 //
 // Eight deep against a view of four. Scripts are sparse: one arrives, the
 // session runs it for a minute, another arrives. The depth is slack for a

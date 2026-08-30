@@ -1,0 +1,40 @@
+# Apache-2.0; see LICENSE and NOTICE at the repository root.
+#
+# The intent edge: a motion script from outside, screened and compiled into the
+# request the session understands. Sans-I/O — bytes and an instant in, a message
+# or a typed refusal out — so the process that holds the bus and the harness
+# that drives one gesture run the same screens. `src/run.rs` carries the state a
+# process holds around them, for the same reason: both of those processes follow
+# the session's story the same way, and a second copy of that loop would prove a
+# rehearsal of the edge rather than the edge.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-edge` is not a Rust identifier.
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "reachy_edge",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cogs:schedule_clk_rs",
+        "//cogs:script_clk_rs",
+        "//cogs:session_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "//crates/motion-proto:motion_proto",
+        "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:thiserror",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The screens, the numbering and the compile: in-memory documents, an injected
+# instant, and a fixture name table. No clock, no socket, no file.
+rust_test(
+    name = "reachy_edge_test",
+    size = "small",
+    crate = ":reachy_edge",
+)

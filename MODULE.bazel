@@ -94,16 +94,18 @@ crate.spec(
     version = "0.35",
 )
 
-# Derived `Display`/`Error` for the libraries' typed error enums.
+# Derived `Display`/`Error` for the libraries' typed error enums, motion-proto's
+# decode and validation refusals among them.
 crate.spec(
     package = "thiserror",
     version = "2",
 )
 
-# Tests only: reachy-kin's baked linkage constants are asserted against the
-# vendored copy of the vendor file they were transcribed from, and that file is
-# JSON. `float_roundtrip` because the comparison is exact equality against
-# transcribed decimals.
+# JSON at runtime and in tests. motion-proto decodes the motion intent bodies
+# that arrive on the wire; reachy-clips reads the clip assets; reachy-kin's baked
+# linkage constants are asserted against the vendored copy of the vendor file
+# they were transcribed from, and that file is JSON. `float_roundtrip` because
+# that comparison is exact equality against transcribed decimals.
 crate.spec(
     features = ["float_roundtrip"],
     package = "serde_json",
@@ -135,7 +137,9 @@ crate.spec(
 # atomic flag the loop thread reads, which is all the handler does. Taken as a
 # dependency rather than written here because installing a handler is an `unsafe`
 # syscall and every crate in this tree forbids unsafe code; `signal_hook::flag`
-# is a safe wrapper over exactly that. reachy-motord.
+# is a safe wrapper over exactly that. reachy-motord, reachy-host, reachy-ask --
+# the last two because a background child of a non-interactive shell inherits
+# SIGINT ignored, so the handler is what makes a harness stop act at all.
 crate.spec(
     default_features = False,
     package = "signal-hook",
@@ -150,9 +154,10 @@ crate.spec(
     version = "0.2",
 )
 
-# Deserialization for the bench's configuration file and for the clip assets.
-# `derive` because every one of those types is a plain struct with a `#[derive]`
-# on it. reachy-bench, reachy-clips.
+# Deserialization for the bench's configuration file, the clip assets, and the
+# motion intent wire contract. `derive` because every one of those types is a
+# plain struct with a `#[derive]` on it. reachy-bench, reachy-clips,
+# motion-proto.
 crate.spec(
     features = ["derive"],
     package = "serde",

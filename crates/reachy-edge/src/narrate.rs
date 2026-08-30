@@ -1,0 +1,448 @@
+//! Narration: what the edge says happened, one JSON object per line.
+//!
+//! Two streams of events end up on one operator-facing stream. The session's
+//! own timeline rows arrive over the reports socket and are rendered from the
+//! report vocabulary; the edge's own drops — a body too big, a script for
+//! another machine, a redelivery, something that does not compile — never reach
+//! the session at all and are rendered here from the refusal that stopped them.
+//! A reader of the stream wants both, and wants to be able to tell them apart,
+//! so each line names which it is in `stream`.
+//!
+//! A line carries the numbers as the wire holds them *and* the sentence they
+//! mean. The numbers are what joins against a log; the sentence is what a
+//! person holding the robot reads. Where the vocabulary numbers something this
+//! build has no name for — a report kind or a refusal reason from a newer
+//! build — the line says the number and says that it is unnamed, rather than
+//! guessing at a neighbour.
+//!
+//! Every line carries `at_ns`, so a reader reconstructing an incident joins on
+//! a number rather than on the order two files happen to be in. The two streams
+//! stamp from two clocks and mean two things by it: on a `timeline` line it is
+//! the session's own clock, written when the session appended the row; on an
+//! `edge` line it is this machine's wall clock, read when the edge did the
+//! thing the line reports. Both are `CLOCK_REALTIME` on the same machine, which
+//! is what makes them comparable at all.
+//!
+//! The text in a line is bounded and stripped of control characters. Most of it
+//! is this tree's own words, but not all: a refusal quotes the pod a foreign
+//! script was addressed to, and a decode failure quotes what it could not read.
+//! That text belongs to whoever sent the body, and a line-oriented stream is
+//! exactly where a newline in it would forge a line that reads like ours.
+
+use clockwork_rs::SyncTime;
+use serde_json::{Value, json};
+
+use brenn_reachy__cogs__session_clk_rs::{SessionPhase, SessionPhaseWire};
+use brenn_reachy__motion__reports_clk_rs::{
+    RefusalReason, RefusalReasonWire, ReportKind, ReportKindWire,
+};
+use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
+
+use crate::intake::Refusal;
+
+/// How much of a quoted text a line carries.
+///
+/// The unabridged text is not kept anywhere else, which is a deliberate
+/// narrowing: this stream is the operator surface, and a body long enough to
+/// bury a terminal is a body whose first two hundred characters already say
+/// what is wrong with it.
+const TEXT_LIMIT: usize = 200;
+
+/// Text made safe to put on a line-oriented stream: bounded, and with control
+/// characters spent as spaces.
+fn one_line(text: &str) -> String {
+    let mut clean: String = text
+        .chars()
+        .take(TEXT_LIMIT)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().count() > TEXT_LIMIT {
+        clean.push('…');
+    }
+    clean
+}
+
+/// One row of the session's story, as a line.
+#[must_use]
+pub fn timeline_line(row: &TimelineEntryWire) -> String {
+    line(&json!({
+        "stream": "timeline",
+        "at_ns": row.time().as_nanos(),
+        "kind": kind_name(row.kind()),
+        "a": row.a(),
+        "b": row.b(),
+        "detail": finite(row.detail()),
+        "says": one_line(&says(row)),
+    }))
+}
+
+/// One body the edge dropped, as a line.
+///
+/// `at` is this machine's clock at the drop — the same instant the body would
+/// have been stamped with had it been accepted.
+#[must_use]
+pub fn refusal_line(refusal: &Refusal, at: SyncTime) -> String {
+    line(&json!({
+        "stream": "edge",
+        "at_ns": at.as_nanos(),
+        "kind": refusal.kind(),
+        "says": one_line(&refusal.to_string()),
+    }))
+}
+
+/// The story went backwards: the process telling it restarted.
+#[must_use]
+pub fn restart_line(narrated: u64, at: SyncTime) -> String {
+    line(&json!({
+        "stream": "edge",
+        "at_ns": at.as_nanos(),
+        "kind": "story_restarted",
+        "says": format!(
+            "the session's story went backwards after {narrated} row(s): the control process \
+             restarted, and what follows is the new one from its beginning"
+        ),
+    }))
+}
+
+/// Rows the session narrated that no datagram carried here.
+#[must_use]
+pub fn lost_line(lost: u64, at: SyncTime) -> String {
+    line(&json!({
+        "stream": "edge",
+        "at_ns": at.as_nanos(),
+        "kind": "story_rows_lost",
+        "lost": lost,
+        "says": format!(
+            "{lost} row(s) of the session's story fell off its ring before a datagram carried \
+             them: the narration has a hole, and what they classified travelled on the channels \
+             that raised it"
+        ),
+    }))
+}
+
+/// A JSON object as one line. Compact, because the reader is `grep` and a log
+/// shipper before it is a person.
+fn line(value: &Value) -> String {
+    value.to_string()
+}
+
+/// A measurement as JSON can carry it.
+///
+/// A report's `detail` is carried bit for bit and a non-finite number is a
+/// legal one — a story dropped for an unreadable measurement loses the part
+/// that was readable. JSON has no infinity, so it goes as its own spelling
+/// rather than as `null`, which would read as a field nobody set.
+fn finite(detail: f64) -> Value {
+    if detail.is_finite() {
+        json!(detail)
+    } else {
+        json!(format!("{detail}"))
+    }
+}
+
+/// A report kind's own word, or the number where this build has no word for it.
+fn kind_name(kind: ReportKindWire) -> String {
+    match kind.to_known() {
+        Some(known) => known_kind(known).to_owned(),
+        None => format!("kind_{}", kind.0),
+    }
+}
+
+/// The wire spelling of a report kind.
+///
+/// Written out rather than derived from the Rust identifier: the identifier is
+/// a name a rename would rewrite this stream with, and a stream whose spelling
+/// drifts stops joining against the runs that came before it, silently. The
+/// `match` is wildcard-free, so a kind the vocabulary grows is a compile error
+/// here rather than a line that says nothing.
+const fn known_kind(kind: ReportKind) -> &'static str {
+    match kind {
+        ReportKind::None => "none",
+        ReportKind::PhaseChanged => "phase_changed",
+        ReportKind::ScriptAccepted => "script_accepted",
+        ReportKind::ScriptRefused => "script_refused",
+        ReportKind::FaultRecorded => "fault_recorded",
+        ReportKind::ResponseTaken => "response_taken",
+        ReportKind::WinddownOutcome => "winddown_outcome",
+        ReportKind::TorqueOffConfirmed => "torque_off_confirmed",
+        ReportKind::TorqueOffUnconfirmed => "torque_off_unconfirmed",
+        ReportKind::BusFailureDeclared => "bus_failure_declared",
+        ReportKind::SessionEnded => "session_ended",
+        ReportKind::AuxGaveUp => "aux_gave_up",
+        ReportKind::SchedulePublished => "schedule_published",
+        ReportKind::DegradeReleased => "degrade_released",
+        ReportKind::CommissionFailed => "commission_failed",
+        ReportKind::ScriptReplaced => "script_replaced",
+    }
+}
+
+/// What a row means, in a sentence.
+///
+/// The two numbers mean something different per kind, and this is where that
+/// table is spelled — the same table the report vocabulary states beside each
+/// kind. A reader of a line should not have to hold the vocabulary in their
+/// head to know whether `b` is a servo, a phase or a reason.
+pub(crate) fn says(row: &TimelineEntryWire) -> String {
+    let (a, b, detail) = (row.a(), row.b(), row.detail());
+    let Some(kind) = row.kind().to_known() else {
+        return format!(
+            "report kind {}, which this build does not name: {a}, {b}, {detail}",
+            row.kind().0
+        );
+    };
+    match kind {
+        ReportKind::None => "an unwritten row, which no sender produces".to_owned(),
+        ReportKind::PhaseChanged => {
+            format!("phase {} entered from {}", phase_name(a), phase_name(b))
+        }
+        ReportKind::ScriptAccepted => {
+            format!("script {a} accepted: {b} step(s), schedule epoch {detail}")
+        }
+        ReportKind::ScriptRefused => format!("script {a} refused: {}", refusal_reason(b)),
+        ReportKind::FaultRecorded => {
+            format!("fault {a} recorded on servo {b}, magnitude {detail}")
+        }
+        ReportKind::ResponseTaken => format!("response {a} taken, for fault {b}"),
+        ReportKind::WinddownOutcome => format!(
+            "wind-down concluded with outcome {a}{}, {detail:.3} s of its clock left",
+            if b == 0 { "" } else { ", park-class" }
+        ),
+        ReportKind::TorqueOffConfirmed => "every row confirmed torque off".to_owned(),
+        ReportKind::TorqueOffUnconfirmed => {
+            format!("torque off unconfirmed: {a} row(s) unread after {detail:.3} s")
+        }
+        ReportKind::BusFailureDeclared => {
+            format!("the bus was declared failed: {detail:.3} s since a fresh sample")
+        }
+        ReportKind::SessionEnded => format!(
+            "the session ended at rest: script {a}, servo set {b:#x} unread at the release, \
+             worst deviation from stow {detail:.4} rad"
+        ),
+        ReportKind::AuxGaveUp => {
+            format!("aux transaction {a} on servo {b} gave up after {detail:.3} s")
+        }
+        ReportKind::SchedulePublished => format!("schedule epoch {a} published: {b} step(s)"),
+        ReportKind::DegradeReleased => {
+            format!("a group de-torque for response {a} released {b} row(s)")
+        }
+        ReportKind::CommissionFailed => format!(
+            "the survey refused the machine: failure kind {a} at servo {b}, headline {detail}"
+        ),
+        ReportKind::ScriptReplaced => format!(
+            "script {a} replaced the running schedule under epoch {b}, asking for {detail} step(s)"
+        ),
+    }
+}
+
+/// A phase by its own word, or by number where this build has none for it.
+fn phase_name(phase: u32) -> String {
+    let wire = SessionPhaseWire(u8::try_from(phase).unwrap_or(u8::MAX));
+    match wire.to_known() {
+        Some(SessionPhase::Starting) => "starting".to_owned(),
+        Some(SessionPhase::Resting) => "resting".to_owned(),
+        Some(SessionPhase::Engaging) => "engaging".to_owned(),
+        Some(SessionPhase::Active) => "active".to_owned(),
+        Some(SessionPhase::WindingDown) => "winding_down".to_owned(),
+        Some(SessionPhase::Stopping) => "stopping".to_owned(),
+        Some(SessionPhase::Parked) => "parked".to_owned(),
+        None => format!("phase {phase}, which this build does not name"),
+    }
+}
+
+/// A refusal reason as a sentence, or by number where this build has none.
+pub(crate) fn refusal_reason(reason: u32) -> String {
+    let wire = RefusalReasonWire(u8::try_from(reason).unwrap_or(u8::MAX));
+    match wire.to_known() {
+        Some(RefusalReason::None) => "no refusal at all".to_owned(),
+        Some(RefusalReason::Parked) => "the machine is parked".to_owned(),
+        Some(RefusalReason::NotResting) => "the machine was busy with a session".to_owned(),
+        Some(RefusalReason::TooManySteps) => "more steps than a schedule holds".to_owned(),
+        Some(RefusalReason::TooManyOverlays) => {
+            "more overlay windows than a schedule holds".to_owned()
+        }
+        Some(RefusalReason::BadTimes) => "times that are not a timeline".to_owned(),
+        Some(RefusalReason::UnknownMotion) => "a motion index no library could hold".to_owned(),
+        Some(RefusalReason::Undecodable) => "a datagram that is not a script".to_owned(),
+        Some(RefusalReason::Stale) => "a number no higher than the running engagement's".to_owned(),
+        Some(RefusalReason::TooLong) => "a schedule reaching past the session's horizon".to_owned(),
+        None => format!("reason {reason}, which this build does not name"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clockwork_rs::SyncTime;
+    use serde_json::Value;
+
+    use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+    use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
+    use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
+
+    use super::{TEXT_LIMIT, lost_line, refusal_line, restart_line, timeline_line};
+    use crate::intake::Refusal;
+
+    /// The host's clock at the moment an edge line reports, distinct from the
+    /// 42 a fixture row carries, so a line stamped from the wrong side shows.
+    fn at() -> SyncTime {
+        SyncTime::from_nanos(1_700_000_000_000_000_000)
+    }
+
+    fn row(kind: ReportKindWire, a: u32, b: u32, detail: f64) -> TimelineEntryWire {
+        let mut entry = TimelineEntryWire::new();
+        entry.set_time(SyncTime::from_nanos(42));
+        entry.set_kind(kind);
+        entry.set_a(a);
+        entry.set_b(b);
+        entry.set_detail(detail);
+        entry
+    }
+
+    /// One line, parsed back.
+    fn parsed(line: &str) -> Value {
+        assert!(!line.contains('\n'), "a line holds no newline: {line}");
+        serde_json::from_str(line).expect("a line is one JSON object")
+    }
+
+    #[test]
+    fn a_row_carries_its_numbers_and_its_sentence() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::PHASE_CHANGED,
+            u32::from(SessionPhaseWire::ACTIVE.0),
+            u32::from(SessionPhaseWire::ENGAGING.0),
+            0.0,
+        )));
+        assert_eq!(value["stream"], "timeline");
+        assert_eq!(value["at_ns"], 42);
+        assert_eq!(value["kind"], "phase_changed");
+        assert_eq!(value["a"], u32::from(SessionPhaseWire::ACTIVE.0));
+        assert_eq!(value["b"], u32::from(SessionPhaseWire::ENGAGING.0));
+        assert_eq!(value["says"], "phase active entered from engaging");
+    }
+
+    #[test]
+    fn a_refusal_row_spells_the_reason_out() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::SCRIPT_REFUSED,
+            7,
+            u32::from(RefusalReasonWire::STALE.0),
+            0.0,
+        )));
+        assert_eq!(value["kind"], "script_refused");
+        assert_eq!(
+            value["says"],
+            "script 7 refused: a number no higher than the running engagement's"
+        );
+    }
+
+    /// A build reading a log written by a newer one. The number is what the two
+    /// have in common, so the line carries it rather than guessing at a
+    /// neighbouring name.
+    #[test]
+    fn a_kind_this_build_does_not_know_says_so() {
+        let value = parsed(&timeline_line(&row(ReportKindWire(200), 1, 2, 0.0)));
+        assert_eq!(value["kind"], "kind_200");
+        assert!(
+            value["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("does not name"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn a_reason_this_build_does_not_know_says_so() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::SCRIPT_REFUSED,
+            1,
+            250,
+            0.0,
+        )));
+        assert!(
+            value["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("reason 250"),
+            "{value}"
+        );
+    }
+
+    /// A measurement JSON has no number for. It goes as its own spelling: a
+    /// `null` here would read as a field the session never set.
+    #[test]
+    fn a_non_finite_measurement_is_carried_as_its_spelling() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::FAULT_RECORDED,
+            1,
+            2,
+            f64::INFINITY,
+        )));
+        assert_eq!(value["detail"], "inf");
+        let nan = parsed(&timeline_line(&row(
+            ReportKindWire::FAULT_RECORDED,
+            1,
+            2,
+            f64::NAN,
+        )));
+        assert_eq!(nan["detail"], "NaN");
+    }
+
+    #[test]
+    fn an_edge_drop_names_its_screen() {
+        let value = parsed(&refusal_line(
+            &Refusal::Stale {
+                seq: 4,
+                accepted: 9,
+            },
+            at(),
+        ));
+        assert_eq!(value["stream"], "edge");
+        assert_eq!(value["at_ns"], at().as_nanos());
+        assert_eq!(value["kind"], "stale");
+        assert!(
+            value["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("numbered 4"),
+            "{value}"
+        );
+    }
+
+    /// The text a refusal quotes is the sender's, and this stream is
+    /// line-oriented: a newline in it would forge a line that reads like one of
+    /// ours, and an unbounded one would bury the terminal.
+    #[test]
+    fn a_refusal_quoting_a_sender_is_bounded_and_holds_no_control_characters() {
+        let addressed = format!("kitchen\nreachy: forged {}", "x".repeat(400));
+        let value = parsed(&refusal_line(
+            &Refusal::ForeignPod {
+                addressed,
+                pod: "reachy00".to_owned(),
+            },
+            at(),
+        ));
+        let says = value["says"].as_str().expect("a sentence");
+        assert!(!says.contains('\n'), "{says}");
+        assert!(says.chars().count() <= TEXT_LIMIT + 1, "{says}");
+        assert!(says.ends_with('…'), "{says}");
+    }
+
+    #[test]
+    fn a_restart_and_a_hole_each_have_a_line() {
+        let restart = parsed(&restart_line(12, at()));
+        assert_eq!(restart["kind"], "story_restarted");
+        assert_eq!(restart["at_ns"], at().as_nanos());
+        assert!(
+            restart["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("12 row(s)"),
+            "{restart}"
+        );
+
+        let lost = parsed(&lost_line(3, at()));
+        assert_eq!(lost["kind"], "story_rows_lost");
+        assert_eq!(lost["at_ns"], at().as_nanos());
+        assert_eq!(lost["lost"], 3);
+    }
+}

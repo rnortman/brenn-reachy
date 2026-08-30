@@ -64,10 +64,12 @@ build_flags=(--config=device)
 build_target=//bazel/platform:motion_payload
 
 # The members, named again here only because their outputs have to be told apart
-# afterwards: the driver is a Rust binary, the executable is synthesized from
-# `robot.clk` (both processes start from it), and the system target provides the
-# process descriptions and the generated log-writer configuration.
+# afterwards: the driver and the harness's intent source are Rust binaries, the
+# executable is synthesized from `robot.clk` (both processes start from it), and
+# the system target provides the process descriptions and the generated
+# log-writer configuration.
 motord_target=//crates/reachy-motord:reachy_motord
+ask_target=//crates/reachy-ask:reachy_ask
 exe_target=//cogs:robot_clk_exe
 system_target=//cogs:system_robot_clk
 launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
@@ -238,17 +240,25 @@ stamp_build_commit() {
 # path, or no directory at all — which `deploy-motion.sh --push` refuses — rather
 # than a payload with half its files deleted, which it cannot tell from a whole
 # one.
+#
+# Every input is read from the enclosing scope by name, and nothing is passed
+# positionally: the payload grows a member per slice, and an unlabelled argument
+# list is a place where two of them can be transposed into a staging that looks
+# right and runs the wrong file — two cross-built Rust binaries especially,
+# which every existence check downstream would still pass.
 stage() {
-	local motord=$1 exe=$2 launcher=$3 launch_config=$4 prelaunch=$5
 	local entry staging="${payload}.new" previous="${payload}.old"
 	rm -rf -- "$staging" "$previous"
 	mkdir -p -- "$staging"
 
-	install -m 0755 -D -- "$motord" "${staging}/reachy_motord"
-	install -m 0755 -D -- "$exe" "${staging}/cogs/robot_clk_exe"
-	install -m 0755 -D -- "$launcher" "${staging}/simplelaunch"
-	install -m 0644 -D -- "$launch_config" "${staging}/robotcpu.textproto"
-	install -m 0755 -D -- "$prelaunch" \
+	install -m 0755 -D -- "$motord_out" "${staging}/reachy_motord"
+	# Not a launcher app: it binds the narration port before the composition is
+	# started, so `--run` starts it itself, ahead of the launcher.
+	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
+	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
+	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
+	install -m 0644 -D -- "$launch_config_out" "${staging}/robotcpu.textproto"
+	install -m 0755 -D -- "$prelaunch_out" \
 		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 
 	for entry in "${plan_files[@]}"; do
@@ -269,7 +279,7 @@ report() {
 	size=$(du -sh -- "$payload" | cut -f1)
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
-	for file in reachy_motord cogs/robot_clk_exe simplelaunch; do
+	for file in reachy_motord reachy_ask cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
 }
@@ -277,18 +287,21 @@ report() {
 require_bazel "device payload"
 check_pinion_defaults "$logger_config"
 compile
-built=$(bazel_files "$(union "$motord_target" "$exe_target" "$system_target" \
-	"$launcher_target" "$launch_config_target" "$prelaunch_target")")
+built=$(bazel_files "$(union "$motord_target" "$ask_target" "$exe_target" \
+	"$system_target" "$launcher_target" "$launch_config_target" \
+	"$prelaunch_target")")
 configs=$(bazel_files "$(union "${config_targets[@]}")")
 motord_out=$(bazel_named_in "$built" reachy_motord)
+ask_out=$(bazel_named_in "$built" reachy_ask)
 exe_out=$(bazel_named_in "$built" robot_clk_exe)
 launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
 prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
 check_launcher_apps "$launch_config_out"
 verify_aarch64 "$motord_out"
+verify_aarch64 "$ask_out"
 verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
 plan "$built" "$configs"
-stage "$motord_out" "$exe_out" "$launcher_out" "$launch_config_out" "$prelaunch_out"
+stage
 report

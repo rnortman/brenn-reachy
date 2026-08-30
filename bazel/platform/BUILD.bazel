@@ -33,8 +33,10 @@ platform(
 # What a motion run on a unit is built out of: the driver binary, the executable
 # both cog processes start from, the system target that emits their process
 # descriptions and the writer's channel set, the launcher that starts all three
-# processes, and the launcher config naming them. tools/build-motion.sh builds
-# this, so the payload it stages and the set the gate covers are one set.
+# processes, the launcher config naming them, and the harness's intent source --
+# which the launcher does not start, because it binds the narration port before
+# the composition comes up. tools/build-motion.sh builds this, so the payload it
+# stages and the set the gate covers are one set.
 #
 # The launcher is C++ from the drop rather than anything of ours, so it is also
 # what makes `make check-device` gate a cross-build of boost, protobuf and
@@ -46,20 +48,30 @@ filegroup(
         "//cogs:robot_clk_exe",
         "//cogs:robotcpu.textproto",
         "//cogs:system_robot_clk",
+        "//crates/reachy-ask:reachy_ask",
         "//crates/reachy-motord:reachy_motord",
         "@clockwork//jewels/simplelaunch:simplelaunch",
     ],
     visibility = ["//visibility:public"],
 )
 
-# Everything a unit runs, named once. `make check-device` builds exactly this,
-# so no deployable can be outside the gate: adding one here is what puts it in
-# CI, and there is nowhere else to add it.
+# Everything cross-built for a unit, named once: what a unit runs today plus
+# what is built for it and not yet staged. `make check-device` builds exactly
+# this, so a target named here cannot be outside the gate, and there is nowhere
+# else to add it. Membership here is a build claim, not a deploy claim --
+# `motion_payload` above is the only place a *deployed* member is declared.
+#
+# `//crates/reachy-host:reachy_host` is gated but not staged: the four things it
+# needs beside it on a unit -- the pod audio device, the speech configuration,
+# the wake and VAD models, and a launcher config naming the app -- are not here
+# yet, so no payload carries it.
+# TODO(host-payload-membership)
 filegroup(
     name = "device_deployables",
     srcs = [
         ":motion_payload",
         "//crates/reachy-bench:reachy_bench",
+        "//crates/reachy-host:reachy_host",
     ],
     visibility = ["//visibility:public"],
 )
