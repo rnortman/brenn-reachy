@@ -32,7 +32,6 @@ rust_library(
     deps = [
         "//crates/reachy-edge:reachy_edge",
         "//host:host_config_clk_rs",
-        "@brenn_reachy_crates//:brenn-bridge",
         "@brenn_reachy_crates//:prost-reflect",
         "@brenn_reachy_crates//:protox",
         "@brenn_reachy_crates//:serde_json",
@@ -103,6 +102,7 @@ rust_test(
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
         ":reachy_host_lib",
+        ":speech_fixture",
     ],
 )
 
@@ -118,9 +118,23 @@ rust_test(
     size = "small",
     crate = ":reachy_host_lib",
     deps = [
+        ":speech_fixture",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
     ],
+)
+
+# The speech configurations both test crates compose the server over. Its own
+# `testonly` library because the library's cases and the binary's are separate
+# crates: a module inside either one is unreachable from the other, and two
+# copies of the file that makes `Config::carries_alerts()` true can drift apart
+# under a pin bump without anything saying so.
+rust_library(
+    name = "speech_fixture",
+    testonly = True,
+    srcs = ["testing/speech_fixture.rs"],
+    edition = "2024",
+    deps = ["@brenn_reachy_crates//:speech-surface"],
 )
 
 # The voice pipeline's third-party closure, linked. Every other target in this
@@ -133,7 +147,10 @@ rust_test(
 # All three brenn-pod crates are deps, not just the surface: the closure claim is
 # that every native library any of them carries resolves, and a crate reached
 # only through another's internal edges is a claim about that other crate's
-# current dependency list rather than about this link.
+# current dependency list rather than about this link. This is the only target
+# in the package that names `brenn-bridge` -- the library takes the seam's whole
+# vocabulary through `speech-surface`, and the name here is what forces the
+# link; the assertion beside it is incidental.
 rust_test(
     name = "host_closure_test",
     size = "small",

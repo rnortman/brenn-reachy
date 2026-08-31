@@ -29,7 +29,6 @@ use std::time::Duration;
 use clockwork_rs::SyncTime;
 use reachy_edge::{edge_line, edge_line_with};
 use serde_json::json;
-use speech_surface::config::BrainMode;
 use speech_surface::server::Server;
 use speech_surface::{AlertInbox, Config, ConfigError, Sinks, jsonl};
 use tokio::runtime::Runtime;
@@ -145,15 +144,10 @@ impl Voice {
                 config.display()
             )),
         })?;
-        // Coupled to the server's drain condition: the server drains the
-        // seam only where `brain.mode` is `Brenn`, validated to require the
-        // `[brenn]` table and vice versa — one check decides both. Spelled
-        // here rather than asked of the crate that owns it, which is a
-        // duplicate across a pinned revision until the pin can name the
-        // published predicate.
-        // TODO(drain-condition-through-the-seam)
-        let carries_alerts =
-            settings.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn);
+        // The server's own drain condition, asked of the crate that spawns the
+        // drain rather than re-spelled here: a pinned revision that narrows or
+        // widens it moves this answer with it.
+        let carries_alerts = settings.carries_alerts();
         let settings = Arc::new(settings);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -363,9 +357,6 @@ mod tests {
     /// A configuration naming a key table that is not there.
     const NO_KEYS: &str = "listen_addr = \"127.0.0.1:0\"\npod_psk_file = \"/nowhere/psk.toml\"\n";
 
-    /// A key, as the pod platform's table spells one.
-    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-
     /// The server's end of an alert seam whose raising end nothing keeps.
     ///
     /// What the cases below are about is the composition, not the reporting: a
@@ -376,66 +367,19 @@ mod tests {
         inbox
     }
 
-    /// A speech configuration this host will actually run, written into `dir`.
+    /// The fixture, with an event sink one case reads back.
     ///
-    /// Everything it names is inside that directory and nothing it names is on
-    /// a network: an ephemeral loopback listener, a key table of one pod, no
-    /// recording, and an event sink that is a file. No `[wake]` and no
-    /// `[endpointer]` table, so no model is loaded and no inference runs — what
-    /// this composes is the server, which is what the cases below are about.
+    /// A file rather than `none` because the composition's own proof that the
+    /// sink was opened and flushed is that the file is there.
     fn runnable(dir: &Path) -> std::path::PathBuf {
-        let keys = dir.join("psk.toml");
-        speech_surface::psk::write_secret_file(&keys, &format!("fixture-pod = \"{KEY}\"\n"))
-            .expect("a key table");
-        let path = dir.join("speech.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "listen_addr = \"127.0.0.1:0\"\n\
-                 pod_psk_file = {:?}\n\
-                 [record]\nenabled = false\n\
-                 [jsonl]\nsink = {:?}\n",
-                keys.to_str().expect("a path this test wrote"),
-                dir.join("events.jsonl")
-                    .to_str()
-                    .expect("a path this test wrote"),
-            ),
-        )
-        .expect("a file");
-        path
+        let events = dir.join("events.jsonl");
+        speech_fixture::runnable(dir, speech_fixture::Events::File(&events))
     }
 
-    /// The same fixture with a bus brain: the deployment whose alerts travel.
-    ///
-    /// Everything `mode = "brenn"` needs and nothing that dials anybody: the
-    /// speech services are URLs nothing calls in a composition that runs no
-    /// turn, and the bridge is pointed at a closed loopback port with a token
-    /// file this case wrote. What is under test is what the server composes
-    /// from this configuration, not the transport.
+    /// The bus-brain fixture, same sink: the deployment whose alerts travel.
     fn carrying(dir: &Path) -> std::path::PathBuf {
-        let token = dir.join("bus.token");
-        speech_surface::psk::write_secret_file(&token, "a-bearer-token\n").expect("a token file");
-        let path = runnable(dir);
-        let text = std::fs::read_to_string(&path).expect("the fixture");
-        std::fs::write(
-            &path,
-            format!(
-                "{text}\
-                 [brain]\nmode = \"brenn\"\n\
-                 [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
-                 [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
-                 model = \"m\"\nvoice = \"v\"\n\
-                 [brenn]\n\
-                 publish_channel = \"brenn:pod.utterance\"\n\
-                 response_channel = \"brenn:pod.speak\"\n\
-                 [brenn.bridge]\n\
-                 server_url = \"wss://127.0.0.1:1/ws\"\n\
-                 token_file = {:?}\n",
-                token.to_str().expect("a path this test wrote"),
-            ),
-        )
-        .expect("a file");
-        path
+        let events = dir.join("events.jsonl");
+        speech_fixture::carrying(dir, speech_fixture::Events::File(&events))
     }
 
     #[test]

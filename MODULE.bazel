@@ -210,14 +210,18 @@ crate.spec(
 # the two motion sinks (`Sinks`, `Server::with_sinks`) and the alert queue
 # (`alert_seam`, `Server::with_alerts`), which is how an alert the edge's table
 # raised reaches the robot's single bus attachment without this process opening
-# a second one.
+# a second one. It also states each seam's whole vocabulary on the seam
+# itself -- `AlertSeverity` re-exported beside the
+# `Alert` that carries it, and `Config::carries_alerts()` answering the drain
+# condition the server spawns under -- so this tree fills in the seam and asks
+# about it through the one crate, rather than spelling either against a pin.
 #
-# At this revision `speech-surface` takes `motion-proto` from a published
-# brenn-reachy revision, so the fetched closure carries a second copy of the wire
-# contract beside `//crates/motion-proto` -- the same contract, one publish
-# behind this tree's. Nothing carries a `MotionScript` value across the two
-# seams, so the two types never meet. TODO(motion-proto-two-copies)
-BRENN_POD_REV = "5a99838166fab4e7bccb03b2a3b366bf6c522107"
+# At this revision `speech-surface` takes `motion-proto` from an earlier
+# published brenn-reachy revision, so the fetched closure carries a second copy
+# of the wire contract beside `//crates/motion-proto` -- the same contract, some
+# publishes behind this tree's. Nothing carries a `MotionScript` value across the
+# two seams, so the two types never meet. TODO(motion-proto-two-copies)
+BRENN_POD_REV = "117093b0cacaa830820f2c03271af3aa7db66c12"
 
 # The host library the robot's voice process is a composition of. reachy-host.
 crate.spec(
@@ -234,8 +238,11 @@ crate.spec(
     rev = BRENN_POD_REV,
 )
 
-# The bus attachment crate, generic across the fleet and consumed here through
-# the host's own driver: the robot attaches once, from the voice host.
+# The bus attachment crate, generic across the fleet. The robot attaches once,
+# from the voice host, and reaches this crate's vocabulary through
+# `speech-surface` -- so the only target that names this spec directly is
+# `//crates/reachy-host:host_closure_test`, which holds it to prove the link
+# resolves.
 crate.spec(
     git = "https://github.com/rnortman/brenn-pod.git",
     package = "brenn-bridge",

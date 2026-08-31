@@ -875,62 +875,14 @@ mod tests {
         assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
     }
 
-    /// A speech configuration the pod platform will run, written into `dir`.
-    ///
-    /// Loopback on an ephemeral port, one key, no recording, no wake or
-    /// endpointer table, so nothing here loads a model or touches a network.
+    /// The fixture, with the event stream dropped: nothing here reads it back.
     fn runnable_speech_config(dir: &std::path::Path) -> PathBuf {
-        let keys = dir.join("psk.toml");
-        speech_surface::psk::write_secret_file(
-            &keys,
-            "fixture-pod = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n",
-        )
-        .expect("a key table");
-        let path = dir.join("speech.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "listen_addr = \"127.0.0.1:0\"\n\
-                 pod_psk_file = {:?}\n\
-                 [record]\nenabled = false\n\
-                 [jsonl]\nsink = \"none\"\n",
-                keys.to_str().expect("a path this case wrote"),
-            ),
-        )
-        .expect("a file");
-        path
+        speech_fixture::runnable(dir, speech_fixture::Events::Dropped)
     }
 
     /// The same, for a deployment whose brain is on the bus.
-    ///
-    /// Everything `mode = "brenn"` requires, pointed at nobody: speech service
-    /// URLs a composition that runs no turn never calls, and a bridge onto a
-    /// closed loopback port with a token file this case wrote. What it buys is
-    /// the run that drains the alert seam, which is the branch under test.
     fn carrying_speech_config(dir: &std::path::Path) -> PathBuf {
-        let token = dir.join("bus.token");
-        speech_surface::psk::write_secret_file(&token, "a-bearer-token\n").expect("a token file");
-        let path = runnable_speech_config(dir);
-        let text = std::fs::read_to_string(&path).expect("the fixture");
-        std::fs::write(
-            &path,
-            format!(
-                "{text}\
-                 [brain]\nmode = \"brenn\"\n\
-                 [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
-                 [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
-                 model = \"m\"\nvoice = \"v\"\n\
-                 [brenn]\n\
-                 publish_channel = \"brenn:pod.utterance\"\n\
-                 response_channel = \"brenn:pod.speak\"\n\
-                 [brenn.bridge]\n\
-                 server_url = \"wss://127.0.0.1:1/ws\"\n\
-                 token_file = {:?}\n",
-                token.to_str().expect("a path this case wrote"),
-            ),
-        )
-        .expect("a file");
-        path
+        speech_fixture::carrying(dir, speech_fixture::Events::Dropped)
     }
 
     #[test]

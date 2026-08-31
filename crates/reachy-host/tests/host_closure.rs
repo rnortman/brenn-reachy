@@ -92,3 +92,13 @@ fn the_pipeline_libraries_link() {
 
     assert_eq!(brenn_bridge::Urgency::Normal.as_str(), "normal");
 }
+
+#[test]
+fn the_alert_severity_the_surface_names_is_the_attachment_s_own() {
+    // `speech_surface::AlertSeverity` must be `brenn_bridge::AlertSeverity` —
+    // the same type, not a structurally similar copy. If the surface defined
+    // its own enum the host would still compile but silently carry two
+    // unrelated severity types. This is the only executable linking both
+    // crates. The binding is the case; it fails to compile, not at runtime.
+    let _: speech_surface::AlertSeverity = brenn_bridge::AlertSeverity::Warning;
+}

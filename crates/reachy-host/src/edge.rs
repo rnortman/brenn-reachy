@@ -32,11 +32,10 @@
 //!
 //! [`HostEdge`]: reachy_edge::HostEdge
 
-use brenn_bridge::AlertSeverity; // TODO(alert-severity-through-the-seam)
 use clockwork_rs::SyncTime;
 use reachy_edge::{Alert, Severity, Surface, alert_line, edge_line_with, now, severity_word};
 use serde_json::json;
-use speech_surface::{Alert as Raised, AlertRaiser, AlertRefused};
+use speech_surface::{Alert as Raised, AlertRaiser, AlertRefused, AlertSeverity};
 
 /// The surface the host runs on.
 ///
@@ -124,7 +123,10 @@ fn carried(alert: &Alert) -> Raised {
     }
 }
 
-/// The edge's two words as the attachment spells them.
+/// The edge's two words as the attachment spells them, through the seam.
+///
+/// `AlertSeverity` arrives from `speech_surface` beside the `Alert` it fills
+/// in, so the two halves of one value cannot come from two revisions.
 ///
 /// Wildcard-free, so a third word in either vocabulary is a compile-time
 /// decision here rather than an alert silently published as the wrong loudness.
