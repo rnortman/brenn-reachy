@@ -22,8 +22,10 @@
 //!
 //! What this prints is one JSON object per line on stdout: every row of the
 //! session's story as it is narrated, every body the edge dropped, and every
-//! alert the table raised. With no bus attachment configured the alerts are
-//! those lines and nothing else.
+//! alert the table raised. An alert also goes to the bus, through the seam the
+//! composed pipeline drains onto the robot's one attachment; a host that
+//! composed no pipeline has no attachment, and its alerts are those lines and
+//! nothing else.
 
 #![forbid(unsafe_code)]
 
@@ -39,13 +41,14 @@ use reachy_edge::{
     DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
     Surface, edge_line_with, now,
 };
-use reachy_host::edge::Console;
+use reachy_host::edge::{Console, Publishing};
 use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
 use reachy_host::sinks::Stdout;
 use reachy_host::voice::{NotRunning, Voice, absent_line, composed_line, silent_line};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
+use speech_surface::{ALERT_QUEUE_DEPTH, AlertRaiser, alert_seam};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 ///
@@ -208,10 +211,15 @@ fn run(options: &Options) -> Result<(), String> {
     // and the loop below narrates the session's story and asks for nothing.
     let (intents, waiting) = waking_queue(Arc::new(nudge));
     let mut host = HostEdge::new(settings.edge.clone(), table);
-    let mut surface = Console;
+    let mut surface = Publishing::new(Console);
     surface.say(started_line(&settings, &options.config, now()));
 
-    let voice = start_voice(options, &intents, &mut surface)?;
+    // Only a run that drains the seam gives the alerts anywhere to go, so the
+    // raising end comes back only from one that does. Installed after the fact
+    // because the surface exists before it: the host's first line is written
+    // before there is anything to publish through.
+    let started = start_voice(options, &intents, &mut surface)?;
+    let voice = install_alerts(&mut surface, started);
     // The queue's other sending handle. Dropped here so that the only holders
     // are the pipeline's two sinks: the loop reads a disconnected queue the same
     // as an empty one, so a handle kept here would hide nothing, but a queue
@@ -236,6 +244,24 @@ fn run(options: &Options) -> Result<(), String> {
     outcome(followed, stopped)
 }
 
+/// Put the raising end on the surface, and hand back the pipeline to stop.
+///
+/// The one place the two halves of the alert path are joined: the raiser a
+/// composed run handed back is the raiser the surface publishes through. A
+/// separate function because that join is otherwise unobservable — a host that
+/// composed a pipeline and installed nothing looks exactly like one whose
+/// deployment carries no alerts, and both of them run.
+fn install_alerts<S: Surface>(
+    surface: &mut Publishing<S>,
+    started: Option<Started>,
+) -> Option<Voice> {
+    let started = started?;
+    if let Some(raiser) = started.alerts {
+        surface.publish_through(raiser);
+    }
+    Some(started.voice)
+}
+
 /// What the process exits on, from the loop's answer and the pipeline's.
 ///
 /// The loop's failure leads when both failed: it is what ended the run, and the
@@ -255,21 +281,43 @@ fn outcome(followed: Result<(), String>, stopped: Option<String>) -> Result<(), 
     }
 }
 
+/// What a composed voice half left this process holding.
+///
+/// Two things rather than one, because they are held by different halves: the
+/// pipeline is stopped by whoever ends the run, and the raiser belongs to the
+/// surface the edge's loop narrates on. A host that composed no pipeline holds
+/// neither, which is the absence of this whole value rather than a state
+/// inside it.
+struct Started {
+    /// The running pipeline.
+    voice: Voice,
+    /// The raising end of the alert seam, where this run drains one. Absent on
+    /// a pipeline that composed no bus attachment: the run drops its end, so
+    /// every raise against it would refuse and say so for nothing.
+    alerts: Option<AlertRaiser>,
+}
+
 /// Start the voice pipeline where one was configured, and say which it is.
 ///
 /// The sinks it is composed with are handed the queue the loop takes from, so
-/// the scripter's decision and a body off the bus reach one gate. Nothing about
-/// the machine waits on this: a host with no pipeline is deaf and mute, and the
-/// motion stack owes it nothing either way.
+/// the scripter's decision and a body off the bus reach one gate. The alert
+/// seam runs the other way: the pipeline drains it onto the attachment it
+/// holds. Nothing about the machine waits on any of this: a host with no
+/// pipeline is deaf and mute, and the motion stack owes it nothing either way.
 fn start_voice(
     options: &Options,
     intents: &Intents,
     surface: &mut impl Surface,
-) -> Result<Option<Voice>, String> {
+) -> Result<Option<Started>, String> {
     let Some(path) = &options.speech_config else {
         surface.say(silent_line(now()));
         return Ok(None);
     };
+    // Minted here and handed on only once the pipeline is serving and drains
+    // it: a raiser whose far end never ran, or whose run composed no bus
+    // attachment to drain onto, would refuse every alert — a line per alert
+    // saying nothing a host with no pipeline does not already say.
+    let (raiser, inbox) = alert_seam(ALERT_QUEUE_DEPTH);
     // A named configuration that is not on the machine is the shipped state of
     // a unit: the launcher entry names the path unconditionally and an
     // operator's own file is a push into RAM, so until that push the file is
@@ -279,10 +327,14 @@ fn start_voice(
     // answer for. Absence is the loader's own answer and not a `stat` asked
     // ahead of it, which cannot tell a file that is not there from one this
     // process may not look at.
-    match Voice::start(path, intents.clone(), Arc::new(Stdout)) {
+    match Voice::start(path, intents.clone(), Arc::new(Stdout), inbox) {
         Ok(voice) => {
-            surface.say(composed_line(path, &voice.listening(), now()));
-            Ok(Some(voice))
+            let carries = voice.carries_alerts();
+            surface.say(composed_line(path, &voice.listening(), carries, now()));
+            Ok(Some(Started {
+                voice,
+                alerts: carries.then_some(raiser),
+            }))
         }
         Err(NotRunning::Absent) => {
             surface.say(absent_line(path, now()));
@@ -410,7 +462,10 @@ mod tests {
 
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 
-    use super::{DEFAULT_CONFIG, Options, follow, outcome, parse, start_voice, unsent_line};
+    use super::{
+        DEFAULT_CONFIG, Options, Publishing, Started, alert_seam, follow, install_alerts, outcome,
+        parse, start_voice, unsent_line,
+    };
 
     /// The pod the fixture bodies are addressed to.
     const POD: &str = "fixture-reachy";
@@ -429,6 +484,31 @@ mod tests {
     impl Surface for Recorded {
         fn say(&mut self, line: String) {
             self.lines.push(line);
+        }
+
+        fn alert(&mut self, _alert: &Alert) {}
+    }
+
+    /// Everything said, readable while something else holds the surface.
+    ///
+    /// The cases that install the alert seam hand their surface to
+    /// [`Publishing`], which owns what it wraps and shows nobody, so what they
+    /// read the lines through is a handle onto the same vector.
+    #[derive(Clone, Debug, Default)]
+    struct Shared {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Shared {
+        /// Every line said so far.
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().expect("the recorded lines").clone()
+        }
+    }
+
+    impl Surface for Shared {
+        fn say(&mut self, line: String) {
+            self.lines.lock().expect("the recorded lines").push(line);
         }
 
         fn alert(&mut self, _alert: &Alert) {}
@@ -631,7 +711,10 @@ mod tests {
         // `is_none()` rather than a match on the value: a running `Voice` owns
         // a runtime and is deliberately not `Debug`.
         let started = start_voice(&options, &intents, &mut said).expect("a running host");
-        assert!(started.is_none(), "no pipeline was composed");
+        assert!(
+            started.is_none(),
+            "no pipeline was composed, so there is nothing to hold and nowhere to publish",
+        );
         let line = said.lines.last().expect("a line saying which host this is");
         let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
         assert_eq!(parsed["kind"], "awaiting_speech_config");
@@ -654,15 +737,141 @@ mod tests {
             speech_config: Some(path.clone()),
             ..Options::default()
         };
-        let started = start_voice(&options, &intents, &mut said).expect("a running host");
-        let voice = started.expect("a composed pipeline");
+        let started = start_voice(&options, &intents, &mut said)
+            .expect("a running host")
+            .expect("a composed pipeline");
+        // The fixture configuration names no bus, so the composed run drops its
+        // end of the alert seam and this host keeps no raising end.
+        assert!(started.alerts.is_none(), "nowhere to publish, so no raiser");
+        let voice = started.voice;
         let line = said.lines.last().expect("a line saying what was composed");
         let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
         assert_eq!(parsed["kind"], "composed");
+        assert_eq!(parsed["alerts"], false);
         let says = parsed["says"].as_str().expect("a sentence");
         let listening = voice.listening();
         assert!(says.contains(&listening), "{line}");
         assert!(!listening.ends_with(":0"), "the bound port, not `:0`");
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_pipeline_that_carries_alerts_is_the_one_the_surface_publishes_through() {
+        // The whole path in one case: a deployment whose run drains the seam,
+        // the raiser it hands back, the install onto the surface the loop
+        // narrates on, and an alert raised afterwards leaving without a word
+        // saying it did not.
+        let dir = scratch_dir("reachy-host-alert-install");
+        let path = carrying_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let said = Shared::default();
+        let mut surface = Publishing::new(said.clone());
+        let options = Options {
+            speech_config: Some(path),
+            ..Options::default()
+        };
+        let started = start_voice(&options, &intents, &mut surface)
+            .expect("a running host")
+            .expect("a composed pipeline");
+        assert!(
+            started.alerts.is_some(),
+            "a bus attachment is somewhere to publish, so the raiser comes back",
+        );
+        let composed: serde_json::Value =
+            serde_json::from_str(&said.lines().pop().expect("a composed line"))
+                .expect("one JSON object");
+        assert_eq!(composed["kind"], "composed");
+        assert_eq!(composed["alerts"], true);
+
+        let voice = install_alerts(&mut surface, Some(started)).expect("the composed pipeline");
+        surface.alert(&Alert {
+            severity: reachy_edge::Severity::Critical,
+            title: "the head is parked".to_owned(),
+            body: "a fault row ended the session".to_owned(),
+        });
+        let after = said.lines();
+        assert!(
+            after.iter().all(|line| !line.contains("unpublished")),
+            "the installed raiser took it: {after:?}",
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_pipeline_with_nowhere_to_publish_installs_nothing() {
+        // The other arm of the same join: `start_voice` hands back no raiser,
+        // so the surface stays narration-only and an alert raised on it is not
+        // reported as one that failed to travel either.
+        let dir = scratch_dir("reachy-host-alert-narration");
+        let path = runnable_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let said = Shared::default();
+        let mut surface = Publishing::new(said.clone());
+        let options = Options {
+            speech_config: Some(path),
+            ..Options::default()
+        };
+        let started = start_voice(&options, &intents, &mut surface)
+            .expect("a running host")
+            .expect("a composed pipeline");
+        assert!(started.alerts.is_none(), "nowhere to publish, so no raiser");
+
+        let voice = install_alerts(&mut surface, Some(started)).expect("the composed pipeline");
+        surface.alert(&Alert {
+            severity: reachy_edge::Severity::Warning,
+            title: "a script was refused".to_owned(),
+            body: "the session declined it".to_owned(),
+        });
+        let after = said.lines();
+        assert!(
+            after.iter().all(|line| !line.contains("unpublished")),
+            "an alert nobody could publish is not an unpublished one: {after:?}",
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn an_installed_raiser_is_the_one_an_alert_goes_through() {
+        // Dropping the inbox before install means a raised alert is refused —
+        // the "unpublished" line proves install_alerts wired this raiser.
+        let dir = scratch_dir("reachy-host-alert-installed-raiser");
+        let path = runnable_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let said = Shared::default();
+        let mut surface = Publishing::new(said.clone());
+        let options = Options {
+            speech_config: Some(path),
+            ..Options::default()
+        };
+        let voice = start_voice(&options, &intents, &mut surface)
+            .expect("a running host")
+            .expect("a composed pipeline")
+            .voice;
+        let (raiser, inbox) = alert_seam(1);
+        drop(inbox);
+
+        let voice = install_alerts(
+            &mut surface,
+            Some(Started {
+                voice,
+                alerts: Some(raiser),
+            }),
+        )
+        .expect("the composed pipeline");
+        surface.alert(&Alert {
+            severity: reachy_edge::Severity::Critical,
+            title: "the head is parked".to_owned(),
+            body: "a fault row ended the session".to_owned(),
+        });
+        let lines = said.lines();
+        let unpublished: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("one JSON object"))
+            .filter(|line: &serde_json::Value| line["kind"] == "unpublished")
+            .collect();
+        assert_eq!(unpublished.len(), 1, "{lines:?}");
+        assert_eq!(unpublished[0]["title"], "the head is parked");
+        assert_eq!(unpublished[0]["reason"], "gone");
         assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
     }
 
@@ -686,6 +895,38 @@ mod tests {
                  [record]\nenabled = false\n\
                  [jsonl]\nsink = \"none\"\n",
                 keys.to_str().expect("a path this case wrote"),
+            ),
+        )
+        .expect("a file");
+        path
+    }
+
+    /// The same, for a deployment whose brain is on the bus.
+    ///
+    /// Everything `mode = "brenn"` requires, pointed at nobody: speech service
+    /// URLs a composition that runs no turn never calls, and a bridge onto a
+    /// closed loopback port with a token file this case wrote. What it buys is
+    /// the run that drains the alert seam, which is the branch under test.
+    fn carrying_speech_config(dir: &std::path::Path) -> PathBuf {
+        let token = dir.join("bus.token");
+        speech_surface::psk::write_secret_file(&token, "a-bearer-token\n").expect("a token file");
+        let path = runnable_speech_config(dir);
+        let text = std::fs::read_to_string(&path).expect("the fixture");
+        std::fs::write(
+            &path,
+            format!(
+                "{text}\
+                 [brain]\nmode = \"brenn\"\n\
+                 [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
+                 [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+                 model = \"m\"\nvoice = \"v\"\n\
+                 [brenn]\n\
+                 publish_channel = \"brenn:pod.utterance\"\n\
+                 response_channel = \"brenn:pod.speak\"\n\
+                 [brenn.bridge]\n\
+                 server_url = \"wss://127.0.0.1:1/ws\"\n\
+                 token_file = {:?}\n",
+                token.to_str().expect("a path this case wrote"),
             ),
         )
         .expect("a file");
@@ -725,7 +966,10 @@ mod tests {
         let mut said = Recorded::default();
         let started =
             start_voice(&Options::default(), &intents, &mut said).expect("a running host");
-        assert!(started.is_none(), "no pipeline was composed");
+        assert!(
+            started.is_none(),
+            "no pipeline was composed, and nothing to publish through",
+        );
         let line = said.lines.last().expect("a line");
         let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
         assert_eq!(parsed["kind"], "voiceless");

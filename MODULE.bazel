@@ -206,17 +206,18 @@ crate.spec(
 # brenn-pod, never the reverse. Move the three together; they are one workspace
 # upstream and their internal path dependencies must agree.
 #
-# What this revision does not yet have: a seam handing a composing process the
-# bus attachment the server holds, which is what an alert published from the
-# edge's table needs. Until it exists the host's alerts are narration on its own
-# stream. TODO(host-alert-publish)
+# Three seams the host composes through are what this revision is chosen for:
+# the two motion sinks (`Sinks`, `Server::with_sinks`) and the alert queue
+# (`alert_seam`, `Server::with_alerts`), which is how an alert the edge's table
+# raised reaches the robot's single bus attachment without this process opening
+# a second one.
 #
 # At this revision `speech-surface` takes `motion-proto` from a published
 # brenn-reachy revision, so the fetched closure carries a second copy of the wire
 # contract beside `//crates/motion-proto` -- the same contract, one publish
 # behind this tree's. Nothing carries a `MotionScript` value across the two
 # seams, so the two types never meet. TODO(motion-proto-two-copies)
-BRENN_POD_REV = "cab7fa658f49c8f0955112444261bdc5d80d236b"
+BRENN_POD_REV = "5a99838166fab4e7bccb03b2a3b366bf6c522107"
 
 # The host library the robot's voice process is a composition of. reachy-host.
 crate.spec(

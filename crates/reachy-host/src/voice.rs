@@ -12,8 +12,9 @@
 //! Two schedulers share this process on purpose. The pipeline is network I/O
 //! and belongs on an async runtime; the edge's loop owns two loopback sockets
 //! and a story it narrates in order, and it stays a plain blocking loop on the
-//! thread that started the process. They meet at the bounded queue and nowhere
-//! else, so neither can park the other.
+//! thread that started the process. They meet at two bounded queues and nowhere
+//! else — bodies inbound to the gate, alerts outbound to the attachment — so
+//! neither can park the other.
 //!
 //! Everything here is optional at run time. A unit whose payload does not yet
 //! carry a speech configuration runs the edge half alone: it follows the
@@ -26,9 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clockwork_rs::SyncTime;
-use reachy_edge::edge_line;
+use reachy_edge::{edge_line, edge_line_with};
+use serde_json::json;
+use speech_surface::config::BrainMode;
 use speech_surface::server::Server;
-use speech_surface::{Config, ConfigError, Sinks, jsonl};
+use speech_surface::{AlertInbox, Config, ConfigError, Sinks, jsonl};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
@@ -45,6 +48,7 @@ pub struct Voice {
     stop: Option<oneshot::Sender<()>>,
     serving: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     listening: String,
+    carries_alerts: bool,
 }
 
 /// How long a stop waits for the composed server to drain before it stops
@@ -91,7 +95,14 @@ impl std::fmt::Display for NotRunning {
 }
 
 impl Voice {
-    /// Load `config`, compose the server over `intents`, and start serving.
+    /// Load `config`, compose the server over `intents` and `alerts`, and start
+    /// serving.
+    ///
+    /// `alerts` is the server's end of the operator-alert seam: the robot's one
+    /// bus attachment is held inside this run, and this is how something the
+    /// edge's table raised on the blocking loop's thread reaches it. A start
+    /// that fails drops it, so the raiser its caller kept refuses every alert
+    /// rather than appearing to carry one.
     ///
     /// The runtime is this process's own and is built here rather than wrapped
     /// around `main`: the thread that calls this goes on to run the edge's
@@ -116,6 +127,7 @@ impl Voice {
         config: &Path,
         intents: Intents,
         lines: Arc<dyn Lines>,
+        alerts: AlertInbox,
     ) -> Result<Self, NotRunning> {
         let settings = Config::load(config).map_err(|error| match &error {
             ConfigError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -133,6 +145,15 @@ impl Voice {
                 config.display()
             )),
         })?;
+        // Coupled to the server's drain condition: the server drains the
+        // seam only where `brain.mode` is `Brenn`, validated to require the
+        // `[brenn]` table and vice versa — one check decides both. Spelled
+        // here rather than asked of the crate that owns it, which is a
+        // duplicate across a pinned revision until the pin can name the
+        // published predicate.
+        // TODO(drain-condition-through-the-seam)
+        let carries_alerts =
+            settings.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn);
         let settings = Arc::new(settings);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -165,7 +186,8 @@ impl Voice {
                     .map_err(|error| {
                         format!("binding the pod link at {}: {error}", settings.listen_addr)
                     })?
-                    .with_sinks(sinks);
+                    .with_sinks(sinks)
+                    .with_alerts(alerts);
                 // Asked of the listener rather than read off the configuration: an
                 // ephemeral port is resolved only once it is bound, and a line
                 // naming `:0` would answer nobody's question.
@@ -202,7 +224,19 @@ impl Voice {
             stop: Some(stop),
             serving: Some(serving),
             listening,
+            carries_alerts,
         })
+    }
+
+    /// Whether an alert raised on this run's seam reaches the bus.
+    ///
+    /// False on every configuration that composed no attachment, where the run
+    /// drops its end of the seam: a raiser kept against one refuses each alert,
+    /// which is a line per alert saying nothing about the machine. The caller
+    /// keeps the raising end only when this is true.
+    #[must_use]
+    pub const fn carries_alerts(&self) -> bool {
+        self.carries_alerts
     }
 
     /// The address the pod link actually bound.
@@ -255,16 +289,28 @@ impl Voice {
 /// On the edge's stream rather than the pipeline's own: a reader following the
 /// robot's narration should see that the voice half came up without having to
 /// join two streams to find out.
+///
+/// `alerts` says whether this pipeline can interrupt anybody: a configuration
+/// that composed no bus attachment runs every other part of the voice half and
+/// carries no alert off the machine, and that is a standing property of the
+/// deployment worth reading once at startup rather than inferring from a
+/// silence.
 #[must_use]
-pub fn composed_line(config: &Path, listen: &str, at: SyncTime) -> String {
-    edge_line(
+pub fn composed_line(config: &Path, listen: &str, alerts: bool, at: SyncTime) -> String {
+    edge_line_with(
         "composed",
         at,
         &format!(
             "the voice pipeline is running from {}, pod link on {listen}; the scripter's \
-             decisions and the bus's motion channel both meet this host's gate",
+             decisions and the bus's motion channel both meet this host's gate, and alerts {}",
             config.display(),
+            if alerts {
+                "ride its attachment"
+            } else {
+                "are narration only"
+            },
         ),
+        &[("alerts", json!(alerts))],
     )
 }
 
@@ -320,6 +366,16 @@ mod tests {
     /// A key, as the pod platform's table spells one.
     const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
+    /// The server's end of an alert seam whose raising end nothing keeps.
+    ///
+    /// What the cases below are about is the composition, not the reporting: a
+    /// dropped raiser is a seam nothing raises on, which is what a host with no
+    /// alerts to raise looks like.
+    fn inbox() -> speech_surface::AlertInbox {
+        let (_raiser, inbox) = speech_surface::alert_seam(speech_surface::ALERT_QUEUE_DEPTH);
+        inbox
+    }
+
     /// A speech configuration this host will actually run, written into `dir`.
     ///
     /// Everything it names is inside that directory and nothing it names is on
@@ -349,12 +405,45 @@ mod tests {
         path
     }
 
+    /// The same fixture with a bus brain: the deployment whose alerts travel.
+    ///
+    /// Everything `mode = "brenn"` needs and nothing that dials anybody: the
+    /// speech services are URLs nothing calls in a composition that runs no
+    /// turn, and the bridge is pointed at a closed loopback port with a token
+    /// file this case wrote. What is under test is what the server composes
+    /// from this configuration, not the transport.
+    fn carrying(dir: &Path) -> std::path::PathBuf {
+        let token = dir.join("bus.token");
+        speech_surface::psk::write_secret_file(&token, "a-bearer-token\n").expect("a token file");
+        let path = runnable(dir);
+        let text = std::fs::read_to_string(&path).expect("the fixture");
+        std::fs::write(
+            &path,
+            format!(
+                "{text}\
+                 [brain]\nmode = \"brenn\"\n\
+                 [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
+                 [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+                 model = \"m\"\nvoice = \"v\"\n\
+                 [brenn]\n\
+                 publish_channel = \"brenn:pod.utterance\"\n\
+                 response_channel = \"brenn:pod.speak\"\n\
+                 [brenn.bridge]\n\
+                 server_url = \"wss://127.0.0.1:1/ws\"\n\
+                 token_file = {:?}\n",
+                token.to_str().expect("a path this test wrote"),
+            ),
+        )
+        .expect("a file");
+        path
+    }
+
     #[test]
     fn a_configuration_this_host_can_run_becomes_a_listening_pipeline() {
         let dir = scratch_dir("reachy-host-composed");
         let path = runnable(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout)) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -389,7 +478,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("the fixture");
         std::fs::write(&path, text.replace("127.0.0.1:0", "0.0.0.0:7380")).expect("a file");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout))
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
             .err()
             .expect("a configuration this host will not run");
         assert!(
@@ -406,7 +495,7 @@ mod tests {
         let (intents, _waiting) = queue();
         // `err()` rather than `expect_err`: a running `Voice` owns a runtime and
         // is deliberately not `Debug`, and the failure is the whole assertion.
-        let refused = Voice::start(&path, intents, Arc::new(Stdout))
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
             .err()
             .expect("a configuration this host will not run on");
         assert!(
@@ -421,7 +510,7 @@ mod tests {
         let path = dir.join("nokeys.toml");
         std::fs::write(&path, NO_KEYS).expect("a file");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout))
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
             .err()
             .expect("a key table that is not there");
         assert!(
@@ -434,7 +523,7 @@ mod tests {
     fn a_configuration_that_is_not_on_the_machine_is_absent() {
         let dir = scratch_dir("reachy-host-absent");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&dir.join("speech.toml"), intents, Arc::new(Stdout))
+        let refused = Voice::start(&dir.join("speech.toml"), intents, Arc::new(Stdout), inbox())
             .err()
             .expect("a path with no file at it");
         assert!(matches!(refused, NotRunning::Absent), "{refused}");
@@ -450,7 +539,7 @@ mod tests {
         let path = dir.join("speech.toml");
         std::fs::create_dir_all(&path).expect("a directory where a file should be");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout))
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
             .err()
             .expect("a configuration this host cannot read");
         assert!(
@@ -462,11 +551,17 @@ mod tests {
     #[test]
     fn a_composed_pipeline_says_where_it_came_from() {
         let at = SyncTime::from_nanos(1_700_000_000_000_000_000);
-        let line = composed_line(Path::new("/run/reachy/speech.toml"), "127.0.0.1:7380", at);
+        let line = composed_line(
+            Path::new("/run/reachy/speech.toml"),
+            "127.0.0.1:7380",
+            true,
+            at,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
         assert_eq!(parsed["stream"], "edge");
         assert_eq!(parsed["kind"], "composed");
         assert_eq!(parsed["at_ns"], at.as_nanos());
+        assert_eq!(parsed["alerts"], true);
         assert!(
             parsed["says"]
                 .as_str()
@@ -474,6 +569,93 @@ mod tests {
                 .contains("7380"),
             "{line}",
         );
+    }
+
+    #[test]
+    fn a_composed_pipeline_says_whether_it_can_interrupt_anybody() {
+        let at = SyncTime::from_nanos(1_700_000_000_000_000_000);
+        let line = composed_line(
+            Path::new("/run/reachy/speech.toml"),
+            "127.0.0.1:7380",
+            false,
+            at,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert_eq!(parsed["alerts"], false);
+        assert!(
+            parsed["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("narration only"),
+            "{line}",
+        );
+    }
+
+    #[test]
+    fn a_pipeline_with_no_bus_attachment_carries_no_alert() {
+        // The fixture names no `[brain]` table, so the composed run drops its
+        // end of the alert seam: the host must not keep the raising end.
+        let dir = scratch_dir("reachy-host-alertless");
+        let path = runnable(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(
+            !voice.carries_alerts(),
+            "no bus attachment is nowhere to publish"
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_pipeline_whose_brain_is_on_the_bus_carries_its_alerts() {
+        // The branch the seam exists for, and the only one where the composed
+        // run drains it: a raiser kept against this one reaches an attachment.
+        let dir = scratch_dir("reachy-host-alerting");
+        let path = carrying(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(
+            voice.carries_alerts(),
+            "a bus brain is an attachment to publish through"
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_brain_that_is_not_on_the_bus_carries_no_alert() {
+        // A brain, and not the one that builds an attachment: the predicate is
+        // about which mode this is and not about whether a brain was named at
+        // all, which is the reading a `[brain]`-less fixture cannot tell apart.
+        let dir = scratch_dir("reachy-host-echoing");
+        let path = runnable(dir.as_ref());
+        let text = std::fs::read_to_string(&path).expect("the fixture");
+        std::fs::write(
+            &path,
+            format!(
+                "{text}\
+                 [brain]\nmode = \"echo\"\n\
+                 [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
+                 [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+                 model = \"m\"\nvoice = \"v\"\n",
+            ),
+        )
+        .expect("a file");
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(
+            !voice.carries_alerts(),
+            "no bridge is built, so nothing drains the seam"
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
     }
 
     #[test]

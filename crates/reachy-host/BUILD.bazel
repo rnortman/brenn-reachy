@@ -32,6 +32,7 @@ rust_library(
     deps = [
         "//crates/reachy-edge:reachy_edge",
         "//host:host_config_clk_rs",
+        "@brenn_reachy_crates//:brenn-bridge",
         "@brenn_reachy_crates//:prost-reflect",
         "@brenn_reachy_crates//:protox",
         "@brenn_reachy_crates//:serde_json",
@@ -80,6 +81,7 @@ rust_binary(
         "//crates/reachy-edge:reachy_edge",
         "@brenn_reachy_crates//:serde_json",
         "@brenn_reachy_crates//:signal-hook",
+        "@brenn_reachy_crates//:speech-surface",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -101,7 +103,6 @@ rust_test(
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
         ":reachy_host_lib",
-        "@brenn_reachy_crates//:speech-surface",
     ],
 )
 

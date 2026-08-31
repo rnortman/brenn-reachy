@@ -792,35 +792,6 @@ Done = an operator on the unit can ask what the head is doing and get an answer
 that does not require reading a log. Marked at the host's console surface in
 `crates/reachy-host/src/edge.rs`.
 
-## `host-alert-publish`
-
-The voice host's alerts go onto its own narration stream and nowhere else. The
-alert plane the design puts them on — fault and park rows as `Critical`, refusals
-as a once-per-run `Warning` — is not reached.
-
-Deferral context: the alert table is built and exercised
-(`crates/reachy-edge/src/alerts.rs`), and the host renders every alert it raises
-as a line. What is missing is the publish. Alerts ride the robot's single bus
-attachment, and that attachment is held inside `speech-surface`'s `Server::run`:
-the composing process supplies the two motion sinks and never sees the
-`BridgeHandle` behind them. So there is no seam to publish through, and inventing
-a second attachment in this process would give the robot two, which the design
-rules out by name.
-
-The seam is a brenn-pod change of the same shape as the two that already exist —
-something the server hands a composing process once its bridge is up — and it is
-a small design question rather than a mechanical one: an alert is fire-and-forget
-on an async handle, and the edge's table raises them from a blocking loop, so
-what crosses the seam is a queue and not a call. Nothing about the machine rests
-on it: an operator alert is a report, and a fault reaches the Minimum Risk
-Condition without one.
-
-Done = a fault or park row raises a `Critical` on the bus and a refusal a
-once-per-run `Warning`, through the host's own attachment, with the
-narration-only behaviour intact where no bus is configured. Marked at the host's
-console surface in `crates/reachy-host/src/edge.rs` and at the pin in
-`MODULE.bazel`.
-
 ## `motion-proto-two-copies`
 
 Two copies of the motion wire contract compile in this build: `crates/
@@ -923,3 +894,53 @@ deciding what sets it are a motion-schema decision rather than an edge one.
 Done = the story follower tells one run of the control process from the next by
 something the message says, not by arithmetic on its length. Marked at the
 restart test in `crates/reachy-edge/src/story.rs`.
+
+## `alert-severity-through-the-seam`
+
+`reachy-host` spells the alert seam's severity through `speech-surface` instead
+of taking its own build edge onto `brenn-bridge` for the one enum.
+
+Deferral context: `speech_surface::Alert` carries a `brenn_bridge::AlertSeverity`
+and `speech-surface` did not re-export the type, so the host's library links the
+attachment crate directly to fill in a field of a value it hands back to the
+pipeline. The seam's dependency footprint is larger than the seam, and this
+tree's pin then holds two pod crates that must agree about a type nothing here
+would notice the skew in until a build broke.
+
+The pod half is done — `speech-surface` re-exports `AlertSeverity` beside the
+rest of the seam's vocabulary — and the half that cannot be taken yet is this
+tree's, because `BRENN_POD_REV` names a *published* revision and the re-export
+is not in one. It is a two-line change once it is: import the type from
+`speech_surface` and drop `@brenn_reachy_crates//:brenn-bridge` from
+`//crates/reachy-host:reachy_host`'s deps.
+
+Done = `crates/reachy-host` names `brenn-bridge` nowhere, and the severity it
+maps onto comes through the same crate as the `Alert` it fills in. Marked at
+the import in `crates/reachy-host/src/edge.rs`.
+
+## `drain-condition-through-the-seam`
+
+`reachy-host` asks `speech-surface` whether a composed run carries its alerts,
+instead of re-spelling that condition against a pinned revision.
+
+Deferral context: `Voice::start` decides whether to keep the alert seam's
+raising end by reading `brain.mode` off the speech configuration, which is the
+condition the pod platform's server spawns its alert drain under. The two
+expressions are equivalent today and live in different repositories joined by
+`BRENN_POD_REV`, so a pinned revision that narrows or widens the drain — another
+brain mode that also attaches, a switch that disables alerts — moves the server
+and leaves this host's copy where it was. Neither side fails to compile and no
+test crosses the boundary; the symptom is either a raiser onto a queue nothing
+reads (each alert then narrated as `backlogged`) or a run that would have
+carried alerts whose host kept no raiser. Both are silent outages of the one
+channel that exists to interrupt an operator.
+
+The pod half is done — `Config::carries_alerts()` is the single spelling, and
+the server's own `bus_brain` asks it — and the half that cannot be taken yet is
+this tree's, because `BRENN_POD_REV` names a *published* revision and the
+predicate is not in one.
+
+Done = `crates/reachy-host/src/voice.rs` calls `Config::carries_alerts()` and
+spells no drain condition of its own, so a pin bump that changes the condition
+is a compile-or-behaviour change here rather than a silent divergence. Marked at
+the computation in `crates/reachy-host/src/voice.rs`.
