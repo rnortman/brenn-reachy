@@ -122,6 +122,7 @@ export PUSHED_PROVENANCE="${work}/pushed-provenance"
 export SSH_PREPARE_STATUS=0
 export SSH_PROBE_STATUS=0
 export SSH_RUN_STATUS=124
+export SSH_RUN_REACHED=no
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
 export RSYNC_CONSOLE=full
@@ -140,7 +141,14 @@ case " $* " in
 	# unit will not answer it is a property of the run, not of the push that
 	# preceded it.
 	*timedatectl*|*/proc/config.gz*) exit "${SSH_PROBE_STATUS:-0}" ;;
-	*" -t "*) exit "${SSH_RUN_STATUS:-124}" ;;
+	*" -t "*)
+		# Whether the chain got past its last refusal, which on a real
+		# unit is the sentinel line the chain echoes and here is a knob
+		# of its own: a status is a number both a chain step and a
+		# launcher can exit with, and this is what tells them apart.
+		[ "${SSH_RUN_REACHED:-no}" = yes ] && echo ---brenn-launcher-starting
+		exit "${SSH_RUN_STATUS:-124}"
+		;;
 esac
 exit "${SSH_PREPARE_STATUS:-0}"
 STUB
@@ -247,9 +255,22 @@ STUB
 # The analyzer, whose verdict a run's verdict is. It reports its argument so a
 # case can pin which run directory was judged, and its status is the knob that
 # says whether the log passed.
+#
+# It answers two other questions for the speech run: the build of the
+# configuration checker, on its own knob because a checker that will not build
+# is a different refusal from a configuration it rejects, and the cquery that
+# names where the built checker is. The path it names is a stub in the tree
+# under test, which is what the subject then runs from the payload root.
 cat >"${stubs}/bazel" <<'STUB'
 #!/usr/bin/env bash
 printf 'bazel %s\n' "$*" >>"$CALLS"
+case " $* " in
+	*" cquery "*)
+		echo bazel-out/reachy_host
+		exit 0
+		;;
+	*" build "*) exit "${BAZEL_BUILD_STATUS:-0}" ;;
+esac
 exit "${BAZEL_STATUS:-0}"
 STUB
 
@@ -359,6 +380,73 @@ assert_contains "the refusal names that member" "$(output_of "$result")" \
 	"speech configuration"
 assert_lacks "and pushes nothing" "$(calls)" "rsync"
 rm -f -- "$speech_source" "${payload}/host/speech.toml"
+
+# The credential files that configuration names — the pod's key table, the bus
+# token. They are the flavour of this an operator would otherwise chase on the
+# unit: a re-provisioned key table or a freshly issued token is a file no commit
+# to this workspace dates, and pushed against an old payload it is the previous
+# secret shipped under a green verdict. The paths come out of the configuration,
+# so the push and the build cannot disagree about where they are.
+mkdir -p -- "${repo}/host/secrets" "${payload}/secrets"
+cat >"$speech_source" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+pod_psk_file = "secrets/pod-psk.toml"
+
+[brenn.bridge]
+token_file = "secrets/remote.token"
+TOML
+: >"${repo}/host/secrets/pod-psk.toml"
+: >"${repo}/host/secrets/remote.token"
+: >"${payload}/host/speech.toml"
+: >"${payload}/secrets/pod-psk.toml"
+: >"${payload}/secrets/remote.token"
+touch -d "@${after}" -- "$speech_source" "${repo}/host/secrets/pod-psk.toml" \
+	"${repo}/host/secrets/remote.token"
+touch -d "@$((after + 60))" -- "${payload}/host/speech.toml" \
+	"${payload}/secrets/pod-psk.toml" "${payload}/secrets/remote.token"
+result=$(deploy unit --push)
+assert_status "credentials no newer than their staged copies push" 0 \
+	"$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "${repo}/host/secrets/pod-psk.toml"
+result=$(deploy unit --push)
+assert_status "a re-provisioned key table refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the credential by its payload path" \
+	"$(output_of "$result")" "speech credential secrets/pod-psk.toml"
+assert_contains "and says which copy would be shipped" "$(output_of "$result")" \
+	"newer than the copy in the payload"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok covers the credentials too" 0 "$(status_of "$result")"
+touch -d "@$((after + 60))" -- "${repo}/host/secrets/pod-psk.toml"
+
+# A credential the configuration names against a payload that carries none: the
+# same mistake as a speech configuration the payload never staged, because the
+# file existed nowhere when the payload was built.
+rm -f -- "${payload}/secrets/remote.token"
+result=$(deploy unit --push)
+assert_status "a token the payload never staged refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names it" "$(output_of "$result")" \
+	"speech credential secrets/remote.token"
+assert_contains "and says the payload carries none" "$(output_of "$result")" \
+	"the staged payload carries none"
+: >"${payload}/secrets/remote.token"
+touch -d "@$((after + 60))" -- "${payload}/secrets/remote.token"
+
+# A configuration this reader cannot read is a refused push, not a push that
+# skipped a credential it could not name.
+printf 'pod_psk_file = "secrets/pod-psk.toml\n' >"$speech_source"
+touch -d "@${after}" -- "$speech_source"
+result=$(deploy unit --push)
+assert_status "a speech configuration whose quoting does not close refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and says what it could not read" "$(output_of "$result")" \
+	"the value's quoting does not close"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+
+rm -rf -- "$speech_source" "${repo}/host/secrets" "${payload}/host/speech.toml" \
+	"${payload}/secrets"
 stage_payload "$after"
 
 # A tree that cannot answer the question is not a stale tree.
@@ -633,7 +721,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; ./reachy_ask --resting-timeout 30 --run-window 30 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 30 --run-window 30 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -889,6 +977,21 @@ assert_contains "and says the unit was left as it was" "$(output_of "$result")" 
 assert_lacks "and does not tell the copy's story" "$(output_of "$result")" \
 	"copying it into"
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+# The same code out of a launcher that was actually reached is the launcher's,
+# not the chain's: the sentinel the chain echoes past its last refusal is what
+# says which, so the refusal cannot claim that nothing was started about a run
+# that ran.
+SSH_RUN_STATUS=5
+SSH_RUN_REACHED=yes
+result=$(deploy unit --run "${work}/run-launcher-5")
+assert_status "a launcher that itself exited 5 is not read as a missing stamp" 1 \
+	"$(status_of "$result")"
+assert_contains "it is judged as a run that failed" "$(output_of "$result")" \
+	"the run on unit failed (exit 5)"
+assert_lacks "and nothing claims the stamp was missing" "$(output_of "$result")" \
+	"could not name their build"
+SSH_RUN_REACHED=no
 
 # The stamp is staged before the wipe rather than copied after it, so a copy
 # that fails has emptied nothing and the refusal can send the operator to fetch
@@ -1161,6 +1264,437 @@ assert_contains "the refusal says it has nowhere of its own to land" "$(output_o
 assert_lacks "and nothing is fetched beside it" "$(calls)" "rsync"
 
 # ---------------------------------------------------------------------------
+# The speech run
+# ---------------------------------------------------------------------------
+#
+# The production launcher config, no budget, and a person in front of the
+# machine. What is pinned here is everything that is different from `--run`: the
+# preflights that refuse before a device is touched, the chain's own two
+# questions of the unit, a launcher started with no `timeout` and no intent
+# source, and a fetch and a report that happen however the run ended.
+#
+# The mode refuses a stdin that is not a terminal, and this suite's is not, so
+# the cases that get past that refusal run the subject under a pty of their own.
+cat >"${work}/pty-run.py" <<'PTY'
+"""Run a command with a pty on its stdin, and exit with its status.
+
+The subject refuses a speech run it could not receive a ^C for, which is the
+whole of what makes the mode supervised. A suite whose own stdin is a pipe can
+only exercise that refusal, so the cases past it get a terminal made here.
+"""
+
+import os
+import pty
+import sys
+
+sys.exit(os.waitstatus_to_exitcode(pty.spawn(["/bin/sh", "-c", sys.argv[1]])))
+PTY
+
+# The subject under a pty, otherwise `deploy`. The carriage returns a terminal
+# adds are stripped, so a case asserts on the same text either way.
+deploy_tty() {
+	: >"$CALLS"
+	local out status=0 command
+	printf -v command '%q ' "$subject" "$@"
+	out=$(python3 "${work}/pty-run.py" "$command" 2>&1) || status=$?
+	printf '%s\n---status %s\n' "$(printf '%s' "$out" | tr -d '\r')" "$status"
+}
+
+# The staged speech configuration, in the payload where the build puts it: the
+# copy the host will load, which is where the endpoints the preflight asks
+# about are read from.
+stage_speech_config() {
+	mkdir -p -- "${payload}/host"
+	cat >"${payload}/host/speech.toml" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+pod_psk_file = "secrets/pod-psk.toml"
+
+[stt]
+url = "http://speaches.example:8000"
+
+[tts]
+url = "http://speaches.example:8001"
+TOML
+}
+
+# The configuration checker: the host binary, built here and run with the
+# payload root as its working directory. The stub records both, because what
+# makes the check worth anything is that it resolved the payload's own relative
+# paths.
+mkdir -p -- "${repo}/bazel-out"
+cat >"${repo}/bazel-out/reachy_host" <<'STUB'
+#!/usr/bin/env bash
+printf 'reachy_host %s cwd=%s\n' "$*" "$PWD" >>"$CALLS"
+exit "${SPEECH_CHECK_STATUS:-0}"
+STUB
+chmod 0755 -- "${repo}/bazel-out/reachy_host"
+export SPEECH_CHECK_STATUS=0
+export BAZEL_BUILD_STATUS=0
+
+stage_payload "$after"
+stage_speech_config
+
+# A payload with no speech configuration is a good motion payload and no
+# pipeline at all, and the refusal says which command puts one in it.
+rm -f -- "${payload}/host/speech.toml"
+result=$(deploy unit --speech "${work}/speech-voiceless")
+assert_status "a voiceless payload refuses with its own code" 9 "$(status_of "$result")"
+assert_contains "the refusal names the member that is missing" "$(output_of "$result")" \
+	"carries no host/speech.toml"
+assert_contains "and the knob that names one" "$(output_of "$result")" \
+	"REACHY_SPEECH_CONFIG"
+assert_contains "and the build that stages it" "$(output_of "$result")" "make motion-build"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+stage_speech_config
+
+# This suite's stdin is a pipe, which is exactly the run nobody could stop: a
+# speech run has no budget, so it is refused rather than warned about.
+result=$(deploy unit --speech "${work}/speech-notty")
+assert_status "a speech run with no terminal refuses with its own code" 10 \
+	"$(status_of "$result")"
+assert_contains "the refusal says why the terminal matters" "$(output_of "$result")" \
+	"stdin is not a terminal"
+assert_contains "and that this run has no budget to end it instead" "$(output_of "$result")" \
+	"has no budget"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+assert_lacks "and nothing was built for it either" "$(calls)" "bazel"
+
+# The same question asked alone, which is what `make speech-run` asks before it
+# provisions the unit and builds a payload: one spelling of the refusal, and the
+# only preflight that needs neither.
+result=$(deploy unit --speech-preflight)
+assert_status "the preflight alone refuses with the run's own code" 10 \
+	"$(status_of "$result")"
+assert_contains "in the same words the run would have used" "$(output_of "$result")" \
+	"stdin is not a terminal"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+
+# With a terminal it says nothing and succeeds: it is a gate, not a step.
+result=$(deploy_tty unit --speech-preflight)
+assert_status "under a terminal the preflight passes" 0 "$(status_of "$result")"
+assert_lacks "having touched nothing on the device" "$(calls)" "ssh"
+
+# It takes no destination: a mode that fetches nothing has nowhere to put it.
+result=$(deploy unit --speech-preflight "${work}/speech-records")
+assert_status "the preflight takes no arguments" 1 "$(status_of "$result")"
+assert_contains "and says so in the usage" "$(output_of "$result")" "usage:"
+# The usage line is the menu a mistyped mode lands on, so it has to list this
+# mode: a mode absent from it is one an operator cannot recover their way to.
+assert_contains "which names this mode among the others" "$(output_of "$result")" \
+	"--speech-preflight"
+
+# The run itself, under a terminal of its own.
+speech_dest="${work}/speech-records"
+result=$(deploy_tty unit --speech "$speech_dest")
+ran=$(calls)
+assert_status "a supervised speech run the analyzer passes succeeds" 0 "$(status_of "$result")"
+assert_contains "the configuration is checked before any device is touched" "$ran" \
+	"reachy_host --speech-config host/speech.toml --check cwd=${payload}"
+assert_contains "the checker is built in the default configuration" "$ran" \
+	"bazel build -- //crates/reachy-host:reachy_host"
+assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; exit \$rc"
+assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
+	"ssh -t -o BatchMode=yes root@unit"
+assert_lacks "nothing puts a budget around a conversation" "$ran" "timeout --signal=INT"
+assert_lacks "and the harness intent source is not started beside the host" "$ran" \
+	"./reachy_ask"
+assert_lacks "nor is the harness config the one that starts" "$ran" \
+	"./simplelaunch robotcpu_harness.textproto"
+assert_contains "the records come back under the speech name" "$ran" \
+	"//cogs:speech_run_report ${speech_dest}/speech-log-"
+assert_lacks "and not under the motion one" "$ran" "motion-log-"
+assert_lacks "the motion analyzer has nothing to say about a conversation" "$ran" \
+	"first_motion_report"
+assert_contains "the run says where the console is" "$(output_of "$result")" \
+	"speech-log-"
+
+# The report is handed the fetch itself, not a run directory inside it: the
+# console it reads is named from that spelling.
+fetched=$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d ! -name '*.console')
+assert_contains "the analyzer is handed the fetched directory" "$ran" \
+	"//cogs:speech_run_report ${fetched}"
+assert_eq "with the run's consoles beside it" 1 \
+	"$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d -name '*.console' | wc -l)"
+assert_file "and the host-side captures were filed with them" \
+	"${fetched}.console/clock-before.txt"
+
+# The report's verdict is this mode's, as it is for a motion run.
+BAZEL_STATUS=7
+result=$(deploy_tty unit --speech "${work}/speech-failed")
+assert_status "the speech analyzer's verdict is the run's" 7 "$(status_of "$result")"
+BAZEL_STATUS=0
+
+# A configuration the host itself would refuse never reaches the unit. This is
+# the whole point of running the real loader here: on the unit it is a host that
+# exits at start, in a log somebody has to fetch to read.
+SPEECH_CHECK_STATUS=1
+result=$(deploy_tty unit --speech "${work}/speech-refused")
+assert_status "a configuration the checker refuses refuses the run" 11 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the check" "$(output_of "$result")" "--check"
+assert_contains "and says the fix is beside the configuration" "$(output_of "$result")" \
+	"make motion-build"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh -t"
+SPEECH_CHECK_STATUS=0
+
+BAZEL_BUILD_STATUS=1
+result=$(deploy_tty unit --speech "${work}/speech-nochecker")
+assert_status "a checker that will not build refuses the run" 11 "$(status_of "$result")"
+assert_contains "and says the configuration went unchecked" "$(output_of "$result")" \
+	"was not checked"
+assert_lacks "and nothing reaches the device either" "$(calls)" "ssh -t"
+BAZEL_BUILD_STATUS=0
+
+# The unit's two preflights, each answered by the code the chain emits for it.
+SSH_RUN_STATUS=12
+# The assembly configuration this run was built from, so the refusal can be
+# checked against the real path rather than against a placeholder.
+mkdir -p -- "${work}/assembly"
+cp -- "${payload}/host/speech.toml" "${work}/assembly/speech.toml"
+REACHY_SPEECH_CONFIG="${work}/assembly/speech.toml"
+export REACHY_SPEECH_CONFIG
+result=$(deploy_tty unit --speech "${work}/speech-noaudioconf")
+assert_status "a unit with no link credentials refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the file" "$(output_of "$result")" \
+	"/run/brenn-app/conf/audio.conf"
+# The lead is the target that writes the file for you. Reaching this refusal at
+# all means either this script was invoked directly or the unit lost its tmpfs
+# since the provisioning ran, and the first is far the likelier — so the remedy
+# offered first is the one command that covers both.
+assert_contains "and leads with the target that provisions it" "$(output_of "$result")" \
+	"make speech-run"
+assert_contains "and the other repo's command that writes it" "$(output_of "$result")" \
+	"make -C firmware reachy-provision"
+assert_contains "and says the pod would have parked silently" "$(output_of "$result")" \
+	"park silently"
+# The flag is required for a loopback listen address; without it in the
+# message the operator hits a second refusal.
+assert_contains "and the opt-in that command needs for an on-unit host" \
+	"$(output_of "$result")" "ON_UNIT=1"
+# A command the operator must edit before running is one more thing to get wrong
+# while already blocked, so the configuration this run knows about is in it —
+# quoted, because it is pasted as it stands and a path with a space in it splits
+# into two arguments the other repo's make cannot read.
+assert_contains "and the configuration to point that command at" \
+	"$(output_of "$result")" "SPEECH_CONFIG=\"${work}/assembly/speech.toml\""
+# And the unit, which needs no confirming dance — this refusal came from it.
+# Omitted, the remediation command may target a different unit, and this one
+# refuses again identically.
+assert_contains "and the unit the command has to provision" \
+	"$(output_of "$result")" "REACHY_HOST=unit"
+assert_lacks "and nothing is fetched from a run that never started" "$(calls)" "rsync"
+
+# The variable is read here, at deploy time; the payload was staged by an
+# earlier build. A named configuration that is not the one the payload carries
+# is not named at all: provisioning from it derives the pod's address and key
+# from a file the host never loads, and the next run composes and sits deaf —
+# the failure this refusal exists to head off, arriving by the refusal's own
+# advice.
+cp -- "${work}/assembly/speech.toml" "${work}/assembly/other.toml"
+printf 'ident = "somewhere else"\n' >>"${work}/assembly/other.toml"
+REACHY_SPEECH_CONFIG="${work}/assembly/other.toml"
+result=$(deploy_tty unit --speech "${work}/speech-otherconfig")
+assert_lacks "a configuration that is not the payload's is not handed back" \
+	"$(output_of "$result")" "other.toml"
+assert_contains "the placeholder goes back in instead" "$(output_of "$result")" \
+	"SPEECH_CONFIG=\"<assembly>/speech.toml\""
+assert_contains "and says why the path is the operator's to supply" \
+	"$(output_of "$result")" "could not confirm"
+unset REACHY_SPEECH_CONFIG
+
+# The same with the variable unset: the default is this tree's gitignored
+# host/speech.toml, which a payload built elsewhere has nothing to do with and
+# which need not exist at all. Naming a file that is not there is a second dead
+# end at the one moment the message is meant to unblock somebody.
+result=$(deploy_tty unit --speech "${work}/speech-defaultconfig")
+assert_contains "an unnamed configuration is the placeholder too" \
+	"$(output_of "$result")" "SPEECH_CONFIG=\"<assembly>/speech.toml\""
+assert_lacks "and this tree's default is not passed off as the payload's" \
+	"$(output_of "$result")" "${repo}/host/speech.toml"
+
+SSH_RUN_STATUS=13
+result=$(deploy_tty unit --speech "${work}/speech-unreachable")
+assert_status "a speech service the robot cannot reach refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says whose vantage decided" "$(output_of "$result")" \
+	"from the unit"
+assert_contains "and names the migration error it is usually" "$(output_of "$result")" \
+	"never by localhost"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+SSH_RUN_STATUS=3
+result=$(deploy_tty unit --speech "${work}/speech-held")
+assert_status "a held servo bus refuses a speech run" 1 "$(status_of "$result")"
+assert_contains "and names the service holding it" "$(output_of "$result")" \
+	"brenn-app.service is running"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+SSH_RUN_STATUS=5
+result=$(deploy_tty unit --speech "${work}/speech-nostamp")
+assert_status "a payload on the unit with no stamp refuses" 1 "$(status_of "$result")"
+assert_contains "and says nothing was emptied" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+
+SSH_RUN_STATUS=7
+result=$(deploy_tty unit --speech "${work}/speech-postwipe")
+assert_status "a failure after the wipe refuses" 1 "$(status_of "$result")"
+assert_contains "and says the previous run's records are gone" "$(output_of "$result")" \
+	"as gone"
+
+# Every other ending is a run that happened. Which of them it was is the
+# report's question over the console the fetch brings back, not a refusal here:
+# a launcher that stopped on the operator's ^C, one that exited by itself, and a
+# terminal that died mid-run all leave records worth reading.
+SSH_RUN_REACHED=yes
+for ending in 0 130 137 255; do
+	SSH_RUN_STATUS=$ending
+	result=$(deploy_tty unit --speech "${work}/speech-ending-${ending}")
+	assert_status "a run that ended with ${ending} is fetched and reported" 0 \
+		"$(status_of "$result")"
+	assert_contains "and the report reads it" "$(calls)" "//cogs:speech_run_report"
+	assert_contains "and the ending is said rather than judged" "$(output_of "$result")" \
+		"the run ended (exit ${ending})"
+done
+
+# The chain's own codes are small integers and so are a launcher's. What tells
+# them apart is the sentinel the chain echoes past its last refusal, not the
+# number: a launcher exiting 5 with that line in the console is a supervised
+# session whose records are fetched, and reading it as a payload with no
+# provenance stamp would leave them on tmpfs until the next run wiped them.
+for ending in 5 6 7 8 12 13; do
+	SSH_RUN_STATUS=$ending
+	result=$(deploy_tty unit --speech "${work}/speech-launcher-${ending}")
+	assert_status "a launcher that itself exited ${ending} is still fetched" 0 \
+		"$(status_of "$result")"
+	assert_contains "and its records are reported over" "$(calls)" \
+		"//cogs:speech_run_report"
+done
+# A speech run's evidence is the console, and the channel log is the motion
+# run's. A launcher that died in its first seconds -- the host refusing its
+# configuration on the unit, the pod taking the composition down, an immediate
+# ^C -- leaves a log root with nothing in it worth reading, and refusing there
+# would drop the console rsync that explains it and leave the only copy on the
+# unit's tmpfs until the next run's wipe.
+RSYNC_OLOG=empty
+SSH_RUN_STATUS=0
+result=$(deploy_tty unit --speech "${work}/speech-empty-olog")
+assert_status "a speech run that recorded no channels is still reported on" 0 \
+	"$(status_of "$result")"
+assert_contains "the fetch says what it kept and why" "$(output_of "$result")" \
+	"keeping the fetch for its console"
+assert_contains "and the console comes back with it" "$(calls)" ".console/"
+assert_contains "and the analyzer reads it" "$(calls)" "//cogs:speech_run_report"
+RSYNC_OLOG=full
+SSH_RUN_REACHED=no
+SSH_RUN_STATUS=124
+
+# The chain's refusals are one copy for both modes, parameterized on the
+# launcher config this mode starts and the flag that fetches its records. A
+# supervised session cannot be repeated, so a message sending its operator to
+# the harness config or to `--fetch` is a message about the wrong run.
+SSH_RUN_STATUS=8
+result=$(deploy_tty unit --speech "${work}/speech-nolaunchconfig")
+assert_status "a unit whose payload has no production config refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the production config, not the harness twin" \
+	"$(output_of "$result")" "has no robotcpu.textproto"
+assert_lacks "and not the harness one" "$(output_of "$result")" "robotcpu_harness.textproto"
+assert_contains "it says the config rides the payload" "$(output_of "$result")" \
+	"The production config is pushed with the payload"
+assert_contains "and recovers the previous run's records with this mode's flag" \
+	"$(output_of "$result")" "--speech-fetch <records-dir>"
+
+SSH_RUN_STATUS=6
+result=$(deploy_tty unit --speech "${work}/speech-stampunstaged")
+assert_status "a stamp that could not be staged refuses" 1 "$(status_of "$result")"
+assert_contains "and says nothing was emptied" "$(output_of "$result")" \
+	"nothing was emptied"
+assert_contains "with the speech mode's own fetch flag" "$(output_of "$result")" \
+	"--speech-fetch <records-dir>"
+SSH_RUN_STATUS=124
+
+# The log root a speech run empties is the same configured one, wiped as root on
+# the unit: the shared guard is called from this mode too, and a call site that
+# was dropped or reordered below the chain leaves the extracted function green
+# while the supervised mode wipes /etc.
+sed -i 's|log_root_dir: "/run/brenn-app/logs/testing"|log_root_dir: "/etc"|' \
+	-- "$logger_config"
+result=$(deploy_tty unit --speech "${work}/speech-outside")
+assert_status "a speech run whose log root is outside the payload store refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the value and where it has to be" \
+	"$(output_of "$result")" "which is not under /run/brenn-app"
+assert_lacks "and nothing was emptied on the unit" "$(calls)" "rm -rf"
+stage_logger_config
+
+# A trailing slash on a configured endpoint comes off before the probe path is
+# appended: `//v1/models` is a 404, and a 404 read as an unreachable robot would
+# refuse a run against a healthy service.
+cat >"${payload}/host/speech.toml" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+pod_psk_file = "secrets/pod-psk.toml"
+
+[stt]
+url = "http://speaches.example:8000/"
+TOML
+result=$(deploy_tty unit --speech "${work}/speech-slash")
+assert_status "an endpoint written with a trailing slash runs" 0 "$(status_of "$result")"
+assert_contains "and the unit is asked for one slash, not two" "$(calls)" \
+	"http://speaches.example:8000/v1/models"
+assert_lacks "so no doubled slash reaches the probe" "$(calls)" \
+	"http://speaches.example:8000//v1/models"
+
+# A configuration naming no speech services is asked nothing about them: a
+# preflight over tables that are not there would refuse a pipeline whose shape
+# is simply different.
+cat >"${payload}/host/speech.toml" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+pod_psk_file = "secrets/pod-psk.toml"
+TOML
+result=$(deploy_tty unit --speech "${work}/speech-noservices")
+assert_status "a configuration naming no services runs" 0 "$(status_of "$result")"
+assert_lacks "and the unit is asked to reach nothing" "$(calls)" "curl"
+assert_contains "while the link credentials are still asked about" "$(calls)" \
+	"[ -s /run/brenn-app/conf/audio.conf ]"
+
+# A configuration whose endpoint is not one this can pass on: the value is
+# pasted into a command run on the unit as root, so it is refused where it is
+# read.
+cat >"${payload}/host/speech.toml" <<'TOML'
+[stt]
+url = "http://speaches.example:8000; rm -rf /"
+TOML
+result=$(deploy_tty unit --speech "${work}/speech-injected")
+assert_status "an endpoint carrying a command refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the table and the value" "$(output_of "$result")" \
+	"[stt] url in ${payload}/host/speech.toml"
+assert_lacks "and nothing was started with it" "$(calls)" "simplelaunch"
+stage_speech_config
+
+# A records directory named relatively, which is what the Makefile passes, for
+# the reason `--run`'s is absolutized: the report runs out of its own runfiles
+# tree.
+rel_speech=$(basename -- "${work}")/speech-relative
+result=$(cd -- "$(dirname -- "${work}")" && deploy_tty unit --speech "$rel_speech")
+assert_status "a relative records directory runs" 0 "$(status_of "$result")"
+assert_contains "and the analyzer is handed an absolute path" "$(calls)" \
+	"//cogs:speech_run_report ${work}/speech-relative/speech-log-"
+
+# The fetch on its own: the terminal that died mid-run, or a report wanted a
+# second time. It needs no terminal, because it starts nothing.
+speech_fetch_dest="${work}/speech-fetched"
+result=$(deploy unit --speech-fetch "$speech_fetch_dest")
+assert_status "a speech fetch succeeds" 0 "$(status_of "$result")"
+assert_contains "it reads the log root out of the configuration" "$(calls)" \
+	"root@unit:/run/brenn-app/logs/testing/"
+assert_contains "and names the analyzer of a speech run" "$(output_of "$result")" \
+	"speech_run_report -- ${speech_fetch_dest}/speech-log-"
+assert_eq "and lands under the speech name" 1 \
+	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name 'speech-log-*' ! -name '*.console' | wc -l)"
+
+# ---------------------------------------------------------------------------
 # The grammar
 # ---------------------------------------------------------------------------
 
@@ -1181,6 +1715,18 @@ assert_lacks "and starts nothing" "$(calls)" "simplelaunch"
 result=$(deploy unit --run "${work}/run-extra" --wat)
 assert_status "an extra argument after --run refuses" 1 "$(status_of "$result")"
 assert_lacks "and starts nothing either" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --speech)
+assert_status "a speech run with no records directory refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal is the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and starts nothing" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --speech "${work}/speech-extra" --wat)
+assert_status "an extra argument after --speech refuses" 1 "$(status_of "$result")"
+assert_lacks "and starts nothing either" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --speech-fetch)
+assert_status "a speech fetch with no destination refuses" 1 "$(status_of "$result")"
 
 result=$(deploy unit --commands)
 assert_status "the mode that only printed commands is gone" 1 "$(status_of "$result")"
@@ -1237,7 +1783,10 @@ assert_eq "the release directory keeps the name the pod deploy refuses on" \
 	"$(grep '^release=' -- "${script_dir}/deploy-motion.sh")"
 assert_eq "the stamp keeps the name the pod deploy refuses on" \
 	"provenance_name=provenance.txt" \
-	"$(grep '^provenance_name=' -- "${script_dir}/deploy-motion.sh")"
+	"$(grep '^provenance_name=' -- "${script_dir}/lib.sh")"
+assert_eq "and only lib.sh spells it, so the build and the push cannot disagree" \
+	"" \
+	"$(grep '^provenance_name=' -- "${script_dir}/deploy-motion.sh" "${script_dir}/build-motion.sh" || true)"
 assert_contains "and the constants say who else reads them" \
 	"$(cat -- "${script_dir}/deploy-motion.sh")" \
 	"deploy-reachy-pod.sh"

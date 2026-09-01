@@ -143,7 +143,7 @@ done
 
 # What the rendered launcher config calls the control process, and whether the
 # harness twin names the voice host or the audio device. The subject pins each
-# config's app names because deploy-motion.sh prints a tail command per name,
+# config's app names because each name is a log file an operator is sent to,
 # because a host in the twin would be a second owner of the ports the intent
 # source binds, and because a pod in it would make a motion run want a mic array;
 # these are how a case renames one and how a case merges either into the wrong
@@ -655,11 +655,31 @@ assert_status "an audio-device binary that is not there refuses" 1 \
 	"$(status_of "$result")"
 assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
 	"brenn-pod/firmware/target/reachy-pod/payload/reachy-pod"
-assert_contains "and says whose build produces it" "$(output_of "$result")" \
-	"make -C ../brenn-pod/firmware reachy-pod"
-assert_contains "and names the knob that points elsewhere" "$(output_of "$result")" \
+# The remedy names the checkout this run actually resolved, not the sibling
+# default: an operator whose checkouts are not siblings set BRENN_POD_DIR
+# precisely so that a message would stop naming a directory they do not have.
+assert_contains "and says whose build produces it, in the checkout it resolved" \
+	"$(output_of "$result")" \
+	"make -C ${repo}/../brenn-pod/firmware reachy-pod"
+assert_contains "and names the knob that moves the checkout" "$(output_of "$result")" \
+	"BRENN_POD_DIR"
+assert_contains "and the one that names a bare artifact" "$(output_of "$result")" \
 	"REACHY_POD_BINARY"
+# Asked of this build, before the marker is reset for the next one:
+# assert_unstaged measures against the last mark_payload, so an assertion left
+# below a second build interrogates that one twice and this one not at all.
 assert_unstaged "and a payload without it is never staged"
+
+# The same refusal from a checkout somewhere else: the remedy follows the knob.
+mark_payload
+BRENN_POD_DIR="${work}/elsewhere-pod"
+export BRENN_POD_DIR
+result=$(build)
+unset BRENN_POD_DIR
+assert_status "a named checkout with no binary refuses too" 1 "$(status_of "$result")"
+assert_contains "and the build command names that checkout" "$(output_of "$result")" \
+	"make -C ${work}/elsewhere-pod/firmware reachy-pod"
+assert_unstaged "and stages nothing"
 mv -- "${pod_default}.aside" "$pod_default"
 
 # The knob, for a checkout that is not a sibling: what it names is what is
@@ -727,6 +747,223 @@ result=$(build)
 assert_status "and with the knob unset the default is back" 0 "$(status_of "$result")"
 assert_no_file "which is not there, so neither is the payload's" \
 	"${payload}/host/speech.toml"
+
+# ---------------------------------------------------------------------------
+# The credential files that configuration names
+# ---------------------------------------------------------------------------
+#
+# A speech configuration is not one file but a small directory: the TOML, and
+# the pod's key table and the bus token beside it, named by the payload-relative
+# paths they will occupy. The subject stages them with it, because a payload
+# member that arrived by a different route is the one file whose freshness
+# nothing checks — and because the path the TOML names is the path the host
+# resolves at run time, the launcher having started it at the payload root.
+#
+# What is pinned here is that pair of claims and the refusals that keep them
+# true: the file lands where the TOML said, under the configuration's own mode,
+# and every path the payload cannot honour is a refused build rather than a
+# credential quietly left out.
+
+assembly="${work}/assembly"
+mkdir -p -- "${assembly}/secrets"
+assembly_config="${assembly}/speech.toml"
+
+# The whole assembly, rewritten by each case so a refusal leaves nothing behind
+# for the next one. `psk` and `token` are the payload-relative paths the TOML
+# names; an empty one leaves that key out of the file entirely.
+stage_assembly() {
+	local psk=$1 token=$2
+	rm -rf -- "$assembly"
+	mkdir -p -- "${assembly}/secrets"
+	{
+		printf 'listen_addr = "127.0.0.1:7380"\n'
+		[ -z "$psk" ] || printf 'pod_psk_file = "%s"\n' "$psk"
+		printf '\n[stt]\nurl = "http://speaches.example:8000"\n'
+		if [ -n "$token" ]; then
+			printf '\n[brenn.bridge]\ntoken_file = "%s"\n' "$token"
+		fi
+	} >"$assembly_config"
+}
+
+# One credential file beside the configuration, at the path the TOML names it
+# by. Not written by stage_assembly, because a named-but-missing source is one
+# of the refusals.
+stage_credential() {
+	local at="${assembly}/$1"
+	mkdir -p -- "$(dirname -- "$at")"
+	printf 'a credential\n' >"$at"
+}
+
+REACHY_SPEECH_CONFIG="$assembly_config"
+export REACHY_SPEECH_CONFIG
+
+stage_assembly secrets/pod-psk.toml secrets/remote.token
+stage_credential secrets/pod-psk.toml
+stage_credential secrets/remote.token
+result=$(build)
+assert_status "a build against an assembly directory succeeds" 0 "$(status_of "$result")"
+assert_file "the key table lands where the configuration names it" \
+	"${payload}/secrets/pod-psk.toml"
+assert_file "and so does the bus token" "${payload}/secrets/remote.token"
+assert_eq "the key table is readable by the payload's account and nobody else" 600 \
+	"$(stat -c %a -- "${payload}/secrets/pod-psk.toml")"
+assert_eq "and so is the token" 600 \
+	"$(stat -c %a -- "${payload}/secrets/remote.token")"
+assert_contains "the report names the key table and where it came from" \
+	"$(output_of "$result")" "secrets/pod-psk.toml  staged from ${assembly}/secrets/pod-psk.toml"
+assert_contains "and the token" "$(output_of "$result")" \
+	"secrets/remote.token  staged from ${assembly}/secrets/remote.token"
+assert_lacks "and neither line carries a digest" "$(output_of "$result")" \
+	"$(sha256sum -- "${payload}/secrets/pod-psk.toml" | cut -d' ' -f1)"
+
+# The collision check decides whether a credential would be installed over a
+# payload member, and it asks that of a hand-written list. Nothing in the
+# subject keeps that list in step with what `stage` actually installs, and a
+# member added to one and not the other is a credential landing on top of a
+# config with the winner decided by install order -- bad bytes at run time,
+# found on hardware. This is the join: every path the build just staged has to
+# be one the collision check knows about.
+#
+# The generated plan and the model weights are resolved sets rather than named
+# ones, so they are recognised by the shapes and the places they occupy; the
+# two credentials are this case's own. Everything else is a name the subject
+# spells in that list, and a member added to `stage` and not to it makes this
+# red.
+listing=$(cd -- "$payload" && find . -type f | sed 's|^\./||' | sort)
+fixed=$(sed -n '/^payload_fixed_members=(/,/^)/p' -- "${script_dir}/build-motion.sh" |
+	sed -e '1d' -e '$d' -e 's/^[[:space:]]*//' -e 's/"//g' \
+		-e "s|^\$build_commit_name\$|build-commit.txt|" \
+		-e "s|^\$speech_config_path\$|host/speech.toml|")
+unaccounted=""
+while read -r member; do
+	[ -n "$member" ] || continue
+	case "$member" in
+	models/*) continue ;;
+	cogs/*.textproto | cogs/*.json | cogs/*.tachyon) continue ;;
+	driver/*.textproto | host/*.textproto | *.tachyon) continue ;;
+	secrets/pod-psk.toml | secrets/remote.token) continue ;;
+	esac
+	grep -qxF -- "$member" <<<"$fixed" || unaccounted="${unaccounted}${member} "
+done <<<"$listing"
+assert_eq "every payload member is one the credential collision check knows about" \
+	"" "$unaccounted"
+
+# A configuration with no [brenn.bridge] is a voiced, bus-less pipeline. Legal,
+# and the payload carries no token: the host composes without alerts.
+stage_assembly secrets/pod-psk.toml ""
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "a configuration naming no bridge builds" 0 "$(status_of "$result")"
+assert_file "and the key table is still staged" "${payload}/secrets/pod-psk.toml"
+assert_no_file "and no token is" "${payload}/secrets/remote.token"
+
+# A credential the configuration names and the assembly does not hold. The
+# refusal names both, because which of the two is wrong — the path or the
+# missing file — is the operator's to see.
+mark_payload
+stage_assembly secrets/pod-psk.toml secrets/remote.token
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "a named credential that is not beside the configuration refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the key and its value" "$(output_of "$result")" \
+	"token_file = secrets/remote.token"
+assert_contains "and the path it looked at" "$(output_of "$result")" \
+	"${assembly}/secrets/remote.token"
+assert_unstaged "and it stages nothing"
+
+# An absolute path is the workstation-era spelling: it would stat green on the
+# machine the payload was built on and name nothing on the unit.
+mark_payload
+stage_assembly "${assembly}/secrets/pod-psk.toml" ""
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "an absolute credential path refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says the payload carries its own credentials" \
+	"$(output_of "$result")" "the payload carries its own credentials"
+assert_unstaged "and that one stages nothing either"
+
+mark_payload
+stage_assembly ../pod-psk.toml ""
+result=$(build)
+assert_status "a credential path that climbs out of the payload refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says where it would land" "$(output_of "$result")" \
+	"climbs out of the payload"
+assert_unstaged "and stages nothing"
+
+# A credential named at a path the payload already carries: the install order
+# decides which file wins, and the loser is a process reading the wrong bytes.
+# Both kinds are refused — a member the subject installs by name, and one it
+# resolved from Bazel's answer.
+mark_payload
+stage_assembly reachy_host ""
+stage_credential reachy_host
+result=$(build)
+assert_status "a credential over a payload binary refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says whose path it is" "$(output_of "$result")" \
+	"a payload member's own path"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly host/speech.toml ""
+stage_credential host/speech.toml
+result=$(build)
+assert_status "a credential over the speech configuration itself refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and names that path" "$(output_of "$result")" "host/speech.toml"
+assert_unstaged "and stages nothing"
+
+# The collision check compares names, and the filesystem resolves what a name
+# comparison does not: `./robotcpu.textproto` matches no member and installs
+# over the launcher config all the same, at 0600, under a green build.
+mark_payload
+stage_assembly ./robotcpu.textproto ""
+stage_credential ./robotcpu.textproto
+result=$(build)
+assert_status "a credential path that resolves onto a member refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the component it will not take" \
+	"$(output_of "$result")" "a . or an empty component"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly models/silero/silero_vad.onnx ""
+stage_credential models/silero/silero_vad.onnx
+result=$(build)
+assert_status "a credential over a model refuses" 1 "$(status_of "$result")"
+assert_contains "and names that path too" "$(output_of "$result")" \
+	"models/silero/silero_vad.onnx"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly cogs/mover_params.textproto ""
+stage_credential cogs/mover_params.textproto
+result=$(build)
+assert_status "a credential over a cog's configuration refuses" 1 "$(status_of "$result")"
+assert_contains "and names it" "$(output_of "$result")" "cogs/mover_params.textproto"
+assert_unstaged "and stages nothing"
+
+# A value this reader cannot read confidently is a refused build, not a guess:
+# a credential path truncated where the quoting went wrong is a plausible wrong
+# file.
+mark_payload
+printf 'pod_psk_file = "secrets/pod-psk.toml\n' >"$assembly_config"
+result=$(build)
+assert_status "a credential value whose quoting does not close refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says what it could not read" "$(output_of "$result")" \
+	"the value's quoting does not close"
+assert_unstaged "and stages nothing"
+
+# Back to the ordinary case, so what follows builds against a payload with no
+# speech configuration at all.
+unset REACHY_SPEECH_CONFIG
+rm -rf -- "$assembly"
+result=$(build)
+assert_status "and with the assembly gone the build is voiceless again" 0 \
+	"$(status_of "$result")"
+assert_no_file "the payload carries no key table" "${payload}/secrets/pod-psk.toml"
 
 mark_payload
 INFO_STATUS=1
@@ -860,8 +1097,8 @@ assert_status "and the shipped values build" 0 "$(status_of "$result")"
 # The launcher's app names, which are the names of the log files an operator
 # tails. They come out of the compositions and `docs/bench-runbook.md` retypes
 # them, so this assertion is the join between the two: a process renamed in a
-# `.clk` file is a refused build here rather than three tail commands at a bench
-# naming files that never appear.
+# `.clk` file is a refused build here rather than a runbook naming five log
+# files that never appear.
 
 mark_payload
 APP_CONTROL=control_proc
@@ -874,7 +1111,7 @@ assert_contains "and what the run needs" "$(output_of "$result")" \
 assert_contains "and says which config it read" "$(output_of "$result")" \
 	"robotcpu.textproto names the apps"
 assert_contains "and says why the names matter" "$(output_of "$result")" \
-	"tail command per name"
+	"names each app's log file"
 assert_unstaged "a renamed process stages nothing"
 APP_CONTROL=""
 
@@ -1161,6 +1398,248 @@ if [ -n "$shipped_apps" ]; then
 else
 	fail "the runbook names every app's log file" \
 		"read no launcher_apps=(...) from tools/build-motion.sh — the name has moved"
+fi
+
+# ---------------------------------------------------------------------------
+# The runbook against the deploy script's own vocabulary
+# ---------------------------------------------------------------------------
+#
+# A refusal an operator meets on a unit sends them to a document, and a code in
+# a status is only readable against a table. Both live in `docs/bench-runbook.md`
+# and neither is generated from anything, so this is the join: every exit code
+# `deploy-motion.sh` names, and every target the Makefile's help text offers, has
+# to be a row that document actually carries. Read out of this checkout, all
+# three sides.
+
+deploy_src=$(cat -- "${real_repo}/tools/deploy-motion.sh")
+for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
+	rc_no_audio_conf:12 rc_service_unreachable:13; do
+	name=${code%%:*}
+	number=${code#*:}
+	assert_contains "${name} is still ${number} in the deploy script" "$deploy_src" \
+		"${name}=${number}"
+	assert_contains "and the runbook tabulates ${number}" "$runbook" \
+		"- **${number}** —"
+done
+assert_contains "the runbook names the speech run's section" "$runbook" \
+	"## The speech run"
+assert_contains "and the target that starts one" "$runbook" "make speech-run"
+assert_contains "and the fetch that recovers its records" "$runbook" \
+	"make speech-fetch"
+assert_contains "and the assembly directory's payload-relative naming" "$runbook" \
+	"pod_psk_file"
+
+# The provisioning step, which no operator types and which therefore has to be
+# ordered by the Makefile rather than by a runbook sentence. On a first run
+# against a fresh assembly directory, provisioning is what writes the PSK table
+# the build then stages, so a build that ran first would refuse a
+# named-but-missing credential — and prerequisites are unordered under `-j`,
+# where two recipe lines are not.
+speech_recipe=$(sed -n '/^speech-run:/,/^$/p' -- "${real_repo}/Makefile")
+# Make syntax, quoted so this shell leaves it alone.
+# shellcheck disable=SC2016
+provision_step='$(MAKE) speech-provision'
+# shellcheck disable=SC2016
+deploy_step='$(MAKE) motion-deploy'
+assert_contains "speech-run provisions the pod's half of the link" \
+	"$speech_recipe" "$provision_step"
+assert_contains "and pushes the payload" "$speech_recipe" "$deploy_step"
+for step in speech-provision motion-deploy; do
+	assert_lacks "with ${step} not left as a prerequisite, which -j may reorder" \
+		"${speech_recipe%%$'\n'*}" "$step"
+done
+provision_at=${speech_recipe%%"$provision_step"*}
+deploy_at=${speech_recipe%%"$deploy_step"*}
+if [ "${#provision_at}" -lt "${#deploy_at}" ]; then
+	pass "and provisions before it builds, which is what a first run needs"
+else
+	fail "and provisions before it builds, which is what a first run needs" \
+		"$speech_recipe"
+fi
+
+# And the cheapest refusal is the first thing asked. A stdin with no terminal
+# refuses the run whatever else is true, so it is asked before the provisioning
+# writes to the unit and before the build spends minutes on a payload nobody
+# will run.
+preflight_step="--speech-preflight"
+assert_contains "speech-run asks the terminal question of its own" \
+	"$speech_recipe" "$preflight_step"
+preflight_at=${speech_recipe%%"$preflight_step"*}
+if [ "${#preflight_at}" -lt "${#provision_at}" ]; then
+	pass "and asks it before it touches the unit or builds anything"
+else
+	fail "and asks it before it touches the unit or builds anything" \
+		"$speech_recipe"
+fi
+
+# The step `speech-run` delegates to, which is also a target of its own. Its
+# recipe is one line, and every part of that line is load-bearing: the shim is
+# where both refusals live, the host is what the other repository provisions,
+# and `device-host` is what refuses an unnamed one before the shim hands an
+# empty value across. A drop here surfaces only mid-run against hardware.
+provision_recipe=$(sed -n '/^speech-provision:/,/^$/p' -- "${real_repo}/Makefile")
+assert_contains "speech-provision runs this repo's shim" "$provision_recipe" \
+	"tools/provision-speech.sh"
+# shellcheck disable=SC2016
+assert_contains "and passes it the unit" "$provision_recipe" '$(REACHY_HOST)'
+assert_contains "and asks for a named unit first" "${provision_recipe%%$'\n'*}" \
+	"device-host"
+
+# The help text is where a person learns a target exists, and the runbook is
+# where they learn what it does: a target offered in one and absent from the
+# other is a command nobody can follow through.
+makefile_help=$(sed -n '/^help:/,/^$/p' -- "${real_repo}/Makefile")
+for target in speech-run speech-fetch speech-provision; do
+	assert_contains "the help text offers make ${target}" "$makefile_help" \
+		"make ${target}"
+	assert_contains "and the runbook names make ${target}" "$runbook" \
+		"make ${target}"
+done
+
+# The local configuration file, which is what lets a session type `make
+# speech-run` with no variables at all. The strings below are tripwires — cheap,
+# and they name the shapes a refactor most plausibly breaks — but the contract
+# is make's own resolution, and that is exercised further down.
+makefile_src=$(cat -- "${real_repo}/Makefile")
+assert_contains "the local configuration's include is at the file's top level" \
+	"$makefile_src" '
+-include .local/reachy.conf'
+assert_lacks "and the old guard on one variable's origin is gone" "$makefile_src" \
+	'origin REACHY_HOST'
+
+# The include's position, which the probe below cannot see: a `?=` parsed before
+# it is already set when the file lands, so that variable's conf-file line is a
+# silent no-op. The invariant is that every default in the Makefile comes after.
+include_line=$(grep -n -e '^-include .local/reachy.conf' \
+	-- "${real_repo}/Makefile" | head -n 1 | cut -d: -f1)
+first_default_line=$(grep -n -E -e '^[A-Za-z_][A-Za-z0-9_]* *\?=' \
+	-- "${real_repo}/Makefile" | head -n 1 | cut -d: -f1)
+if [ -n "$include_line" ] && [ -n "$first_default_line" ] &&
+	[ "$include_line" -lt "$first_default_line" ]; then
+	pass "the include is read ahead of every default in the Makefile"
+else
+	fail "the include is read ahead of every default in the Makefile" \
+		"-include at line [${include_line}]" \
+		"first ?= at line [${first_default_line}]"
+fi
+assert_contains "the speech configuration is exported to the scripts" \
+	"$makefile_src" 'export REACHY_SPEECH_CONFIG'
+# The other repository's location: one knob for one physical fact, read by
+# `tools/lib.sh` for both the pod binary it stages and the provisioning it
+# invokes, and therefore exported like the speech configuration.
+assert_contains "the brenn-pod checkout has a default" "$makefile_src" \
+	'BRENN_POD_DIR ?='
+assert_contains "and is exported to the scripts that read it" "$makefile_src" \
+	'export BRENN_POD_DIR'
+assert_contains "and the runbook spells the conf file's assignments with ?=" \
+	"$runbook" 'REACHY_HOST ?='
+assert_contains "the speech configuration among them" "$runbook" \
+	'REACHY_SPEECH_CONFIG ?='
+# `REACHY_HOST ?= reachy00` is make syntax and not shell syntax: sourcing the
+# file leaves the variable unset and the runbook's own `ssh root@"$REACHY_HOST"`
+# lines dial nothing. The document must not tell a shell to read it.
+assert_lacks "and never tells the shell to source that file" "$runbook" \
+	'. .local/reachy.conf'
+assert_lacks "in either spelling of the same instruction" "$runbook" \
+	'source .local/reachy.conf'
+assert_contains "it teaches the shell's own half instead" "$runbook" \
+	'export REACHY_HOST='
+
+# The resolution itself, run rather than read. A probe makefile in this run's
+# tree includes the real one, so `.local/reachy.conf` resolves against the
+# probe's directory and no operator's own file is in the picture. What is
+# asserted is the three-way precedence a session depends on — command line over
+# environment over file over the Makefile's defaults — plus the export that
+# carries a file-origin value into the scripts, which are children of a recipe
+# and read it from their environment.
+conf_probe="${work}/conf-probe"
+mkdir -p -- "${conf_probe}/.local"
+cat >"${conf_probe}/Makefile" <<'PROBE'
+include @REPO@/Makefile
+
+.PHONY: probe
+probe:
+	@printf 'host=[%s] bazel=[%s] speech=[%s]\n' '$(REACHY_HOST)' \
+	    '$(BAZEL_FLAGS)' "$${REACHY_SPEECH_CONFIG-unset}"
+PROBE
+sed -i "s|@REPO@|${real_repo}|" -- "${conf_probe}/Makefile"
+
+# The parent `make check` is a make of its own; its flags and its job server are
+# no part of what is being measured here. BAZEL_FLAGS goes with them: it is a
+# documented knob of this Makefile, so a shell profile or a CI `env:` block may
+# export it, and an environment origin beats the conf file's `?=` — which is
+# make's own rule and not what these cases are measuring.
+probe_make() {
+	(cd -- "$conf_probe" &&
+		env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS -u BAZEL_FLAGS "$@" 2>&1)
+}
+
+cat >"${conf_probe}/.local/reachy.conf" <<'CONF'
+REACHY_HOST ?= from-the-file
+REACHY_SPEECH_CONFIG ?= /assembly/speech.toml
+BAZEL_FLAGS ?= --from-the-file
+CONF
+
+assert_eq "a conf file alone names the unit, the flags and the configuration" \
+	'host=[from-the-file] bazel=[--from-the-file] speech=[/assembly/speech.toml]' \
+	"$(probe_make make probe)"
+assert_eq "a command-line value wins, and the file's other lines survive it" \
+	'host=[argv] bazel=[--from-the-file] speech=[/assembly/speech.toml]' \
+	"$(probe_make make probe REACHY_HOST=argv)"
+assert_eq "an environment value wins over the file, and the rest survives" \
+	'host=[from-the-env] bazel=[--from-the-file] speech=[/assembly/speech.toml]' \
+	"$(probe_make REACHY_HOST=from-the-env make probe)"
+assert_eq "and a command line wins over the environment" \
+	'host=[argv] bazel=[--from-the-file] speech=[/assembly/speech.toml]' \
+	"$(probe_make REACHY_HOST=from-the-env make probe REACHY_HOST=argv)"
+
+# The speech configuration at its other two origins. This is the one variable
+# whose whole job is reaching the scripts through the environment, and the
+# operator-facing override is the documented way to point one run at another
+# assembly directory; a narrowed export would drop it silently and build a
+# voiceless payload from the file's config instead.
+assert_eq "a command-line speech configuration reaches the scripts" \
+	'host=[from-the-file] bazel=[--from-the-file] speech=[/argv/speech.toml]' \
+	"$(probe_make make probe REACHY_SPEECH_CONFIG=/argv/speech.toml)"
+assert_eq "and one already in the environment is passed through unchanged" \
+	'host=[from-the-file] bazel=[--from-the-file] speech=[/env/speech.toml]' \
+	"$(probe_make REACHY_SPEECH_CONFIG=/env/speech.toml make probe)"
+
+rm -f -- "${conf_probe}/.local/reachy.conf"
+assert_eq "with no file at all the scripts' environment is left alone" \
+	'host=[] bazel=[] speech=[unset]' \
+	"$(probe_make make probe)"
+
+# The refusal an operator without a conf file meets. It teaches the `?=`
+# spelling the runbook teaches — a bare `=` there shadows an environment value —
+# and the runbook's half is gated above, so this is the other half.
+missing_host_status=0
+missing_host=$(probe_make make device-host) || missing_host_status=$?
+if [ "$missing_host_status" != 0 ]; then
+	pass "with no conf file, device-host refuses"
+else
+	fail "with no conf file, device-host refuses" "the target exited 0"
+fi
+assert_contains "saying which variable is missing" "$missing_host" \
+	"REACHY_HOST is not set"
+assert_contains "naming the file to put it in" "$missing_host" \
+	".local/reachy.conf"
+assert_contains "in the spelling that yields to both other origins" \
+	"$missing_host" 'REACHY_HOST ?='
+
+# The runbook's word budget. It is a checklist joined to the tools' own
+# vocabulary, and every refusal in these scripts already names its own remedy,
+# so prose restating that is prose that rots. A number is the only thing that
+# holds against regrowth. 1000 is the budget the document is written to; room
+# for the next correction comes from the document's own slack, not from a larger
+# number here.
+runbook_words=$(wc -w <<<"$runbook")
+if [ "$runbook_words" -le 1000 ]; then
+	pass "the runbook is inside its 1000-word budget"
+else
+	fail "the runbook is inside its 1000-word budget" \
+		"wc -w says ${runbook_words}" \
+		"trim the document"
 fi
 
 # ---------------------------------------------------------------------------

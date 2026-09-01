@@ -602,9 +602,9 @@ pub fn provision<P: BusPort>(
 ///
 /// And the byte an operator came here to clear is judged: a servo that answers
 /// still reporting hardware-error bits fails the command, whichever bits they
-/// are. This machine clears them to zero on a restart — the observation is in
-/// `docs/bench-runbook.md`, under the open observations, including for the
-/// chronic input-voltage bit every servo latches while running. So a byte that
+/// are. This machine clears them to zero on a restart -- observed on all nine
+/// servos of `reachy00`, 2026-08-28, the chronic input-voltage bit every servo
+/// latches while running included, which running re-latches. So a byte that
 /// survives means the restart did not happen or the condition is live at this
 /// instant, and neither of those is a recovery. There is no per-bit tolerance
 /// here: the input-voltage latch is unexplained, and writing "probably fine"

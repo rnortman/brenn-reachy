@@ -13,7 +13,9 @@
 //! themselves are `reachy-edge`'s, held by the same [`HostEdge`] the harness
 //! runs. The voice half is the pod platform's own server, composed here
 //! ([`voice`]) with its two motion seams filled by this process's gate
-//! ([`sinks`]) instead of by a bus that is not on this machine.
+//! ([`sinks`]) instead of by a bus that is not on this machine. What both
+//! halves would load, decided on a workstation before anything is pushed, is
+//! [`check`].
 //!
 //! [`HostEdge`]: reachy_edge::HostEdge
 //!
@@ -32,14 +34,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod check;
 pub mod edge;
 pub mod intents;
 pub mod params;
 pub mod sinks;
 pub mod voice;
+pub mod words;
 
+pub use check::{Conclusion, conclusion_line, inspect, settled};
 pub use edge::Console;
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};
 pub use sinks::{BusIntents, Lines, ScripterIntents, Stdout};
 pub use voice::{Voice, absent_line, composed_line, silent_line};
+pub use words::{
+    AWAITING_SPEECH_CONFIG, COMPOSED, REFUSAL_PREFIX, STARTED, UNPUBLISHED, VOICELESS,
+};

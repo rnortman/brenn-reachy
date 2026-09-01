@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 
 use crate::intents::Intents;
 use crate::sinks::{BusIntents, Lines, ScripterIntents};
+use crate::words;
 
 /// The composed pipeline, running.
 ///
@@ -292,7 +293,7 @@ impl Voice {
 #[must_use]
 pub fn composed_line(config: &Path, listen: &str, alerts: bool, at: SyncTime) -> String {
     edge_line_with(
-        "composed",
+        words::COMPOSED,
         at,
         &format!(
             "the voice pipeline is running from {}, pod link on {listen}; the scripter's \
@@ -315,7 +316,7 @@ pub fn composed_line(config: &Path, listen: &str, alerts: bool, at: SyncTime) ->
 #[must_use]
 pub fn silent_line(at: SyncTime) -> String {
     edge_line(
-        "voiceless",
+        words::VOICELESS,
         at,
         "no speech configuration was named, so this host runs its edge half alone: it follows \
          the session's story and narrates it, and nothing in this process authors intent",
@@ -334,7 +335,7 @@ pub fn silent_line(at: SyncTime) -> String {
 #[must_use]
 pub fn absent_line(config: &Path, at: SyncTime) -> String {
     edge_line(
-        "awaiting_speech_config",
+        words::AWAITING_SPEECH_CONFIG,
         at,
         &format!(
             "no speech configuration at {}, so this host runs its edge half alone; push one \

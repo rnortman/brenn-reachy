@@ -160,12 +160,13 @@ const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > JOINT_COUNT as i64 * NOMINA
 /// and raising it is what makes the host's side of the relation fail.
 ///
 /// A ceiling and not a measurement, and the healthy cost is nowhere near the
-/// worst one. On a bus that answers, the sweep costs about 5 ms
-/// (`docs/bench-runbook.md` records the runs). On a bus that answers nothing
+/// worst one. On a bus that answers, the sweep costs about 5 ms -- 5.1, 5.2 and
+/// 5.5 ms on three `reachy00` runs, 2026-08-29. On a bus that answers nothing,
 /// every one of its eighteen exchanges -- a write and a read-back per row --
 /// runs to the cycle deadline instead, and the sweep's own stated bound is
-/// 58.5 ms -- over half of this figure rather than a tenth of it. `crates/reachy-motord`
-/// asserts this budget clears that bound, so the two cannot drift apart.
+/// 58.5 ms -- over half of this figure rather than a tenth of it.
+/// `crates/reachy-motord` asserts this budget clears that bound, so the two
+/// cannot drift apart.
 ///
 /// The port open in front of the sweep is not in the arithmetic: it is a local
 /// device open, and nothing in this tree bounds it.

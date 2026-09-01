@@ -186,4 +186,51 @@ assert_lacks "the kept-tree line is not" "$stdout_only" "$kept_line"
 assert_lacks "and neither is the failure detail" "$stdout_only" "what was there"
 rm -rf -- "$kept"
 
+# ---------------------------------------------------------------------------
+# The operator's knobs, cleared before any suite reads them
+# ---------------------------------------------------------------------------
+
+# `tools/lib.sh` reads REACHY_SPEECH_CONFIG at source time and the Makefile
+# exports it, so a suite that inherited a workstation's value would stage that
+# site's real assembly configuration and its credentials into a fixture payload.
+# The harness clears the three knobs for every suite, and this is the case that
+# says so — the suites that would notice are the ones that assert on a voiceless
+# build, which pass on a CI box either way.
+write_fixture inheriting <<'FIXTURE'
+printf 'speech=[%s] host=[%s] pod=[%s]\n' \
+	"${REACHY_SPEECH_CONFIG-unset}" "${REACHY_HOST-unset}" \
+	"${REACHY_POD_BINARY-unset}"
+pass "the fixture ran"
+tally
+FIXTURE
+
+REACHY_SPEECH_CONFIG=/site/speech.toml
+REACHY_HOST=somewhere
+REACHY_POD_BINARY=/site/reachy_pod
+export REACHY_SPEECH_CONFIG REACHY_HOST REACHY_POD_BINARY
+result=$(run_fixture inheriting)
+unset REACHY_SPEECH_CONFIG REACHY_HOST REACHY_POD_BINARY
+assert_contains "a suite starts with the operator's knobs cleared" \
+	"$(output_of "$result")" "speech=[unset] host=[unset] pod=[unset]"
+
+# The list's join to what actually reads these variables. The case above pins the
+# three names as they stand; this one says the list cannot fall behind `lib.sh`,
+# whose expansions are what a suite would inherit. A fourth knob added there and
+# not here leaks the maintainer's own path into a fixture payload on the
+# workstation while CI, where nothing is set, stays green.
+lib_sh="${script_dir}/lib.sh"
+unset_line=$(grep -n -e '^unset ' -- "${script_dir}/test-lib.sh")
+readers=$(grep -o -E -e '\$\{(REACHY|BRENN)_[A-Z_]+' -- "$lib_sh" |
+	sed 's/^\${//' | sort -u)
+if [ -z "$readers" ]; then
+	fail "tools/lib.sh names at least one operator knob" \
+		"the search over ${lib_sh} found none — it has stopped matching"
+else
+	pass "tools/lib.sh names at least one operator knob"
+	while IFS= read -r knob; do
+		assert_contains "the harness clears ${knob}, which lib.sh reads" \
+			"$unset_line" "$knob"
+	done <<<"$readers"
+fi
+
 tally

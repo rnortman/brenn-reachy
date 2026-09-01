@@ -72,9 +72,16 @@ assert_refused() {
 
 # One lane, run out of the scratch repository, captured as output plus a status
 # line the harness reads back.
+#
+# make is fed a recognisable stdin rather than whatever the suite has, so a
+# script the recipe runs with stdin left open reads the poison and says so. Under
+# `make check` the suite's own stdin is already /dev/null, which would make the
+# recipe's `</dev/null` per script indistinguishable from doing nothing.
+stdin_poison="poison-for-a-script-that-reads-stdin"
 lane() {
 	local out status=0
-	out=$(make -C "$repo" --no-print-directory "$1" 2>&1) || status=$?
+	out=$(printf '%s\n' "$stdin_poison" |
+		make -C "$repo" --no-print-directory "$1" 2>&1) || status=$?
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
@@ -107,6 +114,34 @@ good_test_script "${repo}/target/ignored.test.sh"
 result=$(lane test-scripts)
 assert_status "an ignored self-check is left alone" 0 "$(status_of "$result")"
 assert_lacks "and is not in the set" "$(output_of "$result")" "target/ignored.test.sh"
+
+# A self-check that reads stdin — one spawning a pty, one feeding a subject —
+# must not swallow the list of the suites after it. The lane would exit 0 having
+# run a prefix of the set, which is the one failure a green result cannot be
+# told from.
+#
+# The recipe has two independent halves — the list on a descriptor of its own,
+# and each script run with stdin closed — and each is asserted separately: the
+# marker count says both scripts ran (the list survived), and what the hungry one
+# recorded says its stdin was closed rather than the lane's poison.
+cat >"${repo}/tools/aaa-hungry.test.sh" <<HUNGRY
+#!/usr/bin/env bash
+set -euo pipefail
+cat >"\$(dirname -- "\${BASH_SOURCE[0]}")/../stdin-seen"
+echo ${marker}
+HUNGRY
+chmod 0755 -- "${repo}/tools/aaa-hungry.test.sh"
+good_test_script "${repo}/tools/zzz-later.test.sh"
+result=$(lane test-scripts)
+assert_status "a self-check that reads stdin leaves the lane green" 0 \
+	"$(status_of "$result")"
+# Three: the tracked `fresh.test.sh` from the cases above, and the two here.
+assert_eq "and every suite in the set really ran" 3 \
+	"$(grep -c -- "$marker" <<<"$(output_of "$result")")"
+assert_eq "with the hungry one handed a closed stdin, not the lane's" "" \
+	"$(cat -- "${repo}/stdin-seen")"
+rm -f -- "${repo}/tools/aaa-hungry.test.sh" "${repo}/tools/zzz-later.test.sh" \
+	"${repo}/stdin-seen"
 
 # ---------------------------------------------------------------------------
 # test-scripts: the two refusals

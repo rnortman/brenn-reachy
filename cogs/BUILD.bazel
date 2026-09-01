@@ -287,6 +287,7 @@ rust_binary(
         ":log_read",
         ":motion_channels",
         ":motion_slots",
+        ":run_report",
         ":schedule_clk_rs",
         ":script_clk_rs",
         ":session_clk_rs",
@@ -993,6 +994,29 @@ merge_simplelaunch_config(
     visibility = ["//visibility:public"],
 )
 
+# The two lists an analyzer's verdict is, and the printer that turns them into
+# stdout, stderr and an exit status.
+#
+# Shared by both log analyzers in this package because their output is one
+# operator-facing convention read side by side after the same fetch: a second
+# copy of it drifts on the first change nobody made twice, and the drift is
+# invisible until somebody compares two runs.
+rust_library(
+    name = "run_report",
+    srcs = ["report.rs"],
+    crate_name = "run_report",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+# The printer's own cases: the two halves stay separate and in order, and the
+# exit status is the presence of a finding.
+rust_test(
+    name = "run_report_test",
+    size = "small",
+    crate = ":run_report",
+)
+
 # S1, raise-hold-stow, over the real system: three cogs, seven channels, two
 # configs read from text. What is under test is the loop, not the harness -- the
 # harness's own proof points live in `proof/` and are not re-proved here.
@@ -1620,6 +1644,43 @@ rust_clk_module(
     src = "sim_state.clk",
     imports = clk_module_deps(SIM_STATE_MODULES).imports,
     deps = clk_module_deps(SIM_STATE_MODULES).rs,
+)
+
+# What one supervised speech run did, read off the voice host's console: the
+# operator's tool for judging a speech run, run as
+# `bazel run //cogs:speech_run_report -- <records>` over a fetched record pair.
+#
+# The console side of the fetch rather than the channel log, which is why it
+# shares no reading machinery with the motion report above -- only the verdict's
+# shape, through `:run_report`. It depends on the edge and the host for the words
+# the console is spelled with, so the vocabulary it counts is the vocabulary
+# those two emit rather than a copy of it that drifts silently.
+rust_binary(
+    name = "speech_run_report",
+    srcs = ["speech_run_report.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":run_report",
+        "//crates/motion-proto:motion_proto",
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-host:reachy_host_lib",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# The analyzer over crafted consoles: a clean run, each way a run is not the
+# production pipeline, and each shape it must summarize without judging. The
+# cases write a record pair into a scratch directory, which
+# `//crates/reachy-scratch` removes however a case ended.
+rust_test(
+    name = "speech_run_report_test",
+    size = "small",
+    crate = ":speech_run_report",
+    deps = [
+        "//crates/reachy-scratch:reachy_scratch",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
 )
 
 clk(

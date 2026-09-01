@@ -50,6 +50,23 @@ store_mount=/run/brenn-app
 # writer and the reader cannot disagree about it.
 build_commit_name=build-commit.txt
 
+# The name the push's account of which build the payload is goes by, at the root
+# of the payload and at the root of a run's log root. Part of the payload: it is
+# written into the staged directory before the push, so the one rsync that
+# delivers the payload delivers the stamp with it and a stamp on the unit
+# describes the payload beside it by construction. The build stages that
+# directory from scratch, so nothing stale is left there to push, and it lists
+# this name among the payload members a credential must not land on. The copy in
+# the log root comes home with the records under the fetch's own name, with no
+# fetch-side logic to put it there. It is also what a pod deploy from brenn-pod's
+# deploy-reachy-pod.sh reads to recognise a robot — a rename here is invisible
+# there, so this name is pinned by a case in `deploy-motion.test.sh`.
+#
+# Here rather than in either script: the build lists it and the push writes it,
+# and three spellings of one payload member is a rename that leaves the build's
+# collision list matching nothing.
+provenance_name=provenance.txt
+
 # A leading `~` replaced with $HOME, any other path unchanged. Bazel's path
 # converter expands a leading `~` and so does the cache action in its path list;
 # a shell passing an environment variable through does not, and neither does a
@@ -88,6 +105,24 @@ die() {
 		echo "    ${line}" >&2
 	done
 	exit 1
+}
+
+# The two ways to set one knob, as detail lines for `die`.
+#
+#   knob_remedy <VAR> <placeholder> [make goal]
+#
+# Every knob these scripts read can be named for one invocation or once in the
+# gitignored `.local/reachy.conf`, which make includes unconditionally. Written
+# here rather than at each refusal because the `?=` spelling is load-bearing --
+# it is what yields to both a command-line and an environment value -- and a
+# convention spelled once cannot be half-changed.
+knob_remedy() {
+	local var=$1 placeholder=$2 goal=${3:-speech-run}
+	printf '%s\n' \
+		"Name it for this invocation:" \
+		"    make ${goal} ${var}=${placeholder}" \
+		"or once, in the gitignored .local/reachy.conf:" \
+		"    ${var} ?= ${placeholder}"
 }
 
 # ---------------------------------------------------------------------------
@@ -347,6 +382,24 @@ refuse_if_stale() {
 # workspace touches them -- so they get their own, and a knob spelled once
 # cannot answer the two scripts differently.
 
+# The brenn-pod checkout this repo reads two things out of: the audio device's
+# prebuilt binary, staged into the payload, and the provisioning make target
+# that writes the pod's half of the voice link onto the unit.
+#
+# One physical fact — where that repo is — gets one knob, so a workstation whose
+# checkouts are not siblings says so once. `REACHY_POD_BINARY` still wins for the
+# binary alone: it names a file rather than a repository, which is what an
+# artifact copied out of a build somewhere else is.
+# A relative value is relative to this repository's root, not to whatever
+# directory the caller happened to be in: the Makefile's own default is spelled
+# relatively and exported, and a script run by hand from a subdirectory must
+# resolve it to the same checkout the recipes do.
+brenn_pod_dir=${BRENN_POD_DIR:-../brenn-pod}
+case $brenn_pod_dir in
+/*) ;;
+*) brenn_pod_dir=${repo_root}/${brenn_pod_dir} ;;
+esac
+
 # The audio device's binary, which this repo does not build.
 #
 # `reachy-pod` links libusb-1.0 and libasound2 and is compiled natively in
@@ -362,7 +415,7 @@ refuse_if_stale() {
 # is not there is a refused build naming both the knob and the command in the
 # other repo that produces the file, so a different layout says so once rather
 # than staging something unexpected.
-pod_binary=${REACHY_POD_BINARY:-${repo_root}/../brenn-pod/firmware/target/reachy-pod/payload/reachy-pod}
+pod_binary=${REACHY_POD_BINARY:-${brenn_pod_dir}/firmware/target/reachy-pod/payload/reachy-pod}
 
 # The voice pipeline's own configuration, which this repo does not contain and
 # will not.
@@ -379,6 +432,15 @@ pod_binary=${REACHY_POD_BINARY:-${repo_root}/../brenn-pod/firmware/target/reachy
 # `host/speech.toml` of the working tree, and its absence is not a refusal: the
 # host starts either way and says which of the two it is, and a motion run and a
 # bench night need no speech configuration at all.
+#
+# A relative value is taken as the caller typed it -- against their working
+# directory, not against this repository's root, which is where `brenn_pod_dir`
+# anchors one. The two differ in where a relative value can come from: that
+# knob's own default is relative and exported by the Makefile, so a value
+# arriving there may be one no human typed, and only the repository root makes
+# it name the same checkout from every directory. This one's default is already
+# absolute, so every relative value is one somebody typed at a prompt, and their
+# prompt is what they typed it against.
 speech_config=${REACHY_SPEECH_CONFIG:-${repo_root}/host/speech.toml}
 # Whether an operator named it, which is the whole difference between "not there
 # and that is the shipped state" and "not there and you asked for it".
@@ -389,6 +451,342 @@ speech_config_named=${REACHY_SPEECH_CONFIG:+named}
 # The two have to agree, and `tools/build-motion.test.sh` holds them to each
 # other.
 speech_config_path=host/speech.toml
+
+# ---------------------------------------------------------------------------
+# Reading the speech configuration
+# ---------------------------------------------------------------------------
+#
+# The speech configuration names files — the pod's key table, the bus token —
+# and endpoints, and two scripts have to know which: the build stages the files
+# it names, and the push asks whether any of them has moved on since. The real
+# loader is `speech-surface`'s and `reachy_host --check` runs it; what these
+# scripts need is four string values out of a file they never write, so this is
+# a reader and not a parser, and every shape it cannot read confidently is a
+# refusal rather than a guess.
+
+# One string value out of a TOML file, or empty when the file does not state it.
+#
+#   toml_table_value <file> <table> <key>
+#
+# The table is a header's name without its brackets (`brenn.bridge`), or the
+# empty string for the keys above the first header. Scoping is what keeps a
+# `url` under `[stt]` from answering for a `url` under `[tts]`.
+#
+# Keys and values may be bare, double-quoted or single-quoted, and a `#` inside
+# a quoted value is part of the value: a path truncated at a `#` is a plausible
+# wrong file, and a wrong file here is a credential the payload does not carry.
+# Escapes inside a basic string are not decoded — nothing this reads holds one.
+#
+# Seven shapes are refusals, because each of them has a reading this would get
+# wrong silently: a value whose quoting does not close; the same key stated
+# twice in one table (which of the two the host loads is not this reader's to
+# decide); a table header this cannot parse, which would file every key after it
+# under the wrong name; an array-of-tables header, whose keys belong to a table
+# no caller asks for; a dotted key inside the table being read, which states a
+# nested table this scoping does not descend into; an inline table there, whose
+# keys are on a line this reads as one value; and a multiline string anywhere in
+# the file, whose body this would read as TOML of its own. The last four are the
+# spellings that would otherwise read as *absent* — a staged payload with no
+# credential in it and nothing said. The refusal names the remedy: these four
+# keys want simple `key = "value"` spellings.
+#
+# A caller reads this through a command substitution, so the refusal's exit is
+# the subshell's: `value=$(toml_table_value ...) || exit 1`.
+toml_table_value() {
+	local file=$1 table=$2 want=$3 out status=0
+	local label="${table:+[${table}] }${want}"
+	out=$(awk -v table="$table" -v want="$want" '
+		# The line up to a comment marker outside quotes, or the whole line.
+		function strip_comment(line,   i, c, q, n) {
+			q = ""
+			n = length(line)
+			for (i = 1; i <= n; i++) {
+				c = substr(line, i, 1)
+				if (q != "") { if (c == q) q = "" }
+				else if (c == "\"" || c == "'\''") q = c
+				else if (c == "#") return substr(line, 1, i - 1)
+			}
+			return line
+		}
+		# Where the key ends and the value begins: the first = outside quotes.
+		function eq_index(line,   i, c, q, n) {
+			q = ""
+			n = length(line)
+			for (i = 1; i <= n; i++) {
+				c = substr(line, i, 1)
+				if (q != "") { if (c == q) q = "" }
+				else if (c == "\"" || c == "'\''") q = c
+				else if (c == "=") return i
+			}
+			return 0
+		}
+		function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+		# The contents of a quoted token, or the token itself. Both ends must
+		# agree: a half-quoted token is malformed, not a value with a stray mark.
+		function unquote(s,   c, n) {
+			n = length(s)
+			c = substr(s, 1, 1)
+			if (c == "\"" || c == "'\''") {
+				if (n >= 2 && substr(s, n, 1) == c)
+					return substr(s, 2, n - 2)
+				malformed = 1
+				return s
+			}
+			return s
+		}
+		BEGIN {
+			current = ""; hits = 0; value = ""; bad = 0
+			# The two multiline openers, assembled rather than
+			# written: three single quotes inside a shell-quoted
+			# program are unreadable at every later edit.
+			three_basic = "\"\"\""
+			three_literal = sprintf("%c%c%c", 39, 39, 39)
+		}
+		{
+			line = strip_comment($0)
+			head = trim(line)
+			if (substr(head, 1, 2) == "[[") { bad = 5; exit }
+			if (substr(head, 1, 1) == "[") {
+				if (substr(head, length(head), 1) != "]") { bad = 4; exit }
+				current = trim(substr(head, 2, length(head) - 2))
+				gsub(/^["'\'']|["'\'']$/, "", current)
+				next
+			}
+			eq = eq_index(line)
+			if (eq == 0) next
+			# A multiline string, in any table: this reads one line
+			# per value, so the body of one is read as TOML -- a
+			# bracketed line in it re-scopes every key after it and
+			# the keys wanted here go absent with nothing said.
+			# Refused wherever it is, because the damage is to the
+			# scope this walk keeps rather than to the value.
+			opener = trim(substr(line, eq + 1))
+			if (substr(opener, 1, 3) == three_basic ||
+			    substr(opener, 1, 3) == three_literal) { bad = 8; exit }
+			if (current != table) next
+			malformed = 0
+			raw_key = trim(substr(line, 1, eq - 1))
+			raw_val = trim(substr(line, eq + 1))
+			key = unquote(raw_key)
+			val = unquote(raw_val)
+			# A dotted key states a nested table and an inline table
+			# holds its keys on this one line: both are in the scope
+			# being read and neither is descended into, so a key
+			# spelled either way would read as absent.
+			if (raw_key == key && index(raw_key, ".") > 0) { bad = 6; exit }
+			if (substr(raw_val, 1, 1) == "{") { bad = 7; exit }
+			if (key != want) next
+			if (malformed) { bad = 2; exit }
+			hits++
+			if (hits > 1) { bad = 3; exit }
+			value = val
+		}
+		END {
+			if (bad) exit bad
+			if (hits == 1) print value
+		}
+	' "$file") || status=$?
+	case "$status" in
+	0) ;;
+	2)
+		die "cannot read ${label} from ${file}: the value's quoting does not close." \
+			"This reader takes a simple 'key = \"value\"' spelling and refuses the rest;" \
+			"it will not guess where a credential path ends."
+		;;
+	3)
+		die "${file} states ${label} twice, and which one the host would load is not this reader's to decide." \
+			"Leave one of them."
+		;;
+	4)
+		die "${file} has a table header this reader cannot parse." \
+			"Every key after it would be filed under the wrong table, so nothing is read."
+		;;
+	5)
+		die "${file} has an array-of-tables header, and this reader files keys under one table name." \
+			"Reading ${label} past it would answer from a table nothing asked for." \
+			"These four keys want plain '[table]' headers and simple 'key = \"value\"' lines."
+		;;
+	6)
+		die "${file} states a dotted key in the ${table:-top-level} table, which names a nested table this reader does not descend into." \
+			"Spelling ${label} that way would read as absent and stage no credential." \
+			"Write the nested table as its own '[table]' header instead."
+		;;
+	7)
+		die "${file} states an inline table in the ${table:-top-level} table, whose keys are all on one line." \
+			"Spelling ${label} that way would read as absent and stage no credential." \
+			"Write it as its own '[table]' header with simple 'key = \"value\"' lines."
+		;;
+	8)
+		die "${file} states a multiline string, and this reader takes one line per value." \
+			"Its body would be read as TOML: a bracketed line inside it files every key" \
+			"after it under a table nothing asked for, and ${label} would read as absent." \
+			"Write the multiline values in this file as single-line strings."
+		;;
+	*)
+		die "cannot read ${label} from ${file}."
+		;;
+	esac
+	printf '%s\n' "$out"
+}
+
+# The speech configuration's credential path fields, as `<table>\t<key>`.
+#
+# Both of them are optional and each is optional for its own reason: a
+# configuration with no `[brenn.bridge]` is a voiced, bus-less pipeline, which
+# is legal and stages no token.
+speech_credential_keys=(
+	$'\tpod_psk_file'
+	$'brenn.bridge\ttoken_file'
+)
+
+# Refuse a credential path the payload cannot carry.
+#
+#   check_credential_path <config> <key> <value>
+#
+# Every file the configuration names travels inside the payload and is named by
+# the payload-relative path it will occupy — which is also the path the host
+# resolves at run time, because the launcher starts it with the payload root as
+# its working directory. An absolute path is the workstation-era spelling: it would resolve on
+# the machine the payload was built on and name nothing on the unit.
+check_credential_path() {
+	local config=$1 key=$2 value=$3
+	case "$value" in
+	/*)
+		die "${key} in ${config} is the absolute path ${value}, and the payload carries its own credentials." \
+			"Name it relative to the payload root, with the file beside the configuration:" \
+			"a re-push then replaces it and the freshness check covers it. An absolute path" \
+			"resolves on this machine and names nothing on the unit."
+		;;
+	esac
+	case "/${value}/" in
+	*/../*)
+		die "${key} in ${config} is ${value}, which climbs out of the payload." \
+			"The file is staged at that path under the payload root and the host resolves it" \
+			"there; a path leaving the payload is a file no push carries."
+		;;
+	esac
+	case "$value" in
+	*/ | "")
+		die "${key} in ${config} is '${value}', which names no file."
+		;;
+	esac
+	# A `.` component or a doubled slash names the same file under a spelling
+	# nothing else uses. The collision check the build runs is textual --
+	# `./robotcpu.textproto` matches no member's name and installs over the
+	# member all the same, because the filesystem resolves what the compare
+	# did not. So the path has to name where it points to.
+	case "/${value}/" in
+	*/./* | *//*)
+		die "${key} in ${config} is ${value}, which carries a . or an empty component." \
+			"The payload's members are compared against this path by name, so a spelling" \
+			"that resolves to one of them without matching it would install a credential" \
+			"over a launcher config or a model. Name the file plainly."
+		;;
+	esac
+}
+
+# The credential files a speech configuration names, as
+# `<key>\t<payload-relative path>\t<source path>` lines, one per key it states.
+#
+#   speech_credential_paths <config>
+#
+# A configuration that is not there names nothing: a payload built without one
+# is the ordinary case, and the build refuses a *named* one that is missing
+# before this is ever asked. Every value that is there is checked here, so the
+# build and the push cannot disagree about which paths the payload's credentials
+# occupy.
+#
+# The source column is the other half of the assembly-directory convention: the
+# configuration names the path a file will occupy in the payload, and the file
+# itself sits beside the configuration under that same name. Emitted here rather
+# than re-joined at each call site, so the build's staging and the push's
+# freshness check cannot come to disagree about where a credential came from —
+# which would be a stale secret shipped under a green verdict.
+#
+# Read through a command substitution, as `toml_table_value` is.
+speech_credential_paths() {
+	local config=$1 entry table key value
+	[ -f "$config" ] || return 0
+	for entry in "${speech_credential_keys[@]}"; do
+		table=${entry%%$'\t'*}
+		key=${entry#*$'\t'}
+		value=$(toml_table_value "$config" "$table" "$key") || exit 1
+		[ -n "$value" ] || continue
+		check_credential_path "$config" "$key" "$value"
+		printf '%s\t%s\t%s\n' "$key" "$value" "$(dirname -- "$config")/${value}"
+	done
+}
+
+# The speech configuration's service endpoints, as `<table>\t<key>`.
+#
+# Both are optional for the same reason the credential fields are: a
+# configuration naming neither is a pipeline with no speech services, and a
+# table that is not there is asked nothing.
+speech_service_keys=(
+	$'stt\turl'
+	$'tts\turl'
+)
+
+# Refuse a service URL a remote command cannot safely carry.
+#
+#   check_service_url <config> <table> <value>
+#
+# The value is pasted into a command run on the unit as root, so what is
+# accepted is the shape of a URL and nothing else: a scheme this repo speaks and
+# a rest made of characters that mean the same thing to every shell between here
+# and there. A value that is something other than a URL is a refusal where it is
+# read rather than a quoting that has to hold at three sites.
+check_service_url() {
+	local config=$1 table=$2 value=$3
+	case "$value" in
+	http://?* | https://?*) ;;
+	*)
+		die "[${table}] url in ${config} is '${value}', which is not an http or https URL." \
+			"The speech run asks the unit to reach that address before it starts anything," \
+			"so the value has to be one a URL fetch can be pointed at."
+		;;
+	esac
+	case "$value" in
+	*[!A-Za-z0-9:/._~%-]*)
+		die "[${table}] url in ${config} is '${value}', which carries a character this cannot pass on." \
+			"That URL is pasted into a command run on the unit as root, so only" \
+			"[A-Za-z0-9:/._~%-] is accepted here — a service endpoint is a scheme, a host," \
+			"a port and a path, and nothing that means something to a shell."
+		;;
+	esac
+}
+
+# The speech services a configuration names, as `<table>\t<url>` lines, one per
+# table it states.
+#
+#   speech_service_urls <config>
+#
+# What the speech run's on-unit reachability preflight is built from: the
+# vantage that decides whether a pipeline can hear and speak is the robot's, and
+# a workstation-era `localhost` endpoint is the migration error that looks like
+# a deaf machine. A configuration that is not there names nothing.
+#
+# Trailing slashes come off here, once, because the caller appends a probe path:
+# a configured `http://host:8000/` would otherwise be asked for `//v1/models`,
+# and the 404 that comes back would be read as an address the robot cannot
+# reach.
+#
+# Read through a command substitution, as `toml_table_value` is.
+speech_service_urls() {
+	local config=$1 entry table key value
+	[ -f "$config" ] || return 0
+	for entry in "${speech_service_keys[@]}"; do
+		table=${entry%%$'\t'*}
+		key=${entry#*$'\t'}
+		value=$(toml_table_value "$config" "$table" "$key") || exit 1
+		[ -n "$value" ] || continue
+		check_service_url "$config" "$table" "$value"
+		while [ "${value%/}" != "$value" ]; do
+			value=${value%/}
+		done
+		printf '%s\t%s\n' "$table" "$value"
+	done
+}
 
 # Refuse a payload member whose out-of-tree source has moved on since the build
 # staged it.
@@ -481,4 +879,21 @@ report_verdict() {
 	local run_dir=$1
 	shift
 	"$bazel" run "${build_flags[@]}" -- "$report_target" "$@" "$run_dir"
+}
+
+# The analyzer of a speech run, which reads the console side of a fetch rather
+# than the records: what a supervised session holds depends on what a person
+# said to the robot, so the pipeline's own narration is the evidence and the
+# motion analyzer's grid arithmetic has nothing to say about it.
+speech_report_target=//cogs:speech_run_report
+
+# Judge a speech run's fetch, and let the analyzer's verdict be the caller's.
+#
+#   speech_verdict <fetched records directory>
+#
+# The argument is the fetch's own directory, not a run directory inside it: the
+# analyzer names the console beside it from that spelling. Host tool over a
+# stopped log, so it builds in the default configuration, like `report_verdict`.
+speech_verdict() {
+	"$bazel" run "${build_flags[@]}" -- "$speech_report_target" "$1"
 }

@@ -41,6 +41,7 @@ use reachy_edge::{
     DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
     Surface, edge_line_with, now,
 };
+use reachy_host::check;
 use reachy_host::edge::{Console, Publishing};
 use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
@@ -72,6 +73,13 @@ struct Options {
     /// two are different formats owned by different repositories — this repo's
     /// textproto for the edge, the pod platform's TOML for the pipeline.
     speech_config: Option<PathBuf>,
+    /// Load both configurations, look for every file they name, and exit —
+    /// without binding a port, starting a pipeline or touching a robot.
+    ///
+    /// What the deploy step runs over a staged payload, with that payload's
+    /// root as the working directory, so the relative paths the unit will
+    /// resolve are the ones resolved here.
+    check: bool,
 }
 
 impl Default for Options {
@@ -79,6 +87,7 @@ impl Default for Options {
         Self {
             config: PathBuf::from(DEFAULT_CONFIG),
             speech_config: None,
+            check: false,
         }
     }
 }
@@ -86,7 +95,7 @@ impl Default for Options {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-host [--config PATH] [--speech-config PATH]\n\
+        "usage: reachy-host [--config PATH] [--speech-config PATH] [--check]\n\
          \n\
          Runs the robot's voice host: binds {REPORTS_OUT_PORT} on loopback, follows the\n\
          session's story, and sends compiled scripts to {SCRIPTS_IN_PORT}. One line of JSON\n\
@@ -96,6 +105,11 @@ fn usage() -> String {
          this process too, and the scripter's decisions and the bus's motion channel both\n\
          meet the gate above. Without the flag, or with a path nothing has been pushed to\n\
          yet, the host runs its edge half alone and says which of the two it is.\n\
+         \n\
+         With --check the process instead loads both configurations, looks for every file\n\
+         they name relative to the working directory, prints one line of JSON per\n\
+         conclusion and exits: zero when everything loaded and every file is there. It\n\
+         binds nothing and prints no file's contents.\n\
          \n\
          Nothing is retried and nothing is persisted. A configuration that does not parse,\n\
          a clip name table that is not there and a port already held are each a nonzero\n\
@@ -107,15 +121,16 @@ fn usage() -> String {
 
 fn main() -> ExitCode {
     match parse(std::env::args().skip(1)) {
+        Ok(options) if options.check => checked(&options),
         Ok(options) => match run(&options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("reachy-host: {message}");
+                eprintln!("{}{message}", reachy_host::REFUSAL_PREFIX);
                 ExitCode::FAILURE
             }
         },
         Err(message) => {
-            eprintln!("reachy-host: {message}\n\n{}", usage());
+            eprintln!("{}{message}\n\n{}", reachy_host::REFUSAL_PREFIX, usage());
             ExitCode::FAILURE
         }
     }
@@ -123,7 +138,7 @@ fn main() -> ExitCode {
 
 /// What the invocation asks for.
 ///
-/// Two optional flags, each naming a path. A word this does not know is a
+/// Three optional flags, two of them naming a path. A word this does not know is a
 /// refusal rather than something ignored: a host run on the shipped
 /// configuration when an operator meant a unit's own would answer to the wrong
 /// pod name.
@@ -145,6 +160,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
                 let value = path_once(&word, args.next(), &mut speech_given)?;
                 options.speech_config = Some(PathBuf::from(value));
             }
+            "--check" => {
+                if options.check {
+                    return Err("--check was given twice".to_owned());
+                }
+                options.check = true;
+            }
             other => return Err(format!("`{other}` is not an option this takes")),
         }
     }
@@ -162,6 +183,42 @@ fn path_once(flag: &str, value: Option<String>, given: &mut bool) -> Result<Stri
     }
     *given = true;
     Ok(value)
+}
+
+/// Say what both configurations would load, and exit on whether they would.
+///
+/// The empty base is what makes this the run's own question: a relative path
+/// joins to itself and so resolves against this process's working directory,
+/// which the deploy step sets to the staged payload's root — the directory the
+/// launcher will run the host from on the unit.
+fn checked(options: &Options) -> ExitCode {
+    if write_check(&mut io::stdout().lock(), options, Path::new("")) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The conclusions onto `out`, and whether the run could start on them.
+///
+/// Written to a handed-in sink and given the base as an argument, because what
+/// this decides is a gate: the deploy step refuses a speech run on this exit
+/// status, so an inverted answer is a host that exits at start on a unit with a
+/// person in front of it. A case can hold both halves of that here — the status
+/// and the one line of JSON per conclusion an operator and the fetched log both
+/// read — without a process and without a working directory of its own.
+///
+/// # Panics
+///
+/// If the sink cannot be written, which for the caller's stdout is a console
+/// that has gone away mid-preflight.
+fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool {
+    let found = check::inspect(&options.config, options.speech_config.as_deref(), base);
+    let at = now();
+    for conclusion in &found {
+        writeln!(out, "{}", check::conclusion_line(conclusion, at)).expect("a writable stream");
+    }
+    check::settled(&found)
 }
 
 /// Read the configuration and the name table, hold the ports, run.
@@ -420,7 +477,7 @@ fn names(settings: &HostSettings) -> Result<MotionTable, String> {
 /// What this host is, as the first line of its stream.
 fn started_line(settings: &HostSettings, config: &Path, at: SyncTime) -> String {
     edge_line_with(
-        "started",
+        reachy_host::STARTED,
         at,
         &format!(
             "the voice host answers for `{}`, configured by {}; reports on {REPORTS_OUT_PORT}, \
@@ -654,6 +711,7 @@ mod tests {
             Ok(Options {
                 config: PathBuf::from(DEFAULT_CONFIG),
                 speech_config: None,
+                check: false,
             }),
         );
     }
@@ -665,6 +723,7 @@ mod tests {
             Ok(Options {
                 config: PathBuf::from("/run/reachy/host_params.textproto"),
                 speech_config: None,
+                check: false,
             }),
         );
     }
@@ -693,6 +752,113 @@ mod tests {
                 .expect("a named speech configuration")
                 .speech_config,
             Some(PathBuf::from("/run/reachy/speech.toml")),
+        );
+    }
+
+    #[test]
+    fn the_check_flag_is_asked_for_and_asked_for_once() {
+        // The flag that makes this a preflight instead of a host: no path, and
+        // a run that never binds a port.
+        assert!(!parsed(&[]).expect("no arguments").check);
+        assert!(
+            parsed(&["--check", "--speech-config", "host/speech.toml"])
+                .expect("a preflight over a named speech configuration")
+                .check
+        );
+        let refused = parsed(&["--check", "--check"]).expect_err("a repeated flag");
+        assert!(refused.contains("--check"), "{refused}");
+    }
+
+    /// A host configuration this build reads, in `dir`, with its clip table.
+    ///
+    /// Named relative to `dir`, which is the base the cases below hand the
+    /// check: what a payload's own configuration names, resolved the way the
+    /// unit resolves it.
+    fn checkable(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("host_params.textproto");
+        std::fs::write(
+            &path,
+            "pod: \"fixture-reachy\"\n\
+             stow_duration_ms: 3000\n\
+             body_cap_bytes: 8192\n\
+             clip_names_path: \"clip_library.names.json\"\n",
+        )
+        .expect("a file");
+        std::fs::write(dir.join("clip_library.names.json"), "{\"names\": []}\n").expect("a file");
+        path
+    }
+
+    /// Every line `write_check` printed for these options, over this base.
+    fn checked_lines(options: &Options, base: &std::path::Path) -> (bool, Vec<String>) {
+        let mut out: Vec<u8> = Vec::new();
+        let settled = super::write_check(&mut out, options, base);
+        let text = String::from_utf8(out).expect("the conclusions are text");
+        (
+            settled,
+            text.lines().map(std::borrow::ToOwned::to_owned).collect(),
+        )
+    }
+
+    #[test]
+    fn a_payload_carrying_everything_its_configurations_name_checks_out() {
+        // The gate the deploy step refuses a speech run on. An inverted answer
+        // here is a host that exits at start on a unit with a person in front
+        // of it, so the status and what it printed are both the case's.
+        let dir = scratch_dir("reachy-host-checked-clean");
+        let config = checkable(dir.as_ref());
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        let options = Options {
+            config,
+            speech_config: Some(speech),
+            check: true,
+        };
+
+        let (settled, lines) = checked_lines(&options, dir.as_ref());
+        assert!(settled, "{lines:?}");
+        assert!(lines.len() > 1, "{lines:?}");
+        for line in &lines {
+            let object: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|_| panic!("one line of JSON: {line}"));
+            assert_eq!(object["stream"], "check", "{line}");
+            assert_eq!(object["held"], true, "{line}");
+        }
+        let verdict: serde_json::Value =
+            serde_json::from_str(lines.last().expect("a verdict")).expect("JSON");
+        assert_eq!(verdict["kind"], "checked");
+    }
+
+    #[test]
+    fn a_payload_missing_a_file_its_configuration_names_does_not() {
+        let dir = scratch_dir("reachy-host-checked-missing");
+        let config = checkable(dir.as_ref());
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        std::fs::remove_file(dir.join("bus.token")).expect("the fixture's token file");
+        let options = Options {
+            config,
+            speech_config: Some(speech),
+            check: true,
+        };
+
+        let (settled, lines) = checked_lines(&options, dir.as_ref());
+        assert!(!settled, "{lines:?}");
+        let verdict: serde_json::Value =
+            serde_json::from_str(lines.last().expect("a verdict")).expect("JSON");
+        assert_eq!(verdict["kind"], "checked");
+        assert_eq!(verdict["held"], false);
+        assert!(
+            verdict["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("brenn.bridge.token_file"),
+            "{verdict}",
         );
     }
 

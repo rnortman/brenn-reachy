@@ -15,6 +15,42 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
+# The gitignored local configuration: everything a workstation always says the
+# same way, so a session types no variables at all.
+#
+#     REACHY_HOST ?= reachy00
+#     REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
+#
+# Read unconditionally, because it carries more than one variable and a guard on
+# any single one would silently drop the rest. The precedence the file wants is
+# `?=` per line: make's conditional assignment yields to both a command-line and
+# an environment value, and wins over every default in this file. A legacy `=`
+# line still works and still yields to the command line, but shadows an
+# environment value — make's own ordering, not something worked around here.
+#
+# Read here, ahead of every `?=` in this file, so that "wins over the defaults"
+# is true of all of them: a `?=` parsed before the include is already set when
+# the include lands, and the file's line for it would be a silent no-op.
+-include .local/reachy.conf
+
+# The operator's speech configuration, for the payload's voice half. The
+# variable is read by the scripts rather than by any recipe, so a value the
+# conf file supplies has to be exported to reach them; one already in the
+# environment is left exactly as it is.
+ifdef REACHY_SPEECH_CONFIG
+export REACHY_SPEECH_CONFIG
+endif
+
+# The brenn-pod checkout, read for two things a speech run needs: the prebuilt
+# audio-device binary the payload stages, and the provisioning target that
+# writes the pod's link credentials onto the unit. The default is the sibling
+# layout the two repos are worked on in.
+#
+# Exported for the same reason the speech configuration is: `tools/lib.sh` reads
+# it, and the scripts are children of a recipe.
+BRENN_POD_DIR ?= ../brenn-pod
+export BRENN_POD_DIR
+
 .PHONY: help
 help:
 	@echo "Repo-root targets:"
@@ -37,6 +73,9 @@ help:
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
 	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
+	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
+	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
+	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
 
 # The shell half of the gate. These scripts push binaries and configuration onto
 # real hardware and drop privileges there, and they already carry
@@ -108,9 +147,14 @@ check-scripts:
 # there. And a just-written script routinely carries no mode bit, where
 # `Permission denied` on a program nobody asked to run reads like a broken gate
 # rather than like one `chmod` away from green.
+#
+# The list is read on a descriptor of its own and each script runs with stdin
+# closed: a suite that reads stdin — one spawning a pty, one feeding a subject —
+# would otherwise swallow the rest of the list, and the lane would report green
+# having run the suites up to that one and none after it.
 .PHONY: test-scripts
 test-scripts:
-	@while IFS= read -r -d '' script; do \
+	@while IFS= read -r -d '' -u 3 script; do \
 	    echo "$$script"; \
 	    [ -f "$$script" ] || { \
 	        echo "$$script is tracked but missing from the working tree:" >&2; \
@@ -122,8 +166,8 @@ test-scripts:
 	        echo "    chmod +x $$script" >&2; \
 	        exit 1; \
 	    }; \
-	    "./$$script"; \
-	done < <(git ls-files -z --cached --others --exclude-standard '*.test.sh')
+	    "./$$script" </dev/null; \
+	done 3< <(git ls-files -z --cached --others --exclude-standard '*.test.sh')
 
 # The whole gate, one lane: the shell scripts' own checks, then every Bazel
 # target in the tree — the eight Rust crates with their tests, the `.clk` schema
@@ -292,18 +336,6 @@ motion-host-run: require-bazel
 # brenn-os carries no compiler, and its flash is not somewhere a toolchain gets
 # installed.
 
-# The unit these targets talk to. Named for one invocation on the command line
-# first, and in the gitignored .local/reachy.conf second, so a workstation that
-# always talks to the same unit says so once:
-#
-#     echo 'REACHY_HOST=reachy00' > .local/reachy.conf
-#
-# The file is only read when the variable is not already set, so an override for
-# one invocation stays an override for one invocation.
-ifeq ($(origin REACHY_HOST), undefined)
--include .local/reachy.conf
-endif
-
 # The bench's configuration for this unit. Gitignored: it holds the serial node
 # this machine's servos are on.
 BENCH_CONFIG ?= .local/reachy-bench.toml
@@ -321,7 +353,7 @@ device-host:
 	    echo "Name the unit for this invocation:" >&2; \
 	    echo "    make $(MAKECMDGOALS) REACHY_HOST=<hostname>" >&2; \
 	    echo "or once, in the gitignored .local/reachy.conf:" >&2; \
-	    echo "    REACHY_HOST=<hostname>" >&2; \
+	    echo "    REACHY_HOST ?= <hostname>" >&2; \
 	    exit 1; \
 	}
 
@@ -417,8 +449,7 @@ motion-deploy: device-host motion-build
 
 # Build, push, run, fetch, judge. The run is given a fixed budget and stopped by
 # it; the launcher's console streams here meanwhile, and this target's verdict is
-# `first_motion_report`'s over the records it brought back. The runbook's manual
-# appendix is the same run started by hand.
+# `first_motion_report`'s over the records it brought back.
 #
 # Needs a reachable unit and bazel — the analyzer runs here, over the fetched log.
 .PHONY: motion-run
@@ -430,3 +461,68 @@ motion-run: device-host motion-deploy require-bazel
 .PHONY: motion-fetch
 motion-fetch: device-host
 	tools/deploy-motion.sh $(REACHY_HOST) --fetch $(MOTION_RECORDS)
+
+# ---------------------------------------------------------------------------
+# The speech run: the whole voice pipeline, on the unit, with a person talking
+# to it.
+#
+# The same build and the same push as a motion run — one payload, one deploy
+# path — and a different launcher config on the far end: the production one,
+# which starts the voice host and the audio device beside the motion stack. What
+# is different here is the ending. A motion run is stopped by its budget; a
+# speech run is stopped by the operator, because how long a conversation takes
+# is not a number this repo knows. That is also why it refuses to start without
+# a terminal to receive the ^C.
+#
+# The build stays speech-optional, so there is no `speech-build`: what a payload
+# needs to be a pipeline is the operator's own speech configuration, named by
+# `REACHY_SPEECH_CONFIG`, and the refusals that say so live in the run.
+
+# Where fetched speech runs accumulate. Separate from MOTION_RECORDS by default:
+# the two are read by different analyzers, and the fetch names each for the kind
+# of run it came off.
+SPEECH_RECORDS ?= .local/speech-logs
+
+# The pod's half of the voice link: brenn-pod's provisioning, invoked from here
+# with the arrangement a speech run implies. A real target an operator can run
+# alone, and the point of it is that nobody has to — `speech-run` runs it first,
+# every time. It is idempotent and cheap, and `audio.conf` lives on tmpfs, so a
+# rebooted unit is indistinguishable from a warm one at the prompt.
+.PHONY: speech-provision
+speech-provision: device-host
+	tools/provision-speech.sh $(REACHY_HOST)
+
+# Provision, build, push, preflight, run, fetch, judge. The preflights are the
+# migration errors this arrangement invites — a speech configuration the payload
+# does not carry, one the host itself would refuse, a speech service the robot
+# cannot reach — and each is refused before the launcher starts rather than
+# discovered by talking to a machine that cannot answer.
+#
+# Needs a reachable unit and bazel: the configuration check and the report both
+# run here.
+#
+# The steps are recipe lines rather than prerequisites, and their order is
+# load-bearing: on a first run against a fresh assembly directory, provisioning
+# is what *writes* the PSK table the build then stages, and a build that ran
+# first would refuse a named-but-missing credential. Make guarantees left-to-
+# right prerequisite execution only for a serial make — under `-j`, typed or
+# inherited through MAKEFLAGS, two prerequisites are independent goals that can
+# race — while recipe lines run in order under any `-j`.
+#
+# The terminal check leads, ahead of the provisioning that writes to the unit
+# and the build that takes minutes: a run started from something with no
+# terminal is refused whatever else happened, so it is refused before anything
+# else happens.
+.PHONY: speech-run
+speech-run: device-host require-bazel
+	tools/deploy-motion.sh $(REACHY_HOST) --speech-preflight
+	$(MAKE) speech-provision
+	$(MAKE) motion-deploy
+	tools/deploy-motion.sh $(REACHY_HOST) --speech $(SPEECH_RECORDS)
+
+# Bring a speech run's records back — the run whose terminal died, or whose
+# report is wanted a second time. Each fetch lands under its own timestamped
+# directory, as a motion fetch does.
+.PHONY: speech-fetch
+speech-fetch: device-host
+	tools/deploy-motion.sh $(REACHY_HOST) --speech-fetch $(SPEECH_RECORDS)

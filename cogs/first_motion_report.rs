@@ -74,6 +74,7 @@ use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, TrackingFaultConfig,
 };
 use reachy_motion::value;
+use run_report::{Report, verdict};
 
 /// How far the head may be from the posture it was sent to, in metres, and still
 /// count as having arrived.
@@ -372,31 +373,6 @@ impl Run {
             .iter()
             .find(|channel| channel.name == name)
             .map_or(0, |channel| channel.count)
-    }
-}
-
-/// The report as it is being built: what the run failed, and what it measured.
-///
-/// Two lists rather than one, because they are read for different reasons. A
-/// finding is a claim about the run that did not hold and is what the exit
-/// status is about; a measurement is a number the run produced, printed whether
-/// the run passed or not. A first hardware run that fails is exactly the run
-/// whose numbers somebody needs.
-#[derive(Default)]
-struct Report {
-    findings: Vec<String>,
-    measured: Vec<String>,
-}
-
-impl Report {
-    /// One way the run did not do what it claims to have done.
-    fn fail(&mut self, what: impl Into<String>) {
-        self.findings.push(what.into());
-    }
-
-    /// One number the run produced.
-    fn note(&mut self, what: impl Into<String>) {
-        self.measured.push(what.into());
     }
 }
 
@@ -2554,22 +2530,12 @@ fn main() -> ExitCode {
         ..run
     };
     let report = analyze(&run);
-    println!("first_motion_report over {log_dir}");
-    for line in &report.measured {
-        println!("{line}");
-    }
-    if report.findings.is_empty() {
-        println!("the wake gesture happened, whole");
-        return ExitCode::SUCCESS;
-    }
-    for finding in &report.findings {
-        eprintln!("first_motion_report: {finding}");
-    }
-    eprintln!(
-        "first_motion_report: {} findings over {log_dir}",
-        report.findings.len()
-    );
-    ExitCode::FAILURE
+    verdict(
+        "first_motion_report",
+        log_dir,
+        &report,
+        "the wake gesture happened, whole",
+    )
 }
 
 #[cfg(test)]

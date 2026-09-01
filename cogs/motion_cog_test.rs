@@ -2900,9 +2900,10 @@ const STARTUP_GRACE_NS: i64 = 2_000_000_000;
 /// in no particular way, nanoseconds.
 ///
 /// A budget and not a measurement: the adverse ordering it exists for -- the
-/// session up first, the driver late -- has not been observed. What the runs
-/// `docs/bench-runbook.md` records do show is the opposite ordering, the
-/// control process last by up to ~275 ms behind the driver's first logged line.
+/// session up first, the driver late -- has not been observed. Three
+/// consecutive `make motion-run`s on `reachy00`, 2026-08-29, show the opposite
+/// ordering: the control process last, by 268-276 ms behind the driver's first
+/// logged line.
 /// One second is ~3.6x that, deliberately wide because the term is a scheduler
 /// property with no derivable ceiling and the observation bounds a healthy unit
 /// in the benign direction only.

@@ -174,11 +174,19 @@ fn finite(detail: f64) -> Value {
     }
 }
 
+/// How a kind this build has no word for is spelled, ahead of its number.
+///
+/// Exported because the words are read outside this tree: `//cogs:speech_run_report`
+/// separates the kinds it can count from the ones it can only carry by this
+/// prefix, and a spelling restated there would drift without either side
+/// noticing.
+pub const UNKNOWN_KIND_PREFIX: &str = "kind_";
+
 /// A report kind's own word, or the number where this build has no word for it.
 fn kind_name(kind: ReportKindWire) -> String {
     match kind.to_known() {
         Some(known) => known_kind(known).to_owned(),
-        None => format!("kind_{}", kind.0),
+        None => format!("{UNKNOWN_KIND_PREFIX}{}", kind.0),
     }
 }
 

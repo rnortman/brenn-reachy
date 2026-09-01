@@ -62,14 +62,28 @@
 # Knobs, environment only:
 #
 #   REACHY_BAZEL           the bazel to run (default bazel)
-#   REACHY_POD_BINARY      the prebuilt audio-device binary to stage (default: the
-#                          one a sibling brenn-pod checkout's payload build leaves
-#                          behind)
+#   BRENN_POD_DIR          the brenn-pod checkout the prebuilt audio-device
+#                          binary is taken from (default: ../brenn-pod; a
+#                          relative value is relative to this repository's root)
+#   REACHY_POD_BINARY      the prebuilt audio-device binary to stage, overriding
+#                          that resolution for the file alone (default: the one
+#                          BRENN_POD_DIR's payload build leaves behind)
 #   REACHY_SPEECH_CONFIG   the voice pipeline's own configuration to stage
 #                          (default: the gitignored host/speech.toml of this
 #                          tree; a payload built without one carries no speech
 #                          configuration, which is a host that narrates and does
-#                          not listen)
+#                          not listen). The credential files it names are staged
+#                          with it, from beside it — see the assembly directory
+#                          below.
+#
+# A speech configuration is not one file but a small directory: the TOML, and
+# the credential files it names — the pod's key table, the bus token — beside
+# it. The TOML names them by the payload-relative paths they will occupy, which
+# are also the paths the host resolves at run time, because the launcher starts
+# it with the payload root as its working directory. This script stages them
+# into the payload for the reason it stages `reachy_pod` there: a payload member
+# that arrived by a different route would be the one file whose freshness,
+# machine and digest nothing checked.
 
 set -euo pipefail
 
@@ -232,7 +246,7 @@ check_launcher_apps() {
 	[ "$named" = "${expected[*]}" ] || die \
 		"${config##*/} names the apps '${named:-nothing}' and the run needs '${expected[*]}'." \
 		"Those names are what the launcher calls each process's log file, and" \
-		"docs/bench-runbook.md names one tail command per name. A process renamed in" \
+		"docs/bench-runbook.md names each app's log file. A process renamed in" \
 		"a composition, or an app merged in under another name, has to be renamed there too."
 }
 
@@ -319,6 +333,76 @@ resolve_models() {
 			"MODULE.bazel's fetches and build-motion.sh's model_paths describe one set."
 }
 
+# The payload paths this script installs from a name of its own rather than from
+# a resolved plan: the binaries at the root, the two launcher configs, the
+# launcher's prelaunch script, the speech configuration and the build stamp. The
+# push writes one more, `provenance.txt`, into the same directory.
+#
+# They are listed for one purpose — deciding whether a credential file the
+# speech configuration names would land on top of one of them. Nothing else
+# reads this, and the members themselves are installed by `stage` by name,
+# because an unlabelled argument list is where two cross-built binaries get
+# transposed.
+payload_fixed_members=(
+	reachy_motord
+	reachy_host
+	reachy_pod
+	reachy_ask
+	libonnxruntime.so.1
+	simplelaunch
+	robotcpu.textproto
+	robotcpu_harness.textproto
+	cogs/robot_clk_exe
+	clockwork/launch/clockwork_prelaunch.sh
+	"$provenance_name"
+	"$speech_config_path"
+	"$build_commit_name"
+)
+
+# The credential files the staged speech configuration names, as `<absolute
+# source>\t<path under the payload root>`, in the shape `plan_files` uses.
+speech_credentials=()
+
+# Resolve them, and refuse everything about them that cannot be staged.
+#
+# Run after `plan` and `resolve_models`, because the collision question is asked
+# against the payload members those two resolved: a credential path that lands
+# on a model or a cog's configuration would be a file the payload carries under
+# a name something else reads, and the loser depends on install order. Still
+# before `stage`, so every refusal here leaves the previous payload alone.
+#
+# The source is beside the configuration, because the configuration names the
+# path the file will occupy in the payload rather than the path it occupies now.
+# That is the assembly-directory convention: one directory holds the TOML and
+# its credentials, and it is also what brenn-pod's provisioning is pointed at,
+# so the two sides of the pod's key link keep deriving from one source.
+resolve_speech_credentials() {
+	local listing key value src entry
+	speech_credentials=()
+	listing=$(speech_credential_paths "$speech_config") || exit 1
+	while IFS=$'\t' read -r key value src; do
+		[ -n "$key" ] || continue
+		for entry in "${payload_fixed_members[@]}"; do
+			[ "$entry" = "$value" ] || continue
+			die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
+				"The credential would be installed over ${value}, or under it; name it something" \
+				"the payload does not already carry."
+		done
+		for entry in "${plan_files[@]}" "${model_files[@]}"; do
+			[ "${entry#*$'\t'}" = "$value" ] || continue
+			die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
+				"The credential would be installed over ${value}, or under it; name it something" \
+				"the payload does not already carry."
+		done
+		[ -f "$src" ] ||
+			die "${speech_config} names ${key} = ${value} and there is no file at ${src}." \
+				"The credential files a speech configuration names live beside it, under the" \
+				"payload-relative paths it spells: that is the directory the payload is staged" \
+				"from and the one brenn-pod's provisioning writes the key table into."
+		speech_credentials+=("${src}"$'\t'"${value}")
+	done <<<"$listing"
+}
+
 # The commit the payload's binaries came out of, into the payload itself.
 #
 #   stamp_build_commit <file>
@@ -399,6 +483,13 @@ stage() {
 		install -m 0600 -D -- "$speech_config" "${staging}/${speech_config_path}"
 	fi
 
+	# Credentials (the pod's key table, the bus token): mode 0600 so only
+	# the payload's account reads them. `rsync -a` carries the mode to the
+	# unit.
+	for entry in "${speech_credentials[@]}"; do
+		install -m 0600 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
+	done
+
 	stamp_build_commit "${staging}/${build_commit_name}"
 
 	if [ -e "$payload" ]; then
@@ -429,6 +520,13 @@ report() {
 	else
 		echo "${prog}: ${speech_config_path}  absent; the voice host will run its edge half alone"
 	fi
+	# The credential files that configuration names, path only and no digest,
+	# for the reason the configuration itself gets none: what a person needs at
+	# the bench is which files this payload carries and where they came from.
+	local entry
+	for entry in "${speech_credentials[@]}"; do
+		echo "${prog}: ${entry#*$'\t'}  staged from ${entry%%$'\t'*}"
+	done
 }
 
 require_bazel "device payload"
@@ -465,8 +563,10 @@ onnx_out="${execroot}/$(bazel_files "$onnx_target")"
 # be trying.
 [ -f "$pod_binary" ] ||
 	die "there is no audio-device binary at ${pod_binary}." \
-		"It is brenn-pod's to build: run 'make -C ../brenn-pod/firmware reachy-pod'" \
-		"in a checkout of that repo, or name the artifact with REACHY_POD_BINARY."
+		"It is brenn-pod's to build: run 'make -C ${brenn_pod_dir}/firmware reachy-pod'" \
+		"in that checkout. If brenn-pod is somewhere else, BRENN_POD_DIR names the" \
+		"checkout — for this invocation or once in the gitignored .local/reachy.conf —" \
+		"and REACHY_POD_BINARY names a bare artifact copied out of a build elsewhere."
 # The other member from outside the build, decided in the same place. Only the
 # named case can refuse: an unnamed one that is not there is a payload whose
 # host narrates and does not listen, which is what a unit runs until somebody
@@ -492,5 +592,6 @@ verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
 verify_aarch64 "$onnx_out"
 plan "$built" "$configs"
+resolve_speech_credentials
 stage
 report

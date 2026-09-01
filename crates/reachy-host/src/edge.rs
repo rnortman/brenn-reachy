@@ -146,7 +146,7 @@ const fn severity(severity: Severity) -> AlertSeverity {
 /// interrupted by it.
 fn unpublished_line(alert: &Alert, refused: AlertRefused, at: SyncTime) -> String {
     edge_line_with(
-        "unpublished",
+        crate::words::UNPUBLISHED,
         at,
         &format!(
             "the alert `{}` was not carried to the bus: {refused}. nothing is retried; the \

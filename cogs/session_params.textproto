@@ -39,8 +39,9 @@ sample_stale_after: 5
 # skew allowance, the driver's init budget and two grid periods, so a grace cut
 # under the terms it has to cover, or a driver that grows what it does before
 # its first cycle, fails at `make check`. The driver-side terms are figures the
-# tree states; the skew allowance is a budget, wider than any spread the
-# 2026-08-29 launcher consoles show, and `docs/bench-runbook.md` records those.
+# tree states; the skew allowance is a budget of one second, wider than any
+# spread a launcher console has shown — three runs on `reachy00`, 2026-08-29,
+# put the two process starts 268-276 ms apart.
 #
 # Only the first sample is budgeted here. Once samples are flowing,
 # `sample_stale_after` above is what declares a driver that died, and it is

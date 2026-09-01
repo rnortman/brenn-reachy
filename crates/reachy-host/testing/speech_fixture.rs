@@ -63,6 +63,33 @@ fn quoted(path: &Path) -> String {
     format!("\"{text}\"")
 }
 
+/// How a fixture spells the paths of the files it names.
+///
+/// A configuration written for a workstation names its files absolutely; one
+/// written for the payload names them relative to the directory the host runs
+/// in. Both are configurations the loader accepts, and the difference is what
+/// the deployment preflight is about, so the fixture states it rather than
+/// leaving each case to rewrite the file it was handed.
+#[derive(Debug, Clone, Copy)]
+pub enum Naming {
+    /// Absolute paths, as a workstation's own configuration carries.
+    Absolute,
+    /// Paths relative to the directory the fixture is written into, which is
+    /// what a payload member's configuration carries.
+    PayloadRelative,
+}
+
+impl Naming {
+    /// `path`, spelled the way this naming spells it. `name` is the file's name
+    /// inside the fixture's directory.
+    fn spell(self, path: &Path, name: &str) -> String {
+        match self {
+            Naming::Absolute => quoted(path),
+            Naming::PayloadRelative => format!("\"{name}\""),
+        }
+    }
+}
+
 /// A speech configuration the pod platform will run, written into `dir`.
 ///
 /// Everything it names is inside that directory and nothing it names is on a
@@ -75,6 +102,15 @@ fn quoted(path: &Path) -> String {
 /// If the directory cannot be written, which is a test that cannot use the
 /// machine it is running on.
 pub fn runnable(dir: &Path, events: Events<'_>) -> PathBuf {
+    runnable_named(dir, events, Naming::Absolute)
+}
+
+/// The same fixture, spelling the files it names the way `naming` says.
+///
+/// # Panics
+///
+/// If the directory cannot be written.
+pub fn runnable_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf {
     let keys = dir.join("psk.toml");
     speech_surface::psk::write_secret_file(&keys, &format!("fixture-pod = \"{KEY}\"\n"))
         .expect("a key table");
@@ -86,13 +122,71 @@ pub fn runnable(dir: &Path, events: Events<'_>) -> PathBuf {
              pod_psk_file = {}\n\
              [record]\nenabled = false\n\
              [jsonl]\nsink = {}\n",
-            quoted(&keys),
+            naming.spell(&keys, "psk.toml"),
             events.sink(),
         ),
     )
     .expect("a file");
     path
 }
+
+/// The same fixture with every model path a configuration can name.
+///
+/// A `[wake]` table with its three openWakeWord models, an `[endpointer]` with
+/// the VAD model, and a `[brain]` answering every utterance with a clip: the
+/// five path fields beside the two credential ones, each naming a file of its
+/// own so a check that looks at the wrong struct member names the wrong file.
+/// Every one of them is written, so a case that wants one missing removes it.
+///
+/// Nothing here is a real model — they are bytes at a path, which is all a
+/// presence check reads. No `[brenn]`, so this composes without a bus.
+///
+/// # Panics
+///
+/// If the directory cannot be written.
+pub fn modelled_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf {
+    let path = runnable_named(dir, events, naming);
+    let named = |name: &str| -> String {
+        let at = dir.join(name);
+        std::fs::write(&at, b"not a model").expect("a file");
+        naming.spell(&at, name)
+    };
+    let melspectrogram = named(WAKE_MELSPECTROGRAM);
+    let embedding = named(WAKE_EMBEDDING);
+    let wake_model = named(WAKE_MODEL);
+    let endpointer = named(ENDPOINTER_MODEL);
+    let clip = named(BRAIN_CLIP);
+    let text = std::fs::read_to_string(&path).expect("the fixture");
+    std::fs::write(
+        &path,
+        format!(
+            "{text}\
+             [wake]\nmode = \"oww\"\n\
+             melspectrogram = {melspectrogram}\n\
+             embedding = {embedding}\n\
+             model = {wake_model}\n\
+             [endpointer]\nmodel = {endpointer}\n\
+             [brain]\nmode = \"wav\"\nclip = {clip}\n",
+        ),
+    )
+    .expect("a file");
+    path
+}
+
+/// The file `wake.melspectrogram` names in [`modelled_named`].
+pub const WAKE_MELSPECTROGRAM: &str = "wake-melspectrogram.onnx";
+
+/// The file `wake.embedding` names in [`modelled_named`].
+pub const WAKE_EMBEDDING: &str = "wake-embedding.onnx";
+
+/// The file `wake.model` names in [`modelled_named`].
+pub const WAKE_MODEL: &str = "wake-phrase.onnx";
+
+/// The file `endpointer.model` names in [`modelled_named`].
+pub const ENDPOINTER_MODEL: &str = "endpointer-vad.onnx";
+
+/// The file `brain.clip` names in [`modelled_named`].
+pub const BRAIN_CLIP: &str = "brain-answer.wav";
 
 /// The same fixture with a bus brain: the deployment whose alerts travel.
 ///
@@ -105,9 +199,18 @@ pub fn runnable(dir: &Path, events: Events<'_>) -> PathBuf {
 ///
 /// If the directory cannot be written.
 pub fn carrying(dir: &Path, events: Events<'_>) -> PathBuf {
+    carrying_named(dir, events, Naming::Absolute)
+}
+
+/// The same fixture, spelling the files it names the way `naming` says.
+///
+/// # Panics
+///
+/// If the directory cannot be written.
+pub fn carrying_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf {
     let token = dir.join("bus.token");
     speech_surface::psk::write_secret_file(&token, "a-bearer-token\n").expect("a token file");
-    let path = runnable(dir, events);
+    let path = runnable_named(dir, events, naming);
     let text = std::fs::read_to_string(&path).expect("the fixture");
     std::fs::write(
         &path,
@@ -123,7 +226,7 @@ pub fn carrying(dir: &Path, events: Events<'_>) -> PathBuf {
              [brenn.bridge]\n\
              server_url = \"wss://127.0.0.1:1/ws\"\n\
              token_file = {}\n",
-            quoted(&token),
+            naming.spell(&token, "bus.token"),
         ),
     )
     .expect("a file");

@@ -853,9 +853,12 @@ same shape — the `main` that dispatches to `parse`/`run` and prints `prog:
 message`, the word loop, a `given` bool per flag, and a `usage()` string. The
 refusal wording is operator-facing and already varies between the three for the
 same mistake, and the per-flag bool scales with the flag count in every copy.
-Two of the three now carry two flags each — `reachy-host` took `--speech-config`
-beside `--config` — so the shape being copied is a loop over flags, not a loop
-around one.
+`reachy-host` now carries three flags — `--config` and `--speech-config`, both
+path-bearing, and the bare boolean `--check`, which needed a `given`-style bool
+of its own written a third time and a third arm that differs from the other two
+only in taking no value. So the shape being copied is a loop over flags with an
+arity each, not a loop around one, and the case for the `(flag, arity)` table
+below is stronger than when this was written.
 
 Not done in place for the same reason as `params-reader-shared`: one of the
 three is the driver, which the cycle that made the third copy leaves alone. The

@@ -70,7 +70,8 @@ pub use config::{BODY_CAP_BYTES, ConfigError, EdgeConfig, MIN_BODY_CAP_BYTES, ST
 pub use intake::{Accepted, Edge, Refusal};
 pub use names::{MAX_MOTIONS, MotionEntry, MotionTable, SidecarError};
 pub use narrate::{
-    edge_line, edge_line_with, lost_line, refusal_line, restart_line, timeline_line,
+    UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, refusal_line, restart_line,
+    timeline_line,
 };
 pub use ports::{LOOPBACK, REPORTS_OUT_PORT, SCRIPTS_IN_PORT};
 pub use run::{DATAGRAM_CAP, HostEdge, POLL, Surface, alert_line, now, severity_word};
