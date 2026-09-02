@@ -26,6 +26,8 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 
+use reachy_edge::Origin;
+
 /// How many bodies may be waiting for the loop at once.
 ///
 /// Small on purpose. The loop drains the queue on every pass and every offer
@@ -41,9 +43,22 @@ pub const INTENT_BACKLOG: usize = 8;
 /// those, at the other end of this queue.
 #[derive(Clone, Debug)]
 pub struct Intents {
-    bodies: SyncSender<Vec<u8>>,
+    bodies: SyncSender<Offered>,
     /// What an offer nudges the loop awake through, where the caller gave one.
     nudge: Option<Arc<UdpSocket>>,
+}
+
+/// A body waiting for the loop, and where it was authored.
+///
+/// The origin rides with the body rather than being recovered at the gate:
+/// which of the two sinks handed it over is the only place that knows, and by
+/// the time the gate has screened it there is nothing left to ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offered {
+    /// Where the body was authored.
+    pub origin: Origin,
+    /// The encoded body itself.
+    pub body: Vec<u8>,
 }
 
 /// Why a body did not reach the edge at all.
@@ -73,11 +88,13 @@ impl Intents {
     /// # Errors
     ///
     /// [`NotOffered`] when the queue is full or the loop has stopped.
-    pub fn offer(&self, body: Vec<u8>) -> Result<(), NotOffered> {
-        self.bodies.try_send(body).map_err(|error| match error {
-            TrySendError::Full(_) => NotOffered::Backlogged,
-            TrySendError::Disconnected(_) => NotOffered::Stopped,
-        })?;
+    pub fn offer(&self, body: Vec<u8>, origin: Origin) -> Result<(), NotOffered> {
+        self.bodies
+            .try_send(Offered { origin, body })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => NotOffered::Backlogged,
+                TrySendError::Disconnected(_) => NotOffered::Stopped,
+            })?;
         if let Some(nudge) = &self.nudge {
             // Best effort, and deliberately not an error: the body is already
             // queued, and a nudge that did not go out costs it one read timeout
@@ -93,7 +110,7 @@ impl Intents {
 /// The receiving half: what the loop that owns the edge holds.
 #[derive(Debug)]
 pub struct Waiting {
-    bodies: Receiver<Vec<u8>>,
+    bodies: Receiver<Offered>,
 }
 
 impl Waiting {
@@ -104,7 +121,7 @@ impl Waiting {
     /// session's story, which is the half of this process that says what the
     /// machine is doing.
     #[must_use]
-    pub fn next(&self) -> Option<Vec<u8>> {
+    pub fn next(&self) -> Option<Offered> {
         self.bodies.try_recv().ok()
     }
 }
@@ -140,15 +157,28 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{INTENT_BACKLOG, NotOffered, queue, waking_queue};
+    use reachy_edge::Origin;
+
+    use super::{INTENT_BACKLOG, NotOffered, Offered, queue, waking_queue};
+
+    fn offered(body: &[u8], origin: Origin) -> Option<Offered> {
+        Some(Offered {
+            origin,
+            body: body.to_vec(),
+        })
+    }
 
     #[test]
     fn a_body_offered_is_a_body_waiting() {
         let (intents, waiting) = queue();
-        intents.offer(b"one".to_vec()).expect("room for one");
-        intents.offer(b"two".to_vec()).expect("room for two");
-        assert_eq!(waiting.next(), Some(b"one".to_vec()));
-        assert_eq!(waiting.next(), Some(b"two".to_vec()));
+        intents
+            .offer(b"one".to_vec(), Origin::Local)
+            .expect("room for one");
+        intents
+            .offer(b"two".to_vec(), Origin::Remote)
+            .expect("room for two");
+        assert_eq!(waiting.next(), offered(b"one", Origin::Local));
+        assert_eq!(waiting.next(), offered(b"two", Origin::Remote));
         assert_eq!(waiting.next(), None);
     }
 
@@ -156,19 +186,29 @@ mod tests {
     fn a_full_queue_drops_rather_than_waits() {
         let (intents, waiting) = queue();
         for _ in 0..INTENT_BACKLOG {
-            intents.offer(b"body".to_vec()).expect("room");
+            intents
+                .offer(b"body".to_vec(), Origin::Remote)
+                .expect("room");
         }
-        assert_eq!(intents.offer(b"body".to_vec()), Err(NotOffered::Backlogged));
+        assert_eq!(
+            intents.offer(b"body".to_vec(), Origin::Remote),
+            Err(NotOffered::Backlogged)
+        );
         // Draining one makes room: the queue is a backlog, not a latch.
         assert!(waiting.next().is_some());
-        intents.offer(b"body".to_vec()).expect("room again");
+        intents
+            .offer(b"body".to_vec(), Origin::Remote)
+            .expect("room again");
     }
 
     #[test]
     fn a_loop_that_has_gone_is_said_rather_than_waited_for() {
         let (intents, waiting) = queue();
         drop(waiting);
-        assert_eq!(intents.offer(b"body".to_vec()), Err(NotOffered::Stopped));
+        assert_eq!(
+            intents.offer(b"body".to_vec(), Origin::Remote),
+            Err(NotOffered::Stopped)
+        );
     }
 
     /// The wake path: an offer does not wait for the loop's read timeout, and
@@ -186,7 +226,9 @@ mod tests {
             .connect(asleep.local_addr().expect("its own address"))
             .expect("a loopback peer");
         let (intents, waiting) = waking_queue(Arc::clone(&sender));
-        intents.offer(b"body".to_vec()).expect("room for one");
+        intents
+            .offer(b"body".to_vec(), Origin::Local)
+            .expect("room for one");
         assert!(waiting.next().is_some());
 
         // The nudge is empty, which is what tells the loop it is not a story.
@@ -198,9 +240,11 @@ mod tests {
     #[test]
     fn a_queue_whose_senders_are_gone_still_reads_empty() {
         let (intents, waiting) = queue();
-        intents.offer(b"body".to_vec()).expect("room");
+        intents
+            .offer(b"body".to_vec(), Origin::Remote)
+            .expect("room");
         drop(intents);
-        assert_eq!(waiting.next(), Some(b"body".to_vec()));
+        assert_eq!(waiting.next(), offered(b"body", Origin::Remote));
         assert_eq!(waiting.next(), None);
     }
 }

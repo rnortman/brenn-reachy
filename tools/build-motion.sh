@@ -512,6 +512,11 @@ report() {
 		cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
+	# The one member whose provenance a digest does not settle: reachy_pod was
+	# compiled in the other repository, and the host beside it links that
+	# repository's crates from a revision this tree pins. Said on every build,
+	# because the two agreeing is a habit rather than a mechanism.
+	echo "${prog}: brenn-pod  $(pod_provenance)"
 	# Said either way, and without a digest: the contents are a site's own, and
 	# what a person needs to know at the bench is whether this payload's host
 	# will listen or only narrate.

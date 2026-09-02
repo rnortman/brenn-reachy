@@ -94,6 +94,34 @@ fn the_pipeline_libraries_link() {
 }
 
 #[test]
+fn the_announcement_seam_is_the_shape_the_host_speaks_through() {
+    // The seam the host's `Speaker` leg is wrapped around, named here for the
+    // reason the three crates above are: the shape is the pin. A queue the host
+    // can hand a sentence to off its blocking loop, a refusal vocabulary the
+    // console spells its `unspoken` line from, and both spelled by the surface
+    // rather than by this tree.
+    let (announcer, inbox) = speech_surface::announce_seam(speech_surface::ANNOUNCE_QUEUE_DEPTH);
+    announcer
+        .announce(speech_surface::Announcement {
+            text: String::from("My head is not moving."),
+        })
+        .expect("a seam whose far end is still held");
+
+    drop(inbox);
+    let refused = announcer
+        .announce(speech_surface::Announcement {
+            text: String::from("and again"),
+        })
+        .expect_err("the far end is gone");
+    assert_eq!(refused, speech_surface::AnnounceRefused::Gone);
+    assert_eq!(refused.reason(), "gone");
+    assert_eq!(
+        speech_surface::AnnounceRefused::Backlogged.reason(),
+        "backlogged"
+    );
+}
+
+#[test]
 fn the_alert_severity_the_surface_names_is_the_attachment_s_own() {
     // `speech_surface::AlertSeverity` must be `brenn_bridge::AlertSeverity` —
     // the same type, not a structurally similar copy. If the surface defined

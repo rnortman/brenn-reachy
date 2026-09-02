@@ -286,6 +286,7 @@ rust_binary(
     deps = [
         ":log_read",
         ":motion_channels",
+        ":motion_evidence",
         ":motion_slots",
         ":run_report",
         ":schedule_clk_rs",
@@ -632,6 +633,33 @@ rust_test(
     name = "motion_cogs_test",
     size = "small",
     crate = ":motion_cogs",
+)
+
+# Where the head actually went, read off an estimate stream: the pose arithmetic
+# both log analyzers in this package judge motion by. Its own crate because they
+# must not disagree about it -- one copy of the tolerances, one solver, one
+# scoring -- and a drift between two copies is one report passing a run the other
+# fails with neither saying why.
+rust_library(
+    name = "motion_evidence",
+    srcs = ["motion_evidence.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":run_report",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:pose_clk_rs",
+        "@brenn_reachy_crates//:nalgebra",
+    ],
+)
+
+# The arithmetic's own cases: what a still run's excursion is, that the two
+# components are maxima in their own right, what arrival at a posture is, and
+# that an approach on its own is numbers rather than a verdict.
+rust_test(
+    name = "motion_evidence_test",
+    size = "small",
+    crate = ":motion_evidence",
 )
 
 rust_test(
@@ -1646,32 +1674,46 @@ rust_clk_module(
     deps = clk_module_deps(SIM_STATE_MODULES).rs,
 )
 
-# What one supervised speech run did, read off the voice host's console: the
+# What one supervised speech run did, read off both halves of its fetch: the
 # operator's tool for judging a speech run, run as
 # `bazel run //cogs:speech_run_report -- <records>` over a fetched record pair.
 #
-# The console side of the fetch rather than the channel log, which is why it
-# shares no reading machinery with the motion report above -- only the verdict's
-# shape, through `:run_report`. It depends on the edge and the host for the words
-# the console is spelled with, so the vocabulary it counts is the vocabulary
-# those two emit rather than a copy of it that drifts silently.
+# The console for what was asked and how the process fared, the channel log for
+# what the machine did. The log half is read through the same `:log_read`
+# binding machinery the motion report uses, over three of the channels
+# `:motion_channels` names, and judges the head's movement by `:motion_evidence`
+# -- the one copy of the tolerances and the solver both analyzers share. It
+# depends on the edge and the host for the words the console is spelled with, so
+# the vocabulary it counts is the vocabulary those two emit rather than a copy
+# of it that drifts silently.
 rust_binary(
     name = "speech_run_report",
     srcs = ["speech_run_report.rs"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
+        ":log_read",
+        ":motion_channels",
+        ":motion_evidence",
         ":run_report",
+        ":script_clk_rs",
+        ":session_clk_rs",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-host:reachy_host_lib",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:pose_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@brenn_reachy_crates//:nalgebra",
         "@brenn_reachy_crates//:serde_json",
     ],
 )
 
-# The analyzer over crafted consoles: a clean run, each way a run is not the
-# production pipeline, and each shape it must summarize without judging. The
-# cases write a record pair into a scratch directory, which
+# The analyzer over crafted fetches: a clean run, each way a run is not the
+# production pipeline, each shape it must summarize without judging, and the
+# head's own account over a channel log written by the framework's own writer.
+# The cases write a record pair into a scratch directory, which
 # `//crates/reachy-scratch` removes however a case ended.
 rust_test(
     name = "speech_run_report_test",
@@ -1679,6 +1721,7 @@ rust_test(
     crate = ":speech_run_report",
     deps = [
         "//crates/reachy-scratch:reachy_scratch",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )

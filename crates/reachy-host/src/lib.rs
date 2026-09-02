@@ -43,11 +43,12 @@ pub mod voice;
 pub mod words;
 
 pub use check::{Conclusion, conclusion_line, inspect, settled};
-pub use edge::Console;
+pub use edge::{Console, Speaker, Unspoken};
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};
 pub use sinks::{BusIntents, Lines, ScripterIntents, Stdout};
-pub use voice::{Voice, absent_line, composed_line, silent_line};
+pub use voice::{Composition, Voice, absent_line, composed_line, silent_line};
 pub use words::{
-    AWAITING_SPEECH_CONFIG, COMPOSED, REFUSAL_PREFIX, STARTED, UNPUBLISHED, VOICELESS,
+    AWAITING_SPEECH_CONFIG, COMPOSED, REFUSAL_PREFIX, STARTED, UNOFFERED, UNPUBLISHED, UNSENT,
+    UNSPOKEN, VOICELESS,
 };

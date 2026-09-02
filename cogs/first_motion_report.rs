@@ -63,38 +63,18 @@ use motion_channels::{
     POSE_CHANNEL, REPORT_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL,
     STATUS_CHANNEL,
 };
+use motion_evidence::{ARRIVAL_TURN_RAD, closest, solved_pose};
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_motion::joints::{JointGroup, ROW_COUNT, ROWS, flags, group_of, row, rows_of};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
-use reachy_motion::record;
 use reachy_motion::seq::failure::Name as FailureName;
 use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, TrackingFaultConfig,
 };
 use reachy_motion::value;
 use run_report::{Report, verdict};
-
-/// How far the head may be from the posture it was sent to, in metres, and still
-/// count as having arrived.
-///
-/// Five millimetres, which is a machine's tolerance rather than a solver's: the
-/// servos quantise at 0.088 degrees of crank, the linkage flexes under the
-/// head's own weight, and a real leg sits wherever its load leaves it. A
-/// scenario asserts a thousand times tighter than this because its plant is
-/// arithmetic; asserting that here would fail every hardware run on physics.
-///
-/// Nobody has measured this machine. This figure and the two below were sized
-/// from the mechanism on paper, so what they are is a guess of the right order;
-/// a verdict that turns on one of them is a verdict about a number an agent
-/// chose. The runbook's first-run checks say to confirm or reset all three
-/// before reading a report as a pass or a fail.
-const ARRIVAL_OFFSET_M: f64 = 5e-3;
-
-/// How far the head's orientation may be from the posture it was sent to,
-/// radians, on the same terms, and unmeasured on the same terms.
-const ARRIVAL_TURN_RAD: f64 = 0.05;
 
 /// How far an antenna may point away from where the posture puts it, radians.
 ///
@@ -104,13 +84,10 @@ const ARRIVAL_TURN_RAD: f64 = 0.05;
 /// to the head's figure is an argument, not an observation.
 const ARRIVAL_ANTENNA_RAD: f64 = 0.1;
 
-// The tolerances above are a machine's and not a solver's, which is the whole
-// reason this tool is separate from the scenario checkers. Held apart from the
-// figures a deterministic run is asserted to, so tightening one to a scenario's
-// is a deliberate edit rather than a report that fails every hardware run on
-// physics.
-const _: () = assert!(ARRIVAL_OFFSET_M >= 1e-3);
-const _: () = assert!(ARRIVAL_TURN_RAD >= 1e-2);
+// The antenna's tolerance is a machine's and not a solver's, like the two head
+// figures it is stated against in `motion_evidence`. Held apart from the figures
+// a deterministic run is asserted to, so tightening it to a scenario's is a
+// deliberate edit rather than a report that fails every hardware run on physics.
 const _: () = assert!(ARRIVAL_ANTENNA_RAD >= ARRIVAL_TURN_RAD);
 
 /// Everything one run put in the log.
@@ -1364,57 +1341,6 @@ fn the_gesture(
     antennas_arrived(run, traffic, released, report);
 }
 
-/// Where the head came to `wanted` from `from` onwards, reported and judged
-/// against the hardware tolerances. Answers the instant it arrived, or the
-/// instant of its best approach where it never did.
-///
-/// Arrival is both tolerances at once, on one sample: a machine 4 mm away but
-/// badly turned has not arrived, and a machine that arrived is a sample that was
-/// close in translation *and* aligned. The sample reported is the best by one
-/// score over both components, so the printed number and the verdict come from
-/// the same definition -- ranking on translation alone would report a
-/// well-placed, badly turned sample as the closest approach and then fail the
-/// run on it while a further, aligned sample went unmentioned.
-fn closest(
-    poses: &[(i64, Isometry3<f64>)],
-    from: usize,
-    what: &str,
-    wanted: &reachy_motion::joints::JointTargets,
-    report: &mut Report,
-) -> Option<i64> {
-    let mut best: Option<(i64, f64, f64, f64)> = None;
-    let mut arrived: Option<(i64, f64, f64)> = None;
-    for (at, pose) in &poses[from.min(poses.len())..] {
-        let offset = (pose.translation.vector - wanted.head_pose_body.translation.vector).norm();
-        let turn = pose.rotation.angle_to(&wanted.head_pose_body.rotation);
-        // Each component against its own tolerance, summed: a score of one is
-        // the tolerance box's corner, and nothing about it is a distance.
-        let score = offset / ARRIVAL_OFFSET_M + turn / ARRIVAL_TURN_RAD;
-        if best.is_none_or(|(_, _, _, was)| score < was) {
-            best = Some((*at, offset, turn, score));
-        }
-        if arrived.is_none() && offset <= ARRIVAL_OFFSET_M && turn <= ARRIVAL_TURN_RAD {
-            arrived = Some((*at, offset, turn));
-        }
-    }
-    let (best_at, offset, turn, _) = best?;
-    report.note(format!(
-        "closest to {what}: {offset:.4} m and {turn:.4} rad away, at {best_at}"
-    ));
-    let Some((at, offset, turn)) = arrived else {
-        report.fail(format!(
-            "the head never came within {ARRIVAL_OFFSET_M} m and {ARRIVAL_TURN_RAD} rad of \
-             {what} on one sample: its best approach was {offset:.4} m and {turn:.4} rad, at \
-             {best_at}"
-        ));
-        return Some(best_at);
-    };
-    report.note(format!(
-        "reached {what} at {at}: {offset:.4} m and {turn:.4} rad away"
-    ));
-    Some(at)
-}
-
 /// The antennas ended up where stow puts them.
 ///
 /// Read off the last sample the machine was measured on rather than off the
@@ -2428,12 +2354,6 @@ fn counter_cross_check(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report)
     }
 }
 
-/// The pose an estimate describes, whatever its own flag says.
-fn solved_pose(estimate: &PoseEstimateWire) -> Option<Isometry3<f64>> {
-    let estimate = estimate.validate().ok()?;
-    record::read_pose(&estimate.head_pos, &estimate.head_quat).ok()
-}
-
 /// Every check and every measurement this tool makes, over one run.
 ///
 /// One function so the order is stated once: the log is checked for being
@@ -2547,8 +2467,9 @@ mod tests {
         RegIdWire, Report, ReportKindWire, Retention, Run, SCHEDULE_CHANNEL, SESSION_CMD_CHANNEL,
         STATUS_CHANNEL, SeqFailureKindWire, SessionCmdKindWire, SessionCmdWire, SessionPhaseWire,
         TickFaultWire, TimelineEntryWire, ValueShapeWire, analyze, joint_set_of, judge_antennas,
-        neutral_targets, record, row, stow_pose_targets,
+        neutral_targets, row, stow_pose_targets,
     };
+    use reachy_motion::record;
     use std::collections::BTreeSet;
 
     use brenn_reachy__motion__faults_clk_rs::FaultKindWire;

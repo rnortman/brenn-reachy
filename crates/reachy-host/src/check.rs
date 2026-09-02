@@ -14,6 +14,14 @@
 //! No socket is opened, no model is read, and no file's contents are printed —
 //! two of the paths below name secrets.
 //!
+//! One comparison here is between the two configurations rather than inside
+//! either. The speech pipeline addresses every motion script to the connected
+//! device's authenticated pod id, and the edge refuses a script addressed to a
+//! name it does not answer to — so a host whose `pod` is not one of the names
+//! the speech configuration knows refuses every script it authors, silently,
+//! for the whole run. Neither loader can see that; both files load. This is the
+//! only place before a robot where the two names meet.
+//!
 //! One rule here is stricter than the loader's: a path in the speech
 //! configuration must be relative. Every file that configuration names travels
 //! inside the payload and is named payload-relative, so an absolute path is a
@@ -56,7 +64,7 @@ pub struct Conclusion {
 #[must_use]
 pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<Conclusion> {
     let mut found = Vec::new();
-    match params::load(config) {
+    let host = match params::load(config) {
         Ok(settings) => {
             found.push(Conclusion {
                 kind: "params",
@@ -72,29 +80,94 @@ pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<
             // one, so the relative-path rule above does not apply to it: what
             // it must be is there.
             found.push(present("clip_names_path", &settings.clip_names, base));
+            Some(settings)
         }
-        Err(error) => found.push(Conclusion {
-            kind: "params",
-            subject: config.display().to_string(),
-            held: false,
-            says: error.to_string(),
-        }),
-    }
+        Err(error) => {
+            found.push(Conclusion {
+                kind: "params",
+                subject: config.display().to_string(),
+                held: false,
+                says: error.to_string(),
+            });
+            None
+        }
+    };
 
-    match speech_config {
-        None => found.push(Conclusion {
-            kind: crate::words::VOICELESS,
-            subject: String::new(),
-            held: true,
-            says: "no speech configuration was named, so this host is its edge half alone"
-                .to_owned(),
-        }),
-        Some(path) => found.extend(speech(path, base)),
+    let voice = match speech_config {
+        None => {
+            found.push(Conclusion {
+                kind: crate::words::VOICELESS,
+                subject: String::new(),
+                held: true,
+                says: "no speech configuration was named, so this host is its edge half alone"
+                    .to_owned(),
+            });
+            None
+        }
+        Some(path) => {
+            let (conclusions, config) = speech(path, base);
+            found.extend(conclusions);
+            config
+        }
+    };
+
+    // Only when both loads held. A load that failed is already an unheld
+    // conclusion, and there is no second name to compare the first against.
+    if let (Some(host), Some(voice)) = (host.as_ref(), voice.as_ref()) {
+        found.push(addressee(host.edge.pod(), voice));
     }
 
     let verdict = verdict(&found);
     found.push(verdict);
     found
+}
+
+/// Whether the name this host answers to is one the speech configuration knows.
+///
+/// The `[pods]` table is the comparison surface because it is the only set of
+/// pod ids that configuration exposes; the key table's identities are private
+/// to it. So a device keyed for the handshake but left out of `[pods]` connects
+/// anyway, addresses its scripts by its own id, and passes here — the runtime
+/// alert and the run analyzer are what catch that one.
+fn addressee(pod: &str, voice: &speech_surface::Config) -> Conclusion {
+    let mut names: Vec<&str> = voice.pods.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        return Conclusion {
+            kind: "addressee",
+            subject: "pod".to_owned(),
+            held: true,
+            says: format!(
+                "`pod` is `{pod}`; the speech configuration names no `[pods]` table, so \
+                 there is nothing here to compare it against — whichever device connects \
+                 addresses its scripts by the id it authenticated with"
+            ),
+        };
+    }
+    let listed: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    let listed = listed.join(", ");
+    if names.contains(&pod) {
+        return Conclusion {
+            kind: "addressee",
+            subject: "pod".to_owned(),
+            held: true,
+            says: format!(
+                "`pod` is `{pod}`, which the speech configuration's `[pods]` table names \
+                 among {listed}"
+            ),
+        };
+    }
+    Conclusion {
+        kind: "addressee",
+        subject: "pod".to_owned(),
+        held: false,
+        says: format!(
+            "`pod` is `{pod}`; the speech configuration's `[pods]` table names {listed}. \
+             the scripter addresses every script to the connected device's authenticated \
+             id, so a host answering to a name that is not one of them will refuse every \
+             script it authors"
+        ),
+    }
 }
 
 /// Whether every conclusion held.
@@ -125,16 +198,22 @@ pub fn conclusion_line(conclusion: &Conclusion, at: SyncTime) -> String {
 ///
 /// A configuration that will not load ends the walk: the path fields below are
 /// read off the loaded value, and there is no partial value to read them from.
-fn speech(path: &Path, base: &Path) -> Vec<Conclusion> {
+///
+/// The loaded configuration comes back beside the conclusions, because one
+/// check needs a field of it and not a path it names.
+fn speech(path: &Path, base: &Path) -> (Vec<Conclusion>, Option<speech_surface::Config>) {
     let config = match speech_surface::Config::load(path) {
         Ok(config) => config,
         Err(error) => {
-            return vec![Conclusion {
-                kind: "speech_config",
-                subject: path.display().to_string(),
-                held: false,
-                says: error.to_string(),
-            }];
+            return (
+                vec![Conclusion {
+                    kind: "speech_config",
+                    subject: path.display().to_string(),
+                    held: false,
+                    says: error.to_string(),
+                }],
+                None,
+            );
         }
     };
     let mut found = vec![Conclusion {
@@ -164,7 +243,7 @@ fn speech(path: &Path, base: &Path) -> Vec<Conclusion> {
             present(field, &named, base)
         });
     }
-    found
+    (found, Some(config))
 }
 
 /// Every path field a loaded speech configuration states, with its field name.
@@ -421,6 +500,101 @@ mod tests {
         assert!(verdict(&found).says.contains("wake.embedding"), "{found:?}");
     }
 
+    /// The failure this comparison exists for, exactly: two files that both
+    /// load, and a host that will refuse every script its own pipeline writes.
+    #[test]
+    fn a_host_answering_to_a_name_the_speech_configuration_does_not_know_is_refused() {
+        let dir = scratch_dir("reachy-host-check-addressee-mismatch");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_with_pods(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+            &["reachy00", "reachy01"],
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let addressee = about(&found, "pod");
+        assert_eq!(addressee.kind, "addressee", "{addressee:?}");
+        assert!(!addressee.held, "{addressee:?}");
+        assert!(addressee.says.contains("`fixture-reachy`"), "{addressee:?}");
+        assert!(addressee.says.contains("`reachy00`"), "{addressee:?}");
+        assert!(addressee.says.contains("`reachy01`"), "{addressee:?}");
+        assert!(!addressee.says.contains("  "), "{addressee:?}");
+        assert!(verdict(&found).says.contains("pod"), "{found:?}");
+    }
+
+    #[test]
+    fn a_host_the_speech_configuration_names_holds() {
+        let dir = scratch_dir("reachy-host-check-addressee-match");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_with_pods(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+            &["fixture-reachy", "reachy00"],
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let addressee = about(&found, "pod");
+        assert!(addressee.held, "{addressee:?}");
+        assert!(addressee.says.contains("`fixture-reachy`"), "{addressee:?}");
+        assert!(!addressee.says.contains("  "), "{addressee:?}");
+    }
+
+    /// A configuration with no `[pods]` table exposes no pod ids at all, so
+    /// there is nothing to compare against — and a check that failed on that
+    /// would refuse every deployment that never wrote the table.
+    #[test]
+    fn a_speech_configuration_with_no_pods_table_has_nothing_to_compare() {
+        let dir = scratch_dir("reachy-host-check-addressee-empty");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let addressee = about(&found, "pod");
+        assert!(addressee.held, "{addressee:?}");
+        assert!(
+            addressee.says.contains("nothing here to compare"),
+            "{addressee:?}",
+        );
+        assert!(!addressee.says.contains("  "), "{addressee:?}");
+    }
+
+    /// A host configuration that did not load leaves no name to compare, and
+    /// the comparison says nothing rather than guessing at one.
+    #[test]
+    fn a_host_configuration_that_did_not_load_gets_no_addressee_conclusion() {
+        let dir = scratch_dir("reachy-host-check-addressee-no-params");
+        let config = dir.join("host_params.textproto");
+        std::fs::write(&config, "not_a_field: 1\n").expect("a file");
+        let speech = speech_fixture::runnable_with_pods(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+            &["reachy00"],
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|conclusion| conclusion.kind == "addressee"),
+            "{found:?}",
+        );
+    }
+
     #[test]
     fn a_key_table_that_is_not_there_is_named_and_refused() {
         let dir = scratch_dir("reachy-host-check-missing-psk");
@@ -504,6 +678,12 @@ mod tests {
                 .iter()
                 .any(|conclusion| conclusion.subject == "pod_psk_file"),
             "a configuration that will not load names nothing to look for: {found:?}",
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|conclusion| conclusion.kind == "addressee"),
+            "a configuration that will not load has no pod ids to compare: {found:?}",
         );
     }
 

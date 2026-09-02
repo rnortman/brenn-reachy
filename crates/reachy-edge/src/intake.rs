@@ -48,6 +48,23 @@ pub struct Edge {
     issued: u32,
 }
 
+/// Where a body offered to the gate was authored.
+///
+/// The gate itself does not read this — every screen applies the same way to
+/// both sources, which is what makes one gate one authority. What reads it is
+/// the alert table: a refusal of a script *this machine wrote for itself* is
+/// the machine disagreeing with itself, and no sender's next refresh will ever
+/// resolve it, whereas a refusal of somebody else's script is the disagreement
+/// the channel is expected to carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Authored on this machine, for this machine: the pipeline's scripter, or
+    /// the motion harness's pinned gesture.
+    Local,
+    /// Delivered off the bus by a sender that is not this process.
+    Remote,
+}
+
 /// A script the edge accepted, ready to send.
 #[derive(Debug, PartialEq)]
 pub struct Accepted {

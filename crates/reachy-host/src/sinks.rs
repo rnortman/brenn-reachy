@@ -20,11 +20,12 @@
 
 use std::sync::Arc;
 
-use reachy_edge::{edge_line_with, now};
+use reachy_edge::{Origin, edge_line_with, now};
 use serde_json::json;
 use speech_surface::{IntentSink, ScriptOut, ScriptSink};
 
 use crate::intents::{Intents, NotOffered};
+use crate::words;
 
 /// Where a sink's own lines go.
 ///
@@ -68,7 +69,7 @@ impl ScripterIntents {
 
 impl ScriptSink for ScripterIntents {
     fn offer(&self, out: ScriptOut) {
-        if let Err(error) = self.intents.offer(out.body.into_bytes()) {
+        if let Err(error) = self.intents.offer(out.body.into_bytes(), Origin::Local) {
             self.lines
                 .say(unoffered_line("scripter", &out.pod, out.seq, error));
         }
@@ -94,7 +95,7 @@ impl BusIntents {
 impl IntentSink for BusIntents {
     fn deliver(&self, body: &str) -> Result<(), &'static str> {
         self.intents
-            .offer(body.as_bytes().to_vec())
+            .offer(body.as_bytes().to_vec(), Origin::Remote)
             .map_err(reason_word)
     }
 }
@@ -117,7 +118,7 @@ const fn reason_word(error: NotOffered) -> &'static str {
 /// refusal, which is the gate having seen a body and declined it.
 fn unoffered_line(source: &str, pod: &str, seq: u64, error: NotOffered) -> String {
     edge_line_with(
-        "unoffered",
+        words::UNOFFERED,
         now(),
         &format!(
             "a script for `{pod}` at seq {seq} never reached the gate: {error}. nothing is \
@@ -136,7 +137,7 @@ mod tests {
     use std::sync::Mutex;
 
     use motion_proto::{MotionScript, Posture, Step};
-    use reachy_edge::{EdgeConfig, HostEdge, MotionTable, Surface};
+    use reachy_edge::{EdgeConfig, HostEdge, MotionTable, Origin, Surface};
 
     use super::*;
     use crate::intents::{INTENT_BACKLOG, queue};
@@ -207,12 +208,22 @@ mod tests {
         sink.offer(decision(1));
 
         let queued = waiting.next().expect("the body the scripter decided");
-        assert_eq!(queued, body(1).into_bytes(), "the encoded body, verbatim");
+        assert_eq!(
+            queued.body,
+            body(1).into_bytes(),
+            "the encoded body, verbatim"
+        );
+        assert_eq!(queued.origin, Origin::Local, "the scripter's own decision");
 
         let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
         let mut surface = Narration::default();
         let accepted = host
-            .offer(&queued, reachy_edge::now(), &mut surface)
+            .offer(
+                &queued.body,
+                queued.origin,
+                reachy_edge::now(),
+                &mut surface,
+            )
             .expect("a lawful script the gate accepts");
         assert_eq!(accepted.script_id, 1);
         assert!(said(&recorder).is_empty(), "{:?}", said(&recorder));
@@ -226,11 +237,17 @@ mod tests {
         sink.deliver(&body(4)).expect("a queue with room");
 
         let queued = waiting.next().expect("the body the bus delivered");
+        assert_eq!(queued.origin, Origin::Remote, "somebody else's script");
         let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
         let mut surface = Narration::default();
         assert!(
-            host.offer(&queued, reachy_edge::now(), &mut surface)
-                .is_some(),
+            host.offer(
+                &queued.body,
+                queued.origin,
+                reachy_edge::now(),
+                &mut surface
+            )
+            .is_some(),
             "the bus's body meets the gate the scripter's does",
         );
     }
@@ -251,12 +268,17 @@ mod tests {
         let first = waiting.next().expect("the scripter's body");
         let second = waiting.next().expect("the bus's body");
         assert!(
-            host.offer(&first, reachy_edge::now(), &mut surface)
+            host.offer(&first.body, first.origin, reachy_edge::now(), &mut surface)
                 .is_some()
         );
         assert!(
-            host.offer(&second, reachy_edge::now(), &mut surface)
-                .is_none(),
+            host.offer(
+                &second.body,
+                second.origin,
+                reachy_edge::now(),
+                &mut surface
+            )
+            .is_none(),
             "the same sequence number twice is a redelivery",
         );
     }

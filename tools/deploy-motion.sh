@@ -64,8 +64,9 @@
 # its own console stream and the unit's clock discipline, read before and after,
 # to the second of those. The motion analyzer reads none of it: the log is
 # self-contained, and everything the driver counts about itself is republished
-# into it. The speech analyzer reads only that side, because the voice host's
-# whole account of a session is what it printed there. The
+# into it. The speech analyzer reads both sides — the console for what was asked
+# of the head and how the process fared, the records for what the machine did
+# with it. The
 # console is for a person reading a run that went wrong, and the clock captures
 # say whether the time base the whole log is stamped in could have stepped
 # underneath it.
@@ -1507,10 +1508,12 @@ case "$mode" in
 		echo "${prog}: console ${console}"
 		echo "${prog}: log  ${out}"
 
-		# The console side is what a speech run is read off: what a
-		# person said to the robot decides what is in it, so the
-		# analyzer's standard is presence and absence rather than
-		# arithmetic, and its verdict is this script's.
+		# Both sides of the fetch are what a speech run is read off:
+		# what a person said to the robot decides what is in either, so
+		# the analyzer's standard over the console is presence and
+		# absence rather than arithmetic, and the records are where it
+		# asks whether the head moved for the scripts the session took.
+		# Its verdict is this script's.
 		speech_verdict "$out"
 		;;
 

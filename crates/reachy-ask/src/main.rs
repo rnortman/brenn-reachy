@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 
 use clockwork_rs::SyncTime;
 use reachy_edge::{
-    Alert, DATAGRAM_CAP, EdgeConfig, HostEdge, LOOPBACK, MotionTable, POLL, REPORTS_OUT_PORT,
-    SCRIPTS_IN_PORT, Surface, alert_line, now,
+    Alert, DATAGRAM_CAP, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, POLL,
+    REPORTS_OUT_PORT, SCRIPTS_IN_PORT, Surface, alert_line, now,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -275,7 +275,12 @@ fn run(options: &Options) -> Result<(), String> {
         if watch.should_ask(&update.rows) {
             let arrival = now();
             let accepted = host
-                .offer(body(ASK_POD).as_bytes(), arrival, &mut surface)
+                .offer(
+                    body(ASK_POD).as_bytes(),
+                    Origin::Local,
+                    arrival,
+                    &mut surface,
+                )
                 .ok_or_else(|| {
                     "the edge refused the harness gesture; the line above names the screen it \
                      stopped at"

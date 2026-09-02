@@ -23,6 +23,33 @@ Nothing has been released, and nothing here has driven a motor.
   is a skeleton at this point — the module headers state the contract each will
   hold to.
 
+- **The robot says its critical alerts out loud.** An alert the host's table
+  raises Critical now carries a sentence for a person standing in front of the
+  machine, and the voice host speaks it through the speech pipeline where the
+  deployment has a voice: the head is not moving, or its motion has stopped, or
+  — where de-torquing could not be confirmed — that nobody should touch the
+  head. Warnings are never spoken; each latch fires once per run, so a run
+  speaks at most three sentences. A host built without a voice narrates and
+  raises exactly as before, and every sentence a speaker refuses is an
+  `unspoken` line on the console.
+
+- **`reachy_host --check` compares the two names a speech run needs to agree.**
+  The new `addressee` conclusion holds the host's own `pod` against the speech
+  configuration's `[pods]` table: the pipeline addresses every motion script to
+  the connected device's authenticated id, so a host answering to a name that
+  is not one of them refuses every script it authors and its head never moves.
+  A mismatch is an unheld conclusion, which `make speech-run` refuses on (exit
+  11) before anything is provisioned.
+
+- **Every payload build says which two brenn-pod revisions it is made of** — the
+  revision `MODULE.bazel` pins for the crates the host links, and the one the
+  brenn-pod checkout stands at, with the staged audio-device binary's age
+  against that checkout's HEAD commit beside it, because the binary is whatever
+  the last build there left behind and not the revision the checkout is on now.
+  A note, never a refusal: a development checkout legitimately sits ahead of the
+  pin, and a payload built out of two revisions otherwise fails on the unit as a
+  handshake.
+
 ### Changed
 
 - **The clip library asset carries motions, and sequence documents load
@@ -60,6 +87,25 @@ Nothing has been released, and nothing here has driven a motor.
   With the copy go `bazel/BUILD.bazel`'s `framework_clk_imports` filegroup,
   which the macro now reaches for itself, and `cogs/upstream`'s longhand
   generator invocation, which is a macro call naming `repo` and `crate_name`.
+
+- **A motion script this host authored and then refused is Critical, not a
+  Warning.** A body offered to the host's gate now carries where it was authored
+  — the pipeline's scripter and the motion harness are local, the bus is remote
+  — and a local body the gate refuses means the head will not move for anything
+  said to the robot until somebody edits a file. The alert says so once per run,
+  under `reachy head refuses its own scripts`, and the refusal line on the
+  console carries an `origin` field. A remote sender's refusal keeps the Warning
+  it had: the intent channel is not assumed to carry one machine's traffic.
+
+- **The speech-run analyzer opens the channel log and has an opinion about
+  motion.** `speech_run_report` read the console alone and counted a dropped
+  motion script as a note; it now reads the run's `.olog` beside it and fails a
+  run whose scripts the host itself refused, whose session accepted none of what
+  the pipeline authored, that the session never took the machine for, or whose
+  head never measurably left its first pose. It also fails a run that handed an
+  alert to a bus attachment that did not grant alerts, which loses it. A run
+  nobody spoke to is still green. Runs that passed before this change can fail
+  after it — that is the point of it.
 
 ### Removed
 

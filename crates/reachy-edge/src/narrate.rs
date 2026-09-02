@@ -43,7 +43,8 @@ use brenn_reachy__motion__reports_clk_rs::{
 };
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
-use crate::intake::Refusal;
+use crate::alerts::Severity;
+use crate::intake::{Origin, Refusal};
 
 /// How much of a quoted text a line carries.
 ///
@@ -77,7 +78,7 @@ pub fn timeline_line(row: &TimelineEntryWire) -> String {
         "a": row.a(),
         "b": row.b(),
         "detail": finite(row.detail()),
-        "says": one_line(&says(row)),
+        "says": one_line(&row_says(row)),
     }))
 }
 
@@ -121,9 +122,18 @@ pub fn edge_line_with(kind: &str, at: SyncTime, says: &str, fields: &[(&str, Val
 ///
 /// `at` is this machine's clock at the drop — the same instant the body would
 /// have been stamped with had it been accepted.
+///
+/// `origin` is on the line because it is what separates a sender disagreeing
+/// with this machine from this machine disagreeing with itself, and a reader
+/// after the fact cannot recover it from anything else the line carries.
 #[must_use]
-pub fn refusal_line(refusal: &Refusal, at: SyncTime) -> String {
-    edge_line(refusal.kind(), at, &refusal.to_string())
+pub fn refusal_line(refusal: &Refusal, origin: Origin, at: SyncTime) -> String {
+    edge_line_with(
+        refusal.kind(),
+        at,
+        &refusal.to_string(),
+        &[("origin", json!(origin_word(origin)))],
+    )
 }
 
 /// The story went backwards: the process telling it restarted.
@@ -182,10 +192,36 @@ fn finite(detail: f64) -> Value {
 /// noticing.
 pub const UNKNOWN_KIND_PREFIX: &str = "kind_";
 
+/// How an alert's loudness is spelled on the wire and in a log.
+///
+/// The edge's two words, spelled once here. Here and not beside the loop that
+/// raises an alert: this module is where the vocabulary of every line this
+/// crate writes lives, so a reader joining on one of these words has one place
+/// to look for it.
+#[must_use]
+pub const fn severity_word(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Warning => "warning",
+        Severity::Critical => "critical",
+    }
+}
+
+/// How a body's origin is spelled in a log.
+///
+/// The edge's two words, spelled once here, so the analyzer that reads a
+/// refusal line joins on the same string the host writes.
+#[must_use]
+pub const fn origin_word(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Local => "local",
+        Origin::Remote => "remote",
+    }
+}
+
 /// A report kind's own word, or the number where this build has no word for it.
 fn kind_name(kind: ReportKindWire) -> String {
     match kind.to_known() {
-        Some(known) => known_kind(known).to_owned(),
+        Some(known) => row_word(known).to_owned(),
         None => format!("{UNKNOWN_KIND_PREFIX}{}", kind.0),
     }
 }
@@ -197,7 +233,13 @@ fn kind_name(kind: ReportKindWire) -> String {
 /// drifts stops joining against the runs that came before it, silently. The
 /// `match` is wildcard-free, so a kind the vocabulary grows is a compile error
 /// here rather than a line that says nothing.
-const fn known_kind(kind: ReportKind) -> &'static str {
+///
+/// Public because a reader of this stream that counts rows by kind must count
+/// the spelling this writes rather than a copy of it: `//cogs:speech_run_report`
+/// asks how many scripts the session accepted by looking for one of these
+/// words.
+#[must_use]
+pub const fn row_word(kind: ReportKind) -> &'static str {
     match kind {
         ReportKind::None => "none",
         ReportKind::PhaseChanged => "phase_changed",
@@ -224,7 +266,14 @@ const fn known_kind(kind: ReportKind) -> &'static str {
 /// table is spelled — the same table the report vocabulary states beside each
 /// kind. A reader of a line should not have to hold the vocabulary in their
 /// head to know whether `b` is a servo, a phase or a reason.
-pub(crate) fn says(row: &TimelineEntryWire) -> String {
+///
+/// Public for the same reason [`row_word`] is: a reader of this stream that
+/// quotes a row back to an operator quotes the sentence the edge would have
+/// written for it rather than keeping a second table of what the two numbers
+/// mean. `//cogs:speech_run_report` says what the session refused a script for
+/// by asking here.
+#[must_use]
+pub fn row_says(row: &TimelineEntryWire) -> String {
     let (a, b, detail) = (row.a(), row.b(), row.detail());
     let Some(kind) = row.kind().to_known() else {
         return format!(
@@ -323,7 +372,7 @@ mod tests {
     use super::{
         TEXT_LIMIT, edge_line, edge_line_with, lost_line, refusal_line, restart_line, timeline_line,
     };
-    use crate::intake::Refusal;
+    use crate::intake::{Origin, Refusal};
 
     /// The host's clock at the moment an edge line reports, distinct from the
     /// 42 a fixture row carries, so a line stamped from the wrong side shows.
@@ -498,8 +547,10 @@ mod tests {
                 seq: 4,
                 accepted: 9,
             },
+            Origin::Remote,
             at(),
         ));
+        assert_eq!(value["origin"], "remote");
         assert_eq!(value["stream"], "edge");
         assert_eq!(value["at_ns"], at().as_nanos());
         assert_eq!(value["kind"], "stale");
@@ -523,8 +574,10 @@ mod tests {
                 addressed,
                 pod: "reachy00".to_owned(),
             },
+            Origin::Local,
             at(),
         ));
+        assert_eq!(value["origin"], "local");
         let says = value["says"].as_str().expect("a sentence");
         assert!(!says.contains('\n'), "{says}");
         assert!(says.chars().count() <= TEXT_LIMIT + 1, "{says}");

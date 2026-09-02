@@ -26,11 +26,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clockwork_rs::SyncTime;
 use serde_json::json;
 
-use crate::alerts::{Alert, Alerts, Severity};
+use crate::alerts::{Alert, Alerts};
 use crate::config::EdgeConfig;
-use crate::intake::{Accepted, Edge};
+use crate::intake::{Accepted, Edge, Origin};
 use crate::names::MotionTable;
-use crate::narrate::{edge_line, lost_line, refusal_line, restart_line, timeline_line};
+use crate::narrate::{
+    edge_line, lost_line, refusal_line, restart_line, severity_word, timeline_line,
+};
 use crate::story::{Story, Update};
 
 /// How long a read on the reports port waits before its caller looks at
@@ -93,19 +95,12 @@ pub fn alert_line(alert: &Alert, at: SyncTime) -> String {
         "severity": severity_word(alert.severity),
         "title": alert.title,
         "says": alert.body,
+        // The sentence the robot was asked to say out loud, where the row has
+        // one, so a run's own records answer what the room was told. Null on
+        // every alert the table decided says nothing aloud.
+        "spoken": alert.spoken,
     })
     .to_string()
-}
-
-/// How an alert's loudness is spelled on the wire and in a log.
-///
-/// The edge's two words, spelled once here.
-#[must_use]
-pub const fn severity_word(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Warning => "warning",
-        Severity::Critical => "critical",
-    }
 }
 
 /// The running edge: one gate, one story, one latch.
@@ -137,9 +132,14 @@ impl HostEdge {
     /// authority. The answer is the message to send to the control process, or
     /// nothing at all: a refusal is narrated here, and never retried and never
     /// repaired.
+    ///
+    /// `origin` says where the body was authored. No screen reads it — the
+    /// gate treats both sources identically — and it reaches the refusal line
+    /// and the alert table, which are the two places the difference matters.
     pub fn offer(
         &mut self,
         body: &[u8],
+        origin: Origin,
         arrival: SyncTime,
         surface: &mut impl Surface,
     ) -> Option<Accepted> {
@@ -149,8 +149,8 @@ impl HostEdge {
                 Some(accepted)
             }
             Err(refusal) => {
-                surface.say(refusal_line(&refusal, arrival));
-                if let Some(alert) = self.alerts.on_refusal(&refusal) {
+                surface.say(refusal_line(&refusal, origin, arrival));
+                if let Some(alert) = self.alerts.on_refusal(&refusal, origin) {
                     surface.alert(&alert);
                 }
                 None
@@ -224,10 +224,12 @@ mod tests {
     use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
     use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 
-    use super::{HostEdge, Surface, alert_line, severity_word};
+    use super::{HostEdge, Surface, alert_line};
     use crate::alerts::{Alert, STALE_ALERT_RUN, Severity};
     use crate::config::EdgeConfig;
+    use crate::intake::Origin;
     use crate::names::MotionTable;
+    use crate::narrate::{origin_word, severity_word};
 
     /// The pod every fixture body is addressed to.
     const POD: &str = "fixture-reachy";
@@ -302,7 +304,7 @@ mod tests {
     fn a_script_that_compiles_becomes_a_message_and_narrates_nothing() {
         let mut surface = Recorded::default();
         let accepted = host()
-            .offer(body(1).as_bytes(), at(), &mut surface)
+            .offer(body(1).as_bytes(), Origin::Remote, at(), &mut surface)
             .expect("the fixture compiles");
         assert_eq!(accepted.script_id, 1);
         assert!(surface.lines.is_empty(), "{:?}", surface.lines);
@@ -316,8 +318,14 @@ mod tests {
         // reason a process holds one edge rather than one per source.
         let mut host = host();
         let mut surface = Recorded::default();
-        assert!(host.offer(body(4).as_bytes(), at(), &mut surface).is_some());
-        assert!(host.offer(body(4).as_bytes(), at(), &mut surface).is_none());
+        assert!(
+            host.offer(body(4).as_bytes(), Origin::Remote, at(), &mut surface)
+                .is_some()
+        );
+        assert!(
+            host.offer(body(4).as_bytes(), Origin::Remote, at(), &mut surface)
+                .is_none()
+        );
         assert!(surface.said("stale"), "{:?}", surface.lines);
     }
 
@@ -326,7 +334,10 @@ mod tests {
         let mut host = host();
         let mut surface = Recorded::default();
         for _ in 0..3 {
-            assert!(host.offer(b"not a script", at(), &mut surface).is_none());
+            assert!(
+                host.offer(b"not a script", Origin::Remote, at(), &mut surface)
+                    .is_none()
+            );
         }
         assert_eq!(surface.lines.len(), 3, "{:?}", surface.lines);
         assert_eq!(surface.alerts.len(), 1, "{:?}", surface.alerts);
@@ -339,7 +350,7 @@ mod tests {
     fn an_edge_line_carries_the_instant_it_was_told() {
         let mut host = host();
         let mut surface = Recorded::default();
-        host.offer(b"not a script", at(), &mut surface);
+        host.offer(b"not a script", Origin::Remote, at(), &mut surface);
         host.follow(b"neither a story nor the right size", at(), &mut surface);
         for line in &surface.lines {
             let value: serde_json::Value =
@@ -348,13 +359,59 @@ mod tests {
         }
     }
 
+    /// The Critical this machine raises about itself, end to end through the
+    /// running edge: the line says the body was local, and the alert beside it
+    /// is the loud one rather than the refusal Warning.
+    #[test]
+    fn a_local_refusal_is_narrated_as_local_and_alerted_loudly() {
+        let mut host = host();
+        let mut surface = Recorded::default();
+        let foreign =
+            MotionScript::new("somebody-else", 1, vec![Step::new(0, Posture::Up)], 13_000)
+                .expect("a lawful script for another machine")
+                .encode();
+
+        assert!(
+            host.offer(foreign.as_bytes(), Origin::Local, at(), &mut surface)
+                .is_none()
+        );
+
+        assert_eq!(surface.lines.len(), 1, "{:?}", surface.lines);
+        let line: serde_json::Value =
+            serde_json::from_str(&surface.lines[0]).expect("one JSON object");
+        assert_eq!(line["kind"], "foreign_pod");
+        assert_eq!(line["origin"], origin_word(Origin::Local));
+        assert_eq!(surface.alerts.len(), 1, "{:?}", surface.alerts);
+        assert_eq!(surface.alerts[0].severity, Severity::Critical);
+    }
+
+    /// The word the analyzer joins on is the word the host writes, both ways
+    /// round. Wildcard-free at the source, so a third origin is a compile error
+    /// rather than a line whose field a reader has never seen.
+    #[test]
+    fn a_refusal_line_carries_the_origin_word() {
+        let mut host = host();
+        let mut surface = Recorded::default();
+        host.offer(b"not a script", Origin::Remote, at(), &mut surface);
+        let line: serde_json::Value =
+            serde_json::from_str(&surface.lines[0]).expect("one JSON object");
+        assert_eq!(line["origin"], "remote");
+        assert_eq!(origin_word(Origin::Local), "local");
+    }
+
     #[test]
     fn a_run_of_stale_drops_is_the_loud_one() {
         let mut host = host();
         let mut surface = Recorded::default();
-        assert!(host.offer(body(9).as_bytes(), at(), &mut surface).is_some());
+        assert!(
+            host.offer(body(9).as_bytes(), Origin::Remote, at(), &mut surface)
+                .is_some()
+        );
         for _ in 0..STALE_ALERT_RUN {
-            assert!(host.offer(body(9).as_bytes(), at(), &mut surface).is_none());
+            assert!(
+                host.offer(body(9).as_bytes(), Origin::Remote, at(), &mut surface)
+                    .is_none()
+            );
         }
         let loud: Vec<&Alert> = surface
             .alerts
@@ -517,6 +574,7 @@ mod tests {
                 severity: Severity::Critical,
                 title: "a title".to_owned(),
                 body: "a body".to_owned(),
+                spoken: Some("A sentence.".to_owned()),
             },
             at(),
         );
@@ -526,6 +584,25 @@ mod tests {
         assert_eq!(parsed["severity"], "critical");
         assert_eq!(parsed["title"], "a title");
         assert_eq!(parsed["says"], "a body");
+        assert_eq!(parsed["spoken"], "A sentence.");
         assert_eq!(severity_word(Severity::Warning), "warning");
+    }
+
+    /// An alert the table decided says nothing aloud carries the field anyway,
+    /// as null: a reader after an incident distinguishes a sentence nobody was
+    /// given from a build that wrote no field.
+    #[test]
+    fn an_alert_with_nothing_to_say_carries_a_null_sentence() {
+        let line = alert_line(
+            &Alert {
+                severity: Severity::Warning,
+                title: "a title".to_owned(),
+                body: "a body".to_owned(),
+                spoken: None,
+            },
+            at(),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert!(parsed["spoken"].is_null(), "{parsed}");
     }
 }

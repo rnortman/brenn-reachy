@@ -38,11 +38,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clockwork_rs::SyncTime;
 use reachy_edge::{
-    DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
-    Surface, edge_line_with, now,
+    DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, Origin, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
+    Surface, edge_line_with, now, origin_word,
 };
 use reachy_host::check;
-use reachy_host::edge::{Console, Publishing};
+use reachy_host::edge::{Console, Publishing, Speaker};
 use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
 use reachy_host::sinks::Stdout;
@@ -301,13 +301,15 @@ fn run(options: &Options) -> Result<(), String> {
     outcome(followed, stopped)
 }
 
-/// Put the raising end on the surface, and hand back the pipeline to stop.
+/// Put the raising and speaking ends on the surface, and hand back the pipeline
+/// to stop.
 ///
-/// The one place the two halves of the alert path are joined: the raiser a
-/// composed run handed back is the raiser the surface publishes through. A
+/// The one place the alert path's halves are joined: the raiser a composed run
+/// handed back is the raiser the surface publishes through, and the seam that
+/// run speaks on is what the surface says a Critical's sentence through. A
 /// separate function because that join is otherwise unobservable — a host that
 /// composed a pipeline and installed nothing looks exactly like one whose
-/// deployment carries no alerts, and both of them run.
+/// deployment carries no alerts and cannot speak, and both of them run.
 fn install_alerts<S: Surface>(
     surface: &mut Publishing<S>,
     started: Option<Started>,
@@ -315,6 +317,9 @@ fn install_alerts<S: Surface>(
     let started = started?;
     if let Some(raiser) = started.alerts {
         surface.publish_through(raiser);
+    }
+    if let Some(speaker) = started.speaker {
+        surface.speak_through(speaker);
     }
     Some(started.voice)
 }
@@ -352,6 +357,10 @@ struct Started {
     /// a pipeline that composed no bus attachment: the run drops its end, so
     /// every raise against it would refuse and say so for nothing.
     alerts: Option<AlertRaiser>,
+    /// What the robot says a critical alert's sentence through, where this run
+    /// can speak. Absent on a pipeline that composed no brain or no voice, on
+    /// the same grounds the raiser is.
+    speaker: Option<Box<dyn Speaker>>,
 }
 
 /// Start the voice pipeline where one was configured, and say which it is.
@@ -387,10 +396,17 @@ fn start_voice(
     match Voice::start(path, intents.clone(), Arc::new(Stdout), inbox) {
         Ok(voice) => {
             let carries = voice.carries_alerts();
-            surface.say(composed_line(path, &voice.listening(), carries, now()));
+            let speaker = voice.speaker();
+            surface.say(composed_line(
+                path,
+                &voice.listening(),
+                voice.composition(),
+                now(),
+            ));
             Ok(Some(Started {
                 voice,
                 alerts: carries.then_some(raiser),
+                speaker,
             }))
         }
         Err(NotRunning::Absent) => {
@@ -497,14 +513,19 @@ fn follow(
             Err(error) => return Err(format!("reading the reports port: {error}")),
         }
 
-        while let Some(body) = waiting.next() {
+        while let Some(offered) = waiting.next() {
             let arrival = now();
-            if let Some(accepted) = host.offer(&body, arrival, surface) {
+            if let Some(accepted) = host.offer(&offered.body, offered.origin, arrival, surface) {
                 // Fire and forget: the session narrates what it decided with
                 // the script, and a send that failed is said here because
                 // nothing else would ever mention it.
                 if let Err(error) = scripts.send_to(accepted.bytes(), scripts_to) {
-                    surface.say(unsent_line(accepted.script_id, &error.to_string(), arrival));
+                    surface.say(unsent_line(
+                        accepted.script_id,
+                        offered.origin,
+                        &error.to_string(),
+                        arrival,
+                    ));
                 }
             }
         }
@@ -541,15 +562,23 @@ fn started_line(settings: &HostSettings, config: &Path, at: SyncTime) -> String 
 }
 
 /// A compiled script that never left this machine, as a line.
-fn unsent_line(script_id: u32, detail: &str, at: SyncTime) -> String {
+///
+/// Carries the origin the body was offered under, because this host sends every
+/// script its gate accepted and a send that failed does not say whose gesture
+/// was lost: a reader counting what this machine did to its own scripts needs
+/// the same word a refusal carries.
+fn unsent_line(script_id: u32, origin: Origin, detail: &str, at: SyncTime) -> String {
     edge_line_with(
-        "unsent",
+        reachy_host::UNSENT,
         at,
         &format!(
             "script {script_id} compiled and could not be sent to the control process: {detail}. \
              nothing is retried; the sender's next refresh is what recovers"
         ),
-        &[("script_id", serde_json::json!(script_id))],
+        &[
+            ("script_id", serde_json::json!(script_id)),
+            ("origin", serde_json::json!(origin_word(origin))),
+        ],
     )
 }
 
@@ -564,7 +593,7 @@ mod tests {
 
     use clockwork_rs::{SyncTime, blob_from_bytes};
     use motion_proto::{MotionScript, Posture, Step};
-    use reachy_edge::{Alert, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Surface};
+    use reachy_edge::{Alert, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, Surface};
     use reachy_host::intents::queue;
     use reachy_scratch::scratch_dir;
 
@@ -628,6 +657,26 @@ mod tests {
         fn alert(&mut self, _alert: &Alert) {}
     }
 
+    /// Every sentence a surface was asked to say out loud.
+    ///
+    /// The room's end of the spoken path, stood in for: the composed pipeline's
+    /// own seam is what production installs, and what these cases have to see
+    /// is that something was installed at all.
+    #[derive(Clone, Debug, Default)]
+    struct Heard {
+        said: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl reachy_host::Speaker for Heard {
+        fn speak(&self, sentence: &str) -> Result<(), reachy_host::Unspoken> {
+            self.said
+                .lock()
+                .expect("the recorded sentences")
+                .push(sentence.to_owned());
+            Ok(())
+        }
+    }
+
     /// A script body for `POD`, as the wire contract encodes one: a raise now,
     /// with the closing stow left to the compile.
     fn body(seq: u64) -> Vec<u8> {
@@ -664,7 +713,9 @@ mod tests {
     ) -> Recorded {
         let (intents, waiting) = queue();
         for body in bodies {
-            intents.offer(body.clone()).expect("a queue with room");
+            intents
+                .offer(body.clone(), Origin::Local)
+                .expect("a queue with room");
         }
         let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
         let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
@@ -736,6 +787,10 @@ mod tests {
             serde_json::from_str(&said.lines[0]).expect("one JSON object");
         assert_eq!(line["kind"], "unsent");
         assert_eq!(line["script_id"], 1);
+        assert_eq!(
+            line["origin"], "local",
+            "the loop offered this body itself, so the line says whose script was lost",
+        );
     }
 
     #[test]
@@ -1101,11 +1156,16 @@ mod tests {
         // The fixture configuration names no bus, so the composed run drops its
         // end of the alert seam and this host keeps no raising end.
         assert!(started.alerts.is_none(), "nowhere to publish, so no raiser");
+        assert!(
+            started.speaker.is_none(),
+            "no brain and no voice, so nothing to speak through",
+        );
         let voice = started.voice;
         let line = said.lines.last().expect("a line saying what was composed");
         let parsed: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
         assert_eq!(parsed["kind"], "composed");
         assert_eq!(parsed["alerts"], false);
+        assert_eq!(parsed["speaks"], false);
         let says = parsed["says"].as_str().expect("a sentence");
         let listening = voice.listening();
         assert!(says.contains(&listening), "{line}");
@@ -1140,12 +1200,18 @@ mod tests {
                 .expect("one JSON object");
         assert_eq!(composed["kind"], "composed");
         assert_eq!(composed["alerts"], true);
+        assert_eq!(composed["speaks"], true);
+        assert!(
+            started.speaker.is_some(),
+            "a brain and a voice, so the seam to speak through comes back",
+        );
 
         let voice = install_alerts(&mut surface, Some(started)).expect("the composed pipeline");
         surface.alert(&Alert {
             severity: reachy_edge::Severity::Critical,
             title: "the head is parked".to_owned(),
             body: "a fault row ended the session".to_owned(),
+            spoken: Some("My head motion has stopped.".to_owned()),
         });
         let after = said.lines();
         assert!(
@@ -1179,6 +1245,7 @@ mod tests {
             severity: reachy_edge::Severity::Warning,
             title: "a script was refused".to_owned(),
             body: "the session declined it".to_owned(),
+            spoken: None,
         });
         let after = said.lines();
         assert!(
@@ -1213,6 +1280,7 @@ mod tests {
             Some(Started {
                 voice,
                 alerts: Some(raiser),
+                speaker: None,
             }),
         )
         .expect("the composed pipeline");
@@ -1220,6 +1288,7 @@ mod tests {
             severity: reachy_edge::Severity::Critical,
             title: "the head is parked".to_owned(),
             body: "a fault row ended the session".to_owned(),
+            spoken: Some("My head motion has stopped.".to_owned()),
         });
         let lines = said.lines();
         let unpublished: Vec<serde_json::Value> = lines
@@ -1230,6 +1299,63 @@ mod tests {
         assert_eq!(unpublished.len(), 1, "{lines:?}");
         assert_eq!(unpublished[0]["title"], "the head is parked");
         assert_eq!(unpublished[0]["reason"], "gone");
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn an_installed_speaker_is_the_one_a_sentence_goes_through() {
+        // The speaking half of the same join, and the only thing that can see
+        // it: a host that composed a pipeline and installed no speaker says
+        // nothing out loud and writes no line saying so, so the sentence
+        // arriving at a double is the whole of the evidence.
+        let dir = scratch_dir("reachy-host-alert-installed-speaker");
+        let path = runnable_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let said = Shared::default();
+        let mut surface = Publishing::new(said.clone());
+        let options = Options {
+            speech_config: Some(path),
+            ..Options::default()
+        };
+        let voice = start_voice(&options, &intents, &mut surface)
+            .expect("a running host")
+            .expect("a composed pipeline")
+            .voice;
+        let heard = Heard::default();
+
+        let voice = install_alerts(
+            &mut surface,
+            Some(Started {
+                voice,
+                alerts: None,
+                speaker: Some(Box::new(heard.clone())),
+            }),
+        )
+        .expect("the composed pipeline");
+        surface.alert(&Alert {
+            severity: reachy_edge::Severity::Critical,
+            title: "the head is parked".to_owned(),
+            body: "a fault row ended the session".to_owned(),
+            spoken: Some("My head motion has stopped.".to_owned()),
+        });
+        surface.alert(&Alert {
+            severity: reachy_edge::Severity::Warning,
+            title: "a script was refused".to_owned(),
+            body: "the session declined it".to_owned(),
+            spoken: None,
+        });
+
+        assert_eq!(
+            heard.said.lock().expect("the recorded sentences").clone(),
+            vec!["My head motion has stopped.".to_owned()],
+            "the critical's sentence reached the installed speaker, and the warning's silence \
+             stayed silent",
+        );
+        let lines = said.lines();
+        assert!(
+            lines.iter().all(|line| !line.contains("unspoken")),
+            "the installed speaker took it: {lines:?}",
+        );
         assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
     }
 
@@ -1288,11 +1414,15 @@ mod tests {
     #[test]
     fn a_script_that_could_not_be_sent_says_which_one() {
         let at = SyncTime::from_nanos(1_700_000_000_000_000_000);
-        let line = unsent_line(7, "no route to host", at);
+        let line = unsent_line(7, Origin::Remote, "no route to host", at);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
         assert_eq!(parsed["kind"], "unsent");
         assert_eq!(parsed["at_ns"], at.as_nanos());
         assert_eq!(parsed["script_id"], 7);
+        assert_eq!(
+            parsed["origin"], "remote",
+            "this host sends a bus sender's accepted script too, and says so",
+        );
         assert!(
             parsed["says"]
                 .as_str()

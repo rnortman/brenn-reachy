@@ -130,6 +130,37 @@ pub fn runnable_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf
     path
 }
 
+/// The same fixture, naming `pods` in its `[pods]` table.
+///
+/// The table is the only set of pod ids a loaded configuration exposes, and it
+/// is what the deployment preflight compares the host's own `pod` against, so
+/// the fixture states it rather than leaving each case to append TOML to the
+/// file it was handed. Every entry gets the same room: what the comparison
+/// reads is the keys.
+///
+/// # Panics
+///
+/// If the directory cannot be written.
+pub fn runnable_with_pods(
+    dir: &Path,
+    events: Events<'_>,
+    naming: Naming,
+    pods: &[&str],
+) -> PathBuf {
+    let path = runnable_named(dir, events, naming);
+    let text = std::fs::read_to_string(&path).expect("the fixture");
+    let mut table = String::new();
+    for pod in pods {
+        assert!(
+            !pod.contains(['"', '\\', '[', ']', '.']) && !pod.contains(char::is_control),
+            "a pod id this fixture can write as a TOML table key unquoted: {pod:?}"
+        );
+        table.push_str(&format!("[pods.{pod}]\nroom = \"fixture\"\n"));
+    }
+    std::fs::write(&path, format!("{text}{table}")).expect("a file");
+    path
+}
+
 /// The same fixture with every model path a configuration can name.
 ///
 /// A `[wake]` table with its three openWakeWord models, an `[endpointer]` with

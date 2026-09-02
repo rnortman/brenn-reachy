@@ -67,12 +67,12 @@ pub mod story;
 pub use alerts::{Alert, Alerts, STALE_ALERT_RUN, Severity};
 pub use compile::{CompileError, compile};
 pub use config::{BODY_CAP_BYTES, ConfigError, EdgeConfig, MIN_BODY_CAP_BYTES, STOW_DURATION_MS};
-pub use intake::{Accepted, Edge, Refusal};
+pub use intake::{Accepted, Edge, Origin, Refusal};
 pub use names::{MAX_MOTIONS, MotionEntry, MotionTable, SidecarError};
 pub use narrate::{
-    UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, refusal_line, restart_line,
-    timeline_line,
+    UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, origin_word, refusal_line,
+    restart_line, row_says, row_word, severity_word, timeline_line,
 };
 pub use ports::{LOOPBACK, REPORTS_OUT_PORT, SCRIPTS_IN_PORT};
-pub use run::{DATAGRAM_CAP, HostEdge, POLL, Surface, alert_line, now, severity_word};
+pub use run::{DATAGRAM_CAP, HostEdge, POLL, Surface, alert_line, now};
 pub use story::{NotAStory, Story, Update};

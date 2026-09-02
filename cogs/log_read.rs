@@ -284,6 +284,29 @@ pub fn typed<T: Blob + SchemaMeta>(
     }
 }
 
+/// Decode one message as the schema type its channel is bound to, and hand it to
+/// `take` without keeping it.
+///
+/// What [`typed`] is for a consumer that folds instead of collecting: a channel
+/// carrying one message per control sample over a session an operator ends when
+/// they choose is a channel whose retained copy is unbounded in the run's
+/// duration, and a consumer that only needs running maxima off it should never
+/// hold the samples at all.
+pub fn each<T: Blob + SchemaMeta>(
+    message: &LoggedMessage<'_>,
+    complaints: &mut Complaints,
+    take: impl FnOnce(Logged<T>),
+) {
+    match message.to_message::<T>() {
+        Ok(decoded) => take(Logged {
+            at_ns: message.message_time.as_nanos(),
+            sequence_number: message.sequence_number,
+            message: decoded,
+        }),
+        Err(err) => complaints.push(complaint(message, T::SCHEMA_NAME, &err)),
+    }
+}
+
 /// Decode one message as the cumulative record its channel carries, and keep the
 /// rows it holds as the whole of that stream.
 ///
@@ -294,12 +317,15 @@ pub fn typed<T: Blob + SchemaMeta>(
 /// was seen first says everything the ones before it said.
 ///
 /// `rows` is what takes the record apart, because which container holds the rows
-/// is the schema's business and not this module's.
+/// is the schema's business and not this module's. It is handed the whole
+/// decoded record, so a reader that needs a field the record carries beside its
+/// rows -- how many of them the publisher dropped, say -- takes it there rather
+/// than decoding the message a second time.
 pub fn cumulative<T: Blob + SchemaMeta, U>(
     message: &LoggedMessage<'_>,
     out: &mut Vec<Logged<U>>,
     complaints: &mut Complaints,
-    rows: fn(&T, &mut Vec<U>),
+    rows: impl FnOnce(&T, &mut Vec<U>),
 ) {
     match message.to_message::<T>() {
         Ok(decoded) => {
@@ -347,7 +373,7 @@ mod tests {
     //! would be this module's idea of the format rather than the format.
 
     use super::{
-        Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed,
+        Bound, Census, Complaints, Logged, Streams, binding, cumulative, each, read_with, typed,
     };
     use clockwork_logs::offboard::{OffboardWriter, OffboardWriterConfig};
     use clockwork_logs::onboard::OnboardWriter;
@@ -726,6 +752,31 @@ mod tests {
             vec![1, 2],
             "the rows the last readable copy carried are still what the stream holds",
         );
+        assert_eq!(complaints.len(), 1, "{complaints:?}");
+        assert!(
+            complaints[0].contains(SPOKEN) && complaints[0].contains("2000"),
+            "the complaint names the channel and the instant, like every other one: {complaints:?}"
+        );
+    }
+
+    #[test]
+    fn a_folded_copy_that_does_not_decode_is_a_complaint_and_is_never_handed_on() {
+        // The folding sibling's own refusal. A consumer of `each` keeps no
+        // sample, so a message handed to its closure regardless of the decode
+        // would fold arithmetic out of bytes read as the wrong message and
+        // leave nothing behind saying it had happened.
+        let recorded = ChannelMetadata::for_schema::<Sample>(SPOKEN);
+        let payload = [1u8, 2, 0, 0, 0, 0, 0, 0];
+        let mut complaints = Complaints::new();
+        let mut taken = 0usize;
+
+        each::<Widened>(
+            &logged(&recorded, 1, 2_000, &payload),
+            &mut complaints,
+            |_| taken += 1,
+        );
+
+        assert_eq!(taken, 0, "nothing of another width decodes");
         assert_eq!(complaints.len(), 1, "{complaints:?}");
         assert!(
             complaints[0].contains(SPOKEN) && complaints[0].contains("2000"),

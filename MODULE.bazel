@@ -206,26 +206,48 @@ crate.spec(
 # three together; they are one workspace upstream and their internal path
 # dependencies must agree.
 #
-# Three seams the host composes through are what this revision is chosen for:
-# the two motion sinks (`Sinks`, `Server::with_sinks`) and the alert queue
+# Four seams the host composes through are what this revision is chosen for:
+# the two motion sinks (`Sinks`, `Server::with_sinks`), the alert queue
 # (`alert_seam`, `Server::with_alerts`), which is how an alert the edge's table
 # raised reaches the robot's single bus attachment without this process opening
-# a second one. It also states each seam's whole vocabulary on the seam
-# itself -- `AlertSeverity` re-exported beside the
-# `Alert` that carries it, and `Config::carries_alerts()` answering the drain
-# condition the server spawns under -- so this tree fills in the seam and asks
-# about it through the one crate, rather than spelling either against a pin.
+# a second one, and the announcement queue (`announce_seam`,
+# `Server::with_announcements`), which is how a critical alert's sentence
+# reaches the room the robot is standing in. It also states each seam's whole
+# vocabulary on the seam itself -- `AlertSeverity` re-exported beside the
+# `Alert` that carries it, and `Config::carries_alerts()` and
+# `Config::carries_announcements()` answering the drain conditions the server
+# spawns under -- so this tree fills in the seam and asks about it through the
+# one crate, rather than spelling either against a pin.
 #
 # At this revision `speech-surface` takes `motion-proto` from an earlier
 # published brenn-reachy revision, so the fetched closure carries a second copy
 # of the wire contract beside `//crates/motion-proto` -- the same contract, some
 # publishes behind this tree's. Nothing carries a `MotionScript` value across the
 # two seams, so the two types never meet. TODO(motion-proto-two-copies)
-BRENN_POD_REV = "e2f3b21dcaeea603bc8873eab33ef03ace571afe"
+#
+# The remote and the revision are named once each and the three specs read them,
+# so a fork, a mirror or a bump cannot reach two of the three.
+BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
+BRENN_POD_REV = "f5fa3f77116706203adffdc28c61accdaa8e77de"
+
+# Developing a seam that lands on both sides of this dependency arrow: replace
+# each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
+# resolve them from a working tree beside this one, and put them back before
+# anything is pushed. `crate.spec` has no override form, so all three are edited
+# by hand and all three must be in the same form at once. Three things come back
+# with them: `BRENN_POD_REV` has to name a revision *published* on the remote
+# and carrying the seam before the specs return to `git`/`rev`, or the tree does
+# not compile; `MODULE.bazel.lock` records an absolute path under a `path =`
+# spec, so it is left uncommitted while the overlay is active and regenerated
+# with the pin; and a `path =` spec writes generated `BUILD.bazel` files into
+# the other repository's crate directories, which are the overlay's litter to
+# delete. The pin is what CI, a fresh clone and every other machine resolve --
+# `tools/module-pins.test.sh` is the gate that catches an overlay left active.
+#
 # The host library the robot's voice process is a composition of. reachy-host.
 crate.spec(
-    git = "https://github.com/rnortman/brenn-pod.git",
+    git = BRENN_POD_GIT,
     package = "speech-surface",
     rev = BRENN_POD_REV,
 )
@@ -233,7 +255,7 @@ crate.spec(
 # The pipeline stages the surface drives. Named here because the host states
 # its own pipeline wiring. reachy-host.
 crate.spec(
-    git = "https://github.com/rnortman/brenn-pod.git",
+    git = BRENN_POD_GIT,
     package = "speech-pipeline",
     rev = BRENN_POD_REV,
 )
@@ -244,7 +266,7 @@ crate.spec(
 # `//crates/reachy-host:host_closure_test`, which holds it to prove the link
 # resolves.
 crate.spec(
-    git = "https://github.com/rnortman/brenn-pod.git",
+    git = BRENN_POD_GIT,
     package = "brenn-bridge",
     rev = BRENN_POD_REV,
 )

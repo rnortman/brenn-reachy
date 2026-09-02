@@ -18,6 +18,14 @@
 //!   per run, because a sender emitting garbage at the refresh cadence would
 //!   otherwise be an alert every few seconds. Warning: nothing about the
 //!   machine is wrong when it declines a script it cannot run.
+//! - **A refused script this machine authored for itself.** Not the same news:
+//!   a body the edge dropped that its own process wrote is this machine
+//!   disagreeing with itself, and no sender's refresh recovers it — the head
+//!   will not move for anything said to the robot until somebody edits a file.
+//!   Critical, once a run. The staleness screen is the exception, whatever the
+//!   origin: a local script numbered below the mark is a pipeline that
+//!   restarted its numbering under a host that kept its own, which is the
+//!   two-senders news the Warning already carries.
 //! - **A run of stale drops.** The shape of a machine that has gone
 //!   permanently deaf — every script arriving at or below a mark it will not
 //!   go below — which is indistinguishable from an idle one to everything but
@@ -39,6 +47,12 @@
 //! be recognised as the same. This module decides *which* rows are worth the
 //! interruption; [`crate::narrate`] says what they say.
 //!
+//! A Critical also carries a sentence to say out loud, for the deployments that
+//! can speak: the person standing in front of the robot is the one the machine
+//! has stopped working for, and a log they will read tomorrow is not a report to
+//! them. Only the Criticals carry one — spoken words interrupt a room, and a
+//! Warning is something an operator reads afterwards.
+//!
 //! What this module does *not* do is send anything. It is a table over the
 //! things the edge already saw, and the process that holds the bus attachment
 //! is what publishes what it hands back. That split is what lets a deployment
@@ -49,8 +63,8 @@ use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
-use crate::intake::Refusal;
-use crate::narrate::{refusal_reason, says};
+use crate::intake::{Origin, Refusal};
+use crate::narrate::{refusal_reason, row_says};
 
 /// How many drops in a row say the machine has gone deaf rather than idle.
 ///
@@ -82,6 +96,12 @@ pub struct Alert {
     pub title: String,
     /// What happened, what it means, and what it does not mean.
     pub body: String,
+    /// One sentence the robot says out loud, where the deployment can speak,
+    /// or `None` for an alert not worth interrupting a room with.
+    ///
+    /// Must be short, free of identifiers a listener cannot use, and never a
+    /// claim about the machine's state the row itself does not make.
+    pub spoken: Option<String>,
 }
 
 /// The latches, and the counts they are latched over.
@@ -97,6 +117,8 @@ pub struct Alerts {
     refusals: u64,
     /// Whether the refusal alert has gone out.
     alerted_refusal: bool,
+    /// Whether the own-scripts alert has gone out.
+    alerted_own: bool,
     /// Drops for staleness since the last script that was accepted.
     stale_run: u64,
     /// Whether the staleness alert has gone out.
@@ -158,6 +180,7 @@ impl Alerts {
                  raised nothing — the session's own log is the whole account. this is the only \
                  alert of its kind this run."
             ),
+            spoken: None,
         })
     }
 
@@ -171,21 +194,32 @@ impl Alerts {
         self.stale_run = 0;
     }
 
-    /// A body the edge dropped before the session saw it.
+    /// A body the edge dropped before the session saw it, and where it was
+    /// authored.
     ///
     /// The count rises for every drop, whichever alert the drop goes on to
     /// raise: a run of stale drops raises the louder one, and the count still
     /// has to be the number of scripts that did not run.
+    ///
+    /// A [`Origin::Local`] drop that is not the staleness screen raises the
+    /// own-scripts Critical instead of the refusal Warning, and never touches
+    /// the Warning's latch: the two conditions are different news, and a
+    /// machine refusing its own scripts must not spend the quieter latch on
+    /// the way to the louder one.
     #[must_use]
-    pub fn on_refusal(&mut self, refusal: &Refusal) -> Option<Alert> {
+    pub fn on_refusal(&mut self, refusal: &Refusal, origin: Origin) -> Option<Alert> {
         self.refusals += 1;
         if matches!(refusal, Refusal::Stale { .. }) {
             self.stale_run += 1;
             if let Some(alert) = self.stale_alert() {
                 return Some(alert);
             }
+            return self.refusal_alert(&refusal.to_string());
         }
-        self.refusal_alert(&refusal.to_string())
+        match origin {
+            Origin::Local => self.own_alert(refusal),
+            Origin::Remote => self.refusal_alert(&refusal.to_string()),
+        }
     }
 
     /// One row of the session's story.
@@ -212,7 +246,7 @@ impl Alerts {
             return None;
         }
         self.faulted = true;
-        let stopped = says(row);
+        let stopped = row_says(row);
         Some(Alert {
             severity: Severity::Critical,
             title: "reachy head motion stopped".to_owned(),
@@ -225,6 +259,7 @@ impl Alerts {
                  rather than a recovery of this one. this is the only alert of its kind this \
                  run; the narration carries every row."
             ),
+            spoken: Some(spoken_stop(row)),
         })
     }
 
@@ -246,6 +281,33 @@ impl Alerts {
                  the only refusal alert of the run; the narration carries every one.",
                 self.refusals
             ),
+            spoken: None,
+        })
+    }
+
+    /// The own-scripts alert, once a run.
+    ///
+    /// Louder than the refusal Warning because it is a different condition:
+    /// the process that authored the script and the process that screened it
+    /// are on this one machine, so there is no other sender to blame and no
+    /// refresh that recovers. Until the two configurations agree, the head
+    /// will not move for anything said to the robot.
+    fn own_alert(&mut self, refusal: &Refusal) -> Option<Alert> {
+        if self.alerted_own {
+            return None;
+        }
+        self.alerted_own = true;
+        Some(Alert {
+            severity: Severity::Critical,
+            title: "reachy head refuses its own scripts".to_owned(),
+            body: format!(
+                "the edge dropped a motion script this machine authored for itself: {refusal}. \
+                 both ends of that disagreement are on this machine, so nothing retries it and \
+                 no sender's next refresh recovers it — the head will not move for anything said \
+                 to this robot until the two configurations agree. this is the only alert of its \
+                 kind this run; the narration carries every one."
+            ),
+            spoken: Some(spoken_own(refusal)),
         })
     }
 
@@ -266,7 +328,48 @@ impl Alerts {
                  machine, or one sender that restarted its numbering.",
                 self.stale_run
             ),
+            spoken: Some("My head is dropping every motion script.".to_owned()),
         })
+    }
+}
+
+/// What the robot says out loud about a row that stopped it.
+///
+/// Two sentences, because one row means something a bystander has to act on.
+/// [`ReportKind::TorqueOffUnconfirmed`] exists to say de-torquing was *not*
+/// confirmed, and stowed with torque held is this machine's one pinch hazard,
+/// so what a person in the room hears has to say the same. Every other row here
+/// says the head stopped and nothing about limpness: reaching the minimum risk
+/// condition is the machine's own to do, and these rows do not report it
+/// reached.
+fn spoken_stop(row: &TimelineEntryWire) -> String {
+    if row.kind().to_known() == Some(ReportKind::TorqueOffUnconfirmed) {
+        return "My head motion has stopped, and I could not confirm my motors are off. Do not \
+                touch my head."
+            .to_owned();
+    }
+    "My head motion has stopped.".to_owned()
+}
+
+/// What the robot says out loud about a script of its own that was refused.
+///
+/// The two names, where the refusal holds them: they are the whole of what
+/// somebody has to reconcile, and a listener who has them can act without
+/// reading a log. Any other screen has nothing a listener could use, so the
+/// sentence says only what happened.
+fn spoken_own(refusal: &Refusal) -> String {
+    match refusal {
+        Refusal::ForeignPod { addressed, pod } => format!(
+            "My head is not moving. My motion scripts are addressed to {addressed}, but I answer \
+             to {pod}."
+        ),
+        Refusal::Oversize { .. }
+        | Refusal::NotText
+        | Refusal::Undecodable(_)
+        | Refusal::Stale { .. }
+        | Refusal::Uncompilable(_) => {
+            "My head is not moving. My own motion scripts are being refused.".to_owned()
+        }
     }
 }
 
@@ -324,7 +427,7 @@ mod tests {
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
     use super::{Alerts, STALE_ALERT_RUN, Severity};
-    use crate::intake::Refusal;
+    use crate::intake::{Origin, Refusal};
 
     fn row(kind: ReportKindWire, a: u32, b: u32) -> TimelineEntryWire {
         let mut entry = TimelineEntryWire::new();
@@ -411,7 +514,7 @@ mod tests {
     fn refusals_are_one_warning_a_run_over_a_count_that_keeps_rising() {
         let mut alerts = Alerts::new();
         let first = alerts
-            .on_refusal(&Refusal::NotText)
+            .on_refusal(&Refusal::NotText, Origin::Remote)
             .expect("a refusal owes an alert");
         assert_eq!(first.severity, Severity::Warning);
         assert!(first.body.contains("1 script(s)"), "{}", first.body);
@@ -442,7 +545,7 @@ mod tests {
                 .is_some(),
             "the first refusal owes an alert"
         );
-        assert_eq!(alerts.on_refusal(&Refusal::NotText), None);
+        assert_eq!(alerts.on_refusal(&Refusal::NotText, Origin::Remote), None);
     }
 
     #[test]
@@ -450,19 +553,22 @@ mod tests {
         let mut alerts = Alerts::new();
         // The first drops raise the refusal warning, not the deafness alert.
         for n in 0..STALE_ALERT_RUN - 1 {
-            let alert = alerts.on_refusal(&stale(n));
+            let alert = alerts.on_refusal(&stale(n), Origin::Remote);
             assert!(
                 alert.is_none_or(|alert| alert.severity == Severity::Warning),
                 "a short run of drops is not deafness"
             );
         }
         let alert = alerts
-            .on_refusal(&stale(STALE_ALERT_RUN))
+            .on_refusal(&stale(STALE_ALERT_RUN), Origin::Remote)
             .expect("a run of drops owes an alert");
         assert_eq!(alert.severity, Severity::Critical);
         assert!(alert.title.contains("dropping"), "{}", alert.title);
         // Once. A sender that keeps its numbering keeps producing these.
-        assert_eq!(alerts.on_refusal(&stale(STALE_ALERT_RUN + 1)), None);
+        assert_eq!(
+            alerts.on_refusal(&stale(STALE_ALERT_RUN + 1), Origin::Remote),
+            None
+        );
     }
 
     /// A stale drop the session caught counts toward the same run: the mark it
@@ -489,7 +595,7 @@ mod tests {
     fn every_drop_counts_toward_the_refusal_tally_whatever_it_alerted() {
         let mut alerts = Alerts::new();
         for n in 0..STALE_ALERT_RUN {
-            let _ = alerts.on_refusal(&stale(n));
+            let _ = alerts.on_refusal(&stale(n), Origin::Remote);
         }
         assert_eq!(alerts.refusals(), STALE_ALERT_RUN);
 
@@ -532,10 +638,89 @@ mod tests {
         let entry = row(ReportKindWire::FAULT_RECORDED, 3, 12);
         let alert = alerts.on_row(&entry).expect("a fault owes an alert");
         assert!(
-            alert.body.contains(&crate::narrate::says(&entry)),
+            alert.body.contains(&crate::narrate::row_says(&entry)),
             "{}",
             alert.body
         );
+    }
+
+    /// The condition this latch exists for: the pipeline's own scripter
+    /// addressed to a name this host does not answer to. Nobody else is
+    /// involved, so nothing recovers it.
+    #[test]
+    fn a_local_refusal_is_one_critical_alert_naming_both_names() {
+        let mut alerts = Alerts::new();
+        let refusal = Refusal::ForeignPod {
+            addressed: "reachy00".to_owned(),
+            pod: "kitchen-reachy".to_owned(),
+        };
+        let alert = alerts
+            .on_refusal(&refusal, Origin::Local)
+            .expect("a refused local script owes an alert");
+        assert_eq!(alert.severity, Severity::Critical);
+        assert!(alert.title.contains("its own scripts"), "{}", alert.title);
+        assert!(alert.body.contains("reachy00"), "{}", alert.body);
+        assert!(alert.body.contains("kitchen-reachy"), "{}", alert.body);
+        // Once. The scripter re-authors at the refresh cadence, and the head
+        // stays still for all of them.
+        assert_eq!(alerts.on_refusal(&refusal, Origin::Local), None);
+        assert_eq!(alerts.on_refusal(&Refusal::NotText, Origin::Local), None);
+    }
+
+    /// The two conditions are different news and keep separate latches: a local
+    /// refusal must not spend the Warning on its way to the Critical, or a
+    /// remote sender's garbage afterwards would raise nothing at all.
+    #[test]
+    fn a_local_refusal_leaves_the_warning_latch_alone() {
+        let mut alerts = Alerts::new();
+        let critical = alerts
+            .on_refusal(&Refusal::NotText, Origin::Local)
+            .expect("a refused local script owes an alert");
+        assert_eq!(critical.severity, Severity::Critical);
+        let warning = alerts
+            .on_refusal(&Refusal::NotText, Origin::Remote)
+            .expect("a remote refusal owes the warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(alerts.refusals(), 2);
+    }
+
+    /// A remote sender addressing another machine is the disagreement the intent
+    /// channel is expected to carry, and stays the Warning it is today.
+    #[test]
+    fn a_remote_refusal_is_the_warning_it_has_always_been() {
+        let mut alerts = Alerts::new();
+        let alert = alerts
+            .on_refusal(
+                &Refusal::ForeignPod {
+                    addressed: "somebody-else".to_owned(),
+                    pod: "fixture-reachy".to_owned(),
+                },
+                Origin::Remote,
+            )
+            .expect("a refusal owes an alert");
+        assert_eq!(alert.severity, Severity::Warning);
+        assert!(alert.title.contains("refused"), "{}", alert.title);
+    }
+
+    /// Staleness takes today's path whatever the origin: a local script below
+    /// the mark is a pipeline that restarted its numbering under a host that
+    /// kept its own, which is the two-senders news the Warning carries.
+    #[test]
+    fn a_local_stale_drop_takes_the_path_a_remote_one_takes() {
+        let mut alerts = Alerts::new();
+        let first = alerts
+            .on_refusal(&stale(1), Origin::Local)
+            .expect("the first drop owes an alert");
+        assert_eq!(first.severity, Severity::Warning);
+        for n in 2..STALE_ALERT_RUN {
+            assert_eq!(alerts.on_refusal(&stale(n), Origin::Local), None);
+        }
+        let deafness = alerts
+            .on_refusal(&stale(STALE_ALERT_RUN), Origin::Local)
+            .expect("a run of drops owes an alert");
+        assert_eq!(deafness.severity, Severity::Critical);
+        assert!(deafness.title.contains("dropping"), "{}", deafness.title);
+        assert_eq!(alerts.refusals(), STALE_ALERT_RUN);
     }
 
     /// An accepted script says the sender and this machine still agree about
@@ -543,11 +728,144 @@ mod tests {
     #[test]
     fn an_accepted_script_ends_the_run_of_drops() {
         let mut alerts = Alerts::new();
-        let _ = alerts.on_refusal(&stale(1));
-        let _ = alerts.on_refusal(&stale(2));
+        let _ = alerts.on_refusal(&stale(1), Origin::Remote);
+        let _ = alerts.on_refusal(&stale(2), Origin::Remote);
         alerts.accepted();
         assert_eq!(alerts.stale_run(), 0);
-        assert_eq!(alerts.on_refusal(&stale(3)), None);
+        assert_eq!(alerts.on_refusal(&stale(3), Origin::Remote), None);
         assert_eq!(alerts.stale_run(), 1);
+    }
+
+    /// Every row the fault-or-park latch fires on, one per arm of
+    /// `stops_the_machine` that answers true. Each on its own table, because
+    /// the latch is once a run.
+    fn stopping_rows() -> Vec<TimelineEntryWire> {
+        vec![
+            row(ReportKindWire::FAULT_RECORDED, 3, 12),
+            row(ReportKindWire::RESPONSE_TAKEN, 2, 3),
+            row(ReportKindWire::TORQUE_OFF_UNCONFIRMED, 0, 0),
+            row(ReportKindWire::BUS_FAILURE_DECLARED, 0, 0),
+            row(ReportKindWire::COMMISSION_FAILED, 0, 0),
+            row(ReportKindWire::WINDDOWN_OUTCOME, 1, 1),
+            phase(SessionPhaseWire::PARKED),
+        ]
+    }
+
+    /// The person in front of the robot is who a Critical is for, and a
+    /// deployment that can speak has nothing to say without this sentence.
+    #[test]
+    fn every_critical_the_table_raises_carries_a_sentence() {
+        for entry in stopping_rows() {
+            let mut alerts = Alerts::new();
+            let alert = alerts.on_row(&entry).expect("a stopping row owes an alert");
+            assert_eq!(alert.severity, Severity::Critical);
+            assert!(alert.spoken.is_some(), "{entry:?}: {alert:?}");
+        }
+
+        let mut own = Alerts::new();
+        let foreign = own
+            .on_refusal(
+                &Refusal::ForeignPod {
+                    addressed: "reachy00".to_owned(),
+                    pod: "kitchen-reachy".to_owned(),
+                },
+                Origin::Local,
+            )
+            .expect("a refused local script owes an alert");
+        assert_eq!(
+            foreign.spoken.as_deref(),
+            Some(
+                "My head is not moving. My motion scripts are addressed to reachy00, but I \
+                 answer to kitchen-reachy."
+            ),
+        );
+
+        let mut other = Alerts::new();
+        let refused = other
+            .on_refusal(&Refusal::NotText, Origin::Local)
+            .expect("a refused local script owes an alert");
+        assert_eq!(
+            refused.spoken.as_deref(),
+            Some("My head is not moving. My own motion scripts are being refused."),
+            "a screen with no names to reconcile says only what happened",
+        );
+
+        let mut deaf = Alerts::new();
+        let deafness = (1..=STALE_ALERT_RUN)
+            .filter_map(|n| deaf.on_refusal(&stale(n), Origin::Local))
+            .find(|alert| alert.severity == Severity::Critical)
+            .expect("a run of drops owes an alert");
+        assert_eq!(
+            deafness.spoken.as_deref(),
+            Some("My head is dropping every motion script."),
+        );
+    }
+
+    /// Spoken words interrupt a room. A Warning is what an operator reads
+    /// afterwards, and the robot announcing every declined script to whoever is
+    /// standing there is how the sentences that matter stop being listened to.
+    #[test]
+    fn no_warning_the_table_raises_is_spoken() {
+        let mut refused = Alerts::new();
+        let warning = refused
+            .on_refusal(&Refusal::NotText, Origin::Remote)
+            .expect("a refusal owes an alert");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.spoken, None);
+
+        let mut session = Alerts::new();
+        let declined = session
+            .on_row(&row(
+                ReportKindWire::SCRIPT_REFUSED,
+                1,
+                u32::from(RefusalReasonWire::TOO_LONG.0),
+            ))
+            .expect("a refusal owes an alert");
+        assert_eq!(declined.severity, Severity::Warning);
+        assert_eq!(declined.spoken, None);
+
+        let mut hole = Alerts::new();
+        let lost = hole.narration_hole(4).expect("a hole owes an alert");
+        assert_eq!(lost.severity, Severity::Warning);
+        assert_eq!(lost.spoken, None);
+
+        let mut stale_once = Alerts::new();
+        let below = stale_once
+            .on_refusal(&stale(1), Origin::Local)
+            .expect("the first drop owes an alert");
+        assert_eq!(below.severity, Severity::Warning);
+        assert_eq!(below.spoken, None);
+    }
+
+    /// The row exists to say de-torquing was *not* confirmed, and stowed with
+    /// torque held is this machine's one pinch hazard. What a bystander hears
+    /// has to say the same, and no other row's sentence may imply the motors
+    /// are off.
+    #[test]
+    fn the_unconfirmed_row_is_the_only_one_that_warns_a_bystander_off() {
+        let mut alerts = Alerts::new();
+        let unconfirmed = alerts
+            .on_row(&row(ReportKindWire::TORQUE_OFF_UNCONFIRMED, 0, 0))
+            .expect("a stopping row owes an alert");
+        assert_eq!(
+            unconfirmed.spoken.as_deref(),
+            Some(
+                "My head motion has stopped, and I could not confirm my motors are off. Do not \
+                 touch my head."
+            ),
+        );
+
+        for entry in stopping_rows() {
+            if entry.kind() == ReportKindWire::TORQUE_OFF_UNCONFIRMED {
+                continue;
+            }
+            let mut alerts = Alerts::new();
+            let alert = alerts.on_row(&entry).expect("a stopping row owes an alert");
+            assert_eq!(
+                alert.spoken.as_deref(),
+                Some("My head motion has stopped."),
+                "{entry:?}: nothing about limpness, either way",
+            );
+        }
     }
 }

@@ -393,20 +393,57 @@ exec "$REAL_INSTALL" "$@"
 STUB
 chmod 0755 -- "${stubs}/install"
 
-# A third stub: `git`, answering the one question the subject asks it — which
-# commit the payload is being staged from. The temporary tree has no history of
-# its own, and what the push does with an answer of `unknown` is
-# deploy-motion.sh's business; here the knob is what lets both answers be a case.
+# A third stub: `git`, answering the two questions the subject asks it — which
+# commit the payload is being staged from, and what the brenn-pod checkout
+# beside this tree holds. The temporary tree has no history of its own, and what
+# the push does with an answer of `unknown` is deploy-motion.sh's business; here
+# the knobs are what let each answer be a case.
+#
+# Every arm is keyed on the *directory* the question was put to, and the two
+# trees answer different revisions. A stub that answered one constant to any
+# `-C` would pass every case below while the subject asked the wrong tree — or
+# no tree — so the directory is what the cases actually hold.
 export GIT_HEAD=0123456789abcdef0123456789abcdef01234567
+# This tree, as the subject spells it when it asks for the build stamp.
+export REPO_DIR="$repo"
+export POD_GIT_HEAD=89abcdef0123456789abcdef0123456789abcdef
+# The brenn-pod checkout as the subject spells it: `lib.sh` resolves the default
+# relative to the repository root, and does not canonicalise it.
+export POD_DIR="${repo}/../brenn-pod"
+# Where that checkout's `rev-parse --show-toplevel` lands. Itself for an
+# ordinary checkout; a case points it at an enclosing directory to stand for a
+# tree that is not a repository root but sits inside one.
+export POD_TOPLEVEL="${work}/brenn-pod"
+# The date of that checkout's HEAD commit, against which the staged binary's
+# mtime is read. Well in the past, so a fixture file written by this suite is
+# newer than it until a case says otherwise.
+export POD_COMMIT_TIME=1000000000
 
 cat >"${stubs}/git" <<'STUB'
 #!/usr/bin/env bash
-# -C <dir> rev-parse HEAD, and nothing else is asked.
+# -C <dir> rev-parse HEAD, -C <dir> rev-parse --show-toplevel, and
+# -C <dir> log -1 --format=%ct. Nothing else is asked.
 case "$*" in
-*rev-parse*HEAD*)
+"-C ${POD_DIR} rev-parse HEAD")
+	[ -n "${POD_GIT_HEAD:-}" ] || exit 128
+	echo "$POD_GIT_HEAD"
+	;;
+"-C ${POD_DIR} rev-parse --show-toplevel")
+	[ -n "${POD_TOPLEVEL:-}" ] || exit 128
+	echo "$POD_TOPLEVEL"
+	;;
+"-C ${POD_DIR} log -1 --format=%ct")
+	[ -n "${POD_COMMIT_TIME:-}" ] || exit 128
+	echo "$POD_COMMIT_TIME"
+	;;
+"-C ${REPO_DIR} rev-parse HEAD")
 	[ -n "${GIT_HEAD:-}" ] || exit 128
 	echo "$GIT_HEAD"
 	;;
+# Any other directory is not a repository this stub knows: git's own answer for
+# a tree with no history, which is what the cases that move a knob are asking
+# the subject to handle.
+*rev-parse*|*log*) exit 128 ;;
 *) echo "unstubbed git ${*}" >&2; exit 1 ;;
 esac
 STUB
@@ -697,6 +734,122 @@ unset REACHY_POD_BINARY
 mv -- "${pod_default}.aside" "$pod_default"
 result=$(build)
 assert_status "and the default is back" 0 "$(status_of "$result")"
+
+# ---------------------------------------------------------------------------
+# The two brenn-pod revisions in one payload
+# ---------------------------------------------------------------------------
+#
+# `reachy_pod` comes out of the brenn-pod checkout, and the `reachy_host` beside
+# it links that repository's crates from the revision MODULE.bazel pins. Nothing
+# makes the two agree, and a payload built out of two revisions fails on the
+# unit as a handshake or a protocol mismatch -- a device round-trip to diagnose.
+# So every build says which two revisions it used, and every shape of that line
+# is a case here, including the ones where a revision cannot be read: silence
+# there would read as agreement.
+#
+# The checkout's answer is the `git` stub's `POD_GIT_HEAD`, which is what the
+# subject's `git -C <brenn-pod checkout> rev-parse HEAD` resolves to here --
+# deliberately a different revision from `GIT_HEAD`, this tree's, so a line that
+# named the wrong tree's answer could not pass.
+module_pin="${repo}/MODULE.bazel"
+stage_module_pin() { printf 'BRENN_POD_REV = "%s"\n' "$1" >"$module_pin"; }
+
+other_rev=fedcba9876543210fedcba9876543210fedcba98
+
+# No MODULE.bazel at all: this fixture tree has none until the next case writes
+# one.
+result=$(build)
+assert_contains "a tree with no MODULE.bazel says the linked surface is unknown" \
+	"$(output_of "$result")" "there is no MODULE.bazel"
+
+# The file there and the pin unreadable -- a branch name, a short id, a reflowed
+# assignment. A different cause from the one above and a different sentence, so
+# a reader is not sent looking for a missing file.
+stage_module_pin main
+result=$(build)
+assert_contains "a pin this cannot read is named as unreadable" \
+	"$(output_of "$result")" "states no BRENN_POD_REV this can read"
+assert_lacks "and is not reported as a missing file" \
+	"$(output_of "$result")" "there is no MODULE.bazel"
+
+# A pin, and a checkout that answers no revision -- an unpacked archive, or a
+# tree somebody copied out of one.
+stage_module_pin "$other_rev"
+result=$(POD_GIT_HEAD="" build)
+assert_contains "a checkout with no revision is named as unknown too" \
+	"$(output_of "$result")" "answers no revision"
+assert_contains "and the line still names the pin" "$(output_of "$result")" \
+	"${other_rev:0:12}"
+
+# The same, for the shape `rev-parse HEAD` answers anyway: a directory that is
+# not a checkout root but sits inside some other repository, whose HEAD would be
+# offered as brenn-pod's.
+result=$(POD_TOPLEVEL="$work" build)
+assert_contains "a directory inside another repository answers no revision" \
+	"$(output_of "$result")" "answers no revision"
+assert_lacks "rather than that repository's HEAD" \
+	"$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+
+# The pin and the checkout agreeing, with the staged binary newer than the
+# checkout's HEAD commit. Not silent even here: HEAD is where the checkout
+# stands now and the binary is what its last build left behind, so the line says
+# what was compared.
+stage_module_pin "$POD_GIT_HEAD"
+result=$(build)
+assert_status "a build whose two halves agree succeeds" 0 "$(status_of "$result")"
+assert_contains "and says the checkout is at the pinned revision" \
+	"$(output_of "$result")" \
+	"pinned at ${POD_GIT_HEAD:0:12} and the checkout is at that revision"
+assert_contains "and where the staged binary sits against that commit" \
+	"$(output_of "$result")" "built after that commit"
+assert_lacks "the answer is brenn-pod's tree's, not this one's" \
+	"$(output_of "$result")" "${GIT_HEAD:0:12}"
+# The same build's stamp names this tree, so the two questions demonstrably went
+# to two directories.
+assert_eq "while the build stamp names this tree" "commit=${GIT_HEAD}" \
+	"$(cat -- "${payload}/build-commit.txt")"
+
+# The pin and the checkout agreeing and the binary older than that commit: the
+# case the agreement hides, because a pull or a pin bump moves HEAD and leaves
+# the binary alone.
+result=$(POD_COMMIT_TIME=4000000000 build)
+assert_contains "a binary older than the checkout's HEAD commit is said to be" \
+	"$(output_of "$result")" "older than that commit, so it was built at an earlier one"
+assert_lacks "and the agreement is not left to speak for the binary" \
+	"$(output_of "$result")" "built after that commit"
+
+# A checkout whose HEAD commit has no date to read: nothing to compare, said
+# rather than assumed either way.
+result=$(POD_COMMIT_TIME="" build)
+assert_contains "an undatable commit leaves the binary's age uncompared" \
+	"$(output_of "$result")" "cannot be compared against it"
+
+# The two disagreeing: a note and never a refusal, because a development
+# checkout legitimately sits ahead of the pin.
+stage_module_pin "$other_rev"
+result=$(build)
+assert_status "a build out of two revisions still succeeds" 0 "$(status_of "$result")"
+assert_contains "and says they are two" "$(output_of "$result")" \
+	"two revisions of brenn-pod in one payload"
+assert_contains "naming the pinned one" "$(output_of "$result")" "${other_rev:0:12}"
+assert_contains "and the checkout's" "$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+
+# A bare artifact copied out of a build somewhere else: the checkout's revision
+# says nothing about the file being staged, so the line does not offer it. The
+# pin here is `other_rev`, so the checkout's revision appearing at all is the
+# bug this denies.
+REACHY_POD_BINARY="$elsewhere"
+export REACHY_POD_BINARY
+result=$(build)
+assert_contains "an artifact named by the knob has no revision to compare" \
+	"$(output_of "$result")" "REACHY_POD_BINARY names"
+assert_lacks "so the checkout's revision is not offered as one" \
+	"$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+unset REACHY_POD_BINARY
+
+stage_module_pin "$POD_GIT_HEAD"
+result=$(build)
+assert_status "and the agreeing pair is back" 0 "$(status_of "$result")"
 
 # The other member from outside the build, and the only optional one: the voice
 # pipeline's own configuration. It is a site's file -- speech endpoints, a bus

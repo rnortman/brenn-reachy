@@ -29,6 +29,15 @@ pub const AWAITING_SPEECH_CONFIG: &str = "awaiting_speech_config";
 /// An alert that was narrated and did not reach the bus.
 pub const UNPUBLISHED: &str = "unpublished";
 
+/// An alert whose sentence the robot was asked to say and did not.
+pub const UNSPOKEN: &str = "unspoken";
+
+/// A body that never reached the gate: a sink's queue would not take it.
+pub const UNOFFERED: &str = "unoffered";
+
+/// An accepted script that never reached the session's port.
+pub const UNSENT: &str = "unsent";
+
 /// How the binary spells a startup it refused, on its way out.
 ///
 /// On stderr and not on the JSONL stream, because a process refusing its own

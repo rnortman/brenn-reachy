@@ -12,9 +12,10 @@
 //! Two schedulers share this process on purpose. The pipeline is network I/O
 //! and belongs on an async runtime; the edge's loop owns two loopback sockets
 //! and a story it narrates in order, and it stays a plain blocking loop on the
-//! thread that started the process. They meet at two bounded queues and nowhere
-//! else — bodies inbound to the gate, alerts outbound to the attachment — so
-//! neither can park the other.
+//! thread that started the process. They meet at three bounded queues and
+//! nowhere else — bodies inbound to the gate, alerts outbound to the
+//! attachment, and sentences outbound to the robot's own voice — so neither can
+//! park the other.
 //!
 //! Everything here is optional at run time. A unit whose payload does not yet
 //! carry a speech configuration runs the edge half alone: it follows the
@@ -30,10 +31,14 @@ use clockwork_rs::SyncTime;
 use reachy_edge::{edge_line, edge_line_with};
 use serde_json::json;
 use speech_surface::server::Server;
-use speech_surface::{AlertInbox, Config, ConfigError, Sinks, jsonl};
+use speech_surface::{
+    ANNOUNCE_QUEUE_DEPTH, AlertInbox, AnnounceRefused, Announcement, Announcer, Config,
+    ConfigError, Sinks, announce_seam, jsonl,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+use crate::edge::{Speaker, Unspoken};
 use crate::intents::Intents;
 use crate::sinks::{BusIntents, Lines, ScripterIntents};
 use crate::words;
@@ -49,6 +54,29 @@ pub struct Voice {
     serving: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     listening: String,
     carries_alerts: bool,
+    /// The announcing end of the seam this run drains, where it drains one.
+    announcer: Option<Announcer>,
+}
+
+/// The pipeline's announcement seam, as something the surface can speak
+/// through.
+///
+/// The one implementor of [`Speaker`] this process has: what the robot says out
+/// loud is synthesized by the same voice that answers a person, on the pipeline
+/// this host already composed, so there is no second audio path to hold open.
+struct Announcing(Announcer);
+
+impl Speaker for Announcing {
+    fn speak(&self, sentence: &str) -> Result<(), Unspoken> {
+        self.0
+            .announce(Announcement {
+                text: sentence.to_owned(),
+            })
+            .map_err(|refused| match refused {
+                AnnounceRefused::Backlogged => Unspoken::Backlogged,
+                AnnounceRefused::Gone => Unspoken::Gone,
+            })
+    }
 }
 
 /// How long a stop waits for the composed server to drain before it stops
@@ -104,6 +132,12 @@ impl Voice {
     /// that fails drops it, so the raiser its caller kept refuses every alert
     /// rather than appearing to carry one.
     ///
+    /// The announcement seam is minted here rather than handed in, because both
+    /// of its ends belong to this run: the sentence a Critical carries is
+    /// spoken by the pipeline's own voice, and a caller has nothing to say
+    /// through it before there is a pipeline. [`Voice::speaker`] is where the
+    /// surface picks its end up.
+    ///
     /// The runtime is this process's own and is built here rather than wrapped
     /// around `main`: the thread that calls this goes on to run the edge's
     /// blocking loop, and a blocking loop on a runtime's own thread is the one
@@ -149,6 +183,7 @@ impl Voice {
         // drain rather than re-spelled here: a pinned revision that narrows or
         // widens it moves this answer with it.
         let carries_alerts = settings.carries_alerts();
+        let carries_announcements = settings.carries_announcements();
         let settings = Arc::new(settings);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -164,6 +199,12 @@ impl Voice {
             scripts: Some(Arc::new(ScripterIntents::new(intents.clone(), lines))),
             intents: Some(Arc::new(BusIntents::new(intents))),
         };
+
+        let (announcer, announce_inbox) = announce_seam(ANNOUNCE_QUEUE_DEPTH);
+        // Kept only where the run drains it, on the alert seam's rule: an end
+        // whose far half nothing reads turns every sentence into a refusal line
+        // saying nothing about the machine.
+        let announcer = carries_announcements.then_some(announcer);
 
         let (stop, stopped) = oneshot::channel();
         let (serving, listening) = runtime
@@ -182,7 +223,8 @@ impl Voice {
                         format!("binding the pod link at {}: {error}", settings.listen_addr)
                     })?
                     .with_sinks(sinks)
-                    .with_alerts(alerts);
+                    .with_alerts(alerts)
+                    .with_announcements(announce_inbox);
                 // Asked of the listener rather than read off the configuration: an
                 // ephemeral port is resolved only once it is bound, and a line
                 // naming `:0` would answer nobody's question.
@@ -220,7 +262,35 @@ impl Voice {
             serving: Some(serving),
             listening,
             carries_alerts,
+            announcer,
         })
+    }
+
+    /// The end of the announcement seam the surface speaks through, where this
+    /// run can speak at all.
+    ///
+    /// `None` on a configuration that composed no brain or no voice: the run
+    /// drops its end of the seam, so an announcer kept against one would refuse
+    /// every sentence.
+    #[must_use]
+    pub fn speaker(&self) -> Option<Box<dyn Speaker>> {
+        let announcer = self.announcer.clone()?;
+        Some(Box::new(Announcing(announcer)))
+    }
+
+    /// Whether the robot says this run's critical alerts out loud.
+    #[must_use]
+    pub const fn speaks(&self) -> bool {
+        self.announcer.is_some()
+    }
+
+    /// What this run can do with an alert, as the line builder takes it.
+    #[must_use]
+    pub const fn composition(&self) -> Composition {
+        Composition {
+            alerts: self.carries_alerts,
+            speaks: self.announcer.is_some(),
+        }
     }
 
     /// Whether an alert raised on this run's seam reaches the bus.
@@ -298,33 +368,61 @@ impl Voice {
     }
 }
 
+/// What a composed pipeline can do with an alert.
+///
+/// Two named properties rather than two positional booleans on the line
+/// builder: both come off the same [`Voice`], and swapping them would compile
+/// into a line that reads plausibly and says the opposite of the deployment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Composition {
+    /// Whether an alert this host raises reaches the bus attachment.
+    pub alerts: bool,
+    /// Whether the robot says a critical alert's sentence out loud.
+    pub speaks: bool,
+}
+
 /// What the pipeline this host composed is, as a line.
 ///
 /// On the edge's stream rather than the pipeline's own: a reader following the
 /// robot's narration should see that the voice half came up without having to
 /// join two streams to find out.
 ///
-/// `alerts` says whether this pipeline can interrupt anybody: a configuration
-/// that composed no bus attachment runs every other part of the voice half and
-/// carries no alert off the machine, and that is a standing property of the
-/// deployment worth reading once at startup rather than inferring from a
-/// silence.
+/// `alerts` says whether this pipeline can interrupt anybody, and `speaks`
+/// whether the robot says its critical alerts out loud: a configuration that
+/// composed no bus attachment carries no alert off the machine, and one that
+/// composed no brain or no voice cannot say a word in the room. Both are
+/// standing properties of the deployment, worth reading once at startup rather
+/// than inferring from a silence.
 #[must_use]
-pub fn composed_line(config: &Path, listen: &str, alerts: bool, at: SyncTime) -> String {
+pub fn composed_line(
+    config: &Path,
+    listen: &str,
+    composition: Composition,
+    at: SyncTime,
+) -> String {
+    let Composition { alerts, speaks } = composition;
     edge_line_with(
         words::COMPOSED,
         at,
+        // Terser than the two facts deserve, because the stream's own budget
+        // bounds a sentence at 200 characters and both clauses have to survive
+        // a configuration path of a plausible length.
         &format!(
-            "the voice pipeline is running from {}, pod link on {listen}; the scripter's \
-             decisions and the bus's motion channel both meet this host's gate, and alerts {}",
+            "the voice pipeline is running from {}, pod link on {listen}; scripted and \
+             bus-sent motion both meet this host's gate; alerts {}; criticals {}",
             config.display(),
             if alerts {
                 "ride its attachment"
             } else {
                 "are narration only"
             },
+            if speaks {
+                "are spoken aloud"
+            } else {
+                "are not spoken"
+            },
         ),
-        &[("alerts", json!(alerts))],
+        &[("alerts", json!(alerts)), ("speaks", json!(speaks))],
     )
 }
 
@@ -403,6 +501,7 @@ impl Voice {
             serving: Some(serving),
             listening: "127.0.0.1:0".to_owned(),
             carries_alerts: false,
+            announcer: None,
         }
     }
 }
@@ -599,7 +698,10 @@ mod tests {
         let line = composed_line(
             Path::new("/run/reachy/speech.toml"),
             "127.0.0.1:7380",
-            true,
+            Composition {
+                alerts: true,
+                speaks: true,
+            },
             at,
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
@@ -607,6 +709,7 @@ mod tests {
         assert_eq!(parsed["kind"], "composed");
         assert_eq!(parsed["at_ns"], at.as_nanos());
         assert_eq!(parsed["alerts"], true);
+        assert_eq!(parsed["speaks"], true);
         assert!(
             parsed["says"]
                 .as_str()
@@ -622,7 +725,10 @@ mod tests {
         let line = composed_line(
             Path::new("/run/reachy/speech.toml"),
             "127.0.0.1:7380",
-            false,
+            Composition {
+                alerts: false,
+                speaks: false,
+            },
             at,
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
@@ -632,6 +738,33 @@ mod tests {
                 .as_str()
                 .expect("a sentence")
                 .contains("narration only"),
+            "{line}",
+        );
+    }
+
+    /// The two properties are separate: a deployment can carry its alerts off
+    /// the machine and still have no voice to say them in the room, and the
+    /// line says which of the two a reader is looking at.
+    #[test]
+    fn a_composed_pipeline_says_whether_the_robot_speaks() {
+        let at = SyncTime::from_nanos(1_700_000_000_000_000_000);
+        let line = composed_line(
+            Path::new("/run/reachy/speech.toml"),
+            "127.0.0.1:7380",
+            Composition {
+                alerts: true,
+                speaks: false,
+            },
+            at,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert_eq!(parsed["alerts"], true);
+        assert_eq!(parsed["speaks"], false);
+        assert!(
+            parsed["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("are not spoken"),
             "{line}",
         );
     }
@@ -668,6 +801,79 @@ mod tests {
         assert!(
             voice.carries_alerts(),
             "a bus brain is an attachment to publish through"
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_pipeline_with_a_brain_and_a_voice_speaks() {
+        // The composition the spoken path needs, and the only one where the run
+        // drains the announcement seam: a brain builds the speak channel and
+        // `[tts]` renders the sentence.
+        let dir = scratch_dir("reachy-host-speaking");
+        let path = carrying(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(voice.speaks(), "a brain and a voice: the robot can speak");
+        let speaker = voice.speaker().expect("a seam to speak through");
+        speaker
+            .speak("my head is not moving")
+            .expect("a live seam takes the sentence");
+
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+        // The run took the inbox with it, so the surface is told the sentence
+        // was dropped rather than left believing the room heard it.
+        assert_eq!(
+            speaker
+                .speak("and again")
+                .expect_err("nothing is draining the seam"),
+            Unspoken::Gone
+        );
+    }
+
+    #[test]
+    fn a_full_announcement_queue_is_backlogged_and_not_gone() {
+        // The adapter's other arm, and the only place it can be seen: the two
+        // refusals are different news about the same failure to speak, and the
+        // word the console carries is what an operator reads back — a
+        // pipeline that is merely behind must not be reported as one that died.
+        let (announcer, _inbox) = speech_surface::announce_seam(1);
+        let speaker = Announcing(announcer);
+
+        speaker
+            .speak("my head is not moving")
+            .expect("an undrained seam of depth one takes the first sentence");
+
+        assert_eq!(
+            speaker
+                .speak("and again")
+                .expect_err("the queue is full and nothing is draining it"),
+            Unspoken::Backlogged,
+        );
+    }
+
+    #[test]
+    fn a_pipeline_with_no_voice_says_nothing_out_loud() {
+        // The fixture names no `[brain]` and no `[tts]`, so the composed run
+        // drops its end of the announcement seam: the host must not keep an end
+        // that turns every sentence into a refusal.
+        let dir = scratch_dir("reachy-host-mute");
+        let path = runnable(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(
+            !voice.speaks(),
+            "no brain and no voice is nothing to say it"
+        );
+        assert!(
+            voice.speaker().is_none(),
+            "a speaker nothing drains is a refusal line per alert"
         );
         assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
     }

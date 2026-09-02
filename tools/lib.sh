@@ -416,6 +416,96 @@ esac
 # other repo that produces the file, so a different layout says so once rather
 # than staging something unexpected.
 pod_binary=${REACHY_POD_BINARY:-${brenn_pod_dir}/firmware/target/reachy-pod/payload/reachy-pod}
+# Whether an operator named the artifact rather than the checkout, which decides
+# whether the checkout's revision says anything about the file being staged.
+pod_binary_named=${REACHY_POD_BINARY:+named}
+
+# The brenn-pod revision this tree links its surface crates from.
+#
+#   pinned_pod_rev <MODULE.bazel path>
+#
+# One reader, because two of them drift: the build's provenance line below and
+# `tools/module-pins.test.sh` both ask this question of the same line, and the
+# self-check holds this answer equal to its own independent parse of the file.
+# An empty answer means the file states no `BRENN_POD_REV` in a form this reads
+# -- a branch name, a short id, a reflowed assignment -- which every caller has
+# to say out loud rather than treat as an absent pin.
+pinned_pod_rev() {
+	sed -n 's/^BRENN_POD_REV = "\([0-9a-f]*\)".*/\1/p' -- "$1" 2>/dev/null |
+		head -n 1
+}
+
+# What a payload's two halves of brenn-pod are, said in one line.
+#
+#   pod_provenance
+#
+# Two independent sources of brenn-pod feed one speech run. `reachy_host` links
+# speech-surface, speech-pipeline and brenn-bridge from the revision
+# `MODULE.bazel` pins, and `reachy_pod` is staged from whatever the working tree
+# at `brenn_pod_dir` last built. Nothing makes the two agree, and a payload that
+# pairs a pinned surface with a pod binary from another revision fails on the
+# unit as a handshake or a protocol mismatch — a long way from this build, and
+# costing a device round-trip to diagnose.
+#
+# What can be measured here is narrow, and the line says only that. `HEAD` is
+# where the checkout stands *now*; the staged file is whatever the last build in
+# that tree left behind, and a pull or a pin bump moves the one without touching
+# the other. So the line never calls a revision the binary's: it names the
+# checkout's, and beside it the one comparison that bears on the file — the
+# binary's mtime against the HEAD commit's date, the same arithmetic
+# `refuse_if_stale` uses. A binary older than that commit was built at some
+# earlier revision, whatever the checkout says today.
+#
+# `rev-parse HEAD` also answers from an enclosing repository when the directory
+# is not a checkout root — an unpacked archive under a tracked `$HOME` would
+# otherwise be reported at the revision of whatever tracks it — so the toplevel
+# is checked first and anything else is "answers no revision".
+#
+# A note and never a refusal: a development checkout legitimately sits ahead of
+# the pin, and the checkout may not be a git checkout at all. Every shape it
+# cannot read says what it could not read rather than staying silent, because
+# silence here reads as agreement.
+pod_provenance() {
+	local module pinned tree top committed built age
+	module=${repo_root}/MODULE.bazel
+	if [ ! -f "$module" ]; then
+		echo "there is no MODULE.bazel at ${repo_root}, so the linked surface's revision is unknown"
+		return
+	fi
+	pinned=$(pinned_pod_rev "$module")
+	if [ -z "$pinned" ]; then
+		echo "MODULE.bazel is here but states no BRENN_POD_REV this can read, so the linked surface's revision is unknown"
+		return
+	fi
+	if [ -n "$pod_binary_named" ]; then
+		echo "the linked surface is pinned at ${pinned:0:12}; the audio-device binary is the artifact REACHY_POD_BINARY names, whose revision this cannot ask"
+		return
+	fi
+	tree=
+	top=$(git -C "$brenn_pod_dir" rev-parse --show-toplevel 2>/dev/null) || top=
+	if [ -n "$top" ] &&
+		[ "$(cd -P -- "$top" 2>/dev/null && pwd)" = "$(cd -P -- "$brenn_pod_dir" 2>/dev/null && pwd)" ]; then
+		tree=$(git -C "$brenn_pod_dir" rev-parse HEAD 2>/dev/null) || tree=
+	fi
+	if [ -z "$tree" ]; then
+		echo "the linked surface is pinned at ${pinned:0:12}; ${brenn_pod_dir} answers no revision, so where the audio-device binary came from is unknown"
+		return
+	fi
+	committed=$(git -C "$brenn_pod_dir" log -1 --format=%ct 2>/dev/null) || committed=
+	built=$(stat -c %Y -- "$pod_binary" 2>/dev/null) || built=
+	if [ -z "$committed" ] || [ -z "$built" ]; then
+		age="when the audio-device binary was built cannot be compared against it"
+	elif [ "$built" -lt "$committed" ]; then
+		age="the audio-device binary is older than that commit, so it was built at an earlier one"
+	else
+		age="the audio-device binary was built after that commit"
+	fi
+	if [ "$tree" = "$pinned" ]; then
+		echo "the linked surface is pinned at ${pinned:0:12} and the checkout is at that revision; ${age}"
+	else
+		echo "the linked surface is pinned at ${pinned:0:12} and the checkout is at ${tree:0:12}: two revisions of brenn-pod in one payload; ${age}"
+	fi
+}
 
 # The voice pipeline's own configuration, which this repo does not contain and
 # will not.
@@ -881,10 +971,11 @@ report_verdict() {
 	"$bazel" run "${build_flags[@]}" -- "$report_target" "$@" "$run_dir"
 }
 
-# The analyzer of a speech run, which reads the console side of a fetch rather
-# than the records: what a supervised session holds depends on what a person
-# said to the robot, so the pipeline's own narration is the evidence and the
-# motion analyzer's grid arithmetic has nothing to say about it.
+# The analyzer of a speech run, which reads both sides of a fetch: what a
+# supervised session holds depends on what a person said to the robot, so the
+# pipeline's own narration is the evidence for what was asked and the records
+# are the evidence for what the head did with it. The motion analyzer's grid
+# arithmetic still has nothing to say about a session nobody budgeted.
 speech_report_target=//cogs:speech_run_report
 
 # Judge a speech run's fetch, and let the analyzer's verdict be the caller's.
@@ -892,7 +983,8 @@ speech_report_target=//cogs:speech_run_report
 #   speech_verdict <fetched records directory>
 #
 # The argument is the fetch's own directory, not a run directory inside it: the
-# analyzer names the console beside it from that spelling. Host tool over a
+# analyzer names the console beside it from that spelling and finds the run
+# directory within it the way `run_directory` above does. Host tool over a
 # stopped log, so it builds in the default configuration, like `report_verdict`.
 speech_verdict() {
 	"$bazel" run "${build_flags[@]}" -- "$speech_report_target" "$1"
