@@ -218,6 +218,13 @@ launch_logs="${store_mount}/logs/launch"
 # `reachy_ask` — the host owns the narration port here — and takes no budget.
 speech_launch_config=robotcpu.textproto
 
+# The file the launcher gives the voice host's console, inside the log dir. The
+# launcher redirects every app's stdout and stderr into `<name>_<index>.log`
+# before exec, so nothing the host prints reaches the operator's terminal on its
+# own; a speech run tails this one onto the pty for exactly that reason. The
+# index is 0 because the log dir is emptied at the start of every run.
+voice_host_log=voice_host_0.log
+
 # The pod's link credentials on the unit, written by brenn-pod's provisioning
 # and read by the audio device at start. Checked here and never written: that
 # file's format, its compiled-in path, and the key generation and secret
@@ -1392,8 +1399,24 @@ case "$mode" in
 		# The trailing `exit $?` keeps a shell in front of the launcher,
 		# for the reason `--run`'s does: without it a launcher killed by
 		# a signal comes back as ssh's own 255.
+		#
+		# The tail is what puts the voice host's own console on the
+		# operator's terminal. Without it the pipeline's narration —
+		# including the loud line a bridge or a stage dies on — goes only
+		# into a file on the unit that nobody reads until the run is
+		# over, and the person talking to the robot spends the session
+		# addressing a machine that stopped listening in its first
+		# second. `-F` because the file does not exist yet when this
+		# starts, and its `2>/dev/null` suppresses only tail's own
+		# waiting-for-the-file chatter.
+		remote="${remote}; tail -F ${launch_logs}/${voice_host_log} 2>/dev/null &"
+		remote="${remote} tail_pid=\$!"
 		remote="${remote}; ./simplelaunch ${speech_launch_config} --logdir ${launch_logs}"
-		remote="${remote}; rc=\$?; exit \$rc"
+		# The kill covers the orderly exit: a ^C through the pty reaches
+		# the tail with the rest of the foreground group, but a launcher
+		# that returned on its own would otherwise leave a tail holding
+		# the ssh session open.
+		remote="${remote}; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
 
 		aside=$(mktemp -d)
 		trap 'rm -rf -- "$aside"' EXIT

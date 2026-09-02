@@ -234,6 +234,25 @@ impl Voice {
         self.carries_alerts
     }
 
+    /// Whether the composed pipeline's task has ended.
+    ///
+    /// A pipeline that ended without being asked to — a fault it latched, a
+    /// task that panicked, a stage that died under it — is a process that has
+    /// stopped listening, and a host that goes on narrating the motion edge
+    /// around it is a robot nobody watching can tell is deaf. Answering true is
+    /// how the loop is ended so that the stop below reaps the sentence and the
+    /// process exits on it.
+    ///
+    /// The handle is an `Option` only because [`Voice::stop`] takes it, and
+    /// `stop` consumes the whole value, so every `Voice` a caller can still ask
+    /// this of holds one.
+    #[must_use]
+    pub fn pipeline_ended(&self) -> bool {
+        self.serving
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
     /// The address the pod link actually bound.
     ///
     /// The listener's answer and not the configuration's, so an ephemeral port
@@ -345,6 +364,49 @@ pub fn absent_line(config: &Path, at: SyncTime) -> String {
     )
 }
 
+/// How long a task that returns immediately is given to be polled once.
+///
+/// Orders of magnitude past what a spawn costs, because what it bounds is a
+/// case that would otherwise hang rather than a duration worth measuring.
+#[cfg(test)]
+const ENDED_DEADLINE: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+impl Voice {
+    /// A pipeline whose serving task has already ended on `message`.
+    ///
+    /// Built without a listener, an audio device, or a bus.
+    fn ended_on(message: &str) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime this case can spawn on");
+        let message = message.to_owned();
+        let serving = runtime.spawn(async move { Err(std::io::Error::other(message)) });
+        // The handle answers `is_finished` only once the task has been polled
+        // to completion, so the case waits for the state it is about rather
+        // than racing the runtime's first poll. Bounded, and loudly: a wait
+        // that never ends costs whoever hits it a harness timeout with no
+        // sentence in it, on a suite that gates every commit.
+        let deadline = std::time::Instant::now() + ENDED_DEADLINE;
+        while !serving.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the serving task did not finish within {ENDED_DEADLINE:?}",
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (stop, _stopped) = oneshot::channel();
+        Self {
+            runtime,
+            stop: Some(stop),
+            serving: Some(serving),
+            listening: "127.0.0.1:0".to_owned(),
+            carries_alerts: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -410,6 +472,44 @@ mod tests {
             dir.join("events.jsonl").exists(),
             "the event sink was opened and flushed"
         );
+    }
+
+    #[test]
+    fn a_serving_pipeline_has_not_ended() {
+        // The healthy answer, from a pipeline that is actually serving: a true
+        // here would end the edge's loop on a robot that is working.
+        let dir = scratch_dir("reachy-host-serving");
+        let path = runnable(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+            Ok(voice) => voice,
+            Err(refused) => panic!("a configuration this host can run: {refused}"),
+        };
+        assert!(
+            !voice.pipeline_ended(),
+            "a pipeline nobody has asked to stop is still serving"
+        );
+        assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_pipeline_that_ended_on_its_own_says_so_and_stopping_reaps_its_sentence() {
+        // The path from a dead pipeline to the process's exit status: the
+        // predicate the loop breaks on, and the message `run` fails with.
+        let voice = Voice::ended_on(
+            "brenn bridge exited: no wire version in common: this bridge speaks 3..=3, the \
+             server speaks 4..=4",
+        );
+        assert!(
+            voice.pipeline_ended(),
+            "a serving task that has finished is a pipeline that ended"
+        );
+        let said = voice.stop().expect("the sentence the pipeline ended on");
+        assert!(
+            said.contains("the voice pipeline stopped on an error"),
+            "{said}"
+        );
+        assert!(said.contains("no wire version in common"), "{said}");
     }
 
     #[test]

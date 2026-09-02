@@ -291,7 +291,7 @@ fn run(options: &Options) -> Result<(), String> {
         &waiting,
         &mut host,
         &mut surface,
-        &stop,
+        &until(&stop, &voice),
     );
 
     // The pipeline is stopped after the loop returns, whichever way it went: a
@@ -401,7 +401,58 @@ fn start_voice(
     }
 }
 
+/// Whether this run's voice half has ended without being asked to.
+///
+/// A host that composed no pipeline has nothing that can end, so this answers
+/// false for its whole run and the edge half serves on. `map_or(true, …)`
+/// would end every voiceless host's loop on its first pass.
+fn voice_ended(voice: &Option<Voice>) -> bool {
+    voice.as_ref().is_some_and(Voice::pipeline_ended)
+}
+
+/// Why the loop below would end.
+///
+/// Two conditions, asked together every pass, because they are one question:
+/// whether this process still has anything to do.
+struct Until<'a> {
+    /// The flag the signal handlers set.
+    stop: &'a AtomicBool,
+    /// Whether the voice pipeline has ended without being asked to.
+    ///
+    /// A predicate rather than a `Voice` read here, because the case that
+    /// matters is not otherwise observable: a loop that never asks, and a loop
+    /// that asks a host with no pipeline and reads its absence as a death, both
+    /// look exactly like the working one from the outside.
+    ended: Box<dyn Fn() -> bool + 'a>,
+}
+
+/// The pair of conditions this run's loop ends on, as `run` builds them.
+///
+/// A loop and a predicate that are each right separately still leave a host
+/// narrating around a dead voice half if the two are not joined.
+fn until<'a>(stop: &'a AtomicBool, voice: &'a Option<Voice>) -> Until<'a> {
+    Until {
+        stop,
+        ended: Box::new(move || voice_ended(voice)),
+    }
+}
+
+impl Until<'_> {
+    /// Whether either of them has come about.
+    fn reached(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) || (self.ended)()
+    }
+}
+
 /// The loop: a story datagram, then whatever intent is waiting, until stopped.
+///
+/// Two ways out, and the second is why this process ends when its voice half
+/// does. A stop signal is one. The other is the pipeline having ended without
+/// being asked to: a host that went on narrating around a dead voice half would
+/// be a robot that hears nothing and looks alive — the shape that costs an
+/// operator a whole session before anybody reads the log. Ending here puts the
+/// pipeline's own sentence on the caller's exit status within one read timeout
+/// of the death.
 ///
 /// The story comes first because the read is what the loop sleeps in; the queue
 /// is drained on every pass, whatever woke it. An offer wakes it immediately —
@@ -427,10 +478,10 @@ fn follow(
     waiting: &Waiting,
     host: &mut HostEdge,
     surface: &mut impl Surface,
-    stop: &AtomicBool,
+    until: &Until,
 ) -> Result<(), String> {
     let mut buffer = vec![0u8; DATAGRAM_CAP];
-    while !stop.load(Ordering::Relaxed) {
+    while !until.reached() {
         match reports.recv_from(&mut buffer) {
             Ok((0, _)) => {}
             Ok((read, _)) => {
@@ -509,7 +560,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use clockwork_rs::{SyncTime, blob_from_bytes};
     use motion_proto::{MotionScript, Posture, Step};
@@ -520,8 +571,8 @@ mod tests {
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 
     use super::{
-        DEFAULT_CONFIG, Options, Publishing, Started, alert_seam, follow, install_alerts, outcome,
-        parse, start_voice, unsent_line,
+        DEFAULT_CONFIG, Options, Publishing, Started, Until, Voice, alert_seam, follow,
+        install_alerts, outcome, parse, start_voice, unsent_line, until, voice_ended,
     };
 
     /// The pod the fixture bodies are addressed to.
@@ -531,6 +582,12 @@ mod tests {
     /// they read was already queued before the loop started: the timeout is
     /// only what the loop wakes on to notice the stop.
     const READ: Duration = Duration::from_millis(20);
+
+    /// How long a loop whose only exit condition already holds is given to
+    /// return. Orders of magnitude past one read timeout, because what it
+    /// bounds is a case that would otherwise never end rather than a duration
+    /// worth measuring.
+    const ENDS_WITHIN: Duration = Duration::from_secs(10);
 
     /// Everything said, kept rather than printed.
     #[derive(Clone, Debug, Default)]
@@ -595,6 +652,16 @@ mod tests {
     /// starts, so what the cases assert does not depend on when the stop lands
     /// — only that it lands.
     fn drive(reports: &UdpSocket, scripts_to: SocketAddr, bodies: &[Vec<u8>]) -> Recorded {
+        driven(reports, scripts_to, bodies, Box::new(|| false))
+    }
+
+    /// The same, with the pipeline-ended predicate the loop also exits on.
+    fn driven(
+        reports: &UdpSocket,
+        scripts_to: SocketAddr,
+        bodies: &[Vec<u8>],
+        ended: Box<dyn Fn() -> bool + '_>,
+    ) -> Recorded {
         let (intents, waiting) = queue();
         for body in bodies {
             intents.offer(body.clone()).expect("a queue with room");
@@ -615,7 +682,7 @@ mod tests {
             &waiting,
             &mut host,
             &mut surface,
-            &stop,
+            &Until { stop: &stop, ended },
         )
         .expect("a loop that was stopped rather than broken");
         stopper.join().expect("the stopping thread");
@@ -686,10 +753,135 @@ mod tests {
             &waiting,
             &mut host,
             &mut surface,
-            &stop,
+            &Until {
+                stop: &stop,
+                ended: Box::new(|| false),
+            },
         )
         .expect("a stopped loop is not a failed one");
         assert!(surface.lines.is_empty(), "{:?}", surface.lines);
+    }
+
+    #[test]
+    fn a_pipeline_that_ended_ends_the_loop_with_no_stop() {
+        // The condition this exists for: nothing signalled the host, and the
+        // voice half is gone. A loop that stayed here is the host sitting
+        // alive-and-deaf until somebody presses ^C.
+        //
+        // On its own thread and joined against a deadline, because *returning*
+        // is the behaviour: nothing ever stops this loop, so a regression in
+        // the exit condition runs forever, and a case that proved itself by not
+        // hanging would spend that regression as a wedged test binary with no
+        // sentence in it.
+        let reports = reports_port();
+        let following = thread::spawn(move || {
+            let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+            let (_intents, waiting) = queue();
+            let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+            let mut surface = Recorded::default();
+            let stop = AtomicBool::new(false);
+            follow(
+                &reports,
+                &scripts,
+                unreachable_destination(),
+                &waiting,
+                &mut host,
+                &mut surface,
+                &Until {
+                    stop: &stop,
+                    ended: Box::new(|| true),
+                },
+            )
+            .expect("a loop that ended on the pipeline is not a broken one");
+            surface
+        });
+        let deadline = Instant::now() + ENDS_WITHIN;
+        while !following.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the loop did not end within {ENDS_WITHIN:?} on a pipeline that is gone, and \
+                 nothing else will ever end it",
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let surface = following.join().expect("the following thread");
+        assert!(surface.lines.is_empty(), "{:?}", surface.lines);
+    }
+
+    #[test]
+    fn a_host_with_no_pipeline_keeps_serving_the_edge() {
+        // The conditions `run` builds, against the host that composed no voice
+        // half: a regression here takes the narrating edge away from a unit
+        // whose speech configuration has simply not been pushed yet.
+        let voiceless: Option<Voice> = None;
+        let quiet = AtomicBool::new(false);
+        assert!(
+            !until(&quiet, &voiceless).reached(),
+            "no pipeline is not an ended pipeline",
+        );
+
+        let reports = reports_port();
+        let control = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+        control
+            .set_read_timeout(Some(READ * 10))
+            .expect("a read timeout on a bound socket");
+        let destination = control.local_addr().expect("a bound port");
+
+        // The loop ran a pass and did the seam's work before the stop reached
+        // it, which is what makes this the voiceless host still serving rather
+        // than a loop that exited early and said nothing.
+        let said = driven(
+            &reports,
+            destination,
+            &[body(1)],
+            Box::new(|| voice_ended(&voiceless)),
+        );
+        assert!(said.lines.is_empty(), "{:?}", said.lines);
+        let mut buffer = vec![0u8; 4096];
+        control
+            .recv_from(&mut buffer)
+            .expect("the body left as a script, so the loop iterated");
+    }
+
+    #[test]
+    fn a_serving_pipeline_and_a_stop_are_a_clean_exit() {
+        // The orderly path: a pipeline that is actually serving answers false
+        // throughout, the stop ends the loop, and the stop of the pipeline
+        // itself adds nothing to the outcome.
+        let dir = scratch_dir("reachy-host-follow-serving");
+        let path = runnable_speech_config(dir.as_ref());
+        let (intents, _waiting) = queue();
+        let mut said = Recorded::default();
+        let options = Options {
+            speech_config: Some(path),
+            ..Options::default()
+        };
+        let voice = Some(
+            start_voice(&options, &intents, &mut said)
+                .expect("a running host")
+                .expect("a composed pipeline")
+                .voice,
+        );
+        let stop = AtomicBool::new(false);
+        assert!(
+            !until(&stop, &voice).reached(),
+            "a pipeline that is serving has not ended",
+        );
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            until(&stop, &voice).reached(),
+            "the same conditions still end on a stop",
+        );
+
+        let reports = reports_port();
+        let followed = driven(
+            &reports,
+            unreachable_destination(),
+            &[],
+            Box::new(|| voice_ended(&voice)),
+        );
+        assert!(followed.lines.is_empty(), "{:?}", followed.lines);
+        assert_eq!(outcome(Ok(()), voice.and_then(Voice::stop)), Ok(()));
     }
 
     /// A destination a send to cannot reach: an IPv6 address from a socket the

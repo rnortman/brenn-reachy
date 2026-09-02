@@ -200,11 +200,11 @@ crate.spec(
 # crate reached only through the surface's internal edges is proved to link only
 # for as long as that edge exists.
 #
-# Git pins at a revision published on brenn-pod's public remote, never a local
-# hash: a pin at an unpublished revision produces no lockfile, so the gate could
-# not run. The dependency arrow is the ratified one -- brenn-reachy consumes
-# brenn-pod, never the reverse. Move the three together; they are one workspace
-# upstream and their internal path dependencies must agree.
+# Git pins at a revision published on brenn-pod's public remote, so that CI and
+# a fresh clone can fetch what this tree builds. The dependency arrow is the
+# ratified one -- brenn-reachy consumes brenn-pod, never the reverse. Move the
+# three together; they are one workspace upstream and their internal path
+# dependencies must agree.
 #
 # Three seams the host composes through are what this revision is chosen for:
 # the two motion sinks (`Sinks`, `Server::with_sinks`) and the alert queue
@@ -221,7 +221,7 @@ crate.spec(
 # of the wire contract beside `//crates/motion-proto` -- the same contract, some
 # publishes behind this tree's. Nothing carries a `MotionScript` value across the
 # two seams, so the two types never meet. TODO(motion-proto-two-copies)
-BRENN_POD_REV = "117093b0cacaa830820f2c03271af3aa7db66c12"
+BRENN_POD_REV = "e2f3b21dcaeea603bc8873eab33ef03ace571afe"
 
 # The host library the robot's voice process is a composition of. reachy-host.
 crate.spec(

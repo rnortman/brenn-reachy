@@ -1394,9 +1394,18 @@ assert_contains "the configuration is checked before any device is touched" "$ra
 assert_contains "the checker is built in the default configuration" "$ran" \
 	"bazel build -- //crates/reachy-host:reachy_host"
 assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
+# The voice host's console reaches the operator while the run is happening, not
+# only in the fetched records afterwards: the tail starts before the launcher
+# does and is killed after it returns. A run that lost this is one where a
+# pipeline dying in its first second is invisible to the person talking to it.
+assert_contains "the voice host's console is tailed onto the pty before the launcher starts" \
+	"$ran" \
+	"tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch"
+assert_contains "and the tail is killed once the launcher returns" "$ran" \
+	"rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
 assert_lacks "nothing puts a budget around a conversation" "$ran" "timeout --signal=INT"
 assert_lacks "and the harness intent source is not started beside the host" "$ran" \
 	"./reachy_ask"
