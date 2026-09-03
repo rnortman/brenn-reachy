@@ -4,7 +4,7 @@
 // The sequencers write these, which is why the module lives here. Every
 // sequencer's own state schema carries a `failure: SeqFailureSnap`, and the
 // session names the running sequence with a `SeqKind`, so this is the one
-// vocabulary all four sequencers and their host share -- held apart from any one
+// vocabulary all three sequencers and their host share -- held apart from any one
 // sequencer's phases, which are that sequencer's own module and no concern of the
 // others.
 //
@@ -21,9 +21,10 @@ use motion::fk;
 
 // Which sequencer the session is driving over the aux path, or none.
 //
-// One at a time, always: the phase machine runs a commission, then an engage,
-// then a disarm, and never two at once. This names which of the snapshot slots
-// the session keeps describes a live sequence.
+// One at a time, always: the phase machine runs a commission, then the resting
+// watch a stale rail row falls to, then a disarm, and never two at once. This
+// names which of the snapshot slots the session keeps describes a live
+// sequence.
 enum SeqKind
 {
     uuid: 3da17b33-acfe-4936-9b9e-9543f9128d72;
@@ -37,9 +38,12 @@ enum SeqKind
         #0 none default { underlying_value: 0; }
         // The start-up survey.
         #1 commission { underlying_value: 1; }
-        // A position sweep.
+        // The resting watch: a re-read of the supply and the error byte of the
+        // rows the driver's health rotation has left stale.
         #2 poll { underlying_value: 2; }
-        // Arming.
+        // Retired: engagement is a single datagram, not a sequenced exchange.
+        // Nothing raises this. Kept because recorded logs still carry it, and
+        // the number is never reused.
         #3 engage { underlying_value: 3; }
         // The orderly release.
         #4 disarm { underlying_value: 4; }

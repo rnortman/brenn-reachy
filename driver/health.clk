@@ -90,6 +90,26 @@ enum EventKind
         // all. A window is not made up for: a run that ends mid-window
         // publishes nothing for it.
         #9 cycle_stats { underlying_value: 9; }
+
+        // An engagement took: every row it named read its torque-enable
+        // register back as enabled, in the cycle that wrote it. `rows` names
+        // them. A re-issue of an engagement whose rows are already believed
+        // torqued says this again and writes nothing, so a lost answer heals
+        // on the next re-issue.
+        #10 engage_confirmed { underlying_value: 10; }
+
+        // An engagement was written and at least one row did not read its
+        // torque-enable register back as enabled. `rows` names the ones that
+        // did not; the rest are believed torqued, and the driver's dead-man
+        // runs over them like any other belief.
+        #11 engage_unconfirmed { underlying_value: 11; }
+
+        // An engagement was dropped without anything being written: no cycle
+        // inside the request's window had a grouped read that answered every
+        // row it named. `rows` names the ones the reads kept missing. The pin
+        // is taken from the same read the cycle engages on, so a cycle that
+        // cannot see a row does not take hold of it from an older reading.
+        #12 engage_declined { underlying_value: 12; }
     }
 }
 

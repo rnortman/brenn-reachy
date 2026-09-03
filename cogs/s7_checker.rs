@@ -21,7 +21,6 @@
 use std::process::ExitCode;
 
 use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
-use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
@@ -30,9 +29,7 @@ use reachy_motion::joints::{JointRef, row};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
-use scenario::{
-    SESSION_WAKE_FLOOR_NS, cycle_at, cycle_within, cycles_for, drain_cycle, stow_clocks,
-};
+use scenario::{cycle_at, cycle_within, drain_cycle, stow_clocks};
 
 use s7_scenario::{
     CLOSING_SCRIPT_ID, CLOSING_STOW_CYCLES, HOLD_RAD, HOLD_SCRIPT_ID, REFRESH_SCRIPT_ID,
@@ -63,23 +60,10 @@ fn main() -> ExitCode {
         // One engagement and no more, across all three accepted scripts. The
         // phase sequence is the ordinary one: a session that had disarmed and
         // re-engaged for a refresh would carry four more changes here.
-        let cycles = check::phases(
-            run,
-            &[
-                (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
-                (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
-                (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
-                (SessionPhaseWire::STOPPING, SessionPhaseWire::ACTIVE),
-                (SessionPhaseWire::RESTING, SessionPhaseWire::STOPPING),
-            ],
-            failures,
-        );
-        let engaged = match (cycles.get(2), cycles.get(3)) {
-            (Some(&taken), Some(&released)) => Some((taken, released)),
-            _ => None,
-        };
+        let (engaged, _) = check::ordinary_life(run, &[], failures);
+        let bracket = engaged.map(|engaged| (engaged.taken, engaged.released));
         check::ended_promptly(
-            engaged.map(|(_, released)| released),
+            engaged.map(|engaged| engaged.released),
             disengage_cycle(),
             failures,
         );
@@ -88,7 +72,7 @@ fn main() -> ExitCode {
         // replacements, and everything within the stretch is the assertion that
         // no epoch change jumped the machine.
         if let (Some(stream), Some((taken, released))) =
-            (check::goal_stream(run, failures), engaged)
+            (check::goal_stream(run, failures), bracket)
         {
             check::stream_starts_with_session(&stream, taken, failures);
             check::stream_stops_with_release(&stream, released, failures);
@@ -97,7 +81,7 @@ fn main() -> ExitCode {
         check::estimates_valid(run, failures);
         check_schedules(run, engaged, failures);
         check_replacements(run, failures);
-        check_torque_untouched(run, engaged, failures);
+        check_torque_untouched(run, bracket, failures);
         check_presence(run, failures);
         check_overlay_played(run, failures);
         check_arrival(run, failures);
@@ -144,104 +128,53 @@ fn main() -> ExitCode {
 
 /// The four schedules the session published, and what each of them says.
 ///
-/// The engagement, one per replacement, and the one nobody is running. Three
-/// things are asserted about them together, and each is a way a replacement
-/// could go wrong quietly. `engaged` stays true from the arming through both
-/// replacements, because a pass through false would pause the goal stream the
-/// driver's dead-man is fed by. The epoch rises on every one of them, because
-/// that is the whole mechanism by which the mover notices a schedule that
-/// happens to command the posture it is already holding. And each replacement
-/// is *whole*: the refresh's schedule is its own step and its own window, and
-/// the closing one's is its two steps and no window at all, rather than either
-/// merged with what was running.
-fn check_schedules(run: &Run, engaged: Option<(i64, i64)>, failures: &mut Vec<String>) {
-    let published: Vec<(i64, bool, u32, usize, usize)> = run
+/// The engagement, one per replacement, and the one nobody is running. Each
+/// replacement is *whole*: the refresh's schedule is its own step and its own
+/// window, and the closing one's is its two steps and no window at all, rather
+/// than either merged with what was running.
+fn check_schedules(run: &Run, engaged: Option<check::Engaged>, failures: &mut Vec<String>) {
+    let published = check::schedules_under_one_engagement(
+        run,
+        &["the arming", "the refresh", "the closing script"],
+        check::Tail::Nothing,
+        engaged,
+        failures,
+    );
+    if published.is_empty() {
+        return;
+    }
+    let shapes: Vec<(usize, usize)> = run
         .schedules
         .iter()
         .map(|logged| {
             (
-                cycle_within(logged.at_ns),
-                logged.message.engaged(),
-                logged.message.epoch(),
                 logged.message.steps().len(),
                 logged.message.overlays().len(),
             )
         })
         .collect();
-    let [took, refreshed, closing, let_go] = published.as_slice() else {
-        failures.push(format!(
-            "the session published {} schedules; one engagement carrying two replacements \
-             publishes the arming, one per replacement, and the ending: {published:?}",
-            published.len()
-        ));
+    let [_, refreshed, closing, _] = shapes.as_slice() else {
         return;
     };
-    for (what, entry) in [
-        ("the arming", took),
-        ("the refresh", refreshed),
-        ("the closing script", closing),
-    ] {
-        if !entry.1 {
-            failures.push(format!(
-                "the schedule {what} published at cycle {} says nobody is engaged: the machine is \
-                 under command from the arming to the end, and a pass through disengaged is a \
-                 goal stream the driver's dead-man would measure",
-                entry.0
-            ));
-        }
-    }
-    if let_go.1 {
-        failures.push(format!(
-            "the last schedule went out at cycle {} engaged: a session that is over publishes a \
-             schedule nobody is running",
-            let_go.0
-        ));
-    }
-    for pair in published.windows(2) {
-        if pair[1].2 <= pair[0].2 {
-            failures.push(format!(
-                "the session published epoch {} at cycle {} and then {} at cycle {}: a change a \
-                 consumer is to notice carries a fresh epoch",
-                pair[0].2, pair[0].0, pair[1].2, pair[1].0
-            ));
-        }
-    }
     // The replacements are whole, which is what the schedules' shapes say: the
     // refresh's window is in the refresh's schedule and gone from the closing
     // one, rather than carried forward into it.
-    if (refreshed.3, refreshed.4) != (1, 1) {
+    if *refreshed != (1, 1) {
         failures.push(format!(
             "the refresh's schedule carries {} steps and {} windows, and the refresh asks for one \
              of each: a replacement is the whole commanded future",
-            refreshed.3, refreshed.4
+            refreshed.0, refreshed.1
         ));
     }
-    if (closing.3, closing.4) != (2, 0) {
+    if *closing != (2, 0) {
         failures.push(format!(
             "the closing schedule carries {} steps and {} windows, and the closing script asks \
              for two steps and no window: a window the replacement did not ask for is one the \
              session merged rather than replaced",
-            closing.3, closing.4
+            closing.0, closing.1
         ));
     }
     check_closing_steps(run, failures);
-    let Some((taken, released)) = engaged else {
-        return;
-    };
-    if took.0 != taken {
-        failures.push(format!(
-            "the session published its engagement on cycle {} and entered the phase on {taken}: \
-             the publish and the phase are one decision",
-            took.0
-        ));
-    }
-    if let_go.0 != released {
-        failures.push(format!(
-            "the session published its disengagement on cycle {} and left the phase on \
-             {released}: the publish and the phase are one decision",
-            let_go.0
-        ));
-    }
 }
 
 /// The closing script's schedule is the timeline it asked for: up until the
@@ -328,17 +261,7 @@ fn check_replacements(run: &Run, failures: &mut Vec<String>) {
                  {wanted_id}"
             ));
         }
-        // The same window a refusal is held to: a script is answered on the
-        // wake it arrives on, and a replacement decided a wake later is an
-        // intake that ran late.
-        let by = sent_on + cycles_for(SESSION_WAKE_FLOOR_NS) + 1;
-        if *at < sent_on || *at > by {
-            failures.push(format!(
-                "the replacement is dated cycle {at}, and the script it answers was sent on \
-                 {sent_on}: a script is answered on the wake it arrives on, so the answer is due \
-                 by cycle {by}"
-            ));
-        }
+        check::answered_on_its_wake("replacement", *at, sent_on, failures);
         match run.schedules.get(index) {
             Some(logged) if logged.message.epoch() == *epoch => {}
             Some(logged) => failures.push(format!(

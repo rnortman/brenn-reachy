@@ -53,9 +53,10 @@ use speech_surface::{ALERT_QUEUE_DEPTH, AlertRaiser, alert_seam};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 ///
-/// The path a Bazel-built binary's runfiles put it at, which is also what the
-/// deploy step copies: the file travels with the binary, and a host run from
-/// somewhere else is a host told where to look.
+/// The path the payload lays the operator's configuration at, relative to the
+/// working directory the launcher starts this process in. The file does not
+/// travel with the binary: it is a per-unit file pushed into RAM, so a host
+/// started anywhere else is a host told where to look.
 const DEFAULT_CONFIG: &str = "host/host_params.textproto";
 
 /// What the invocation asked for.

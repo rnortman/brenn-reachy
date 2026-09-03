@@ -762,6 +762,7 @@ impl std::fmt::Display for ReasonName {
             RefusalReason::Undecodable => "a datagram that is not a script",
             RefusalReason::Stale => "a number no higher than the running engagement's",
             RefusalReason::TooLong => "a schedule reaching past the session's horizon",
+            RefusalReason::FaultEnding => "the machine was being stood down by a fault",
         })
     }
 }
@@ -931,14 +932,34 @@ fn joint_set_of(bits: u32) -> Option<brenn_reachy__motion__joints_clk_rs::JointF
         .and_then(|flags| joint_set(flags).ok())
 }
 
+/// A driver event's row set in words, or by number where it holds a bit this
+/// build has no servo for.
+///
+/// An unplaceable set is said as the number it is, not as the empty set:
+/// "nothing did not read back enabled" would launder an unreadable value into
+/// a plausible decoded fact, and this report is the artefact a bring-up run is
+/// read from.
+fn named_rows(bits: brenn_reachy__motion__joints_clk_rs::JointFlagsWire) -> String {
+    match joint_set(bits) {
+        Ok(set) => flags::Names(set).to_string(),
+        Err(_) => format!("servo set {:#x}, which this build does not name", bits.0),
+    }
+}
+
 /// The decision tick raised nothing.
+///
+/// The count travels with the kind: on a tracking fault it is the window the
+/// run was judged by, which is what says whether the figure was too short or
+/// the run was never recognised as a reversal, and reading it out here saves a
+/// dig through the log.
 fn no_faults(run: &Run, report: &mut Report) {
     for fault in &run.faults {
         report.fail(format!(
-            "the decision tick raised {:?} at {}, and nothing in a wake gesture is wrong with the \
-             machine",
+            "the decision tick raised {:?} at {}, count {}, and nothing in a wake gesture is \
+             wrong with the machine",
             fault.message.kind(),
-            fault.message.time().as_nanos()
+            fault.message.time().as_nanos(),
+            fault.message.count()
         ));
     }
 }
@@ -984,7 +1005,7 @@ fn driver_events(run: &Run, report: &mut Report) {
             )),
             EventKindWire::TORQUE_OFF_UNCONFIRMED => report.fail(format!(
                 "the driver could not confirm the de-torquing at {at}: {} did not read back",
-                flags::Names(joint_set(event.message.rows()).unwrap_or_default())
+                named_rows(event.message.rows())
             )),
             // The instant itself is read off the status, which every log holds
             // whenever its logger attached; this stream carries the event only
@@ -1000,6 +1021,20 @@ fn driver_events(run: &Run, report: &mut Report) {
             EventKindWire::TORQUE_OFF_CONFIRMED => {
                 report.note(format!("the driver read every row back de-torqued at {at}"))
             }
+            EventKindWire::ENGAGE_CONFIRMED => report.note(format!(
+                "the driver took hold of {} at {at} and read every enable back",
+                named_rows(event.message.rows())
+            )),
+            EventKindWire::ENGAGE_UNCONFIRMED => report.fail(format!(
+                "the driver could not confirm the engagement at {at}: {} did not read back \
+                 enabled",
+                named_rows(event.message.rows())
+            )),
+            EventKindWire::ENGAGE_DECLINED => report.fail(format!(
+                "the driver declined the engagement at {at}: {} never answered a grouped read, \
+                 and nothing was written",
+                named_rows(event.message.rows())
+            )),
             other => report.fail(format!(
                 "the driver raised {other:?} at {at}, which this report has no reading for"
             )),
@@ -2467,7 +2502,7 @@ mod tests {
         RegIdWire, Report, ReportKindWire, Retention, Run, SCHEDULE_CHANNEL, SESSION_CMD_CHANNEL,
         STATUS_CHANNEL, SeqFailureKindWire, SessionCmdKindWire, SessionCmdWire, SessionPhaseWire,
         TickFaultWire, TimelineEntryWire, ValueShapeWire, analyze, joint_set_of, judge_antennas,
-        neutral_targets, row, stow_pose_targets,
+        named_rows, neutral_targets, row, stow_pose_targets,
     };
     use reachy_motion::record;
     use std::collections::BTreeSet;
@@ -2569,6 +2604,22 @@ mod tests {
             report.findings[0].contains("no samples"),
             "{:?}",
             report.findings
+        );
+    }
+
+    /// A row set from a build this tool does not share is said as the number it
+    /// is, never as the empty set: "nothing did not read back enabled" reads as
+    /// a decoded fact, and this report is what a bring-up run is judged from.
+    #[test]
+    fn a_row_set_this_build_cannot_place_is_said_by_number() {
+        assert_eq!(
+            named_rows(JointFlagsWire::from(flags::bit(JointRef::AntennaLeft))),
+            "left antenna"
+        );
+        assert_eq!(named_rows(JointFlagsWire(0)), "nothing");
+        assert_eq!(
+            named_rows(JointFlagsWire(1 << 10)),
+            "servo set 0x400, which this build does not name"
         );
     }
 
@@ -3228,8 +3279,8 @@ mod tests {
         );
     }
 
-    /// Every kind the driver's event stream can carry, classified: five failures
-    /// and three censused, each said in its own words and counted once.
+    /// Every kind the driver's event stream can carry, classified: seven
+    /// failures and four censused, each said in its own words and counted once.
     ///
     /// The table is the point. The verdict this tool prints lives in these arms,
     /// and an arm that notes what it should fail -- or fires twice, or leaks into
@@ -3251,6 +3302,14 @@ mod tests {
             (
                 EventKindWire::TORQUE_OFF_UNCONFIRMED,
                 "could not confirm the de-torquing",
+            ),
+            (
+                EventKindWire::ENGAGE_UNCONFIRMED,
+                "did not read back enabled",
+            ),
+            (
+                EventKindWire::ENGAGE_DECLINED,
+                "never answered a grouped read",
             ),
             // An event kind this build has no reading for: a log written by a
             // newer tree than the analyzer.
@@ -3292,6 +3351,7 @@ mod tests {
                 EventKindWire::TORQUE_OFF_CONFIRMED,
                 "read every row back de-torqued",
             ),
+            (EventKindWire::ENGAGE_CONFIRMED, "took hold of"),
         ];
         for (kind, said) in censused {
             let report = analyze(&Run {
@@ -3421,6 +3481,10 @@ mod tests {
                 u32::from(RefusalReasonWire::TOO_LONG.0),
                 "a schedule reaching past the session's horizon",
             ),
+            (
+                u32::from(RefusalReasonWire::FAULT_ENDING.0),
+                "the machine was being stood down by a fault",
+            ),
             (200, "reason 200, which this build does not name"),
         ] {
             let report = analyze(&Run {
@@ -3545,6 +3609,7 @@ mod tests {
         let mut fault = TickFaultWire::new();
         fault.set_kind(FaultKindWire::HEAD_OBSTRUCTED);
         fault.set_time(when(4));
+        fault.set_count(30);
         let report = analyze(&Run {
             samples: heartbeat(10),
             faults: vec![at(4, fault)],
@@ -3552,6 +3617,21 @@ mod tests {
         });
         assert_eq!(
             findings_about(&report, "the decision tick raised"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        // The window the run was judged by travels from the row into the line,
+        // beside the kind: that is what says whether the figure was short or
+        // the run was never recognised as a reversal.
+        assert_eq!(
+            findings_about(&report, "HEAD_OBSTRUCTED at"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "count 30"),
             1,
             "{:?}",
             report.findings

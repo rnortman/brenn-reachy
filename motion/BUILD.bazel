@@ -96,19 +96,6 @@ clk_schema_module(
 )
 
 clk_schema_module(
-    name = "engage",
-    imports = [
-        "arm_record",
-        "bus_txn",
-        "joints",
-        "seq",
-        "fk",
-        "//geometry:primitives",
-        "//hardware/dynamixel:registers",
-    ],
-)
-
-clk_schema_module(
     name = "tick_state",
     imports = [
         "faults",

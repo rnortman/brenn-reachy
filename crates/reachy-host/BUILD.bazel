@@ -45,10 +45,13 @@ rust_library(
 # The process the robot's voice runs in. Cross-compiled for the device with
 # `--platforms=//bazel/platform:reachy-device`.
 #
-# Both files it reads by path travel with it: its own configuration, at the path
-# the binary defaults to, and the clip name table that configuration points at.
-# The payload lays both out the same way, because the launcher runs this from the
-# payload root and a runfiles tree and that root spell the same relative paths.
+# One of the two files it reads by path travels with it: the clip name table its
+# configuration points at, which the payload lays out at the same relative path a
+# runfiles tree does, because the launcher runs this from the payload root. The
+# configuration itself does not travel -- it is an operator's own, laid at the
+# path the binary defaults to by `tools/build-motion.sh` or named by `--config`,
+# so a `bazel run` with neither refuses and names the path it looked at, which is
+# what a unit without a payload would see too.
 #
 # A member of `//bazel/platform:motion_payload`, so a unit stages and starts it
 # and the gate cross-builds it. The launcher entry there names
@@ -68,10 +71,7 @@ rust_library(
 rust_binary(
     name = "reachy_host",
     srcs = ["src/main.rs"],
-    data = [
-        "//cogs:clip_library.names.json",
-        "//host:host_params.textproto",
-    ],
+    data = ["//cogs:clip_library.names.json"],
     edition = "2024",
     rustc_flags = ["-Clink-arg=-Wl,-rpath,$$ORIGIN"],
     visibility = ["//visibility:public"],
@@ -165,22 +165,22 @@ rust_test(
     ],
 )
 
-# The shipped configuration, read by the parser that will read it on the device.
-# A separate crate from the library's own tests because it reads a file: it
-# arrives through runfiles, and the environment variable names it beside the
-# `data` attribute that supplies it. Nothing here needs the schema -- the parser
-# carries its own copy, embedded at compile time.
+# The example configuration, read by the parser that will read an operator's
+# copy of it on the device. A separate crate from the library's own tests
+# because it reads a file: it arrives through runfiles, and the environment
+# variable names it beside the `data` attribute that supplies it. Nothing here
+# needs the schema -- the parser carries its own copy, embedded at compile time.
 rust_test(
-    name = "shipped_params_test",
+    name = "example_params_test",
     size = "small",
-    srcs = ["tests/shipped_params.rs"],
+    srcs = ["tests/example_params.rs"],
     data = [
         "//cogs:clip_library.names.json",
-        "//host:host_params.textproto",
+        "//host:host_params.example.textproto",
     ],
     edition = "2024",
     env = {
-        "HOST_PARAMS": "host/host_params.textproto",
+        "HOST_PARAMS": "host/host_params.example.textproto",
         "CLIP_NAMES": "cogs/clip_library.names.json",
     },
     deps = [

@@ -22,7 +22,7 @@ use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
-use brenn_reachy__driver__health_clk_rs::EventKind;
+use brenn_reachy__driver__health_clk_rs::{EventKind, EventKindWire};
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
@@ -33,6 +33,7 @@ use log_read::Logged;
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use reachy_kin::wrap_to_pi;
+use reachy_motion::arm;
 use reachy_motion::joints::{
     JointGroup, JointRef, JointTargets, Name, ROW_COUNT, flags, group_of, joint_ref, row, rows_of,
 };
@@ -42,9 +43,9 @@ use crate::read::Run;
 use crate::{
     BUS_WATCHDOG, COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS,
     FIRST_CYCLE, LAG_K, MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY,
-    REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS, SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD,
-    SLEW_LEGS_RAD, commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for,
-    drain_cycle,
+    RAIL_STALE_AFTER_NS, REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS,
+    SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD, SLEW_LEGS_RAD, commission_transactions, cycle_at,
+    cycle_of, cycle_within, cycles_for, drain_cycle, engage_cycles, rail_watch_transactions,
 };
 
 /// How far the plant may be from the posture it was sent to, in metres and in
@@ -694,15 +695,30 @@ pub fn scripts_sent(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>
     }
 }
 
-/// The cycles a session held the machine under command between.
+/// The cycles a session held the machine under command between, and the three
+/// that bracket them.
+///
+/// Named rather than left to the caller's ordinal read of the phase sequence:
+/// the sequence's length is this module's, so a scenario indexing into it is
+/// asserting something about whichever change a later edit moved into that slot.
 #[derive(Clone, Copy)]
 pub struct Engaged {
+    /// The cycle the survey ended on: the machine reached its first rest, and
+    /// what the survey cost is dated from.
+    pub commissioned: i64,
+    /// The cycle the script was taken on: the engagement was entered, and what
+    /// it cost is measured from here.
+    pub accepted: i64,
     /// The cycle the engagement took hold on: the arming concluded, and the
     /// schedule went out engaged.
     pub taken: i64,
     /// The cycle the session let go on: what the schedule asked for was over,
     /// and it went out disengaged.
     pub released: i64,
+    /// The cycle the machine reached rest on: the release confirmed, and the
+    /// session was over. `None` for a session that ended in a park instead,
+    /// which never reaches rest.
+    pub rested: Option<i64>,
 }
 
 /// The ordinary life of a session, as the run narrates it.
@@ -730,6 +746,45 @@ pub fn engagement_then(
     then: &[(SessionPhaseWire, SessionPhaseWire)],
     failures: &mut Vec<String>,
 ) -> Option<Engaged> {
+    engagement_cycles(run, then, failures).0
+}
+
+/// The same, and the cycle every phase change `then` names landed on.
+///
+/// For a scenario that carries on past the session it is about and says
+/// something about the phases it went through afterwards. The vector is `then`'s
+/// alone, in `then`'s order, so a scenario indexes into the list it wrote
+/// itself; what the ordinary life's own five changes are worth is [`Engaged`]'s
+/// four named cycles.
+pub fn engagement_cycles(
+    run: &Run,
+    then: &[(SessionPhaseWire, SessionPhaseWire)],
+    failures: &mut Vec<String>,
+) -> (Option<Engaged>, Vec<i64>) {
+    let (engaged, later) = ordinary_life(run, then, failures);
+    survey_cost(run, engaged.map(|engaged| engaged.commissioned), failures);
+    schedules_published(run, engaged, failures);
+    (engaged, later)
+}
+
+/// The five phase changes of an ordinary session, `then`'s after them, and the
+/// cycles `then`'s changes name -- without saying anything about the schedules
+/// the session published.
+///
+/// [`engagement_cycles`] is this plus the survey's cost and the schedule shape
+/// an ordinary run has. A scenario whose schedules are its own subject -- a
+/// replacement mid-engagement, most of all -- asserts them itself and takes the
+/// sequence from here, so that what the ordinary life of a session is lives in
+/// one place.
+///
+/// The two answers are the [`Engaged`] cycles and `then`'s own, in `then`'s
+/// order; the sequence's own five are [`Engaged`]'s named fields, so nothing
+/// outside this module indexes into the list this module wrote.
+pub fn ordinary_life(
+    run: &Run,
+    then: &[(SessionPhaseWire, SessionPhaseWire)],
+    failures: &mut Vec<String>,
+) -> (Option<Engaged>, Vec<i64>) {
     let mut expected = vec![
         (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
         (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
@@ -737,15 +792,287 @@ pub fn engagement_then(
         (SessionPhaseWire::STOPPING, SessionPhaseWire::ACTIVE),
         (SessionPhaseWire::RESTING, SessionPhaseWire::STOPPING),
     ];
+    let base = expected.len();
     expected.extend_from_slice(then);
     let cycles = phases(run, &expected, failures);
-    let engaged = match (cycles.get(2), cycles.get(3)) {
-        (Some(&taken), Some(&released)) => Some(Engaged { taken, released }),
+    let later = cycles.get(base..).unwrap_or_default().to_vec();
+    (engaged_of(&cycles), later)
+}
+
+/// The four phase changes of a session that ended in a park, and the cycles
+/// they name.
+///
+/// Beside [`ordinary_life`] and for the same reason: the sequence is this
+/// module's, so a scenario that ends parked says so by calling this rather than
+/// by re-typing the list and indexing into it. `rested` is `None` for every run
+/// this answers, because a parked machine never reaches rest -- the session
+/// stops where the fault left it.
+pub fn parked_life(run: &Run, failures: &mut Vec<String>) -> Option<Engaged> {
+    let cycles = phases(
+        run,
+        &[
+            (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
+            (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
+            (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
+            (SessionPhaseWire::PARKED, SessionPhaseWire::ACTIVE),
+        ],
+        failures,
+    );
+    engaged_of(&cycles)
+}
+
+/// The named cycles of a phase sequence whose first four changes are a
+/// session's: the survey ending, the script taken, the machine armed, and the
+/// engagement let go of. A fifth, where the sequence has one, is the rest.
+fn engaged_of(cycles: &[i64]) -> Option<Engaged> {
+    match (cycles.first(), cycles.get(1), cycles.get(2), cycles.get(3)) {
+        (Some(&commissioned), Some(&accepted), Some(&taken), Some(&released)) => Some(Engaged {
+            commissioned,
+            accepted,
+            taken,
+            released,
+            rested: cycles.get(4).copied(),
+        }),
         _ => None,
+    }
+}
+
+/// What one engagement cost the run: an aux transaction only for a rail row the
+/// driver's rotation had left stale, and the phase entered within two driver
+/// cycles of the last of them.
+///
+/// The torque-on gate is arithmetic over the picture the session keeps, so an
+/// engagement whose picture is fresh puts nothing on the bus at all: one
+/// datagram naming the rows, one driver cycle that pins, enables and reads the
+/// enable back, and the answer. A row the rotation has left older than
+/// `rail_stale_after_ns` is re-read first, two transactions for it, and the
+/// engagement follows the last of them.
+///
+/// Which rows those were is derived from the run rather than stated by the
+/// scenario: whether the rotation has lapped every row by the wake a script is
+/// taken on is a fact about how the aux slot was shared, and a scenario that
+/// wrote the answer down would be asserting its own arithmetic. So the readings
+/// the session had in hand at that wake are read out of the log, judged against
+/// the same window the session judges them against, and the traffic that follows
+/// is compared with what that verdict costs.
+///
+/// `accepted` is the cycle the engagement was entered on and `active` the cycle
+/// it took hold on -- [`engagement_cycles`]'s second and third, for the
+/// engagement that opens a session.
+pub fn engagement_cost(run: &Run, accepted: i64, active: i64, failures: &mut Vec<String>) {
+    let Some(accepted_ns) = wake_of_change(run, SessionPhaseWire::ENGAGING, accepted) else {
+        failures.push(format!(
+            "the session entered no engagement on cycle {accepted}, and this is an assertion \
+             about what one cost"
+        ));
+        return;
     };
-    survey_cost(run, cycles.first().copied(), failures);
-    schedules_published(run, engaged, failures);
-    engaged
+    let stale = stale_rows(run, accepted_ns, failures);
+    let spent: Vec<i64> = run
+        .datagrams
+        .iter()
+        .filter(|logged| logged.message.kind() == SessionCmdKindWire::AUX)
+        .map(|logged| drain_cycle(logged.at_ns))
+        .filter(|cycle| *cycle > accepted && *cycle <= active)
+        .collect();
+    let wanted = rail_watch_transactions(stale);
+    if spent.len() as i64 != wanted {
+        failures.push(format!(
+            "the engagement entered on cycle {accepted} spent {} aux transaction(s), on cycles \
+             {spent:?}, and the {stale} row(s) the rotation had left stale by then cost {wanted}: \
+             a fresh picture is gated on without touching the bus",
+            spent.len()
+        ));
+    }
+    // From the last re-read rather than from the acceptance: a stale row is
+    // looked at first, and what the engagement itself is worth is the stretch
+    // after the last answer the gate waited for.
+    //
+    // A window and not a count. On this grid the driver's cycle runs after the
+    // wake that published the ask, so an engagement asked for and answered
+    // inside one cycle is what a deterministic run of a fresh picture looks
+    // like; the two cycles are what it may cost, not what it must.
+    let last = spent.last().copied().unwrap_or(accepted);
+    if active < last || active - last > engage_cycles() {
+        failures.push(format!(
+            "the session entered the phase on cycle {active}, {} cycle(s) past the {last} the \
+             engagement was issued from, and taking hold of the machine is at most {} driver \
+             cycle(s): the ask and its answer",
+            active - last,
+            engage_cycles()
+        ));
+    }
+}
+
+/// How many rail rows the session's picture was stale in at the wake `at_ns`.
+///
+/// The picture is written from every health report the rotation publishes, in
+/// every phase, and seeded once from the commissioning survey's own readings on
+/// the wake the survey ends. Both are in the log: the reports carry the instant
+/// each reading was taken, and the seeding is dated by the phase change the same
+/// wake narrated. A row is stale on the session's own comparison -- older than
+/// the configured window, counted from the wake the gate is judged on.
+///
+/// A reading is only in the session's hands if it was published before that
+/// wake, so the reading's own instant is compared with the publish that carried
+/// it. A row nothing in the log says anything about is a failure rather than a
+/// stale row: the seeding is what the survey leaves behind, so a row with no
+/// evidence at all is a picture this assertion cannot be made against.
+fn stale_rows(run: &Run, at_ns: i64, failures: &mut Vec<String>) -> i64 {
+    let seeded = wake_of_change(run, SessionPhaseWire::RESTING, i64::MIN);
+    let mut freshest = [seeded.filter(|at| *at <= at_ns); ROW_COUNT];
+    for reading in &run.rail_readings {
+        if reading.at_ns > at_ns {
+            continue;
+        }
+        let reading = &reading.message;
+        let taken = reading.sample_time().as_nanos();
+        let Some(row) = arm::row_of_id(reading.id()) else {
+            failures.push(format!(
+                "the rotation reported on servo {}, which this configuration has no row for",
+                reading.id()
+            ));
+            continue;
+        };
+        freshest[row] = Some(freshest[row].map_or(taken, |seen: i64| seen.max(taken)));
+    }
+    let mut stale = 0;
+    for (row, freshest) in freshest.iter().enumerate() {
+        match freshest {
+            None => failures.push(format!(
+                "nothing in the run says anything about row {row}'s supply, and the survey seeds \
+                 every row of the picture before the first rest"
+            )),
+            Some(freshest) if at_ns - freshest > RAIL_STALE_AFTER_NS => stale += 1,
+            Some(_) => {}
+        }
+    }
+    stale
+}
+
+/// The instant the session ran at when it narrated its first phase change into
+/// `phase` on cycle `on` -- or its first into `phase` at all, for `on` of
+/// [`i64::MIN`].
+///
+/// The wake and not the publish: a report carries the instant it was decided at,
+/// which is the instant every other decision of that wake was made at.
+fn wake_of_change(run: &Run, phase: SessionPhaseWire, on: i64) -> Option<i64> {
+    run.reports
+        .iter()
+        .map(|report| &report.message)
+        .filter(|report| report.kind() == ReportKindWire::PHASE_CHANGED)
+        .filter(|report| SessionPhaseWire(u8::try_from(report.a()).unwrap_or(u8::MAX)) == phase)
+        .map(|report| report.time().as_nanos())
+        .find(|at| on == i64::MIN || cycle_within(*at) == on)
+}
+
+/// The scripts the session held, with the phase it held each one in and the
+/// cycle it was sent on.
+///
+/// A hold is neither an acceptance nor a refusal: the script arrived while a
+/// maneuver was under way, nothing was engaged by it, and it will be answered on
+/// the phase that maneuver ends in. What a scenario asserts here is that the
+/// sender was told so -- and, because the list is exhaustive, that nothing else
+/// was held.
+pub fn holds(run: &Run, expected: &[(u32, SessionPhaseWire, i64)], failures: &mut Vec<String>) {
+    let expected: Vec<(u32, u32, i64)> = expected
+        .iter()
+        .map(|(id, phase, sent_on)| (*id, u32::from(phase.0), *sent_on))
+        .collect();
+    answers(
+        run,
+        ReportKindWire::SCRIPT_HELD,
+        &expected,
+        Answered {
+            verb: "held",
+            noun: "hold",
+            about: "phase",
+        },
+        failures,
+    );
+}
+
+/// How one kind of answer to a script reads, for the one reader that checks
+/// them all.
+struct Answered {
+    /// What the session did, in the past tense: "held", "refused".
+    verb: &'static str,
+    /// What one of them is: "hold", "refusal".
+    noun: &'static str,
+    /// What the row's second field says: "phase", "reason".
+    about: &'static str,
+}
+
+/// Every row of `kind` the session narrated, in order, against `expected` --
+/// each entry a script id, the row's second field, and the cycle the script it
+/// answers was sent on.
+///
+/// One reader for every kind of answer a script gets, because what a scenario
+/// asserts about one is what it asserts about all of them: the row says which
+/// script and says why, the list is exhaustive so nothing else was answered that
+/// way, and each answer is dated on the wake its script arrived on. A second
+/// copy of this would be two functions that have to agree on all three.
+fn answers(
+    run: &Run,
+    kind: ReportKindWire,
+    expected: &[(u32, u32, i64)],
+    says: Answered,
+    failures: &mut Vec<String>,
+) {
+    let Answered { verb, noun, about } = says;
+    let found: Vec<(i64, u32, u32)> = run
+        .reports
+        .iter()
+        .filter(|report| report.message.kind() == kind)
+        .map(|report| {
+            (
+                cycle_within(report.message.time().as_nanos()),
+                report.message.a(),
+                report.message.b(),
+            )
+        })
+        .collect();
+    if found.len() != expected.len() {
+        failures.push(format!(
+            "the session {verb} {found:?}, and this run expects {} {noun}(s): {expected:?}",
+            expected.len()
+        ));
+        return;
+    }
+    for ((at, script_id, found_about), (wanted_id, wanted_about, sent_on)) in
+        found.iter().zip(expected)
+    {
+        if script_id != wanted_id || found_about != wanted_about {
+            failures.push(format!(
+                "the session {verb} script {script_id} under {about} {found_about}, and this run \
+                 sends script {wanted_id} to a machine that answers {about} {wanted_about}"
+            ));
+        }
+        answered_on_its_wake(noun, *at, *sent_on, failures);
+    }
+}
+
+/// The session answered a script on the wake it arrived on: `at` is inside the
+/// window that opens on `sent_on`.
+///
+/// A window and not a floor. The session decides an answer on the wake the
+/// script arrives on -- a message is a wake, and the report carries the instant
+/// it was decided at rather than the instant it was published -- so an answer
+/// dated a wake floor and a cycle past the script is an intake that answered on
+/// a later wake than the one it was woken by.
+///
+/// The claim is about the session's intake and not about any one kind of answer,
+/// which is why it is one function: a hold, a refusal and a replacement are all
+/// due by the same cycle, and a copy of the arithmetic per kind is a copy that
+/// would be missed when the floor changes. `what` is what is being dated.
+pub fn answered_on_its_wake(what: &str, at: i64, sent_on: i64, failures: &mut Vec<String>) {
+    let by = sent_on + cycles_for(SESSION_WAKE_FLOOR_NS) + 1;
+    if at < sent_on || at > by {
+        failures.push(format!(
+            "the {what} is dated cycle {at}, and the script it answers was sent on {sent_on}: a \
+             script is answered on the wake it arrives on, so the answer is due by cycle {by}"
+        ));
+    }
 }
 
 /// The session let go promptly: within one wake of the instant its schedule ran
@@ -777,12 +1104,65 @@ pub fn ended_promptly(released: Option<i64>, last_step_end: i64, failures: &mut 
 /// the arming concluded, disengaged when the session was over, and nothing
 /// between.
 ///
-/// Two messages and no more. A schedule is state rather than an event, so a
-/// republication between changes would be the session saying the same thing
-/// twice -- and the epoch bumping on each is the whole mechanism by which a
-/// consumer holding the last one notices, so a pair under one epoch is a change
-/// nobody would act on.
+/// Two messages for the session this judges, and every one after them a fresh
+/// engagement's. A schedule is state rather than an event, so a republication
+/// between changes would be the session saying the same thing twice -- and the
+/// epoch bumping on each is the whole mechanism by which a consumer holding the
+/// last one notices, so a pair under one epoch is a change nobody would act on.
+///
+/// A run whose tail takes a second script publishes a third: the engagement it
+/// opens now concludes in two driver cycles rather than in a hundred
+/// transactions. Those are held to being engaged under a fresh epoch, which is
+/// what a second session's arming taking hold looks like, and the pair before
+/// them is judged as it always was.
 pub fn schedules_published(run: &Run, engaged: Option<Engaged>, failures: &mut Vec<String>) {
+    schedules_under_one_engagement(
+        run,
+        &["the arming"],
+        Tail::FurtherSessions,
+        engaged,
+        failures,
+    );
+}
+
+/// What a run publishes after the session [`schedules_under_one_engagement`]
+/// judges has ended.
+#[derive(Clone, Copy)]
+pub enum Tail {
+    /// Nothing: the schedule that ended the session is the run's last.
+    Nothing,
+    /// Two more per further session -- an arming taking hold and the ending it
+    /// held for -- of which the last may be the odd first half, which is what a
+    /// run that engages the machine again in its tail looks like.
+    FurtherSessions,
+}
+
+/// The schedules one engagement published, judged as the one contract the mover
+/// and the driver's dead-man both key off.
+///
+/// `published_by` names, in order, every schedule the session published while it
+/// was under command -- the arming and one per replacement -- and the schedule
+/// after them is the one nobody is running. `engaged` stays true across all of
+/// the named ones, because a pass through disengaged is a pause in the goal
+/// stream the dead-man would measure, and the last is disengaged because a
+/// session that is over publishes a schedule nobody is running. Every epoch
+/// rises on the one before it: a schedule is state rather than an event, so the
+/// bump is the whole mechanism by which a consumer holding the last one notices,
+/// and a pair under one epoch is a change nobody would act on. The first and the
+/// last land on the cycles the phase changes did, because the publish and the
+/// phase are one decision.
+///
+/// The rows are answered so that a scenario can say what is its own about them
+/// -- the wake a replacement was answered on, the steps and windows each carries
+/// -- without re-typing the shape every session shares. Empty where the count
+/// was wrong, which is the one failure that leaves nothing to index.
+pub fn schedules_under_one_engagement(
+    run: &Run,
+    published_by: &[&str],
+    tail: Tail,
+    engaged: Option<Engaged>,
+    failures: &mut Vec<String>,
+) -> Vec<(i64, bool, u32)> {
     let published: Vec<(i64, bool, u32)> = run
         .schedules
         .iter()
@@ -794,47 +1174,84 @@ pub fn schedules_published(run: &Run, engaged: Option<Engaged>, failures: &mut V
             )
         })
         .collect();
-    let [
-        (took, took_engaged, took_epoch),
-        (let_go, let_go_engaged, let_go_epoch),
-    ] = published.as_slice()
-    else {
-        failures.push(format!(
-            "the session published {} schedules; a session that ran is the one that engaged and \
-             the one that ended: {published:?}",
-            published.len()
-        ));
-        return;
+    let wanted = published_by.len() + 1;
+    let enough = match tail {
+        Tail::Nothing => published.len() == wanted,
+        Tail::FurtherSessions => published.len() >= wanted,
     };
-    if !took_engaged || *let_go_engaged {
+    if !enough {
+        let more = match tail {
+            Tail::Nothing => "",
+            Tail::FurtherSessions => ", and two more per further session",
+        };
         failures.push(format!(
-            "the session published engaged = {took_engaged} and then {let_go_engaged}: the first \
-             is the arming taking hold and the second is the session being over"
+            "the session published {} schedules; one engagement publishes {} and the one nobody \
+             is running{more}: {published:?}",
+            published.len(),
+            published_by.join(", "),
+        ));
+        return Vec::new();
+    }
+    for (what, entry) in published_by.iter().zip(&published) {
+        if !entry.1 {
+            failures.push(format!(
+                "the schedule {what} published at cycle {} says nobody is engaged: the machine is \
+                 under command from the arming to the end, and a pass through disengaged is a \
+                 goal stream the driver's dead-man would measure",
+                entry.0
+            ));
+        }
+    }
+    let ended = published[published_by.len()];
+    if ended.1 {
+        failures.push(format!(
+            "the last schedule went out at cycle {} engaged: a session that is over publishes a \
+             schedule nobody is running",
+            ended.0
         ));
     }
-    if let_go_epoch <= took_epoch {
-        failures.push(format!(
-            "the session published epoch {took_epoch} and then {let_go_epoch}: a change a \
-             consumer is to notice carries a fresh epoch"
-        ));
+    // Past the session's own schedules the run is one more session per pair: an
+    // arming taking hold, then the session it held for being over.
+    if let Tail::FurtherSessions = tail {
+        let mut engaging = true;
+        for (at, engaged_again, _) in &published[wanted..] {
+            if *engaged_again != engaging {
+                failures.push(format!(
+                    "the session published engaged = {engaged_again} on cycle {at}, and what a \
+                     schedule past the one that ended a session is is a fresh engagement taking \
+                     hold (engaged = {engaging})"
+                ));
+            }
+            engaging = !engaging;
+        }
+    }
+    for pair in published.windows(2) {
+        if pair[1].2 <= pair[0].2 {
+            failures.push(format!(
+                "the session published epoch {} at cycle {} and then {} at cycle {}: a change a \
+                 consumer is to notice carries a fresh epoch",
+                pair[0].2, pair[0].0, pair[1].2, pair[1].0
+            ));
+        }
     }
     let Some(engaged) = engaged else {
-        return;
+        return published;
     };
-    if *took != engaged.taken {
+    if published[0].0 != engaged.taken {
         failures.push(format!(
-            "the session published its engagement on cycle {took} and entered the phase on \
-             {}: the publish and the phase are one decision",
-            engaged.taken
+            "the session published its engagement on cycle {} and entered the phase on {}: the \
+             publish and the phase are one decision",
+            published[0].0, engaged.taken
         ));
     }
-    if *let_go != engaged.released {
+    if ended.0 != engaged.released {
         failures.push(format!(
-            "the session published its disengagement on cycle {let_go} and left the phase on \
-             {}: the publish and the phase are one decision",
-            engaged.released
+            "the session published its disengagement on cycle {} and left the phase on {}: the \
+             publish and the phase are one decision",
+            ended.0, engaged.released
         ));
     }
+    published
 }
 
 /// The schedules of a run whose session carried the machine down: the
@@ -1040,49 +1457,21 @@ pub fn no_goals(run: &Run, why: &str, failures: &mut Vec<String>) {
 /// take a script until an operator has been. The mirror of [`scripts_sent`],
 /// which is the accepted half.
 pub fn refusals(run: &Run, expected: &[(u32, RefusalReasonWire, i64)], failures: &mut Vec<String>) {
-    let refused: Vec<(i64, u32, u32)> = run
-        .reports
+    let expected: Vec<(u32, u32, i64)> = expected
         .iter()
-        .filter(|report| report.message.kind() == ReportKindWire::SCRIPT_REFUSED)
-        .map(|report| {
-            (
-                cycle_within(report.message.time().as_nanos()),
-                report.message.a(),
-                report.message.b(),
-            )
-        })
+        .map(|(id, reason, sent_on)| (*id, u32::from(reason.0), *sent_on))
         .collect();
-    if refused.len() != expected.len() {
-        failures.push(format!(
-            "the session refused {refused:?}, and this run expects {} refusal(s): {expected:?}",
-            expected.len()
-        ));
-        return;
-    }
-    for ((at, script_id, reason), (wanted_id, wanted_reason, sent_on)) in
-        refused.iter().zip(expected)
-    {
-        let wanted_reason = u32::from(wanted_reason.0);
-        if *script_id != *wanted_id || *reason != wanted_reason {
-            failures.push(format!(
-                "the session refused script {script_id} for reason {reason}, and this run sends \
-                 script {wanted_id} to a machine that answers {wanted_reason}"
-            ));
-        }
-        // A window and not a floor. The session decides a refusal on the wake
-        // the script arrives on -- a message is a wake, and the report carries
-        // the instant it was decided at rather than the instant it was published
-        // -- so a refusal dated a wake floor and a cycle past the script is an
-        // intake that answered on a later wake than the one it was woken by.
-        let by = *sent_on + cycles_for(SESSION_WAKE_FLOOR_NS) + 1;
-        if *at < *sent_on || *at > by {
-            failures.push(format!(
-                "the refusal is dated cycle {at}, and the script it answers was sent on \
-                 {sent_on}: a script is answered on the wake it arrives on, so the answer is due \
-                 by cycle {by}"
-            ));
-        }
-    }
+    answers(
+        run,
+        ReportKindWire::SCRIPT_REFUSED,
+        &expected,
+        Answered {
+            verb: "refused",
+            noun: "refusal",
+            about: "reason",
+        },
+        failures,
+    );
 }
 
 /// How many times a scenario expects one condition to have been recorded.
@@ -1504,14 +1893,35 @@ pub fn first_release(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
 /// event here would mean the machine was still energised when the commander
 /// went quiet -- which is exactly the condition the dead-man exists for, and
 /// exactly the thing a scenario's ordering is supposed to avoid.
+///
+/// An engagement's own answer is not such an event. The three endings say what
+/// became of an ask the scenario made by sending a script, so they are the
+/// driver answering rather than the gate raising something: a run that engages
+/// carries one per engagement, and what a scenario asserts about them is the
+/// phase each one moved the session to.
 pub fn no_events(run: &Run, failures: &mut Vec<String>) {
     for event in &run.events {
+        if engagement_answer(event.message.kind()) {
+            continue;
+        }
         failures.push(format!(
             "the driver's gate raised {} at {}, and nothing in this scenario asks it to",
             event.message.kind(),
             event.message.time().as_nanos()
         ));
     }
+}
+
+/// Whether `kind` is the answer an engagement that took hold ends in.
+///
+/// Stated once, because two checks exempt it for the same reason: it is the
+/// driver saying an ask the scenario made was granted rather than the gate
+/// raising a condition. The other two answers -- an engagement that did not read
+/// back enabled, and one the driver declined -- are exempted by neither: a
+/// scenario that means to end an engagement either of those ways asks for it by
+/// name through `only_kinds`, and one that does not means it as a failure.
+fn engagement_answer(kind: EventKindWire) -> bool {
+    matches!(kind, EventKindWire::ENGAGE_CONFIRMED)
 }
 
 /// The outage is exactly where the scenario put it: every sample inside `blind`
@@ -1834,9 +2244,16 @@ pub fn sole_event(
 /// scenario with a de-torquing in it expects two events -- the latch and the
 /// read-back that confirmed it -- and a helper that judged one kind could only
 /// ever call the other a surprise.
+///
+/// An engagement's own answer is exempt, for [`no_events`]'s reason: every run
+/// that engages carries one, so a scenario that had to list it would be listing
+/// the fact that it sent a script.
 pub fn only_kinds(run: &Run, kinds: &[EventKind], failures: &mut Vec<String>) {
     for event in &run.events {
         let event = &event.message;
+        if engagement_answer(event.kind()) {
+            continue;
+        }
         let Some(raised) = event.kind().to_known() else {
             // Reported by `sole_event`, which reads the same log; naming it
             // twice would make one unreadable event two failures.

@@ -444,6 +444,19 @@ pub struct CycleBounds {
     /// The torque-off sweep: a verified write per row, which is a write and a
     /// read-back each.
     pub sweep_ns: i64,
+    /// An engagement: the goal pin, the torque-enable write and the read-back
+    /// that verifies it, each grouped over the rows it takes hold of and
+    /// charged at the whole bus.
+    ///
+    /// Four exchanges with the cycle's own read in front of it, against the
+    /// ordinary cycle's three, so at the per-exchange bound the engage cycle
+    /// overruns its period and the grid skips a point or two -- which the loop
+    /// counts and publishes rather than making up for, and which the session
+    /// tolerates well inside its own staleness budget. On the wire at the
+    /// shipped baud the four are a few milliseconds and the cycle keeps its
+    /// grid point. It is a torque transition rather than surveillance, which is
+    /// the same reason the torque-off sweep is allowed to overrun.
+    pub engage_ns: i64,
     /// The most expensive out-of-band transaction: a verified write of the
     /// widest value the wire carries, or the health rotation's three reads.
     ///
@@ -467,6 +480,13 @@ impl CycleBounds {
             write_ns: nanos(bus_timing.sync_write_bound(ROW_COUNT, GOAL_POSITION.len.into())),
             sweep_ns: nanos(bus_timing.verified_write_bound(TORQUE_ENABLE.len.into()))
                 .saturating_mul(ROW_COUNT as i64),
+            engage_ns: nanos(bus_timing.sync_write_bound(ROW_COUNT, GOAL_POSITION.len.into()))
+                .saturating_add(nanos(
+                    bus_timing.sync_write_bound(ROW_COUNT, TORQUE_ENABLE.len.into()),
+                ))
+                .saturating_add(nanos(
+                    bus_timing.sync_read_bound(ROW_COUNT, TORQUE_ENABLE.len.into()),
+                )),
             aux_ns: nanos(verified.max(health_reads)),
         }
     }
@@ -982,6 +1002,35 @@ mod tests {
         assert!(
             bounds.read_ns + bounds.write_ns + bounds.aux_ns < reachy_driver::NOMINAL_CYCLE_NS,
             "an ordinary cycle has room for one transaction: {bounds:?}"
+        );
+    }
+
+    /// An engage cycle is four exchanges and is allowed to overrun, inside a
+    /// bound the session's own staleness budget clears.
+    ///
+    /// The figure asserted is the grid points a cycle may cost: the read plus
+    /// the engagement plus the margin against three periods, so at the
+    /// per-exchange bound the loop skips at most two points where the session
+    /// tolerates five missing samples. On the wire at the shipped baud the four
+    /// exchanges are under 3 ms and the cycle keeps its grid point; the hardware
+    /// run is what asserts that, under the bring-up rule.
+    #[test]
+    fn an_engage_cycle_of_the_shipped_bus_costs_at_most_two_grid_points() {
+        let timing = crate::tick::cycle_timing(reachy_bus::DEFAULT_BAUD);
+        let bounds = CycleBounds::of(&timing);
+
+        assert!(
+            bounds.engage_ns > bounds.write_ns,
+            "three exchanges cost more than the goal write alone: {bounds:?}"
+        );
+        assert!(
+            bounds.read_ns + bounds.engage_ns + crate::tick::CYCLE_MARGIN_NS
+                < 3 * reachy_driver::NOMINAL_CYCLE_NS,
+            "an engagement costs at most two grid points: {bounds:?}"
+        );
+        assert!(
+            bounds.engage_ns < bounds.sweep_ns,
+            "three grouped exchanges are cheaper than eighteen single-servo ones: {bounds:?}"
         );
     }
 

@@ -41,11 +41,12 @@ rust_clk_module(
     src = "host_config.clk",
 )
 
-# The numbers the host ships with, read by the host at startup and by the test
-# that holds this file to the schema; and the host's entry in the launcher's app
-# table, which `cogs/robot.clk`'s `RobotCpu` merges into the production launcher
-# config and the harness twin deliberately leaves out.
+# The schema's worked example, read by the test that holds it to the schema and
+# by nothing on a unit -- the configuration a unit runs is an operator's own,
+# staged into RAM by `tools/build-motion.sh`; and the host's entry in the
+# launcher's app table, which `cogs/robot.clk`'s `RobotCpu` merges into the
+# production launcher config and the harness twin deliberately leaves out.
 exports_files([
     "host_launch.textproto",
-    "host_params.textproto",
+    "host_params.example.textproto",
 ])

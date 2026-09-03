@@ -5,11 +5,12 @@
 //! with the grid instant they are to be executed at, a held setpoint that gets
 //! rewritten between due goals, and a timer that de-torques the machine when
 //! the process feeding it goals goes quiet. That is [`GoalGate`], and beside it
-//! sit the three smaller decisions a cycle also makes — what the driver
+//! sit the four smaller decisions a cycle also makes — what the driver
 //! believes about torque ([`BelievedTorqued`]), whether a commanded
 //! de-torquing has been seen to take ([`TorqueOffConfirm`]), and which one
 //! out-of-band transaction the cycle spends its spare bus time on
-//! ([`AuxSlot`]). Those decisions are this crate, and nothing else is: no
+//! ([`AuxSlot`]), and when an engagement a host asked for may be written
+//! ([`EngageRequest`]). Those decisions are this crate, and nothing else is: no
 //! register addresses, no wire, no clock of its own.
 //!
 //! Beside them sit the two policy numbers every host answers to — how long a
@@ -82,11 +83,16 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRef};
 use clockwork_rs::SyncTime;
 
 pub mod aux_slot;
+pub mod engage;
 pub mod report;
 pub mod state;
 pub mod torque;
 
 pub use aux_slot::{AuxOffer, AuxSlot, AuxTask};
+pub use engage::{
+    EngageRequest, EngageStep, credit as credit_engagement, fail as fail_engagement,
+    verdict as engage_verdict,
+};
 pub use report::Event;
 pub use state::DriverStateError;
 pub use torque::{
@@ -171,6 +177,18 @@ const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET_NS > JOINT_COUNT as i64 * NOMINA
 /// The port open in front of the sweep is not in the arithmetic: it is a local
 /// device open, and nothing in this tree bounds it.
 pub const STARTUP_INIT_BUDGET_NS: i64 = 100_000_000;
+
+/// How many cycles an engagement may wait for a grouped read that answers
+/// every row it names.
+///
+/// The pin an engagement writes is the reading the same cycle took, so a cycle
+/// whose read missed a named row cannot take hold of it and the request waits.
+/// This is how long it waits: five cycles, which is the run of missing samples
+/// a host tolerates before it calls the bus stale — past that the host is no
+/// longer waiting for this engagement anyway, and a request outliving the host
+/// that asked for it would take hold of the machine on the strength of an ask
+/// nobody is behind any more.
+pub const ENGAGE_READ_CYCLES: u32 = 5;
 
 /// How many cycles in a row the bus may answer nothing before the driver says
 /// its bus is gone.

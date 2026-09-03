@@ -108,7 +108,7 @@ reachy_motion::vocab_numbering! {
     /// inserted among these renarrates every story already on disk. Nothing in
     /// either language says so, which is why it is said here.
     the_report_numbering_is_the_one_written_down:
-        ReportKind as ReportKindSlot, past the end 16 {
+        ReportKind as ReportKindSlot, past the end 17 {
         ReportKind::None => 0,
         ReportKind::PhaseChanged => 1,
         ReportKind::ScriptAccepted => 2,
@@ -125,6 +125,7 @@ reachy_motion::vocab_numbering! {
         ReportKind::DegradeReleased => 13,
         ReportKind::CommissionFailed => 14,
         ReportKind::ScriptReplaced => 15,
+        ReportKind::ScriptHeld => 16,
     }
 }
 

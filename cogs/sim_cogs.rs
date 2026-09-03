@@ -47,16 +47,19 @@ use clockwork_rs::SyncTime;
 use motion_slots::{configured, counters};
 use reachy_driver::report::{self, Event};
 use reachy_driver::{
-    AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, GateAction, GoalGate,
-    TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm,
+    AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, EngageRequest, EngageStep,
+    GateAction, GoalGate, TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm, credit_engagement,
+    engage_verdict, fail_engagement,
 };
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
-    JointGroup, angle_of, flags, group_of, row, rows_of, set_angle, write_rows, write_vector,
+    JointGroup, JointRef, ROW_COUNT, angle_of, flags, group_of, row, rows_of, set_angle,
+    write_rows, write_vector,
 };
 
 pub mod sim_aux;
+pub mod sim_lag;
 pub mod sim_regs;
 
 use sim_aux::{Answer, Request};
@@ -217,6 +220,15 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             state.aux_refused += 1;
             continue;
         }
+        if cmd.kind == SessionCmdKind::EngageNow && cmd.rows == JointFlags::NONE {
+            // An engagement naming no row is the same thing said another way:
+            // there is no row to take hold of, so nothing would be written and
+            // nothing answered. Refused and counted rather than fed to the
+            // dead-man, so a host that sent one learns it from the census
+            // instead of from its own silence deadline.
+            state.aux_refused += 1;
+            continue;
+        }
         GoalGate::over(&mut state.gate).note_liveness(nominal);
         match cmd.kind {
             // Liveness and nothing else. The asking-nothing arm is unreachable:
@@ -234,11 +246,21 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
                 // side: a release outranks whatever was asked for before it, and
                 // a torque-enable write run out of the slot after the latch
                 // would re-energise the row this datagram exists to release.
+                // An engagement not yet written goes the same way and
+                // unanswered, for the same reason.
                 GoalGate::over(&mut state.gate).latch_torque_off();
                 AuxSlot::over(&mut state.aux).abandon();
+                EngageRequest::over(&mut state.engage).abandon();
                 state.torqued = JointFlags::NONE;
                 state.has_target = JointFlags::NONE;
                 TorqueOffConfirm::over(&mut state.confirm).begin(nominal);
+            }
+            SessionCmdKind::EngageNow => {
+                // Nothing is written here. What an engagement writes is written
+                // below, at the reading this cycle took: the pin is where the
+                // machine actually is, and a pin from an older reading would
+                // command a limp machine back to where it used to be.
+                EngageRequest::over(&mut state.engage).offer(cmd.rows);
             }
             SessionCmdKind::Aux => {
                 match AuxSlot::over(&mut state.aux).offer(cmd.corr, &cmd.txn) {
@@ -366,6 +388,7 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     // points behind it are points no cycle attended -- which is the same
     // reading the real driver's loop makes of a slot it missed.
     state.skipped_cycles += u64::try_from(cycles - 1).unwrap_or(0);
+    keep_history(state, cycles);
     advance(params, state, cycles);
 
     // A cycle in which the bus answers nothing at all. Decided before anything
@@ -374,10 +397,11 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     // confirmation's read-back and the health rotation are all silent for it.
     let blind = state.drop_replies_left > 0;
     state.drop_replies_left = state.drop_replies_left.saturating_sub(1);
+    let engaged = run_engage(state, nominal, blind, &mut report);
     if !blind {
         read_registers(state);
     }
-    run_aux(state, params, nominal, blind, &mut report);
+    run_aux(state, params, nominal, blind, engaged, &mut report);
 
     // The sample: published every cycle without exception, because it is the
     // clock the control loop runs on and a missing one is a cycle the loop
@@ -503,6 +527,43 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
         // none: an outage a scenario cannot end is one it cannot show a machine
         // surviving.
         SimOp::AbsentServo => state.absent = mask,
+        // A response delay the rings can hold, or an injection refused whole:
+        // a run whose premise is a servo nineteen cycles behind says nothing
+        // about anything if the plant quietly gave it eight.
+        SimOp::SetLag => {
+            if sim_lag::representable(cmd.count) {
+                // Each row *entering* the set has its whole ring filled with the
+                // angle it is holding now, so a delay reaching back further than
+                // the lag has existed chases that rather than the angle an
+                // unwritten cell holds -- which on this machine is a real angle,
+                // and a plant that slewed to it would be moving on nobody's
+                // command. The target for a row that has one, and where the row
+                // stands for a row that does not: a row nothing has commanded is
+                // holding its position, and that is the only angle it can be
+                // said to have been given.
+                //
+                // A row already lagged keeps its ring. Refilling it would hand a
+                // row mid-move the target it holds now at every depth, so the
+                // delayed target it is chasing would jump a whole lag's distance
+                // forward for one cycle -- a step no scenario asked for, in the
+                // one place a scenario is watching how far a row stands behind
+                // its goal. The ring is what survives, not the depth: the depth
+                // below is one number for the whole set, so naming a moving row
+                // at a different one reads its kept history at the new offset
+                // and steps that row's target by the difference on the next
+                // cycle.
+                let held = holding(state);
+                for joint in flags::iter(flags::without(mask, state.lagged)) {
+                    if let Some(index) = row(joint) {
+                        sim_lag::seed(&mut state.target_history, index, held[index]);
+                    }
+                }
+                state.lagged = mask;
+                state.lag_cycles = cmd.count;
+            } else {
+                state.refused_injections += 1;
+            }
+        }
         SimOp::SetRegister => {
             for joint in flags::iter(mask) {
                 let Some(index) = row(joint) else {
@@ -593,6 +654,127 @@ fn read_registers(state: &mut SimState) {
     state.refused_readings += u64::from(refused);
 }
 
+/// The rows this cycle's grouped position read answered: every row on the bus.
+///
+/// A servo the scenario has taken off the bus answers no read, which is what
+/// the real driver's grouped read finds too -- and an engagement may only pin a
+/// row this cycle read, so the two drivers decline the same engagements.
+fn answering_rows(state: &SimState) -> JointFlags {
+    let mut answered = JointFlags::NONE;
+    for joint in flags::iter(flags::all()) {
+        let on_bus = row(joint).is_some_and(|index| !sim_aux::is_absent(state, index));
+        if on_bus {
+            answered |= flags::bit(joint);
+        }
+    }
+    answered
+}
+
+/// Take hold of the machine, where an engagement is asked for and this cycle's
+/// bus answered the rows it names.
+///
+/// The plant's side of the real driver's engage cycle: the goal registers
+/// pinned where the modelled servos actually stand, torque on over the same
+/// rows, and the enable read back. Run before the proprioception refresh, so
+/// the cells the rest of the cycle reads -- the sample's own, and the
+/// confirmation pass's -- answer about the machine as this cycle left it.
+///
+/// A cycle whose bus answers nothing answers no row, so nothing is written and
+/// the request waits: the pin is the reading this cycle took, and there is no
+/// older one to take hold of a machine on. A servo off the bus answers nothing
+/// either, so an engagement naming one waits out its window and is declined
+/// with nothing written -- which is what the real driver does with it, the
+/// grouped position read being the same read there.
+///
+/// The unconfirmed ending is a row that answers the position read and then does
+/// not read its enable back. Nothing injects that here: the plant energises
+/// what it pins, and a servo that answers reads while refusing its own enable
+/// is not a machine this simulator models.
+///
+/// No out-of-band transaction runs behind an engagement, which is the real
+/// driver's own budget: three grouped exchanges leave no room for a fourth.
+/// Here that is not a budget but the same shape kept, so a scenario's evidence
+/// about what a cycle did carries. Answers whether this cycle wrote one.
+fn run_engage(state: &mut SimState, nominal: i64, blind: bool, report: &mut Report) -> bool {
+    let answered = if blind {
+        JointFlags::NONE
+    } else {
+        answering_rows(state)
+    };
+    let believed = AuxSlot::over(&mut state.aux).belief().rows();
+    let step = EngageRequest::over(&mut state.engage).step(answered, believed);
+    // The two endings that write nothing are answered by the decision itself,
+    // so this driver and the real one say the same thing about the same step.
+    if let Some((kind, rows)) = step.answer() {
+        report.raise(
+            &mut state.events_dropped,
+            Event {
+                kind,
+                rows,
+                ..Event::at(nominal)
+            },
+        );
+        return false;
+    }
+    let EngageStep::Run { rows } = step else {
+        return false;
+    };
+
+    let mut confirmed = JointFlags::NONE;
+    let mut unconfirmed = JointFlags::NONE;
+    for joint in flags::iter(rows) {
+        let Some(index) = row(joint) else {
+            continue;
+        };
+        // Unreachable by way of the answered mask above, and kept because a
+        // row off the bus must never be pinned or believed whatever route
+        // reached this loop.
+        if sim_aux::is_absent(state, index) {
+            unconfirmed |= flags::bit(joint);
+            continue;
+        }
+        // The pin: the goal register at the angle the plant is at, which is
+        // what makes a servo that comes up hold where it stands.
+        if let Some(angle) = angle_of(&state.positions, joint) {
+            set_angle(&mut state.targets, joint, angle);
+        }
+        confirmed |= flags::bit(joint);
+    }
+    state.torqued |= confirmed;
+    state.has_target |= confirmed;
+    believe(state, confirmed, true);
+    // Arming grants a fresh hold-timeout window and ends a standing latch, and a
+    // fresh arming ends whatever confirmation pass was reading the old
+    // de-torquing back: the machine is being energised deliberately. The plant's
+    // own belief is written above; what the driver crate credits is the belief
+    // the dead-man runs over, and the latch and the pass with it.
+    credit_engagement(
+        &mut state.aux,
+        &mut state.gate,
+        &mut state.confirm,
+        confirmed,
+        nominal,
+    );
+    let (kind, named) = engage_verdict(rows, unconfirmed);
+    // A row that did not confirm leaves this driver holding a torque it cannot
+    // vouch for, so it lets go on its own authority -- after the credit, so the
+    // latch stands over whatever the confirmed rows released. Unreachable here
+    // for the reason the unconfirmed ending is, and written because whatever
+    // route reaches it, the two drivers must do the same thing about it.
+    if kind == EventKind::EngageUnconfirmed {
+        fail_engagement(&mut state.aux, &mut state.gate, &mut state.confirm, nominal);
+    }
+    report.raise(
+        &mut state.events_dropped,
+        Event {
+            kind,
+            rows: named,
+            ..Event::at(nominal)
+        },
+    );
+    true
+}
+
 /// Spend this cycle's one out-of-band transaction.
 ///
 /// Three things want it and [`reachy_driver::AuxSlot`] is what picks, in the
@@ -619,6 +801,7 @@ fn run_aux(
     params: &SimParams,
     nominal: i64,
     blind: bool,
+    engaged: bool,
     report: &mut Report,
 ) {
     let step =
@@ -654,8 +837,16 @@ fn run_aux(
         }
     }
 
-    let task =
-        AuxSlot::over(&mut state.aux).take(nominal, params.health_poll_period_ns, step.read_row);
+    let task = if engaged {
+        // Nothing out of band behind an engagement, which is the real driver's
+        // budget: three grouped exchanges leave no room for a fourth. The
+        // confirmation pass keeps its place either way -- an engagement that
+        // confirmed anything stood it down, and one that did not left it
+        // reading.
+        AuxTask::Nothing
+    } else {
+        AuxSlot::over(&mut state.aux).take(nominal, params.health_poll_period_ns, step.read_row)
+    };
     match task {
         AuxTask::Nothing => {}
         // The whole bus is silent, so the transaction is dropped exactly as a
@@ -789,6 +980,70 @@ fn elapsed_cycles(elapsed_ns: i64, period_ns: i64) -> i64 {
     (elapsed_ns / period_ns).clamp(1, MAX_CATCHUP_CYCLES)
 }
 
+/// Write this execution's targets into the rings, one cell per cycle of plant
+/// motion.
+///
+/// Every cycle, whether or not a goal arrived: a row asked for nothing new is a
+/// row still being asked for the same thing, and a ring that only moved when a
+/// setpoint did would measure a delay in goals rather than in cycles. An
+/// execution that covered several cycles writes the same target into each of
+/// them, which is a plant that was asked for nothing while the process was away.
+///
+/// Only while some row is lagged: a ring nothing reads back through is 288 cells
+/// written per cycle for nobody. The lag's own injection fills the rings it is
+/// about, so the history a delay reads begins where the delay does.
+fn keep_history(state: &mut SimState, cycles: i64) {
+    if flags::is_empty(state.lagged) {
+        return;
+    }
+    let targets = holding(state);
+    let mut cursor = state.history_cursor;
+    for _ in 0..cycles.min(sim_lag::LAG_DEPTH as i64) {
+        cursor = sim_lag::push(&mut state.target_history, cursor, &targets);
+    }
+    state.history_cursor = cursor;
+}
+
+/// What each row is holding, radians: the target it has been given, or -- for a
+/// row nothing has commanded yet -- where it stands.
+///
+/// The distinction matters only to the rings. A row with no target carries the
+/// schema's zero in `targets`, which on this machine is a real angle, so a ring
+/// filled from it would hand a lagged row a goal nobody ever gave: a row nothing
+/// has asked anything of is holding its position, and that is the only angle it
+/// can be said to be chasing.
+fn holding(state: &SimState) -> [f64; ROW_COUNT] {
+    let mut held = rows_of(&state.targets);
+    let standing = rows_of(&state.positions);
+    for joint in flags::iter(flags::without(flags::all(), state.has_target)) {
+        if let Some(index) = row(joint) {
+            held[index] = standing[index];
+        }
+    }
+    held
+}
+
+/// What `joint` is closing on this cycle, radians.
+///
+/// The target it holds now, or -- for a row the scenario gave a response delay
+/// -- the one it was given that many cycles ago. A delay the rings cannot reach
+/// back to is a delay nothing set: `set_lag` refused it, so there is no case in
+/// which this silently shortens one.
+fn chasing(state: &SimState, joint: JointRef) -> Option<f64> {
+    if flags::contains(state.lagged, joint)
+        && let Some(row) = row(joint)
+        && let Some(angle) = sim_lag::delayed(
+            &state.target_history,
+            state.history_cursor,
+            row,
+            state.lag_cycles,
+        )
+    {
+        return Some(angle);
+    }
+    angle_of(&state.targets, joint)
+}
+
 /// Move the modelled servos toward what they are being asked for.
 ///
 /// A jammed servo holds where it stands whatever it is asked for -- that is
@@ -804,10 +1059,9 @@ fn advance(params: &SimParams, state: &mut SimState, cycles: i64) {
         let Some(group) = group_of(joint) else {
             continue;
         };
-        let (Some(target), Some(position)) = (
-            angle_of(&state.targets, joint),
-            angle_of(&state.positions, joint),
-        ) else {
+        let (Some(target), Some(position)) =
+            (chasing(state, joint), angle_of(&state.positions, joint))
+        else {
             continue;
         };
         let step = slew(params, group) * cycles as f64;

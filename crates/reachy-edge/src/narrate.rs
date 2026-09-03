@@ -38,6 +38,7 @@ use clockwork_rs::SyncTime;
 use serde_json::{Value, json};
 
 use brenn_reachy__cogs__session_clk_rs::{SessionPhase, SessionPhaseWire};
+use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
 use brenn_reachy__motion__reports_clk_rs::{
     RefusalReason, RefusalReasonWire, ReportKind, ReportKindWire,
 };
@@ -257,6 +258,7 @@ pub const fn row_word(kind: ReportKind) -> &'static str {
         ReportKind::DegradeReleased => "degrade_released",
         ReportKind::CommissionFailed => "commission_failed",
         ReportKind::ScriptReplaced => "script_replaced",
+        ReportKind::ScriptHeld => "script_held",
     }
 }
 
@@ -314,7 +316,10 @@ pub fn row_says(row: &TimelineEntryWire) -> String {
         }
         ReportKind::SchedulePublished => format!("schedule epoch {a} published: {b} step(s)"),
         ReportKind::DegradeReleased => {
-            format!("a group de-torque for response {a} released {b} row(s)")
+            format!(
+                "a group de-torque for response {a} released {}",
+                joint_rows(b)
+            )
         }
         ReportKind::CommissionFailed => format!(
             "the survey refused the machine: failure kind {a} at servo {b}, headline {detail}"
@@ -322,7 +327,66 @@ pub fn row_says(row: &TimelineEntryWire) -> String {
         ReportKind::ScriptReplaced => format!(
             "script {a} replaced the running schedule under epoch {b}, asking for {detail} step(s)"
         ),
+        ReportKind::ScriptHeld => format!(
+            "script {a} held in phase {}, for the phase this maneuver ends in",
+            phase_name(b)
+        ),
     }
+}
+
+/// The nine bus rows and the joint vocabulary's word for each, in bus order.
+///
+/// The words are the vocabulary's own, written out rather than derived, for the
+/// same reason [`row_word`]'s are: a reader joining this stream against a
+/// recorded log matches on the spelling, and a spelling that follows a Rust
+/// identifier drifts with a rename.
+///
+/// A second rendering of a joint set, and knowingly: `reachy_motion::joints::
+/// flags::Names` spells the same set in prose ("right antenna") for the reports
+/// the control process writes, and this edge links the vocabulary modules and
+/// no Rust crate of this project's, which is what keeps an alert stream
+/// buildable from the wire alone. So the two spellings differ on purpose --
+/// this one is the recorded word, that one is the sentence -- and neither is
+/// derived from the other.
+const ROW_NAMES: [(JointFlags, &str); 9] = [
+    (JointFlags::BODY_YAW, "body_yaw"),
+    (JointFlags::LEG_0, "leg_0"),
+    (JointFlags::LEG_1, "leg_1"),
+    (JointFlags::LEG_2, "leg_2"),
+    (JointFlags::LEG_3, "leg_3"),
+    (JointFlags::LEG_4, "leg_4"),
+    (JointFlags::LEG_5, "leg_5"),
+    (JointFlags::ANTENNA_RIGHT, "antenna_right"),
+    (JointFlags::ANTENNA_LEFT, "antenna_left"),
+];
+
+/// A bus row the machine grows is a compile error here rather than a row this
+/// stream renders as nothing. The declared values carry the empty set as well
+/// as the nine rows.
+const _: () = assert!(ROW_NAMES.len() + 1 == JointFlags::VARIANTS.len());
+
+/// A set of bus rows by the joints in it, or by number where the set holds a
+/// bit this build does not name.
+///
+/// A number is what a reader joins on, and it is right there in the row's own
+/// `b`; what a person holding the robot needs is which servos went limp.
+fn joint_rows(rows: u32) -> String {
+    let Some(set) = u16::try_from(rows)
+        .ok()
+        .map(JointFlagsWire)
+        .and_then(JointFlagsWire::to_known)
+    else {
+        return format!("servo set {rows:#x}, which this build does not name");
+    };
+    let named: Vec<&str> = ROW_NAMES
+        .iter()
+        .filter(|(row, _)| set.contains(*row))
+        .map(|(_, word)| *word)
+        .collect();
+    if named.is_empty() {
+        return "no rows at all".to_owned();
+    }
+    named.join(", ")
 }
 
 /// A phase by its own word, or by number where this build has none for it.
@@ -356,6 +420,9 @@ pub(crate) fn refusal_reason(reason: u32) -> String {
         Some(RefusalReason::Undecodable) => "a datagram that is not a script".to_owned(),
         Some(RefusalReason::Stale) => "a number no higher than the running engagement's".to_owned(),
         Some(RefusalReason::TooLong) => "a schedule reaching past the session's horizon".to_owned(),
+        Some(RefusalReason::FaultEnding) => {
+            "the machine was being stood down by a fault".to_owned()
+        }
         None => format!("reason {reason}, which this build does not name"),
     }
 }
@@ -366,6 +433,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+    use brenn_reachy__motion__joints_clk_rs::JointFlagsWire;
     use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
@@ -484,6 +552,82 @@ mod tests {
         assert_eq!(
             value["says"],
             "script 7 refused: a number no higher than the running engagement's"
+        );
+    }
+
+    /// A hold names itself and names the phase in words.
+    ///
+    /// Both halves are read by something outside this process: the word is what
+    /// a run's own assertions look for in the stream, and the phase is a number
+    /// on the wire that means nothing to a reader who does not hold this
+    /// vocabulary. A row rendering `b` as the number it is would be a hold
+    /// nobody can place.
+    #[test]
+    fn a_hold_names_the_phase_it_found_in_words() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::SCRIPT_HELD,
+            11,
+            u32::from(SessionPhaseWire::STOPPING.0),
+            0.0,
+        )));
+        assert_eq!(value["kind"], "script_held");
+        assert_eq!(
+            value["says"],
+            "script 11 held in phase stopping, for the phase this maneuver ends in"
+        );
+    }
+
+    /// The reason a fault's ending refuses says what the machine was doing,
+    /// which is the whole of what tells a reader to ask again later.
+    #[test]
+    fn a_refusal_by_a_faults_ending_says_what_stood_the_machine_down() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::SCRIPT_REFUSED,
+            9,
+            u32::from(RefusalReasonWire::FAULT_ENDING.0),
+            0.0,
+        )));
+        assert_eq!(
+            value["says"],
+            "script 9 refused: the machine was being stood down by a fault"
+        );
+    }
+
+    /// The row a released antenna pair produces. The number stays in `b`,
+    /// where a reader joins on it; the sentence says which servos went limp.
+    #[test]
+    fn a_released_set_says_which_joints_it_let_go() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::DEGRADE_RELEASED,
+            3,
+            u32::from((JointFlagsWire::ANTENNA_RIGHT | JointFlagsWire::ANTENNA_LEFT).0),
+            0.0,
+        )));
+        assert_eq!(value["kind"], "degrade_released");
+        assert_eq!(value["b"], 384);
+        assert_eq!(
+            value["says"],
+            "a group de-torque for response 3 released antenna_right, antenna_left"
+        );
+    }
+
+    /// A set holding a bit this build has no row for. The number is what the
+    /// two builds have in common, so the sentence carries it rather than
+    /// naming the rows it did recognise and quietly dropping the rest.
+    #[test]
+    fn a_released_set_this_build_cannot_place_says_so() {
+        let value = parsed(&timeline_line(&row(
+            ReportKindWire::DEGRADE_RELEASED,
+            3,
+            1024,
+            0.0,
+        )));
+        assert!(
+            value["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("does not name"),
+            "{value}"
         );
     }
 

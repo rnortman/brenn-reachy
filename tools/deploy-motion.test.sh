@@ -381,6 +381,34 @@ assert_contains "the refusal names that member" "$(output_of "$result")" \
 assert_lacks "and pushes nothing" "$(calls)" "rsync"
 rm -f -- "$speech_source" "${payload}/host/speech.toml"
 
+# The unit's own parameters. The build stages the operator's file from outside
+# the tree, and the value in it decides which pod this head answers to: pushed
+# from a payload staged before the edit, the head answers to the previous name
+# and every script addressed to it is dropped as a foreign pod's.
+host_params_source="${repo}/.local/host_params.textproto"
+mkdir -p -- "$(dirname -- "$host_params_source")" "${payload}/host"
+printf 'pod: "unit-reachy"\n' >"$host_params_source"
+touch -d "@${after}" -- "$host_params_source"
+: >"${payload}/host/host_params.textproto"
+touch -d "@$((after + 60))" -- "${payload}/host/host_params.textproto"
+result=$(deploy unit --push)
+assert_status "a staged copy newer than the operator's parameters pushes" 0 \
+	"$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "$host_params_source"
+result=$(deploy unit --push)
+assert_status "host parameters edited since the build refuse" 1 "$(status_of "$result")"
+assert_contains "the refusal names that member" "$(output_of "$result")" \
+	"host configuration"
+assert_contains "and names the file it would ship the old copy of" \
+	"$(output_of "$result")" "$host_params_source"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok covers the operator's parameters too" 0 \
+	"$(status_of "$result")"
+rm -f -- "$host_params_source" "${payload}/host/host_params.textproto"
+
 # The credential files that configuration names — the pod's key table, the bus
 # token. They are the flavour of this an operator would otherwise chase on the
 # unit: a re-provisioned key table or a freshly issued token is a file no commit

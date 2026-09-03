@@ -36,6 +36,12 @@ fn main() -> ExitCode {
         // all: everything below is the system's answer to this message.
         check::scripts_sent(run, &[(SCRIPT_ID, script_sent_cycle())], failures);
         let engaged = check::engagement(run, failures);
+        // What taking hold of the machine cost: nothing on the bus, because the
+        // rotation has lapped every row long before a script may be taken here,
+        // and two driver cycles between the ask and the phase.
+        if let Some(engaged) = engaged {
+            check::engagement_cost(run, engaged.accepted, engaged.taken, failures);
+        }
         check::ended_promptly(
             engaged.map(|engaged| engaged.released),
             disengage_cycle(),

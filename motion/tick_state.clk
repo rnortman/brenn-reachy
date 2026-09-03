@@ -129,18 +129,34 @@ schema TrackingStreakSnap
     uuid: f2d6d29a-87a7-44bf-933a-af86736b3f80;
     fields
     {
-        // Whether a run is open at all. Every field below means nothing when
-        // this is false.
+        // Whether a run is open at all. `count` and `crossed` mean nothing when
+        // this is false; `anchor` and `side` keep meaning, because a closed run
+        // is what the next one is judged against.
         #0 active: Bool;
 
-        // Where the joint was when this run last restarted, radians.
+        // Where the joint was when this run last restarted, radians. On a
+        // closed run, where it stood on the last tick its error was inside the
+        // tracking threshold -- its last healthy sample.
         #1 anchor: Float64;
 
-        // Which side of `anchor` the goal lay on then.
+        // Which side of `anchor` the goal lay on when a run last restarted.
+        // Written only while a run is open, and a close leaves it alone, so a
+        // closed run still says which way the joint was being asked to go --
+        // but a move the joint followed inside the threshold opens no run and
+        // writes nothing here, leaving the side of the move before it.
         #2 side: TrackingSideKind;
 
-        // Live ticks since, this one included.
+        // Live ticks since, this one included. Zero on a closed run.
         #3 count: UInt32;
+
+        // Whether the goal turned round under this run rather than the joint
+        // having gone quiet: the goal stepped over an open run's anchor in one
+        // period, or this run opened on the far side of the side a closed run
+        // retained, under a joint that had carried the old direction. A joint
+        // whose goal turned round under it is still carrying that direction, so
+        // a crossed run measures progress from the far end of the coast and
+        // counts against the longer of the two windows.
+        #4 crossed: Bool;
     }
 }
 

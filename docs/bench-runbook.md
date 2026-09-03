@@ -14,6 +14,7 @@ rules: `docs/fault-management.md`.
 
       REACHY_HOST ?= reachy00
       REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
+      REACHY_HOST_PARAMS ?= /elsewhere/reachy00/host_params.textproto
 
   Only make reads the file — it is not shell syntax, so for the `ssh` lines
   below `export REACHY_HOST=reachy00` in your shell as well.

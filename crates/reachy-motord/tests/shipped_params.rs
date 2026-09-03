@@ -56,7 +56,10 @@ fn the_shipped_configuration_is_the_one_the_driver_runs() {
         shipped.hold_timeout_ns, 200_000_000,
         "the dead-man the simulated driver runs, so a scenario's evidence about it carries"
     );
-    assert_eq!(shipped.health_poll_period_ns, 500_000_000);
+    assert_eq!(
+        shipped.health_poll_period_ns, 120_000_000,
+        "the spacing the simulated driver runs, so a lap of the nine is about a second"
+    );
     assert_eq!(
         shipped.bus_device.as_str(),
         "/dev/ttyAMA3",

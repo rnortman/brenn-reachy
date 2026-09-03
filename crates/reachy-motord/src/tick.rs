@@ -44,7 +44,10 @@
 //! socket.
 
 use brenn_reachy__cogs__session_cmd_clk_rs::{SessionCmd, SessionCmdKind};
-use brenn_reachy__driver__aux_clk_rs::{AuxSlotState, AuxSlotStateWire, TorqueConfirmStateWire};
+use brenn_reachy__driver__aux_clk_rs::{
+    AuxSlotState, AuxSlotStateWire, EngageRequestStateWire, TorqueConfirmState,
+    TorqueConfirmStateWire,
+};
 use brenn_reachy__driver__gate_clk_rs::{GateState, GateStateWire};
 use brenn_reachy__driver__goal_clk_rs::GoalSetpoint;
 use brenn_reachy__driver__health_clk_rs::{
@@ -59,8 +62,9 @@ use dxl_proto::regs::{GOAL_POSITION, PRESENT_POSITION, TORQUE_ENABLE};
 use reachy_bus::{Bus, BusPort, BusTiming, IdOutcome, RawValue, ServoMap, SyncReadOutcome};
 use reachy_driver::report::{self, Event};
 use reachy_driver::{
-    AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, GateAction, GoalGate,
-    TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm,
+    AcceptOutcome, AuxOffer, AuxSlot, AuxTask, ConfirmReport, EngageRequest, EngageStep,
+    GateAction, GoalGate, TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm, credit_engagement,
+    engage_verdict, fail_engagement,
 };
 
 use crate::aux::{self, Answer, CycleBounds, Request};
@@ -80,6 +84,7 @@ pub struct DriverState {
     gate: GateStateWire,
     aux: AuxSlotStateWire,
     confirm: TorqueConfirmStateWire,
+    engage: EngageRequestStateWire,
 }
 
 impl Default for DriverState {
@@ -96,10 +101,12 @@ impl DriverState {
             gate: GateStateWire::new(),
             aux: AuxSlotStateWire::new(),
             confirm: TorqueConfirmStateWire::new(),
+            engage: EngageRequestStateWire::new(),
         };
         state.gate.clear_valid();
         state.aux.clear_valid();
         state.confirm.clear_valid();
+        state.engage.clear_valid();
         state
     }
 
@@ -132,6 +139,36 @@ impl DriverState {
         (gate, aux)
     }
 
+    /// The gate, the aux slot and the confirmation pass together, which is what
+    /// crediting an engagement writes: the belief, the latch and the pass move
+    /// as one act, so the decision that moves them is handed all three at once
+    /// rather than reaching for them in turn.
+    ///
+    /// Each is cleared rather than raised on bytes that do not read as its
+    /// state, for the reason [`Self::decide`] states.
+    fn crediting(&mut self) -> (&mut GateState, &mut AuxSlotState, &mut TorqueConfirmState) {
+        if self.gate.validate_mut().is_err() {
+            self.gate.clear_valid();
+        }
+        if self.aux.validate_mut().is_err() {
+            self.aux.clear_valid();
+        }
+        if self.confirm.validate_mut().is_err() {
+            self.confirm.clear_valid();
+        }
+        (
+            self.gate
+                .validate_mut()
+                .expect("a cleared gate reads as one"),
+            self.aux
+                .validate_mut()
+                .expect("a cleared slot reads as one"),
+            self.confirm
+                .validate_mut()
+                .expect("a cleared pass reads as one"),
+        )
+    }
+
     /// The confirmation pass, cleared first if its bytes do not read as one.
     fn confirming(&mut self) -> TorqueOffConfirm<'_> {
         if self.confirm.validate_mut().is_err() {
@@ -143,6 +180,39 @@ impl DriverState {
                 .expect("a cleared pass reads as one"),
         )
     }
+
+    /// The engagement asked for, cleared first if its bytes do not read as one.
+    ///
+    /// A cleared request asks for nothing, which is the reading that claims
+    /// least: a driver that cannot read its own request takes hold of no row,
+    /// and the host re-issues.
+    fn engaging(&mut self) -> EngageRequest<'_> {
+        if self.engage.validate_mut().is_err() {
+            self.engage.clear_valid();
+        }
+        EngageRequest::over(
+            self.engage
+                .validate_mut()
+                .expect("a cleared request reads as one"),
+        )
+    }
+}
+
+/// One grouped goal write, packed and ready for the wire.
+///
+/// The entries and the ids are parallel and `packed` long: a caller writing
+/// another register over the same servos -- an engagement enabling exactly what
+/// it pinned -- addresses them off `ids` rather than walking the rows again.
+struct GoalFrame {
+    /// The servo ids and their goal values, in bus order.
+    entries: [(u8, RawValue); ROW_COUNT],
+    /// The same ids, for a caller that needs them on their own.
+    ids: [u8; ROW_COUNT],
+    /// How many of each are real.
+    packed: usize,
+    /// The rows whose angle no servo count represents, which nothing was
+    /// packed for.
+    left_out: JointFlags,
 }
 
 /// The numbers a cycle runs on, as configuration read at startup.
@@ -189,7 +259,7 @@ pub fn cycle_timing(baud: u32) -> BusTiming {
 /// what the publish will take is not knowable then. Written as the fraction it
 /// is, so a machine built to run a different grid keeps a margin that is still a
 /// tenth of it.
-const CYCLE_MARGIN_NS: i64 = reachy_driver::NOMINAL_CYCLE_NS / 10;
+pub(crate) const CYCLE_MARGIN_NS: i64 = reachy_driver::NOMINAL_CYCLE_NS / 10;
 
 /// What the driver has counted, as plain numbers since the process started.
 ///
@@ -486,7 +556,10 @@ impl<P: BusPort> Tick<P> {
     /// A verbatim re-issue of the pending request is neither: the driver is
     /// already acting on exactly what it asks for, which is a host that is
     /// there and a transport that repeated itself. It counts as liveness and
-    /// draws no answer of its own.
+    /// draws no answer of its own. An engagement re-issued over the same rows
+    /// is the same thing and is liveness for the same reason, which is what
+    /// keeps the dead-man from firing under a host still waiting for its
+    /// answer.
     pub fn offer_session_cmd(&mut self, cmd: &SessionCmd, nominal_ns: i64) {
         let accepted = match cmd.kind {
             SessionCmdKind::None => false,
@@ -517,6 +590,16 @@ impl<P: BusPort> Tick<P> {
                 }
                 offered != AuxOffer::RefusedBusy
             }
+            // An engagement naming no row asks for nothing at all and is
+            // refused, the way a datagram of no kind is: there is no row to
+            // take hold of, so nothing is written, nothing is answered, and a
+            // host that sent one is left waiting out its own deadline unless
+            // the driver counts it. A re-issue over rows already asked for is
+            // not this case -- it names rows and it is liveness.
+            SessionCmdKind::EngageNow => {
+                self.request_engage(cmd.rows);
+                cmd.rows != JointFlags::NONE
+            }
         };
         if accepted {
             let (gate, _) = self.state.decide();
@@ -539,12 +622,35 @@ impl<P: BusPort> Tick<P> {
     /// written out of the queue after the latch would command a machine this
     /// call exists to let go of.
     pub fn request_torque_off(&mut self, nominal_ns: i64) {
-        {
-            let (gate, aux) = self.state.decide();
-            GoalGate::over(gate).latch_torque_off();
-            AuxSlot::over(aux).abandon();
-        }
-        self.state.confirming().begin(nominal_ns);
+        self.let_go(nominal_ns);
+        self.state.engaging().abandon();
+    }
+
+    /// Latch torque off, abandon the slot and open the confirmation pass.
+    ///
+    /// `reachy-driver`'s, over this process's own state: what a de-torquing
+    /// changes about the machine the dead-man runs over is one decision,
+    /// hosted where the simulated driver reaches the same one. A commanded
+    /// release is this plus the engagement it outranks; an engagement that did
+    /// not confirm is this on the driver's own authority.
+    fn let_go(&mut self, nominal_ns: i64) {
+        let (gate, aux, confirm) = self.state.crediting();
+        fail_engagement(aux, gate, confirm, nominal_ns);
+    }
+
+    /// Take hold of `rows` on the first cycle whose grouped read answers all of
+    /// them.
+    ///
+    /// Idempotent over the same rows, and the window a standing request is
+    /// already waiting in keeps running: a host re-issuing every wake is a host
+    /// that has not heard its answer, not a host asking again.
+    ///
+    /// Nothing is written here. What an engagement writes is written inside a
+    /// cycle, at the reading that cycle took, because the goal registers are
+    /// pinned at where the machine actually is and a pin from an older reading
+    /// would command a limp machine back to where it used to be.
+    pub fn request_engage(&mut self, rows: JointFlags) {
+        self.state.engaging().offer(rows);
     }
 
     /// Run one cycle at grid instant `nominal_ns`, and answer what to publish.
@@ -560,11 +666,12 @@ impl<P: BusPort> Tick<P> {
         // measured for free on every sample.
         let sample_time_ns = now_ns();
         let swept = self.write_from_gate(nominal_ns);
+        let engaged = self.run_engage(nominal_ns, &read);
         // Blind is a cycle the machine said nothing on, and the read is the
         // whole of the evidence: a grouped write is acknowledged by nothing at
         // all, so a write that went out says nothing about anyone listening.
         self.count_blind(nominal_ns, flags::is_empty(read.answered));
-        let health = self.run_aux(nominal_ns, sample_time_ns, swept);
+        let health = self.run_aux(nominal_ns, sample_time_ns, swept, engaged);
 
         let mut sample = PoseSampleWire::new();
         self.write_sample(sample.clear_valid(), &read, nominal_ns, sample_time_ns);
@@ -617,6 +724,7 @@ impl<P: BusPort> Tick<P> {
         nominal_ns: i64,
         sample_time_ns: i64,
         swept: bool,
+        engaged: bool,
     ) -> Option<HealthReportWire> {
         let step = self
             .state
@@ -671,7 +779,7 @@ impl<P: BusPort> Tick<P> {
         // absorbing state, with the machine unable to be armed again for the
         // life of the process. The cost is a grid point, which the loop already
         // counts and publishes rather than making up for.
-        let task = if self.aux_fits(swept) || (swept && pending) {
+        let task = if self.aux_fits(swept, engaged) || (swept && pending) {
             let (_, slot) = self.state.decide();
             AuxSlot::over(slot).take(nominal_ns, health_period_ns, step.read_row)
         } else if let Some(row) = step.read_row {
@@ -808,17 +916,26 @@ impl<P: BusPort> Tick<P> {
     /// and the question is whether that sum is inside the period.
     ///
     /// Which write depends on what was written: a grouped goal write is one
-    /// unacknowledged frame, while a torque-off sweep is a verified write per
-    /// row and overruns the period on its own. That is the sweep's business and
+    /// unacknowledged frame, an engagement is a pin, an enable and a read-back
+    /// over the rows it takes hold of, while a torque-off sweep is a verified
+    /// write per row and overruns the period on its own. That is the sweep's business and
     /// not something to trade against — nothing gates de-torquing — so a swept
     /// cycle has no room left for surveillance. Its caller exempts one thing
     /// from that: a host request already pending, which is the only way a latch
     /// can end.
-    fn aux_fits(&self, swept: bool) -> bool {
+    fn aux_fits(&self, swept: bool, engaged: bool) -> bool {
         let write_ns = if swept {
             self.bounds.sweep_ns
         } else {
             self.bounds.write_ns
+        };
+        // An engagement is three exchanges of its own and leaves no room for a
+        // fourth: charged on top of whatever the gate wrote, so a cycle that
+        // both swept and engaged is charged for both.
+        let write_ns = if engaged {
+            write_ns.saturating_add(self.bounds.engage_ns)
+        } else {
+            write_ns
         };
         let needed = self
             .bounds
@@ -987,53 +1104,254 @@ impl<P: BusPort> Tick<P> {
         false
     }
 
+    /// Pack the grouped goal write for `rows` at `targets`.
+    ///
+    /// The only place in this process that turns an angle into servo targets:
+    /// a setpoint's rows and an engagement's pin are the same write over the
+    /// same conversion, and a machine that refused one of them and rounded the
+    /// other would have two answers to the one question.
+    ///
+    /// An angle no servo count represents is refused rather than rounded to the
+    /// nearest one a servo has: the envelope check runs above this process, and
+    /// a driver quietly commanding the closest reachable angle instead would be
+    /// the clamp this stack does not have. Such a row is counted as a write
+    /// failure and named among the rows this could not build, which is what
+    /// lets a caller leave it out of whatever else it was going to write.
+    ///
+    /// Answers the entries and the ids they go to, in the same order, how many
+    /// of each were packed, and the rows it could not build.
+    fn goal_frame(&mut self, rows: JointFlags, targets: &[f64; ROW_COUNT]) -> GoalFrame {
+        let blank = RawValue::new(&0i32.to_le_bytes()).expect("four bytes carry a goal");
+        let mut frame = GoalFrame {
+            entries: [(0u8, blank); ROW_COUNT],
+            ids: [0u8; ROW_COUNT],
+            packed: 0,
+            left_out: JointFlags::NONE,
+        };
+        for joint in flags::iter(rows) {
+            let Some(index) = row(joint) else {
+                continue;
+            };
+            let (Some(id), Ok(counts)) = (
+                self.map.id_at(index),
+                self.map.goal_counts(index, targets[index]),
+            ) else {
+                self.counts.write_failures += 1;
+                frame.left_out |= flags::bit(joint);
+                continue;
+            };
+            let Some(value) = RawValue::new(&counts.to_le_bytes()) else {
+                self.counts.write_failures += 1;
+                frame.left_out |= flags::bit(joint);
+                continue;
+            };
+            frame.entries[frame.packed] = (id, value);
+            frame.ids[frame.packed] = id;
+            frame.packed += 1;
+        }
+        frame
+    }
+
     /// Write the held setpoint's rows in one grouped write.
     ///
     /// The mask is the setpoint's own and it is write-side filtering and nothing
     /// else: a setpoint applies to the servos it names and leaves every other
     /// one holding the angle it already had. That is the whole meaning of a
-    /// partial mask, stated here because this is the only place in this process
-    /// that turns a commanded setpoint into servo targets.
+    /// partial mask, stated here because this is where a partial mask is spent;
+    /// what the rows become on the wire is [`Self::goal_frame`]'s.
     fn write_held(&mut self) {
         let (mask, targets) = {
             let (gate, _) = self.state.decide();
             (gate.held.mask, rows_of(&gate.held.targets))
         };
-        let blank = RawValue::new(&0i32.to_le_bytes()).expect("four bytes carry a goal");
-        let mut entries = [(0u8, blank); ROW_COUNT];
-        let mut written = 0;
-        for joint in flags::iter(mask) {
-            let Some(index) = row(joint) else {
-                continue;
-            };
-            let angle = targets[index];
-            let (Some(id), Ok(counts)) =
-                (self.map.id_at(index), self.map.goal_counts(index, angle))
-            else {
-                // An angle no servo count represents. Refused rather than
-                // rounded to the nearest one a servo has: the envelope check
-                // runs above this process, and a driver quietly commanding the
-                // closest reachable angle instead would be the clamp this stack
-                // does not have.
-                self.counts.write_failures += 1;
-                continue;
-            };
-            let Some(value) = RawValue::new(&counts.to_le_bytes()) else {
-                continue;
-            };
-            entries[written] = (id, value);
-            written += 1;
-        }
-        if written == 0 {
+        let frame = self.goal_frame(mask, &targets);
+        if frame.packed == 0 {
             return;
         }
         if self
             .bus
-            .sync_write(GOAL_POSITION, &entries[..written])
+            .sync_write(GOAL_POSITION, &frame.entries[..frame.packed])
             .is_err()
         {
             self.counts.write_failures += 1;
         }
+    }
+
+    /// Take hold of the machine, where an engagement is asked for and this
+    /// cycle's read answered every row it names. Answers whether it wrote.
+    ///
+    /// Three grouped exchanges and no aux transaction: the goal registers
+    /// pinned at the angles this cycle's own read returned, torque enabled over
+    /// the same rows, and the enable read back. That is the whole of what an
+    /// engagement has to establish, and it is one cycle rather than a
+    /// transaction per row because the answer the host is waiting on is the
+    /// head coming up.
+    ///
+    /// The gate has already been asked what to write, and at an engagement it
+    /// has nothing: a machine at rest holds no setpoint and has no goal queued,
+    /// so this is the cycle's only write. What the order buys is the one case
+    /// where the gate does have something — a standing torque-off latch, whose
+    /// sweep goes out first and is never held back for this, because nothing
+    /// gates de-torquing. The engagement then writes torque back on and releases
+    /// the latch, which is what a verified enable through the aux slot does
+    /// today and the only way out of a latch there is.
+    fn run_engage(&mut self, nominal_ns: i64, read: &Reading) -> bool {
+        let believed = {
+            let (_, slot) = self.state.decide();
+            AuxSlot::over(slot).belief().rows()
+        };
+        let step = self.state.engaging().step(read.answered, believed);
+        // The two endings that write nothing -- a re-issue of an engagement
+        // that already took, and a request the reads kept missing -- are
+        // answered by the decision itself, so both hosts say the same thing
+        // about the same step.
+        if let Some((kind, rows)) = step.answer() {
+            self.raise(Event {
+                kind,
+                rows,
+                ..Event::at(nominal_ns)
+            });
+            return false;
+        }
+        let EngageStep::Run { rows } = step else {
+            return false;
+        };
+        self.engage_rows(nominal_ns, rows, read);
+        true
+    }
+
+    /// Pin, enable and read back, over `rows`, in this cycle.
+    ///
+    /// The pin is unverified and unjudged, which is what a grouped write is:
+    /// these servos report their goal register as their present position, so
+    /// writing where the machine already is buys the one thing it can buy — a
+    /// servo that comes up holding the angle it was at rather than whatever its
+    /// goal register held before. Unjudged is about the servos' silence: a pin
+    /// this host could not put on the wire at all ends the engagement with
+    /// nothing enabled, as a failed enable write does.
+    ///
+    /// The enable is verified by one grouped read of the same register: the
+    /// evidence is what each servo answers about itself, with a verdict per id,
+    /// and it costs one exchange rather than a verified write per row. A row
+    /// whose reply carries a nonzero enable is confirmed and the belief takes
+    /// it; a row that answered anything else, or nothing, is left un-believed
+    /// and named in the event — a torque the driver believes in on the strength
+    /// of its own write is a dead-man measuring the wrong thing.
+    ///
+    /// A row whose pin could not be built — an angle no servo count represents
+    /// — is left out of the whole engagement and named unconfirmed. The
+    /// envelope check runs above this process and a driver that engaged a row it
+    /// could not pin would be taking hold of it blind.
+    fn engage_rows(&mut self, nominal_ns: i64, rows: JointFlags, read: &Reading) {
+        let on = RawValue::new(&[1]).expect("one byte carries a torque-enable value");
+        let frame = self.goal_frame(rows, &read.present);
+        let taken = frame.packed;
+        if taken == 0 {
+            self.engagement_failed(nominal_ns, rows);
+            return;
+        }
+        let mut enables = [(0u8, on); ROW_COUNT];
+        for (entry, id) in enables[..taken].iter_mut().zip(&frame.ids[..taken]) {
+            *entry = (*id, on);
+        }
+        if self
+            .bus
+            .sync_write(GOAL_POSITION, &frame.entries[..taken])
+            .is_err()
+        {
+            // The pin is unjudged about what the servos did with it, not about
+            // whether it reached the wire: a frame this host could not put on
+            // the bus pinned nothing, and enabling torque behind it would take
+            // hold of rows at whatever their goal registers held before. So the
+            // engagement stops here, with nothing enabled.
+            self.counts.write_failures += 1;
+            self.engagement_failed(nominal_ns, rows);
+            return;
+        }
+        if self
+            .bus
+            .sync_write(TORQUE_ENABLE, &enables[..taken])
+            .is_err()
+        {
+            // The enable never reached the wire, so nothing is believed and
+            // nothing is read back: a read of a register the write did not
+            // reach would answer about the machine before the engagement.
+            self.counts.write_failures += 1;
+            self.engagement_failed(nominal_ns, rows);
+            return;
+        }
+        let mut outcome = SyncReadOutcome::new();
+        if self
+            .bus
+            .sync_read(&frame.ids[..taken], TORQUE_ENABLE, &mut outcome)
+            .is_err()
+        {
+            self.counts.write_failures += 1;
+            self.engagement_failed(nominal_ns, rows);
+            return;
+        }
+        let left_out = frame.left_out;
+        let mut confirmed = JointFlags::NONE;
+        let mut unconfirmed = left_out;
+        for joint in flags::iter(flags::without(rows, left_out)) {
+            let Some(index) = row(joint) else {
+                continue;
+            };
+            let enabled = self
+                .map
+                .id_at(index)
+                .and_then(|id| match outcome.get(id) {
+                    Some(IdOutcome::Ok(raw)) => raw.u8(),
+                    _ => None,
+                })
+                .is_some_and(|enabled| enabled != 0);
+            if enabled {
+                confirmed |= flags::bit(joint);
+            } else {
+                self.counts.write_failures += 1;
+                unconfirmed |= flags::bit(joint);
+            }
+        }
+        self.credit_engagement(nominal_ns, confirmed);
+        let (kind, named) = engage_verdict(rows, unconfirmed);
+        if kind == EventKind::EngageUnconfirmed {
+            // After the credit, so the latch stands over whatever the rows that
+            // did confirm released.
+            self.let_go(nominal_ns);
+        }
+        self.raise(Event {
+            kind,
+            rows: named,
+            ..Event::at(nominal_ns)
+        });
+    }
+
+    /// Answer an engagement that did not confirm, and let go of the machine.
+    ///
+    /// The event names the whole engagement -- nothing here is reached with a
+    /// row confirmed -- and the machine is de-torqued on the driver's own
+    /// authority. The exits that reach this wrote at most a pin, so the sweep
+    /// that follows is over an already-limp machine and costs a cycle; the one
+    /// that matters is an enable this host sent and could not read back, where
+    /// nine servos may be holding behind a belief that says none. A commanded
+    /// release, if one follows, meets a latch already standing.
+    fn engagement_failed(&mut self, nominal_ns: i64, rows: JointFlags) {
+        self.let_go(nominal_ns);
+        self.raise(Event {
+            kind: EventKind::EngageUnconfirmed,
+            rows,
+            ..Event::at(nominal_ns)
+        });
+    }
+
+    /// Move the belief a confirmed engagement earns, and end a standing latch.
+    ///
+    /// The three writes are `reachy-driver`'s, over this process's own state:
+    /// what an engagement changes about the machine the dead-man runs over is
+    /// one decision, hosted where the simulated driver reaches the same one.
+    fn credit_engagement(&mut self, nominal_ns: i64, confirmed: JointFlags) {
+        let (gate, aux, confirm) = self.state.crediting();
+        credit_engagement(aux, gate, confirm, confirmed, nominal_ns);
     }
 
     /// Write the minimum risk condition before the loop exists, and answer which
@@ -1265,6 +1583,10 @@ mod tests {
         deaf: Vec<(u8, u16)>,
         /// Every write that reached a control table, in order.
         wrote: Vec<(u8, u16, Vec<u8>)>,
+        /// Every grouped read this machine was asked for, in order, as
+        /// (address, the ids the frame named): which rows an exchange covered,
+        /// which is what a case about a partial engagement asserts on.
+        sync_read: Vec<(u16, Vec<u8>)>,
         /// Every unicast read this machine was asked for, in order, as (servo,
         /// address, width): what a task put on the wire one exchange at a time,
         /// which is what a per-cycle budget is spent on.
@@ -1275,6 +1597,18 @@ mod tests {
         /// serial device that has been unplugged does. Persistent: the failure a
         /// driver has to survive is the one that does not go away.
         fail_write: Option<io::ErrorKind>,
+        /// One register whose frames the port will not take, while taking every
+        /// other: a transient failure confined to one exchange of a cycle that
+        /// makes several. Checked before the instruction is dispatched, so it
+        /// refuses reads of that address as well as writes to it, and it is a
+        /// field with no reset -- a case that wants one exchange to fail clears
+        /// it before the next cycle runs.
+        fail_write_to: Option<u16>,
+        /// One register whose reads the port will not take, while taking a
+        /// write to the same address: what a read-back that never reached the
+        /// wire looks like from the host, after the write it is reading back
+        /// did.
+        fail_read_of: Option<u16>,
         out: VecDeque<u8>,
     }
 
@@ -1288,9 +1622,12 @@ mod tests {
                 ignored: Vec::new(),
                 deaf: Vec::new(),
                 wrote: Vec::new(),
+                sync_read: Vec::new(),
                 read: Vec::new(),
                 model: MODEL,
                 fail_write: None,
+                fail_write_to: None,
+                fail_read_of: None,
                 out: VecDeque::new(),
             };
             for id in SERVO_IDS {
@@ -1358,6 +1695,13 @@ mod tests {
                 return Ok(());
             }
             let addr = u16::from_le_bytes([params[0], params[1]]);
+            if self.fail_write_to == Some(addr) {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            if self.fail_read_of == Some(addr) && matches!(instruction, INST_READ | INST_SYNC_READ)
+            {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
             match instruction {
                 INST_READ => {
                     let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
@@ -1374,6 +1718,7 @@ mod tests {
                 }
                 INST_SYNC_READ => {
                     let width = usize::from(u16::from_le_bytes([params[2], params[3]]));
+                    self.sync_read.push((addr, params[4..].to_vec()));
                     for asked in params[4..].iter().copied() {
                         self.answer(asked, addr, width);
                     }
@@ -2947,6 +3292,531 @@ mod tests {
                 .iter()
                 .any(|(_, addr, _)| *addr == GOAL_POSITION.addr),
             "the setpoint reached no register, so the write is unconfirmed",
+        );
+    }
+    /// A machine holding `counts` with every row limp, which is what a driver
+    /// meets between sessions.
+    fn limp(counts: i32) -> Machine {
+        let mut machine = Machine::at(counts);
+        for id in SERVO_IDS {
+            machine.set(id, TORQUE_ENABLE, &[0]);
+        }
+        machine
+    }
+
+    /// A host asking to take hold of `rows`.
+    fn engage(rows: JointFlags) -> SessionCmdWire {
+        let mut message = SessionCmdWire::new();
+        let cmd = message.clear_valid();
+        cmd.kind = SessionCmdKind::EngageNow;
+        cmd.rows = rows;
+        message
+    }
+
+    /// The kind of the event a cycle published, where it published one.
+    fn evented(report: &super::CycleReport) -> Option<EventKind> {
+        report
+            .event
+            .as_ref()
+            .map(|event| event.validate().expect("an event this cycle wrote").kind)
+    }
+
+    /// The rows the event a cycle published names.
+    fn evented_rows(report: &super::CycleReport) -> JointFlags {
+        report
+            .event
+            .as_ref()
+            .expect("this cycle published an event")
+            .validate()
+            .expect("an event this cycle wrote")
+            .rows
+    }
+
+    /// What this driver believes is holding torque.
+    fn believed(tick: &Tick<Shared>) -> JointFlags {
+        tick.state
+            .aux
+            .validate()
+            .expect("a slot this driver wrote")
+            .believed_torqued
+    }
+
+    /// Whether the gate's torque-off latch stands.
+    fn latched(tick: &Tick<Shared>) -> bool {
+        bool::from(
+            tick.state
+                .gate
+                .validate()
+                .expect("a gate this driver wrote")
+                .latched,
+        )
+    }
+
+    /// Whether a torque-off confirmation pass is open.
+    fn pass_open(tick: &Tick<Shared>) -> bool {
+        bool::from(
+            tick.state
+                .confirm
+                .validate()
+                .expect("a pass this driver wrote")
+                .active,
+        )
+    }
+
+    /// The ids every grouped read of `reg` named, in order.
+    fn grouped_reads_of(machine: &Rc<RefCell<Machine>>, reg: Reg) -> Vec<Vec<u8>> {
+        machine
+            .borrow()
+            .sync_read
+            .iter()
+            .filter(|(addr, _)| *addr == reg.addr)
+            .map(|(_, ids)| ids.clone())
+            .collect()
+    }
+
+    /// Every write of `reg` that reached a control table, as (servo, bytes).
+    fn writes_of(machine: &Rc<RefCell<Machine>>, reg: Reg) -> Vec<(u8, Vec<u8>)> {
+        machine
+            .borrow()
+            .wrote
+            .iter()
+            .filter(|(_, addr, _)| *addr == reg.addr)
+            .map(|(id, _, bytes)| (*id, bytes.clone()))
+            .collect()
+    }
+
+    /// An engagement naming no row asks for nothing at all, and is counted as
+    /// the refusal it is rather than fed to the dead-man.
+    ///
+    /// A datagram this driver cannot act on is the one thing its refusal count
+    /// says, and a host that sent one would otherwise learn nothing: nothing is
+    /// written, no event goes out, and the ask would read as a host that is
+    /// there and asking.
+    #[test]
+    fn an_engage_naming_no_rows_is_refused_and_counted() {
+        let (mut tick, machine) = driver(limp(2048));
+        let before = tick.counts.aux_refused;
+
+        tick.offer_session_cmd(asked(&engage(JointFlags::NONE)), T0);
+        let report = tick.run(T0);
+
+        assert_eq!(
+            tick.counts.aux_refused,
+            before + 1,
+            "the driver counted a datagram it could not act on",
+        );
+        assert_eq!(evented(&report), None, "and answered nothing");
+        assert!(
+            writes_of(&machine, TORQUE_ENABLE).is_empty(),
+            "and wrote nothing",
+        );
+        assert_eq!(believed(&tick), JointFlags::NONE);
+    }
+
+    #[test]
+    fn an_engage_request_pins_enables_and_reads_back_in_one_cycle() {
+        let (mut tick, machine) = driver(limp(2048));
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageConfirmed));
+        assert_eq!(
+            evented_rows(&report),
+            flags::all(),
+            "every row read its enable back"
+        );
+        let pins = writes_of(&machine, GOAL_POSITION);
+        assert_eq!(pins.len(), ROW_COUNT, "one grouped write over the nine");
+        for (id, bytes) in &pins {
+            assert_eq!(
+                bytes.as_slice(),
+                &2048i32.to_le_bytes()[..],
+                "servo {id} is pinned at the angle this cycle's own read returned",
+            );
+        }
+        let enables = writes_of(&machine, TORQUE_ENABLE);
+        assert_eq!(enables.len(), ROW_COUNT);
+        assert!(
+            enables.iter().all(|(_, bytes)| bytes.as_slice() == [1]),
+            "torque on, over the rows the host named",
+        );
+        assert_eq!(believed(&tick), flags::all());
+        assert!(
+            machine.borrow().read.is_empty(),
+            "an engage cycle runs no out-of-band transaction: the rotation was due and waited",
+        );
+        assert!(report.health.is_none());
+        assert!(report.outcome.is_none());
+    }
+
+    #[test]
+    fn a_row_that_does_not_read_back_enabled_is_unconfirmed() {
+        let mut machine = limp(2048);
+        // A servo that acknowledges the enable and does not take it, which is
+        // what a row failing to come up looks like from the host.
+        machine.ignored.push((SERVO_IDS[4], TORQUE_ENABLE.addr));
+        let (mut tick, _machine) = driver(machine);
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageUnconfirmed));
+        assert_eq!(
+            evented_rows(&report),
+            flags::bit(joint_ref(4).expect("row 4 is a servo")),
+            "the row that did not read back, and only it",
+        );
+        assert_eq!(
+            believed(&tick),
+            flags::without(flags::all(), evented_rows(&report)),
+            "the rows that did confirm are believed holding, so the dead-man runs over them",
+        );
+        assert!(
+            latched(&tick),
+            "and the machine is let go of: a row that may be holding and cannot be vouched for \
+             is de-torqued on this driver's own authority",
+        );
+        assert!(pass_open(&tick), "with the pass reading the release back");
+    }
+
+    /// An engagement over eight rows is eight rows on the wire, and the ninth
+    /// servo is left exactly as it was.
+    ///
+    /// The row set is the gate's whole output -- an antenna with a latched
+    /// error bit is degraded and left out -- so a driver that widened it to
+    /// every row would take hold of a servo the session refused to trust, and
+    /// nothing else in this process would say so.
+    #[test]
+    fn an_engage_over_a_subset_touches_only_the_named_rows() {
+        let (mut tick, machine) = driver(limp(2048));
+        let left_out = joint_ref(3).expect("row 3 is a servo");
+        let asked_for = flags::without(flags::all(), flags::bit(left_out));
+        let named: Vec<u8> = SERVO_IDS
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 3)
+            .map(|(_, id)| id)
+            .collect();
+        tick.offer_session_cmd(asked(&engage(asked_for)), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageConfirmed));
+        assert_eq!(evented_rows(&report), asked_for, "the eight rows asked for");
+        assert_eq!(
+            writes_of(&machine, GOAL_POSITION)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            named,
+            "the pin named the eight and nothing else",
+        );
+        assert_eq!(
+            writes_of(&machine, TORQUE_ENABLE)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            named,
+            "and so did the enable",
+        );
+        assert_eq!(
+            grouped_reads_of(&machine, TORQUE_ENABLE),
+            vec![named.clone()],
+            "one read-back, over the same eight",
+        );
+        assert_eq!(
+            machine
+                .borrow()
+                .get(SERVO_IDS[3], TORQUE_ENABLE)
+                .map(<[u8]>::to_vec),
+            Some(vec![0]),
+            "the row the gate left out is still limp",
+        );
+        assert_eq!(
+            believed(&tick),
+            asked_for,
+            "and the driver believes exactly what it took hold of",
+        );
+    }
+
+    /// A pin frame this host could not put on the wire stops the engagement
+    /// before the enable.
+    ///
+    /// The pin is unjudged about what the servos did with it, and that is the
+    /// whole of what unjudged means: a write the host could not send pinned
+    /// nothing, and enabling torque behind it would take hold of nine rows at
+    /// whatever their goal registers happened to hold. The failure is counted
+    /// and named, as a failed enable write is.
+    #[test]
+    fn a_pin_this_host_could_not_send_enables_nothing() {
+        let mut machine = limp(2048);
+        machine.fail_write_to = Some(GOAL_POSITION.addr);
+        let (mut tick, machine) = driver(machine);
+        let before = tick.counts.write_failures;
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageUnconfirmed));
+        assert_eq!(
+            evented_rows(&report),
+            flags::all(),
+            "the whole engagement, since nothing was pinned",
+        );
+        assert!(
+            writes_of(&machine, TORQUE_ENABLE).is_empty(),
+            "and no row was enabled behind a pin that never went out",
+        );
+        assert_eq!(believed(&tick), JointFlags::NONE);
+        assert_eq!(tick.counts.write_failures, before + 1);
+        assert!(
+            latched(&tick),
+            "and the machine is let go of, which over an already-limp one costs a cycle",
+        );
+        assert!(pass_open(&tick));
+    }
+
+    /// An enable write this host could not put on the wire confirms nothing and
+    /// de-torques what it may have written.
+    ///
+    /// The write did not reach the wire, so nothing took torque -- but the
+    /// answer to a torque state this driver cannot vouch for is the same
+    /// whichever way it arose, and the sweep over an already-limp machine costs
+    /// one cycle. The knob is cleared before the second cycle, because what is
+    /// under test is the one exchange and not a port that stays shut.
+    #[test]
+    fn an_enable_write_this_host_could_not_send_confirms_nothing() {
+        let mut machine = limp(2048);
+        machine.fail_write_to = Some(TORQUE_ENABLE.addr);
+        let (mut tick, machine) = driver(machine);
+        let before = tick.counts.write_failures;
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageUnconfirmed));
+        assert_eq!(evented_rows(&report), flags::all());
+        assert_eq!(
+            writes_of(&machine, GOAL_POSITION).len(),
+            ROW_COUNT,
+            "the pin went out",
+        );
+        assert!(
+            writes_of(&machine, TORQUE_ENABLE).is_empty(),
+            "and no enable reached the machine",
+        );
+        assert_eq!(believed(&tick), JointFlags::NONE);
+        assert_eq!(tick.counts.write_failures, before + 1);
+        assert!(latched(&tick));
+        assert!(pass_open(&tick));
+
+        machine.borrow_mut().fail_write_to = None;
+        let written = writes_of(&machine, TORQUE_ENABLE).len();
+        tick.run(T0 + 20_000_000);
+
+        let sweep = writes_of(&machine, TORQUE_ENABLE);
+        assert_eq!(sweep.len(), written + ROW_COUNT, "one sweep, nine rows");
+        assert!(
+            sweep[written..]
+                .iter()
+                .all(|(_, bytes)| bytes.as_slice() == [0]),
+            "every write of it a release",
+        );
+        assert_eq!(
+            tick.counts.write_failures,
+            before + 1,
+            "and the sweep itself failed nothing",
+        );
+    }
+
+    /// A read-back this host could not put on the wire de-torques the enable
+    /// that did land.
+    ///
+    /// The one case that matters: the servos have taken torque and the driver
+    /// believes none of them have, so the dead-man is blind to nine rows that
+    /// may be holding. What covers them today is a session that parks and
+    /// commands the release -- one datagram, and the case the dead-man exists
+    /// for is exactly the one where it never arrives. So the driver lets go
+    /// itself.
+    #[test]
+    fn a_read_back_this_host_could_not_send_de_torques_what_it_wrote() {
+        let mut machine = limp(2048);
+        machine.fail_read_of = Some(TORQUE_ENABLE.addr);
+        let (mut tick, machine) = driver(machine);
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let report = tick.run(T0);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageUnconfirmed));
+        assert_eq!(evented_rows(&report), flags::all());
+        assert!(
+            SERVO_IDS
+                .into_iter()
+                .all(|id| machine.borrow().get(id, TORQUE_ENABLE) == Some(&[1][..])),
+            "the pin and the enable both landed: these servos are holding",
+        );
+        assert_eq!(
+            believed(&tick),
+            JointFlags::NONE,
+            "and the driver believes none of them are, the read-back being the evidence",
+        );
+        assert!(
+            latched(&tick),
+            "so it lets go rather than leaving nine rows behind that belief",
+        );
+        assert!(pass_open(&tick));
+
+        machine.borrow_mut().fail_read_of = None;
+        let written = writes_of(&machine, TORQUE_ENABLE).len();
+        tick.run(T0 + 20_000_000);
+
+        let sweep = writes_of(&machine, TORQUE_ENABLE);
+        assert_eq!(sweep.len(), written + ROW_COUNT);
+        assert!(
+            sweep[written..]
+                .iter()
+                .all(|(_, bytes)| bytes.as_slice() == [0]),
+            "one sweep, and every write of it a release",
+        );
+        assert!(
+            SERVO_IDS
+                .into_iter()
+                .all(|id| machine.borrow().get(id, TORQUE_ENABLE) == Some(&[0][..])),
+            "the machine is limp again",
+        );
+        assert_eq!(
+            believed(&tick),
+            JointFlags::NONE,
+            "and the sweep's verified writes say so",
+        );
+    }
+
+    #[test]
+    fn an_engage_whose_rows_the_read_missed_waits_and_then_declines() {
+        let mut machine = limp(2048);
+        machine.silent.push(SERVO_IDS[7]);
+        let (mut tick, machine) = driver(machine);
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+
+        let mut answers = Vec::new();
+        for cycle in 0..reachy_driver::ENGAGE_READ_CYCLES {
+            let report = tick.run(T0 + i64::from(cycle) * 20_000_000);
+            if let Some(kind) = evented(&report) {
+                answers.push((kind, evented_rows(&report)));
+            }
+            assert!(
+                writes_of(&machine, TORQUE_ENABLE).is_empty(),
+                "nothing is written for a request the reads keep missing a row of",
+            );
+        }
+
+        assert_eq!(
+            answers,
+            vec![(
+                EventKind::EngageDeclined,
+                flags::bit(joint_ref(7).expect("row 7 is a servo")),
+            )],
+            "one answer, at the end of the window, naming the row the reads missed",
+        );
+        assert_eq!(believed(&tick), JointFlags::NONE);
+    }
+
+    #[test]
+    fn a_repeated_engage_of_torqued_rows_writes_nothing_and_confirms_again() {
+        let (mut tick, machine) = driver(limp(2048));
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+        tick.run(T0);
+        let written = writes_of(&machine, TORQUE_ENABLE).len();
+
+        // The host re-issuing because it did not hear the first answer.
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0 + 20_000_000);
+        let report = tick.run(T0 + 20_000_000);
+
+        assert_eq!(
+            evented(&report),
+            Some(EventKind::EngageConfirmed),
+            "a lost answer heals on the re-issue",
+        );
+        assert_eq!(evented_rows(&report), flags::all());
+        assert_eq!(
+            writes_of(&machine, TORQUE_ENABLE).len(),
+            written,
+            "and nothing is written for it: the rows are already believed holding",
+        );
+    }
+
+    #[test]
+    fn an_engage_releases_a_standing_latch() {
+        let (mut tick, _machine) = driver(limp(2048));
+        // A commanded de-torquing, so the latch stands and its confirmation
+        // pass is reading the rows back.
+        tick.offer_session_cmd(asked(&command(SessionCmdKind::TorqueOffNow)), T0);
+        tick.run(T0);
+        assert!(
+            tick.torque_latched(),
+            "the latch this engagement has to end"
+        );
+
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0 + 20_000_000);
+        let report = tick.run(T0 + 20_000_000);
+
+        assert_eq!(evented(&report), Some(EventKind::EngageConfirmed));
+        assert!(!tick.torque_latched(), "a fresh arming is the way out");
+        assert!(
+            !bool::from(
+                tick.state
+                    .confirm
+                    .validate()
+                    .expect("a pass this driver wrote")
+                    .active
+            ),
+            "and the pass reading the replaced de-torquing back is stood down",
+        );
+        assert_eq!(believed(&tick), flags::all());
+        assert!(
+            !bool::from(
+                report
+                    .sample
+                    .validate()
+                    .expect("a sample this cycle wrote")
+                    .torque_off_latched
+            ),
+            "the sample the host reads says the machine is holding",
+        );
+    }
+
+    #[test]
+    fn a_de_torquing_drops_an_engagement_nothing_has_written_yet() {
+        let mut machine = limp(2048);
+        // A row the reads keep missing, so the request is still standing when
+        // the release arrives.
+        machine.silent.push(SERVO_IDS[2]);
+        let (mut tick, machine) = driver(machine);
+        tick.offer_session_cmd(asked(&engage(flags::all())), T0);
+        tick.run(T0);
+
+        tick.offer_session_cmd(
+            asked(&command(SessionCmdKind::TorqueOffNow)),
+            T0 + 20_000_000,
+        );
+        for cycle in 1..=i64::from(reachy_driver::ENGAGE_READ_CYCLES) + 1 {
+            let report = tick.run(T0 + cycle * 20_000_000);
+            assert!(
+                !matches!(
+                    evented(&report),
+                    Some(EventKind::EngageConfirmed | EventKind::EngageUnconfirmed)
+                ),
+                "nothing takes hold of a machine a release outranked",
+            );
+        }
+
+        assert_eq!(believed(&tick), JointFlags::NONE);
+        assert!(
+            writes_of(&machine, TORQUE_ENABLE)
+                .iter()
+                .all(|(_, bytes)| bytes.as_slice() == [0]),
+            "every write of the register the release reached is a release",
         );
     }
 }

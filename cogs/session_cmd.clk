@@ -20,6 +20,7 @@
 #![cpp(namespace=brenn_reachy::cogs)]
 
 use motion::bus_txn;
+use motion::joints;
 
 // What the datagram asks for.
 //
@@ -51,12 +52,21 @@ enum SessionCmdKind
 
         // Run the transaction below, and answer with its outcome.
         #3 aux { underlying_value: 3; }
+
+        // Take hold of the rows named below, in one cycle: pin their goal
+        // registers at what that cycle's own read returned, enable torque over
+        // them, and read the enable back. Idempotent, and republished every
+        // wake until the driver answers: a re-issue of the same rows is
+        // liveness and draws the same answer again, and rows already believed
+        // torqued are confirmed without a write.
+        #4 engage_now { underlying_value: 4; }
     }
 }
 
 // One datagram from the session to the driver.
 //
-// The transaction and the correlation number mean nothing except under `aux`.
+// The transaction and the correlation number mean nothing except under `aux`,
+// and the rows nothing except under `engage_now`.
 // They are carried in the fields rather than in a separate message so that a
 // re-issue is a byte-for-byte repeat of what went out before, which is what
 // makes delivery retry safe on a lossy link.
@@ -77,5 +87,10 @@ schema SessionCmd
         // for it and copied here verbatim: the session decides when a
         // transaction goes out, never what it says.
         #2 txn: bus_txn::BusTxn;
+
+        // The servos to take hold of, under `engage_now`. The rows the
+        // session's torque-on gate passed, so a row the gate degraded is not
+        // named and is left limp.
+        #3 rows: joints::JointFlags;
     }
 }

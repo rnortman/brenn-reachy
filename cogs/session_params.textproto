@@ -104,3 +104,12 @@ bus_watchdog: 10
 # Any publisher here must stamp arrival with this machine's clock, never
 # forward the sender's.
 script_span_cap_ms: 600000
+
+# How old a retained rail reading may be and still be gated on: 2.2 s, two laps
+# of the driver's 120 ms health rotation over nine servos. The picture is seeded
+# by the commissioning survey and refreshed a row per lap in every phase, and
+# the oldest a row gets in normal operation is one lap plus whatever deferral the
+# aux slot owes something else -- about 1.5 s. A row past this has gone unread
+# for two laps, which is a servo not answering its health reads or an aux slot
+# starved by something else, and is worth the two transactions it costs to look.
+rail_stale_after_ns: 2200000000

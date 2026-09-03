@@ -98,9 +98,9 @@ pub mod winddown;
 
 pub use arm::{
     ArmConfig, ArmRecord, CommissionSequencer, CommissionSummary, EXPECTED_MODELS,
-    EXPECTED_OPERATING_MODES, EngageSequencer, EngageSummary, Gains, GroupGains, PinOutcome,
-    PollCadence, PollSequencer, Posture, ProfileConfig, ProvisionExpect, ProvisionTable, Rail,
-    VENDOR_HOMING_OFFSETS, engage_gates, pin_goals, rest_pose_seeds,
+    EXPECTED_OPERATING_MODES, Gains, GroupGains, PinOutcome, PollSequencer, ProfileConfig,
+    ProvisionExpect, ProvisionTable, Rail, VENDOR_HOMING_OFFSETS, engage_gates, pin_goals,
+    rest_pose_seeds,
 };
 pub use disarm::{
     DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow, stow_targets,

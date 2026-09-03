@@ -174,6 +174,9 @@ schema TickFault
         #3 detail: Float64;
 
         // The count that carried it -- misses, failures, or a streak length.
+        // For the two obstructions the streak is the tracking run: the count it
+        // had reached on the tick it ran out, which is the window it was judged
+        // by, ordinary or the longer one a reversal opens.
         #4 count: UInt32;
     }
 }

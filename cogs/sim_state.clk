@@ -77,6 +77,13 @@ enum SimOp
         // torque cannot be confirmed. The mask replaces the set, so an injection
         // naming nothing puts every servo back on the bus.
         #11 absent_servo { underlying_value: 11; }
+        // Give the masked rows a response delay of `count` cycles: each of them
+        // chases the target it was given that many cycles ago rather than the
+        // one it holds now. A servo whose loop takes time to turn round, which
+        // is what a lag on a real antenna is. The mask replaces the set, so an
+        // injection naming nothing makes every row follow at once again, and a
+        // delay longer than the plant's ring is refused rather than truncated.
+        #12 set_lag { underlying_value: 12; }
     }
 }
 
@@ -95,8 +102,9 @@ schema SimCmd
         // The positions `set_positions` teleports to, radians.
         #2 positions: joints::Joints;
 
-        // How many cycles of replies `drop_replies` loses, or how many of the
-        // host's transactions `refuse_aux` swallows.
+        // How many cycles of replies `drop_replies` loses, how many of the
+        // host's transactions `refuse_aux` swallows, or how many cycles of
+        // response delay `set_lag` gives the masked rows.
         #3 count: UInt32;
 
         // Which register `set_register` writes.
@@ -356,5 +364,41 @@ schema SimState
         // de-torquing credited to silence is the one report a driver must never
         // make.
         #37 confirm_misses: UInt64;
+
+        // The engagement the host asked for, if one is outstanding. The
+        // engagement decides over it directly, the same way the gate's state
+        // and the aux slot's above are carried: the real driver keeps this
+        // declaration in its own memory, and two drivers disagreeing about when
+        // an engagement may be written would be two machines.
+        #38 engage: aux_vocab::EngageRequestState;
+
+        // Which servos chase a target `lag_cycles` old rather than the one they
+        // hold now. A response delay, which on this plant is the only way a row
+        // lags a goal it is not jammed against.
+        #39 lagged: joints::JointFlags;
+
+        // How many cycles of response delay the rows above run at. One number
+        // for the whole set, so an injection re-times the rows already lagged
+        // as well as the ones it names for the first time: two depths cannot
+        // coexist, and the later injection's mask and depth are the whole rule.
+        #40 lag_cycles: UInt32;
+
+        // What each row was being asked for on each of the last cycles, radians:
+        // nine rings, row-major, `history_cursor` naming this cycle's cell in
+        // each. A row's whole ring is filled with its first target, so a delay
+        // never chases a cell nothing has written. Only a row entering the
+        // lagged set is filled that way: a row already lagged keeps its history
+        // across a further injection, so restating the same delay over a moving
+        // row does not jump the target it is chasing forward to the present
+        // one. What is kept is the ring, not the depth: an injection that names
+        // a moving row at a *different* depth reads that same history one or
+        // more cells further back or forward, so the target that row is chasing
+        // steps by the difference in one cycle. A scenario measuring how far a
+        // row stands behind its goal changes a standing depth at its own cost.
+        #41 target_history: FixedArray<Float64, 288>;
+
+        // Which cell of each ring above the newest target sits in. Walks one
+        // cell per cycle of plant motion and wraps.
+        #42 history_cursor: UInt32;
     }
 }

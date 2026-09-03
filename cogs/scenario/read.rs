@@ -21,14 +21,14 @@ use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdWire;
 use brenn_reachy__cogs__sim_state_clk_rs::SimCmdWire;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
-use brenn_reachy__driver__health_clk_rs::DriverEventWire;
+use brenn_reachy__driver__health_clk_rs::{DriverEventWire, HealthReportWire};
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use log_read::{Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed};
 use motion_channels::{
-    CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL,
-    SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL, SIM_CMD_CHANNEL,
+    CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL, POSE_CHANNEL,
+    REPORT_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL, SESSION_CMD_CHANNEL, SIM_CMD_CHANNEL,
 };
 
 /// Everything one run put in the log.
@@ -46,6 +46,12 @@ pub struct Run {
     pub goals: Vec<Logged<GoalSetpointWire>>,
     /// What the gate did that the sample stream does not show.
     pub events: Vec<Logged<DriverEventWire>>,
+    /// What the driver's rotating read of the status registers found: one report
+    /// per row it visited, carrying the instant the reading was taken. The
+    /// picture the session's torque-on gate is judged over is built from these.
+    ///
+    /// Named for the rail because the pose samples carry readings of their own.
+    pub rail_readings: Vec<Logged<HealthReportWire>>,
     /// What the decision tick raised.
     pub faults: Vec<Logged<TickFaultWire>>,
     /// What the session said about all of it: the rows of the newest story it
@@ -80,7 +86,7 @@ impl Streams for Run {
 /// The signal report groups are deliberately absent: nothing binds a Rust type
 /// to a group's generated schema, so they are observable through
 /// [`Run::census`] and not decoded.
-const CHANNELS: [Bound<Run>; 10] = [
+const CHANNELS: [Bound<Run>; 11] = [
     Bound {
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
@@ -137,6 +143,11 @@ const CHANNELS: [Bound<Run>; 10] = [
         name: EVENT_CHANNEL,
         check: binding::<DriverEventWire>,
         route: |run, message| typed(message, &mut run.events, &mut run.complaints),
+    },
+    Bound {
+        name: HEALTH_CHANNEL,
+        check: binding::<HealthReportWire>,
+        route: |run, message| typed(message, &mut run.rail_readings, &mut run.complaints),
     },
 ];
 

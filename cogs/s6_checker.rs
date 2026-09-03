@@ -19,6 +19,7 @@
 use std::process::ExitCode;
 
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use reachy_motion::joints::{JointRef, row};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
@@ -86,11 +87,15 @@ fn main() -> ExitCode {
             failures,
         );
         // The session's own life, and then the second script taking hold of the
-        // machine it let go of: one more phase change, and no more than one --
-        // the run ends before that engagement could conclude.
+        // machine it let go of. Two more phase changes: the engagement is one
+        // datagram and one driver cycle, so the run's tail is long enough for it
+        // to conclude and the machine is under command again when the run ends.
         let engaged = check::engagement_then(
             run,
-            &[(SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING)],
+            &[
+                (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
+                (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
+            ],
             failures,
         );
         check::ended_promptly(
@@ -98,9 +103,13 @@ fn main() -> ExitCode {
             disengage_cycle(),
             failures,
         );
-        if let (Some(stream), Some(engaged)) = (check::goal_stream(run, failures), engaged) {
-            check::stream_starts_with_session(&stream, engaged.taken, failures);
-            check::stream_stops_with_release(&stream, engaged.released, failures);
+        // Two stretches, because the second script's engagement concludes inside
+        // the run's tail: the first session's, and the one the machine is under
+        // command for when the run ends.
+        let streams = check::goal_streams_exactly(run, JointFlags::NONE, 2, failures);
+        if let (Some(stream), Some(engaged)) = (streams.first(), engaged) {
+            check::stream_starts_with_session(stream, engaged.taken, failures);
+            check::stream_stops_with_release(stream, engaged.released, failures);
         }
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
@@ -127,6 +136,8 @@ fn main() -> ExitCode {
                 ReportKindWire::PHASE_CHANGED,
                 ReportKindWire::SCRIPT_ACCEPTED,
                 ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::PHASE_CHANGED,
+                ReportKindWire::SCHEDULE_PUBLISHED,
             ],
             failures,
         );

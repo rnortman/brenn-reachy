@@ -13,9 +13,10 @@
 # binary. Every path below is relative to that same directory.
 #
 # The host's default `--config` is `host/host_params.textproto` and the payload
-# stages the file there, so the edge half needs no argument. An operator running
-# a unit's own edge configuration instead does it by hand, which is what makes a
-# per-unit file a push into RAM rather than an edit to this table.
+# stages the operator's own file there, so the edge half needs no argument: the
+# per-unit file is a push into RAM rather than an edit to this table, and the
+# tree carries only `host/host_params.example.textproto`, which is staged by
+# nothing.
 #
 # `--speech-config` is named unconditionally and the file it names is not in
 # this tree and never will be: a speech configuration holds a site's STT and TTS

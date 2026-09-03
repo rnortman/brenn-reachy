@@ -27,14 +27,15 @@
 // story is told -- are `motion/timeline.clk`, imported under an alias because
 // `SessionState` carries a field called `timeline`.
 //
-// Each of the four sequencers keeps its phases and its
+// Each of the three sequencers keeps its phases and its
 // state in a module of its own -- `motion/commission.clk`, `motion/poll.clk`,
-// `motion/engage.clk`, `motion/disarm.clk` -- over the record they bracket an
-// arming with, `motion/arm_record.clk`. The four are imported under aliases
+// `motion/disarm.clk`. The three are imported under aliases
 // here because `SessionState` carries a field named after each of them.
 //
 // What a session plans is `cogs/schedule.clk`, imported under an alias because
-// `SessionState` carries a field called `schedule`. Angles are radians about
+// `SessionState` carries a field called `schedule`. What somebody asked for is
+// `cogs/script.clk`, aliased for the same reason: the one script held for the
+// phase a maneuver ends in sits here whole. Angles are radians about
 // the model datum and positions metres in the body frame wherever an imported
 // schema carries one, the units `reachy-kin` and `reachy-motion` use, so
 // nothing here converts.
@@ -43,14 +44,15 @@
 #![cpp(namespace=brenn_reachy::motion)]
 
 use cogs::schedule as schedule_vocab;
+use cogs::script as script_vocab;
 use hardware::dynamixel::registers;
 use motion::bus_txn;
 use motion::commission as commission_vocab;
 use motion::disarm as disarm_vocab;
-use motion::engage as engage_vocab;
 use motion::joints;
 use motion::poll as poll_vocab;
 use motion::seq;
+use motion::servo_health;
 use motion::timeline as timeline_vocab;
 
 // Which phase of a session the machine is in.
@@ -152,23 +154,35 @@ schema AuxPending
 // no fixed rate and every wake begins by reading this slot back. What lives here
 // is therefore everything that is not handed to it read-only: which phase it is
 // in, the schedule it published, the sequence it is driving and where that
-// sequence stands, the transaction it is waiting on, the maneuver it may be
-// running, the rows a degrade still owes a torque-off write, the two watchdog
-// anchors, the report timeline, and the run's totals.
+// sequence stands, the transaction it is waiting on, the engagement it may have
+// open, the maneuver it may be running, the rows a degrade still owes a
+// torque-off write, the rail picture its torque-on gate judges, the two
+// watchdog anchors, the report timeline, and the run's totals.
 //
-// The four sequencer snapshots are four fixed slots rather than one, because
+// The three sequencer snapshots are three fixed slots rather than one, because
 // there is no union in this language: `seq_kind` names
-// which of them describes a live sequence and the other three are whatever the
+// which of them describes a live sequence and the other two are whatever the
 // last sequence of their kind left. Only one sequence runs at a time, always --
-// a commission, then an engagement, then a release -- so the cost is bytes and
-// what it buys is a restore that cannot read one sequence's numbers as another's.
+// a commission, then at most a rail re-read, then a release -- so the cost is
+// bytes and what it buys is a restore that cannot read one sequence's numbers
+// as another's.
+//
+// The engagement is no sequence and has no snapshot. It is one datagram and one
+// driver cycle: the three fields below `active_script_id` are the whole of what
+// the session keeps about one.
 //
 // The schedule is held here as well as published. `ScheduleChan` is latest-wins
 // and this cog is its only publisher, so the copy here is the authority on what
 // was asked for: a republish on any change is written from this field, and
 // nothing else reads the channel back.
 //
-// Numbering is append-only; #20 and #21 are retired and will not be reused.
+// One script may be held rather than answered: a wake that arrives while the
+// machine is mid-something is the next command, so it is kept whole in the two
+// fields at the end and answered on the phase that maneuver ends in. One slot
+// and not a queue -- the latest script wins in both directions, and a held one
+// is superseded by anything newer.
+//
+// Numbering is append-only; #6, #20 and #21 are retired and will not be reused.
 schema SessionState
 {
     uuid: 5e79f353-ae2a-4fde-a452-989a253ef1a8;
@@ -194,11 +208,10 @@ schema SessionState
         // The commissioning, as the last one left it.
         #4 commission: commission_vocab::CommissionSnap;
 
-        // The resting watch, likewise.
+        // The resting watch, likewise: the fallback that re-reads the rail rows
+        // the driver's rotation has left stale, from which the engagement takes
+        // no pose.
         #5 poll: poll_vocab::PollSnap;
-
-        // The engagement, likewise.
-        #6 engage: engage_vocab::EngageSnap;
 
         // The release, likewise.
         #7 disarm: disarm_vocab::DisarmSnap;
@@ -380,5 +393,91 @@ schema SessionState
         // replacement admission, so their agreement is asserted as an
         // invariant rather than assumed.
         #39 active_script_id: UInt32;
+
+        // Whether an engagement is open: the machine has been asked to take
+        // hold and the driver has not yet said what became of the ask. While it
+        // stands, every wake in `engaging` republishes the `engage_now` -- the
+        // datagram is idempotent and the transport is lossy, the rule
+        // `torque_off_pending` above runs under -- and the three answers the
+        // driver can give are answered only while it is set, so a late
+        // duplicate for an engagement already answered is counted and ignored.
+        #40 engage_pending: Bool;
+
+        // The rows that engagement asks for: every row the torque-on gate
+        // passed, which is all of them less the ones it degraded. Meaningful
+        // while `engage_pending` stands.
+        //
+        // Written once, on the first ask, and read back by every later wake in
+        // `engaging`: the re-issue publishes these rows verbatim rather than
+        // re-judging the gate, so this is the ask itself and not a record of
+        // one.
+        #41 engage_rows: joints::JointFlags;
+
+        // When the engagement was first asked for. Zero until there has been an
+        // ask. What the silence deadline is measured from, and unlike the
+        // deadline it does not move on a re-issue: a driver that never answers
+        // is rested at one deadline rather than kept waiting by the session's
+        // own liveness.
+        #42 engage_issued: SyncTime;
+
+        // The rail picture the torque-on gate judges: one retained reading per
+        // servo, written from every health report the driver's rotation
+        // publishes in every phase, and seeded from the commissioning survey's
+        // own readings so the machine is never at rest with an empty picture.
+        //
+        // Retained rather than re-read on the wake path, which is what makes
+        // engaging one driver cycle: the gate's two questions -- is the supply
+        // up, has a servo latched an error -- change on the timescale of a
+        // power supply and a servo's own latch, and the rotation asks them of
+        // every row every lap. A row the rotation has left older than
+        // `rail_stale_after_ns` is re-read by the resting watch before the gate
+        // is judged.
+        #43 rail: servo_health::RailRecord;
+
+        // The script held for the phase the maneuver under way ends in,
+        // meaningful while `pending_valid` stands. Whole rather than summarised:
+        // it is screened into a schedule when it takes effect, not when it
+        // arrived, so its horizon is measured from the wake that drains it.
+        #44 pending: script_vocab::Script;
+
+        // Whether the slot above holds a script. Cleared by everything that
+        // answers one: the drain that applies it, a park that refuses it, a
+        // rest-class fault response that refuses it because the machine is
+        // being stood down, and a script accepted or taken as a replacement at
+        // intake -- the newer script supersedes the held one, which is the same
+        // latest-wins rule the hold itself applies.
+        #45 pending_valid: Bool;
+
+        // How many engagement answers arrived for an ask nobody was waiting on:
+        // a late duplicate of one already answered, or an answer to an ask a
+        // fault closed by moving the phase. Its own count rather than
+        // `aux_strays` above, which is about correlation numbers on the
+        // transaction path: a rise here says the driver is answering
+        // engagements this session has stopped asking about, which is a
+        // different thing to diagnose.
+        #46 engage_strays: UInt64;
+
+        // How many engagements were rested at the silence deadline: the driver
+        // answered none of the re-issues inside the delivery window, so the
+        // script is declined and nothing is held torqued on the strength of a
+        // silence. A count rather than a story row, because which of the four
+        // reasons declined an engagement is a report kind that does not exist
+        // yet.
+        #47 engage_silences: UInt64;
+
+        // Whether a fault response is carrying this session to rest: set when a
+        // rest-class ending is answered, standing through its stow and the
+        // release the stow owes, cleared when that release confirms. A script
+        // arriving while it stands is refused rather than taken, because torque
+        // comes back on after a fault only on an ask made of a machine that has
+        // already reached the minimum risk condition -- stowed and de-torqued,
+        // which is this flag being clear. Only ever set over a machine that can
+        // leave the phase it is in: a parked session refuses on its own and
+        // never leaves, so entering `parked` clears this wherever the parking
+        // was decided -- a park-class response, a stow re-ranked to one, a
+        // maneuver record that stopped reading as one -- and the script held for
+        // that machine is answered `parked`, which is the truer of the two
+        // reasons.
+        #48 ending_by_fault: Bool;
     }
 }

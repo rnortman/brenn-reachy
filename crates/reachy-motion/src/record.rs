@@ -18,6 +18,12 @@
 //! The margins cross rather than being re-solved: they are what a first move's
 //! clearance is measured against, and the seeds a solve would need are not in
 //! the slot.
+//!
+//! Nothing outside this module's own tests reads or writes one today: the
+//! engagement that used to bracket itself with a pair of these is one grouped
+//! cycle in the driver, and it takes no pose from the session. What is left is a
+//! schema and an API with no live caller.
+//! TODO(arm-record-retirement)
 
 use nalgebra::Isometry3;
 

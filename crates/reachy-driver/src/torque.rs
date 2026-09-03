@@ -34,9 +34,10 @@ use crate::state::DriverStateError;
 ///
 /// The vocabulary declares the empty set first and then one value per row, so
 /// row `n` is variant `n + 1`; a tenth servo declared there is a tenth row here
-/// with no edit. This is the only place in the crate that turns a row number
-/// into a set, so nothing else has a masking convention to get wrong.
-const ROW_FLAGS: [JointFlags; JOINT_COUNT] = {
+/// with no edit. This is the crate's one table turning a row number into a set,
+/// so nothing else has a masking convention to get wrong; [`crate::engage`]
+/// takes its differences over it for the same reason.
+pub(crate) const ROW_FLAGS: [JointFlags; JOINT_COUNT] = {
     let mut rows = [JointFlags::NONE; JOINT_COUNT];
     let mut row = 0;
     while row < JOINT_COUNT {

@@ -17,7 +17,6 @@ rust_library(
         "//motion:bus_txn_clk_rs",
         "//motion:commission_clk_rs",
         "//motion:disarm_clk_rs",
-        "//motion:engage_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:timeline_clk_rs",
         "//motion:poll_clk_rs",

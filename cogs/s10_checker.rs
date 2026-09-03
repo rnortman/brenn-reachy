@@ -12,7 +12,6 @@
 
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__driver__health_clk_rs::EventKind;
 use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, ResponseKindWire};
@@ -43,20 +42,7 @@ fn main() -> ExitCode {
 
         // Four phase changes and no more, ending parked: a fifth would be a
         // session that did something with a machine it had let go of.
-        let phases = check::phases(
-            run,
-            &[
-                (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
-                (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
-                (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
-                (SessionPhaseWire::PARKED, SessionPhaseWire::ACTIVE),
-            ],
-            failures,
-        );
-        let engaged = phases
-            .get(2)
-            .zip(phases.get(3))
-            .map(|(&taken, &released)| check::Engaged { taken, released });
+        let engaged = check::parked_life(run, failures);
         if let Some(engaged) = engaged
             && engaged.released != bus_failure_cycle()
         {

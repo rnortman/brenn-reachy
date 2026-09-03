@@ -123,6 +123,7 @@ pub(crate) fn every_fault() -> Vec<Fault> {
         Fault::AntennaObstructed {
             joint: JointRef::AntennaLeft,
             error: -0.418,
+            count: 30,
         },
         Fault::AntennaServoFault {
             joint: JointRef::AntennaRight,
@@ -132,6 +133,7 @@ pub(crate) fn every_fault() -> Vec<Fault> {
         Fault::HeadObstructed {
             joint: JointRef::Leg3,
             error: 0.204,
+            count: 10,
         },
         Fault::HeadServoFault {
             joint: JointRef::BodyYaw,
@@ -212,11 +214,6 @@ impl Asked {
     /// The servo it is addressed to.
     pub(crate) fn id(&self) -> u8 {
         self.context.id
-    }
-
-    /// The register it names, where it names one.
-    pub(crate) fn reg(&self) -> Option<RegId> {
-        self.context.reg
     }
 }
 

@@ -169,6 +169,14 @@ pub const BUS_WATCHDOG: i64 = 10;
 /// torqued indefinitely.
 pub const SCRIPT_SPAN_CAP_MS: i64 = 600_000;
 
+/// How old a retained rail reading may be and still be gated on, nanoseconds.
+///
+/// Mirrors the deployed `SessionParams.rail_stale_after_ns`: two laps of the
+/// driver's health rotation. A row older than this is re-read by the resting
+/// watch before the torque-on gate is judged, which is the only thing that puts
+/// an aux transaction on an engagement's path.
+pub const RAIL_STALE_AFTER_NS: i64 = 2_200_000_000;
+
 /// How long the session may go without executing: the floor its wake condition
 /// puts under a run where nothing arrives, nanoseconds.
 ///
@@ -535,27 +543,38 @@ pub fn commission_allowance_cycles() -> i64 {
     3 * commission_transactions()
 }
 
-/// How many transactions taking hold of the machine spends.
+/// How many driver cycles taking hold of the machine costs.
 ///
-/// Three sweeps of the bus for the watch -- the positions, the supply and the
-/// error bits, which are what the two torque-on gates judge -- and three for the
-/// engagement, which writes every goal, enables every servo and reads all nine
-/// back. Derived from the machine's own row count, so a bus that grew a servo
-/// widens this with it.
+/// Two: one for the driver to act on the ask, one for its answer to arrive.
+/// The engagement issues no aux transaction at all -- the torque-on gate is
+/// arithmetic over the rail picture the session keeps.
 #[must_use]
-pub fn engage_transactions() -> i64 {
-    6 * reachy_motion::joints::ROW_COUNT as i64
+pub fn engage_cycles() -> i64 {
+    2
+}
+
+/// How many aux transactions the fallback rail re-read spends over `rows` rows.
+///
+/// Two per row -- the supply and the error byte -- and only for the rows the
+/// driver's health rotation has left older than `rail_stale_after_ns`. Zero on
+/// an engagement whose picture is fresh, which is every engagement in normal
+/// operation.
+#[must_use]
+pub fn rail_watch_transactions(rows: i64) -> i64 {
+    2 * rows
 }
 
 /// How many cycles a run must allow for taking hold of the machine.
 ///
 /// An allowance and not an expectation, on [`commission_allowance_cycles`]'s
-/// arithmetic and for its reasons. A scenario that wants to know the arming
-/// *finished* asserts the phase it ended in, and every instant derived from this
-/// is an outer bound on when the machine can be under command.
+/// arithmetic and for its reasons: the two cycles above, plus a whole fallback
+/// re-read of every row in case the picture has gone stale, at three cycles a
+/// transaction. A scenario that wants to know the arming *finished* asserts the
+/// phase it ended in, and every instant derived from this is an outer bound on
+/// when the machine can be under command.
 #[must_use]
 pub fn engage_allowance_cycles() -> i64 {
-    3 * engage_transactions()
+    3 * (engage_cycles() + rail_watch_transactions(reachy_motion::joints::ROW_COUNT as i64))
 }
 
 /// How many cycles a run must allow for the orderly release.
@@ -704,6 +723,7 @@ pub fn check_params(
             ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
             ("bus_watchdog", Value::Int(BUS_WATCHDOG)),
             ("script_span_cap_ms", Value::Int(SCRIPT_SPAN_CAP_MS)),
+            ("rail_stale_after_ns", Value::Int(RAIL_STALE_AFTER_NS)),
         ],
         &mut failures,
     );

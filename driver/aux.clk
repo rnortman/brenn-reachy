@@ -99,3 +99,29 @@ schema TorqueConfirmState
         #4 said_unconfirmed: Bool;
     }
 }
+
+// An engagement the host asked for: the rows to take hold of, and how long the
+// request has been waiting for a cycle whose grouped read answered them all.
+//
+// One request, not a queue: the host that issues one is the session, it issues
+// the engagement of a session once, and a re-issue is the same rows again --
+// which is liveness on a lossy link and never a second engagement.
+//
+// A slot nothing wrote reads as no engagement asked for, which is what a driver
+// that has just started is.
+schema EngageRequestState
+{
+    uuid: a64a1768-c8fd-4da3-ba56-4bdc16bec64d;
+    fields
+    {
+        // The servos to take hold of. Meaningful only while `pending`.
+        #0 rows: joints::JointFlags;
+
+        // How many cycles the request has waited for a grouped read that
+        // answered every row it names. Meaningful only while `pending`.
+        #1 cycles: UInt32;
+
+        // Whether an engagement is asked for.
+        #2 pending: Bool;
+    }
+}

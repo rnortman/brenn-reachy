@@ -22,13 +22,13 @@
 //! flight is the slot's `aux` field, which is exactly what a re-issue needs:
 //! the datagram's own fields, when it last went out, and how many times it has.
 //!
-//! Four sequences are driven here, and which one a wake steps is read off the
+//! Three sequences are driven here, and which one a wake steps is read off the
 //! phase: the survey a process runs once before anything is torqued, the resting
-//! watch and the engagement that take hold of the machine after a script is
-//! accepted, and the orderly release that lets go of it when the schedule has
-//! run out. All four take the same three steps in the same order -- settle what
-//! is outstanding, step once, publish what the step asked for -- and differ only
-//! in what their endings mean.
+//! watch that re-reads a stale rail row on the way into an engagement, and the
+//! orderly release that lets go of the machine when the schedule has run out.
+//! All three take the same three steps in the same order -- settle what is
+//! outstanding, step once, publish what the step asked for -- and differ only in
+//! what their endings mean.
 //!
 //! One thing driven here is no sequence at all: the group-scoped de-torque, one
 //! verified write per wake over the same outstanding-transaction machinery. It
@@ -36,11 +36,13 @@
 //! only servos to make let go of -- so it settles its own write and the slot
 //! says whose answer an outcome is.
 //!
-//! The watch and the engagement are one arm of the phase machine and not two.
-//! The engagement plans from where the machine actually is, and a limp head
-//! moves under a hand, so the watch that measures it runs immediately before and
-//! hands its posture over inside the same wake it ends on: nothing waits, and
-//! there is no instant at which a stale pose could be pinned.
+//! Taking hold of the machine is no sequence at all, and that is the point. The
+//! torque-on gate is arithmetic over the rail picture this module keeps from the
+//! driver's health rotation, and what it clears is one datagram: the driver pins
+//! the goal registers, enables torque and reads the enable back inside a single
+//! cycle of its own, and answers with an event. So the engaging phase's whole
+//! bus traffic is that datagram -- and, on the rare wake whose picture has a row
+//! two laps old, the two reads the watch spends on it first.
 
 use core::time::Duration;
 
@@ -58,10 +60,10 @@ use clockwork_rs::SyncTime;
 use reachy_kin::EnvelopeConfig;
 use reachy_motion::arm;
 use reachy_motion::arm::{
-    ArmConfig, CommissionSequencer, EXPECTED_OPERATING_MODES, EngageSequencer, EngageSummary,
-    PollCadence, PollSequencer, Posture, ProfileConfig, ProvisionExpect, ProvisionTable, Rail,
-    SERVO_IDS, VENDOR_HOMING_OFFSETS,
+    ArmConfig, CommissionSequencer, EXPECTED_OPERATING_MODES, PollSequencer, ProfileConfig,
+    ProvisionExpect, ProvisionTable, Rail, SERVO_IDS, VENDOR_HOMING_OFFSETS, engage_gates,
 };
+use reachy_motion::cells::{self, RailRecord};
 use reachy_motion::disarm::{
     DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE, DisarmConfig, DisarmSequencer, DisarmSummary,
     stow_targets,
@@ -226,6 +228,8 @@ pub struct Timing {
     pub aux_timeout_ns: i64,
     /// How many re-issues before the sequence is handed a silence.
     pub aux_retries: u32,
+    /// How old a retained rail reading may be and still be gated on.
+    pub rail_stale_after_ns: i64,
 }
 
 /// A transaction as it crosses out of the sequencer's slot.
@@ -352,6 +356,14 @@ pub struct Turn {
     pub unreleased: Option<JointRef>,
     /// What the release found, on the wake the session ended.
     pub ended: Option<Ended>,
+    /// The rows to take hold of, where this turn asked the driver for an
+    /// engagement. Every row the torque-on gate passed; the caller publishes the
+    /// one datagram that asks for them.
+    pub engage: Option<JointFlags>,
+    /// Whether this turn rested an engagement the driver never answered. The
+    /// caller counts it: four things decline an engagement and the timeline
+    /// tells them apart by nothing yet.
+    pub silenced: bool,
 }
 
 /// What the orderly release measured before torque came off.
@@ -404,6 +416,8 @@ impl Turn {
             release: false,
             unreleased: None,
             ended: None,
+            engage: None,
+            silenced: false,
         }
     }
 }
@@ -456,10 +470,44 @@ pub fn run(
 
     match live {
         Live::Commission => commission(slot, prior, now, &mut turn),
-        Live::Poll => poll(slot, prior, now, &mut turn),
-        Live::Engage => engage(slot, prior, now, &mut turn),
+        Live::Engage => engage(slot, prior, now, timing, &mut turn),
         Live::Disarm => letting_go(slot, prior, now, &mut turn),
     }
+    turn
+}
+
+/// Take an engagement's first bus step, outside a wake's ordinary turn.
+///
+/// The `Live::Engage` arm entered with no prior answer -- the same code [`run`]
+/// dispatches to -- for the one caller that reaches `ENGAGING` after this wake's
+/// turn at the bus has already been taken: the drain that applies a script held
+/// across a maneuver's ending. The engagement's first step is the gate and then
+/// either the `engage_now` or the fallback poll's first read, and readiness is
+/// the whole requirement, so it goes out on the wake the phase moved rather than
+/// on the next one.
+///
+/// Nothing may be outstanding when this is called: the wake's turn is what would
+/// have left something, and the drain reaches here only on a wake whose turn
+/// issued nothing at all.
+pub fn open_engagement(slot: &mut SessionStateWire, now_ns: i64, timing: &Timing) -> Turn {
+    debug_assert!(
+        !slot.aux().active(),
+        "an engagement's first step is taken on a wake that issued nothing",
+    );
+    let mut turn = Turn::quiet();
+    let Ok(since_epoch) = duration_from_nanos(now_ns) else {
+        return turn;
+    };
+    engage(
+        slot,
+        None,
+        Now {
+            ns: now_ns,
+            since_epoch,
+        },
+        timing,
+        &mut turn,
+    );
     turn
 }
 
@@ -509,11 +557,10 @@ pub fn last_instant(schedule: &SessionScheduleWire) -> Option<i64> {
 
 /// Which sequence the phase this slot is in drives, or that it drives none.
 ///
-/// The phase is the authority and `seq_kind` only says how far along the arm is:
-/// an engaging machine is watching itself if no engagement has started and
-/// engaging if one has, which is what makes the watch and the engagement one arm
-/// rather than two phases. Resting, active and the two endings drive nothing
-/// over the bus.
+/// The phase is the whole of it: an engaging machine is judging its torque-on
+/// gate and asking the driver to take hold, and the resting watch it may fall to
+/// on the way is a step of that arm rather than a phase of its own. Resting,
+/// active and the two endings drive nothing over the bus.
 ///
 /// A starting session drives nothing until the driver has published a sample it
 /// could read. A transaction issued before then goes to a process whose loop has
@@ -527,10 +574,7 @@ pub fn last_instant(schedule: &SessionScheduleWire) -> Option<i64> {
 fn live(slot: &SessionStateWire) -> Option<Live> {
     match slot.phase() {
         SessionPhaseWire::STARTING => slot.saw_sample().then_some(Live::Commission),
-        SessionPhaseWire::ENGAGING => match slot.seq_kind() {
-            SeqKindWire::ENGAGE => Some(Live::Engage),
-            _ => Some(Live::Poll),
-        },
+        SessionPhaseWire::ENGAGING => Some(Live::Engage),
         SessionPhaseWire::STOPPING => Some(Live::Disarm),
         _ => None,
     }
@@ -605,7 +649,6 @@ fn pending_of(slot: &SessionStateWire, kind: SeqKindWire) -> Txn {
     match kind {
         SeqKindWire::COMMISSION => Txn::of(slot.commission().pending()),
         SeqKindWire::POLL => Txn::of(slot.poll().pending()),
-        SeqKindWire::ENGAGE => Txn::of(slot.engage().pending()),
         _ => Txn::of(slot.disarm().pending()),
     }
 }
@@ -626,9 +669,8 @@ fn let_go(slot: &mut SessionStateWire, turn: &mut Turn) {
 enum Live {
     /// The survey, before anything is torqued.
     Commission,
-    /// The resting watch that measures where the machine is standing.
-    Poll,
-    /// The engagement that takes hold of it there.
+    /// The engagement: the torque-on gate, the rail re-read it may fall to, and
+    /// the one datagram that asks the driver to take hold.
     Engage,
     /// The orderly release that lets go of it.
     Disarm,
@@ -657,7 +699,15 @@ fn commission(slot: &mut SessionStateWire, prior: Option<BusResult>, now: Now, t
         // configured for. Nothing was torqued to get here and nothing is now:
         // the machine is limp, commissioned, and waiting to be asked for
         // something.
-        Some(Ending::Done(_)) => SessionPhaseWire::RESTING,
+        //
+        // Its own rail readings seed the picture the torque-on gate judges, so
+        // the machine is never at rest with an empty one: the first wake after
+        // this gates on numbers this survey read rather than waiting on the
+        // driver's rotation to lap.
+        Some(Ending::Done(summary)) => {
+            merge_rail(slot, &summary.rail, flags::all(), now.ns);
+            SessionPhaseWire::RESTING
+        }
         // The survey refused the machine. Nothing was torqued, so there is no
         // maneuver to run and nothing to make safe: the verdict stays in the
         // snapshot, the phase latches, and only an operator restarting the
@@ -671,105 +721,157 @@ fn commission(slot: &mut SessionStateWire, prior: Option<BusResult>, now: Now, t
     turn.entered = Some(enter(slot, entered));
 }
 
-/// Step the resting watch, and hand its posture to the engagement it ends on.
+/// Take the engagement's turn: the silence deadline, the rail re-read it may
+/// have fallen to, and the torque-on gate.
 ///
-/// The sweep asks about the positions and the rail together, because what it is
-/// feeding is a torque-on gate: the supply floor and the latched error bits are
-/// judged from these readings and from nothing else, so a sweep that carried an
-/// older rail forward would gate an engagement on a supply nobody just looked at.
+/// The whole of what the wake path does over the bus, and by design it is
+/// arithmetic in the ordinary case: the gate judges the rail picture the session
+/// keeps from the driver's health rotation, and what it clears is one datagram
+/// asking the driver to take hold of the rows it passed. The driver answers with
+/// one of three events, which the caller reads.
 ///
-/// A refused sweep leaves the machine resting. Nothing was written in either
-/// direction -- a watch reads -- so there is nothing to undo, and a posture
-/// nobody could place is a reason to decline the script rather than a condition
-/// of the machine.
-fn poll(slot: &mut SessionStateWire, prior: Option<BusResult>, now: Now, turn: &mut Turn) {
-    let fresh = !matches!(slot.seq_kind(), SeqKindWire::POLL);
-    let action = {
-        let snap = slot.poll_mut();
-        watch(snap, fresh, now.since_epoch, prior.as_ref())
-    };
-
-    match paced(slot, SeqKindWire::POLL, action, now, &mut turn.delivery) {
-        None => {}
-        Some(Ending::Done(posture)) => begin(slot, &posture, now, turn),
-        Some(Ending::Failed) => turn.entered = Some(enter(slot, SessionPhaseWire::RESTING)),
-    }
-}
-
-/// Start the engagement at the posture the watch just measured, and take its
-/// first step.
+/// The order is the safety order. The deadline first, because a driver that has
+/// answered nothing is one to stop asking rather than one to ask again; then the
+/// re-read, because a row nobody has looked at for two laps of the rotation is
+/// not a row to gate on; then the gate, whose refusal is the script declined
+/// with nothing written in either direction. The re-read and the gate belong to
+/// the first ask alone: once the datagram is on the wire the gate has passed and
+/// the wake's whole business is asking again.
 ///
-/// In the watch's own wake, because the posture is only as good as the instant it
-/// was read at: a hand can move a limp head, and an engagement that pinned a
-/// pose measured a wake ago would pin the head where it was rather than where it
-/// is.
-fn begin(slot: &mut SessionStateWire, posture: &Posture, now: Now, turn: &mut Turn) {
-    slot.set_seq_kind(SeqKindWire::ENGAGE);
-    let cfg = default_motion_config();
-    let (action, wrote) = {
-        let snap = slot.engage_mut();
-        let mut seq = EngageSequencer::start(arm_config(), &cfg.geom, &cfg.fk, snap, posture);
-        let action = seq.next(now.since_epoch, None);
-        (action, seq.torque_written())
-    };
-    settled(slot, action, wrote, now, turn);
-}
-
-/// Step the engagement.
-///
-/// A snapshot that will not read back as an engagement is answered with the
-/// release, which is what the sequencer's own resume contract asks of a caller:
-/// the numbers a resumed engagement would write to nine servos are the ones that
-/// would not read back, and the machine may be holding torque already. Refusing
-/// it and letting go is the only answer that consults nothing from the slot.
-fn engage(slot: &mut SessionStateWire, prior: Option<BusResult>, now: Now, turn: &mut Turn) {
-    let cfg = default_motion_config();
-    let stepped = {
-        let snap = slot.engage_mut();
-        match snap.validate_mut() {
-            Ok(state) => match EngageSequencer::resume(arm_config(), &cfg.geom, &cfg.fk, state) {
-                Ok(mut seq) => {
-                    let action = seq.next(now.since_epoch, prior.as_ref());
-                    Some((action, seq.torque_written()))
-                }
-                Err(_) => None,
-            },
-            Err(_) => None,
-        }
-    };
-
-    let Some((action, wrote)) = stepped else {
-        let_go(slot, turn);
-        return;
-    };
-    settled(slot, action, wrote, now, turn);
-}
-
-/// Act on what an engagement's step asked for.
-///
-/// `wrote` is whether an enable write has gone out, which is the whole of what a
-/// failure turns on: before it the machine is exactly where it was and the
-/// script is simply declined, and after it servos may be holding with nothing
-/// driving them, which is a machine to let go of and latch.
-fn settled(
+/// A wake past the gate re-issues the same `engage_now`, over the rows the gate
+/// passed. That is liveness to the driver and draws the same answer again, which
+/// is what makes a lost answer heal on the next wake -- and it is why nothing
+/// here is ever held torqued on the strength of a silence: the driver's own
+/// dead-man takes torque off a machine whose session has stopped re-issuing.
+fn engage(
     slot: &mut SessionStateWire,
-    action: SeqAction<EngageSummary>,
-    wrote: bool,
+    prior: Option<BusResult>,
     now: Now,
+    timing: &Timing,
     turn: &mut Turn,
 ) {
-    match paced(slot, SeqKindWire::ENGAGE, action, now, &mut turn.delivery) {
-        None => {}
-        // Nine servos are holding where they stood. What happens to them from
-        // here is the schedule's.
-        Some(Ending::Done(_)) => turn.entered = Some(enter(slot, SessionPhaseWire::ACTIVE)),
-        Some(Ending::Failed) if wrote => let_go(slot, turn),
+    // The driver answered none of the re-issues inside the delivery window.
+    // Nothing is held torqued on the strength of a silence: the session stops
+    // asking and rests, and the driver's own dead-man takes torque off a machine
+    // whose session has stopped feeding it.
+    //
+    // Which of the four reasons declined an engagement -- this silence, the
+    // gate, the fallback sweep, the driver's own `engage_declined` -- is a
+    // report kind that does not exist, so what distinguishes this one is the
+    // count the caller keeps.
+    // TODO(engagement-declined-narration)
+    if silent_too_long(slot, now.ns, timing) {
+        debug_assert!(
+            !matches!(slot.seq_kind(), SeqKindWire::POLL),
+            "the deadline measures asking, and a sweep runs only before the first ask",
+        );
+        slot.set_engage_pending(false);
+        turn.silenced = true;
+        turn.entered = Some(enter(slot, SessionPhaseWire::RESTING));
+        return;
+    }
+
+    if matches!(slot.seq_kind(), SeqKindWire::POLL) {
+        let action = {
+            let snap = slot.poll_mut();
+            watch(snap, false, now.since_epoch, prior.as_ref())
+        };
+        match paced(slot, SeqKindWire::POLL, action, now, &mut turn.delivery) {
+            // The sweep is mid-flight: its transaction is this wake's datagram.
+            None => return,
+            // Only the rows the sweep was named for: it hands back zero for
+            // every other row, and a row nobody read is not a row to write a
+            // reading for.
+            Some(Ending::Done(rail)) => {
+                let read = swept_rows(slot);
+                merge_rail(slot, &rail, read, now.ns);
+            }
+            // Nothing was written in either direction -- a watch reads -- so
+            // there is nothing to undo, and a rail nobody could read is a
+            // reason to decline the script rather than a condition of the
+            // machine.
+            Some(Ending::Failed) => {
+                slot.set_engage_pending(false);
+                turn.entered = Some(enter(slot, SessionPhaseWire::RESTING));
+                return;
+            }
+        }
+    }
+
+    // An ask already on the wire is asked again verbatim, and nothing about the
+    // picture is looked at twice. The gate passed for these rows and the driver
+    // may be holding torque on the strength of it: the re-issue is the only
+    // thing feeding its dead-man, so a sweep started here would stop the
+    // datagram for as long as it ran while the deadline kept running from the
+    // first issue, and a gate re-judged over a picture that has since aged out
+    // would rest a session whose machine is holding. A reading that says
+    // something is wrong with a servo is a condition, and the ladder answers it
+    // wherever the session is.
+    if slot.engage_issued().as_nanos() != 0 {
+        turn.engage = slot.engage_rows().to_known();
+        return;
+    }
+
+    let (picture, stale) = rail_picture(slot, now.ns, timing.rail_stale_after_ns);
+    if !flags::is_empty(stale) {
+        let action = {
+            let snap = slot.poll_mut();
+            start_watch(snap, stale, now.since_epoch)
+        };
+        paced(slot, SeqKindWire::POLL, action, now, &mut turn.delivery);
+        return;
+    }
+
+    match engage_gates(arm_config(), &picture) {
         // Nothing was torqued, so the machine is where it was and the phase is
         // the whole of what the record carries: why the engagement was declined
         // is a report kind that does not exist.
         // TODO(engagement-declined-narration)
-        Some(Ending::Failed) => turn.entered = Some(enter(slot, SessionPhaseWire::RESTING)),
+        Err(_) => {
+            slot.set_engage_pending(false);
+            turn.entered = Some(enter(slot, SessionPhaseWire::RESTING));
+        }
+        Ok(degraded) => {
+            let rows = flags::without(flags::all(), degraded);
+            slot.set_engage_rows(JointFlagsWire::from(rows));
+            slot.set_engage_issued(SyncTime::from_nanos(now.ns));
+            turn.engage = Some(rows);
+        }
     }
+}
+
+/// Whether an engagement asked for has gone unanswered past its whole delivery
+/// budget.
+///
+/// Measured from the first issue and not from the last, because every wake
+/// re-issues: a deadline that moved with the re-issues would never arrive. What
+/// it bounds is the asking. The machine is not holding anything on the strength
+/// of this silence -- the driver either wrote torque and said so, or wrote
+/// nothing -- and a driver that wrote torque and lost its answer has its own
+/// dead-man to take it off once the re-issues stop.
+fn silent_too_long(slot: &SessionStateWire, now_ns: i64, timing: &Timing) -> bool {
+    let issued = slot.engage_issued().as_nanos();
+    if issued == 0 {
+        return false;
+    }
+    let budget = timing
+        .aux_timeout_ns
+        .saturating_mul(i64::from(timing.aux_retries) + 1);
+    now_ns.saturating_sub(issued) >= budget
+}
+
+/// Start the resting watch over `rows` and ask for its first read.
+fn start_watch(
+    snap: &mut PollSnapWire,
+    rows: JointFlags,
+    now: Duration,
+) -> SeqAction<reachy_motion::arm::Rail> {
+    let mut seq = PollSequencer::start(arm_config(), snap, rows);
+    // A fresh sequence is told nothing, whatever answer was in hand: the
+    // sequencer contract is that the first call carries no prior, and an answer
+    // to the old sequence's transaction is an answer to a question this one
+    // never asked.
+    seq.next(now, None)
 }
 
 /// Step the orderly release: settle, measure, let go.
@@ -889,15 +991,17 @@ fn conclude(slot: &mut SessionStateWire) {
 /// a wake that already owes one needs no keep-alive -- the caller publishes at
 /// most one message either way.
 ///
-/// Two windows are covered, and they are exactly the two in which nothing
-/// streams to a machine that may be holding: from an engagement's first enable
-/// write until it ends, which is the arming itself, and the whole of the
-/// release, whose two-second settle sits under held torque with nothing
-/// commanding the machine at all and is an order of magnitude past the hold
-/// timeout. The first closes when the engagement concludes, which is the wake
-/// the schedule saying the machine is under command goes out on; the second
-/// closes when the release writes conclude, because concluding is what leaves
-/// the phase.
+/// One window is covered, and it is the one in which nothing streams to a
+/// machine that may be holding: the whole of the release, whose two-second
+/// settle sits under held torque with nothing commanding the machine at all and
+/// is an order of magnitude past the hold timeout. It closes when the release
+/// writes conclude, because concluding is what leaves the phase.
+///
+/// The engagement is deliberately not covered. Torque comes on inside one driver
+/// cycle and the session's re-issued `engage_now` is what feeds the dead-man
+/// until the answer arrives; a keep-alive here would either say what the
+/// re-issue already says or hold the dead-man off a machine the session has
+/// stopped asking about.
 ///
 /// A machine under command is deliberately not covered. The decision tick
 /// streams a goal per sample while a schedule is running -- a holding machine
@@ -909,9 +1013,11 @@ fn conclude(slot: &mut SessionStateWire) {
 #[must_use]
 pub fn keep_alive_owed(slot: &SessionStateWire) -> bool {
     match slot.phase() {
-        SessionPhaseWire::ENGAGING => {
-            matches!(slot.seq_kind(), SeqKindWire::ENGAGE) && slot.engage().torque_written()
-        }
+        // Nothing is owed while the machine is being taken hold of. Before the
+        // gate nothing is torqued, so there is no dead-man to hold off; after it
+        // the re-issued `engage_now` is the liveness, and every wake that owes
+        // one publishes it.
+        SessionPhaseWire::ENGAGING => false,
         SessionPhaseWire::STOPPING => true,
         _ => false,
     }
@@ -1157,36 +1263,143 @@ fn act(
 ///
 /// Started over rather than refused, for the commissioning sweep's reason and
 /// more plainly: a watch writes nothing in either direction, so a fresh one
-/// costs nine reads and establishes the pose an engagement plans from, where a
-/// refusal would leave a script declined over a slot rather than over a machine.
+/// costs two reads per row it was named for and establishes the readings the
+/// torque-on gate judges, where a refusal would leave a script declined over a
+/// slot rather than over a machine. A sweep started over here is named for every
+/// row, because the mask the stale rows made is exactly what the slot no longer
+/// says.
 ///
-/// The rail handed to a fresh sweep is empty because this cadence re-reads it:
-/// the readings the torque-on gate judges are the ones this sweep is about to
-/// take, and a sweep that carried numbers forward would be gating on a supply
-/// nobody just looked at. A sweep that does not complete never reaches that
-/// gate.
+/// What the gate sees is never half a picture: the rows this sweep reads are
+/// merged into the picture the session keeps, and the gate is judged over that.
 fn watch(
     snap: &mut PollSnapWire,
     fresh: bool,
     now: Duration,
     prior: Option<&BusResult>,
-) -> SeqAction<Posture> {
+) -> SeqAction<Rail> {
     if !fresh
         && let Ok(state) = snap.validate_mut()
         && let Ok(mut seq) = PollSequencer::resume(arm_config(), state)
     {
         return seq.next(now, prior);
     }
-    let mut seq = PollSequencer::start(
-        arm_config(),
-        snap,
-        Rail {
-            voltages: [0.0; ROW_COUNT],
-            health: SERVO_IDS.map(|id| ServoHealth { id, bits: 0 }),
-        },
-        PollCadence::PositionsAndRail,
-    );
-    seq.next(now, None)
+    start_watch(snap, flags::all(), now)
+}
+
+/// The rail picture the gate judges, and the rows too old to judge from.
+///
+/// One reading per servo, kept from the driver's health rotation and seeded by
+/// the commissioning survey. A row unseen or older than `stale_after_ns` is
+/// named in the second answer: it is re-read before the gate runs, and its
+/// numbers in the picture are whatever was last recorded, which nothing gates on
+/// until the re-read has replaced them.
+///
+/// A slot that will not read back as a session hands every row over as stale.
+/// The reading is this cog's own memory, so bytes it cannot read are memory gone
+/// wrong -- and the safe answer to a picture that cannot be read is to look at
+/// the machine rather than to gate on it.
+fn rail_picture(slot: &SessionStateWire, now_ns: i64, stale_after_ns: i64) -> (Rail, JointFlags) {
+    let mut picture = Rail {
+        voltages: [0.0; ROW_COUNT],
+        health: SERVO_IDS.map(|id| ServoHealth { id, bits: 0 }),
+    };
+    let Ok(state) = slot.validate() else {
+        return (picture, flags::all());
+    };
+    let mut stale = JointFlags::NONE;
+    for (row, joint) in ROWS.into_iter().enumerate() {
+        let Some(held) = cells::rail_row(&state.rail, joint) else {
+            flags::insert(&mut stale, joint);
+            continue;
+        };
+        if !bool::from(held.seen)
+            || now_ns.saturating_sub(held.sample_time.as_nanos()) > stale_after_ns
+        {
+            flags::insert(&mut stale, joint);
+            continue;
+        }
+        picture.voltages[row] = held.volts;
+        picture.health[row] = ServoHealth {
+            id: SERVO_IDS[row],
+            bits: held.bits,
+        };
+    }
+    (picture, stale)
+}
+
+/// Record one servo's rail reading, with the instant it was taken at.
+///
+/// Every health report the driver's rotation publishes lands here, in every
+/// phase: the picture the torque-on gate judges is kept while the machine rests
+/// rather than read on the wake that needs it, which is what makes engaging one
+/// driver cycle.
+///
+/// The picture alone is read back rather than the whole session: a reading
+/// arrives up to eight times a wake in every phase, and the rail record is nine
+/// rows of four numbers against the largest schema this process carries.
+pub fn record_reading(
+    slot: &mut SessionStateWire,
+    joint: JointRef,
+    bits: u8,
+    volts: f64,
+    at_ns: i64,
+) {
+    let Ok(record) = slot.rail_mut().validate_mut() else {
+        return;
+    };
+    write_reading(record, joint, bits, volts, at_ns);
+}
+
+/// One row of the picture, written in place.
+fn write_reading(record: &mut RailRecord, joint: JointRef, bits: u8, volts: f64, at_ns: i64) {
+    let Some(row) = cells::rail_row_mut(record, joint) else {
+        return;
+    };
+    row.bits = bits;
+    row.volts = volts;
+    row.sample_time = SyncTime::from_nanos(at_ns);
+    row.seen = true.into();
+}
+
+/// Merge what a sweep read into the picture: the commissioning survey's own
+/// readings, or the resting watch's fallback re-read.
+///
+/// `rows` is what the sweep was named for, and nothing outside it is touched. A
+/// sweep hands back zero for every row it did not read, so merging the whole
+/// picture would write a rail of zero volts over rows the driver's rotation had
+/// just reported healthy -- and the gate, judged in the same wake, would refuse
+/// a machine whose supply nobody had said anything against.
+///
+/// The survey is what makes the machine never at rest with an empty picture: it
+/// reads the supply and the error byte of all nine before the first rest, and
+/// those readings are the ones the first wake's gate judges.
+pub fn merge_rail(slot: &mut SessionStateWire, rail: &Rail, rows: JointFlags, at_ns: i64) {
+    let Ok(record) = slot.rail_mut().validate_mut() else {
+        return;
+    };
+    for (row, joint) in ROWS.into_iter().enumerate() {
+        if !flags::contains(rows, joint) {
+            continue;
+        }
+        write_reading(
+            record,
+            joint,
+            rail.health[row].bits,
+            rail.voltages[row],
+            at_ns,
+        );
+    }
+}
+
+/// The rows the sweep in the slot was named for.
+///
+/// Read off the sweep's own snapshot rather than remembered by the caller: a
+/// sweep whose slot no longer reads as one has established nothing, and the
+/// honest merge for it is of no row at all.
+fn swept_rows(slot: &SessionStateWire) -> JointFlags {
+    slot.poll()
+        .validate()
+        .map_or(JointFlags::NONE, |snap| snap.rows)
 }
 
 /// Write the record a re-issue is rebuilt from.
@@ -1208,8 +1421,29 @@ fn record_pending(slot: &mut SessionStateWire, corr: u32, txn: Txn, now_ns: i64)
 /// The one place a phase is written, so a story about a machine changing phase
 /// is the same story wherever the decision was made -- a sequence ending, or a
 /// response taking the machine out of service.
+///
+/// Leaving `engaging` closes whatever ask was open, wherever the leaving was
+/// decided. A fault answered while the machine is being taken hold of moves the
+/// phase from outside the engagement's own arm -- a rest-class response, a park
+/// -- and the driver's answer to the ask already on the wire arrives a wake or
+/// two later. Answered against a standing `engage_pending` it would take a
+/// parked machine active, which nothing may do until an operator has been, so
+/// the ask is closed here: the answer is then a stray and is counted as one.
+///
+/// Entering `parked` clears `ending_by_fault`, wherever the parking was decided
+/// -- the ladder's own park endings, a stow re-ranked to one, a maneuver record
+/// that stopped reading as a maneuver. The flag says a fault is carrying this
+/// session to rest; a parked session is on its way nowhere, and the script held
+/// for it is answered `parked`, which is the truer of the two reasons.
 pub fn enter(slot: &mut SessionStateWire, to: SessionPhaseWire) -> Entered {
     let from = slot.phase();
+    if from == SessionPhaseWire::ENGAGING && to != SessionPhaseWire::ENGAGING {
+        slot.set_engage_pending(false);
+        slot.set_engage_issued(SyncTime::from_nanos(0));
+    }
+    if to == SessionPhaseWire::PARKED {
+        slot.set_ending_by_fault(false);
+    }
     slot.set_phase(to);
     Entered { to, from }
 }
@@ -1226,12 +1460,76 @@ mod tests {
     //! mismatch here rather than a register written wrong on a bus.
 
     use super::{
-        BusResult, JointFlagsWire, JointRef, ProfileConfig, Timing, Txn, degrade, degrade_rows,
-        flags, init_arm_config, record_pending,
+        BusResult, JointFlagsWire, JointRef, ProfileConfig, Rail, ServoHealth, SessionPhaseWire,
+        Timing, Txn, degrade, degrade_rows, enter, flags, init_arm_config, merge_rail,
+        rail_picture, record_pending,
     };
     use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
+
+    /// The survey's own readings seed the picture the torque-on gate judges, row
+    /// for row and stamped with the instant they were merged at.
+    ///
+    /// What makes the first wake after a boot cost one datagram: the commission
+    /// ends by merging its summary, so a machine at rest is never at rest with an
+    /// empty picture waiting on the driver's rotation to lap. Row for row,
+    /// because the gate judges each row's own supply and error byte -- a merge
+    /// that spread one row's numbers over nine would gate every row on one
+    /// servo's answer.
+    #[test]
+    fn a_surveys_own_readings_seed_the_gates_picture_row_for_row() {
+        let mut slot = SessionStateWire::new();
+        let surveyed = Rail {
+            voltages: [7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9],
+            health: core::array::from_fn(|row| ServoHealth {
+                id: 10 + row as u8,
+                bits: row as u8,
+            }),
+        };
+
+        merge_rail(&mut slot, &surveyed, flags::all(), 4_000);
+        let (picture, stale) = rail_picture(&slot, 5_000, 2_000);
+
+        assert!(
+            flags::is_empty(stale),
+            "every row was seen, at the instant the merge was told",
+        );
+        assert_eq!(picture.voltages, surveyed.voltages);
+        for (row, health) in picture.health.into_iter().enumerate() {
+            assert_eq!(
+                health.bits, surveyed.health[row].bits,
+                "row {row} carries its own error byte",
+            );
+        }
+        let (_, aged) = rail_picture(&slot, 7_000, 2_000);
+        assert_eq!(
+            aged,
+            flags::all(),
+            "and the stamp is the merge's, so the whole picture ages together",
+        );
+    }
+
+    /// Entering `parked` leaves no fault ending standing, whatever decided the
+    /// parking.
+    ///
+    /// The flag says a fault is carrying this session to rest. A parked session
+    /// is carried nowhere -- nothing engages it until an operator has been -- and
+    /// the paths that park a machine mid-stow reach the phase without the ladder
+    /// answering again, so the clearing belongs to the one place a phase is
+    /// written.
+    #[test]
+    fn entering_parked_clears_a_fault_ending() {
+        let mut slot = SessionStateWire::new();
+        slot.set_phase(SessionPhaseWire::WINDING_DOWN);
+        slot.set_ending_by_fault(true);
+
+        let entered = enter(&mut slot, SessionPhaseWire::PARKED);
+
+        assert_eq!(entered.from, SessionPhaseWire::WINDING_DOWN);
+        assert_eq!(entered.to, SessionPhaseWire::PARKED);
+        assert!(!slot.ending_by_fault());
+    }
 
     /// The size of a transaction record, which is every byte this module copies.
     ///
@@ -1272,6 +1570,7 @@ mod tests {
         Timing {
             aux_timeout_ns: 1_000_000,
             aux_retries: 3,
+            rail_stale_after_ns: 2_200_000_000,
         }
     }
 

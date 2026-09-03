@@ -32,10 +32,13 @@ period_ns: 20000000
 # alone.
 hold_timeout_ns: 200000000
 
-# A health read offered every 500 ms. The slot runs at most one transaction per
-# cycle and a host request outranks it, so this is the spacing when nothing else
-# is asking rather than a promise.
-health_poll_period_ns: 500000000
+# A health read offered every 120 ms, which is the spacing the simulated driver
+# runs and the health channel's depth is sized for. A lap of the nine servos is
+# then about 1.1 s, which is what makes the session's torque-on gate arithmetic
+# over a picture it already holds rather than eighteen reads on the wake path.
+# The slot runs at most one transaction per cycle and a host request outranks
+# it, so this is the spacing when nothing else is asking rather than a promise.
+health_poll_period_ns: 120000000
 
 # The servo bus node on the Reachy Mini's board, and the rate the servos are
 # configured for.

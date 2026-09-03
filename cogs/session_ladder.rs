@@ -95,6 +95,11 @@ impl Budgets {
 /// this host's own timing rather than about the servos, which is what a window
 /// of cycle measurements is.
 ///
+/// The three endings of an engagement are answers and not conditions: the
+/// session asked the driver to take hold of the machine, and each one says what
+/// became of that ask. Which phase each lands the session in is the session's
+/// own, the way a confirmed release is.
+///
 /// A hold timeout says the goal stream went quiet for longer than the driver
 /// waits, and the machine was de-torqued because of it. Nothing here answers it
 /// and the fault vocabulary names no such condition, so it is evidence this
@@ -112,7 +117,10 @@ pub fn fault_of_event(kind: EventKind) -> Option<FaultKind> {
         | EventKind::CycleSkipped
         | EventKind::CycleStats
         | EventKind::GoalDroppedQueueFull
-        | EventKind::GoalStaleOrOutOfOrder => None,
+        | EventKind::GoalStaleOrOutOfOrder
+        | EventKind::EngageConfirmed
+        | EventKind::EngageUnconfirmed
+        | EventKind::EngageDeclined => None,
     }
 }
 
@@ -311,11 +319,17 @@ pub fn owes_release(slot: &SessionStateWire) -> bool {
 ///
 /// Answers whether one was standing, so a confirmation of a release nobody
 /// commanded is not narrated as the end of one.
+///
+/// A fault's ending falls with it. The machine is stowed and de-torqued, which
+/// is the minimum risk condition, so what a script arriving from here asks for
+/// is a fresh engagement of a machine already stood down rather than a retry of
+/// the one that stopped.
 pub fn confirmed(slot: &mut SessionStateWire) -> bool {
     if !slot.torque_off_pending() {
         return false;
     }
     slot.set_torque_off_pending(false);
+    slot.set_ending_by_fault(false);
     true
 }
 

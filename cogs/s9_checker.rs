@@ -113,9 +113,10 @@ fn main() -> ExitCode {
 /// Numbers this file does not own decide both -- how long a survey's presence
 /// sweep takes, and how long the gate gives a commander to speak -- and a move in
 /// either can flip them. A script that arrived while the survey was still
-/// running would be refused as `not_resting`, and every assertion below would
-/// still pass while the run said something else entirely, so the ordering is
-/// asserted rather than described.
+/// running would be held for the phase the survey ends in and refused as
+/// `parked` by the drain instead, and every assertion below would still pass
+/// while the run said something else entirely, so the ordering is asserted
+/// rather than described.
 fn check_the_script_meets_a_parked_machine(failures: &mut Vec<String>) {
     if parked_by_cycle() >= script_sent_cycle() {
         failures.push(format!(

@@ -32,7 +32,9 @@ use brenn_reachy__driver__health_clk_rs::{
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegIdWire, ValueShapeWire};
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
-use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, ResponseKindWire, TickFaultWire};
+use brenn_reachy__motion__faults_clk_rs::{
+    EndingKindWire, FaultKindWire, ResponseKindWire, TickFaultWire,
+};
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointRefWire, JointsWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqKindWire;
@@ -2934,6 +2936,14 @@ const BUS_WATCHDOG: u32 = 10;
 /// refused has to name the ceiling it cut both scripts from.
 const SCRIPT_SPAN_CAP_MS: u32 = 600_000;
 
+/// How old a retained rail reading may be and still be gated on, nanoseconds:
+/// the window `cogs/session_params.textproto` ships.
+///
+/// Restated because the engagement cases turn on it: a case that seeds a
+/// reading and expects the gate to take it, or leaves one out and expects the
+/// fallback to read it, is measuring against this window.
+const RAIL_STALE_AFTER_NS: i64 = 2_200_000_000;
+
 /// The environment variable naming the shipped session configuration, relative
 /// to the runfiles root, which is a test's working directory.
 const SESSION_PARAMS_ENV: &str = "SESSION_PARAMS";
@@ -2977,6 +2987,7 @@ fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() 
         ("profile_velocity", PROFILE_VELOCITY.to_string()),
         ("bus_watchdog", BUS_WATCHDOG.to_string()),
         ("script_span_cap_ms", SCRIPT_SPAN_CAP_MS.to_string()),
+        ("rail_stale_after_ns", RAIL_STALE_AFTER_NS.to_string()),
     ] {
         assert_eq!(
             shipped_session_figure(field),
@@ -3021,6 +3032,7 @@ fn session_params() -> SessionParamsWire {
     params.set_profile_velocity(PROFILE_VELOCITY);
     params.set_bus_watchdog(u8::try_from(BUS_WATCHDOG).expect("the watchdog count is one byte"));
     params.set_script_span_cap_ms(SCRIPT_SPAN_CAP_MS);
+    params.set_rail_stale_after_ns(RAIL_STALE_AFTER_NS);
     params
 }
 
@@ -3038,7 +3050,10 @@ fn session() -> SessionTestWrapper {
     cog.input_fault_set_num_slots(4);
     cog.input_aux_out_set_num_slots(4);
     cog.input_evt_set_num_slots(8);
-    cog.input_readings_set_num_slots(8);
+    // Wider than the channel's own depth, so a case can hand the cog a whole
+    // lap of the driver's rotation between two wakes: the deployment sees one
+    // report per rotation period and never nine at once.
+    cog.input_readings_set_num_slots(16);
     cog.initialize(SyncTime::from_nanos(T0));
     cog.set_config_params(&session_params());
     cog
@@ -3054,6 +3069,9 @@ struct Asked {
     reg: RegIdWire,
     value_kind: ValueShapeWire,
     value: u64,
+    /// The rows an engagement names, as the bits the datagram carries. Zero for
+    /// every other kind of datagram.
+    rows: u16,
 }
 
 /// What one execution asked the driver for, or `None` where it asked nothing.
@@ -3066,6 +3084,7 @@ fn asked(cog: &mut SessionTestWrapper) -> Option<Asked> {
         reg: msg.txn().reg(),
         value_kind: msg.txn().value_kind(),
         value: msg.txn().value(),
+        rows: msg.rows().0,
     })
 }
 
@@ -3111,6 +3130,29 @@ fn reading(id: u8, bits: u8, at_ns: i64) -> HealthReportWire {
     msg.set_bits(bits);
     msg.set_sample_time(SyncTime::from_nanos(at_ns));
     msg
+}
+
+/// Report every servo healthy on a rail of `volts`, as one lap of the driver's
+/// rotation would.
+///
+/// What fills the picture the torque-on gate judges. A case that wants an
+/// engagement to cost nothing but its one datagram calls this first.
+///
+/// Two wakes are spent draining them, because an execution reads at most eight
+/// new reports and a lap of this machine is nine. Answers the instant it left
+/// off, so a case that sends a script next sends it after the lap it depends on.
+fn rail_lap(cog: &mut SessionTestWrapper, volts: f64, at_ns: i64) -> i64 {
+    for id in SERVO_IDS {
+        let mut msg = reading(id, 0, at_ns);
+        msg.set_volts(volts);
+        cog.publish_readings(&msg, SyncTime::from_nanos(at_ns));
+    }
+    let mut at = at_ns;
+    for _ in 0..2 {
+        at += LAPSE_NS;
+        drive(cog, at);
+    }
+    at
 }
 
 /// An outcome as the driver's channel carries it: a ping answered by a servo
@@ -3436,8 +3478,9 @@ fn an_accepted_script_becomes_the_schedule_the_session_holds() {
 
 /// Two scripts in one window are answered one at a time, and the first one
 /// accepted is the schedule the session holds: accepting it is the machine
-/// beginning to arm, and a script arriving mid-engagement is refused rather than
-/// queued or swapped in under a sequence that has started.
+/// beginning to arm, and a script arriving mid-engagement is held for the phase
+/// the engagement ends in rather than swapped in under a sequence that has
+/// started.
 #[test]
 fn the_first_script_accepted_in_a_window_is_the_schedule() {
     let mut cog = resting_session();
@@ -3478,13 +3521,15 @@ fn the_first_script_accepted_in_a_window_is_the_schedule() {
     assert_eq!(entered.kind, ReportKindWire::PHASE_CHANGED);
     assert_eq!(entered.a, u32::from(SessionPhaseWire::ENGAGING.0));
     let second = wake(&mut cog, T0 + 1 + 2 * LAPSE_NS).expect("and the second script's answer");
-    assert_eq!(second.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(second.kind, ReportKindWire::SCRIPT_HELD);
     assert_eq!(second.a, 2);
-    assert_eq!(second.b, u32::from(RefusalReasonWire::NOT_RESTING.0));
+    assert_eq!(second.b, u32::from(SessionPhaseWire::ENGAGING.0));
 
     let state = cog.state_sess();
     assert_eq!(state.scripts_accepted(), 1);
-    assert_eq!(state.scripts_refused(), 1);
+    assert_eq!(state.scripts_refused(), 0);
+    assert!(state.pending_valid(), "the second one is waiting");
+    assert_eq!(state.pending().script_id(), 2);
     assert_eq!(state.script_id(), 1, "the one that was taken");
     let schedule = state.schedule();
     assert_eq!(schedule.epoch(), 1, "the one acceptance bumped it");
@@ -3529,23 +3574,25 @@ fn an_accepted_script_carries_its_overlay_windows() {
     assert_eq!(window.speed(), 1.0);
 }
 
-/// The answer a script gets at a machine that is doing something else: the
-/// default non-resting one, which is what every phase but `active` and `parked`
-/// gives. The phase table those two make is
-/// `the_phases_between_the_two_that_take_a_script_still_refuse`'s.
+/// The answer a script gets at a machine that is doing something else: held,
+/// with the phase it arrived in, and nothing about the machine changed. The
+/// phase table is `a_script_arriving_mid_something_is_held_and_narrated`'s.
 ///
-/// The reason is the whole of what a sender is told, so a screen that answered
-/// the wrong one would send somebody to fix a script that was fine. Each reason
-/// wants its own case for that.
+/// A wake is the next command and never an error, so the one phase that still
+/// refuses is the latched one; every other answer a sender gets is about the
+/// script itself.
 #[test]
-fn a_script_outside_resting_is_refused_with_the_phase_it_found() {
+fn a_script_outside_resting_is_held_with_the_phase_it_found() {
     let mut cog = session();
 
     cog.publish_script(&one_step_script(1, T0), SyncTime::from_nanos(T0));
-    let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
-    assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
-    assert_eq!(report.b, u32::from(RefusalReasonWire::NOT_RESTING.0));
-    assert_eq!(cog.state_sess().scripts_refused(), 1);
+    let report = wake(&mut cog, T0 + 1).expect("a hold is narrated");
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_HELD);
+    assert_eq!(report.a, 1);
+    assert_eq!(report.b, u32::from(SessionPhaseWire::STARTING.0));
+    assert_eq!(cog.state_sess().scripts_refused(), 0);
+    assert_eq!(cog.state_sess().scripts_accepted(), 0, "nothing is engaged");
+    assert!(cog.state_sess().pending_valid());
     assert_eq!(
         cog.state_sess().schedule().epoch(),
         0,
@@ -3562,6 +3609,10 @@ fn a_script_arriving_at_a_parked_machine_is_refused_as_parked() {
     let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
     assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED);
     assert_eq!(report.b, u32::from(RefusalReasonWire::PARKED.0));
+    assert!(
+        !cog.state_sess().pending_valid(),
+        "a parked machine never holds: nothing engages it until an operator has been",
+    );
 }
 
 #[test]
@@ -5161,17 +5212,14 @@ const NOMINAL_VOLTS: f64 = 7.4;
 /// The modelled machine a case answers with.
 ///
 /// Not a plant: nothing here moves, and every read answers with where the stow
-/// pose says the machine is standing. What a case varies is the supply, whether
-/// an enable write is refused -- the two things an engagement's outcome turns on
-/// -- and whether a servo says it let go, which is what a release's turns on.
+/// pose says the machine is standing. What a case varies is the supply and what
+/// the driver says became of an engagement -- the two things its outcome turns
+/// on -- and whether a servo says it let go, which is what a release's turns on.
 struct Bus {
     /// What every servo's supply reads.
     volts: f64,
-    /// Which torque-enable write to answer with a servo error, counting from
-    /// one, or `None` to answer them all.
-    refuse_enable: Option<u32>,
-    /// How many enable writes have been asked for.
-    enables: u32,
+    /// What the driver answers an `engage_now` with.
+    engaged: EventKindWire,
     /// Which torque-off write to answer badly, counting from one, and how, or
     /// `None` to acknowledge them all. The servo it names is one whose torque
     /// this session cannot establish: a silence and a servo's own error code are
@@ -5186,8 +5234,7 @@ impl Bus {
     fn healthy() -> Self {
         Self {
             volts: NOMINAL_VOLTS,
-            refuse_enable: None,
-            enables: 0,
+            engaged: EventKindWire::ENGAGE_CONFIRMED,
             refuse_release: None,
             releases: 0,
         }
@@ -5215,18 +5262,11 @@ impl Bus {
                     ),
                     RegIdWire::PRESENT_INPUT_VOLTAGE => value::volts(self.volts),
                     RegIdWire::HARDWARE_ERROR_STATUS => value::u8(0),
-                    other => panic!("the watch reads three registers, not {other:?}"),
+                    other => panic!("the watch reads two registers, not {other:?}"),
                 };
                 msg.set_value_kind(ValueShapeWire::from(held.shape()));
                 msg.set_value(held.bits());
             }
-            // The pin sweep, which takes no read-back: the goal register mirrors
-            // the present position while torque is off, so there is nothing to
-            // answer with but the acknowledgement.
-            AuxOpKindWire::WRITE_REG => match asked.reg {
-                RegIdWire::GOAL_POSITION => {}
-                other => panic!("the pin sweep writes one register, not {other:?}"),
-            },
             AuxOpKindWire::WRITE_REG_VERIFIED => match asked.reg {
                 // The value says which write this is: an arming enables torque
                 // and a release writes the zero, and the two are answered by
@@ -5237,13 +5277,6 @@ impl Bus {
                         && refused == self.releases
                     {
                         msg.set_status(status);
-                    }
-                }
-                RegIdWire::TORQUE_ENABLE => {
-                    self.enables += 1;
-                    if self.refuse_enable == Some(self.enables) {
-                        msg.set_status(AuxStatusWire::SERVO_ERROR);
-                        msg.set_value(1);
                     }
                 }
                 other => panic!("the verified writes are torque, not {other:?}"),
@@ -5288,12 +5321,19 @@ fn sweep(cog: &mut SessionTestWrapper, bus: &mut Bus, from_ns: i64, first: Asked
     let mut asked = first;
     let mut at = from_ns;
     for _ in 0..400 {
-        if asked.kind != SessionCmdKindWire::AUX {
+        // The one datagram that is answered by an event rather than an outcome:
+        // the driver takes hold of the machine in a cycle of its own and says
+        // what became of it.
+        if asked.kind == SessionCmdKindWire::ENGAGE_NOW {
+            at += 1_000_000;
+            cog.publish_evt(&event(bus.engaged, at), SyncTime::from_nanos(at));
+        } else if asked.kind == SessionCmdKindWire::AUX {
+            let outcome = bus.answer(&asked);
+            at += 1_000_000;
+            cog.publish_aux_out(&outcome, SyncTime::from_nanos(at));
+        } else {
             return ran;
         }
-        let outcome = bus.answer(&asked);
-        at += 1_000_000;
-        cog.publish_aux_out(&outcome, SyncTime::from_nanos(at));
         at += 1_000_000;
         let published = drive(cog, at);
         ran.told.extend(said(cog));
@@ -5316,13 +5356,16 @@ fn engagement(cog: &mut SessionTestWrapper, bus: &mut Bus) -> Ran {
     sweep(cog, bus, FIRST_WAKE, first)
 }
 
-/// An accepted script takes the machine out of resting and reads where it is
-/// standing, in the same wake.
+/// An accepted script takes the machine out of resting and takes the
+/// engagement's first bus step, in the same wake.
 ///
 /// Both halves matter. The phase moves because a script the machine cannot take
 /// is refused, so a second script arriving now is answered rather than queued;
-/// and the first read goes out on the accepting wake because the pose an
-/// engagement pins is only as good as the instant it was measured at.
+/// and the first step goes out on the accepting wake because readiness is the
+/// whole requirement. This case's slot was written to resting rather than
+/// commissioned, so its rail picture is empty and that first step is the
+/// fallback re-read; an engagement over a fresh picture asks for the
+/// `engage_now` itself.
 #[test]
 fn an_accepted_script_starts_the_resting_watch_on_the_same_wake() {
     let mut cog = resting_session();
@@ -5331,7 +5374,7 @@ fn an_accepted_script_starts_the_resting_watch_on_the_same_wake() {
     let asked = drive(&mut cog, FIRST_WAKE).expect("the watch's first read");
     assert_eq!(asked.kind, SessionCmdKindWire::AUX);
     assert_eq!(asked.op, AuxOpKindWire::READ_REG);
-    assert_eq!(asked.reg, RegIdWire::PRESENT_POSITION);
+    assert_eq!(asked.reg, RegIdWire::PRESENT_INPUT_VOLTAGE);
     assert_eq!(asked.id, SERVO_IDS[0]);
     assert_eq!(
         cog.state_sess().phase(),
@@ -5355,13 +5398,14 @@ fn an_accepted_script_starts_the_resting_watch_on_the_same_wake() {
     assert_eq!(entered.b, u32::from(SessionPhaseWire::RESTING.0));
 }
 
-/// The watch and the engagement together take the machine under command.
+/// The fallback re-read and the engagement together take the machine under
+/// command.
 ///
-/// The transaction count is the arithmetic and not a guess: three sweeps of nine
-/// for the watch -- the positions, the supply and the error bits -- and three for
-/// the engagement, which writes every goal, enables every servo and reads all
-/// nine back. Their order is asserted too, because pinning a goal after enabling
-/// torque is the slam the order exists to prevent.
+/// The transaction count is the arithmetic and not a guess: this slot was
+/// written to resting with an empty rail picture, so every row is stale and the
+/// watch re-reads two registers of each of the nine, and then the engagement is
+/// one datagram. Their order is asserted too, because a gate judged over
+/// readings nobody had taken is the thing the fallback exists to prevent.
 #[test]
 fn the_watch_and_the_engagement_take_the_machine_active() {
     let mut cog = resting_session();
@@ -5370,13 +5414,15 @@ fn the_watch_and_the_engagement_take_the_machine_active() {
 
     assert_eq!(
         log.len(),
-        6 * JOINT_COUNT,
-        "three sweeps of nine each side of the torque line, and nothing after \
-         them: the machine is under command and the decision tick is what \
-         speaks to the driver about it",
+        2 * JOINT_COUNT + 1,
+        "the supply and the error byte of every stale row, then the one \
+         datagram that takes hold: the machine is under command and the \
+         decision tick is what speaks to the driver about it",
     );
-    let regs: Vec<(AuxOpKindWire, RegIdWire)> =
-        log.iter().map(|asked| (asked.op, asked.reg)).collect();
+    let regs: Vec<(AuxOpKindWire, RegIdWire)> = log[..2 * JOINT_COUNT]
+        .iter()
+        .map(|asked| (asked.op, asked.reg))
+        .collect();
     let expected = |from: usize, op: AuxOpKindWire, reg: RegIdWire| {
         for (offset, (was_op, was_reg)) in regs[from..from + JOINT_COUNT].iter().enumerate() {
             assert_eq!(
@@ -5388,43 +5434,296 @@ fn the_watch_and_the_engagement_take_the_machine_active() {
             assert_eq!(log[from + offset].id, SERVO_IDS[offset], "in bus order");
         }
     };
-    expected(0, AuxOpKindWire::READ_REG, RegIdWire::PRESENT_POSITION);
+    expected(0, AuxOpKindWire::READ_REG, RegIdWire::PRESENT_INPUT_VOLTAGE);
     expected(
         JOINT_COUNT,
         AuxOpKindWire::READ_REG,
-        RegIdWire::PRESENT_INPUT_VOLTAGE,
-    );
-    expected(
-        2 * JOINT_COUNT,
-        AuxOpKindWire::READ_REG,
         RegIdWire::HARDWARE_ERROR_STATUS,
     );
-    expected(
-        3 * JOINT_COUNT,
-        AuxOpKindWire::WRITE_REG,
-        RegIdWire::GOAL_POSITION,
-    );
-    expected(
-        4 * JOINT_COUNT,
-        AuxOpKindWire::WRITE_REG_VERIFIED,
-        RegIdWire::TORQUE_ENABLE,
-    );
-    expected(
-        5 * JOINT_COUNT,
-        AuxOpKindWire::READ_REG,
-        RegIdWire::PRESENT_POSITION,
-    );
     assert!(
-        log[..6 * JOINT_COUNT]
+        log[..2 * JOINT_COUNT]
             .iter()
             .all(|asked| asked.kind == SessionCmdKindWire::AUX),
         "no keep-alive displaced a transaction",
+    );
+    assert_eq!(
+        log[2 * JOINT_COUNT].kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "the cleared gate asked the driver to take hold",
     );
     assert_eq!(
         cog.state_sess().phase(),
         SessionPhaseWire::ACTIVE,
         "the machine is holding where it stood",
     );
+}
+
+/// What the eight rows the driver's rotation did reach read on their supply.
+///
+/// Told apart from [`NOMINAL_VOLTS`], which is what the fallback sweep's own
+/// read answers with: a case about which rows a merge touches needs the two
+/// sources of a reading to be distinguishable in the picture afterwards.
+const FRESH_VOLTS: f64 = 7.9;
+
+/// A picture with one stale row re-reads that row and keeps the eight it has.
+///
+/// The fallback sweep is named for the stale rows only and hands back zero for
+/// every other row, so what it establishes is the rows it read: a merge of the
+/// whole picture would write a rail of zero volts over eight rows the rotation
+/// had just reported healthy, and the gate judged in the same wake would refuse
+/// a machine whose supply nobody had said anything against. The eight
+/// voltages after the engagement are what says the merge was by row.
+#[test]
+fn a_partly_stale_picture_re_reads_the_stale_row_and_keeps_the_others() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    // Eight rows visited by the rotation; the ninth never reached, which is the
+    // one row the gate cannot judge.
+    for id in &SERVO_IDS[..JOINT_COUNT - 1] {
+        let mut msg = reading(*id, 0, T0);
+        msg.set_volts(FRESH_VOLTS);
+        cog.publish_readings(&msg, SyncTime::from_nanos(T0));
+    }
+    let filled = T0 + LAPSE_NS;
+    drive(&mut cog, filled);
+
+    cog.publish_script(&one_step_script(7, filled), SyncTime::from_nanos(filled));
+    let first = drive(&mut cog, filled + LAPSE_NS).expect("the stale row's supply read");
+    assert_eq!(first.kind, SessionCmdKindWire::AUX);
+    assert_eq!(first.id, SERVO_IDS[JOINT_COUNT - 1], "the row nobody read");
+    assert_eq!(first.reg, RegIdWire::PRESENT_INPUT_VOLTAGE);
+    let log = sweep(&mut cog, &mut bus, filled + LAPSE_NS, first).asks;
+
+    assert_eq!(
+        log.len(),
+        3,
+        "the supply and the error byte of the one stale row, then the datagram \
+         that takes hold: {log:?}",
+    );
+    assert_eq!(log[1].reg, RegIdWire::HARDWARE_ERROR_STATUS);
+    assert_eq!(log[1].id, SERVO_IDS[JOINT_COUNT - 1]);
+    assert_eq!(log[2].kind, SessionCmdKindWire::ENGAGE_NOW);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "the gate judged the eight readings it had and the one it went and took",
+    );
+
+    let state = cog.state_sess();
+    let rail = state.rail();
+    let kept = [
+        rail.body_yaw().volts(),
+        rail.leg_0().volts(),
+        rail.leg_1().volts(),
+        rail.leg_2().volts(),
+        rail.leg_3().volts(),
+        rail.leg_4().volts(),
+        rail.leg_5().volts(),
+        rail.antenna_right().volts(),
+    ];
+    for (row, volts) in kept.into_iter().enumerate() {
+        assert!(
+            (volts - FRESH_VOLTS).abs() < CLOSE,
+            "row {row} reads {volts} volts: the sweep named it for nothing and \
+             the rotation's reading stands",
+        );
+    }
+    assert!(
+        (rail.antenna_left().volts() - NOMINAL_VOLTS).abs() < CLOSE,
+        "and the row the sweep did read carries what the sweep read",
+    );
+}
+
+/// Every wake in `engaging` past the gate asks the driver for the same
+/// engagement.
+///
+/// The re-issue is the liveness: the session owes the driver a keep-alive in no
+/// other window of an engagement, and what holds the driver's dead-man off a
+/// machine it is about to hold is this datagram arriving every wake. Verbatim,
+/// rows included, because the driver reads a different set of rows as a
+/// different engagement and would start its window again.
+#[test]
+fn every_wake_in_engaging_after_the_gate_republishes_engage_now() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let mut at = asked_at;
+    let mut asks = Vec::new();
+    for _ in 0..3 {
+        at += LAPSE_NS;
+        asks.push(drive(&mut cog, at).expect("the wake owes the driver the same ask"));
+    }
+
+    for asked in &asks {
+        assert_eq!(
+            asked.kind,
+            SessionCmdKindWire::ENGAGE_NOW,
+            "never a keep-alive: {asks:?}",
+        );
+        assert_eq!(
+            asked.rows, asks[0].rows,
+            "the same rows every time, which is one engagement and not four",
+        );
+    }
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ENGAGING);
+    assert!(cog.state_sess().engage_pending());
+}
+
+/// An answer to a re-issued engagement takes the machine active, one wake late.
+///
+/// How a lost answer heals: the driver answers a re-issue of an engagement that
+/// already took with the same event again, so an answer the link dropped costs
+/// a wake and nothing else. Nothing is written twice on the machine's side --
+/// the driver's belief is what makes the repeat an answer rather than a second
+/// engagement.
+#[test]
+fn an_answer_to_a_re_issued_engage_now_takes_the_machine_active() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    // Two wakes with the first answer lost.
+    let mut at = asked_at + LAPSE_NS;
+    for _ in 0..2 {
+        let asked = drive(&mut cog, at).expect("the re-issue");
+        assert_eq!(asked.kind, SessionCmdKindWire::ENGAGE_NOW);
+        at += LAPSE_NS;
+    }
+    caught_up(&mut cog);
+
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, at),
+        SyncTime::from_nanos(at),
+    );
+    let told = everything(&mut cog, at + LAPSE_NS);
+
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "the answer to the re-issue is the answer: {told:?}",
+    );
+    assert!(!cog.state_sess().engage_pending(), "and the ask is closed");
+    assert_eq!(
+        cog.state_sess().engage_strays(),
+        0,
+        "nothing answered an ask nobody was waiting on",
+    );
+}
+
+/// An engagement the driver never answers rests the session at the deadline.
+///
+/// The session stops asking rather than holding a machine open on a silence: at
+/// the delivery window's end the phase is `resting`, no further `engage_now`
+/// leaves, and the driver's own dead-man is what takes torque off a machine it
+/// may have energised without being heard. A count is what tells this ending
+/// from the other three, the timeline having one row for all four.
+#[test]
+fn an_engagement_nobody_answers_rests_at_the_deadline() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+    let deadline = asked_at + AUX_TIMEOUT_NS * i64::from(1 + AUX_RETRIES);
+
+    let mut at = asked_at + LAPSE_NS;
+    while at < deadline {
+        let asked = drive(&mut cog, at).expect("every wake before the deadline re-issues");
+        assert_eq!(asked.kind, SessionCmdKindWire::ENGAGE_NOW);
+        at += LAPSE_NS;
+    }
+    assert_eq!(at, deadline, "the wake floor divides the window");
+    let rested = drive(&mut cog, at);
+
+    assert_eq!(rested, None, "the deadline's wake asks for nothing");
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::RESTING);
+    assert!(!state.engage_pending(), "the ask is closed");
+    assert_eq!(
+        state.engage_silences(),
+        1,
+        "and counted as the silence it is"
+    );
+    assert_eq!(
+        drive(&mut cog, at + LAPSE_NS),
+        None,
+        "and nothing asks again: a wake past the deadline re-issues nothing",
+    );
+}
+
+/// An engagement answered after the session gave up on it moves nothing.
+///
+/// The ask is over. Re-deciding a phase from an answer to a question nobody is
+/// still asking would take a rested machine active with no gate judged for it,
+/// so the answer is counted as the stray it is and dropped.
+#[test]
+fn a_late_engage_answer_moves_nothing() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+    let deadline = asked_at + AUX_TIMEOUT_NS * i64::from(1 + AUX_RETRIES);
+
+    let mut at = asked_at + LAPSE_NS;
+    while at <= deadline {
+        drive(&mut cog, at);
+        at += LAPSE_NS;
+    }
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::RESTING);
+    caught_up(&mut cog);
+
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, at),
+        SyncTime::from_nanos(at),
+    );
+    let told = everything(&mut cog, at + LAPSE_NS);
+
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::RESTING,
+        "a machine nobody gated is a machine nobody takes active: {told:?}",
+    );
+    assert_eq!(state.engage_strays(), 1);
+}
+
+/// A condition answered while the machine is being taken hold of closes the ask.
+///
+/// The phase can leave `engaging` from outside the engagement's own turn: a
+/// servo's error byte read by the driver's rotation is answered by the ladder,
+/// which lets the machine go and latches it. The driver's answer to the ask
+/// already on the wire arrives afterwards, and a machine that has been parked is
+/// one nothing takes active until an operator has been -- so what the answer
+/// meets is a closed ask.
+#[test]
+fn a_condition_answered_mid_engagement_closes_the_ask() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let latched = asked_at + LAPSE_NS;
+    let leg = SERVO_IDS[usize::from(JointRefWire::LEG_3.0) - 1];
+    cog.publish_readings(&reading(leg, 0x20, latched), SyncTime::from_nanos(latched));
+    let told = everything(&mut cog, latched);
+
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::PARKED,
+        "the condition's own disposition: {told:?}",
+    );
+    assert!(
+        !state.engage_pending(),
+        "and leaving engaging closed the ask",
+    );
+
+    let answered = latched + 10 * LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, answered),
+        SyncTime::from_nanos(answered),
+    );
+    let told = everything(&mut cog, answered + LAPSE_NS);
+
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::PARKED,
+        "a parked machine stays parked: {told:?}",
+    );
+    assert_eq!(state.engage_strays(), 1, "the answer is a stray");
 }
 
 /// A machine under command is not kept alive by the session.
@@ -5474,8 +5773,9 @@ fn a_rail_the_gate_refuses_leaves_the_machine_resting_for_the_next_script() {
 
     assert_eq!(
         ran.asks.len(),
-        3 * JOINT_COUNT,
-        "the watch swept and the engagement wrote nothing",
+        2 * JOINT_COUNT,
+        "the watch re-read every stale row and the gate then refused, asking \
+         the driver for nothing",
     );
     assert_eq!(cog.state_sess().phase(), SessionPhaseWire::RESTING);
     assert!(
@@ -5496,27 +5796,45 @@ fn a_rail_the_gate_refuses_leaves_the_machine_resting_for_the_next_script() {
         "the machine said it went back to resting: {told:?}",
     );
 
+    // The gate judges the picture the rotation keeps, so a machine whose last
+    // reading is under the floor declines every script until a better reading
+    // arrives. One lap of the rotation is what changes the answer.
     at += 10 * LAPSE_NS;
     cog.publish_script(&one_step_script(8, at), SyncTime::from_nanos(at));
     at += LAPSE_NS;
-    drive(&mut cog, at).expect("the next script is taken");
+    assert!(
+        drive(&mut cog, at).is_none(),
+        "a rail still under the floor asks the driver for nothing",
+    );
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::RESTING);
+
+    at += LAPSE_NS;
+    at = rail_lap(&mut cog, NOMINAL_VOLTS, at) + LAPSE_NS;
+    cog.publish_script(&one_step_script(9, at), SyncTime::from_nanos(at));
+    at += LAPSE_NS;
+    let asked = drive(&mut cog, at).expect("the next script is taken");
+    assert_eq!(
+        asked.kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "a fresh picture is gated on where it stands, with nothing re-read",
+    );
     assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ENGAGING);
 }
 
-/// An engagement that stops after an enable write commands the release and
+/// An engagement a row did not read back its enable on commands the release and
 /// parks.
 ///
-/// The one path that crosses the torque line mid-sequence. Servos may be holding
-/// with nothing driving them, so the answer is that torque comes off now --
+/// The one answer that leaves the torque line crossed. The rows that did confirm
+/// are believed torqued and nothing is driving them, so torque comes off now --
 /// republished every wake until the driver confirms it, because the datagram is
 /// idempotent and nothing gates de-torquing -- and the phase latches, because a
-/// machine that was left holding by a sequence that failed is not one to engage
-/// again without an operator.
+/// machine left holding by an engagement that failed is not one to engage again
+/// without an operator.
 #[test]
 fn an_engagement_that_fails_under_torque_commands_the_release_and_parks() {
     let mut cog = resting_session();
     let mut bus = Bus {
-        refuse_enable: Some(2),
+        engaged: EventKindWire::ENGAGE_UNCONFIRMED,
         ..Bus::healthy()
     };
     let log = engagement(&mut cog, &mut bus).asks;
@@ -5676,6 +5994,70 @@ fn an_antenna_fault_makes_the_pair_let_go_and_the_session_carries_on() {
     cog.publish_script(&one_step_script(4, at), SyncTime::from_nanos(at));
     drive(&mut cog, at + LAPSE_NS).expect("the next script starts the watch");
     assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ENGAGING);
+}
+
+/// A gate that degrades one antenna asks the driver for the other eight rows.
+///
+/// The row set is the gate's whole output and the one safety-relevant value on
+/// the command path: a session that published all nine regardless of what the
+/// gate said would take hold of a servo it had just been told is reporting a
+/// hardware error, and only the datagram says so.
+///
+/// The picture has to be full and fresh for the case to reach an `engage_now`
+/// at all -- a stale row sends the script to the fallback sweep, whose merge
+/// carries no error bit, and a row nobody published reads as zero volts and is
+/// refused on supply before health is looked at. So a whole lap is reported
+/// first, and the one antenna's reading carries the latched bit on a supply the
+/// gate has nothing against. That reading is also a fault, so the pair lets go
+/// before any script arrives; the engagement that follows is over the rows the
+/// gate still trusts.
+#[test]
+fn a_gate_that_degrades_an_antenna_engages_the_other_eight_rows() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    let filled = rail_lap(&mut cog, NOMINAL_VOLTS, T0);
+
+    let right = SERVO_IDS[usize::from(JointRefWire::ANTENNA_RIGHT.0) - 1];
+    let limp = filled + LAPSE_NS;
+    let mut faulted = reading(right, 0x20, limp);
+    faulted.set_volts(NOMINAL_VOLTS);
+    cog.publish_readings(&faulted, SyncTime::from_nanos(limp));
+    let first = drive(&mut cog, limp).expect("the pair is told to let go");
+    sweep(&mut cog, &mut bus, limp, first);
+    assert!(
+        !cog.state_sess().degrade_pending(),
+        "the drain finished before anything was asked of the machine",
+    );
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::RESTING,
+        "a pair going limp is a fault answered, not a session ended",
+    );
+
+    // Inside `rail_stale_after_ns` of every reading in the picture, so the gate
+    // judges what it has rather than sending the script to the sweep.
+    let at = limp + 2 * LAPSE_NS;
+    cog.publish_script(&one_step_script(9, at), SyncTime::from_nanos(at));
+    let asked = drive(&mut cog, at + LAPSE_NS).expect("the engagement's one datagram");
+
+    assert_eq!(asked.kind, SessionCmdKindWire::ENGAGE_NOW);
+    assert_eq!(
+        asked.rows,
+        JointFlagsWire::from(flags::without(flags::all(), JointFlags::ANTENNA_RIGHT)).0,
+        "eight rows: the antenna whose error bit the gate read is left limp",
+    );
+
+    let confirmed = at + 2 * LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    drive(&mut cog, confirmed);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::ACTIVE,
+        "and the machine is holding the eight rows it took",
+    );
 }
 
 /// A degrade under command lets the pair go and leaves the session running.
@@ -6352,6 +6734,10 @@ fn a_window_outliving_the_last_step_keeps_the_machine_under_command() {
 /// a schedule that asks for nothing has already asked for all of it. The
 /// arming is not wasted -- it is what the sender asked for -- and the release
 /// that follows is the same release every other session ends with.
+///
+/// It ends on the very wake it engages on: the driver's confirmation is read
+/// before the bus takes its turn, so the wake that enters `active` is the wake
+/// that finds the schedule over.
 #[test]
 fn a_schedule_of_nothing_ends_the_session_on_the_wake_after_it_engaged() {
     let mut cog = resting_session();
@@ -6359,14 +6745,13 @@ fn a_schedule_of_nothing_ends_the_session_on_the_wake_after_it_engaged() {
     cog.publish_script(&script_msg(12, T0, &[], &[]), SyncTime::from_nanos(T0));
     let first = drive(&mut cog, FIRST_WAKE).expect("an accepted script starts the watch");
     sweep(&mut cog, &mut bus, FIRST_WAKE, first);
-    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ACTIVE);
-
-    let asked = drive(&mut cog, FIRST_WAKE + 400 * 1_000_000).expect("the wake owes a keep-alive");
     assert_eq!(
         cog.state_sess().phase(),
         SessionPhaseWire::STOPPING,
         "there was nothing to wait for",
     );
+
+    let asked = drive(&mut cog, FIRST_WAKE + 400 * 1_000_000).expect("the wake owes a keep-alive");
     assert_eq!(
         asked.kind,
         SessionCmdKindWire::KEEP_ALIVE,
@@ -6451,90 +6836,31 @@ fn a_release_snapshot_that_will_not_resume_commands_the_de_torquing_and_parks() 
     assert!(cog.state_sess().torque_off_pending());
 }
 
-/// Drive a resting session's engagement as far as its first enable write, and
-/// answer with the instant that write went out on.
+/// A wake mid-watch owes the driver nothing.
 ///
-/// The write is left unanswered: what a case wants from here is the stretch
-/// after the torque line, where nine servos may be holding and nothing is
-/// streaming to them.
-fn armed_to_the_first_enable(cog: &mut SessionTestWrapper, bus: &mut Bus) -> i64 {
-    cog.publish_script(&one_step_script(7, T0), SyncTime::from_nanos(T0));
-    let mut asked = drive(cog, FIRST_WAKE).expect("an accepted script starts the watch");
-    let mut at = FIRST_WAKE;
-    for _ in 0..400 {
-        // The value says which write this is: an arming enables torque and a
-        // release writes the zero.
-        if asked.op == AuxOpKindWire::WRITE_REG_VERIFIED
-            && asked.reg == RegIdWire::TORQUE_ENABLE
-            && asked.value != 0
-        {
-            return at;
-        }
-        assert_eq!(
-            asked.kind,
-            SessionCmdKindWire::AUX,
-            "the sequences stopped asking before the machine was armed",
-        );
-        let outcome = bus.answer(&asked);
-        at += 1_000_000;
-        cog.publish_aux_out(&outcome, SyncTime::from_nanos(at));
-        at += 1_000_000;
-        asked = drive(cog, at).expect("the sequences carry on asking");
-    }
-    panic!("the engagement never reached its first enable write");
-}
-
-/// A wake mid-arming that owes no transaction still speaks to the driver.
-///
-/// The window the keep-alive rule was written for: from the first enable write
-/// until the engagement concludes, the machine may be holding torque with
-/// nothing streaming to it, and the driver's hold timeout is what takes torque
-/// off a machine nobody has spoken to. A wake spent waiting on a slow read-back
-/// owes no transaction of its own -- the outstanding one is not re-issued until
-/// its delivery budget is spent -- so what it publishes is the keep-alive, and a
-/// build that published nothing here would have the dead-man de-torque a machine
-/// mid-arming.
-#[test]
-fn a_wake_mid_arming_that_owes_no_transaction_publishes_a_keep_alive() {
-    let mut cog = resting_session();
-    let mut bus = Bus::healthy();
-    let enabled_at = armed_to_the_first_enable(&mut cog, &mut bus);
-    assert!(
-        cog.state_sess().engage().torque_written(),
-        "the torque line has been crossed",
-    );
-
-    // A wake floor past the write and inside the delivery budget, so nothing is
-    // re-issued and the wake owes no transaction at all.
-    const { assert!(LAPSE_NS < AUX_TIMEOUT_NS) };
-    let asked = drive(&mut cog, enabled_at + LAPSE_NS).expect("the wake spoke to the driver");
-    assert_eq!(
-        asked.kind,
-        SessionCmdKindWire::KEEP_ALIVE,
-        "a machine that may be holding is spoken to on every wake",
-    );
-    assert_eq!(
-        cog.state_sess().phase(),
-        SessionPhaseWire::ENGAGING,
-        "and the engagement is still the sequence being driven",
-    );
-}
-
-/// The same wake during the watch owes the driver nothing.
-///
-/// What scopes the rule is the torque line and not the phase: the reads that
-/// measure where a resting machine is standing are made before anything is
-/// enabled, so there is nothing holding for a hold timeout to take off, and a
+/// Before the gate nothing is torqued, so there is no dead-man to hold off and a
 /// keep-alive here would be traffic that says nothing about a machine at rest.
+/// After the gate the re-issued `engage_now` is the liveness, which is a
+/// datagram of its own rather than a keep-alive.
 #[test]
 fn a_wake_mid_watch_before_the_torque_line_publishes_nothing() {
     let mut cog = resting_session();
     cog.publish_script(&one_step_script(7, T0), SyncTime::from_nanos(T0));
     let read = drive(&mut cog, FIRST_WAKE).expect("the watch's first read");
     assert_eq!(read.op, AuxOpKindWire::READ_REG);
+    assert_eq!(
+        read.reg,
+        RegIdWire::PRESENT_INPUT_VOLTAGE,
+        "an empty rail picture is re-read before the gate is judged",
+    );
     assert!(
-        !cog.state_sess().engage().torque_written(),
-        "nothing has been enabled",
+        cog.state_sess().engage_pending(),
+        "an engagement is open and owes the driver something",
+    );
+    assert_eq!(
+        cog.state_sess().engage_rows().0,
+        0,
+        "and the gate has passed no rows yet, so nothing has been asked for",
     );
 
     assert!(
@@ -7053,32 +7379,648 @@ fn a_replacement_that_is_no_timeline_leaves_the_running_schedule_alone() {
     assert!(published.is_empty());
 }
 
-/// Every phase that is neither resting nor active still refuses.
+/// Every phase mid-something that is not a fault's ending holds the script
+/// instead.
 ///
-/// A machine mid-arm-sequence, being carried down out of a fault, or being let
-/// go of finishes what it is doing. Intent never preempts a fault maneuver, and
-/// a sender that still wants the machine raises it again from rest.
+/// A machine mid-arm-sequence or being let go of finishes what it is doing --
+/// intent never preempts a maneuver, and nothing gates or defers a de-torquing
+/// -- and the wake it gets to a phase it can answer from takes the script up.
+/// The sender says it once. `winding_down` is not in the list: it is entered
+/// only by a fault's controlled stow, and what arrives there is refused rather
+/// than held.
+///
+/// The three answers a hold can give are all here: the first script is held, a
+/// lower-numbered one behind it is refused `stale`, and a higher-numbered one
+/// replaces what is held. One slot, latest wins.
 #[test]
-fn the_phases_between_the_two_that_take_a_script_still_refuse() {
+fn a_script_arriving_mid_something_is_held_and_narrated() {
     for phase in [
         SessionPhaseWire::STARTING,
         SessionPhaseWire::ENGAGING,
-        SessionPhaseWire::WINDING_DOWN,
         SessionPhaseWire::STOPPING,
     ] {
         let mut cog = session();
         cog.state_sess_mut().set_phase(phase);
 
-        cog.publish_script(&one_step_script(1, T0), SyncTime::from_nanos(T0));
-        let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
-
-        assert_eq!(report.kind, ReportKindWire::SCRIPT_REFUSED, "in {phase:?}");
+        cog.publish_script(&one_step_script(5, T0), SyncTime::from_nanos(T0));
+        let report = wake(&mut cog, T0 + 1).expect("a hold is narrated");
+        assert_eq!(report.kind, ReportKindWire::SCRIPT_HELD, "in {phase:?}");
+        assert_eq!(report.a, 5, "in {phase:?}");
+        assert_eq!(report.b, u32::from(phase.0), "in {phase:?}");
         assert_eq!(
-            report.b,
-            u32::from(RefusalReasonWire::NOT_RESTING.0),
-            "in {phase:?}",
+            cog.state_sess().pending().script_id(),
+            5,
+            "in {phase:?}: held whole",
+        );
+        // A phase's own first wake may publish a schedule edge of its own; what
+        // the two wakes below are about is the answers to the scripts.
+        caught_up(&mut cog);
+
+        cog.publish_script(
+            &one_step_script(4, T0 + LAPSE_NS),
+            SyncTime::from_nanos(T0 + LAPSE_NS),
+        );
+        let stale = wake(&mut cog, T0 + 1 + LAPSE_NS).expect("a refusal is narrated");
+        assert_eq!(stale.kind, ReportKindWire::SCRIPT_REFUSED, "in {phase:?}");
+        assert_eq!(
+            stale.b,
+            u32::from(RefusalReasonWire::STALE.0),
+            "in {phase:?}: a script no higher than the one held",
+        );
+        assert_eq!(cog.state_sess().pending().script_id(), 5, "in {phase:?}");
+        caught_up(&mut cog);
+
+        cog.publish_script(
+            &one_step_script(6, T0 + 2 * LAPSE_NS),
+            SyncTime::from_nanos(T0 + 2 * LAPSE_NS),
+        );
+        let newer = wake(&mut cog, T0 + 1 + 2 * LAPSE_NS).expect("a hold is narrated");
+        assert_eq!(newer.kind, ReportKindWire::SCRIPT_HELD, "in {phase:?}");
+        assert_eq!(newer.a, 6, "in {phase:?}");
+        assert_eq!(
+            cog.state_sess().pending().script_id(),
+            6,
+            "in {phase:?}: the latest script wins",
+        );
+        assert_eq!(
+            cog.state_sess().phase(),
+            phase,
+            "in {phase:?}: nothing about the machine moved",
         );
     }
+}
+
+/// A resting session over a fresh rail picture, handed one script, with the
+/// engagement asked for and not yet answered.
+///
+/// The state every hold-in-`engaging` case starts from: the rail is filled by a
+/// lap of the driver's rotation so the engagement is the one datagram it is
+/// meant to be, and the driver has been told nothing back. Answers the instant
+/// the ask went out.
+fn engagement_asked(cog: &mut SessionTestWrapper) -> i64 {
+    let filled = rail_lap(cog, NOMINAL_VOLTS, T0);
+    cog.publish_script(&one_step_script(7, filled), SyncTime::from_nanos(filled));
+    let asked = drive(cog, filled + LAPSE_NS).expect("the engagement's one datagram");
+    assert_eq!(
+        asked.kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "a fresh picture engages without re-reading anything",
+    );
+    caught_up(cog);
+    filled + LAPSE_NS
+}
+
+/// A script held through the engagement replaces the schedule on the wake the
+/// engagement completes.
+///
+/// The whole shape of a barge-in: the wake word arrives inside the one driver
+/// cycle the engagement is, the machine finishes taking hold, and the newer
+/// script is what it is holding when it starts streaming. Nothing is refused and
+/// nothing is engaged twice.
+#[test]
+fn a_held_script_replaces_the_schedule_the_wake_the_engagement_completes() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    let held = wake(&mut cog, barged).expect("a hold is narrated");
+    assert_eq!(held.kind, ReportKindWire::SCRIPT_HELD);
+    assert_eq!(held.a, 8);
+    assert_eq!(held.b, u32::from(SessionPhaseWire::ENGAGING.0));
+    caught_up(&mut cog);
+
+    let confirmed = barged + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    let told = everything(&mut cog, confirmed + LAPSE_NS);
+
+    assert_eq!(
+        kinds(&told),
+        vec![
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCRIPT_REPLACED,
+            ReportKindWire::SCHEDULE_PUBLISHED,
+        ],
+        "the machine took hold and the held script is what it is running: {told:?}",
+    );
+    assert_eq!(told[0].a, u32::from(SessionPhaseWire::ACTIVE.0));
+    assert_eq!(told[1].a, 8, "the held script's own number");
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::ACTIVE);
+    assert_eq!(state.script_id(), 8);
+    assert!(!state.pending_valid(), "and the slot is empty");
+}
+
+/// A script held through an engagement the driver declines re-engages on the
+/// wake the machine rests, and takes that wake's datagram.
+///
+/// Two phase rows in one wake, in the order they happened: the declined
+/// engagement rests the machine, and the drain takes it hold of again. The
+/// engagement's first bus step is that same wake's, because readiness is the
+/// whole requirement -- the rail picture is still fresh, so the step is the
+/// `engage_now` itself.
+#[test]
+fn a_held_script_re_engages_the_wake_the_engagement_declines() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    wake(&mut cog, barged).expect("a hold is narrated");
+    caught_up(&mut cog);
+
+    let declined = barged + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_DECLINED, declined),
+        SyncTime::from_nanos(declined),
+    );
+    let asked = drive(&mut cog, declined + LAPSE_NS).expect("the second engagement's datagram");
+    assert_eq!(
+        asked.kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "the drain's own bus step, on the wake it took the script up",
+    );
+    let told = everything(&mut cog, declined + 2 * LAPSE_NS);
+
+    assert_eq!(
+        kinds(&told),
+        vec![
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCRIPT_ACCEPTED,
+            ReportKindWire::PHASE_CHANGED,
+        ],
+        "rested and taken hold of again, in that order: {told:?}",
+    );
+    assert_eq!(
+        (told[0].a, told[0].b),
+        (
+            u32::from(SessionPhaseWire::RESTING.0),
+            u32::from(SessionPhaseWire::ENGAGING.0),
+        ),
+    );
+    assert_eq!(told[1].a, 8);
+    assert_eq!(
+        (told[2].a, told[2].b),
+        (
+            u32::from(SessionPhaseWire::ENGAGING.0),
+            u32::from(SessionPhaseWire::RESTING.0),
+        ),
+    );
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::ENGAGING);
+    assert!(state.engage_pending(), "a second engagement is open");
+    assert!(!state.pending_valid());
+}
+
+/// A script held when the machine parks is answered rather than left waiting.
+///
+/// Nothing engages a parked machine until an operator has been, so a script
+/// held for it would be held for ever. The sender learns the same thing it would
+/// have learned had it sent one wake later.
+#[test]
+fn a_park_clears_the_slot_and_answers_the_sender() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    wake(&mut cog, barged).expect("a hold is narrated");
+    caught_up(&mut cog);
+
+    // An engagement that stopped after torque was written: the machine is let go
+    // of and latched.
+    let unconfirmed = barged + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_UNCONFIRMED, unconfirmed),
+        SyncTime::from_nanos(unconfirmed),
+    );
+    let asked = drive(&mut cog, unconfirmed + LAPSE_NS).expect("the machine is let go of");
+    assert_eq!(asked.kind, SessionCmdKindWire::TORQUE_OFF_NOW);
+    let told = everything(&mut cog, unconfirmed + 2 * LAPSE_NS);
+
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
+    let refused = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REFUSED)
+        .expect("the held script is answered");
+    assert_eq!(refused.a, 8);
+    assert_eq!(refused.b, u32::from(RefusalReasonWire::PARKED.0));
+    assert!(!cog.state_sess().pending_valid());
+}
+
+/// A rest-class fault response answers the script the session was holding.
+///
+/// The doctrine's line, made concrete from the side the phase cannot see: the
+/// script was held before the fault, and the ladder's answer skips
+/// `winding_down` entirely -- a stow outside `active` commands the release and
+/// rests the machine on the spot. So the response itself is what discards the
+/// hold, on the wake it is taken and after the rows that say what happened.
+/// Nothing is applied to a machine a fault is standing down, and the wake the
+/// release confirms asks for nothing.
+#[test]
+fn a_rest_class_response_discards_the_held_script_and_answers_it() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    let held = wake(&mut cog, barged).expect("a hold is narrated");
+    assert_eq!(held.kind, ReportKindWire::SCRIPT_HELD);
+    assert_eq!(held.b, u32::from(SessionPhaseWire::ENGAGING.0));
+    caught_up(&mut cog);
+
+    let grabbed = barged + LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.3,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    let told = everything(&mut cog, grabbed);
+
+    assert_eq!(
+        kinds(&told)[..4],
+        [
+            ReportKindWire::FAULT_RECORDED,
+            ReportKindWire::RESPONSE_TAKEN,
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCRIPT_REFUSED,
+        ],
+        "the held script is answered after the rows that say why: {told:?}",
+    );
+    assert_eq!(told[3].a, 8, "the held script's own number");
+    assert_eq!(told[3].b, u32::from(RefusalReasonWire::FAULT_ENDING.0));
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::RESTING);
+    assert!(state.torque_off_pending(), "the release is owed");
+    assert!(state.ending_by_fault(), "and a fault is what owes it");
+    assert!(!state.pending_valid(), "nothing is left waiting");
+
+    let confirmed = grabbed + 10 * LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::TORQUE_OFF_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    let asked = drive(&mut cog, confirmed + LAPSE_NS);
+    assert!(
+        !matches!(
+            asked.map(|asked| asked.kind),
+            Some(SessionCmdKindWire::ENGAGE_NOW)
+        ),
+        "the wake the release confirms takes hold of nothing: {asked:?}",
+    );
+    assert!(
+        !cog.state_sess().ending_by_fault(),
+        "and the ending is over"
+    );
+}
+
+/// A script arriving while a fault carries the machine down is refused, not
+/// held.
+///
+/// Torque comes back on after a fault only on an ask made of a machine that has
+/// already reached the minimum risk condition -- stowed *and* de-torqued. So the
+/// stow refuses, the release the stow owes refuses too, and only the wake after
+/// the release confirms takes a script up again. The sender is told why on the
+/// wake it can act on it.
+#[test]
+fn a_script_arriving_during_a_faults_stow_is_refused_not_held() {
+    let mut bus = Bus::healthy();
+    let mut cog = active_session(&mut bus);
+
+    let grabbed = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.3,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    coast(&mut cog, grabbed, 2);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::WINDING_DOWN);
+    caught_up(&mut cog);
+
+    let barged = grabbed + 3 * LAPSE_NS;
+    cog.publish_script(&hold_script(9, barged, 3_000), SyncTime::from_nanos(barged));
+    let refused = wake(&mut cog, barged).expect("a refusal is narrated");
+    assert_eq!(refused.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(refused.a, 9);
+    assert_eq!(refused.b, u32::from(RefusalReasonWire::FAULT_ENDING.0));
+    assert!(!cog.state_sess().pending_valid(), "and nothing is held");
+    caught_up(&mut cog);
+
+    // The machine reads as folded, which ends the maneuver and commands the
+    // release.
+    let stowed_at = barged + 2 * LAPSE_NS;
+    wake_folded(&mut cog, stowed_at);
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::RESTING);
+    assert!(state.torque_off_pending(), "the release is owed");
+    assert!(state.ending_by_fault());
+    caught_up(&mut cog);
+
+    // Rest with the fault's release still owed is inside the same ending.
+    let behind = stowed_at + LAPSE_NS;
+    cog.publish_script(
+        &hold_script(10, behind, 3_000),
+        SyncTime::from_nanos(behind),
+    );
+    let again = wake(&mut cog, behind).expect("a refusal is narrated");
+    assert_eq!(again.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(again.b, u32::from(RefusalReasonWire::FAULT_ENDING.0));
+    caught_up(&mut cog);
+
+    let confirmed = behind + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::TORQUE_OFF_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    let asked = drive(&mut cog, confirmed);
+    assert!(
+        !matches!(
+            asked.map(|asked| asked.kind),
+            Some(SessionCmdKindWire::ENGAGE_NOW)
+        ),
+        "nothing was waiting to take hold: {asked:?}",
+    );
+    caught_up(&mut cog);
+
+    // At the minimum risk condition, an ask is an ask like any other.
+    let after = confirmed + LAPSE_NS;
+    cog.publish_script(&hold_script(11, after, 3_000), SyncTime::from_nanos(after));
+    let told = everything(&mut cog, after);
+    let accepted = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_ACCEPTED)
+        .unwrap_or_else(|| panic!("a machine at rest takes the next ask: {told:?}"));
+    assert_eq!(accepted.a, 11);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ENGAGING);
+}
+
+/// A script arriving behind a fault's release is refused, and the wake after it
+/// confirms is taken.
+///
+/// The window `resting` alone cannot tell apart: the phase is the same either
+/// side of the confirmation, and what differs is whether the machine has
+/// actually let go. One bit says which, and it falls with the release.
+#[test]
+fn a_script_arriving_behind_a_faults_release_is_refused() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let grabbed = asked_at + LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.3,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    let told = everything(&mut cog, grabbed);
+    assert!(
+        !told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::SCRIPT_REFUSED),
+        "nothing was held, so nothing is answered: {told:?}",
+    );
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::RESTING);
+    assert!(state.torque_off_pending() && state.ending_by_fault());
+
+    let behind = grabbed + 10 * LAPSE_NS;
+    cog.publish_script(&hold_script(8, behind, 3_000), SyncTime::from_nanos(behind));
+    let refused = wake(&mut cog, behind).expect("a refusal is narrated");
+    assert_eq!(refused.kind, ReportKindWire::SCRIPT_REFUSED);
+    assert_eq!(refused.a, 8);
+    assert_eq!(refused.b, u32::from(RefusalReasonWire::FAULT_ENDING.0));
+    caught_up(&mut cog);
+
+    let confirmed = behind + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::TORQUE_OFF_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    drive(&mut cog, confirmed);
+    let state = cog.state_sess();
+    assert!(
+        !state.torque_off_pending() && !state.ending_by_fault(),
+        "the two flags fall together",
+    );
+    caught_up(&mut cog);
+
+    let again = confirmed + LAPSE_NS;
+    cog.publish_script(&hold_script(8, again, 3_000), SyncTime::from_nanos(again));
+    let asked = drive(&mut cog, again).expect("the engagement's datagram");
+    assert_eq!(
+        asked.kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "the same ask, of a machine that has reached the minimum risk condition",
+    );
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::ENGAGING);
+}
+
+/// An antenna health fault while a script is held leaves it held.
+///
+/// The one response that is not an ending: a pair going limp while the head
+/// keeps its presence is a fault answered and the session carries on, so the
+/// script is still waiting for the maneuver it was held for. No phase moves, the
+/// pair still goes limp, and the engagement that completes takes the script up.
+#[test]
+fn an_antenna_health_fault_during_a_hold_leaves_the_script_held() {
+    let mut bus = Bus::healthy();
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    wake(&mut cog, barged).expect("a hold is narrated");
+    caught_up(&mut cog);
+
+    let right = SERVO_IDS[usize::from(JointRefWire::ANTENNA_RIGHT.0) - 1];
+    let limp = barged + LAPSE_NS;
+    cog.publish_readings(&reading(right, 0x20, limp), SyncTime::from_nanos(limp));
+    let first = drive(&mut cog, limp).expect("the first row is told to let go");
+    let ran = sweep(&mut cog, &mut bus, limp, first);
+
+    assert!(
+        ran.told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::RESPONSE_TAKEN
+                && report.a == u32::from(ResponseKindWire::DEGRADE_ANTENNAS.0)),
+        "the pair is let go of: {:?}",
+        ran.told,
+    );
+    assert!(
+        !ran.told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::PHASE_CHANGED
+                || report.kind == ReportKindWire::SCRIPT_REFUSED),
+        "a degrade is no ending: {:?}",
+        ran.told,
+    );
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::ENGAGING);
+    assert!(state.pending_valid(), "and the script is still held");
+    assert!(
+        !state.ending_by_fault(),
+        "nothing is standing this session down"
+    );
+    caught_up(&mut cog);
+
+    // Inside the engagement's own silence deadline: what this case is about is
+    // the hold surviving the degrade, not the deadline that would rest it.
+    let confirmed = limp + 2 * LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    let told = everything(&mut cog, confirmed);
+    let taken = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REPLACED)
+        .unwrap_or_else(|| panic!("the held script is taken up: {told:?}"));
+    assert_eq!(taken.a, 8);
+    assert!(!cog.state_sess().pending_valid());
+}
+
+/// A script held through the orderly release re-engages on the wake it ends.
+///
+/// The release runs to its own end -- settle, measure, let go -- and the wake it
+/// concludes on both rests the machine and takes hold of it again: two phase
+/// rows and the acceptance between them, all at one instant. Nothing is refused,
+/// and the sender said it once.
+#[test]
+fn a_held_script_re_engages_the_wake_the_release_completes() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    // The schedule runs out, which is what ends a session.
+    let over = ENGAGED_SCHEDULE_END + LAPSE_NS;
+    drive(&mut cog, over);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::STOPPING);
+
+    let barged = over + LAPSE_NS;
+    cog.publish_script(&hold_script(9, barged, 3_000), SyncTime::from_nanos(barged));
+    // A lap of the rotation during the settle, so the gate the drain's
+    // engagement judges is over a fresh picture and asks for nothing over the
+    // bus.
+    let filled = rail_lap(&mut cog, NOMINAL_VOLTS, barged);
+    assert_eq!(cog.state_sess().pending().script_id(), 9);
+    caught_up(&mut cog);
+
+    let ran = ending(&mut cog, &mut bus, filled).0;
+    let mut told = ran.told.clone();
+    told.extend(everything(&mut cog, filled + 200 * LAPSE_NS));
+
+    let at = told
+        .iter()
+        .position(|report| report.kind == ReportKindWire::SCRIPT_ACCEPTED && report.a == 9)
+        .expect("the held script is accepted");
+    let rested = &told[at - 1];
+    let engaging = &told[at + 1];
+    assert_eq!(
+        (rested.kind, rested.a, rested.b),
+        (
+            ReportKindWire::PHASE_CHANGED,
+            u32::from(SessionPhaseWire::RESTING.0),
+            u32::from(SessionPhaseWire::STOPPING.0),
+        ),
+        "the release's own ending comes first: {told:?}",
+    );
+    assert_eq!(
+        (engaging.kind, engaging.a, engaging.b),
+        (
+            ReportKindWire::PHASE_CHANGED,
+            u32::from(SessionPhaseWire::ENGAGING.0),
+            u32::from(SessionPhaseWire::RESTING.0),
+        ),
+        "and the drain takes hold again: {told:?}",
+    );
+    assert_eq!(
+        (rested.time_ns, engaging.time_ns),
+        (told[at].time_ns, told[at].time_ns),
+        "all three on one wake",
+    );
+    assert!(
+        !told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::SCRIPT_REFUSED),
+        "and nothing was refused: {told:?}",
+    );
+    let engage_at = ran
+        .asks
+        .iter()
+        .position(|asked| asked.kind == SessionCmdKindWire::ENGAGE_NOW)
+        .expect("the second engagement asked for the machine");
+    assert_eq!(
+        ran.asks[..engage_at]
+            .iter()
+            .filter(|asked| asked.kind == SessionCmdKindWire::AUX)
+            .count(),
+        2 * JOINT_COUNT,
+        "nine measured and nine let go, and no rail re-read: {:?}",
+        ran.asks,
+    );
+}
+
+/// A script accepted at intake clears whatever was held.
+///
+/// The invariant that makes one slot enough: nothing applies a held script after
+/// a newer one has been taken. The moment a hold and an intake are both live is
+/// the wake a maneuver ends on -- the phase moves before intake is screened, so
+/// the newer script is answered against the phase the machine now stands in and
+/// the older one is superseded rather than refused, because it was never the
+/// sender's mistake.
+#[test]
+fn an_acceptance_at_intake_clears_the_slot() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(9, barged, 3_000), SyncTime::from_nanos(barged));
+    wake(&mut cog, barged).expect("a hold is narrated");
+    assert!(cog.state_sess().pending_valid());
+    caught_up(&mut cog);
+
+    // The engagement completes and a newer script arrives on that same wake: the
+    // phase is `active` by the time intake reads it.
+    let confirmed = barged + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, confirmed),
+        SyncTime::from_nanos(confirmed),
+    );
+    cog.publish_script(
+        &hold_script(10, confirmed, 3_000),
+        SyncTime::from_nanos(confirmed),
+    );
+    let told = everything(&mut cog, confirmed);
+
+    assert!(
+        !told
+            .iter()
+            .any(|report| report.kind == ReportKindWire::SCRIPT_REFUSED),
+        "neither script was refused: {told:?}",
+    );
+    let taken = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REPLACED)
+        .unwrap_or_else(|| panic!("the newer script is taken: {told:?}"));
+    assert_eq!(taken.a, 10);
+    let state = cog.state_sess();
+    assert_eq!(state.script_id(), 10);
+    assert!(!state.pending_valid(), "and the older one is superseded");
 }
 
 /// A wake that both answers a park-class fault and screens a refresh takes the
@@ -7655,20 +8597,14 @@ fn a_grabbed_head_is_stowed_under_control_and_the_machine_let_go_at_rest() {
         ran.asks,
     );
 
-    // A script arriving mid-maneuver is refused: the machine is busy with a
-    // session that is ending.
-    cog.publish_script(
-        &one_step_script(9, grabbed),
-        SyncTime::from_nanos(grabbed + 5 * LAPSE_NS),
-    );
+    // Nothing else happens while the maneuver runs, and the stow is not asked
+    // for again.
     let quiet = coast(&mut cog, grabbed + 5 * LAPSE_NS, 4);
-    assert_eq!(
-        kinds(&quiet.told),
-        vec![ReportKindWire::SCRIPT_REFUSED],
+    assert!(
+        quiet.told.is_empty(),
         "nothing else happened while the stow ran: {:?}",
         quiet.told,
     );
-    assert_eq!(quiet.told[0].b, u32::from(RefusalReasonWire::NOT_RESTING.0),);
     assert!(
         quiet.published.is_empty(),
         "and the stow was not asked for again: {:?}",
@@ -7786,6 +8722,74 @@ fn a_released_head_servo_is_stowed_on_what_is_left_and_the_machine_parked() {
         .find(|report| report.kind == ReportKindWire::SCRIPT_REFUSED)
         .expect("the script was answered");
     assert_eq!(refused.b, u32::from(RefusalReasonWire::PARKED.0));
+}
+
+/// A stow whose record stops reading back as a maneuver latches the machine,
+/// and the flag that says a fault is carrying this session to rest falls with
+/// it.
+///
+/// The one path where a rest-class response ends over a parked machine: there is
+/// nothing left to rank and nothing carrying the head down, so the machine is
+/// let go of where it stands and the phase latches. A parked session refuses
+/// every script on its own and never leaves, so a flag saying it is on its way
+/// to rest would be a standing untruth — and the script waiting on it is owed
+/// `parked`, which says the machine needs a person, rather than `fault_ending`,
+/// which says to ask again.
+#[test]
+fn a_stow_that_cannot_be_ranked_parks_the_machine_and_ends_the_fault_ending() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    let grabbed = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.2,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    let _ = coast(&mut cog, grabbed, 4);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::WINDING_DOWN);
+    assert!(
+        cog.state_sess().ending_by_fault(),
+        "a fault is carrying the session to rest",
+    );
+
+    // The record stands as a maneuver and no longer reads back as one: a
+    // maneuver judged by no ending is one nothing can be judged by.
+    cog.state_sess_mut()
+        .winddown_mut()
+        .set_ending(EndingKindWire::NONE);
+
+    let again = grabbed + 2 * LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            again,
+            0.3,
+        ),
+        SyncTime::from_nanos(again),
+    );
+    let _ = coast(&mut cog, again, 4);
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::PARKED,
+        "the machine is let go of where it stands and the phase latches",
+    );
+    assert!(
+        cog.state_sess().torque_off_pending(),
+        "and the release is commanded",
+    );
+    assert!(
+        !cog.state_sess().ending_by_fault(),
+        "nothing says this session is on its way to rest: it is parked",
+    );
+    assert!(!cog.state_sess().winddown().active());
 }
 
 /// A stow the machine never reaches is ended by the one clock it was opened
@@ -8148,4 +9152,317 @@ fn a_condition_control_is_not_trusted_through_ends_the_maneuver_at_once() {
         .expect("the maneuver's own record");
     assert_eq!(outcome.a, u32::from(WindDownOutcomeWire::FELL_THROUGH.0));
     assert_eq!(outcome.b, 1);
+}
+
+/// A script held for longer than the whole span it asked for is answered rather
+/// than engaged for.
+///
+/// Its instants are the sender's offsets off the sender's own stamp, and holding
+/// does not move them: a schedule whose last instant is already behind the wake
+/// that would take it up commands nothing. Engaging for it would torque the head
+/// on, reach no goal and let go of it again on the next wake, so the sender is
+/// answered and the machine stays where it is.
+#[test]
+fn a_script_held_past_its_own_span_is_refused_at_the_drain() {
+    let mut cog = resting_session();
+    let asked_at = engagement_asked(&mut cog);
+    let deadline = asked_at + AUX_TIMEOUT_NS * i64::from(1 + AUX_RETRIES);
+
+    // A tenth of a second of span, against the whole delivery window the
+    // engagement is about to spend unanswered.
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 100), SyncTime::from_nanos(barged));
+    let held = wake(&mut cog, barged).expect("a hold is narrated");
+    assert_eq!(held.kind, ReportKindWire::SCRIPT_HELD);
+    assert_eq!(held.a, 8);
+    caught_up(&mut cog);
+
+    let mut at = barged + LAPSE_NS;
+    while at < deadline {
+        drive(&mut cog, at);
+        at += LAPSE_NS;
+    }
+    // The deadline's wake rests the machine and drains the slot.
+    let told = all_of_it(&mut cog, at);
+
+    let answered = told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::SCRIPT_REFUSED)
+        .unwrap_or_else(|| panic!("the held script is answered: {told:?}"));
+    assert_eq!(answered.a, 8);
+    assert_eq!(
+        answered.b,
+        u32::from(RefusalReasonWire::BAD_TIMES.0),
+        "and the reason is the times it asked for",
+    );
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::RESTING,
+        "nothing was engaged for a schedule with no future: {told:?}",
+    );
+    assert!(!state.pending_valid(), "and nothing is still waiting");
+    assert_eq!(
+        drive(&mut cog, at + LAPSE_NS),
+        None,
+        "no datagram followed it",
+    );
+}
+
+/// A row going stale under an ask already on the wire is asked again, not swept
+/// for.
+///
+/// The gate has passed for these rows and the driver may be holding torque on
+/// the strength of it: the re-issued datagram is the only thing feeding its
+/// dead-man, and a sweep would stop that datagram for as long as it ran while
+/// the deadline kept running from the first issue. So the sweep belongs to a
+/// first ask, and a picture that ages under an engagement is asked over again.
+#[test]
+fn a_row_going_stale_under_an_ask_is_re_issued_not_swept() {
+    let mut cog = resting_session();
+    // One lap of the rotation, then wakes until the reading is one wake short of
+    // stale: the gate takes it, and the next wake is past the threshold.
+    let filled = rail_lap(&mut cog, NOMINAL_VOLTS, T0);
+    let sent_at = T0 + RAIL_STALE_AFTER_NS - 2 * LAPSE_NS;
+    let mut at = filled;
+    while at + LAPSE_NS <= sent_at {
+        at += LAPSE_NS;
+        drive(&mut cog, at);
+    }
+    assert_eq!(at, sent_at, "the wake floor divides the staleness window");
+
+    cog.publish_script(&one_step_script(7, at), SyncTime::from_nanos(at));
+    at += LAPSE_NS;
+    let first = drive(&mut cog, at).expect("the engagement's one datagram");
+    assert_eq!(
+        first.kind,
+        SessionCmdKindWire::ENGAGE_NOW,
+        "the picture was fresh when the gate judged it",
+    );
+
+    let mut asks = Vec::new();
+    for _ in 0..3 {
+        at += LAPSE_NS;
+        asks.push(drive(&mut cog, at).expect("the wake owes the driver the same ask"));
+    }
+
+    assert!(
+        at - T0 > RAIL_STALE_AFTER_NS,
+        "the readings the gate judged are stale by now",
+    );
+    for asked in &asks {
+        assert_eq!(
+            asked.kind,
+            SessionCmdKindWire::ENGAGE_NOW,
+            "never the sweep's first read: {asks:?}",
+        );
+        assert_eq!(asked.rows, first.rows, "and the same engagement");
+    }
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::ENGAGING);
+    assert_eq!(
+        state.seq_kind(),
+        SeqKindWire::NONE,
+        "and no sequence was started under the ask",
+    );
+}
+
+/// A stow re-ranked to a park leaves no fault ending standing.
+///
+/// The flag says a fault is carrying this session to rest, and a parked machine
+/// is on its way nowhere: nothing engages it until an operator has been, and a
+/// script arriving is answered `parked`, which is the truer of the two reasons.
+/// The re-rank is the path that reaches the phase without the ladder answering
+/// again, so the clearing belongs to entering the phase rather than to the
+/// answer.
+#[test]
+fn a_stow_re_ranked_to_a_park_leaves_no_fault_ending_standing() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    let grabbed = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.2,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    coast(&mut cog, grabbed, 4);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::WINDING_DOWN);
+    assert!(
+        cog.state_sess().ending_by_fault(),
+        "a rest-class response is carrying the session down",
+    );
+
+    // A condition the stow is re-ranked for: the maneuver runs on, and the
+    // ending it is judged by is a park.
+    let dropped = grabbed + 5 * LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_SERVO_FAULT,
+            JointRefWire::LEG_2,
+            dropped,
+            0.0,
+        ),
+        SyncTime::from_nanos(dropped),
+    );
+    coast(&mut cog, dropped, 3);
+    wake_folded(&mut cog, dropped + 3 * LAPSE_NS);
+
+    let state = cog.state_sess();
+    assert_eq!(state.phase(), SessionPhaseWire::PARKED);
+    assert!(
+        !state.ending_by_fault(),
+        "nothing is carrying a parked session anywhere",
+    );
+}
+
+/// A drain waits for a group-scoped de-torque that is still draining.
+///
+/// The wake has one output slot and a machine being made limp owns it: a
+/// de-torque write is never displaced, never deferred and never dropped, so the
+/// engagement a held script opens waits for the wake after the drain's last
+/// write. This is the precondition the engagement's first bus step is asserted
+/// on, and the one arm of the drain that holds a script in a phase that could
+/// otherwise answer it.
+#[test]
+fn a_drain_waits_for_a_group_de_torque_still_draining() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    let asked_at = engagement_asked(&mut cog);
+
+    let barged = asked_at + LAPSE_NS;
+    cog.publish_script(&hold_script(8, barged, 3_000), SyncTime::from_nanos(barged));
+    wake(&mut cog, barged).expect("a hold is narrated");
+    caught_up(&mut cog);
+
+    // An antenna health fault answers a group de-torque, and the engagement is
+    // then declined: the machine rests with the drain still running.
+    let right = SERVO_IDS[usize::from(JointRefWire::ANTENNA_RIGHT.0) - 1];
+    let limp = barged + LAPSE_NS;
+    let mut faulted = reading(right, 0x20, limp);
+    // On a supply the gate has nothing against: what this case is about is the
+    // order the wake's one datagram is decided in.
+    faulted.set_volts(NOMINAL_VOLTS);
+    cog.publish_readings(&faulted, SyncTime::from_nanos(limp));
+    let first = drive(&mut cog, limp).expect("the first row is told to let go");
+    assert_eq!(first.op, AuxOpKindWire::WRITE_REG_VERIFIED);
+
+    let declined = limp + LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_DECLINED, declined),
+        SyncTime::from_nanos(declined),
+    );
+    assert_eq!(
+        drive(&mut cog, declined),
+        None,
+        "the wake asks for nothing: the de-torque write it owes is outstanding, \
+         and an engagement would displace it",
+    );
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::RESTING,
+        "the engagement was declined",
+    );
+    assert!(
+        cog.state_sess().pending_valid(),
+        "and the script is still held: a machine being let go of is not one to \
+         ask anything else of",
+    );
+
+    // The rest of the drain, answered row by row: the engagement leaves once
+    // nothing is outstanding.
+    let ran = sweep(&mut cog, &mut bus, declined, first);
+    let took = ran
+        .asks
+        .iter()
+        .position(|ask| ask.kind == SessionCmdKindWire::ENGAGE_NOW)
+        .unwrap_or_else(|| panic!("the held script is engaged for: {:?}", ran.asks));
+    assert!(
+        ran.asks[..took]
+            .iter()
+            .all(|ask| ask.op == AuxOpKindWire::WRITE_REG_VERIFIED),
+        "every de-torque write went out before it: {:?}",
+        ran.asks,
+    );
+    let state = cog.state_sess();
+    assert!(!state.pending_valid(), "and the hold was answered by it");
+    assert!(!state.degrade_pending(), "with the pair let go of first");
+}
+
+/// A fallback sweep nobody answers rests the machine and closes the ask.
+///
+/// The sweep reads and writes nothing, so there is nothing to undo: a rail
+/// nobody could read is a reason to decline the script rather than a condition of
+/// the machine. What must not be left behind is the ask itself -- an engagement
+/// still recorded as open over a rested machine would take a later
+/// `engage_confirmed` as its answer and go active with no gate judged for it.
+#[test]
+fn a_fallback_sweep_nobody_answers_rests_and_closes_the_ask() {
+    let mut cog = resting_session();
+    // Eight rows the rotation reached, and a ninth it never did: the one row the
+    // gate has nothing to judge from.
+    for id in &SERVO_IDS[..JOINT_COUNT - 1] {
+        let mut msg = reading(*id, 0, T0);
+        msg.set_volts(FRESH_VOLTS);
+        cog.publish_readings(&msg, SyncTime::from_nanos(T0));
+    }
+    let filled = T0 + LAPSE_NS;
+    drive(&mut cog, filled);
+
+    cog.publish_script(&one_step_script(7, filled), SyncTime::from_nanos(filled));
+    let mut at = filled + LAPSE_NS;
+    let first = drive(&mut cog, at).expect("the stale row's supply read");
+    assert_eq!(first.kind, SessionCmdKindWire::AUX);
+    assert_eq!(first.reg, RegIdWire::PRESENT_INPUT_VOLTAGE);
+
+    // Nobody answers it, through every window the delivery budget holds.
+    for _ in 0..AUX_RETRIES {
+        at += AUX_TIMEOUT_NS + 1;
+        assert_eq!(
+            drive(&mut cog, at).expect("a re-issue"),
+            first,
+            "the same datagram, under the same number",
+        );
+    }
+    at += AUX_TIMEOUT_NS + 1;
+    let given_up = all_of_it(&mut cog, at);
+
+    assert!(
+        given_up
+            .iter()
+            .any(|report| report.kind == ReportKindWire::AUX_GAVE_UP),
+        "the give-up is narrated: {given_up:?}",
+    );
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::RESTING,
+        "a rail nobody could read declines the script: {given_up:?}",
+    );
+    assert!(!state.engage_pending(), "and the ask is closed");
+    assert_eq!(state.seq_kind(), SeqKindWire::NONE, "and so is the sweep");
+    assert!(!state.aux().active(), "with nothing left outstanding");
+    caught_up(&mut cog);
+
+    // The ask being closed is what makes a later answer a stray.
+    at += LAPSE_NS;
+    cog.publish_evt(
+        &event(EventKindWire::ENGAGE_CONFIRMED, at),
+        SyncTime::from_nanos(at),
+    );
+    let told = everything(&mut cog, at + LAPSE_NS);
+
+    let state = cog.state_sess();
+    assert_eq!(
+        state.phase(),
+        SessionPhaseWire::RESTING,
+        "a machine nobody gated is a machine nobody takes active: {told:?}",
+    );
+    assert_eq!(state.engage_strays(), 1);
 }

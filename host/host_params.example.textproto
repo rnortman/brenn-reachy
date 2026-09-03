@@ -1,4 +1,11 @@
-# The voice host's intent edge configuration, loaded once at startup.
+# The worked example of the voice host's intent edge configuration, which the
+# host loads once at startup.
+#
+# This file is read by tests and staged by nothing. The configuration a unit
+# runs is an operator's own, laid into the unit's RAM at
+# `host/host_params.textproto` by the payload build, which takes it from
+# `REACHY_HOST_PARAMS` or the gitignored `.local/host_params.textproto`. Copy
+# this file to start one.
 #
 # One message of `brenn_reachy.host.host_config_clk_proto.HostParams`, which the
 # compiler generates from the `HostParams` schema in `host_config.clk`. Read as
@@ -11,15 +18,12 @@
 # this machine's own rules -- every field required, and every value one the edge
 # can actually screen with.
 #
-# This is the file the payload carries. An operator's variant for a particular
-# unit is pushed into RAM beside it and named on the command line; it is never
-# in this tree, and neither is anything it would carry.
-
 # The name this head answers to. A script addressed to any other name is dropped
 # and narrated: the intent channel is not assumed to carry one machine's
 # traffic, and the scripter that authors presence for this unit addresses it by
-# this name.
-pod: "kitchen-reachy"
+# this name. No unit answers to the name below: an example that named a real
+# machine would be a deployment file in a public tree.
+pod: "example-reachy"
 
 # Three seconds for the closing stow. The wake gesture's own stow budget, which
 # is the only measured number available -- it is what the machine has been

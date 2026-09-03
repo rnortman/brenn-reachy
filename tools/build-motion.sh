@@ -22,7 +22,7 @@
 #     reachy_ask                                        the harness's intent source
 #     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
-#     host/host_params.textproto                        the host's configuration
+#     host/host_params.textproto                        the operator's host configuration
 #     cogs/clip_library.names.json                      the overlay name table it reads
 #     models/oww/*.onnx                                 the wake gate's three graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
@@ -35,7 +35,9 @@
 # working directory, which is the payload root, so where a file goes is what that
 # config already says. `robot_clk_exe` lives under `cogs/` for that reason and no
 # other, and the host's two files keep their repository paths because the host's
-# own default and its configuration name them that way.
+# own default and its configuration name them that way -- one of them staged from
+# Bazel's outputs, and the configuration itself from the operator's file
+# (`host_params`, staged at `host_params_path`).
 #
 # Two launcher configs are staged. The production one names the host and the pod;
 # the harness twin names neither, because `deploy-motion.sh --run` starts the
@@ -92,9 +94,11 @@ set -euo pipefail
 
 bazel=${REACHY_BAZEL:-bazel}
 
-# The two payload members whose sources are outside this tree -- the audio
-# device's binary (`pod_binary`) and the site's speech configuration
-# (`speech_config`, staged at `speech_config_path`) -- are named by `lib.sh`:
+# The three payload members whose sources are outside this tree -- the audio
+# device's binary (`pod_binary`), the site's speech configuration
+# (`speech_config`, staged at `speech_config_path`) and the unit's own host
+# configuration (`host_params`, staged at `host_params_path`) -- are named by
+# `lib.sh`:
 # this script stages them and `deploy-motion.sh` asks whether either has changed
 # since, and a knob spelled twice is a knob that answers two ways.
 
@@ -160,15 +164,15 @@ model_paths=(
 # source of truth whose drift is invisible until a process dies at setup on a
 # powered unit.
 #
-# The host's two are named as files rather than through a filegroup because they
-# are all it reads and they live in two packages: its own configuration, and the
-# clip name table that configuration points at, which is generated beside the
-# library it describes and belongs to the cogs.
+# The host's clip name table is named as a file rather than through a filegroup
+# because it is the one thing the host reads that the build produces: it is
+# generated beside the library it describes and belongs to the cogs. The host's
+# own configuration is not here at all -- it is a per-unit file, staged from
+# outside the tree below.
 config_targets=(
 	//cogs:clip_library.names.json
 	//cogs:robot_config_files
 	//driver:motord_params.textproto
-	//host:host_params.textproto
 )
 
 # The staged payload path. `target/` is a cargo-era naming convention, kept
@@ -356,6 +360,7 @@ payload_fixed_members=(
 	clockwork/launch/clockwork_prelaunch.sh
 	"$provenance_name"
 	"$speech_config_path"
+	"$host_params_path"
 	"$build_commit_name"
 )
 
@@ -476,12 +481,18 @@ stage() {
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
 
-	# The one member that may be absent, and the one staged 0600: it carries a
-	# bus token and this unit's link keys, so it is readable by the account that
-	# runs the payload and by nobody else on the machine.
+	# The one member that may be absent, and one of the two staged 0600: it
+	# carries a bus token and this unit's link keys, so it is readable by the
+	# account that runs the payload and by nobody else on the machine.
 	if [ -f "$speech_config" ]; then
 		install -m 0600 -D -- "$speech_config" "${staging}/${speech_config_path}"
 	fi
+
+	# The other operator's file, staged the same way and refused above when it
+	# is not there: the host cannot start without it. 0600 for the reason the
+	# speech configuration is -- it names the machine this unit answers to, and
+	# a per-unit file is nobody else's on the machine to read.
+	install -m 0600 -D -- "$host_params" "${staging}/${host_params_path}"
 
 	# Credentials (the pod's key table, the bus token): mode 0600 so only
 	# the payload's account reads them. `rsync -a` carries the mode to the
@@ -525,6 +536,9 @@ report() {
 	else
 		echo "${prog}: ${speech_config_path}  absent; the voice host will run its edge half alone"
 	fi
+	# Said without a digest for the same reason, and always present: the build
+	# refuses without it, so there is no absent case to report.
+	echo "${prog}: host params staged from ${host_params}"
 	# The credential files that configuration names, path only and no digest,
 	# for the reason the configuration itself gets none: what a person needs at
 	# the bench is which files this payload carries and where they came from.
@@ -581,6 +595,18 @@ if [ -n "$speech_config_named" ] && [ ! -f "$speech_config" ]; then
 		"REACHY_SPEECH_CONFIG names the voice pipeline's own TOML, which is a site's" \
 		"file and is never in this tree; unset it to build a payload whose host runs" \
 		"its edge half alone."
+fi
+# The third member from outside the build, and the one with no optional case:
+# the voice host reads its configuration at startup and exits without one, so a
+# payload built without it is a unit whose voice never starts. Named or
+# defaulted, absent is a refusal here.
+if [ ! -f "$host_params" ]; then
+	mapfile -t params_remedy < <(knob_remedy REACHY_HOST_PARAMS \
+		"/elsewhere/<unit>/host_params.textproto" motion-build)
+	die "there is no host configuration at ${host_params}." \
+		"It names the machine this head answers to, so it is a per-unit file and is" \
+		"never in this tree; host/host_params.example.textproto is the file to copy." \
+		"${params_remedy[@]}"
 fi
 resolve_models
 check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"

@@ -143,14 +143,18 @@ pub fn detail(fault: &Fault) -> f64 {
 
 /// How many consecutive periods the evidence ran for, or zero where it is not a
 /// run.
+///
+/// For the two obstructions this is the count the tracking run reached on the
+/// tick it ran out, which is the window it was judged by — the ordinary `ticks`
+/// or the longer `reversal_ticks` — so a reading tells a window that was too
+/// short from a reversal the detector did not recognise.
 #[must_use]
 pub fn count(fault: &Fault) -> u32 {
     match *fault {
         Fault::PositionFeedbackLost { misses } => misses,
         Fault::MeasuredPoseInvalid { failures, .. } => failures,
-        Fault::AntennaObstructed { .. }
-        | Fault::AntennaServoFault { .. }
-        | Fault::HeadObstructed { .. }
+        Fault::AntennaObstructed { count, .. } | Fault::HeadObstructed { count, .. } => count,
+        Fault::AntennaServoFault { .. }
         | Fault::HeadServoFault { .. }
         | Fault::BusFailure { .. }
         | Fault::TorqueOffUnconfirmed { .. } => 0,
@@ -357,6 +361,7 @@ pub fn read(slot: &FaultSnap) -> Result<Fault, FaultError> {
         FaultKind::AntennaObstructed => Fault::AntennaObstructed {
             joint: joint()?,
             error: slot.error,
+            count: slot.count,
         },
         FaultKind::AntennaServoFault => Fault::AntennaServoFault {
             joint: joint()?,
@@ -366,6 +371,7 @@ pub fn read(slot: &FaultSnap) -> Result<Fault, FaultError> {
         FaultKind::HeadObstructed => Fault::HeadObstructed {
             joint: joint()?,
             error: slot.error,
+            count: slot.count,
         },
         FaultKind::HeadServoFault => Fault::HeadServoFault {
             joint: joint()?,
@@ -536,11 +542,13 @@ mod tests {
             let expected = match slot.code {
                 // The left antenna, and the error is how far it stood from its
                 // goal.
-                FaultKind::AntennaObstructed => (JointRef::AntennaLeft, 0, 0, 0, -0.418),
+                // The window that judged the run lands in the counter, not in
+                // the magnitude.
+                FaultKind::AntennaObstructed => (JointRef::AntennaLeft, 0, 0, 30, -0.418),
                 // The right antenna, its servo's ID, and the hardware-error
                 // byte as the servo reported it.
                 FaultKind::AntennaServoFault => (JointRef::AntennaRight, 71, 0b0010_1001, 0, 0.0),
-                FaultKind::HeadObstructed => (JointRef::Leg3, 0, 0, 0, 0.204),
+                FaultKind::HeadObstructed => (JointRef::Leg3, 0, 0, 10, 0.204),
                 FaultKind::HeadServoFault => (JointRef::BodyYaw, 10, 0b1000_0000, 0, 0.0),
                 // A streak length, in the counter — not in the magnitude.
                 FaultKind::PositionFeedbackLost => (JointRef::None, 0, 0, 51, 0.0),

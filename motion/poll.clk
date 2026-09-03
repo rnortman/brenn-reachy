@@ -1,5 +1,5 @@
-// One sweep of the resting watch, as the slot holds it: which phase is running
-// and what it has measured.
+// One sweep of the resting watch, as the slot holds it: which phase is running,
+// which rows it covers, and what it has read.
 //
 // The poll sequencer writes both declarations here. Its own module rather than
 // a corner of the commissioning one: the two sequencers share the readings in
@@ -17,7 +17,9 @@ use motion::servo_health;
 // Which phase of a resting-watch sweep is running.
 //
 // Phases run from one for the same reason: zero is what nothing wrote, and the
-// position sweep is a thing a poll would then go and do.
+// voltage sweep is a thing a poll would then go and do.
+//
+// Numbering is append-only; #1 is retired and will not be reused.
 enum PollPhaseKind
 {
     uuid: f6cb8316-20bf-42dc-a9b1-a45a1c7ddca2;
@@ -29,13 +31,11 @@ enum PollPhaseKind
     {
         // No phase. What a slot nothing wrote holds.
         #0 none default { underlying_value: 0; }
-        // The nine position reads.
-        #1 position { underlying_value: 1; }
-        // The nine supply reads, on the slow cadence.
+        // The supply read of each named row.
         #2 voltage { underlying_value: 2; }
-        // The nine hardware-error reads, on the slow cadence.
+        // The hardware-error read of each named row.
         #3 health { underlying_value: 3; }
-        // Finished: the next step hands back the posture.
+        // Finished: the next step hands back the rail.
         #4 complete { underlying_value: 4; }
         // Stopped: the next step hands back the failure.
         #5 failed { underlying_value: 5; }
@@ -45,11 +45,13 @@ enum PollPhaseKind
 // One sweep of the resting watch, as the numbers a slot holds it between
 // transactions.
 //
-// The poll sequencer's own state, read and written in place. The watch runs
-// while the platform rests limp, because a hand can move the head and the next
-// engage plans from wherever it actually is -- so this slot is what a poll
-// interrupted by a slot crossing resumes from, and never a verdict about
-// anything.
+// The poll sequencer's own state, read and written in place. The watch is the
+// fallback the torque-on gate falls to: it re-reads the supply and the error
+// byte of the rows the driver's health rotation has left stale, and hands back
+// nothing else -- no pose, because the engagement pins at the angles the
+// driver's own read returns. So this slot is what a sweep interrupted by a slot
+// crossing resumes from, and never a verdict about anything.
+// Numbering is append-only; #4, #6 and #7 are retired and will not be reused.
 schema PollSnap
 {
     uuid: e8c939dd-fb9b-459c-baa1-e54ef4c6dfd0;
@@ -68,18 +70,15 @@ schema PollSnap
         // The transaction awaiting an answer.
         #3 pending: bus_txn::BusTxn;
 
-        // The angles measured so far, in bus order, radians.
-        #4 present: joints::Joints;
-
-        // The supply and error-bit readings: re-read by this sweep, or carried
-        // in from the last one.
+        // The supply and error-bit readings this sweep has taken. A fresh
+        // sweep starts from an empty snapshot, so a row this sweep does not
+        // name reads back zero here and the caller merges by row rather than
+        // taking the whole picture.
         #5 rail: servo_health::RailSnap;
 
-        // Whether this sweep reads the rail itself rather than carrying it,
-        // which is also what the finished posture reports.
-        #6 rail_read: Bool;
-
-        // Re-reads already spent on the joint the position sweep is at.
-        #7 rereads: UInt32;
+        // The rows this sweep re-reads: the ones the driver's health rotation
+        // has left older than the gate's staleness window, or has never
+        // reached.
+        #8 rows: joints::JointFlags;
     }
 }

@@ -20,6 +20,7 @@ SHELL := /bin/bash
 #
 #     REACHY_HOST ?= reachy00
 #     REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
+#     REACHY_HOST_PARAMS ?= /elsewhere/reachy00/host_params.textproto
 #
 # Read unconditionally, because it carries more than one variable and a guard on
 # any single one would silently drop the rest. The precedence the file wants is
@@ -39,6 +40,13 @@ SHELL := /bin/bash
 # environment is left exactly as it is.
 ifdef REACHY_SPEECH_CONFIG
 export REACHY_SPEECH_CONFIG
+endif
+
+# The operator's host configuration, for the payload's edge half. Read by the
+# scripts the same way, and exported for the same reason; the unnamed default is
+# `.local/host_params.textproto`, which `tools/lib.sh` names.
+ifdef REACHY_HOST_PARAMS
+export REACHY_HOST_PARAMS
 endif
 
 # The brenn-pod checkout, read for two things a speech run needs: the prebuilt

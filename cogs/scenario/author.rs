@@ -346,6 +346,33 @@ impl InputLog {
         self.inject(at_ns, &injection)
     }
 
+    /// Give the given rows a response delay of `cycles` cycles: each of them
+    /// chases the target it was given that many cycles ago.
+    ///
+    /// What a servo whose loop takes time to turn round looks like to the
+    /// control loop. The plant has no other way to make a row lag a goal it is
+    /// following -- an unlagged row closes a fixed fraction of the gap every
+    /// cycle and is never behind one -- and the distance a joint stands behind
+    /// a moving goal is what the tracking window is judged over, so a run about
+    /// a goal turning round under a lagging joint says so here.
+    ///
+    /// The set replaces whatever was named before, and a delay past the plant's
+    /// rings is refused rather than shortened.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    pub fn set_lag(
+        &mut self,
+        at_ns: i64,
+        rows: JointFlagsWire,
+        cycles: u32,
+    ) -> Result<(), LogError> {
+        let mut injection = operation(SimOpWire::SET_LAG, rows);
+        injection.set_count(cycles);
+        self.inject(at_ns, &injection)
+    }
+
     /// Teleport the given rows.
     ///
     /// The positions are filled in by `edit` rather than handed over whole: a

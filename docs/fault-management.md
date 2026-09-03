@@ -235,10 +235,20 @@ never retried with perturbed inputs.
 
 The rest-class responses (`slow_stow_to_rest`,
 `immediate_all_torque_off_to_rest`) do **not** latch. They are endings, not
-verdicts about the machine: the session is over, the machine is at the MRC,
-and the next wake engages a fresh session normally. Nothing resumes the
-session that stopped — recovery is always a new engagement or a person, never
-a cleared flag on the old state.
+verdicts about the machine: the session is over, the machine is at the MRC, and
+the next wake engages a fresh session normally. The next wake is one that
+arrives *after* the machine has reached the MRC — stowed, and with its release
+confirmed. A script that arrived while the ending was still running (during the
+stow, or during the release it owes), or that was waiting when the ending began,
+is refused `fault_ending` and never applied, so torque comes back on after a
+fault only on an ask made of a machine already at the MRC. Nothing resumes the
+session that stopped — recovery is always a new engagement or a person, never a
+cleared flag on the old state.
+
+What the session cannot tell is who asked. A script carries no cause, so one
+arriving at rest is taken whether a person said the wake word or the sender
+refreshed on its own cadence; a hand kept on the head is therefore re-engaged at
+that cadence. Closing that is `script-cause` in `TODO.md`.
 
 `degrade_antennas` latches for the session only: the antennas stay out of
 service until the next engagement, which retries them and takes them back if

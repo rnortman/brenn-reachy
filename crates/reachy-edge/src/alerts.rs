@@ -12,6 +12,11 @@
 //!   latched out of engaging until an operator has been. One alert for the run,
 //!   ever: a fault does not improve, and a machine parked for an hour must not
 //!   alert for an hour. Critical.
+//! - **An antenna pair released.** A fault scoped to the antennas is answered
+//!   by letting the pair go, and the head keeps its session — so it is neither
+//!   the machine stopping nor nothing. Warning, and the fault row it answers
+//!   raises nothing of its own: the two rows are one event, and classifying
+//!   both would say it twice.
 //! - **Refused scripts.** The session declined one, or the edge dropped one
 //!   before it got there. Either way a sender and this machine disagree about
 //!   something no retry fixes, and nothing else would tell anybody. One alert
@@ -60,6 +65,9 @@
 //! narration and nothing else.
 
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+use brenn_reachy__motion__faults_clk_rs::{
+    FaultKind, FaultKindWire, ResponseKind, ResponseKindWire,
+};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
@@ -227,6 +235,13 @@ impl Alerts {
     pub fn on_row(&mut self, row: &TimelineEntryWire) -> Option<Alert> {
         if let Some(refused) = refused_script(row) {
             self.refusals += 1;
+            // The refusal alert says a sender and this machine disagree about
+            // something no retry fixes; a fault's ending is not that -- the fix
+            // is to ask again once the machine has rested, and the fault's own
+            // rows have already carried the critical.
+            if refused == RefusalReasonWire::FAULT_ENDING {
+                return None;
+            }
             if refused == RefusalReasonWire::STALE {
                 self.stale_run += 1;
                 if let Some(alert) = self.stale_alert() {
@@ -238,6 +253,16 @@ impl Alerts {
                 row.a(),
                 refusal_reason(row.b())
             ));
+        }
+        match antenna_scoped(row) {
+            // The pair let go of, with the head still under command: news, and
+            // not the news that the machine stopped.
+            Some(AntennaRow::Released) => return Some(antennas_alert(row)),
+            // The condition itself. The response row that follows it in the
+            // same wake is what carries this to an operator, so classifying
+            // the fault as well would say it twice, the second time louder.
+            Some(AntennaRow::Fault) => return None,
+            None => {}
         }
         if !stops_the_machine(row) {
             return None;
@@ -379,6 +404,92 @@ fn refused_script(row: &TimelineEntryWire) -> Option<RefusalReasonWire> {
         .then(|| RefusalReasonWire(u8::try_from(row.b()).unwrap_or(u8::MAX)))
 }
 
+/// Which half of an antenna pair's own trouble a row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AntennaRow {
+    /// The condition: an antenna obstructed, or an antenna servo's own error
+    /// byte.
+    Fault,
+    /// The answer: the pair released, the head carrying on.
+    Released,
+}
+
+/// Whether this row is about an antenna pair alone, and which half.
+///
+/// The two rows a scoped de-torque produces, and nothing else: a response that
+/// covers the head is the machine stopping, and a fault the head shares is
+/// answered by a maneuver that stops it.
+fn antenna_scoped(row: &TimelineEntryWire) -> Option<AntennaRow> {
+    let kind = row.kind().to_known()?;
+    if kind == ReportKind::FaultRecorded && antenna_fault(row.a()) {
+        return Some(AntennaRow::Fault);
+    }
+    if kind == ReportKind::ResponseTaken && releases_the_antennas(row.a()) {
+        return Some(AntennaRow::Released);
+    }
+    None
+}
+
+/// Whether a fault kind is one only the antennas raise.
+///
+/// Wildcard-free over the fault vocabulary: a fault the vocabulary grows is a
+/// compile error here rather than a condition silently classified as the head's.
+fn antenna_fault(fault: u32) -> bool {
+    match FaultKindWire(u8::try_from(fault).unwrap_or(u8::MAX)).to_known() {
+        Some(FaultKind::AntennaObstructed | FaultKind::AntennaServoFault) => true,
+        Some(
+            FaultKind::None
+            | FaultKind::HeadObstructed
+            | FaultKind::HeadServoFault
+            | FaultKind::PositionFeedbackLost
+            | FaultKind::MeasuredPoseInvalid
+            | FaultKind::BusFailure
+            | FaultKind::TorqueOffUnconfirmed
+            | FaultKind::MoveAbortedEnvelope
+            | FaultKind::MoveAbortedStep
+            | FaultKind::CommandRejected,
+        )
+        | None => false,
+    }
+}
+
+/// Whether a response is the one that lets the antenna pair go and carries on.
+///
+/// Wildcard-free for the same reason [`antenna_fault`] is: every other response
+/// in the vocabulary ends the session or parks the machine.
+fn releases_the_antennas(response: u32) -> bool {
+    match ResponseKindWire(u8::try_from(response).unwrap_or(u8::MAX)).to_known() {
+        Some(ResponseKind::DegradeAntennas) => true,
+        Some(
+            ResponseKind::None
+            | ResponseKind::Refuse
+            | ResponseKind::SlowStowToRest
+            | ResponseKind::MaskedSlowStowToPark
+            | ResponseKind::ImmediateAllTorqueOffToRest
+            | ResponseKind::ImmediateAllTorqueOffToPark,
+        )
+        | None => false,
+    }
+}
+
+/// The alert a released antenna pair is worth.
+///
+/// A Warning, unlatched and unspoken: the row is one event rather than a
+/// standing condition, the head still has its session, and a room does not need
+/// to be interrupted for a pair of antennas.
+fn antennas_alert(row: &TimelineEntryWire) -> Alert {
+    Alert {
+        severity: Severity::Warning,
+        title: "reachy antennas released".to_owned(),
+        body: format!(
+            "the session's story says: {}. the head keeps its session and goes on doing what it \
+             was asked; the antennas are limp and out of service until the next engagement.",
+            row_says(row)
+        ),
+        spoken: None,
+    }
+}
+
 /// Whether this row says the machine stopped doing what it was asked.
 ///
 /// A classification and nothing more. What a row *says* is spelled once, in the
@@ -416,7 +527,8 @@ fn stops_the_machine(row: &TimelineEntryWire) -> bool {
         | ReportKind::AuxGaveUp
         | ReportKind::SchedulePublished
         | ReportKind::DegradeReleased
-        | ReportKind::ScriptReplaced => false,
+        | ReportKind::ScriptReplaced
+        | ReportKind::ScriptHeld => false,
     }
 }
 
@@ -426,7 +538,9 @@ mod tests {
     use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
-    use super::{Alerts, STALE_ALERT_RUN, Severity};
+    use super::{
+        Alerts, FaultKind, FaultKindWire, ResponseKind, ResponseKindWire, STALE_ALERT_RUN, Severity,
+    };
     use crate::intake::{Origin, Refusal};
 
     fn row(kind: ReportKindWire, a: u32, b: u32) -> TimelineEntryWire {
@@ -494,6 +608,109 @@ mod tests {
         }
     }
 
+    /// A fault kind as one of a report's numbers.
+    fn fault_of(kind: FaultKind) -> u32 {
+        u32::from(FaultKindWire::from(kind).0)
+    }
+
+    /// A response as one of a report's numbers.
+    fn response_of(kind: ResponseKind) -> u32 {
+        u32::from(ResponseKindWire::from(kind).0)
+    }
+
+    /// The two rows an obstructed antenna produces: the condition, which says
+    /// nothing on its own, and the answer, which is a Warning about a machine
+    /// that is still doing what it was asked.
+    #[test]
+    fn a_released_antenna_pair_is_a_warning_the_fault_row_leaves_to_it() {
+        let mut alerts = Alerts::new();
+        assert_eq!(
+            alerts.on_row(&row(
+                ReportKindWire::FAULT_RECORDED,
+                fault_of(FaultKind::AntennaObstructed),
+                8
+            )),
+            None,
+            "the condition is carried by the answer that follows it"
+        );
+        let alert = alerts
+            .on_row(&row(
+                ReportKindWire::RESPONSE_TAKEN,
+                response_of(ResponseKind::DegradeAntennas),
+                fault_of(FaultKind::AntennaObstructed),
+            ))
+            .expect("a released pair owes an alert");
+        assert_eq!(alert.severity, Severity::Warning);
+        assert_eq!(alert.title, "reachy antennas released");
+        assert_eq!(alert.spoken, None, "a room is not interrupted for this");
+        assert!(alert.body.contains("keeps its session"), "{}", alert.body);
+
+        // The Critical latch is untouched: the head stopping after this is
+        // still the news it was.
+        let head = alerts
+            .on_row(&row(
+                ReportKindWire::FAULT_RECORDED,
+                fault_of(FaultKind::HeadObstructed),
+                2,
+            ))
+            .expect("a head fault owes an alert of its own");
+        assert_eq!(head.severity, Severity::Critical);
+    }
+
+    /// An antenna servo's own error byte is the same news by another route.
+    #[test]
+    fn an_antenna_servo_fault_row_is_left_to_its_answer_too() {
+        let mut alerts = Alerts::new();
+        assert_eq!(
+            alerts.on_row(&row(
+                ReportKindWire::FAULT_RECORDED,
+                fault_of(FaultKind::AntennaServoFault),
+                9
+            )),
+            None
+        );
+        let alert = alerts
+            .on_row(&row(
+                ReportKindWire::RESPONSE_TAKEN,
+                response_of(ResponseKind::DegradeAntennas),
+                fault_of(FaultKind::AntennaServoFault),
+            ))
+            .expect("a released pair owes an alert");
+        assert_eq!(alert.severity, Severity::Warning);
+    }
+
+    /// Every response that covers the head is the machine stopping, and every
+    /// fault the head shares is answered by one.
+    #[test]
+    fn a_response_that_covers_the_head_is_still_critical() {
+        for kind in [
+            ResponseKind::SlowStowToRest,
+            ResponseKind::MaskedSlowStowToPark,
+            ResponseKind::ImmediateAllTorqueOffToRest,
+            ResponseKind::ImmediateAllTorqueOffToPark,
+        ] {
+            let mut alerts = Alerts::new();
+            let alert = alerts
+                .on_row(&row(ReportKindWire::RESPONSE_TAKEN, response_of(kind), 3))
+                .unwrap_or_else(|| panic!("{kind:?} owes an alert"));
+            assert_eq!(alert.severity, Severity::Critical, "{kind:?}");
+        }
+        for kind in [
+            FaultKind::HeadObstructed,
+            FaultKind::HeadServoFault,
+            FaultKind::PositionFeedbackLost,
+            FaultKind::MeasuredPoseInvalid,
+            FaultKind::BusFailure,
+            FaultKind::TorqueOffUnconfirmed,
+        ] {
+            let mut alerts = Alerts::new();
+            let alert = alerts
+                .on_row(&row(ReportKindWire::FAULT_RECORDED, fault_of(kind), 1))
+                .unwrap_or_else(|| panic!("{kind:?} owes an alert"));
+            assert_eq!(alert.severity, Severity::Critical, "{kind:?}");
+        }
+    }
+
     /// A wind-down that rested is the presence contract concluding, not a park.
     #[test]
     fn a_winddown_that_did_not_park_is_not_an_alert() {
@@ -508,6 +725,50 @@ mod tests {
                 .is_some(),
             "a park-class wind-down owes an alert"
         );
+    }
+
+    /// A script held for the phase a maneuver ends in is not news to a room.
+    ///
+    /// Nothing about the machine is wrong and nothing is being refused: the
+    /// sender is owed an answer and will get one on the wake the maneuver ends.
+    #[test]
+    fn a_held_script_owes_no_alert() {
+        let mut alerts = Alerts::new();
+        assert_eq!(alerts.on_row(&row(ReportKindWire::SCRIPT_HELD, 7, 5)), None);
+        assert_eq!(
+            alerts.on_row(&row(ReportKindWire::SCRIPT_HELD, 8, 2)),
+            None,
+            "and a second one is no louder than the first",
+        );
+    }
+
+    /// A script refused because a fault was standing the machine down is
+    /// counted and left there.
+    ///
+    /// The refusal warning says a sender and this machine disagree about
+    /// something no retry fixes; this is the opposite -- the answer is to ask
+    /// again once the machine has rested -- and the fault's own rows have
+    /// already carried the critical to whoever is holding the robot.
+    #[test]
+    fn a_refusal_by_a_faults_ending_owes_no_alert() {
+        let mut alerts = Alerts::new();
+        assert_eq!(
+            alerts.on_row(&row(
+                ReportKindWire::SCRIPT_REFUSED,
+                7,
+                u32::from(RefusalReasonWire::FAULT_ENDING.0)
+            )),
+            None,
+        );
+        assert_eq!(alerts.refusals(), 1, "counted all the same");
+        let after = alerts
+            .on_row(&row(
+                ReportKindWire::SCRIPT_REFUSED,
+                8,
+                u32::from(RefusalReasonWire::BAD_TIMES.0),
+            ))
+            .expect("an ordinary refusal still owes the warning");
+        assert_eq!(after.severity, Severity::Warning);
     }
 
     #[test]

@@ -21,6 +21,8 @@ rust_library(
         "//cogs:schedule_clk_rs",
         "//cogs:script_clk_rs",
         "//cogs:session_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
         "//motion:reports_clk_rs",
         "//motion:timeline_clk_rs",
         "//crates/motion-proto:motion_proto",

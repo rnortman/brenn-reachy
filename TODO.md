@@ -897,3 +897,97 @@ deciding what sets it are a motion-schema decision rather than an edge one.
 Done = the story follower tells one run of the control process from the next by
 something the message says, not by arithmetic on its length. Marked at the
 restart test in `crates/reachy-edge/src/story.rs`.
+
+## `script-cause`
+
+Give `Script` (`cogs/script.clk`) a field saying what caused it — a wake word,
+or the sender's periodic refresh — set by the scripter that sends it, and let
+the session refuse a refresh, but not a wake, that arrives at rest after a fault
+ended the previous session.
+
+Deferral context: the session cannot tell the two apart. A fault's ending now
+refuses everything from the response through the wake its release confirms, so
+nothing is applied to a machine still being stood down — but the sender refreshes
+on a cadence of a few seconds, and the refresh after the release confirms is
+indistinguishable from someone saying the wake word. A hand kept on the head is
+therefore re-engaged roughly every other refresh, with no person acting between
+cycles. Closing it is a contract change on the script and on the sender, plus
+session state that remembers the last ending was a fault until a wake-caused
+script clears it — a design cycle, not a patch.
+
+Done = a machine stood down by a fault stays down until someone asks for it.
+Marked at `phase_intake`'s `Resting` arm in `cogs/session_cog.rs`.
+
+## `arm-record-retirement`
+
+Decide whether the arming record survives: `motion/arm_record.clk`,
+`crates/reachy-motion/src/record.rs`, and `arm.rs`'s `pin_goals`,
+`pin_goals_from` and `PinOutcome`, which `lib.rs` re-exports. Either retire the
+lot, or say in one place what it is being kept for.
+
+Deferral context: the engagement is now one grouped driver cycle that takes no
+pose from the session, which removed the last production caller of all of it.
+`record.rs` is written and read only by its own tests, and the pose-pinning
+helpers only by tests and by `record.rs` — so the reason each is kept is the
+other one, which is a cycle between two dead things. It is left standing rather
+than deleted because the frozen design for that cycle named these as staying,
+and because the leg-window pull-in this record was written for may be the thing
+that wants them back: whether a solved arming record is part of where this stack
+is going is a design question, not a cleanup.
+
+Done = the arming record has a live caller or does not exist. Marked at the
+module header of `crates/reachy-motion/src/record.rs`.
+
+## `hold-ordering-floor`
+
+Decide what number a script held for a maneuver's ending is screened against.
+Today it is the held script's own id alone (`hold`, `cogs/session_cog.rs`), so a
+duplicate of the script the running engagement is already on is held and
+narrated `script_held`, and then answered by the drain — `stale` if the maneuver
+ends in `active`, an acceptance if it ends in `resting`. The same datagram
+arriving in `active` is refused at once.
+
+Deferral context: the frozen design for the pending slot states this rule — the
+hold's floor is the pending id, and the drain applies the ordering rules of the
+phase the maneuver ends in — so tightening it is a change to what the session
+promises a sender, not a defect fix. The two candidate rules differ in what a
+retransmit gets: a refusal alert at the edge one wake after a `script_held` row
+that promised an answer, or an answer that depends on the phase. Deciding
+between them is a decision about the sender's contract.
+
+Done = one datagram gets one answer, whichever answer is chosen, and the rule is
+written where the screen is. Marked at `hold` in `cogs/session_cog.rs`.
+
+## `tracking-response-model`
+
+Replace the tracking detector's direction inference with a model of the servo's
+response. Out go `side`, `crossed`, both of the arms that open a crossed run,
+the extremum anchor and `reversal_ticks`; in comes a per-joint-class prediction
+of where a healthy joint stands, computed from the goal history, and the run is
+judged the way it is judged now — `threshold_rad`, `progress_min_rad`, `ticks` —
+against that prediction rather than against the goal. A first-order lag with a
+rate limit is the shape the replay traces suggest: 0.245 rad at 3.34 rad/s and
+about 0.82 rad at 7.55 rad/s are both near a 70 ms time constant, and 1.38 rad
+at roughly 19.5 rad/s is nearer 110 ms. A prediction turns round when a servo
+would, so a joint that is following is always closing on it and there is no
+reversal left to detect; a fault then means "not closing on where a healthy
+servo would be".
+
+Deferral context: what the detector has today is three separate rules for
+inferring, from one period of position, whether a joint is carrying a direction
+its goal has left, and each is correct where it fires with a shape it cannot
+see. The one the code records is that `side` is written only while a run is
+open, so a reversal of a move the joint followed inside the threshold is judged
+against the move before it and gets the ordinary window while the joint may
+still be coasting; the cost is a scoped antenna release with a warning, not a
+hazard. The model cannot be written yet: it has to be fitted and validated
+against a recorded reversal, and no recording of one exists — the replay traces
+measure following only, and the simulated plant is a transport delay
+(`cogs/sim_lag.rs`) that a lag model does not describe, so a proportional-lag
+plant mode has to come first for S12 and the `Follower` tests to drive it. It
+also deletes the machinery two design cycles have built, which is a cycle of its
+own rather than a rider on one.
+
+Done = the detector judges a run against a predicted position, the crossed-run
+machinery is gone, and the model is fitted against a recorded reversal. Marked
+at the fresh-open arm of `tracking::look` in `crates/reachy-motion/src/tick.rs`.

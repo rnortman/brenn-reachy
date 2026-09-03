@@ -34,9 +34,12 @@ pub use brenn_reachy__motion__commission_clk_rs::{
 };
 pub use brenn_reachy__motion__disarm_clk_rs::SeqFailures;
 pub use brenn_reachy__motion__seq_clk_rs::SeqFailureSnap;
-pub use brenn_reachy__motion__servo_health_clk_rs::{RailSnap, ServoHealthRow, ServoHealths};
+pub use brenn_reachy__motion__servo_health_clk_rs::{
+    RailRecord, RailRecordRow, RailSnap, ServoHealthRow, ServoHealths,
+};
 
 rows_by_joint!(pub ServoHealths, ServoHealthRow, health_row, health_row_mut);
+rows_by_joint!(pub RailRecord, RailRecordRow, rail_row, rail_row_mut);
 rows_by_joint!(pub SeqFailures, SeqFailureSnap, failure_row, failure_row_mut);
 rows_by_joint!(pub ProvisionGrid, ProvisionRow, grid_row, grid_row_mut);
 rows_by_joint!(pub ServoModels, u16, model, model_mut);

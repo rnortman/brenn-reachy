@@ -62,22 +62,22 @@ SIM_CONFIGS = [
 # the Rust crate. Each list is what its module imports plus what those imports
 # reach, which is the import graph. The cog modules ride the mover chain:
 # `motion` over `mover`, and `sim` over `motion` plus the plant. `session` is
-# what the session keeps between executions, over the four sequencers and the
-# narration; `script` is what arrives from outside and `session_cmd` the one
-# datagram that goes to the driver, each deliberately narrow so that the driver
-# side importing the command shape does not import the session's blast radius.
+# what the session keeps between executions, over the three sequencers, the
+# narration and the script it may be holding; `script` is what arrives from
+# outside and `session_cmd` the one datagram that goes to the driver, narrow so
+# that the driver side importing the command shape does not import the session's
+# blast radius.
 # The two state modules stand outside all of it -- the estimator's seed and the
 # simulated plant are each imported by one cog module and nothing else -- so each
 # names what it reaches on its own.
 SESSION_MODULES = [
     "schedule",
+    "script",
     "//geometry:primitives",
     "//hardware/dynamixel:registers",
-    "//motion:arm_record",
     "//motion:bus_txn",
     "//motion:commission",
     "//motion:disarm",
-    "//motion:engage",
     "//motion:faults",
     "//motion:fk",
     "//motion:joints",
@@ -93,6 +93,7 @@ SCRIPT_MODULES = ["schedule"]
 SESSION_CMD_MODULES = [
     "//hardware/dynamixel:registers",
     "//motion:bus_txn",
+    "//motion:joints",
 ]
 
 # The mover's own chain, which meets the one above only at the cog module: what
@@ -128,7 +129,6 @@ MOTION_MODULES = MOVER_MODULES + [
     "config",
     "mover",
     "pose_state",
-    "script",
     "session",
     "session_cmd",
     "//driver:goal",
@@ -609,7 +609,6 @@ rust_library(
         "//hardware/dynamixel:registers_clk_rs",
         "//motion:bus_txn_clk_rs",
         "//motion:commission_clk_rs",
-        "//motion:engage_clk_rs",
         "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
         "//motion:poll_clk_rs",
@@ -1075,7 +1074,6 @@ scenario_suite(
     author_deps = [],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
-        ":session_clk_rs",
         ":session_cmd_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
@@ -1120,6 +1118,60 @@ scenario_suite(
         ":schedule_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
+    ],
+)
+
+# S12, a reversal mid-stow: the same four cogs S1 runs on, with the antennas
+# given a response delay so that a replacement arriving a second into the fold
+# turns their goal round under joints still carrying the old direction. That
+# instant is where the lagging antennas stand furthest behind the fold, which is
+# what leaves a tracking run open outside the threshold at the crossing.
+scenario_suite(
+    name = "s12",
+    author_deps = [
+        "//motion:joints_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":session_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)
+
+# S13, a wake at the wrong moments: the same four cogs S1 runs on, with scripts
+# arriving while the engagement they opened is in flight and while the machine is
+# being let go of -- each held and answered on the phase the maneuver ends in,
+# and a duplicate number refused.
+scenario_suite(
+    name = "s13",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":session_clk_rs",
+        ":session_cmd_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//hardware/dynamixel:registers_clk_rs",
+        "//motion:bus_txn_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
     ],
 )
 
@@ -1178,7 +1230,6 @@ scenario_suite(
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
         ":motion_slots",
-        ":session_clk_rs",
         ":sim_state_clk_rs",
         "//motion:faults_clk_rs",
         "//crates/reachy-motion:reachy_motion",
@@ -1230,6 +1281,7 @@ scenario_suite(
     checker_deps = [
         ":session_clk_rs",
         "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
         "//motion:reports_clk_rs",
     ],
     configs = SIM_CONFIGS,
@@ -1251,7 +1303,6 @@ scenario_suite(
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
         ":schedule_clk_rs",
-        ":session_clk_rs",
         ":session_cmd_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//hardware/dynamixel:registers_clk_rs",
@@ -1447,8 +1498,8 @@ rust_test(
 # What the session keeps between one execution and the next, in a module of its
 # own because a cog member's type is an interface instantiation and the compiler
 # resolves one only against a module the cog's module imports. It reaches the
-# four sequencers, the narration and the schedule, which is why the driver side
-# imports the command module next door instead.
+# three sequencers, the narration, the schedule and the script shape, which is
+# why the driver side imports the command module next door instead.
 # No `cog_impl`: the module declares no cogs.
 clk_schema_module(
     name = "session",
@@ -1616,6 +1667,7 @@ rust_library(
     srcs = [
         "sim_aux.rs",
         "sim_cogs.rs",
+        "sim_lag.rs",
         "sim_regs.rs",
     ],
     edition = "2024",

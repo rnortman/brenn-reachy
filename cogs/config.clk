@@ -143,6 +143,17 @@ schema SessionParams
         // session whose sender stopped talking: the schedule runs out, the
         // machine stows and de-torques, and this is the longest that can take.
         #9 script_span_cap_ms: UInt32;
+
+        // How old a retained rail reading may be and still be gated on,
+        // nanoseconds. Two laps of the driver's health rotation: past it the
+        // row is re-read by the resting watch before the torque-on gate is
+        // judged, and inside it the gate is arithmetic over readings the
+        // rotation already took.
+        //
+        // Not a budget the session waits out. A stale row costs two
+        // transactions and the gate is judged again; what this number decides
+        // is how old a reading the machine will torque on.
+        #10 rail_stale_after_ns: Int64;
     }
 }
 

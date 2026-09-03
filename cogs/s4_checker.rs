@@ -13,7 +13,6 @@
 
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__driver__health_clk_rs::EventKind;
 use reachy_motion::postures::neutral_targets;
 use scenario::check;
@@ -41,20 +40,7 @@ fn main() -> ExitCode {
         // First, because the rest is measured against the cycles these land on.
         // Four changes and no more -- a fifth would be a session that did
         // something with the reads coming back.
-        let phases = check::phases(
-            run,
-            &[
-                (SessionPhaseWire::RESTING, SessionPhaseWire::STARTING),
-                (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
-                (SessionPhaseWire::ACTIVE, SessionPhaseWire::ENGAGING),
-                (SessionPhaseWire::PARKED, SessionPhaseWire::ACTIVE),
-            ],
-            failures,
-        );
-        let engaged = phases
-            .get(2)
-            .zip(phases.get(3))
-            .map(|(&taken, &released)| check::Engaged { taken, released });
+        let engaged = check::parked_life(run, failures);
         if let Some(engaged) = engaged
             && engaged.released != bus_failure_cycle()
         {

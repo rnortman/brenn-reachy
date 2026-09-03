@@ -726,6 +726,23 @@ cog Session
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
+
+        // How many engagement answers arrived for an ask nobody was waiting on:
+        // a late duplicate, or an answer to an ask a fault closed by moving the
+        // phase.
+        engage_strays: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
+
+        // How many engagements were rested at the silence deadline, the driver
+        // having answered none of the re-issues.
+        engage_silences: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
     }
 
     inputs

@@ -21,10 +21,12 @@
 # `tools/lib.sh` reads REACHY_SPEECH_CONFIG at source time and the Makefile
 # exports it, so a suite run from `make check` on a workstation would otherwise
 # stage that site's real assembly configuration — and its 0600 credentials —
-# into a fixture payload. The other two are read the same way. Cleared here
-# rather than per suite: the guard belongs to whatever sources `lib.sh`, which
-# is every one of them. Each case sets what it needs.
-unset REACHY_SPEECH_CONFIG REACHY_HOST REACHY_POD_BINARY BRENN_POD_DIR
+# into a fixture payload. The others are read the same way, and
+# REACHY_HOST_PARAMS names a per-unit file whose pod name a fixture payload has
+# no business carrying. Cleared here rather than per suite: the guard belongs to
+# whatever sources `lib.sh`, which is every one of them. Each case sets what it
+# needs.
+unset REACHY_SPEECH_CONFIG REACHY_HOST_PARAMS REACHY_HOST REACHY_POD_BINARY BRENN_POD_DIR
 
 # ---------------------------------------------------------------------------
 # The tally

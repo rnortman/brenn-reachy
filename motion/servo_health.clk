@@ -1,9 +1,11 @@
 // What a servo says about its own health, and the supply that feeds it.
 //
 // Its own module because two sequencers read it: a commissioning surveys the
-// rail and the error bytes before it arms, and a position sweep re-reads them
-// while it runs. Neither one's provisioning grids or phases belong in the other's
-// rebuilds, so the readings they share sit apart from both.
+// rail and the error bytes before it arms, and the resting watch re-reads the
+// rows a session's retained picture has gone stale on. Neither one's
+// provisioning grids or phases belong in the other's rebuilds, so the readings
+// they share sit apart from both -- and so does the retained picture at the
+// bottom of this file, which the session keeps and the gate judges.
 //
 // A hardware-error byte is reported, never interpreted here: bit 0 is the
 // input-voltage bit this platform expects, and what any bit means is the reading
@@ -72,5 +74,67 @@ schema RailSnap
         #0 voltages: joints::Joints;
         // Each servo's hardware-error byte, as read.
         #1 health: ServoHealths;
+    }
+}
+
+// One servo's rail reading as the session retains it, with the instant it was
+// taken at.
+//
+// The driver's health rotation visits one servo per period and reports what it
+// saw; the session keeps the latest report per servo, and the torque-on gate
+// judges that picture rather than re-reading the wire. So the instant travels
+// with the numbers: what the gate needs to know first is whether the reading
+// is young enough to gate on.
+schema RailRecordRow
+{
+    uuid: 8f4c1e2a-0d63-4f7b-9a58-6c31b0d2f4e9;
+    fields
+    {
+        // The supply reading at this servo, volts. Meaningless until `seen`.
+        #0 volts: Float64;
+
+        // The servo's latched hardware-error byte as read. Bit 0 is the
+        // input-voltage bit, as everywhere else in this vocabulary.
+        #1 bits: UInt8;
+
+        // The nominal instant the reading was taken at, which the staleness
+        // window is measured from.
+        #2 sample_time: SyncTime;
+
+        // Whether anything has ever been read for this servo. A zero instant
+        // is a legitimate one under a deterministic runner, so the row needs a
+        // flag exactly as the session's own clock anchors do.
+        #3 seen: Bool;
+    }
+}
+
+// The rail picture the session keeps: one retained reading per servo, in bus
+// order.
+//
+// Named fields rather than an array, for the reason every schema of this shape
+// here states: a row misplaced across named fields does not compile.
+schema RailRecord
+{
+    uuid: 3d2b7c56-9e14-4a80-b7f2-58ac0e6d91b3;
+    fields
+    {
+        // Bus row 0: the body's yaw servo.
+        #0 body_yaw: RailRecordRow;
+        // Bus row 1: the first crank servo.
+        #1 leg_0: RailRecordRow;
+        // Bus row 2: the second crank servo.
+        #2 leg_1: RailRecordRow;
+        // Bus row 3: the third crank servo.
+        #3 leg_2: RailRecordRow;
+        // Bus row 4: the fourth crank servo.
+        #4 leg_3: RailRecordRow;
+        // Bus row 5: the fifth crank servo.
+        #5 leg_4: RailRecordRow;
+        // Bus row 6: the sixth crank servo.
+        #6 leg_5: RailRecordRow;
+        // Bus row 7: the right antenna.
+        #7 antenna_right: RailRecordRow;
+        // Bus row 8: the left antenna.
+        #8 antenna_left: RailRecordRow;
     }
 }

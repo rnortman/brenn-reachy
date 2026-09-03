@@ -102,6 +102,13 @@ enum ReportKind
         // machine was already under command and stayed under command, and a
         // reader counting engagements must not count this one.
         #15 script_replaced { underlying_value: 15; }
+        // A script arrived while a maneuver was under way and is held for the
+        // phase that maneuver ends in: `a` its id, `b` the phase it arrived in.
+        // Distinct from `script_accepted` because nothing was engaged by it --
+        // the machine is still finishing what it was doing -- and from
+        // `script_refused` because it will be answered: the wake the maneuver
+        // ends on takes it up as an acceptance or a replacement.
+        #16 script_held { underlying_value: 16; }
     }
 }
 
@@ -124,14 +131,22 @@ enum RefusalReason
         #0 none default { underlying_value: 0; }
         // The machine is parked: nothing engages until an operator has been.
         #1 parked { underlying_value: 1; }
-        // The machine is busy with a session. Scripts are never queued.
+        // The machine was busy with a session. Retired: a script arriving
+        // mid-maneuver is now held rather than declined. Kept because recorded
+        // logs still carry it and the number is what log and reader have in
+        // common.
         #2 not_resting { underlying_value: 2; }
         // More steps than a schedule holds.
         #3 too_many_steps { underlying_value: 3; }
         // More overlay windows than a schedule holds.
         #4 too_many_overlays { underlying_value: 4; }
-        // Times that are not a timeline: an offset that goes backwards, or a
-        // duration that is not positive.
+        // Times that are not a timeline: an offset that goes backwards, a
+        // duration that is not positive, or a whole schedule already behind the
+        // wake that would engage the machine for it -- a sender's stamp reading
+        // behind this machine, or a script held for longer than the span it
+        // asked for. Nothing in such a schedule can still happen, so at rest it
+        // is refused rather than engaged for; a running session takes it and is
+        // over, which is a sender's way of saying stop.
         #5 bad_times { underlying_value: 5; }
         // A motion index no library could hold. Whether this library holds one
         // is the mover's question at play time; this is the index that could
@@ -153,5 +168,11 @@ enum RefusalReason
         // would turn a sender that died into an indefinitely torqued machine.
         // A refusal and never a truncation.
         #9 too_long { underlying_value: 9; }
+        // The machine was being carried to the minimum risk condition by a
+        // fault response when the script arrived, or was holding it when one
+        // began. Refused rather than held, because torque comes back on after
+        // a fault only on an ask made of a machine that has already reached
+        // rest.
+        #10 fault_ending { underlying_value: 10; }
     }
 }

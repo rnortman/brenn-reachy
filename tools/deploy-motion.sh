@@ -1008,13 +1008,20 @@ case "$mode" in
 				"push the old payload deliberately" \
 				"${prog} ${host} --push --stale-ok" \
 				"${workspace_paths[@]}"
-			# The two members no commit to this workspace can date,
+			# The three members no commit to this workspace can date,
 			# asked about separately and by the same override.
 			refuse_if_source_newer "${payload}/reachy_pod" "$pod_binary" \
 				"audio device binary" \
 				"${prog} ${host} --push --stale-ok"
 			refuse_if_source_newer "${payload}/${speech_config_path}" \
 				"$speech_config" "speech configuration" \
+				"${prog} ${host} --push --stale-ok"
+			# The unit's own parameters, which name the pod this head
+			# answers to: a staged copy older than the operator's file
+			# is a head answering to the previous name, and every
+			# script addressed to it dropped as a foreign pod's.
+			refuse_if_source_newer "${payload}/${host_params_path}" \
+				"$host_params" "host configuration" \
 				"${prog} ${host} --push --stale-ok"
 			# Credential rotation — a re-provisioned key table
 			# or a fresh token — is a file no commit to this

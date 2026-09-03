@@ -44,14 +44,14 @@ use brenn_reachy__cogs__schedule_clk_rs::{
     OverlayWindowWire, PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
 };
 use brenn_reachy__cogs__script_clk_rs::Script;
-use brenn_reachy__cogs__session_clk_rs::{SessionPhaseWire, SessionStateWire};
+use brenn_reachy__cogs__session_clk_rs::{SessionPhase, SessionPhaseWire, SessionStateWire};
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKind;
 use brenn_reachy__driver__health_clk_rs::{AuxStatus, EventKind};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::ValueShape;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKind;
 use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__faults_clk_rs::ResponseKindWire;
-use brenn_reachy__motion__joints_clk_rs::{JointFlagsWire, JointRefWire};
+use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
@@ -64,7 +64,7 @@ use reachy_motion::seq::{BusResult, SeqFailureKind};
 use reachy_motion::tick::ResponseKind;
 use reachy_motion::value;
 use reachy_motion::verdict::{self, VerdictError};
-use reachy_motion::winddown::Disposition;
+use reachy_motion::winddown::{Disposition, Maneuver, ending, maneuver_of};
 use session_slots::{clear_timeline, held_reports, push_report, report_row};
 
 /// How many motions a library can hold: `cogs/config.clk`'s capacity for them,
@@ -107,6 +107,13 @@ counters! {
         /// Answers that matched no outstanding request: a late duplicate of one
         /// already settled, dropped as it is read.
         aux_strays / set_aux_strays,
+        /// Engagement answers that arrived for an ask nobody was waiting on: a
+        /// late duplicate, or an answer to an ask a fault closed by moving the
+        /// phase.
+        engage_strays / set_engage_strays,
+        /// Engagements rested at the silence deadline, the driver having
+        /// answered none of the re-issues.
+        engage_silences / set_engage_silences,
         /// Responses selected. Fewer than the faults recorded: a fault arriving
         /// while the response it calls for is already being carried out is
         /// answered by the standing one.
@@ -168,6 +175,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     let timing = Timing {
         aux_timeout_ns: params.aux_timeout_ns,
         aux_retries: params.aux_retries,
+        rail_stale_after_ns: params.rail_stale_after_ns,
     };
     // The commissioned record, taken from configuration on the first wake and
     // shared from then on. The profile is the one part of it this deployment
@@ -202,22 +210,36 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     // accepted a script and parked the machine would have narrated an
     // acceptance its sender will act on for a session that is already over.
     let replaced = screen_scripts(dial, &mut counters, now, &screens);
-    // One datagram, decided in one place. A release owed supersedes any bus
-    // work: nothing gates de-torquing, and a sequence stepped into a slot whose
-    // datagram was then overwritten would leave a transaction recorded as
-    // outstanding that never went out.
+    // One datagram, decided in one place, with one exception: the drain below
+    // may take an engagement's first bus step on a wake whose turn here issued
+    // nothing at all, and that step's datagram is the wake's. A release owed
+    // supersedes any bus work: nothing gates de-torquing, and a sequence stepped
+    // into a slot whose datagram was then overwritten would leave a transaction
+    // recorded as outstanding that never went out.
     // Before the bus, because a maneuver that concluded commands the release and
     // the bus half is what publishes one: a machine being let go of is not one
     // to ask anything else of on the same wake.
     run_winddown(dial, &mut counters, now, &budgets);
     run_bus(dial, &mut counters, now, &timing, &budgets);
+    // After the bus and before the schedule: the phase this wake leaves the
+    // machine in is what a held script is answered against, and a drain that
+    // took a replacement is one the wake's one publish is owed.
+    let drained = drain_pending(
+        dial,
+        &mut counters,
+        now,
+        &screens,
+        &timing,
+        &budgets,
+        replaced,
+    );
     // After the bus, because the phase this wake leaves the machine in is what
     // decides whether it is under command, and every path that moves the phase
     // has run by here. A replacement taken this wake is published from here for
     // that same reason: a schedule that was already over when it arrived is one
     // the bus half has by now ended, and the machine being let go of and the
     // replacement are then one change on the channel rather than two.
-    publish_schedule(dial, &mut counters, now, replaced);
+    publish_schedule(dial, &mut counters, now, replaced || drained);
     say_unconfirmed(dial, &mut counters, now, &budgets);
     publish_timeline(dial, &mut counters, before.reports_narrated);
 
@@ -278,6 +300,19 @@ fn screen_scripts(
     replaced
 }
 
+/// Open an engagement: the phase, and the three fields the ask is kept in.
+///
+/// No reading is touched and no gate is judged here. The gate is arithmetic over
+/// the rail picture and is judged on this wake's bus turn, which is where the
+/// datagram it clears is issued from: this is the intake's half of it, and it is
+/// bookkeeping.
+fn open_engagement(slot: &mut SessionStateWire) -> Entered {
+    slot.set_engage_pending(true);
+    slot.set_engage_issued(SyncTime::from_nanos(0));
+    slot.set_engage_rows(JointFlagsWire::from(JointFlags::NONE));
+    session_bus::enter(slot, SessionPhaseWire::ENGAGING)
+}
+
 /// What one script was answered with: the story of the answer, and the phase the
 /// answer moved the machine to.
 struct Answer {
@@ -301,6 +336,12 @@ struct Answer {
 /// it replaces the schedule of an engagement already running: the machine is
 /// already torqued and already being streamed goals, so nothing arms, no phase
 /// moves, and what changes is the whole of the commanded future.
+///
+/// A machine mid-maneuver takes neither shape now: the script is held whole, and
+/// the wake that maneuver ends on calls this again over it -- except where the
+/// maneuver is a fault's, which is refused rather than held. Both an acceptance
+/// and a replacement clear whatever was held, so nothing ever applies a held
+/// script after a newer one has been taken.
 fn decide(
     slot: &mut SessionStateWire,
     script: &Script,
@@ -310,9 +351,24 @@ fn decide(
     bumped: bool,
 ) -> Answer {
     let phase = slot.phase();
-    let outcome = match intake_refusal(phase, slot, script) {
+    match phase_intake(slot) {
+        Intake::Refuse(reason) => {
+            return Answer {
+                report: refusal(script.script_id, reason, counters, now),
+                entered: None,
+            };
+        }
+        Intake::Hold => return hold(slot, phase, script, counters, now),
+        Intake::Take => {}
+    }
+    let outcome = match ordering_refusal(phase, slot, script) {
         Some(reason) => Err(reason),
-        None => screened_plan(script, now, screens),
+        None => screened_plan(script, now, screens).and_then(|plan| {
+            if engages_for_nothing(phase, &plan, now) {
+                return Err(RefusalReasonWire::BAD_TIMES);
+            }
+            Ok(plan)
+        }),
     };
     match outcome {
         Ok(plan) => {
@@ -322,6 +378,11 @@ fn decide(
             // wake publishes.
             let epoch = store(slot, script.script_id, &plan, replacing, !bumped);
             slot.set_active_script_id(script.script_id);
+            // The newer script supersedes the held one, in both directions: a
+            // hold is answered by whatever the machine takes next, and a
+            // schedule taken here is never overwritten afterwards by something
+            // older that was waiting.
+            slot.set_pending_valid(false);
             counters.scripts_accepted += 1;
             let steps = u32::try_from(plan.steps().len()).unwrap_or(u32::MAX);
             if replacing {
@@ -345,9 +406,10 @@ fn decide(
                         detail: f64::from(epoch),
                     },
                     // An accepted script is a machine to take hold of, so the
-                    // engagement begins on this wake: the resting watch's first
-                    // read is the datagram this same execution publishes.
-                    entered: Some(session_bus::enter(slot, SessionPhaseWire::ENGAGING)),
+                    // engagement's first bus step -- the gate, then the
+                    // `engage_now` or the fallback poll's first read -- is taken
+                    // by this same execution.
+                    entered: Some(open_engagement(slot)),
                 }
             }
         }
@@ -358,25 +420,22 @@ fn decide(
     }
 }
 
-/// Why the session will not take `script` at all, or that it will consider it.
+/// Why the number `script` carries is no number this session will take, or that
+/// it is.
 ///
-/// Decided before anything in the script is read but its number: the phase it
-/// found, and the number it carries against the engagement it would replace.
-/// The phase comes first because a machine that cannot take a script now is not
-/// asking about its contents. What the script says -- its times, its motions,
-/// how far ahead it reaches -- is [`screened_plan`]'s, because those are
-/// screened as the schedule is built rather than by reading the rows twice.
+/// Decided before anything else in the script is read: the number it carries
+/// against the engagement it would replace. What the script says -- its times,
+/// its motions, how far ahead it reaches -- is [`screened_plan`]'s, because
+/// those are screened as the schedule is built rather than by reading the rows
+/// twice.
 ///
 /// `phase` is the caller's read of the slot, so one wake's answer is decided
 /// against one phase.
-fn intake_refusal(
+fn ordering_refusal(
     phase: SessionPhaseWire,
     slot: &SessionStateWire,
     script: &Script,
 ) -> Option<RefusalReasonWire> {
-    if let Some(reason) = phase_refusal(phase) {
-        return Some(reason);
-    }
     // Ordering only mid-session: at rest the session takes whatever number it
     // is offered. A high-water mark kept across engagements would let one
     // sender that reset its counter lock the machine out until an operator
@@ -434,6 +493,27 @@ fn screened_plan(
     Ok(plan)
 }
 
+/// Whether taking `plan` would engage the machine for a schedule with no
+/// future.
+///
+/// A schedule whose last instant is already behind this wake commands nothing.
+/// Reached two ways, both of them ordinary: a sender whose stamp reads behind
+/// this machine's clock, and a script held across a maneuver for longer than the
+/// whole span it asked for -- the instants are the sender's offsets off the
+/// sender's own stamp, and holding does not move them.
+///
+/// From `active` such a schedule is a session over, which is a sender's way of
+/// saying stop and is answered by the release. From `resting` there is nothing
+/// to say stop about: engaging would torque the machine on, reach no goal, and
+/// let go of it again on the next wake, so it is refused. A schedule that asks
+/// for nothing at all is not this -- it owns no instant to have outrun.
+fn engages_for_nothing(phase: SessionPhaseWire, plan: &SessionScheduleWire, now: i64) -> bool {
+    // The ends are exclusive wherever a schedule's end is judged, so an instant
+    // at one is an instant the interval no longer owns.
+    phase != SessionPhaseWire::ACTIVE
+        && session_bus::last_instant(plan).is_some_and(|end| end <= now)
+}
+
 /// What the intake screens are configured with, copied off the configuration
 /// once per execution.
 ///
@@ -477,25 +557,106 @@ fn refusal(
     }
 }
 
-/// Why a script arriving in `phase` cannot be taken at all, or that it can.
+/// What the session does with a script that arrived in a given phase.
+enum Intake {
+    /// Answer it now: an acceptance or a replacement, or a refusal for what the
+    /// script itself says.
+    Take,
+    /// Keep it for the phase the maneuver under way ends in.
+    Hold,
+    /// Refuse it outright, with this reason.
+    Refuse(RefusalReasonWire),
+}
+
+/// What the session does with a script arriving at the phase `slot` stands in.
 ///
-/// Two phases take one. `resting` opens an engagement, and `active` replaces
-/// the schedule of one already running: a session that means to hold a
+/// Two phases answer one now. `resting` opens an engagement, and `active`
+/// replaces the schedule of one already running: a session that means to hold a
 /// conversation is refreshed by its sender as it goes, and answering each
 /// refresh with a disarm and a fresh engagement would cycle torque on the head
 /// for every one of them.
 ///
-/// The rest refuse, and the two reasons say different things to a sender.
-/// Parked is latched: nothing engages a parked machine until an operator has
-/// been, and a sender told "busy" would keep asking. Every other phase is
-/// mid-something -- arming, being carried down out of a fault, being let go of
-/// -- and finishes what it is doing; a sender that still wants the machine
-/// raises it again from rest. Scripts are never queued.
-fn phase_refusal(phase: SessionPhaseWire) -> Option<RefusalReasonWire> {
-    match phase {
-        SessionPhaseWire::RESTING | SessionPhaseWire::ACTIVE => None,
-        SessionPhaseWire::PARKED => Some(RefusalReasonWire::PARKED),
-        _ => Some(RefusalReasonWire::NOT_RESTING),
+/// Three are mid-something -- being commissioned, being taken hold of, being let
+/// go of -- and they hold it. A wake is the next command and never an error, and
+/// the maneuver under way is not interrupted for it: every one of them runs to a
+/// phase this session can answer from, and the wake it gets there takes the
+/// script up. Holding rather than interrupting is what keeps the doctrine's rule
+/// that nothing gates or defers a de-torquing.
+///
+/// One maneuver is not held across: a fault's controlled stow, because a script
+/// applied at its end would re-energise a machine that a fault just stood down,
+/// on no act made after it stood. `winding_down` is entered only by that stow,
+/// so the phase is the whole of the test; and a machine at rest that still owes
+/// a fault's release is inside the same ending, which is what `ending_by_fault`
+/// says. Both refuse.
+///
+/// `parked` refuses. It is latched: nothing engages a parked machine until an
+/// operator has been, so a script held for it would be held for ever.
+fn phase_intake(slot: &SessionStateWire) -> Intake {
+    match slot.phase().to_known() {
+        // TODO(script-cause): a script carries no cause, so a sender's periodic
+        // refresh arriving here after a fault ended the last session is
+        // indistinguishable from someone saying the wake word and is engaged.
+        Some(SessionPhase::Resting) if slot.ending_by_fault() => {
+            Intake::Refuse(RefusalReasonWire::FAULT_ENDING)
+        }
+        Some(SessionPhase::Resting | SessionPhase::Active) => Intake::Take,
+        Some(SessionPhase::Starting | SessionPhase::Engaging | SessionPhase::Stopping) => {
+            Intake::Hold
+        }
+        Some(SessionPhase::WindingDown) => Intake::Refuse(RefusalReasonWire::FAULT_ENDING),
+        // A phase this build cannot name is a slot that did not read back, which
+        // the execution's own validation has already answered by letting go of
+        // the machine; refusing engages nothing, which is the answer that holds
+        // either way.
+        Some(SessionPhase::Parked) | None => Intake::Refuse(RefusalReasonWire::PARKED),
+    }
+}
+
+/// Hold `script` for the phase the maneuver under way ends in.
+///
+/// One slot and not a queue, screened against what it already holds by the same
+/// ordering rule a replacement is screened by: strictly greater, so a
+/// re-delivered script is refused `stale` rather than held twice. The running
+/// engagement's own number is not a floor here -- the ordering rules are the
+/// drain's, applied to the phase the maneuver ends in. The whole
+/// script is kept rather than the schedule it would become, because the horizon
+/// screen is measured from the wake it takes effect on -- a script held across a
+/// release keeps the whole span it asked for.
+///
+/// Nothing about the machine changes: no phase moves, nothing is engaged,
+/// nothing is published. The row says the sender is owed an answer and will get
+/// one.
+fn hold(
+    slot: &mut SessionStateWire,
+    phase: SessionPhaseWire,
+    script: &Script,
+    counters: &mut SessionCounters,
+    now: i64,
+) -> Answer {
+    // TODO(hold-ordering-floor): the floor here is the held id alone, so a
+    // duplicate of the script the running engagement is already on is held and
+    // then answered by the drain -- `stale` at `active`, an acceptance at
+    // `resting` -- where an arrival in `active` is refused at once.
+    if slot.pending_valid() && script.script_id <= slot.pending().script_id() {
+        return Answer {
+            report: refusal(script.script_id, RefusalReasonWire::STALE, counters, now),
+            entered: None,
+        };
+    }
+    // Copied whole into the slot: the held script outlives the message window it
+    // arrived in, and the drain screens it from the slot's own copy.
+    *slot.pending_mut() = clockwork_rs::as_raw(script).clone();
+    slot.set_pending_valid(true);
+    Answer {
+        report: Report {
+            time_ns: now,
+            kind: ReportKind::ScriptHeld,
+            a: script.script_id,
+            b: u32::from(phase.0),
+            detail: 0.0,
+        },
+        entered: None,
     }
 }
 
@@ -690,13 +851,19 @@ fn record_raises(
     }
 }
 
-/// Record every edge the driver reported, and act on the one that ends a
-/// release.
+/// Record every edge the driver reported, and act on the ones that answer
+/// something this session asked for.
 ///
 /// Two of the driver's edges are conditions of the machine and become faults
-/// like any other; the confirmation of a release is not a condition at all but
-/// the answer this session is waiting for, so it stops the commanding rather
-/// than being recorded. The rest are the driver working as designed.
+/// like any other; the confirmation of a release and the three endings of an
+/// engagement are not conditions at all but the answers this session is waiting
+/// for, so they stop the asking and move the phase rather than being recorded.
+/// The rest are the driver working as designed.
+///
+/// An answer to an engagement nobody has open is counted and ignored, the way a
+/// confirmation of a release nobody commanded is: a re-issue whose first
+/// datagram was answered after all draws a second answer, and the phase it
+/// would move has already moved.
 fn record_events(
     dial: &mut SessionDial<'_>,
     counters: &mut SessionCounters,
@@ -726,6 +893,10 @@ fn record_events(
             }
             continue;
         }
+        if let Some(answered) = engagement_answer(event.kind) {
+            answer_engagement(dial, counters, answered, at_ns, budgets);
+            continue;
+        }
         let Some(kind) = session_ladder::fault_of_event(event.kind) else {
             continue;
         };
@@ -748,10 +919,70 @@ fn record_events(
     }
 }
 
-/// Record what the driver's rotating read saw, once per servo whose bits say
-/// something.
+/// What one of the driver's three engagement endings says became of the ask.
 ///
-/// The classification is `reachy-motion`'s, the same judgement the decision tick
+/// Stated once here so the phase each ending lands in is decided in one place.
+fn engagement_answer(kind: EventKind) -> Option<Engaged> {
+    match kind {
+        EventKind::EngageConfirmed => Some(Engaged::Confirmed),
+        EventKind::EngageUnconfirmed => Some(Engaged::Unconfirmed),
+        EventKind::EngageDeclined => Some(Engaged::Declined),
+        _ => None,
+    }
+}
+
+/// What became of an engagement this session asked for.
+#[derive(Clone, Copy)]
+enum Engaged {
+    /// Every named row read its enable back: the machine is holding where it
+    /// stood, and what happens to it from here is the schedule's.
+    Confirmed,
+    /// A row did not. The rows that did confirm are believed torqued, so the
+    /// machine may be holding with nothing driving it: it is let go of and
+    /// latched, as an engagement that failed after its enable write always was.
+    Unconfirmed,
+    /// The driver wrote nothing and gave up on the ask. The machine is exactly
+    /// where it was, so the session rests and the next script tries again.
+    Declined,
+}
+
+/// Answer an engagement the driver has said what became of.
+///
+/// Only while one is open. A late duplicate for an engagement already answered
+/// is counted and dropped: the ask is over, and re-deciding a phase from it
+/// would move a machine on the strength of an answer to a question nobody is
+/// still asking.
+fn answer_engagement(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    answered: Engaged,
+    at_ns: i64,
+    budgets: &Budgets,
+) {
+    if !dial.states.sess.engage_pending() {
+        counters.engage_strays += 1;
+        return;
+    }
+    dial.states.sess.set_engage_pending(false);
+    let entered = match answered {
+        Engaged::Confirmed => session_bus::enter(dial.states.sess, SessionPhaseWire::ACTIVE),
+        // The release is commanded here and published by the bus half, which
+        // every wake that owes one does: one datagram, decided in one place.
+        Engaged::Unconfirmed => {
+            session_ladder::command_release(dial.states.sess, at_ns, budgets);
+            session_bus::enter(dial.states.sess, SessionPhaseWire::PARKED)
+        }
+        Engaged::Declined => session_bus::enter(dial.states.sess, SessionPhaseWire::RESTING),
+    };
+    narrate(dial.states.sess, counters, &phase_report(&entered, at_ns));
+}
+
+/// Record what the driver's rotating read saw: the rail picture every report
+/// refreshes, and a fault for the bits that say something.
+///
+/// Every report lands in the picture the torque-on gate judges, whatever its
+/// bits say and whatever phase the machine is in. The classification is
+/// `reachy-motion`'s, the same judgement the decision tick
 /// makes over its own health poll. What is here is the bookkeeping the tick does
 /// with its mask instead: a hardware-error byte latches in the servo, so the
 /// rotation carries it on every pass for the rest of the session, and a host
@@ -776,10 +1007,20 @@ fn record_readings(
         let Some(row) = row_of_id(reading.id) else {
             continue;
         };
-        let Some(kind) = fault::fault_of_health(row, reading.bits) else {
+        let Some(joint) = joints::joint_ref(row) else {
             continue;
         };
-        let Some(joint) = joints::joint_ref(row) else {
+        // The picture the torque-on gate judges, kept in every phase: this is
+        // the whole of what makes engaging arithmetic rather than eighteen
+        // transactions on the wake path.
+        session_bus::record_reading(
+            dial.states.sess,
+            joint,
+            reading.bits,
+            reading.volts,
+            reading.sample_time.as_nanos(),
+        );
+        let Some(kind) = fault::fault_of_health(row, reading.bits) else {
             continue;
         };
         // The slot was read back as a session at the top of this execution, so
@@ -932,6 +1173,9 @@ fn record_fault(
     counters.faults_recorded += 1;
     narrate(slot, counters, &report);
 
+    // When the ladder answers nothing, no held script needs attention: the paths
+    // that reach it have already resolved anything held or refuse arrivals
+    // outright, so nothing is waiting when a second condition arrives behind.
     let Some(answered) = session_ladder::answer(slot, evidence.kind, now, budgets) else {
         return;
     };
@@ -947,6 +1191,38 @@ fn record_fault(
     if let Some(entered) = answered.entered {
         narrate(slot, counters, &phase_report(&entered, now));
     }
+    // `ending_by_fault` must not stand over a parked session: parked never
+    // leaves, so the flag would be a permanent claim that the session is on its
+    // way to rest. Entering the phase is what clears it, wherever that was
+    // decided; what is left here is not to set it again, and to leave a script
+    // held for that machine for the drain to answer `parked`.
+    if slot.phase() == SessionPhaseWire::PARKED {
+        return;
+    }
+    if !ends_toward_rest(answered.response) {
+        return;
+    }
+    slot.set_ending_by_fault(true);
+    if slot.pending_valid() {
+        let held = slot.pending().script_id();
+        slot.set_pending_valid(false);
+        let report = refusal(held, RefusalReasonWire::FAULT_ENDING, counters, now);
+        narrate(slot, counters, &report);
+    }
+}
+
+/// Whether `response` is a fault response that ends the session toward rest.
+///
+/// Both tests are needed: disposition alone would include the group-scoped
+/// de-torque, which disposes to `Rest` but is not a session ending. Stated over
+/// the library's functions rather than over the response names so that a
+/// response added to the doctrine is classified by the crate that owns the
+/// classification.
+fn ends_toward_rest(response: ResponseKind) -> bool {
+    matches!(
+        maneuver_of(response),
+        Some(Maneuver::SlowStow | Maneuver::ImmediateAllTorqueOff)
+    ) && ending::disposition(ending::answering(response)) == Disposition::Rest
 }
 
 /// The survey's verdict, as the one row that says what parked the machine.
@@ -1181,6 +1457,20 @@ fn publish_release(dial: &mut SessionDial<'_>) {
     out.mark_for_publish();
 }
 
+/// Publish the engagement this wake's bus turn cleared.
+///
+/// The rows the torque-on gate passed, and nothing else: the driver handles them
+/// in one cycle of its own and needs nothing more from here. Idempotent, and
+/// republished every wake until the driver answers: a re-issue of the same rows
+/// is liveness and draws the same answer again.
+fn publish_engage(dial: &mut SessionDial<'_>, rows: JointFlags) {
+    let out = &mut dial.outputs.cmd;
+    let msg = out.msg_mut().clear_valid();
+    msg.kind = SessionCmdKind::EngageNow;
+    msg.rows = rows;
+    out.mark_for_publish();
+}
+
 /// Take one turn at the bus, and say what it came to.
 ///
 /// The session's other half: the sequences that establish the machine and the
@@ -1202,11 +1492,13 @@ fn publish_release(dial: &mut SessionDial<'_>) {
 /// it is spending a budget out of the configuration and the ladder is where that
 /// is done.
 ///
-/// One message leaves either way, and which one is decided in this order: the
-/// release, the group-scoped de-torque's next write, the transaction a sequence
-/// asked for, and a keep-alive on a wake that owes none of them while the
-/// machine may be holding torque. A keep-alive can therefore never displace a
-/// transaction, and making a group let go outranks establishing anything.
+/// One message leaves either way. The release and the group-scoped de-torque's
+/// next write are decided here and outrank everything -- making a group let go
+/// outranks establishing anything -- and what a turn itself owes is
+/// [`conclude_turn`]'s.
+///
+/// The engagement and a transaction never coexist: the engaging arm issues the
+/// fallback poll's read or asks for the `engage_now`, never both.
 fn run_bus(
     dial: &mut SessionDial<'_>,
     counters: &mut SessionCounters,
@@ -1283,6 +1575,32 @@ fn run_bus(
         };
         narrate(dial.states.sess, counters, &report);
     }
+    conclude_turn(dial, counters, &turn, now, budgets);
+}
+
+/// Say what a turn at the bus came to, and publish the one datagram it owes.
+///
+/// The tail of a turn, in one place because two callers reach it: a wake's own
+/// turn, and the drain that opens an engagement after that turn has been taken.
+/// A second copy of this would be a second opinion about what a turn's datagram
+/// is.
+///
+/// The order is which datagram outranks which: the release, the transaction a
+/// sequence asked for, the engagement a cleared gate asks for, and a keep-alive
+/// on a wake that owes none of them. A keep-alive can therefore never displace
+/// a transaction; an engagement may displace a keep-alive, which is what lets
+/// the drain's step take a wake whose turn published one, and either datagram
+/// is liveness to the driver so nothing the keep-alive said is lost.
+fn conclude_turn(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    turn: &session_bus::Turn,
+    now: i64,
+    budgets: &Budgets,
+) {
+    if turn.silenced {
+        counters.engage_silences += 1;
+    }
     if let Some(entered) = turn.entered {
         // The survey's verdict, immediately before the phase row it explains.
         // Before, because a reader of the stream meets the row that says the
@@ -1303,9 +1621,90 @@ fn run_bus(
     }
     if let Some(datagram) = turn.delivery.datagram {
         publish_cmd(dial, &datagram);
+    } else if let Some(rows) = turn.engage {
+        publish_engage(dial, rows);
     } else if session_bus::keep_alive_owed(dial.states.sess) {
         publish_keep_alive(dial);
     }
+}
+
+/// Answer the script this session is holding, on the phase this wake left the
+/// machine in.
+///
+/// Conditioned on the phase rather than on a named transition, so every path
+/// that reaches a phase able to answer one drains without being listed here.
+/// `resting` with nothing outstanding takes it as an acceptance and opens the
+/// engagement; `active` takes it as a replacement; `parked` clears the slot and
+/// answers the sender, because nothing engages a parked machine and a script
+/// held for it would be held for ever. Every other phase leaves it held, and so
+/// does a `resting` machine that still owes a release or is still draining a
+/// group-scoped de-torque: a machine being let go of is not one to ask anything
+/// else of, and the wake that finishes letting go drains it instead.
+///
+/// The engagement an acceptance opens takes its first bus step here, on this
+/// same wake: `run_bus` has already had its turn, and readiness is the whole
+/// requirement. Safe because that turn issued nothing -- the phases this drains
+/// from drive no sequence, a release owed holds, and a drain still writing holds
+/// -- so what the turn left in the output slot was a keep-alive or nothing.
+///
+/// Answers whether a replacement was taken, which the wake's one publish is
+/// owed. `bumped` is whether the wake's intake already bumped the epoch, so a
+/// drain and an intake in one wake share the one epoch that goes out.
+fn drain_pending(
+    dial: &mut SessionDial<'_>,
+    counters: &mut SessionCounters,
+    now: i64,
+    screens: &Screens,
+    timing: &Timing,
+    budgets: &Budgets,
+    bumped: bool,
+) -> bool {
+    if !dial.states.sess.pending_valid() {
+        return false;
+    }
+    let phase = dial.states.sess.phase();
+    let outstanding = dial.states.sess.aux().active() || dial.states.sess.degrade_pending();
+    match phase {
+        SessionPhaseWire::PARKED => {
+            let held = dial.states.sess.pending().script_id();
+            dial.states.sess.set_pending_valid(false);
+            let report = refusal(held, RefusalReasonWire::PARKED, counters, now);
+            narrate(dial.states.sess, counters, &report);
+            return false;
+        }
+        SessionPhaseWire::RESTING
+            if !session_ladder::owes_release(dial.states.sess) && !outstanding => {}
+        SessionPhaseWire::ACTIVE => {}
+        _ => return false,
+    }
+
+    // Taken out of the slot before it is decided: a script is answered once,
+    // whatever the answer is, and a decision that refused it must not leave it
+    // waiting for the next wake to refuse it again.
+    let held = dial.states.sess.pending().clone();
+    let held_id = dial.states.sess.pending().script_id();
+    dial.states.sess.set_pending_valid(false);
+    // The slot validated whole at the top of this execution, the script nested
+    // in it included, so this cannot fail. Answered rather than dropped if it
+    // ever does: a script nobody can read is a script nobody can act on, and the
+    // row the hold promised is owed to the sender whichever way it turns out.
+    // The number the slot carries is a field of its own and reads back whatever
+    // the rest of the script did.
+    let Ok(script) = held.validate() else {
+        debug_assert!(false, "a held script read back as no script");
+        let report = refusal(held_id, RefusalReasonWire::UNDECODABLE, counters, now);
+        narrate(dial.states.sess, counters, &report);
+        return false;
+    };
+    let answer = decide(dial.states.sess, script, counters, now, screens, bumped);
+    let replaced = answer.report.kind == ReportKind::ScriptReplaced;
+    narrate(dial.states.sess, counters, &answer.report);
+    if let Some(entered) = answer.entered {
+        narrate(dial.states.sess, counters, &phase_report(&entered, now));
+        let turn = session_bus::open_engagement(dial.states.sess, now, timing);
+        conclude_turn(dial, counters, &turn, now, budgets);
+    }
+    replaced
 }
 
 /// Carry out one row of the group-scoped de-torque, and say what it came to.

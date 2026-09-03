@@ -64,11 +64,18 @@ config_files=(
 	cogs/robot_logger_rates.textproto
 	cogs/session_params.textproto
 	driver/motord_params.textproto
-	host/host_params.textproto
 )
 for file in "${config_files[@]}"; do
 	echo "# ${file}" >"${repo}/${file}"
 done
+
+# The operator's own host configuration, which Bazel never names: it is a
+# per-unit file the subject stages from outside the tree, and the subject
+# refuses without one. Written at the unnamed default so every case below builds
+# the ordinary way; the cases that own this knob move it and put it back.
+host_params_default="${repo}/.local/host_params.textproto"
+mkdir -p -- "$(dirname -- "$host_params_default")"
+printf 'pod: "example-reachy"\n' >"$host_params_default"
 
 # One of them is read rather than merely staged: the subject refuses a logger
 # configuration that does not restate the pinion defaults every flagless process
@@ -566,7 +573,9 @@ assert_contains "the build builds the deployables the gate names" "$(calls)" \
 assert_contains "one cquery names every built output" "$(calls)" \
 	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
-	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto + //host:host_params.textproto"
+	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto"
+assert_lacks "and does not name the host's own configuration, which Bazel does not supply" \
+	"$(calls)" "//host:host_params.textproto"
 # Four, not one per file: the shared object and the model set each need one of
 # their own, because their paths are relative to the execution root and the other
 # two listings are not.
@@ -900,6 +909,71 @@ result=$(build)
 assert_status "and with the knob unset the default is back" 0 "$(status_of "$result")"
 assert_no_file "which is not there, so neither is the payload's" \
 	"${payload}/host/speech.toml"
+
+# ---------------------------------------------------------------------------
+# The unit's own host configuration
+# ---------------------------------------------------------------------------
+#
+# The third member from outside the build, and the one with no optional case:
+# the voice host reads its configuration at startup and exits without one, so an
+# absent file is a refusal here rather than a payload a unit finds out about.
+# The tree's copy is an example, staged by nothing -- the whole point of the
+# change is that a deployment file is not tracked content -- and what this suite
+# can hold is which file the payload carries, at which path and mode, and that
+# both spellings of the knob refuse in the shape the operator can act on.
+result=$(build)
+assert_status "a build with the operator's file at the default path succeeds" 0 \
+	"$(status_of "$result")"
+assert_file "and the payload carries it at the host's own default --config" \
+	"${payload}/host/host_params.textproto"
+assert_eq "the bytes are the operator's" "$(cat -- "$host_params_default")" \
+	"$(cat -- "${payload}/host/host_params.textproto")"
+assert_eq "readable by the account that runs the payload and nobody else" 600 \
+	"$(stat -c %a -- "${payload}/host/host_params.textproto")"
+assert_contains "and the report says where it came from" "$(output_of "$result")" \
+	"host params staged from ${host_params_default}"
+assert_no_file "the example is never a payload member under its own name" \
+	"${payload}/host/host_params.example.textproto"
+
+REACHY_HOST_PARAMS="${work}/elsewhere/reachy00/host_params.textproto"
+export REACHY_HOST_PARAMS
+mkdir -p -- "$(dirname -- "$REACHY_HOST_PARAMS")"
+printf 'pod: "reachy00"\n' >"$REACHY_HOST_PARAMS"
+result=$(build)
+assert_status "a build against the knob's configuration succeeds" 0 "$(status_of "$result")"
+assert_eq "and the payload carries that file's bytes, not the default's" \
+	"$(cat -- "$REACHY_HOST_PARAMS")" \
+	"$(cat -- "${payload}/host/host_params.textproto")"
+assert_contains "the report names the file it staged" "$(output_of "$result")" \
+	"host params staged from ${REACHY_HOST_PARAMS}"
+
+mark_payload
+REACHY_HOST_PARAMS="${work}/nowhere/host_params.textproto"
+result=$(build)
+assert_status "a named host configuration that is not there refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"${work}/nowhere/host_params.textproto"
+assert_contains "and names the example as the file to copy" "$(output_of "$result")" \
+	"host/host_params.example.textproto"
+assert_contains "and spells the knob for this invocation" "$(output_of "$result")" \
+	"make motion-build REACHY_HOST_PARAMS="
+assert_contains "and once, in the conf file" "$(output_of "$result")" \
+	"REACHY_HOST_PARAMS ?="
+assert_unstaged "and a build refused for it stages nothing"
+unset REACHY_HOST_PARAMS
+
+mark_payload
+mv -- "$host_params_default" "${host_params_default}.aside"
+result=$(build)
+assert_status "an unnamed one that is not there refuses too: the host cannot start without it" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the default path" "$(output_of "$result")" \
+	"$host_params_default"
+assert_unstaged "and stages nothing"
+mv -- "${host_params_default}.aside" "$host_params_default"
+result=$(build)
+assert_status "and with the file back the build is ordinary again" 0 "$(status_of "$result")"
 
 # ---------------------------------------------------------------------------
 # The credential files that configuration names
@@ -1677,6 +1751,11 @@ else
 fi
 assert_contains "the speech configuration is exported to the scripts" \
 	"$makefile_src" 'export REACHY_SPEECH_CONFIG'
+# The operator's host configuration, read by the same scripts and therefore
+# exported the same way. Without the export a conf-file value is a variable the
+# build never sees, and the build refuses for a file the operator did name.
+assert_contains "the host configuration is exported too" \
+	"$makefile_src" 'export REACHY_HOST_PARAMS'
 # The other repository's location: one knob for one physical fact, read by
 # `tools/lib.sh` for both the pod binary it stages and the provisioning it
 # invokes, and therefore exported like the speech configuration.
@@ -1688,6 +1767,8 @@ assert_contains "and the runbook spells the conf file's assignments with ?=" \
 	"$runbook" 'REACHY_HOST ?='
 assert_contains "the speech configuration among them" "$runbook" \
 	'REACHY_SPEECH_CONFIG ?='
+assert_contains "and the host configuration, which a payload build refuses without" \
+	"$runbook" 'REACHY_HOST_PARAMS ?='
 # `REACHY_HOST ?= reachy00` is make syntax and not shell syntax: sourcing the
 # file leaves the variable unset and the runbook's own `ssh root@"$REACHY_HOST"`
 # lines dial nothing. The document must not tell a shell to read it.
@@ -1858,12 +1939,15 @@ done
 #
 # `reachy_host` is a launcher app, started from the payload root, so its
 # default `--config` and the `clip_names_path` inside that configuration are both
-# resolved there. What puts a file at either path is `config_targets` below,
-# whose members are staged at their repo-relative paths. Nothing else joins the
-# two strings to that list: `crates/reachy-host/tests/shipped_params.rs` compares
-# a file name and the cases above stage stubs of this test's own making, so a
-# `clip_names_path` shortened to a bare file name, or a `host_params.textproto`
-# moved in the tree, would pass every gate and die at setup on a powered unit.
+# resolved there. Two things put a file at one of those paths: `config_targets`,
+# whose members are staged at their repo-relative paths, and `host_params_path`,
+# where the subject installs the operator's own configuration -- the host's
+# default `--config` is deliberately not a Bazel-supplied file, which is why it
+# has to be unioned in below. Nothing else joins the two strings to that set:
+# `crates/reachy-host/tests/example_params.rs` compares a file name and the
+# cases above stage stubs of this test's own making, so a `clip_names_path`
+# shortened to a bare file name, or a payload path that moved on one side only,
+# would pass every gate and die at setup on a powered unit.
 
 # `//pkg:file` -> `pkg/file`, which is where the payload puts it.
 staged_configs=$(sed -n '/^config_targets=(/,/^)/p' -- "${real_repo}/tools/build-motion.sh" |
@@ -1871,15 +1955,27 @@ staged_configs=$(sed -n '/^config_targets=(/,/^)/p' -- "${real_repo}/tools/build
 assert_eq "the configurations this script stages are read out of build-motion.sh" \
 	yes "$(member_of driver/motord_params.textproto "$staged_configs")"
 
+# The operator's file, which arrives by the other route. Read the same way the
+# speech configuration's payload path is read below, out of the one place that
+# names it.
+operator_params=$(sed -n 's/^host_params_path=\(.*\)$/\1/p' \
+	-- "${real_repo}/tools/lib.sh")
+if [ -z "$operator_params" ]; then
+	fail "the payload path the operator's host configuration is staged at is readable" \
+		"tools/lib.sh states no host_params_path"
+else
+	staged_configs=$(printf '%s\n%s\n' "$staged_configs" "$operator_params" | sort)
+fi
+
 names_path=$(sed -n 's/^clip_names_path: "\([^"]*\)"$/\1/p' \
-	-- "${real_repo}/host/host_params.textproto")
+	-- "${real_repo}/host/host_params.example.textproto")
 default_config=$(sed -n 's/^const DEFAULT_CONFIG: &str = "\([^"]*\)";$/\1/p' \
 	-- "${real_repo}/crates/reachy-host/src/main.rs")
 if [ -z "$names_path" ] || [ -z "$default_config" ]; then
 	fail "the host's two payload-relative paths are readable" \
 		"read clip_names_path='${names_path}' DEFAULT_CONFIG='${default_config}'"
 else
-	assert_eq "the shipped host config names a clip table the payload stages" \
+	assert_eq "the example host config names a clip table the payload stages" \
 		yes "$(member_of "$names_path" "$staged_configs")"
 	assert_eq "and the host's default --config is a file the payload stages" \
 		yes "$(member_of "$default_config" "$staged_configs")"

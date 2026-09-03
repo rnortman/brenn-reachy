@@ -542,6 +542,26 @@ speech_config_named=${REACHY_SPEECH_CONFIG:+named}
 # other.
 speech_config_path=host/speech.toml
 
+# The voice host's own configuration, which is a per-unit file and therefore not
+# in this tree either.
+#
+# It names the machine the head answers to, so a copy of it belongs to whoever
+# runs that machine. The tree carries `host/host_params.example.textproto`,
+# which is the schema's worked example and is staged by nothing.
+#
+# Unlike the speech configuration this is not optional: the host cannot start
+# without it, so an absent file -- named or defaulted -- is a refused build.
+#
+# The unnamed default is under `.local/` rather than `host/` deliberately: Bazel
+# does not read `.gitignore`, so a gitignored operator file at
+# `host/host_params.textproto` would be a file the `host/` package can see and a
+# test could pick up. `.local/` is already every other operator file's home.
+host_params=${REACHY_HOST_PARAMS:-${repo_root}/.local/host_params.textproto}
+
+# Where it goes under the payload root: the host's own `DEFAULT_CONFIG`, which is
+# why the launcher entry passes no `--config` at all.
+host_params_path=host/host_params.textproto
+
 # ---------------------------------------------------------------------------
 # Reading the speech configuration
 # ---------------------------------------------------------------------------
@@ -884,19 +904,21 @@ speech_service_urls() {
 #   refuse_if_source_newer <staged> <source> <noun> <stale-ok cmd>
 #
 # The commit-time check above answers for everything this tree builds and for
-# nothing else, and the two members above are the everything else: a rebuilt
-# `reachy-pod`, or a speech configuration whose token or link keys were just
-# rotated, changes nothing any commit to this workspace can date. Pushed without
-# a rebuild, that is the previous binary and the previous credentials shipped
-# under a green freshness verdict — the exact mistake the age check exists to
-# stop, and the credential flavour of it is the one an operator would chase on
-# the unit.
+# nothing else, and the members staged from outside the tree are the everything
+# else: a rebuilt `reachy-pod`, a speech configuration whose token or link keys
+# were just rotated, or the operator's host parameters, changes nothing any
+# commit to this workspace can date. Pushed without a rebuild, that is the
+# previous binary, the previous credentials or the previous unit's identity
+# shipped under a green freshness verdict — the exact mistake the age check
+# exists to stop, and the credential flavour of it is the one an operator would
+# chase on the unit.
 #
 # A source that is not there says nothing: the pod binary's absence is refused by
-# the build, and a payload built with no speech configuration is the ordinary
-# case. A source that is there against a payload carrying no copy is a refusal
-# for the same reason a newer one is — the file existed nowhere when this payload
-# was staged.
+# the build, a payload built with no speech configuration is the ordinary case,
+# and a host parameters file that is nowhere is refused by the build too. A
+# source that is there against a payload carrying no copy is a refusal for the
+# same reason a newer one is — the file existed nowhere when this payload was
+# staged.
 refuse_if_source_newer() {
 	local staged=$1 source=$2 noun=$3 stale_ok=$4
 	[ -f "$source" ] || return 0

@@ -1036,6 +1036,7 @@ mod tests {
         out.report.degraded = Some(Fault::AntennaObstructed {
             joint: JointRef::AntennaRight,
             error: 0.8,
+            count: 30,
         });
         out.report.newly_masked = {
             let mut set = JointFlags::NONE;
@@ -1107,6 +1108,7 @@ mod tests {
         out.report.degraded = Some(Fault::AntennaObstructed {
             joint: JointRef::AntennaLeft,
             error: 0.9,
+            count: 30,
         });
         out.report.masked = flags::all();
         let mut reports = Reports::default();

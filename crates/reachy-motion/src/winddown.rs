@@ -598,6 +598,7 @@ mod tests {
         Fault::HeadObstructed {
             joint: JointRef::Leg0,
             error: 0.2,
+            count: 10,
         }
     }
 
