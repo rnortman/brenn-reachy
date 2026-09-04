@@ -126,6 +126,7 @@ export SSH_RUN_REACHED=no
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
 export RSYNC_CONSOLE=full
+export RSYNC_AUDIO=full
 export TEE_STATUS=0
 
 # Every stub records its whole invocation on one line, so a case can assert both
@@ -195,6 +196,23 @@ if [ "$status" = 0 ]; then
 	# under a name ending in .console, and what it brings is the launcher's
 	# files rather than a run directory. RSYNC_CONSOLE says whether the
 	# driver's own is among them.
+	# The recorded audio is its own delivery too, and its own knob: what a
+	# speech run brings home depends on whether the site's configuration
+	# turned recording on, and an empty store is a line rather than a
+	# refusal. RSYNC_AUDIO says which of the three a case is asking for.
+	case "$dest" in
+	*.audio/)
+		case "${RSYNC_AUDIO:-full}" in
+			full)
+				echo 'frames' >"${dest}20260903T225630_657Z_1.framelog"
+				echo 'frames' >"${dest}20260903T225641_529Z_2.framelog"
+				;;
+			none) ;;
+			refused) exit 23 ;;
+		esac
+		exit 0
+		;;
+	esac
 	case "$dest" in
 	*.console/)
 		case "${RSYNC_CONSOLE:-full}" in
@@ -803,6 +821,12 @@ assert_eq "and the clock was read on both sides of the run" 2 \
 	"$(find "$console_dir" -name 'clock-*.txt' | wc -l)"
 assert_eq "and the kernel facts a bus measurement is read against came back" 1 \
 	"$(find "$console_dir" -name 'host-facts.txt' | wc -l)"
+# A motion run records no audio, so it fetches none: an empty third directory
+# beside every motion log is one nobody could tell from a speech run whose
+# store was lost.
+assert_lacks "a motion run asks for no recorded audio" "$ran" "framelogs"
+assert_eq "and leaves no audio directory beside its records" 0 \
+	"$(find "$run_dest" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
 assert_contains "the kernel facts ask what the timer tick is" "$ran" \
 	"CONFIG_(HZ|HZ_[0-9]+|NO_HZ"
 assert_contains "and say so where the kernel publishes no configuration" "$ran" \
@@ -1291,6 +1315,28 @@ assert_contains "the refusal says it has nowhere of its own to land" "$(output_o
 	"has nowhere of its own to land"
 assert_lacks "and nothing is fetched beside it" "$(calls)" "rsync"
 
+# And a leftover audio directory, for the same reason as the console's: two
+# runs' framelogs merged into one directory are clips nobody can attribute to
+# the turn they came from, which is the whole use of them.
+stale_audio="${work}/stale-audio"
+occupy "$stale_audio" ".audio"
+result=$(deploy unit --fetch "$stale_audio")
+assert_status "a leftover audio directory refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says it has nowhere of its own to land" "$(output_of "$result")" \
+	"has nowhere of its own to land"
+assert_lacks "and nothing is fetched beside it" "$(calls)" "rsync"
+
+# And a leftover turn-clip directory: the report writes `turn-NN.wav` there by
+# this run's own turn numbering, so another run's clips under those names are
+# audio attributed to a turn that never carved it.
+stale_turns="${work}/stale-turns"
+occupy "$stale_turns" ".turns"
+result=$(deploy unit --fetch "$stale_turns")
+assert_status "a leftover turn-clip directory refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says it has nowhere of its own to land" "$(output_of "$result")" \
+	"has nowhere of its own to land"
+assert_lacks "and nothing is fetched beside it" "$(calls)" "rsync"
+
 # ---------------------------------------------------------------------------
 # The speech run
 # ---------------------------------------------------------------------------
@@ -1449,13 +1495,95 @@ assert_contains "the run says where the console is" "$(output_of "$result")" \
 
 # The report is handed the fetch itself, not a run directory inside it: the
 # console it reads is named from that spelling.
-fetched=$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d ! -name '*.console')
+fetched=$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d \
+	! -name '*.console' ! -name '*.audio')
 assert_contains "the analyzer is handed the fetched directory" "$ran" \
 	"//cogs:speech_run_report ${fetched}"
 assert_eq "with the run's consoles beside it" 1 \
 	"$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d -name '*.console' | wc -l)"
 assert_file "and the host-side captures were filed with them" \
 	"${fetched}.console/clock-before.txt"
+
+# The third sibling: the audio the pipeline heard, which is the only evidence
+# that says what Whisper was given rather than what it made of it. Beside the
+# records for the reason the console is beside them — `run_directory` takes the
+# newest directory under the fetched root as the run.
+assert_contains "the record store is fetched from under the release directory" "$ran" \
+	"rsync -a -e ssh -o BatchMode=yes root@unit:/run/brenn-app/releases/motion/framelogs/ ${fetched}.audio/"
+assert_eq "and the audio lands beside the records, not inside them" 1 \
+	"$(find "$speech_dest" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
+assert_eq "with the framelogs the run wrote in it" 2 \
+	"$(find "${fetched}.audio" -name '*.framelog' | wc -l)"
+assert_eq "and nothing inside the run directory itself" 0 \
+	"$(find "$fetched" -name '*.framelog' | wc -l)"
+
+# A site whose configuration records nothing. The store is empty or absent and
+# the run still reports: what a speech run is judged on is its console, and the
+# audio is evidence beside it rather than the evidence itself.
+RSYNC_AUDIO=none
+result=$(deploy_tty unit --speech "${work}/speech-noaudio")
+assert_status "a run whose store held no audio still reports" 0 "$(status_of "$result")"
+assert_contains "and says the store held none" "$(output_of "$result")" \
+	"holds no recorded audio"
+RSYNC_AUDIO=full
+
+# And a store the fetch could not reach at all: best-effort throughout, because
+# a run's console is not worth losing to a directory that was never created.
+RSYNC_AUDIO=refused
+result=$(deploy_tty unit --speech "${work}/speech-audiorefused")
+assert_status "a run whose audio fetch failed still reports" 0 "$(status_of "$result")"
+assert_contains "and says nothing came back" "$(output_of "$result")" \
+	"no recorded audio fetched"
+# And leaves nothing behind: the line explaining the failure scrolls away, so an
+# empty .audio on disk has to mean the site recorded nothing and nothing else.
+assert_eq "and left no empty audio directory behind" 0 \
+	"$(find "${work}/speech-audiorefused" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
+RSYNC_AUDIO=full
+
+# Which store is fetched is the deployed configuration's answer, not this
+# script's: the build and the fetch cannot disagree about where the audio is,
+# the way they cannot about where the payload's credentials are. A site that
+# renames the store and a fetch that kept looking under the old name would print
+# the same "holds no recorded audio" line as a site recording nothing.
+cat >>"${payload}/host/speech.toml" <<'TOML'
+
+[record]
+enabled = true
+dir = "heard"
+TOML
+result=$(deploy_tty unit --speech "${work}/speech-renamed-store")
+assert_status "a run whose configuration renames the store still reports" 0 \
+	"$(status_of "$result")"
+assert_contains "and the fetch reads the name out of the staged configuration" "$(calls)" \
+	"root@unit:/run/brenn-app/releases/motion/heard/"
+stage_speech_config
+
+# An absolute store is one the preflight refuses -- and is still where the audio
+# would land if such a run ever happened, so the fetch reads it as written
+# rather than under the release directory. A prefix here would look in a place
+# nothing ever wrote and print the same line a site recording nothing does.
+cat >>"${payload}/host/speech.toml" <<'TOML'
+
+[record]
+enabled = true
+dir = "/srv/heard"
+TOML
+result=$(deploy_tty unit --speech "${work}/speech-absolute-store")
+assert_status "a run whose configuration names an absolute store still reports" 0 \
+	"$(status_of "$result")"
+assert_contains "and the fetch reads that path as written" "$(calls)" \
+	"root@unit:/srv/heard/"
+assert_lacks "with no release directory in front of it" "$(calls)" \
+	"releases/motion//srv/heard"
+stage_speech_config
+
+# With no staged configuration to read, the fetch falls back to the name every
+# site uses -- and says which of the two an empty store would mean.
+rm -f -- "${payload}/host/speech.toml"
+result=$(deploy unit --speech-fetch "${work}/speech-fetch-fallback")
+assert_contains "the fallback store is the one fetched" "$(calls)" \
+	"root@unit:/run/brenn-app/releases/motion/framelogs/"
+stage_speech_config
 
 # The report's verdict is this mode's, as it is for a motion run.
 BAZEL_STATUS=7
@@ -1729,7 +1857,13 @@ assert_contains "it reads the log root out of the configuration" "$(calls)" \
 assert_contains "and names the analyzer of a speech run" "$(output_of "$result")" \
 	"speech_run_report -- ${speech_fetch_dest}/speech-log-"
 assert_eq "and lands under the speech name" 1 \
-	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name 'speech-log-*' ! -name '*.console' | wc -l)"
+	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name 'speech-log-*' \
+		! -name '*.console' ! -name '*.audio' | wc -l)"
+# The fetch on its own brings the audio too: a report wanted a second time is
+# read beside the clips it names, and this is the mode an operator reaches for
+# when the run's own terminal died.
+assert_eq "and the audio came with it" 1 \
+	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
 
 # ---------------------------------------------------------------------------
 # The grammar

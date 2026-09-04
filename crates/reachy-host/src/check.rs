@@ -7,7 +7,15 @@
 //! that directory as its own, answers the same question the launcher would, and
 //! answers it before anything is pushed or torqued.
 //!
-//! What is decided here is loading and presence, and nothing else. The
+//! What is decided here is loading and presence. Beside the verdicts, the
+//! speech configuration's conclusion *states* two settings that decide what a
+//! supervised run leaves behind and what it does with what it hears: whether it
+//! records the audio and under what cap, and what the STT-confidence gate will
+//! decline. Neither is a finding — both are the operator's own choice — but a
+//! run whose recording was off, or whose gate was tighter than the person at
+//! the robot believed, is one whose evidence only this line explains.
+//!
+//! The
 //! configurations go through their real readers, so a typo is the loader's own
 //! refusal rather than a second opinion this module maintains; every path field
 //! the loaded configurations name is then looked for where the run would look.
@@ -29,6 +37,13 @@
 //! which is exactly the migration failure this preflight exists to catch. The
 //! host's own configuration is not held to that: the launcher and an operator
 //! both name it wherever it is.
+//!
+//! The recording directory is held to the same rule for the opposite reason.
+//! It is the one path the configuration names that the run *creates* rather
+//! than reads, so an absolute one is not a file the unit fails to find — it is
+//! audio written wherever that path leads, which off the payload root means
+//! flash on a machine whose dev-cycle state is meant to live in tmpfs and be
+//! gone at the reboot.
 
 use std::path::{Path, PathBuf};
 
@@ -221,11 +236,30 @@ fn speech(path: &Path, base: &Path) -> (Vec<Conclusion>, Option<speech_surface::
         subject: path.display().to_string(),
         held: true,
         says: format!(
-            "{} is a speech configuration the pipeline will run on; it listens on {}",
+            "{} is a speech configuration the pipeline will run on; it listens on {}; {}; {}",
             path.display(),
             config.listen_addr,
+            recording(&config.record),
+            gate(config.stt.as_ref()),
         ),
     }];
+    if config.record.enabled
+        && let Some(how) = leaves_the_payload(&config.record.dir)
+    {
+        found.push(Conclusion {
+            kind: "absolute",
+            subject: "record.dir".to_owned(),
+            held: false,
+            says: format!(
+                "`record.dir` is {} {} and recording is on — the recorder \
+                 creates the directory it is given, so this one would be created wherever \
+                 that path leads. On a unit the run's working directory is the payload root \
+                 in tmpfs, and a path that leaves it is recorded audio written to flash",
+                how,
+                config.record.dir.display(),
+            ),
+        });
+    }
     for (field, named) in named_paths(&config) {
         found.push(if named.is_absolute() {
             Conclusion {
@@ -244,6 +278,84 @@ fn speech(path: &Path, base: &Path) -> (Vec<Conclusion>, Option<speech_surface::
         });
     }
     (found, Some(config))
+}
+
+/// How a recording directory leaves the payload root, where it does.
+///
+/// Two spellings of the same write. An absolute path names its destination
+/// outright; a relative one with a `..` in it walks out of the payload root the
+/// run works in, and on the unit that root is one directory deep in tmpfs, so
+/// the walk lands on flash. Refusing only the first would enforce the doctrine
+/// against the obvious spelling and not the equivalent one.
+fn leaves_the_payload(dir: &Path) -> Option<&'static str> {
+    if dir.is_absolute() {
+        return Some("the absolute path");
+    }
+    dir.components()
+        .any(|part| part == std::path::Component::ParentDir)
+        .then_some("the path out of the payload root")
+}
+
+/// What the run will keep of the audio it hears, as a clause of the sentence.
+///
+/// The switch and the cap together, because the pair is the decision: a store
+/// with no stated cap is the one that fills the tmpfs the pipeline is running
+/// in, and a run recording nothing is one whose audio nobody can listen to
+/// afterwards. Which of the two an operator is about to get is not otherwise
+/// visible before the run.
+fn recording(record: &speech_surface::config::RecordConfig) -> String {
+    if !record.enabled {
+        return "it records nothing".to_owned();
+    }
+    format!(
+        "it records to {} under a {} cap",
+        record.dir.display(),
+        size(record.cap_bytes),
+    )
+}
+
+/// `bytes` in the unit a person reads a cap in.
+///
+/// Whole mebibytes when the number is one, a tenth when it is not, and the
+/// bytes themselves when the cap is smaller than a tenth of a mebibyte — a cap
+/// that rounds to `0.0 MiB` says nothing about a store that would hold a few
+/// seconds of audio.
+fn size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes.is_multiple_of(MIB) {
+        return format!("{} MiB", bytes / MIB);
+    }
+    // Divided rather than multiplied: the cap is the operator's number, and a
+    // fat-fingered one large enough to overflow `bytes * 10` would panic the
+    // one tool whose job is to refuse a bad configuration calmly.
+    if bytes < MIB.div_ceil(10) {
+        return format!("{bytes} bytes");
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a byte cap read to a tenth of a mebibyte, where the lost bits are below \
+                  the printed digit"
+    )]
+    let mib = bytes as f64 / MIB as f64;
+    format!("{mib:.1} MiB")
+}
+
+/// What the STT-confidence gate will decline, as a clause of the sentence.
+///
+/// A transcript this gate declines is answered by a stow rather than a reply,
+/// and the run's own narration names the threshold nowhere an operator reads
+/// before starting. Absent `[stt]`, there is no transcript to judge and the
+/// clause says so rather than staying silent — a missing sentence reads as a
+/// gate that was not looked at.
+fn gate(stt: Option<&speech_surface::config::SttConfig>) -> String {
+    let Some(stt) = stt else {
+        return "nothing transcribes, so no confidence gate runs".to_owned();
+    };
+    let mut says = format!("the gate declines above no_speech {}", stt.no_speech_max);
+    if let Some(min) = stt.avg_logprob_min {
+        says.push_str(&format!(" or below logprob {min}"));
+    }
+    says
 }
 
 /// Every path field a loaded speech configuration states, with its field name.
@@ -639,6 +751,261 @@ mod tests {
             assert_eq!(refused.kind, "absolute", "{refused:?}");
             assert!(refused.says.contains("inside the payload"), "{refused:?}");
         }
+    }
+
+    /// The conclusion about the speech configuration itself, by its path.
+    fn speech_says<'a>(found: &'a [Conclusion], speech: &Path) -> &'a str {
+        &about(found, &speech.display().to_string()).says
+    }
+
+    #[test]
+    fn a_run_that_records_says_where_it_records_and_under_what_cap() {
+        let dir = scratch_dir("reachy-host-check-recording-on");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let says = speech_says(&found, &speech);
+        assert!(
+            says.contains("it records to framelogs under a 64 MiB cap"),
+            "{says:?}",
+        );
+    }
+
+    /// A cap that is not a whole number of mebibytes, and one too small to
+    /// round to a tenth of one: both are numbers an operator has to be able to
+    /// read back, and a cap printed as `0.0 MiB` says nothing at all.
+    #[test]
+    fn a_cap_that_is_not_whole_mebibytes_is_still_a_number_a_person_can_read() {
+        let dir = scratch_dir("reachy-host-check-recording-caps");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        // The two figures either side of the boundary between the two
+        // renderings included: a tenth of a mebibyte is where "0.0 MiB" stops
+        // saying anything and the bytes themselves start.
+        for (cap, printed) in [
+            (1_500_000_u64, "1.4 MiB"),
+            (9_000, "9000 bytes"),
+            (104_857, "104857 bytes"),
+            (104_858, "0.1 MiB"),
+        ] {
+            let speech = speech_fixture::runnable_named(
+                dir.as_ref(),
+                speech_fixture::Events::Dropped,
+                speech_fixture::Naming::PayloadRelative,
+            );
+            speech_fixture::records(&speech, Path::new("framelogs"), cap);
+
+            let found = inspect(&config, Some(&speech), dir.as_ref());
+            let says = speech_says(&found, &speech);
+            assert!(says.contains(&format!("under a {printed} cap")), "{says:?}");
+        }
+    }
+
+    /// A cap ten times larger than a `u64` can hold.
+    #[test]
+    fn a_cap_too_large_to_multiply_is_read_rather_than_panicked_on() {
+        let dir = scratch_dir("reachy-host-check-recording-huge-cap");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::records(&speech, Path::new("framelogs"), 9_000_000_000_000_000_000);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let says = speech_says(&found, &speech);
+        // The figure itself, not merely a unit: a cap read at the wrong
+        // magnitude is one an operator would believe.
+        assert!(says.contains("under a 8583068847656.2 MiB cap"), "{says:?}",);
+    }
+
+    #[test]
+    fn a_run_that_records_nothing_says_so_before_anybody_looks_for_the_audio() {
+        let dir = scratch_dir("reachy-host-check-recording-off");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let says = speech_says(&found, &speech);
+        assert!(says.contains("it records nothing"), "{says:?}");
+    }
+
+    /// The gate the transcripts of a run are judged by, stated with the default
+    /// floor off and then with it on.
+    #[test]
+    fn the_confidence_gate_states_the_thresholds_it_will_decline_on() {
+        let dir = scratch_dir("reachy-host-check-gate");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let says = speech_says(&found, &speech);
+        assert!(
+            says.contains("the gate declines above no_speech 0.2"),
+            "{says:?}",
+        );
+        assert!(!says.contains("logprob"), "{says:?}");
+
+        speech_fixture::declining_below(&speech, -0.9);
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let says = speech_says(&found, &speech);
+        assert!(
+            says.contains("the gate declines above no_speech 0.2 or below logprob -0.9"),
+            "{says:?}",
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_transcribes_nothing_has_no_gate_to_state() {
+        let dir = scratch_dir("reachy-host-check-gateless");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let says = speech_says(&found, &speech);
+        assert!(
+            says.contains("nothing transcribes, so no confidence gate runs"),
+            "{says:?}",
+        );
+    }
+
+    /// The one path the run creates rather than reads. Absolute, it leaves the
+    /// payload root — which on the unit is the tmpfs everything dev-cycle lives
+    /// in — and writes a person's voice to flash.
+    #[test]
+    fn an_absolute_recording_directory_is_refused_while_recording_is_on() {
+        let dir = scratch_dir("reachy-host-check-record-absolute");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        let store = dir.join("framelogs");
+        speech_fixture::records(&speech, store.as_path(), 64 * 1024 * 1024);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let refused = about(&found, "record.dir");
+        assert_eq!(refused.kind, "absolute", "{refused:?}");
+        assert!(
+            refused
+                .says
+                .contains(store.to_str().expect("a path this case wrote")),
+            "{refused:?}",
+        );
+        assert!(refused.says.contains("flash"), "{refused:?}");
+        assert!(verdict(&found).says.contains("record.dir"), "{found:?}");
+    }
+
+    /// The same write, spelled relatively. A `..` walks out of the payload root
+    /// the run works in, which on the unit is one directory deep in tmpfs, so
+    /// the store lands on flash with nothing having named a flash path.
+    #[test]
+    fn a_recording_directory_that_walks_out_of_the_payload_is_refused_too() {
+        let dir = scratch_dir("reachy-host-check-record-parent");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::records(
+            &speech,
+            Path::new("../../persistent/framelogs"),
+            64 * 1024 * 1024,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let refused = about(&found, "record.dir");
+        assert_eq!(refused.kind, "absolute", "{refused:?}");
+        assert!(
+            refused.says.contains("../../persistent/framelogs"),
+            "{refused:?}",
+        );
+        assert!(refused.says.contains("flash"), "{refused:?}");
+    }
+
+    /// Recording off, so the directory is a name nothing will create. A refusal
+    /// here would turn a leftover spelling in a file that records nothing into
+    /// a run nobody can start.
+    #[test]
+    fn an_absolute_recording_directory_nothing_writes_to_is_not_a_finding() {
+        let dir = scratch_dir("reachy-host-check-record-absolute-off");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::records(&speech, dir.join("framelogs").as_path(), 1024);
+        let text = std::fs::read_to_string(&speech).expect("the fixture");
+        std::fs::write(&speech, text.replace("enabled = true", "enabled = false")).expect("a file");
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|conclusion| conclusion.subject == "record.dir"),
+            "{found:?}",
+        );
+    }
+
+    /// The store is created by the recorder on its first segment, so a
+    /// relative name that is not there yet is the ordinary case — and a
+    /// presence check over it would refuse every first run.
+    #[test]
+    fn a_recording_directory_that_does_not_exist_yet_is_not_looked_for() {
+        let dir = scratch_dir("reachy-host-check-record-absent");
+        let config = params(dir.as_ref(), "names.json");
+        clip_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|conclusion| conclusion.subject == "record.dir"),
+            "{found:?}",
+        );
     }
 
     #[test]

@@ -187,6 +187,8 @@ a host that narrates the session and does not listen.
 
 `docs/bench-runbook.md` is the procedure for the first run, and
 `//cogs:first_motion_report` is what reads its log.
+`docs/speech-degradation.md` is the shorter one beside it: how to read a
+conversation the robot heard badly, and how to compare two sessions of it.
 
 ## Attribution
 

@@ -422,6 +422,45 @@ build_flags=()
 # repos.
 release="${store_mount}/releases/motion"
 
+# The store name to fetch when the staged configuration names none, and the
+# spelling every site has used.
+record_dir_fallback=framelogs
+
+# Where the speech pipeline writes the audio it heard, when it is recording,
+# and where that name came from — as `<device path>\t<source>`.
+#
+# The host resolves its store against its own working directory, which the
+# launcher makes the payload root, so the store is the release directory plus
+# the `[record] dir` the deployed speech configuration names. That name is the
+# operator's, so it is read out of the staged configuration rather than spelled
+# here: the build and the fetch cannot disagree about where the audio is, the
+# way they cannot about where the payload's credentials are.
+#
+# A fetch with no staged configuration in hand — `--speech-fetch` after a
+# rebuild, or before one — has nothing to read and falls back to the name every
+# site uses. The source travels with the path so the message can say which of
+# the two an empty store means.
+#
+# Read through a command substitution, as `toml_table_value` is.
+record_store() {
+	local config="${payload}/${speech_config_path}" dir=""
+	if [ -f "$config" ]; then
+		dir=$(toml_table_value "$config" record dir) || exit 1
+	fi
+	if [ -n "$dir" ]; then
+		# An absolute store is what the preflight refuses, and it is still
+		# where the audio would land if one ran: read as written, so the
+		# fetch looks where the host would have written.
+		case $dir in
+		/*) printf '%s\t%s\n' "$dir" "the staged ${speech_config_path} names it" ;;
+		*) printf '%s\t%s\n' "${release}/${dir}" "the staged ${speech_config_path} names it" ;;
+		esac
+	else
+		printf '%s\t%s\n' "${release}/${record_dir_fallback}" \
+			"no staged configuration names a store, so this is the fallback name"
+	fi
+}
+
 # Where a run parks its copy of the stamp while the log root is being emptied.
 #
 # Under the payload store and outside both the log root and the launcher's
@@ -503,7 +542,7 @@ config_string() {
 # Copy a run's records off the unit into a directory of their own, and echo
 # where they landed.
 #
-#   fetch_records <destination> <device log root> <name prefix> <evidence>
+#   fetch_records <destination> <device log root> <name prefix> <mode>
 #
 # The prefix says which kind of run these records came off — `motion-log` for a
 # budgeted motion run, `speech-log` for a supervised speech one. It is the
@@ -511,18 +550,23 @@ config_string() {
 # directory, and a name that does not say which is which is one nobody can pick
 # a report for months later.
 #
-# The evidence says which half of the fetch the mode is judged on: `olog` for a
-# motion run, whose verdict is arithmetic over the channel log, and `console`
-# for a speech run, whose verdict is read off the voice host's stdout. It
-# decides one thing — whether a log root holding no records is a refusal. For a
-# motion run it is: there is nothing to report over. For a speech run it is not,
-# because the console is fetched after this and a run that died in the
-# launcher's first seconds is exactly the run whose console explains it; a
-# refusal here would leave that file on tmpfs until the next run's wipe.
+# The mode says which kind of run this is — `motion` or `speech` — and it
+# decides two things.
+#
+# Whether a log root holding no records is a refusal. For a motion run it is:
+# the verdict is arithmetic over the channel log, so there is nothing to report
+# over. For a speech run it is not, because its verdict is read off the voice
+# host's console, which is fetched after this: a run that died in the launcher's
+# first seconds is exactly the run whose console explains it, and a refusal here
+# would leave that file on tmpfs until the next run's wipe.
+#
+# And whether the recorded audio comes home. Only a speech run records any, and
+# an empty third directory beside every motion log would be one nobody can tell
+# from a store that was lost.
 #
 # Everything it says goes to stderr: the caller reads the path off stdout.
 fetch_records() {
-	local dest=$1 log_root=$2 prefix=$3 evidence=$4
+	local dest=$1 log_root=$2 prefix=$3 mode=$4
 	local stamp out part
 	mkdir -p -- "$dest"
 	stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -539,9 +583,10 @@ fetch_records() {
 	# run's records under an unrelated run's directory with a name
 	# saying they were partial. Two fetches in the same second is a
 	# refusal instead. A leftover .part is refused for the same
-	# reason: rsync would merge into it.
+	# reason: rsync would merge into it, and a leftover .turns is
+	# another run's clips under this run's turn numbers.
 	local existing
-	for existing in "$out" "${out}.console" "$part"; do
+	for existing in "$out" "${out}.console" "${out}.audio" "${out}.turns" "$part"; do
 		if [ -e "$existing" ]; then
 			die "${existing} already exists, so this fetch has nowhere of its own to land." \
 				"Fetches are stamped to the second. Move it aside, or wait a second and fetch again."
@@ -563,7 +608,7 @@ fetch_records() {
 	# process's channels somewhere else, which is silent at run time
 	# and looks exactly like this afterwards.
 	if [ -z "$(find "$part" -name '*.olog' -size +0 -print -quit)" ]; then
-		if [ "$evidence" = console ]; then
+		if [ "$mode" = speech ]; then
 			echo "${prog}: nothing in ${log_root} on ${host} is a .olog with bytes in it;" \
 				"keeping the fetch for its console" >&2
 		else
@@ -602,6 +647,43 @@ fetch_records() {
 		fi
 	else
 		echo "${prog}: no console logs fetched from ${host}:${launch_logs}" >&2
+	fi
+
+	# And the audio the pipeline heard, for a speech run only: a motion run
+	# records none, and a fetch that made an empty third directory beside
+	# every motion log would be a directory nobody can tell from one whose
+	# store was lost.
+	#
+	# A third sibling rather than a member of the run directory, for the
+	# reason the console is one: `run_directory` takes the newest directory
+	# under the fetched root as the run, so a store landing inside would be
+	# judged as one and refused for holding no .olog.
+	#
+	# The store is payload-relative, so it sits under the release directory
+	# rather than the log root, and it is the one thing a fetch brings home
+	# that the operator chose per site: a configuration recording nothing
+	# leaves this empty, which is a line and not a refusal.
+	if [ "$mode" = speech ]; then
+		local audio="${out}.audio" store store_source
+		store=$(record_store) || exit 1
+		store_source=${store#*$'\t'}
+		store=${store%%$'\t'*}
+		mkdir -p -- "$audio"
+		if rsync -a -e "ssh -o BatchMode=yes" \
+			"root@${host}:${store}/" "${audio}/"; then
+			if [ -z "$(find "$audio" -type f -print -quit)" ]; then
+				echo "${prog}: ${store} on ${host} holds no recorded audio" \
+					"(${store_source}); the run's speech configuration is what" \
+					"turns recording on" >&2
+			fi
+		else
+			# The directory goes with the failure: an empty one left behind
+			# is indistinguishable from a site that recorded nothing, and
+			# the line saying which scrolls away.
+			rmdir -- "$audio" 2>/dev/null || true
+			echo "${prog}: no recorded audio fetched from ${host}:${store}" \
+				"(${store_source})" >&2
+		fi
 	fi
 
 	echo "${prog}: ${out}" >&2
@@ -1289,7 +1371,7 @@ case "$mode" in
 			;;
 		esac
 
-		out=$(fetch_records "$dest" "$log_root" motion-log olog)
+		out=$(fetch_records "$dest" "$log_root" motion-log motion)
 
 		console=$(file_captures "$aside" "$out")
 		echo "${prog}: console ${console}"
@@ -1314,7 +1396,7 @@ case "$mode" in
 		dest=${1:-}
 		[ -n "$dest" ] || usage
 		log_root=$(config_string log_root_dir)
-		out=$(fetch_records "$dest" "$log_root" motion-log olog)
+		out=$(fetch_records "$dest" "$log_root" motion-log motion)
 		echo "${prog}: read it: bazel run //cogs:first_motion_report -- ${out}/<run>"
 		;;
 
@@ -1510,10 +1592,11 @@ case "$mode" in
 		fi
 
 		echo "${prog}: the run ended (exit ${rc}); fetching what it recorded" >&2
-		out=$(fetch_records "$dest" "$log_root" speech-log console)
+		out=$(fetch_records "$dest" "$log_root" speech-log speech)
 		console=$(file_captures "$aside" "$out")
 		echo "${prog}: console ${console}"
 		echo "${prog}: log  ${out}"
+		echo "${prog}: audio ${out}.audio"
 
 		# Both sides of the fetch are what a speech run is read off:
 		# what a person said to the robot decides what is in either, so
@@ -1538,7 +1621,7 @@ case "$mode" in
 		dest=${1:-}
 		[ -n "$dest" ] || usage
 		log_root=$(config_string log_root_dir)
-		out=$(fetch_records "$dest" "$log_root" speech-log console)
+		out=$(fetch_records "$dest" "$log_root" speech-log speech)
 		echo "${prog}: read it: bazel run //cogs:speech_run_report -- ${out}"
 		;;
 

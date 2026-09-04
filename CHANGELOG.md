@@ -107,6 +107,48 @@ Nothing has been released, and nothing here has driven a motor.
   nobody spoke to is still green. Runs that passed before this change can fail
   after it — that is the point of it.
 
+- **The speech-run report prints one line per turn and writes an audio clip for
+  each.** Every wake-word activation in a run is now a numbered turn whose line
+  shows the transcript, the STT confidence scores (`no_speech`, `logprob`), the
+  outcome (dispatched, declined, superseded), and the direction-of-arrival beam
+  figure averaged over the turn's audio window. Each turn's raw audio is
+  exported as a `.wav` file under `<run>.turns/`, carved from the frame-log
+  store the run brought home, so a declined utterance can be listened to
+  directly. The summary counts dispatched and declined turns and prints the
+  `no_speech` range for each group, which is the reading that says whether audio
+  quality degraded across a session.
+
+- **Deploy fetches recorded audio alongside console logs.** `make speech-run`
+  now brings back the frame-log recording store as `<run>.audio` after each
+  speech run, and the preflight check validates that recording is configured
+  with a relative store path and reports the per-device and per-pod storage
+  caps. A configuration with an absolute recording path is refused.
+
+- **`reachy_host --check` states the STT-confidence gate's thresholds.**
+  The speech preflight conclusion now names the `no_speech` and `logprob`
+  floors the gate will apply, so an operator can see what the pipeline will
+  decline before a run starts. A configuration with no `[stt]` table says so
+  rather than dropping the clause silently.
+
+- **brenn-pod pin advanced to pick up the XVF3800 ASR-output routing and
+  reliable queue lanes.** `BRENN_POD_REV` moves forward by two published
+  commits: the cycle's speech-surface work (chip control registers, startup
+  reboot, ASR-output channel routing, per-segment `base_sample`, and STT
+  threshold narration) and the earlier reliable-lane queue rework. The host
+  crates and the run report compile unchanged against the new surface.
+
+- **A troubleshooting guide for speech degradation.** `docs/speech-degradation.md`
+  explains the symptom (utterances declined after the first in a session), how
+  to read a run's turn lines and `no_speech` scores, how to listen to a turn's
+  clip, what the pod's chip state line says, and the two-session comparison that
+  isolates the microphone board's adaptive processing as the cause.
+
+- **Torn console lines are now recovered.** The run report's line classifier
+  handles JSON with console text on either side — the shape every real
+  transcript line arrives in when the host's console write and the pipeline's
+  event write race on the same descriptor. Previously every such line was
+  counted as noise and every transcript the tool had ever read was lost.
+
 ### Removed
 
 - **The Cargo lane.** The workspace manifest, every crate manifest,

@@ -44,7 +44,7 @@ module="${MODULE_PINS_FILE:-$(checkout_root)/MODULE.bazel}"
 # The packages this tree takes from brenn-pod. Named here rather than derived
 # from the file, so a spec that quietly loses its remote is a missing spec
 # rather than a package this suite stops looking for.
-pod_packages=" speech-surface speech-pipeline brenn-bridge "
+pod_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
 
 # Every `crate.spec` block, one tab-separated record each: package, git, rev,
 # path. A line reader over the literals a person typed, not a parse of Starlark
@@ -83,7 +83,7 @@ specs=$(awk '
 ' "$module")
 
 # ---------------------------------------------------------------------------
-# The three specs
+# The four specs
 # ---------------------------------------------------------------------------
 
 found=0
@@ -100,14 +100,14 @@ while IFS=$'\t' read -r pkg git rev path; do
 	if [ "$path" != "-" ]; then
 		fail "the ${pkg} spec names no working tree" \
 			"it resolves from ${path}, which is a directory only this machine has" \
-			"put the three specs back on git = BRENN_POD_GIT, rev = BRENN_POD_REV" \
+			"put the four specs back on git = BRENN_POD_GIT, rev = BRENN_POD_REV" \
 			"before committing; MODULE.bazel says what else comes back with them"
 	else
 		pass "the ${pkg} spec names no working tree"
 	fi
 done <<<"$specs"
 
-assert_eq "all three brenn-pod specs are there to be read" 3 "$found"
+assert_eq "all four brenn-pod specs are there to be read" 4 "$found"
 
 # ---------------------------------------------------------------------------
 # What the two constants say
@@ -187,7 +187,7 @@ if [ -z "${MODULE_PINS_FILE:-}" ]; then
 	trap 'rm -rf -- "$fixtures"' EXIT
 
 	# A well-formed file in the shape of the real one: the two constants, and
-	# three specs resolving from them. The cases below mutate copies of it.
+	# four specs resolving from them. The cases below mutate copies of it.
 	healthy_module() {
 		cat <<-'MODULE'
 			BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
@@ -209,6 +209,13 @@ if [ -z "${MODULE_PINS_FILE:-}" ]; then
 			crate.spec(
 			    git = BRENN_POD_GIT,
 			    package = "brenn-bridge",
+			    rev = BRENN_POD_REV,
+			)
+
+			crate.spec(
+			    features = ["test-util"],
+			    git = BRENN_POD_GIT,
+			    package = "pod-ingest",
 			    rev = BRENN_POD_REV,
 			)
 		MODULE
@@ -248,7 +255,7 @@ if [ -z "${MODULE_PINS_FILE:-}" ]; then
 		"${fixtures}/overlaid" 1 "the speech-surface spec names no working tree"
 
 	# A spec that resolves from the right remote by spelling it out, which is
-	# how a bump reaches two specs of three.
+	# how a bump reaches some specs and not the rest.
 	healthy_module |
 		sed '5,9s|    git = BRENN_POD_GIT,|    git = "https://github.com/rnortman/brenn-pod.git",|' \
 			>"${fixtures}/literal-remote"
@@ -268,7 +275,7 @@ if [ -z "${MODULE_PINS_FILE:-}" ]; then
 	healthy_module | sed '/brenn-bridge/,+2d' >"${fixtures}/missing-spec"
 	over_fixture "a spec that is no longer there is caught" \
 		"${fixtures}/missing-spec" 1 \
-		"all three brenn-pod specs are there to be read"
+		"all four brenn-pod specs are there to be read"
 
 	# A pin another machine does not resolve the same way.
 	healthy_module | sed 's|^BRENN_POD_REV = .*|BRENN_POD_REV = "main"|' \

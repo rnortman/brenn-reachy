@@ -29,8 +29,16 @@
 //! whether a bus brain kept the attachment its turns and its motion channel
 //! ride, whether anything critical fired, and whether it ended by draining or
 //! by refusing its own configuration. Everything else is measured and printed
-//! and never fails: counts per kind with the sentence each kind said, the warning
-//! alerts, the alerts that never reached the bus, the bodies the edge dropped.
+//! and never fails: the turns of the conversation, counts per kind with the
+//! sentence each kind said, the warning alerts, the alerts that never reached
+//! the bus, the bodies the edge dropped.
+//!
+//! The turns are the part a person reads first. One line per wake — what was
+//! heard, how sure the recogniser was, what the confidence gate did with it,
+//! and where the auto-select beam was pointing while it was said — because a
+//! run of five wakes and five declines is a run in which nobody was answered,
+//! and a report that says only that the pipeline came up and drained whole has
+//! not told anybody that.
 //!
 //! It holds one more opinion, and it is about the motion path. A script the
 //! pipeline authored is a script this host wrote for itself: the scripter's
@@ -74,7 +82,7 @@
 //! shared — anything the process or its libraries write to stderr lands in the
 //! same file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -118,6 +126,12 @@ const POD_LOG: &str = "pod_0.log";
 
 /// What the fetch names the console directory beside a record directory.
 const CONSOLE_SUFFIX: &str = ".console";
+
+/// What the fetch names the recorded-audio store beside a record directory.
+const AUDIO_SUFFIX: &str = ".audio";
+
+/// What this tool names the directory it writes one clip per turn into.
+const TURNS_SUFFIX: &str = ".turns";
 
 /// The extension the online logger writes its records under.
 ///
@@ -189,6 +203,62 @@ const ANNOUNCEMENT_SPOKEN: &str = "announcement_spoken";
 const ANNOUNCEMENT_UNHEARD: &str = "announcement_unheard";
 const ANNOUNCE_SEAM_UNUSED: &str = "announce_seam_unused";
 
+/// The pipeline events one turn of a conversation is assembled out of.
+///
+/// Speech-surface's vocabulary and not this tree's, spelled once here. The
+/// whole utterance lifecycle: the wake that opened the turn, the transcript it
+/// produced, and the one event that says what became of it. A turn is what an
+/// operator asks a speech run about — the counts per event name the rest of
+/// this tool keeps say a pipeline was busy and never say whether anybody was
+/// answered.
+const WAKE_DETECTED: &str = "wake_detected";
+const UTTERANCE: &str = "utterance";
+const BRAIN_DISPATCHED: &str = "brain_dispatched";
+const WAKE_COMMAND_ABSENT: &str = "wake_command_absent";
+const BARGE_COMMAND_ABSENT: &str = "barge_command_absent";
+const BRAIN_NO_TRANSCRIPT: &str = "brain_no_transcript";
+const STT_FAILED: &str = "stt_failed";
+const UTTERANCE_SUPERSEDED: &str = "utterance_superseded";
+
+/// The events about a reply already playing: what cut it, and how long it ran.
+///
+/// `barge_in` names no utterance — it is the moment somebody spoke over the
+/// pod, ahead of any decision about what was playing — so it is attributed to
+/// the reply it cut, which is the last turn this console dispatched.
+const BARGE_IN: &str = "barge_in";
+const PLAYBACK_FLUSHED: &str = "playback_flushed";
+const PLAYBACK_FINISHED: &str = "playback_finished";
+
+/// The two events the auto-select beam's bearing is read off.
+///
+/// A segment closes, saying where its first sample sits in the pod's own index
+/// space, and its tracking line follows with the bearings the beamformer held
+/// through it. The pair is what converts a turn's pod-absolute span into the
+/// segment-relative offsets the bearings are stamped with.
+const SEGMENT_CLOSED: &str = "segment_closed";
+const TRACKING: &str = "tracking";
+
+/// A pod's connection announcing itself.
+///
+/// Read for one thing: the pod counts its samples from zero again on every
+/// connection, so this line is where one index space ends and the next begins.
+const CONN_HELLO: &str = "conn_hello";
+
+/// Which of the four bearings a tracking sample carries is the auto-select
+/// beam's.
+///
+/// The chip reports one bearing per beam and the last is the beam the pod
+/// sends. A sample with fewer than this many is one this build has no reader
+/// for and is skipped rather than guessed at.
+const AUTO_BEAM: usize = 3;
+
+/// The reason word the confidence gate declines a transcript under.
+///
+/// The other reasons a wake goes unanswered — an empty transcript, an arm that
+/// expired — are declines too and counted as such; this word is what separates
+/// the ones that had words in them, which is the class worth reading back.
+const LOW_CONFIDENCE: &str = "low_confidence";
+
 /// Which sink a body that never reached the gate came from, on its own line.
 ///
 /// The scripter's is this process's own decision; the bus's is a remote
@@ -240,6 +310,201 @@ struct HandedOff {
     delivery: String,
     /// What the attachment ahead of it said, where one said anything.
     granted: Option<bool>,
+}
+
+/// Where in the pod's audio a turn's clip was carved from.
+///
+/// Two index spaces meet here. `start_sample` and `end_sample` are
+/// pod-absolute, as the span the utterance names is; `segment` is the segment
+/// that span falls in, whose own bearings are stamped relative to its first
+/// sample. Every field is optional because every field is read optionally: a
+/// console written by a pipeline that names one of them differently prints the
+/// figure that needs it as missing rather than a number nobody can check.
+#[derive(Debug, Default, PartialEq)]
+struct Span {
+    /// Which frame log in the store holds those samples, store-root-relative,
+    /// as the line named it. The clip is cut out of this file.
+    log: Option<String>,
+    start_sample: Option<i64>,
+    end_sample: Option<i64>,
+    segment: Option<u32>,
+    /// Which cap-rollover part of that segment, where the span said. One
+    /// segment id can close several times over — the host's length cap
+    /// finalizes a part and opens a contiguous successor under the same id —
+    /// and only the part tells the two apart.
+    part: Option<u16>,
+}
+
+impl Span {
+    /// Fill this span's empty fields from another's.
+    ///
+    /// A turn's span arrives in pieces: the utterance names the samples, and on
+    /// a pipeline whose first utterance of a process carries no segment list
+    /// the decline line beside it is where the segment is named. Neither
+    /// overwrites what the other already said.
+    fn absorb(&mut self, other: Span) {
+        self.log = self.log.take().or(other.log);
+        self.start_sample = self.start_sample.or(other.start_sample);
+        self.end_sample = self.end_sample.or(other.end_sample);
+        self.segment = self.segment.or(other.segment);
+        self.part = self.part.or(other.part);
+    }
+}
+
+/// Which closed segment a line names.
+///
+/// The id alone does not name one: a segment id closes twice over whenever the
+/// host's length cap finalizes a part and opens a successor under the same id.
+/// The pod is here because each one counts its samples in its own space, and a
+/// segment id means nothing across two of them.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SegKey {
+    /// Which pod said it, empty where the line named none.
+    pod: String,
+    /// Which connection generation the console was in when the segment closed.
+    ///
+    /// A pod counts samples from zero again on every connection, so a segment
+    /// id and a sample index both mean something only inside one generation.
+    /// The counter is console-wide: a hello from any pod fences every pod's
+    /// space, which is what a console carrying one pod — every console this
+    /// tool has been pointed at — needs it to do.
+    generation: u32,
+    segment: u32,
+    /// Which cap-rollover part of the segment, zero for the first and for a
+    /// console that does not say.
+    part: u16,
+}
+
+/// What the console's closed segments say about a turn whose span names none of
+/// them.
+#[derive(Debug, PartialEq)]
+enum Attribution<'a> {
+    /// Exactly one holds the sample the turn is anchored by, and its bearings
+    /// are the turn's.
+    One(&'a SegKey),
+    /// More than one does, so none of them answers for it: one sample sitting
+    /// inside two segments is two segments that share no audio.
+    Several,
+    /// None does.
+    None,
+}
+
+/// Where one closed segment sits in the pod's own index space.
+///
+/// The base is what converts a pod-absolute sample into the segment-relative
+/// offsets its bearings are stamped in. The count is what makes the segment a
+/// range rather than a point, which is how a turn that names no segment is
+/// attributed to the one it was carved from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Closed {
+    base: i64,
+    /// How many samples it held, where its line said. A console that does not
+    /// say leaves the segment a point, and a turn naming no segment finds
+    /// nothing to fall back on.
+    ///
+    /// A segment with gaps in it spans more of the pod's index space than it
+    /// holds samples of, and the console does not say how many were dropped, so
+    /// a carve near such a segment's tail is held by nothing.
+    // TODO(beam-gappy-segment-extent): the console would have to carry the
+    // dropped-sample count for the range to be the segment's true extent.
+    samples: Option<i64>,
+}
+
+impl Closed {
+    /// Whether a pod-absolute sample falls inside this segment.
+    ///
+    /// Every figure here is a number off the console, so the end is computed
+    /// checked: a torn or corrupted line carrying a base or a count near the
+    /// end of the range holds nothing rather than killing the report the run
+    /// is read by.
+    fn holds(&self, sample: i64) -> bool {
+        self.samples
+            .and_then(|samples| self.base.checked_add(samples))
+            .is_some_and(|end| sample >= self.base && sample < end)
+    }
+}
+
+/// What one transcript said and how sure the recogniser was of it.
+#[derive(Debug, Default, PartialEq)]
+struct Spoken {
+    /// The utterance's sequence number, the key every later event joins on.
+    id: Option<u64>,
+    /// Which pod carved it, empty where the line named none. The sample
+    /// indexes on this line are counted in that pod's space and nowhere else.
+    pod: String,
+    text: Option<String>,
+    no_speech: Option<f64>,
+    logprob: Option<f64>,
+    compression: Option<f64>,
+    /// Why the endpointer decided the utterance had ended, in its own word.
+    endpoint_cause: String,
+    span: Span,
+}
+
+/// One event of the utterance lifecycle, read by field.
+///
+/// The fourth variant group [`Line`] holds another repo's schema for, grouped
+/// by what reads it: these are the events one conversational turn is assembled
+/// out of, and the assembly is a fold over them in the order the console
+/// carried them.
+#[derive(Debug, PartialEq)]
+enum Turned {
+    /// A wake, which opens a turn whether or not an utterance follows it.
+    Wake {
+        pod: String,
+        score: Option<f64>,
+        wake_end_sample: Option<i64>,
+    },
+    /// A pod's connection announced itself, fencing the sample-index space
+    /// every line before it counted in off from every line after it.
+    Connected,
+    /// The transcript itself.
+    Said(Box<Spoken>),
+    /// The turn reached the brain.
+    Dispatched { id: Option<u64> },
+    /// The gate declined it, in its own word, with the two numbers it judged on.
+    Declined {
+        id: Option<u64>,
+        reason: String,
+        no_speech: Option<f64>,
+        logprob: Option<f64>,
+        span: Span,
+        /// How many samples of the carve the recogniser was not given, where
+        /// this line said. Only the decline lines carry it.
+        stt_trim: Option<i64>,
+    },
+    /// The brain was handed a turn with no words in it.
+    NoTranscript { id: Option<u64> },
+    /// The recogniser itself failed, in its own words.
+    SttFailed { id: Option<u64>, detail: String },
+    /// Speech resumed and the utterance was transcribed again.
+    Superseded { id: Option<u64> },
+    /// Somebody spoke over a reply that was playing.
+    BargeIn,
+    /// What was left of that reply was thrown away.
+    Flushed { id: Option<u64> },
+    /// A reply played to its end, and for how long.
+    Played {
+        id: Option<u64>,
+        played_ms: Option<f64>,
+    },
+    /// A segment ended, saying where its first sample sits and how many it
+    /// held.
+    SegmentClosed {
+        pod: String,
+        segment: Option<u32>,
+        part: u16,
+        base_sample: Option<i64>,
+        samples: Option<i64>,
+    },
+    /// The bearings the auto-select beam held through one segment, as
+    /// (offset, radians) pairs in that segment's own index space.
+    Tracking {
+        pod: String,
+        segment: Option<u32>,
+        part: u16,
+        beams: Vec<(i64, f64)>,
+    },
 }
 
 /// One line of the host's console, as much as this tool understands of it.
@@ -325,8 +590,158 @@ enum Line {
         /// speaking run was missing. Empty on the spoken event.
         reason: String,
     },
-    /// Anything that is not a JSON object at all.
-    Noise { text: String },
+    /// One event of the utterance lifecycle, read by field.
+    ///
+    /// It carries the key summary too, because these are pipeline events like
+    /// any other and are counted as such.
+    Turned {
+        keys: String,
+        event: String,
+        turned: Box<Turned>,
+    },
+}
+
+/// What became of one turn, in the pipeline's own decision.
+#[derive(Debug, Default, PartialEq)]
+enum Outcome {
+    /// Nothing on this console said. A run the operator ended mid-turn.
+    #[default]
+    Open,
+    /// It reached the brain.
+    Dispatched,
+    /// The gate declined it, in its own word.
+    Declined(String),
+    /// The brain was handed a turn with no words in it.
+    NoTranscript,
+    /// The recogniser failed, in its own words.
+    SttFailed(String),
+}
+
+/// What one turn is called, in the two places it is named.
+///
+/// One value with two spellings rather than two spellings decided apart: the
+/// token the turn line prints after `#` is the token the clip's file name
+/// carries after `turn-`, which is what makes a clip findable from the report
+/// by reading. Spelled in two functions they drift the first time a new kind of
+/// turn is named, and the drift reads as a `.wav` no line points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Label {
+    /// The utterance's own number, which every event of the turn joins on.
+    Utterance(u64),
+    /// Which wake of the run opened it, for a turn no utterance was minted for.
+    Wake(usize),
+}
+
+impl Label {
+    /// How the turn line names it.
+    fn on_line(self) -> String {
+        match self {
+            Self::Utterance(id) => format!("#{id}"),
+            Self::Wake(ordinal) => format!("#? (wake {ordinal})"),
+        }
+    }
+
+    /// What the turn's clip is called.
+    fn file_name(self) -> String {
+        match self {
+            Self::Utterance(id) => format!("turn-{id:02}.wav"),
+            Self::Wake(ordinal) => format!("turn-wake-{ordinal}.wav"),
+        }
+    }
+}
+
+/// One turn of a conversation: a wake, what was heard, and what was done.
+///
+/// The unit an operator judges a speech run in. A turn begins at a wake and
+/// holds whatever followed it, including nothing: a wake that minted no
+/// utterance is a turn the pipeline had and could not read, and it is printed
+/// as such rather than left out of a count nobody would notice it missing
+/// from.
+#[derive(Debug, Default)]
+struct Turn {
+    /// Which wake of the run opened it, counting from one; zero on a turn no
+    /// wake opened.
+    ordinal: usize,
+    /// Whether a `wake_detected` opened it. False on a turn a barge-in minted,
+    /// which is as real as any other and is not a wake the model fired.
+    woke: bool,
+    /// Which pod's index space its samples are counted in, empty where no line
+    /// of it named one.
+    pod: String,
+    /// Which connection generation the console was in when the turn opened.
+    ///
+    /// The pod counts samples from zero again on every connection, so a
+    /// segment closed after a reconnect can hold a sample of a turn from
+    /// before it. A turn and a segment answer for each other only inside one
+    /// generation; a figure read out of another connection's audio is worse
+    /// than none.
+    generation: u32,
+    /// What was said, once a transcript existed.
+    said: Spoken,
+    wake_score: Option<f64>,
+    wake_end_sample: Option<i64>,
+    outcome: Outcome,
+    /// How long the reply to it played, where one played to its end.
+    played_ms: Option<f64>,
+    /// How many times speech resumed and the utterance was transcribed again.
+    superseded: usize,
+    /// How many times somebody spoke over this turn's reply.
+    barge_ins: usize,
+    /// How many times what was left of that reply was thrown away.
+    flushed: usize,
+    /// How many samples at the head of the carve the recogniser was not given,
+    /// where a line of this turn said. Known on a decline and unstated on a
+    /// dispatch, so the clip fragment says where the recogniser began only
+    /// where the console did.
+    stt_trim: Option<i64>,
+}
+
+impl Turn {
+    /// The pod-absolute sample this turn is attributed to a segment by.
+    ///
+    /// The carve's own start, because that is the sample the pipeline judged
+    /// belonged to this utterance. The wake is the fallback for a start no
+    /// closed range holds — a carve whose pre-roll reaches back past its
+    /// segment's base — and for a span that stated no start at all; it is
+    /// never what gives a spanless turn a figure, because such a turn states
+    /// no window end and is not windowed at all.
+    fn carved_at(&self) -> Option<i64> {
+        self.said.span.start_sample.or(self.wake_end_sample)
+    }
+
+    /// The pod-absolute sample this turn's bearing window opens at.
+    ///
+    /// The wake's end, so the look direction the wake word was spoken from is
+    /// not averaged into the utterance's; the carve's start only where no wake
+    /// said. Deliberately the opposite precedence to [`Turn::carved_at`] — the
+    /// two answer different questions — which is why [`Console::beam_of`]
+    /// re-reads the attributing sample when the window opens outside the
+    /// segment that holds the carve.
+    fn window_from(&self) -> Option<i64> {
+        self.wake_end_sample.or(self.said.span.start_sample)
+    }
+
+    /// What names this turn, wherever it is named.
+    ///
+    /// `None` for a turn the console named neither an utterance nor a wake
+    /// for: it is printed as unnamed and no file is cut for it.
+    fn label(&self) -> Option<Label> {
+        match (self.said.id, self.woke) {
+            (Some(id), _) => Some(Label::Utterance(id)),
+            (None, true) => Some(Label::Wake(self.ordinal)),
+            (None, false) => None,
+        }
+    }
+
+    /// Whether the gate declined this turn as a likely hallucination.
+    fn hallucinated(&self) -> bool {
+        matches!(&self.outcome, Outcome::Declined(reason) if reason == LOW_CONFIDENCE)
+            && self
+                .said
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+    }
 }
 
 /// Everything the console said, folded down as it was read.
@@ -341,7 +756,9 @@ enum Line {
 ///
 /// What is kept in full is what the report prints in full anyway — the alerts
 /// and the lines saying one did not reach the bus or the room — so nothing here
-/// grows that the output would not.
+/// grows that the output would not. The one exception is [`Console::tracked`],
+/// which holds one numeric column of one event kind because the turn a bearing
+/// belongs to is not always on the console yet when the bearing is.
 #[derive(Default)]
 struct Console {
     /// Where the file was, for the messages.
@@ -470,6 +887,52 @@ struct Console {
     /// driver's own last act, which a death never reaches. A driver ending that
     /// was asked for ([`CANCELLED`]) is no death and is not kept here.
     driver_deaths: Vec<String>,
+    /// Every turn of the conversation, in the order the wakes came.
+    ///
+    /// Kept in full, which is the exception this fold's rule already names: the
+    /// report prints one line per turn anyway, so nothing here grows that the
+    /// output would not. A turn is a person waking the robot, and a run holds
+    /// as many as somebody had the patience for.
+    turns: Vec<Turn>,
+    /// Which turn each utterance sequence number belongs to.
+    by_id: BTreeMap<u64, usize>,
+    /// The turn a wake opened that no utterance has joined yet.
+    open_turn: Option<usize>,
+    /// The last turn this console dispatched, which is whose reply is playing.
+    last_dispatched: Option<usize>,
+    /// Where each closed segment sits in the pod's own index space.
+    ///
+    /// `None` under a key two closes disagreed on: one segment id and part can
+    /// close twice in one connection, when a truncated segment resumes, and
+    /// then nothing on the console says which of the two bases a tracking line
+    /// belongs to. Such a segment converts nothing.
+    segments: BTreeMap<SegKey, Option<Closed>>,
+    /// The bearings each closed segment's tracking line carried, in that
+    /// segment's own index space.
+    ///
+    /// Kept rather than folded into the turns as the line is read, because the
+    /// turn a bearing belongs to is not always on the console yet when its
+    /// segment's lines arrive: the segment closes at the VAD release while the
+    /// utterance line waits for the recogniser to return, and a recogniser
+    /// running long is what a degraded turn is. Every figure is a function of
+    /// the whole map and none of the order the lines came in.
+    ///
+    /// The cost is one `(offset, bearing)` pair per few thousand samples of
+    /// tracked audio — one numeric column of one event kind, still a fold and
+    /// not the file.
+    ///
+    /// `None` under a key two tracking lines disagreed on, for the same reason
+    /// two disagreeing closes withdraw a base.
+    tracked: BTreeMap<SegKey, Option<Vec<(i64, f64)>>>,
+    /// How many connections have announced themselves, which is the generation
+    /// every segment and every turn read afterwards is stamped with.
+    connection: u32,
+    /// Barge-ins that cut no reply this console had dispatched.
+    ///
+    /// Counted apart rather than attributed to a guess: a barge-in names no
+    /// utterance, and one arriving before anything was dispatched is the pod
+    /// hearing something the report cannot join to a turn.
+    stray_barge_ins: usize,
     /// How many lines were not JSON at all.
     noise: usize,
     /// The first few of those, quoted.
@@ -531,28 +994,60 @@ impl Console {
     }
 
     /// One line, into the counters it belongs to.
+    ///
+    /// A line is one event and nearly always exactly that, but a tear can put
+    /// several on it, so every event the line carried is folded in the order it
+    /// was written.
     fn absorb(&mut self, raw: &str) {
         self.seen += 1;
-        let Classified { ahead, line } = classify(raw);
+        let Classified {
+            ahead,
+            behind,
+            lines,
+        } = classify(raw);
         // The host's refusal is console text, and console text tears the same
         // way an event does — the refusal arrives glued behind a sentence that
-        // never got its newline. So it is looked for inside the console half of
-        // the line rather than at the start of the raw one, on the half that is
-        // console text at all: a JSON event quoting the prefix is an event, not
-        // an exit.
-        let console = match (&ahead, &line) {
-            (Some(text), _) => Some(text.as_str()),
-            (None, Line::Noise { .. }) => Some(raw),
-            (None, _) => None,
-        };
-        let refusal = console.and_then(refused_in);
+        // never got its newline. So it is looked for inside the console halves
+        // of the line rather than at the start of the raw one, on the halves
+        // that are console text at all: a JSON event quoting the prefix is an
+        // event, not an exit. The later half wins, because a tear puts the
+        // refusal at the line's tail.
+        let mut console: Vec<&str> = Vec::new();
+        if let Some(text) = &ahead {
+            console.push(text);
+        }
+        if lines.is_empty() {
+            console.push(raw);
+        }
+        if let Some(text) = &behind {
+            console.push(text);
+        }
+        let refusal = console.iter().rev().find_map(|text| refused_in(text));
         let refused_here = refusal.is_some();
         if let Some(message) = refusal {
             self.refused = Some(message);
         }
-        if let Some(text) = &ahead {
+        for text in [&ahead, &behind].into_iter().flatten() {
             self.noticed_noise(quote(text));
         }
+        if lines.is_empty() {
+            self.noticed_noise(quote(raw));
+            return;
+        }
+        for line in lines {
+            self.fold(line);
+        }
+        // A line of the stream after a refusal means the process went on: the
+        // refusal was something a run printed, not the way it ended. A line
+        // that carried a refusal of its own is not such a line, whatever was
+        // glued behind it.
+        if !refused_here {
+            self.refused = None;
+        }
+    }
+
+    /// One event, into the counters it belongs to.
+    fn fold(&mut self, line: Line) {
         match line {
             Line::Edge { kind, says, fields } => {
                 if kind == UNPUBLISHED {
@@ -659,18 +1154,316 @@ impl Console {
                 });
                 *self.pipeline.entry((event, keys)).or_default() += 1;
             }
-            Line::Noise { text } => {
-                self.noticed_noise(text);
-                return;
+            Line::Turned {
+                keys,
+                event,
+                turned,
+            } => {
+                self.turn_event(*turned);
+                *self.pipeline.entry((event, keys)).or_default() += 1;
             }
         }
-        // A line of the stream after a refusal means the process went on: the
-        // refusal was something a run printed, not the way it ended. A line
-        // that carried a refusal of its own is not such a line, whatever was
-        // glued behind it.
-        if !refused_here {
-            self.refused = None;
+    }
+
+    /// One event of the utterance lifecycle, into the turn it belongs to.
+    ///
+    /// The order the console carried them is the only join this has: a wake
+    /// opens a turn, the utterance that follows binds its sequence number to
+    /// that turn, and everything after joins on the number. An event whose
+    /// number this console has not seen falls back to the open turn, and where
+    /// there is none it opens one — a barge-in mints an utterance with no wake
+    /// ahead of it, and that turn is as real as any other.
+    fn turn_event(&mut self, turned: Turned) {
+        match turned {
+            Turned::Wake {
+                pod,
+                score,
+                wake_end_sample,
+            } => {
+                self.turns.push(Turn {
+                    ordinal: self.turns.iter().filter(|turn| turn.woke).count() + 1,
+                    woke: true,
+                    pod,
+                    generation: self.connection,
+                    wake_score: score,
+                    wake_end_sample,
+                    ..Turn::default()
+                });
+                self.open_turn = Some(self.turns.len() - 1);
+            }
+            // A connection fences the index space every sample read before it
+            // was counted in: nothing read afterwards answers for a turn from
+            // before it, and nothing before answers for a turn after.
+            Turned::Connected => self.connection = self.connection.saturating_add(1),
+            Turned::Said(spoken) => {
+                let at = self.turn_for(spoken.id);
+                let turn = &mut self.turns[at];
+                let mut span = spoken.span;
+                span.absorb(std::mem::take(&mut turn.said.span));
+                if turn.pod.is_empty() {
+                    turn.pod = spoken.pod.clone();
+                }
+                turn.said = Spoken { span, ..*spoken };
+            }
+            Turned::Dispatched { id } => {
+                let at = self.turn_for(id);
+                self.turns[at].outcome = Outcome::Dispatched;
+                self.last_dispatched = Some(at);
+            }
+            Turned::Declined {
+                id,
+                reason,
+                no_speech,
+                logprob,
+                span,
+                stt_trim,
+            } => {
+                let at = self.turn_for(id);
+                let turn = &mut self.turns[at];
+                turn.outcome = Outcome::Declined(reason);
+                turn.stt_trim = turn.stt_trim.or(stt_trim);
+                // The gate's own reading of the two numbers, where the
+                // utterance line did not carry them: the same figures, and on
+                // a turn whose transcript never reached this console they are
+                // the only ones there are.
+                turn.said.no_speech = turn.said.no_speech.or(no_speech);
+                turn.said.logprob = turn.said.logprob.or(logprob);
+                turn.said.span.absorb(span);
+            }
+            Turned::NoTranscript { id } => {
+                let at = self.turn_for(id);
+                self.turns[at].outcome = Outcome::NoTranscript;
+            }
+            Turned::SttFailed { id, detail } => {
+                let at = self.turn_for(id);
+                self.turns[at].outcome = Outcome::SttFailed(detail);
+            }
+            Turned::Superseded { id } => {
+                let at = self.turn_for(id);
+                self.turns[at].superseded += 1;
+            }
+            Turned::BargeIn => match self.last_dispatched {
+                Some(at) => self.turns[at].barge_ins += 1,
+                None => self.stray_barge_ins += 1,
+            },
+            // The two reply-side events name the turn they answer or name
+            // nothing at all: the pipeline plays announcements nobody asked a
+            // question for, and one of those is no turn's reply. An unnamed one
+            // is left out rather than charged to whichever turn is open, which
+            // would read as a wake that was answered.
+            Turned::Flushed { id: Some(id) } => {
+                let at = self.turn_for(Some(id));
+                self.turns[at].flushed += 1;
+            }
+            Turned::Played {
+                id: Some(id),
+                played_ms,
+            } => {
+                let at = self.turn_for(Some(id));
+                self.turns[at].played_ms = played_ms;
+            }
+            Turned::Flushed { id: None } | Turned::Played { id: None, .. } => {}
+            Turned::SegmentClosed {
+                pod,
+                segment,
+                part,
+                base_sample,
+                samples,
+            } => {
+                if let (Some(segment), Some(base)) = (segment, base_sample) {
+                    let closed = Closed { base, samples };
+                    let key = self.key(pod, segment, part);
+                    self.segments
+                        .entry(key)
+                        .and_modify(|held| {
+                            if *held != Some(closed) {
+                                *held = None;
+                            }
+                        })
+                        .or_insert(Some(closed));
+                }
+            }
+            Turned::Tracking {
+                pod,
+                segment,
+                part,
+                beams,
+            } => {
+                if let Some(segment) = segment
+                    && !beams.is_empty()
+                {
+                    let key = self.key(pod, segment, part);
+                    self.tracked
+                        .entry(key)
+                        .and_modify(|held| {
+                            if held.as_deref() != Some(beams.as_slice()) {
+                                *held = None;
+                            }
+                        })
+                        .or_insert(Some(beams));
+                }
+            }
         }
+    }
+
+    /// The turn one event belongs to, opening one where nothing holds it yet.
+    fn turn_for(&mut self, id: Option<u64>) -> usize {
+        if let Some(id) = id
+            && let Some(at) = self.by_id.get(&id)
+        {
+            return *at;
+        }
+        let at = match self.open_turn.take() {
+            Some(at) => at,
+            None => {
+                self.turns.push(Turn {
+                    generation: self.connection,
+                    ..Turn::default()
+                });
+                self.turns.len() - 1
+            }
+        };
+        if let Some(id) = id {
+            self.by_id.insert(id, at);
+            self.turns[at].said.id = Some(id);
+        }
+        at
+    }
+
+    /// Which closed segment a turn whose span names none was carved from.
+    ///
+    /// The carve's own start decides it, because that is the sample the
+    /// pipeline judged belonged to this utterance. Where no closed range holds
+    /// that sample the wake decides instead: the pod's pre-roll is whatever
+    /// history its ring held, so the first segment of a connection can begin
+    /// after the host's own carve does, while the wake word that opened the
+    /// segment is inside it by construction.
+    ///
+    /// Two ranges holding one anchor is no attribution at all. Two connections
+    /// of a pod count samples in unrelated spaces, and a segment id says
+    /// nothing across them, so one sample can sit inside two segments that
+    /// share no audio: the figure such a pair would print is a confident
+    /// reading of the wrong conversation. The generation is what keeps the
+    /// two connections apart in the first place, and a carve one of them holds
+    /// is judged against that connection's segments alone.
+    fn attribution(&self, turn: &Turn) -> Attribution<'_> {
+        for anchor in [turn.carved_at(), turn.wake_end_sample]
+            .into_iter()
+            .flatten()
+        {
+            let mut held = self.segments.iter().filter(|(key, closed)| {
+                self.answers_for(turn, key) && closed.is_some_and(|closed| closed.holds(anchor))
+            });
+            match (held.next(), held.next()) {
+                (Some((key, _)), None) => return Attribution::One(key),
+                (Some(_), Some(_)) => return Attribution::Several,
+                _ => {}
+            }
+        }
+        Attribution::None
+    }
+
+    /// Whether a turn and a segment line agree about whose samples these are.
+    ///
+    /// A line that named no pod agrees with everything: an older pipeline than
+    /// this tool reads for names one on some events and not others, and a
+    /// console with one pod on it is every console this tool has been pointed
+    /// at.
+    fn same_space(one: &str, other: &str) -> bool {
+        one.is_empty() || other.is_empty() || one == other
+    }
+
+    /// Whether a closed segment can answer for a turn at all.
+    ///
+    /// Same pod, same connection: a segment id, and every sample index beside
+    /// it, means something only inside one connection of one pod.
+    fn answers_for(&self, turn: &Turn, key: &SegKey) -> bool {
+        Self::same_space(&turn.pod, &key.pod) && key.generation == turn.generation
+    }
+
+    /// The key a segment line read now is stamped with.
+    fn key(&self, pod: String, segment: u32, part: u16) -> SegKey {
+        SegKey {
+            pod,
+            generation: self.connection,
+            segment,
+            part,
+        }
+    }
+
+    /// Which closed segment a turn reads its bearings out of.
+    ///
+    /// A span that names one is judged by that segment and no other, matched
+    /// on its part as well as its id because one id can close more than once.
+    /// A span that names none is attributed by [`Console::attribution`], to
+    /// the one closed segment whose sample range holds it: the pipeline names
+    /// a segment list only for a carve some segment had already closed over,
+    /// so the first utterance of every run names none, and containment is what
+    /// gives that turn — the one the beam figure is most wanted for — a
+    /// segment at all.
+    fn segment_of(&self, turn: &Turn) -> Option<&SegKey> {
+        match turn.said.span.segment {
+            Some(named) => self.segments.keys().find(|key| {
+                key.segment == named
+                    && turn.said.span.part.is_none_or(|part| part == key.part)
+                    && self.answers_for(turn, key)
+            }),
+            None => match self.attribution(turn) {
+                Attribution::One(key) => Some(key),
+                Attribution::Several | Attribution::None => None,
+            },
+        }
+    }
+
+    /// The auto-select beam through one turn's span: mean and spread, in
+    /// radians, or nothing where this console cannot state it.
+    ///
+    /// Read against the whole fold rather than as the tracking line arrives,
+    /// because the console's order is not the turns' order: a segment closes
+    /// at the VAD release and its utterance line waits for the recogniser, so
+    /// a turn's span can trail its own segment's lines by the whole of an STT
+    /// call — which on a degraded turn is exactly what is long. A figure that
+    /// depended on which came first would go missing on the turns this report
+    /// exists to read.
+    ///
+    /// A turn whose span states no end sample keeps no figure. Nothing on the
+    /// console says where such a turn stopped, so the segment's own end is not
+    /// a bound it has any claim to: it is whatever the gate did afterwards, a
+    /// later turn's utterance included, and a mean over another speaker is the
+    /// one shape that could mislead the reading two acceptance sessions are
+    /// compared on. Every turn the console finished telling states its end,
+    /// an expired arm included.
+    ///
+    /// The window converts between the two index spaces. A turn's wake and
+    /// span are pod-absolute; the bearings are stamped relative to the
+    /// segment's first sample. Without that base sample on the console there
+    /// is no conversion and the turn keeps no figure.
+    ///
+    /// It opens at [`Turn::window_from`] and the segment is chosen by
+    /// [`Turn::carved_at`], which are deliberately opposite precedences: a
+    /// carve that straddles a close has its wake in the segment after the one
+    /// holding it, so the window would open outside this segment and select
+    /// nothing. A turn attributed by containment then opens its window at the
+    /// sample that attributed it, so a successful attribution never reads as
+    /// missing.
+    fn beam_of(&self, turn: &Turn) -> Option<(f64, f64)> {
+        let end = turn.said.span.end_sample?;
+        let key = self.segment_of(turn)?;
+        let closed = (*self.segments.get(key)?)?;
+        let beams = self.tracked.get(key)?.as_deref()?;
+        let base = closed.base;
+        let mut opens = turn.window_from().unwrap_or(base);
+        if turn.said.span.segment.is_none() && !closed.holds(opens) {
+            opens = turn.carved_at().unwrap_or(base);
+        }
+        let from = opens.saturating_sub(base);
+        let until = end.saturating_sub(base);
+        let held: Vec<f64> = beams
+            .iter()
+            .filter(|(offset, _)| *offset >= from && *offset < until)
+            .map(|(_, bearing)| *bearing)
+            .collect();
+        spread(&held)
     }
 
     /// One line's worth of text that is not JSON, counted and maybe quoted.
@@ -1147,27 +1940,60 @@ fn count(table: &mut BTreeMap<String, (usize, String)>, kind: String, says: Stri
     seen.1 = says;
 }
 
-/// The console directory the fetch wrote beside `records`.
+/// The mean and the spread about it of a handful of readings, where there are
+/// any.
+///
+/// The spread is the population standard deviation and not an interval: the
+/// readings are the whole of what the run held, not a sample of something
+/// larger, and what an operator reads it for is whether one turn's bearings sat
+/// still or wandered.
+fn spread(readings: &[f64]) -> Option<(f64, f64)> {
+    if readings.is_empty() {
+        return None;
+    }
+    let n = readings.len() as f64;
+    let mean = readings.iter().sum::<f64>() / n;
+    let variance = readings
+        .iter()
+        .map(|reading| (reading - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    Some((mean, variance.sqrt()))
+}
+
+/// A directory named beside `records` by suffixing the record directory's own
+/// name.
 ///
 /// Built from the record path's own spelling rather than from a sibling scan:
-/// the pair is named by construction, and a directory holding two runs would
-/// otherwise be ambiguous.
-fn console_dir(records: &Path) -> PathBuf {
+/// the set is named by construction, and a directory holding two runs would
+/// otherwise be ambiguous. Three siblings are spelled this way — the console
+/// and the audio store the fetch wrote, and the turn clips this tool writes.
+fn sibling(records: &Path, suffix: &str) -> PathBuf {
     let mut name = records
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push_str(CONSOLE_SUFFIX);
+    name.push_str(suffix);
     records.with_file_name(name)
 }
 
-/// What one raw line is: any console text ahead of an event, and the line.
+/// The console directory the fetch wrote beside `records`.
+fn console_dir(records: &Path) -> PathBuf {
+    sibling(records, CONSOLE_SUFFIX)
+}
+
+/// What one raw line is: any console text around an event, and the line.
 struct Classified {
     /// The console text a recovered event was glued onto, as it was written.
     /// Absent on every line that is one thing, which is nearly all of them.
     ahead: Option<String>,
-    /// What the line, or what is left of it, is.
-    line: Line,
+    /// The console text glued onto the last event's own end, the same way. The
+    /// tear runs both directions: an event written whole and a sentence begun
+    /// into the same descriptor behind it.
+    behind: Option<String>,
+    /// The events on the line, in the order they were written. Empty where the
+    /// line carries none, which is what console text is.
+    lines: Vec<Line>,
 }
 
 /// What one raw line is, recovering an event glued onto console text.
@@ -1176,33 +2002,69 @@ struct Classified {
 /// `voice_host_0.log`, and they tear — a console sentence still without its
 /// newline, and a JSONL event written into the same descriptor behind it. A
 /// whole-line parse reads every torn line as noise. So a line that does not
-/// parse whole is split at an [`EVENT_HEAD`], the suffix read as the event and
-/// the text ahead of it kept as noise. A suffix that still does not parse
-/// leaves the whole line noise, which is what a sentence merely quoting that
-/// spelling is.
+/// parse whole is read as the whole objects it holds and whatever text
+/// surrounds them: the objects are the events and the text on either side is
+/// kept as noise. A line with no whole object anywhere in it stays noise, which
+/// is what a sentence merely quoting that spelling is.
 ///
-/// Every occurrence is tried rather than the first, because the console text a
-/// real event is glued onto can hold that spelling too — a sentence quoting an
-/// event, or a half-written event glued ahead of a whole one. Splitting at the
-/// first match alone loses the real event at the line's end to the trailing
-/// content the parse then rejects, and a lost `brain_brenn` is a run that
-/// exempts itself from [`bridged`].
+/// The tear runs both directions, and both are the ordinary shape rather than
+/// the exotic one — an event glued onto an unterminated sentence, and a
+/// sentence begun into the same descriptor behind a whole event. The second is
+/// how a transcript's own line arrives, so a reader that recovers only the
+/// first loses exactly the events a turn is assembled from.
+///
+/// Every occurrence of an [`EVENT_HEAD`] is tried rather than the first,
+/// because the console text a real event is glued onto can hold that spelling
+/// too — a sentence quoting an event, or a half-written event glued ahead of a
+/// whole one. Splitting at the first match alone loses the real event at the
+/// line's end, and a lost `brain_brenn` is a run that exempts itself from
+/// [`bridged`].
+///
+/// And every whole event from that point on is kept, not only the first: two
+/// writers interleaving cleanly put two finished events in one descriptor with
+/// no newline between them, and the second is as real as the first. Only the
+/// text after the last whole object is noise.
 fn classify(raw: &str) -> Classified {
-    if let Some(line) = object(raw) {
-        return Classified { ahead: None, line };
-    }
-    for (at, _) in raw.match_indices(EVENT_HEAD) {
-        if let Some(line) = object(&raw[at..]) {
-            return Classified {
-                ahead: Some(raw[..at].to_owned()),
-                line,
-            };
+    let starts = std::iter::once(0).chain(raw.match_indices(EVENT_HEAD).map(|(at, _)| at));
+    for at in starts {
+        let (lines, until) = leading(&raw[at..]);
+        if lines.is_empty() {
+            continue;
         }
+        let behind = &raw[at + until..];
+        return Classified {
+            ahead: (at > 0).then(|| raw[..at].to_owned()),
+            behind: (!behind.is_empty()).then(|| behind.to_owned()),
+            lines,
+        };
     }
     Classified {
         ahead: None,
-        line: Line::Noise { text: quote(raw) },
+        behind: None,
+        lines: Vec::new(),
     }
+}
+
+/// Every whole JSON object from the start of some text, and how much of the
+/// text they took.
+///
+/// A streaming read rather than a whole-text parse: trailing content is what a
+/// tear leaves behind an event, and a parse that rejects the line for it throws
+/// away the event with it. The read stops at the first thing that is not a
+/// whole object — a half-written event, or a scalar somebody printed — and
+/// whatever is left is the caller's noise.
+fn leading(raw: &str) -> (Vec<Line>, usize) {
+    let mut values = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
+    let mut lines = Vec::new();
+    let mut until = 0;
+    while let Some(Ok(value)) = values.next() {
+        let Some(line) = object(value) else {
+            break;
+        };
+        until = values.byte_offset();
+        lines.push(line);
+    }
+    (lines, until)
 }
 
 /// What the host refused with inside one line of console text, where it did.
@@ -1227,9 +2089,12 @@ fn refused_in(text: &str) -> Option<String> {
         .map(|(at, _)| text[at + REFUSAL_PREFIX.len()..].to_owned())
 }
 
-/// What one JSON object is, or nothing where the text is not one.
-fn object(raw: &str) -> Option<Line> {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(raw) else {
+/// What one JSON value is, or nothing where it is not an object.
+///
+/// A scalar or an array is not an event: the stream is objects, and anything
+/// else on the console is somebody's print.
+fn object(value: Value) -> Option<Line> {
+    let Value::Object(object) = value else {
         return None;
     };
     let text = |key: &str| -> String {
@@ -1313,9 +2178,220 @@ fn object(raw: &str) -> Option<Line> {
                         event,
                     }
                 }
-                _ => Line::Pipeline { event, keys },
+                _ => match turned(&event, &object) {
+                    Some(turned) => Line::Turned {
+                        keys,
+                        event,
+                        turned: Box::new(turned),
+                    },
+                    None => Line::Pipeline { event, keys },
+                },
             }
         }
+    })
+}
+
+/// A number anywhere in an object, as one, or nothing where it is not written
+/// as a number.
+///
+/// Every figure a turn line prints goes through here, so a pipeline that stops
+/// writing one of them as a number prints it as missing rather than as a zero
+/// nobody can tell from a reading.
+fn number(object: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
+    object.get(key).and_then(Value::as_f64)
+}
+
+/// A whole number, the same way.
+fn whole(object: &serde_json::Map<String, Value>, key: &str) -> Option<i64> {
+    object.get(key).and_then(Value::as_i64)
+}
+
+/// An utterance's sequence number off whichever field this event names it in.
+///
+/// Three spellings, because the pipeline names an utterance three ways: the
+/// utterance's own line calls it `id`, the events that answer it call it
+/// `utterance`, and the recogniser's failure calls it `utterance_seq`. A
+/// supersession names the whole identity and the sequence is inside it.
+fn utterance_id(object: &serde_json::Map<String, Value>) -> Option<u64> {
+    for key in ["utterance", "id", "utterance_seq"] {
+        if let Some(seq) = object.get(key).and_then(Value::as_u64) {
+            return Some(seq);
+        }
+    }
+    object
+        .get("utterance_id")
+        .and_then(Value::as_object)
+        .and_then(|id| id.get("seq"))
+        .and_then(Value::as_u64)
+}
+
+/// The span an event names, out of the fields it names it in.
+///
+/// Two shapes: the utterance's line nests it under `audio_ref`, and the gate's
+/// decline writes the same fields at the top level. The segment is the first
+/// the span lists, which is the segment the turn's own line named; the log and
+/// the two samples are what the clip is cut by, and they are stated whether or
+/// not any segment is.
+fn span_of(object: &serde_json::Map<String, Value>) -> Span {
+    let held = object.get("audio_ref").and_then(Value::as_object);
+    let at = held.unwrap_or(object);
+    let first = at
+        .get("segments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_object);
+    Span {
+        log: at
+            .get("log")
+            .and_then(Value::as_str)
+            .filter(|log| !log.is_empty())
+            .map(str::to_owned),
+        start_sample: whole(at, "start_sample"),
+        end_sample: whole(at, "end_sample"),
+        segment: first
+            .and_then(|first| first.get("segment_id"))
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok()),
+        part: first
+            .and_then(|first| first.get("part"))
+            .and_then(Value::as_u64)
+            .and_then(|part| u16::try_from(part).ok()),
+    }
+}
+
+/// Which pod an event names, or nothing where it names none.
+///
+/// Two spellings: the transport's own lines call it `pod` and the connection's
+/// hello calls it `pod_id`.
+fn pod_of(object: &serde_json::Map<String, Value>) -> String {
+    for key in ["pod", "pod_id"] {
+        if let Some(pod) = object.get(key).and_then(Value::as_str) {
+            return pod.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// Which cap-rollover part of its segment a segment line names, zero where it
+/// names none.
+fn part_of(object: &serde_json::Map<String, Value>) -> u16 {
+    object
+        .get("audio_ref")
+        .and_then(Value::as_object)
+        .and_then(|held| held.get("part"))
+        .and_then(Value::as_u64)
+        .and_then(|part| u16::try_from(part).ok())
+        .unwrap_or_default()
+}
+
+/// What one transcript's line said, out of the fields it carries.
+fn spoken(object: &serde_json::Map<String, Value>) -> Spoken {
+    let transcript = object.get("transcript").and_then(Value::as_object);
+    let confidence = transcript
+        .and_then(|held| held.get("confidence"))
+        .and_then(Value::as_object);
+    Spoken {
+        id: utterance_id(object),
+        pod: pod_of(object),
+        text: transcript
+            .and_then(|held| held.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        no_speech: confidence.and_then(|held| number(held, "no_speech_prob")),
+        logprob: confidence.and_then(|held| number(held, "avg_logprob")),
+        compression: confidence.and_then(|held| number(held, "compression_ratio")),
+        endpoint_cause: object
+            .get("endpoint_cause")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        span: span_of(object),
+    }
+}
+
+/// The auto-select beam's bearings out of one tracking line's `doa` array.
+///
+/// Each entry is an offset and one bearing per beam. An entry that is not that
+/// shape, or that carries fewer beams than this build reads, is skipped: the
+/// figure is a mean over the samples that were readable, and how many there
+/// were is what the spread already says.
+fn beams(object: &serde_json::Map<String, Value>) -> Vec<(i64, f64)> {
+    let Some(doa) = object.get("doa").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    doa.iter()
+        .filter_map(|entry| {
+            let entry = entry.as_array()?;
+            let offset = entry.first()?.as_i64()?;
+            let bearing = entry.get(1)?.as_array()?.get(AUTO_BEAM)?.as_f64()?;
+            Some((offset, bearing))
+        })
+        .collect()
+}
+
+/// Which event of the utterance lifecycle this is, where it is one.
+///
+/// One arm per event name, which with the arm [`Console::turn_event`] holds is
+/// the two edits an event wanted by field costs. An event this build has no
+/// reader for answers nothing and stays the summary every other event is.
+fn turned(event: &str, object: &serde_json::Map<String, Value>) -> Option<Turned> {
+    let id = utterance_id(object);
+    let segment = object
+        .get("segment_id")
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok());
+    let reason = object
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some(match event {
+        WAKE_DETECTED => Turned::Wake {
+            pod: pod_of(object),
+            score: number(object, "score"),
+            wake_end_sample: whole(object, "wake_end_sample"),
+        },
+        CONN_HELLO => Turned::Connected,
+        UTTERANCE => Turned::Said(Box::new(spoken(object))),
+        BRAIN_DISPATCHED => Turned::Dispatched { id },
+        WAKE_COMMAND_ABSENT | BARGE_COMMAND_ABSENT => Turned::Declined {
+            id,
+            reason,
+            no_speech: number(object, "no_speech"),
+            logprob: number(object, "logprob"),
+            span: span_of(object),
+            stt_trim: whole(object, "stt_trim_samples"),
+        },
+        BRAIN_NO_TRANSCRIPT => Turned::NoTranscript { id },
+        STT_FAILED => Turned::SttFailed {
+            id,
+            detail: object
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        UTTERANCE_SUPERSEDED => Turned::Superseded { id },
+        BARGE_IN => Turned::BargeIn,
+        PLAYBACK_FLUSHED => Turned::Flushed { id },
+        PLAYBACK_FINISHED => Turned::Played {
+            id,
+            played_ms: number(object, "nominal_audio_ms"),
+        },
+        SEGMENT_CLOSED => Turned::SegmentClosed {
+            pod: pod_of(object),
+            segment,
+            part: part_of(object),
+            base_sample: whole(object, "base_sample"),
+            samples: whole(object, "samples"),
+        },
+        TRACKING => Turned::Tracking {
+            pod: pod_of(object),
+            segment,
+            part: part_of(object),
+            beams: beams(object),
+        },
+        _ => return None,
     })
 }
 
@@ -1892,6 +2968,507 @@ fn the_log(records: &Records, report: &mut Report) {
     }
 }
 
+/// A confidence reading, printed to the precision it is read at.
+///
+/// Two decimals down to a tenth and three below it: the gate sits at `0.2` and
+/// the readings that pass it are hundredths of that, so a fixed width either
+/// rounds the clean ones to nothing or pads the declined ones with digits the
+/// recogniser did not mean.
+fn reading(value: f64) -> String {
+    if value.abs() >= 0.1 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+/// A figure that may not be on this console, printed as itself or as missing.
+fn figure(value: Option<f64>) -> String {
+    value.map(reading).unwrap_or_else(|| "?".to_owned())
+}
+
+/// The range a set of readings covered, or that there were none.
+fn range(readings: &[f64]) -> String {
+    let (Some(low), Some(high)) = (
+        readings.iter().copied().reduce(f64::min),
+        readings.iter().copied().reduce(f64::max),
+    ) else {
+        return "none".to_owned();
+    };
+    if reading(low) == reading(high) {
+        reading(low)
+    } else {
+        format!("{}–{}", reading(low), reading(high))
+    }
+}
+
+/// What one turn was, on one line.
+fn turn_line(console: &Console, clips: &Clips, at: usize) -> String {
+    let turn = &console.turns[at];
+    let who = turn
+        .label()
+        .map_or_else(|| "#? (no wake)".to_owned(), Label::on_line);
+    let wake = turn
+        .wake_score
+        .map(|score| format!("{score:.2}"))
+        .unwrap_or_else(|| "none".to_owned());
+    let mut line = format!("turn {who} — wake {wake} → ");
+    match &turn.said.text {
+        Some(text) => {
+            line.push_str(&format!(
+                "\"{}\" no_speech={} logprob={}",
+                quote(text),
+                figure(turn.said.no_speech),
+                figure(turn.said.logprob)
+            ));
+            if let Some(compress) = turn.said.compression {
+                line.push_str(&format!(" compress={}", reading(compress)));
+            }
+        }
+        // A wake the pipeline minted no transcript for. Its confidence figures
+        // are still printed where the gate carried them, which is the whole of
+        // what is known about what was said.
+        None => line.push_str(&format!(
+            "no transcript (no_speech={} logprob={})",
+            figure(turn.said.no_speech),
+            figure(turn.said.logprob)
+        )),
+    }
+    line.push_str(&match &turn.outcome {
+        Outcome::Open => " → no outcome on this console".to_owned(),
+        Outcome::Dispatched => " → dispatched".to_owned(),
+        Outcome::Declined(reason) => format!(" → declined ({})", quote(reason)),
+        Outcome::NoTranscript => " → the brain was handed no words".to_owned(),
+        Outcome::SttFailed(detail) => format!(" → stt failed ({})", quote(detail)),
+    });
+    if let Some(played) = turn.played_ms {
+        line.push_str(&format!("; reply played {:.1} s", played / 1000.0));
+    }
+    if !turn.said.endpoint_cause.is_empty() {
+        line.push_str(&format!("; endpoint {}", quote(&turn.said.endpoint_cause)));
+    }
+    for (count, what) in [
+        (turn.superseded, "superseded"),
+        (turn.barge_ins, "barge-in"),
+        (turn.flushed, "reply flushed"),
+    ] {
+        if count > 0 {
+            line.push_str(&format!("; {what} ×{count}"));
+        }
+    }
+    line.push_str(&clip(console, clips, at));
+    line.push_str(&match console.beam_of(turn) {
+        Some((mean, spread)) => format!("; auto beam {mean:.2}±{spread:.2} rad"),
+        None => "; auto beam ?".to_owned(),
+    });
+    line
+}
+
+/// Where this turn's clip is, on the line that reads the turn.
+///
+/// The file the clip was written to, or why it was not, and the pod-absolute
+/// span it covers either way: the span is the window the beam figure is read
+/// over and the coordinates anyone opening the frame log by other means needs,
+/// so it stays on the line whether or not a `.wav` exists.
+///
+/// A turn whose span states no log or no sample bounds, and a turn with no
+/// number to name a file by, print as missing — the report's rule for a value
+/// it cannot state.
+fn clip(console: &Console, clips: &Clips, at: usize) -> String {
+    let turn = &console.turns[at];
+    // A turn whose line tore in the field naming the log states no file and
+    // still states where in the store its audio is.
+    let span = match (turn.said.span.start_sample, turn.said.span.end_sample) {
+        (Some(start), Some(end)) => format!(" [{start}–{end})"),
+        _ => String::new(),
+    };
+    let Some(outcome) = clips.of(at) else {
+        return format!("; clip ?{span}");
+    };
+    let mut said = format!("; clip {}{span}", outcome.what);
+    said.push_str(&outcome.notes);
+    if let Some(trim) = turn.stt_trim {
+        said.push_str(&format!(
+            ", STT from +{:.2} s",
+            trim as f64 / f64::from(speech_pipeline::SPINE_FORMAT.sample_rate_hz)
+        ));
+    }
+    said
+}
+
+/// What became of one turn's clip: what the line says it is, and what else the
+/// resolver had to say about the audio behind it.
+#[derive(Debug)]
+struct Clip {
+    /// The file name, or `not written (<reason>)`, as the turn line prints it.
+    what: String,
+    /// Whatever qualifies the audio that was written: how much of it is
+    /// silence, whether the log's tail was torn, how many protocol errors the
+    /// replay met. Empty on a clip nobody could write.
+    notes: String,
+    /// Why nothing was written, where nothing was. The summary line names it
+    /// when every unwritten turn of the run shares it.
+    unwritten: Option<String>,
+    /// Whether a file was written.
+    written: bool,
+}
+
+impl Clip {
+    /// A turn whose audio never became a file, in the words its line prints.
+    fn not_written(reason: String) -> Self {
+        Self {
+            what: format!("not written ({reason})"),
+            notes: String::new(),
+            unwritten: Some(reason),
+            written: false,
+        }
+    }
+}
+
+/// One `.wav` per turn, cut out of the store the fetch brought home.
+///
+/// Writing is a side effect and [`analyze`] is pure over what was read, so the
+/// clips are cut before the reading and handed to it: the turn lines say which
+/// file holds which turn, and nothing outside this repository is run to hear
+/// one.
+///
+/// Keyed by the turn's index rather than its utterance id, because not every
+/// turn has an id — a wake nobody answered has none, and a torn line can lose
+/// one.
+#[derive(Debug, Default)]
+struct Clips {
+    by_turn: BTreeMap<usize, Clip>,
+    /// Where they went, for the line that counts them.
+    into: PathBuf,
+}
+
+impl Clips {
+    /// Cut every turn the console carved a span for out of `store`, writing
+    /// into `into`.
+    ///
+    /// The store is checked once, not once per turn: a site whose configuration
+    /// records nothing leaves an empty directory behind (the fetch's rsync of a
+    /// store with nothing in it succeeds), and that is one sentence about the
+    /// run rather than one refusal per turn.
+    ///
+    /// A store that would not open is not a store that recorded nothing: the
+    /// fault is said, and never in the words for an empty store.
+    fn write(console: &Console, store: &Path, into: &Path) -> Self {
+        let mut held = Self {
+            into: into.to_path_buf(),
+            ..Self::default()
+        };
+        let recorded = match std::fs::read_dir(store) {
+            Ok(mut entries) => Ok(entries.any(|entry| entry.is_ok())),
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(why) => Err(format!("{}: {why}", store.display())),
+        };
+        // The directory is made once, by the first turn that has audio to
+        // write, and a directory that cannot be made is one fact about the
+        // filesystem rather than one refusal per turn.
+        let mut made = None;
+        for (at, turn) in console.turns.iter().enumerate() {
+            let Some((name, log, start, end)) = named(turn) else {
+                continue;
+            };
+            match &recorded {
+                Ok(true) => {}
+                Ok(false) => {
+                    held.by_turn.insert(
+                        at,
+                        Clip::not_written("no recorded audio beside this fetch".to_owned()),
+                    );
+                    continue;
+                }
+                Err(why) => {
+                    held.by_turn.insert(at, Clip::not_written(why.clone()));
+                    continue;
+                }
+            }
+            held.by_turn
+                .insert(at, cut(&name, log, start, end, store, into, &mut made));
+        }
+        held
+    }
+
+    fn of(&self, at: usize) -> Option<&Clip> {
+        self.by_turn.get(&at)
+    }
+}
+
+/// What this turn's file would be called and what it would hold, where the
+/// console said enough for both.
+///
+/// The name is [`Turn::label`]'s, which is the token the turn line prints after
+/// `#`, so the clip is found from the report by reading. A turn the console
+/// named neither an utterance nor a wake for cannot be named and is not cut.
+fn named(turn: &Turn) -> Option<(String, String, i64, i64)> {
+    let name = turn.label()?.file_name();
+    let log = turn.said.span.log.clone()?;
+    Some((
+        name,
+        log,
+        turn.said.span.start_sample?,
+        turn.said.span.end_sample?,
+    ))
+}
+
+/// Why one log's replay stopped short of the clip it was asked for.
+///
+/// A writer killed mid-write is routine and uninteresting; a corrupt record or
+/// a parked protocol is the store itself failing, and the message the resolver
+/// carries is the only description of what was wrong with it. Collapsed into
+/// one word they read alike, and telling them apart afterwards means running a
+/// tool from the other repository.
+fn stopped_because(stop: &pod_ingest::SpliceStop) -> String {
+    match stop {
+        pod_ingest::SpliceStop::TornTail => "torn tail".to_owned(),
+        pod_ingest::SpliceStop::Corrupt(why) => format!("corrupt: {}", quote(why)),
+        pod_ingest::SpliceStop::ProtocolFatal => "protocol fatal".to_owned(),
+    }
+}
+
+/// Cut one turn's carve out of the store and write it.
+///
+/// The span is built from the turn's own line and names no covering segment:
+/// the resolver's segment refs are provenance and not a filter, and the console
+/// leaves them empty on exactly the turns whose recogniser ran long — which are
+/// the turns this report exists for.
+///
+/// A store fault is never mistaken for silence: it is said in the fragment and
+/// the report goes on. A partial clip is written all the same and says what is
+/// wrong with it, because partial audio beats none.
+///
+/// The log name is console-authored text and must be quoted: a name carrying
+/// a newline would otherwise fabricate a line of this report.
+///
+/// `made` carries the one attempt at creating the output directory, made by the
+/// first turn that gets as far as audio to write.
+///
+/// TODO(clip-one-pass-per-log): every turn of a run is carved from the same log
+/// and each call here decodes it from the head, so a session's clips cost work
+/// quadratic in its turns.
+fn cut(
+    name: &str,
+    log: String,
+    start: i64,
+    end: i64,
+    store: &Path,
+    into: &Path,
+    made: &mut Option<Result<(), String>>,
+) -> Clip {
+    // A sample index off a line that tore is a number this tool does not carve
+    // with: the same fact the resolver names `InvalidSpan`, said in the same
+    // words, rather than a panic in the report the run is read by.
+    let (Ok(start_sample), Ok(end_sample)) = (u64::try_from(start), u64::try_from(end)) else {
+        return Clip::not_written("invalid span".to_owned());
+    };
+    let span = speech_pipeline::AudioSpan {
+        log: log.clone(),
+        start_sample,
+        end_sample,
+        segments: Vec::new(),
+    };
+    let audio = match span.resolve(store) {
+        Ok(audio) => audio,
+        Err(speech_pipeline::SpanResolveError::InvalidSpan { .. }) => {
+            return Clip::not_written("invalid span".to_owned());
+        }
+        Err(speech_pipeline::SpanResolveError::Resolve { log, source }) => {
+            return Clip::not_written(format!("{}: {source}", quote(&log)));
+        }
+    };
+    if audio.pruned.iter().any(|part| part.log == log) {
+        return Clip::not_written(format!("{} is not in the store", quote(&log)));
+    }
+    if let Err(why) = made.get_or_insert_with(|| {
+        std::fs::create_dir_all(into).map_err(|why| format!("{}: {why}", into.display()))
+    }) {
+        return Clip::not_written(why.clone());
+    }
+    if let Err(why) = speech_pipeline::write_spine_wav(&into.join(name), &audio.pcm) {
+        return Clip::not_written(format!("{name}: {why}"));
+    }
+    let mut notes = String::new();
+    // `covered_samples` counts overlapping copies, so it is an upper bound on
+    // distinct audio and `pcm.len() - covered_samples` is an upper bound on
+    // silence when positive. A count past the carve's own length means the
+    // store re-covered part of it, and the silence figure is then unknown
+    // rather than zero: an outage read as silence is the one wrong inference.
+    match audio
+        .pcm
+        .len()
+        .checked_sub(usize::try_from(audio.covered_samples).unwrap_or(usize::MAX))
+    {
+        Some(0) => {}
+        Some(silence) => notes.push_str(&format!(", at most {silence} samples of silence")),
+        None => notes.push_str(
+            ", how much of it is silence is unknown (the store covered part of this span twice)",
+        ),
+    }
+    for (log, stop) in &audio.stopped {
+        notes.push_str(&format!(
+            ", {} torn ({})",
+            quote(log),
+            stopped_because(stop)
+        ));
+    }
+    if audio.protocol_errors > 0 {
+        notes.push_str(&format!(", {} protocol errors", audio.protocol_errors));
+    }
+    Clip {
+        what: name.to_owned(),
+        notes,
+        unwritten: None,
+        written: true,
+    }
+}
+
+/// The turns of the conversation, one line each, and what the gate did to them.
+///
+/// The measured half and never a finding: a wake with nothing said after it
+/// hallucinates and is rightly declined, and a run where nobody was answered is
+/// a run a person reads rather than one this tool holds an opinion about. What
+/// it does hold is that the decline be *visible* — a run of five wakes and five
+/// declines would otherwise close as a pipeline that came up and drained whole.
+fn turns(console: &Console, clips: &Clips, report: &mut Report) {
+    for at in 0..console.turns.len() {
+        report.note(turn_line(console, clips, at));
+    }
+    clips_written(console, clips, report);
+    let count = |wanted: fn(&Turn) -> bool| console.turns.iter().filter(|t| wanted(t)).count();
+    // The gate's own declines, apart from the other ways a wake goes
+    // unanswered. An arm that expired mints an utterance with no transcript, and
+    // an empty transcript is declined without the gate reading anything, and
+    // counting either as a confidence decline would move the one figure two
+    // acceptance sessions are compared on for a reason that has nothing to do
+    // with the audio.
+    let declined =
+        count(|t| matches!(&t.outcome, Outcome::Declined(reason) if reason == LOW_CONFIDENCE));
+    let mut otherwise: BTreeMap<&str, usize> = BTreeMap::new();
+    for turn in &console.turns {
+        if let Outcome::Declined(reason) = &turn.outcome
+            && reason != LOW_CONFIDENCE
+        {
+            *otherwise
+                .entry(if reason.is_empty() { "unsaid" } else { reason })
+                .or_default() += 1;
+        }
+    }
+    let barge_ins: usize =
+        console.turns.iter().map(|t| t.barge_ins).sum::<usize>() + console.stray_barge_ins;
+    // Wakes counted from the turns a wake actually opened. A barge-in mints a
+    // turn with no wake ahead of it, and counting those as wakes would report
+    // more than the model fired — in the one line two sessions are compared on.
+    let woke = count(|t| t.woke);
+    let unwoken = console.turns.len() - woke;
+    report.note(format!(
+        "{woke} wake(s): {} dispatched, {declined} declined by the confidence gate, {} with no \
+         transcript, {} STT failure(s), {barge_ins} barge-in(s){}{}",
+        count(|t| t.outcome == Outcome::Dispatched),
+        count(|t| t.said.text.is_none()),
+        count(|t| matches!(t.outcome, Outcome::SttFailed(_))),
+        if otherwise.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} unanswered for other reasons ({})",
+                otherwise.values().sum::<usize>(),
+                otherwise
+                    .iter()
+                    .map(|(reason, count)| format!("{} ×{count}", quote(reason)))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        },
+        if unwoken > 0 {
+            format!("; {unwoken} turn(s) began with no wake ahead of them")
+        } else {
+            String::new()
+        },
+    ));
+    let readings = |wanted: fn(&Turn) -> bool| -> Vec<f64> {
+        console
+            .turns
+            .iter()
+            .filter(|turn| wanted(turn))
+            .filter_map(|turn| turn.said.no_speech)
+            .collect()
+    };
+    report.note(format!(
+        "no_speech: dispatched {}; declined {}",
+        range(&readings(|t| t.outcome == Outcome::Dispatched)),
+        range(&readings(|t| matches!(t.outcome, Outcome::Declined(_)))),
+    ));
+    // The declines again, together, because they are what a run that looked
+    // fine and answered nobody consists of. Printed as measurements: the
+    // verdict stays green and a person reads the turns.
+    let hallucinated: Vec<usize> = console
+        .turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.hallucinated())
+        .map(|(at, _)| at)
+        .collect();
+    if !hallucinated.is_empty() {
+        report.note(format!(
+            "{} transcript(s) with words were declined as likely hallucination — no reply \
+             followed those wakes",
+            hallucinated.len()
+        ));
+        for at in hallucinated {
+            report.note(format!("  {}", turn_line(console, clips, at)));
+        }
+    }
+    if console.stray_barge_ins > 0 {
+        report.note(format!(
+            "{} barge-in(s) cut no reply this console dispatched",
+            console.stray_barge_ins
+        ));
+    }
+}
+
+/// How many of the run's turns are audio somebody can listen to, and where.
+///
+/// Measured and never a finding: a fetch that brought no audio home, or a store
+/// that would not open, is not a claim about the run that failed to hold. The
+/// one reason is named here only when every turn that has no clip has the same
+/// one — which is the shape a site recording nothing makes — and otherwise each
+/// turn's own line carries its own.
+fn clips_written(console: &Console, clips: &Clips, report: &mut Report) {
+    // A run with no conversation in it has nothing to say here: a fact about
+    // zero things is not a fact this report states.
+    if console.turns.is_empty() {
+        return;
+    }
+    let written = clips.by_turn.values().filter(|clip| clip.written).count();
+    let unwritten = console.turns.len() - written;
+    let given: Vec<&str> = clips
+        .by_turn
+        .values()
+        .filter_map(|clip| clip.unwritten.as_deref())
+        .collect();
+    let distinct: BTreeSet<&str> = given.iter().copied().collect();
+    // Every turn without a clip accounted for, and all of them by the same
+    // sentence: a turn whose own line stated no span gave no reason at all, so
+    // a run holding one of those has no single reason to name.
+    let shared = match distinct.iter().next() {
+        Some(reason) if given.len() == unwritten && distinct.len() == 1 && unwritten > 0 => {
+            format!(" — {reason}")
+        }
+        _ => String::new(),
+    };
+    report.note(if written == 0 {
+        format!("turn clips: none written{shared}")
+    } else {
+        format!(
+            "turn clips: {written} of {} written to {}{shared}",
+            console.turns.len(),
+            clips.into.display()
+        )
+    });
+}
+
 /// Counts per kind, with the sentence each kind said.
 fn kinds(console: &Console, report: &mut Report) {
     for (kind, (count, says)) in &console.edges {
@@ -2050,7 +3627,7 @@ fn the_rest(console: &Console, report: &mut Report) {
 ///
 /// The session's reading is taken once and handed to both halves, so the ledger
 /// and the head's own account are judged against the same numbers.
-fn analyze(console: &Console, records: &Records) -> Report {
+fn analyze(console: &Console, clips: &Clips, records: &Records) -> Report {
     let mut report = Report::default();
     let session = Session::of(console, records);
     came_up(console, &mut report);
@@ -2060,6 +3637,7 @@ fn analyze(console: &Console, records: &Records) -> Report {
     the_motion_path(console, &session, records, &mut report);
     the_head_moved(records, &session, &mut report);
     alerts_travelled(console, &mut report);
+    turns(console, clips, &mut report);
     kinds(console, &mut report);
     alerts(console, &mut report);
     the_log(records, &mut report);
@@ -2084,7 +3662,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let at = Path::new(&records);
-    let report = analyze(&Console::read(at), &Records::of(at));
+    let console = Console::read(at);
+    let clips = Clips::write(
+        &console,
+        &sibling(at, AUDIO_SUFFIX),
+        &sibling(at, TURNS_SUFFIX),
+    );
+    let report = analyze(&console, &clips, &Records::of(at));
     verdict(
         "speech_run_report",
         &records,
@@ -2107,15 +3691,22 @@ mod tests {
     use run_report::Report;
 
     use super::{
-        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Console, ESTIMATE_CHANNEL, HOST_LOG, Line, POD_LOG,
-        PROVENANCE, PoseEstimateWire, REPORT_CHANNEL, Records, ReportKind, ReportKindWire,
-        SCRIPT_CHANNEL, ScriptWire, SessionPhaseWire, TimelineEntryWire, TimelineWire, analyze,
-        classify, console_dir, neutral_targets, refusal_kinds,
+        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, AUDIO_SUFFIX, Clips, Console, ESTIMATE_CHANNEL,
+        HOST_LOG, Line, POD_LOG, PROVENANCE, PoseEstimateWire, REPORT_CHANNEL, Records, ReportKind,
+        ReportKindWire, SCRIPT_CHANNEL, ScriptWire, SessionPhaseWire, TURNS_SUFFIX,
+        TimelineEntryWire, TimelineWire, analyze, classify, console_dir, neutral_targets,
+        refusal_kinds, sibling,
     };
 
     /// The whole reading of one fetch, as a case has just written it.
     fn judge(at: &Path) -> Report {
-        analyze(&Console::read(at), &Records::of(at))
+        let console = Console::read(at);
+        let clips = Clips::write(
+            &console,
+            &sibling(at, AUDIO_SUFFIX),
+            &sibling(at, TURNS_SUFFIX),
+        );
+        analyze(&console, &clips, &Records::of(at))
     }
 
     /// The log instant of the `n`th thing a case records.
@@ -2277,13 +3868,16 @@ mod tests {
     /// The scratch guard comes back with the path: it removes the directory
     /// when it drops, so a case that let it go would read a console that is no
     /// longer there.
-    fn records(name: &str, lines: &[&str]) -> (Scratch, PathBuf) {
+    fn records(name: &str, lines: &[impl AsRef<str>]) -> (Scratch, PathBuf) {
         let dir = scratch_dir(name);
         let records = dir.join("speech-log-20260831T000000Z");
         let console = dir.join("speech-log-20260831T000000Z.console");
         std::fs::create_dir_all(&console).expect("a console directory");
-        std::fs::write(console.join(HOST_LOG), lines.join("\n") + "\n")
-            .expect("the host's console");
+        let text: String = lines
+            .iter()
+            .flat_map(|line| [line.as_ref(), "\n"])
+            .collect();
+        std::fs::write(console.join(HOST_LOG), text).expect("the host's console");
         (dir, records)
     }
 
@@ -2336,7 +3930,7 @@ mod tests {
 
     #[test]
     fn an_empty_host_console_is_the_same_finding() {
-        let (_dir, at) = records("speech-report-empty", &[]);
+        let (_dir, at) = records("speech-report-empty", &[] as &[&str]);
         let report = judge(&at);
         assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert!(report.findings[0].contains("missing or empty"));
@@ -2932,7 +4526,7 @@ mod tests {
         let (_dir, at) = records("speech-report-torn", &[STARTED, COMPOSED, brain, exit]);
         let console = Console::read(&at);
         assert_eq!(console.noise, 2, "the console text ahead of each event");
-        let report = analyze(&console, &Records::of(&at));
+        let report = analyze(&console, &Clips::default(), &Records::of(&at));
         // One loss, one finding: the run never attached *because* the bridge
         // ended the way this line says it did.
         assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
@@ -3037,8 +4631,7 @@ mod tests {
                 r#"{{"stream":"edge","at_ns":5,"kind":"{kind}","says":"a body was dropped"}}"#
             ));
         }
-        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let (_dir, at) = records("speech-report-refusals", &borrowed);
+        let (_dir, at) = records("speech-report-refusals", &lines);
         let report = judge(&at);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         let counted = format!("{} body(ies) the edge dropped", refusal_kinds().len());
@@ -3170,8 +4763,7 @@ mod tests {
         for n in 0..10 {
             lines.push(format!("some library said {n}"));
         }
-        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let (_dir, at) = records("speech-report-noise", &borrowed);
+        let (_dir, at) = records("speech-report-noise", &lines);
         let report = judge(&at);
         let quoted = report
             .measured
@@ -3326,11 +4918,51 @@ mod tests {
         let classified = classify(r#"{"a":1,"b":2}"#);
         assert!(classified.ahead.is_none(), "a whole line is one thing");
         assert_eq!(
-            classified.line,
-            Line::Pipeline {
+            classified.lines,
+            vec![Line::Pipeline {
                 event: String::new(),
                 keys: "a,b".to_owned(),
-            }
+            }]
+        );
+    }
+
+    /// The one event a raw line carried, for a case about a line that carries
+    /// exactly one — which is nearly every line a console holds.
+    fn only(raw: &str) -> Line {
+        let mut lines = classify(raw).lines;
+        assert_eq!(lines.len(), 1, "one event on the line: {raw:?}");
+        lines.remove(0)
+    }
+
+    /// Two writers interleaving cleanly put two finished events in one
+    /// descriptor with no newline between them. Both are real, and a reader
+    /// that keeps only the first drops whatever the second said — a
+    /// `brain_brenn` among them is a run that exempts itself from the bridge
+    /// check.
+    #[test]
+    fn two_whole_events_glued_together_are_both_read() {
+        let torn = concat!(
+            r#"{"ts_ms":1788261689389,"event":"listening","addr":"127.0.0.1:9"}"#,
+            r#"{"ts_ms":1788261689390,"event":"brain_brenn","publish_channel":"c"}"#,
+        );
+        let classified = classify(torn);
+        assert!(classified.ahead.is_none(), "neither is console text");
+        assert!(classified.behind.is_none(), "and nothing is left over");
+        assert_eq!(
+            classified.lines,
+            vec![
+                Line::Pipeline {
+                    event: "listening".to_owned(),
+                    keys: "addr,event,ts_ms".to_owned(),
+                },
+                Line::Bridge {
+                    keys: "event,publish_channel,ts_ms".to_owned(),
+                    event: "brain_brenn".to_owned(),
+                    unexpected: false,
+                    loss: String::new(),
+                    granted: None,
+                },
+            ]
         );
     }
 
@@ -3338,12 +4970,7 @@ mod tests {
     /// on the console is somebody's print.
     #[test]
     fn a_json_scalar_is_noise() {
-        assert_eq!(
-            classify("42").line,
-            Line::Noise {
-                text: "42".to_owned()
-            }
-        );
+        assert!(classify("42").lines.is_empty());
     }
 
     /// The stdout-and-stderr tear: a console sentence with an event glued onto
@@ -3362,14 +4989,14 @@ mod tests {
             "the console text ahead of it is kept",
         );
         assert_eq!(
-            classified.line,
-            Line::Bridge {
+            classified.lines,
+            vec![Line::Bridge {
                 keys: "event,outcome,ts_ms,unexpected".to_owned(),
                 event: "brenn_bridge_exit".to_owned(),
                 unexpected: true,
                 loss: "no wire version in common".to_owned(),
                 granted: None,
-            }
+            }]
         );
     }
 
@@ -3377,7 +5004,7 @@ mod tests {
     /// this tool has no schema for is the key summary it always was.
     #[test]
     fn an_event_that_is_not_the_bridge_s_is_a_summary() {
-        let line = classify(r#"{"ts_ms":1,"event":"listening","addr":"127.0.0.1:9"}"#).line;
+        let line = only(r#"{"ts_ms":1,"event":"listening","addr":"127.0.0.1:9"}"#);
         assert_eq!(
             line,
             Line::Pipeline {
@@ -3392,12 +5019,7 @@ mod tests {
     #[test]
     fn a_line_whose_suffix_does_not_parse_stays_noise() {
         let raw = r#"11:21:30.074 the writer names its events {"ts_ms": and then stops"#;
-        assert_eq!(
-            classify(raw).line,
-            Line::Noise {
-                text: raw.to_owned()
-            }
-        );
+        assert!(classify(raw).lines.is_empty());
     }
 
     /// The console text a real event tears onto can hold that spelling itself —
@@ -3417,14 +5039,14 @@ mod tests {
             "everything ahead of the whole event is the console's",
         );
         assert_eq!(
-            classified.line,
-            Line::Bridge {
+            classified.lines,
+            vec![Line::Bridge {
                 keys: "event,publish_channel,ts_ms".to_owned(),
                 event: "brain_brenn".to_owned(),
                 unexpected: false,
                 loss: String::new(),
                 granted: None,
-            }
+            }]
         );
     }
 
@@ -3741,7 +5363,7 @@ mod tests {
     /// its stream stays the shape summary it was.
     #[test]
     fn a_motion_script_event_is_read_by_field() {
-        let line = classify(&authored("wake")).line;
+        let line = only(&authored("wake"));
         assert_eq!(
             line,
             Line::Authored {
@@ -4370,6 +5992,2142 @@ mod tests {
             found(&report, "1 alert(s) this run raised were handed off"),
             "{:?}",
             report.findings
+        );
+    }
+
+    /// A wake-detection event at the default end sample.
+    fn wake(score: f64) -> String {
+        woke(score, 34880)
+    }
+
+    /// A wake-detection event at a stated end sample.
+    fn woke(score: f64, wake_end: i64) -> String {
+        format!(
+            r#"{{"ts_ms":1,"event":"wake_detected","pod":"reachy00","epoch":1,"score":{score},"wake_end_sample":{wake_end}}}"#
+        )
+    }
+
+    /// An utterance line with a transcript and its three confidence readings.
+    fn said(id: u64, text: &str, no_speech: f64) -> String {
+        carved(id, 16128, 59968, Some(1), no_speech, text)
+    }
+
+    /// The same utterance, at a stated span and segment list. `None` is the
+    /// first utterance of a run, whose carve no closed segment covers yet.
+    fn carved(
+        id: u64,
+        start: i64,
+        end: i64,
+        segment: Option<u32>,
+        no_speech: f64,
+        text: &str,
+    ) -> String {
+        let segments = match segment {
+            Some(segment) => format!(r#"[{{"log":"a.framelog","segment_id":{segment},"part":0}}]"#),
+            None => "[]".to_owned(),
+        };
+        format!(
+            r#"{{"ts_ms":2,"event":"utterance","id":{id},"pod":"reachy00","room":"r-office","endpoint_cause":"soft_endpoint","audio_ref":{{"log":"a.framelog","start_sample":{start},"end_sample":{end},"segments":{segments}}},"transcript":{{"text":"{text}","confidence":{{"avg_logprob":-0.38,"no_speech_prob":{no_speech},"compression_ratio":0.53,"segments":1}}}}}}"#
+        )
+    }
+
+    /// The gate declining one utterance as a likely hallucination.
+    fn declined(id: u64, no_speech: f64) -> String {
+        format!(
+            r#"{{"ts_ms":3,"event":"wake_command_absent","utterance":{id},"pod":"reachy00","reason":"low_confidence","no_speech":{no_speech},"logprob":-1.05,"score":0.76,"wake_end_sample":34880,"log":"a.framelog","start_sample":16128,"end_sample":59968,"segments":[{{"log":"a.framelog","segment_id":1,"part":0}}]}}"#
+        )
+    }
+
+    /// The brain taking one utterance.
+    fn dispatched(id: u64) -> String {
+        format!(r#"{{"ts_ms":4,"event":"brain_dispatched","pod":"reachy00","utterance":{id}}}"#)
+    }
+
+    /// Both sinks of the printer over one report, and its verdict.
+    fn printed(report: &Report) -> (bool, String, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let held = run_report::write_verdict(
+            &mut out,
+            &mut err,
+            "speech_run_report",
+            "somewhere",
+            report,
+            "it drained whole",
+        );
+        (
+            held,
+            String::from_utf8(out).expect("text"),
+            String::from_utf8(err).expect("text"),
+        )
+    }
+
+    /// The report the incident was invisible in: one turn answered, one
+    /// declined with words in it. Both are measurements and the run is green —
+    /// a wake with nothing said after it hallucinates and is rightly declined —
+    /// but neither is silent.
+    #[test]
+    fn a_dispatched_turn_and_a_declined_one_are_both_printed_and_the_run_is_green() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "This is a test, one, two, three.", 0.075),
+            dispatched(1),
+            wake(0.76),
+            said(2, "Test two.", 0.30),
+            declined(2, 0.30),
+        ];
+        let (_dir, at) = records("speech-report-turns-two", &lines);
+        let report = judge(&at);
+        let (held, out, err) = printed(&report);
+        assert!(held, "{:?}", report.findings);
+        assert_eq!(err, "", "a decline is not a finding");
+        for expected in [
+            "turn #1 — wake 0.99 → \"This is a test, one, two, three.\" no_speech=0.075 \
+             logprob=-0.38 compress=0.53 → dispatched",
+            // The utterance's own reading, not the gate's copy of it: the two
+            // are the same figures, and the transcript's line is where they
+            // are written to the precision the recogniser produced.
+            "turn #2 — wake 0.76 → \"Test two.\" no_speech=0.30 logprob=-0.38 compress=0.53 → \
+             declined (low_confidence)",
+            "2 wake(s): 1 dispatched, 1 declined by the confidence gate, 0 with no transcript, \
+             0 STT failure(s), 0 barge-in(s)",
+            "no_speech: dispatched 0.075; declined 0.30",
+            "1 transcript(s) with words were declined as likely hallucination",
+            "; clip not written (no recorded audio beside this fetch) [16128–59968); auto beam ?",
+        ] {
+            assert!(out.contains(expected), "{expected}\nnot in\n{out}");
+        }
+    }
+
+    /// The run that closed as "came up, composed, drained whole": five wakes,
+    /// five declines, nobody answered. Still green, and the declines are visible.
+    #[test]
+    fn five_declined_wakes_are_each_printed_and_counted() {
+        let mut lines = vec![STARTED.to_owned(), COMPOSED.to_owned()];
+        for id in 1..=5u64 {
+            lines.push(wake(0.8));
+            lines.push(said(
+                id,
+                "Thank you for watching.",
+                0.42 + f64::from(id as u32) * 0.02,
+            ));
+            lines.push(declined(id, 0.42 + f64::from(id as u32) * 0.02));
+        }
+        let (_dir, at) = records("speech-report-turns-five", &lines);
+        let report = judge(&at);
+        let (held, out, _err) = printed(&report);
+        assert!(held, "{:?}", report.findings);
+        assert!(
+            out.contains("5 transcript(s) with words were declined as likely hallucination"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "5 wake(s): 0 dispatched, 5 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("no_speech: dispatched none; declined 0.44–0.52"),
+            "{out}"
+        );
+        // Once per turn in the turn section, and once more in the block that
+        // reads the declines back.
+        assert_eq!(
+            out.matches("→ declined (low_confidence)").count(),
+            10,
+            "{out}"
+        );
+    }
+
+    /// A wake the pipeline minted no utterance for is a turn the run had and
+    /// could not read — printed, and not counted as a decline.
+    #[test]
+    fn a_wake_with_no_utterance_is_a_turn_with_no_transcript() {
+        let lines = [STARTED.to_owned(), COMPOSED.to_owned(), wake(0.81)];
+        let (_dir, at) = records("speech-report-turn-silent", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "turn #? (wake 1) — wake 0.81 → no transcript"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 0 declined by the confidence gate, 1 with no transcript"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "declined as likely hallucination"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Speech resuming re-transcribes the same utterance, and the console
+    /// carries two lines for it. One turn, from the final one, with the
+    /// supersession counted.
+    #[test]
+    fn a_superseded_utterance_is_printed_once_from_its_final_line() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test", 0.30),
+            r#"{"ts_ms":5,"event":"utterance_superseded","pod":"reachy00","utterance_id":{"epoch":1,"pod":"reachy00","seq":1}}"#.to_owned(),
+            said(1, "Test one, two.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-superseded", &lines);
+        let report = judge(&at);
+        let turns: Vec<&String> = report
+            .measured
+            .iter()
+            .filter(|line| line.starts_with("turn #"))
+            .collect();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert!(
+            turns[0].contains("\"Test one, two.\" no_speech=0.04")
+                && turns[0].contains("superseded ×1"),
+            "{turns:?}"
+        );
+    }
+
+    /// A transcript with no confidence block at all: the figures print as
+    /// missing, and the range line counts the turn in neither mode.
+    #[test]
+    fn an_utterance_with_no_confidence_reads_as_missing_and_joins_no_range() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","transcript":{"text":"Test."}}"#.to_owned(),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-unsure", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "\"Test.\" no_speech=? logprob=? → dispatched"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "no_speech: dispatched none; declined none"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The bearings a turn is judged by are stamped in the segment's own index
+    /// space and the turn's span is pod-absolute. The window converts between
+    /// them; a fixture whose segment begins far from zero is one an unconverted
+    /// window would select nothing from.
+    #[test]
+    fn the_auto_beam_figure_covers_the_offsets_the_converted_window_selects() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        // Offsets 0 and 1000 are ahead of the wake, 12000 is past the span's
+        // end; the two between are the whole of the figure, at 2.0 and 2.4.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[0,[0.0,0.0,0.0,9.0]],[1000,[0.0,0.0,0.0,9.0]],[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]],[12000,[0.0,0.0,0.0,9.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // The wake ends at 174880 and the span at 179968, which inside the
+            // segment is [4880, 9968).
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-beam", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Without the segment's base sample there is no conversion between the two
+    /// index spaces, and a figure computed anyway would be over the wrong
+    /// offsets. It prints as missing.
+    #[test]
+    fn a_segment_that_does_not_say_where_it_begins_leaves_the_beam_unread() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-no-base", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// And a turn whose segment never tracked at all reads the same way.
+    #[test]
+    fn a_turn_with_no_tracking_line_leaves_the_beam_unread() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-untracked", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// The first utterance of a run is carved before any segment has closed, so
+    /// its span names no segment at all. The closed segment whose sample range
+    /// holds the carve is the one its bearings come out of — a run's first turn
+    /// is the clean one, and it is the reading the degradation is measured
+    /// against.
+    #[test]
+    fn a_turn_naming_no_segment_reads_the_closed_segment_that_holds_it() {
+        // [170000, 319760) holds the carve at 173696.
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,9.0]],[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]],[12000,[0.0,0.0,0.0,9.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-first-beam", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Containment is the whole of the rule: a carve no closed segment's range
+    /// holds is attributed to none of them, rather than to whichever segment
+    /// tracked last.
+    ///
+    /// The carve sits in the gap after the segment, and its window converts to
+    /// offsets this segment did track — so the containment test is the only
+    /// thing between this turn and a bearing read out of audio it was not
+    /// carved from, and dropping that test flips the reading to a figure.
+    #[test]
+    fn a_turn_no_closed_range_holds_leaves_the_beam_unread() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[30500,[0.0,0.0,0.0,2.0]],[31000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // [170000, 180000) ends well before this carve, whose window
+            // converts to [30500, 35000) — offsets the segment tracked.
+            woke(0.99, 200500),
+            carved(1, 200000, 205000, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-uncontained", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// A carve that straddles a close has its wake in the segment after the one
+    /// holding it. The window then opens at the sample that attributed the
+    /// turn rather than outside the segment, so a turn a closed range does hold
+    /// always reads a figure.
+    #[test]
+    fn a_carve_whose_wake_ended_past_the_segment_still_reads_its_bearings() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        // Offset 1000 is ahead of the carve and 25000 past the span's end; the
+        // two between are the whole of the figure.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,9.0]],[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]],[25000,[0.0,0.0,0.0,9.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // The carve starts at 175000, inside [170000, 180000); the wake
+            // ended at 181000, which is past it.
+            woke(0.99, 181000),
+            carved(1, 175000, 190000, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-straddled", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A console that says where a segment begins and not how long it ran
+    /// leaves it a point: there is no range to hold a carve, so a turn naming
+    /// no segment has nothing to fall back on and prints as missing rather
+    /// than borrowing the bearings of whatever segment closed.
+    #[test]
+    fn a_segment_that_does_not_say_how_long_it_ran_holds_no_carve() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-pointlike", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// With two segments closed, the carve picks the one whose range holds it.
+    /// The other's bearings would render a figure of their own over the same
+    /// window, which is what makes the reading checkable.
+    #[test]
+    fn a_turn_naming_no_segment_picks_the_range_it_falls_in() {
+        // [0, 100000) does not hold the carve at 173696; [170000, 319760) does.
+        const FIRST: &str = r#"{"ts_ms":5,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":100000,"base_sample":0}"#;
+        const FIRST_TRACKED: &str = r#"{"ts_ms":6,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[175000,[0.0,0.0,0.0,1.0]]]}"#;
+        const SECOND: &str = r#"{"ts_ms":7,"event":"segment_closed","pod":"reachy00","segment_id":2,"samples":149760,"base_sample":170000}"#;
+        const SECOND_TRACKED: &str = r#"{"ts_ms":8,"event":"tracking","pod":"reachy00","segment_id":2,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            FIRST.to_owned(),
+            FIRST_TRACKED.to_owned(),
+            SECOND.to_owned(),
+            SECOND_TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-second-range", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The range is closed at its first sample. Real segments are contiguous,
+    /// so the sample a segment begins at is the one its predecessor ended
+    /// before, and a carve landing exactly there is the ordinary case at a
+    /// close.
+    #[test]
+    fn a_carve_at_the_first_sample_of_a_segment_is_held_by_it() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,2.0]],[3000,[0.0,0.0,0.0,2.4]],[8000,[0.0,0.0,0.0,9.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 170000),
+            carved(1, 170000, 175000, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-first-sample", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// And open at the sample after its last: the segment holds that many
+    /// samples counting from its base, and the carve beginning there belongs to
+    /// whatever closed next. A range that held both ends would have this turn
+    /// take the earlier segment's bearings, which is a wrong figure and not a
+    /// missing one.
+    #[test]
+    fn a_carve_at_the_sample_after_a_segment_is_held_by_nothing() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        // Offsets the window would select, so an inclusive upper bound reads a
+        // figure rather than nothing.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[10000,[0.0,0.0,0.0,2.0]],[12000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 180000),
+            carved(1, 180000, 185000, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-past-the-end", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// A carve can begin before the segment it was taken from: the pod's
+    /// pre-roll is whatever history its capture ring held, so the first segment
+    /// of a connection can open after the host's own pad reaches back. The wake
+    /// that opened the segment is inside it by construction, so it is the
+    /// anchor that answers when the carve's own start is held by nothing.
+    #[test]
+    fn a_carve_beginning_before_its_segment_is_attributed_by_the_wake() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[2000,[0.0,0.0,0.0,2.0]],[4000,[0.0,0.0,0.0,2.4]],[9000,[0.0,0.0,0.0,9.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // The carve starts 1000 samples ahead of the segment's base; the
+            // wake ended 1000 samples inside it.
+            woke(0.99, 171000),
+            carved(1, 169000, 178000, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-early-carve", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A wake with no utterance behind it names no span at all, so nothing on
+    /// the console says where the turn stopped. The segment's own end is not a
+    /// bound the turn has any claim to — it is whatever the gate did
+    /// afterwards, a later turn's speech included — so the figure is missing
+    /// rather than a mean over somebody else.
+    #[test]
+    fn a_turn_with_no_carve_end_keeps_no_beam_figure() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,9.0]],[6000,[0.0,0.0,0.0,2.0]],[8000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 175000),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-wake-only-beam", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "no transcript"), "{:?}", report.measured);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// A segment closed at [170000, 180000), tracked at four offsets: two
+    /// inside the window an expiry at 178000 bounds, one ahead of the wake and
+    /// one past the expiry.
+    const EXPIRY_CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+    const EXPIRY_TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,9.0]],[3000,[0.0,0.0,0.0,2.0]],[5000,[0.0,0.0,0.0,2.4]],[9000,[0.0,0.0,0.0,9.0]]]}"#;
+    /// An arm that expired with nobody answering: no transcript, and a span all
+    /// the same, whose end is the expiry point.
+    const EXPIRED: &str = r#"{"ts_ms":8,"event":"wake_command_absent","pod":"reachy00","reason":"arm_expired","score":0.99,"log":"a.framelog","start_sample":171000,"end_sample":178000,"segments":[]}"#;
+
+    /// A wake nobody answered still says where it stopped: the arm's expiry is
+    /// on its decline line as an ordinary span. The figure is the bearing after
+    /// the wake, bounded at that expiry rather than running to the close of
+    /// whatever segment held it.
+    ///
+    /// In the order the console produces: the segment closes at the VAD
+    /// release, ahead of the line that states the span.
+    #[test]
+    fn an_expired_arm_reads_its_bearings_up_to_the_expiry() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 172000),
+            EXPIRY_CLOSED.to_owned(),
+            EXPIRY_TRACKED.to_owned(),
+            EXPIRED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-expiry", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The same lines with the span ahead of its segment's, which a fresh wake
+    /// superseding an armed one also produces. The figure is a function of the
+    /// whole console and not of the order its lines arrived in.
+    #[test]
+    fn an_expired_arm_reads_the_same_figure_with_its_span_first() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 172000),
+            EXPIRED.to_owned(),
+            EXPIRY_CLOSED.to_owned(),
+            EXPIRY_TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-expiry-first", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The shape a degraded turn has: the segment closes at the VAD release and
+    /// the transcript's line waits for the recogniser, so the utterance trails
+    /// its own segment's lines by the whole of an STT call. A figure computed
+    /// as the tracking line was read would be missing on exactly these turns.
+    #[test]
+    fn an_utterance_that_trails_its_segment_still_reads_its_bearings() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 172000),
+            EXPIRY_CLOSED.to_owned(),
+            EXPIRY_TRACKED.to_owned(),
+            carved(1, 171000, 178000, None, 0.04, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-trailing", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A pod reconnecting counts its samples from zero again, so a segment id
+    /// means nothing across the hello either: the segment 1 that closes after
+    /// it is not the segment 1 an earlier turn's span named.
+    #[test]
+    fn a_named_segment_from_before_a_reconnect_is_a_different_segment() {
+        const AGAIN: &str = r#"{"ts_ms":5,"event":"conn_hello","conn_seq":2,"pod_id":"reachy00","room":"r-office","unmapped":false}"#;
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+            dispatched(1),
+            AGAIN.to_owned(),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-named-across-hello", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// And the same segment answers for a turn of its own connection, so the
+    /// generation is a fence and not a stop: the reading survives a reconnect
+    /// that happened before the turn.
+    #[test]
+    fn a_named_segment_of_the_live_connection_still_reads_its_bearings() {
+        const AGAIN: &str = r#"{"ts_ms":1,"event":"conn_hello","conn_seq":2,"pod_id":"reachy00","room":"r-office","unmapped":false}"#;
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            AGAIN.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-named-after-hello", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Two ranges holding one carve attribute neither whichever order the two
+    /// closes and their tracking lines arrive in. The judgement is made once
+    /// against the finished map, so there is no first answer for a second
+    /// holder to withdraw.
+    #[test]
+    fn two_closed_ranges_holding_one_carve_attribute_neither_in_either_order() {
+        const FIRST: &str = r#"{"ts_ms":5,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const FIRST_TRACKED: &str = r#"{"ts_ms":6,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        const SECOND: &str = r#"{"ts_ms":7,"event":"segment_closed","pod":"reachy00","segment_id":2,"samples":100000,"base_sample":170000}"#;
+        const SECOND_TRACKED: &str = r#"{"ts_ms":8,"event":"tracking","pod":"reachy00","segment_id":2,"doa":[[5000,[0.0,0.0,0.0,1.0]],[7000,[0.0,0.0,0.0,1.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            SECOND.to_owned(),
+            SECOND_TRACKED.to_owned(),
+            FIRST.to_owned(),
+            FIRST_TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-two-holders-reversed", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// One segment tracked twice in disagreement converts nothing: nothing on
+    /// the console says which of the two readings the turn's samples were taken
+    /// under, and a figure over the wrong one reads exactly like a figure over
+    /// the right one. Two lines that agree are one reading and are kept — the
+    /// rule is disagreement, not repetition.
+    #[test]
+    fn a_segment_tracked_twice_in_disagreement_converts_nothing() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        const ELSEWHERE: &str = r#"{"ts_ms":8,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,1.0]],[7000,[0.0,0.0,0.0,1.0]]]}"#;
+        const AGAIN: &str = r#"{"ts_ms":8,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        for (name, second, says) in [
+            ("speech-report-turn-tracked-apart", ELSEWHERE, "auto beam ?"),
+            (
+                "speech-report-turn-tracked-alike",
+                AGAIN,
+                "auto beam 2.20±0.20 rad",
+            ),
+        ] {
+            let lines = [
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                woke(0.99, 174880),
+                carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+                dispatched(1),
+                CLOSED.to_owned(),
+                TRACKED.to_owned(),
+                second.to_owned(),
+            ];
+            let (_dir, at) = records(name, &lines);
+            let report = judge(&at);
+            assert!(measured(&report, says), "{name}: {:?}", report.measured);
+        }
+    }
+
+    /// The window opens at the wake's end and not at the carve's start, so the
+    /// look direction the wake word was spoken from is not averaged into the
+    /// utterance's. The carve reaches back behind the wake by the host's
+    /// pre-roll pad, which is where the two samples differ.
+    #[test]
+    fn the_window_opens_at_the_wake_and_not_at_the_carve() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        // Offset 4000 is inside the carve and ahead of the wake: a window
+        // opening at the carve would average it in.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[4000,[0.0,0.0,0.0,9.0]],[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // The carve starts at 173696, the wake ended at 174880: inside the
+            // segment those are offsets 3696 and 4880.
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-window-origin", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// With no wake on the console the window opens at the carve's own start
+    /// instead. The two precedences are opposite and only a turn missing one of
+    /// the two samples tells them apart.
+    #[test]
+    fn a_carve_with_no_wake_opens_its_window_at_the_carve() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        // Offset 1000 is inside the segment and ahead of the carve: a window
+        // opening at the segment's base rather than at the carve would take it
+        // and print a figure of its own.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[1000,[0.0,0.0,0.0,9.0]],[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-wakeless-window", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A turn whose span names a segment is judged by that segment and no
+    /// other. Containment is the fallback for a carve nothing named, never a
+    /// second chance for one that was named and did not track.
+    #[test]
+    fn a_named_segment_is_not_overridden_by_the_range_holding_the_carve() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":2,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":2,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            // Segment 1 is what the span names; segment 2 is what holds the
+            // carve and tracked.
+            carved(1, 173696, 179968, Some(1), 0.04, "Test."),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-named-elsewhere", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// Two closed ranges holding one carve attribute neither. A pod that
+    /// restarted its index space mid-run has two unrelated segments answering
+    /// to one sample, and a bearing read out of the wrong one is a confident
+    /// figure over audio nobody spoke into.
+    #[test]
+    fn two_closed_ranges_holding_one_carve_attribute_neither() {
+        const FIRST: &str = r#"{"ts_ms":5,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const FIRST_TRACKED: &str = r#"{"ts_ms":6,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        const SECOND: &str = r#"{"ts_ms":7,"event":"segment_closed","pod":"reachy00","segment_id":2,"samples":100000,"base_sample":170000}"#;
+        const SECOND_TRACKED: &str = r#"{"ts_ms":8,"event":"tracking","pod":"reachy00","segment_id":2,"doa":[[5000,[0.0,0.0,0.0,1.0]],[7000,[0.0,0.0,0.0,1.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            FIRST.to_owned(),
+            FIRST_TRACKED.to_owned(),
+            SECOND.to_owned(),
+            SECOND_TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-two-holders", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// One segment id closes more than once: the host's length cap finalizes a
+    /// part and opens a contiguous successor under the same id. Each part
+    /// converts by its own base, so the part is half of what names a segment.
+    #[test]
+    fn each_part_of_one_segment_converts_by_its_own_base() {
+        const PART_ZERO: &str = r#"{"ts_ms":5,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000,"audio_ref":{"log":"a.framelog","segment_id":1,"part":0}}"#;
+        const PART_ONE: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":180000,"audio_ref":{"log":"a.framelog","segment_id":1,"part":1}}"#;
+        // Part zero's tracking line arrives behind both closes, which is the
+        // ordering a pipeline lagging the connection by a part produces.
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[6000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]],"audio_ref":{"log":"a.framelog","segment_id":1,"part":0}}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // The carve sits in part zero, at [175000, 178000).
+            woke(0.99, 175000),
+            carved(1, 175000, 178000, None, 0.04, "Test."),
+            dispatched(1),
+            PART_ZERO.to_owned(),
+            PART_ONE.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-parts", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "auto beam 2.20±0.20 rad"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A segment id and part that close twice over — a truncated segment that
+    /// resumed — convert nothing: the console does not say which of the two
+    /// bases the tracking line that follows belongs to, and a figure converted
+    /// by the wrong base is over the wrong audio.
+    #[test]
+    fn a_segment_that_closed_twice_under_one_name_converts_nothing() {
+        const FIRST: &str = r#"{"ts_ms":5,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":170000}"#;
+        const AGAIN: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":10000,"base_sample":300000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            // Inside the second close's range, so the last base written would
+            // have read a figure.
+            woke(0.99, 305000),
+            carved(1, 305000, 308000, None, 0.04, "Test."),
+            dispatched(1),
+            FIRST.to_owned(),
+            AGAIN.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-reclosed", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// A reconnect fences the index space its samples were counted in: the pod
+    /// counts from zero again, so a segment closed afterwards can hold a stale
+    /// sample of a turn from the connection before it. The carve here names no
+    /// segment, so containment is the path the generation has to guard.
+    #[test]
+    fn a_reconnect_fences_the_space_an_earlier_turn_was_carved_in() {
+        const AGAIN: &str = r#"{"ts_ms":5,"event":"conn_hello","conn_seq":2,"pod_id":"reachy00","room":"r-office","unmapped":false}"#;
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 174880),
+            carved(1, 173696, 179968, None, 0.04, "Test."),
+            dispatched(1),
+            AGAIN.to_owned(),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-reconnected", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// Every sample index is a number off the console, and a console tears. A
+    /// segment whose stated length runs off the end of the index space holds
+    /// nothing, rather than killing the report the run is read by.
+    #[test]
+    fn a_segment_whose_length_overruns_the_index_space_holds_nothing() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":9000,"base_sample":9223372036854775000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]]]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            woke(0.99, 9223372036854775001),
+            carved(
+                1,
+                9223372036854775001,
+                9223372036854775005,
+                None,
+                0.04,
+                "Test.",
+            ),
+            dispatched(1),
+            CLOSED.to_owned(),
+            TRACKED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-overrun", &lines);
+        let report = judge(&at);
+        assert!(measured(&report, "auto beam ?"), "{:?}", report.measured);
+    }
+
+    /// Somebody speaking over a reply is counted on the turn whose reply it
+    /// cut, and in the summary — the ASR output has no echo suppressor in front
+    /// of it, so a reply cutting itself off is the failure this counts.
+    #[test]
+    fn a_barge_in_is_counted_on_the_turn_whose_reply_it_cut() {
+        const BARGED: &str = r#"{"ts_ms":8,"event":"barge_in","pod":"reachy00","epoch":1,"trigger_sample":5000,"host_rx_us":9}"#;
+        const FLUSHED: &str = r#"{"ts_ms":9,"event":"playback_flushed","pod":"reachy00","utterance":1,"was_playing":true,"frames_written":10,"heard_ms":400,"total_ms":1600}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+            BARGED.to_owned(),
+            FLUSHED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-barge", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "barge-in ×1; reply flushed ×1"),
+            "{:?}",
+            report.measured
+        );
+        assert!(measured(&report, "1 barge-in(s)"), "{:?}", report.measured);
+    }
+
+    /// A turn a barge-in minted is as real as any other and is not a wake. The
+    /// summary is the line two acceptance sessions are compared on, so a count
+    /// that mixed the two would make sessions with different amounts of
+    /// interruption incomparable.
+    #[test]
+    fn a_turn_no_wake_opened_is_not_counted_as_a_wake() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+            // The barge-in's own utterance: minted with no wake ahead of it,
+            // and carrying an id this console has not seen.
+            said(2, "No, stop.", 0.05),
+            dispatched(2),
+        ];
+        let (_dir, at) = records("speech-report-turn-unwoken", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 2 dispatched, 0 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s); 1 turn(s) began with no wake \
+                 ahead of them"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The recogniser itself failing is the class of run the ASR channel could
+    /// newly produce, so the line it renders through and the counter it lands
+    /// in are both read here.
+    #[test]
+    fn a_turn_the_recogniser_failed_on_renders_and_is_counted() {
+        const FAILED: &str = r#"{"ts_ms":5,"event":"stt_failed","pod":"reachy00","utterance_seq":1,"detail":"the model returned no segments"}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            FAILED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-stt-failed", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "→ stt failed (the model returned no segments); clip ?"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 0 declined by the confidence gate, 1 with no \
+                 transcript, 1 STT failure(s), 0 barge-in(s)"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A turn that reached the brain with nothing in it: its own clause, and
+    /// counted as neither dispatched nor declined.
+    #[test]
+    fn a_turn_the_brain_was_handed_no_words_for_renders_and_is_counted() {
+        const EMPTY: &str =
+            r#"{"ts_ms":5,"event":"brain_no_transcript","pod":"reachy00","utterance":1}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "", 0.04),
+            EMPTY.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-wordless", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "→ the brain was handed no words"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 0 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s)"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The gate declines a turn somebody barged in with through its own event,
+    /// and that decline is the same decline: counted under the gate, and read
+    /// back as a hallucination because it had words in it.
+    #[test]
+    fn a_barge_turn_the_gate_declined_is_counted_with_the_others() {
+        const BARGE_DECLINED: &str = r#"{"ts_ms":5,"event":"barge_command_absent","utterance":1,"pod":"reachy00","reason":"low_confidence","no_speech":0.44,"logprob":-1.2}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Thank you for watching.", 0.44),
+            BARGE_DECLINED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-barge-declined", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 1 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s)"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 transcript(s) with words were declined as likely hallucination — no reply \
+                 followed those wakes"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A wake whose arm expired is unanswered without the gate having read
+    /// anything, so it is said apart from the confidence declines — the count
+    /// two acceptance sessions are compared on is about the audio.
+    #[test]
+    fn a_decline_the_gate_did_not_make_is_counted_apart_from_it() {
+        const EXPIRED: &str = r#"{"ts_ms":5,"event":"wake_command_absent","utterance":1,"pod":"reachy00","reason":"arm_expired"}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            EXPIRED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-arm-expired", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 0 declined by the confidence gate, 1 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s), 1 unanswered for other reasons \
+                 (arm_expired ×1)"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "declined as likely hallucination"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A reply that played to its end is said in seconds on the turn it
+    /// answered; an announcement nobody asked a question for names no turn and
+    /// is charged to none, because a turn carrying it reads as a wake that was
+    /// answered.
+    #[test]
+    fn a_reply_that_played_is_said_on_its_own_turn_and_an_announcement_on_none() {
+        const PLAYED: &str = r#"{"ts_ms":6,"event":"playback_finished","pod":"reachy00","utterance":1,"nominal_audio_ms":1600}"#;
+        const ANNOUNCED: &str = r#"{"ts_ms":7,"event":"playback_finished","pod":"reachy00","utterance":null,"nominal_audio_ms":9000}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+            PLAYED.to_owned(),
+            wake(0.76),
+            said(2, "Test two.", 0.30),
+            declined(2, 0.30),
+            ANNOUNCED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-played", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "→ dispatched; reply played 1.6 s"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.contains("reply played"))
+                .count(),
+            1,
+            "the announcement is no turn's reply: {:?}",
+            report.measured
+        );
+    }
+
+    /// A barge-in ahead of anything this console dispatched cut no reply it
+    /// knows about. Said on its own line rather than charged to a turn, and
+    /// still counted — the robot hearing itself is what that line would be.
+    #[test]
+    fn a_barge_in_before_any_reply_is_counted_on_its_own_line() {
+        const BARGED: &str = r#"{"ts_ms":2,"event":"barge_in","pod":"reachy00","epoch":1,"trigger_sample":5000,"host_rx_us":9}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            BARGED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-stray-barge", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "1 barge-in(s) cut no reply this console dispatched"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(measured(&report, "1 barge-in(s)"), "{:?}", report.measured);
+        assert!(
+            !measured(&report, "barge-in ×1"),
+            "no turn was charged with it: {:?}",
+            report.measured
+        );
+    }
+
+    /// The run an operator ended mid-turn: a transcript with nothing after it.
+    /// Its own clause, and counted in neither column of the summary.
+    #[test]
+    fn a_turn_this_console_never_said_the_end_of_prints_as_open() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+        ];
+        let (_dir, at) = records("speech-report-turn-open", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "→ no outcome on this console"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 wake(s): 0 dispatched, 0 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s)"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The first utterance of a process carries no segment list and the decline
+    /// beside it does. The two halves of a turn's span are taken from whichever
+    /// event named them, in either order, and neither overwrites the other.
+    #[test]
+    fn a_span_named_across_two_events_is_whole_in_either_order() {
+        const CLOSED: &str = r#"{"ts_ms":6,"event":"segment_closed","pod":"reachy00","segment_id":1,"samples":149760,"base_sample":170000}"#;
+        const TRACKED: &str = r#"{"ts_ms":7,"event":"tracking","pod":"reachy00","segment_id":1,"doa":[[5000,[0.0,0.0,0.0,2.0]],[7000,[0.0,0.0,0.0,2.4]]]}"#;
+        // The transcript names the samples and no segment at all.
+        const SEGMENTLESS: &str = r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","audio_ref":{"log":"a.framelog","start_sample":173696,"end_sample":179968},"transcript":{"text":"Test.","confidence":{"avg_logprob":-0.38,"no_speech_prob":0.44}}}"#;
+        // The decline names the segment, and the samples again.
+        const NAMED: &str = r#"{"ts_ms":3,"event":"wake_command_absent","utterance":1,"pod":"reachy00","reason":"low_confidence","no_speech":0.44,"logprob":-1.05,"log":"a.framelog","start_sample":173696,"end_sample":179968,"segments":[{"log":"a.framelog","segment_id":1,"part":0}]}"#;
+        const WOKE: &str = r#"{"ts_ms":1,"event":"wake_detected","pod":"reachy00","epoch":1,"score":0.99,"wake_end_sample":174880}"#;
+        for (name, order) in [
+            ("speech-report-span-said-first", [SEGMENTLESS, NAMED]),
+            ("speech-report-span-declined-first", [NAMED, SEGMENTLESS]),
+        ] {
+            let lines = [STARTED, COMPOSED, WOKE, order[0], order[1], CLOSED, TRACKED];
+            let (_dir, at) = records(name, &lines);
+            let report = judge(&at);
+            assert!(
+                measured(
+                    &report,
+                    "clip not written (no recorded audio beside this fetch) [173696–179968)"
+                ),
+                "{name}: {:?}",
+                report.measured
+            );
+            assert!(
+                measured(&report, "auto beam 2.20±0.20 rad"),
+                "{name}: {:?}",
+                report.measured
+            );
+        }
+    }
+
+    /// A transcript is somebody's words and reaches the terminal through the
+    /// same bound every other quoted line does.
+    #[test]
+    fn a_transcript_is_quoted_like_any_other_text_off_the_console() {
+        let long = "ha".repeat(200);
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, &format!("one\\ttwo {long}"), 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-quoted", &lines);
+        let report = judge(&at);
+        let turn = report
+            .measured
+            .iter()
+            .find(|line| line.starts_with("turn "))
+            .unwrap_or_else(|| panic!("{:?}", report.measured));
+        assert!(turn.contains("one two ha"), "the tab is a space: {turn}");
+        assert!(turn.contains('…'), "the text is bounded: {turn}");
+    }
+
+    /// The other direction of the stdout-and-stderr tear: a whole event with a
+    /// console sentence begun into the same descriptor behind it, which is how
+    /// the transcript's own line actually arrives.
+    #[test]
+    fn a_console_sentence_glued_behind_an_event_leaves_the_event_readable() {
+        let torn = format!(
+            "{}22:56:35.293 [r-office/reachy00] utterance #1 — \"Test.\"",
+            said(1, "Test.", 0.04)
+        );
+        let classified = classify(&torn);
+        assert!(classified.ahead.is_none(), "the event leads the line");
+        assert_eq!(
+            classified.behind.as_deref(),
+            Some("22:56:35.293 [r-office/reachy00] utterance #1 — \"Test.\""),
+            "the sentence behind it is the console's",
+        );
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            torn,
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-turn-torn", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "\"Test.\" no_speech=0.04"),
+            "{:?}",
+            report.measured
+        );
+    }
+    // -----------------------------------------------------------------------
+    // The turn clips
+    // -----------------------------------------------------------------------
+
+    /// How many samples one fixture audio frame holds.
+    ///
+    /// The wire payload caps a frame at 640 samples, so a carve-sized segment
+    /// is several frames and the fixture's values restart at 1 in each of them.
+    const FRAME: usize = 640;
+
+    /// Where the fixture segment's first sample sits, below every span the
+    /// cases carve so a clip is audio and not silence.
+    const AUDIO_BASE: u64 = 15_360;
+
+    /// The value the fixture writes at one absolute sample index.
+    ///
+    /// A sawtooth: non-zero wherever the log has audio, different at every
+    /// offset inside a frame, so a slice off by one sample or one frame reads
+    /// differently from the one that was asked for.
+    fn sawtooth(sample: u64) -> i16 {
+        ((sample - AUDIO_BASE) % FRAME as u64) as i16 + 1
+    }
+
+    /// A recorded-audio store beside `records`, holding one segment of
+    /// `frames` frames in `log`.
+    ///
+    /// Written through brenn-pod's own frame-log writer, which is the only
+    /// thing that writes this format: a fixture built any other way is a second
+    /// writer of it to keep in step with the first.
+    fn store(records: &Path, log: &str, frames: usize) -> PathBuf {
+        let dir = sibling(records, AUDIO_SUFFIX);
+        std::fs::create_dir_all(&dir).expect("an audio store");
+        let mut written = vec![
+            pod_ingest::test_fixtures::hello("reachy00"),
+            pod_ingest::test_fixtures::seg_start(1, AUDIO_BASE),
+        ];
+        for frame in 0..frames {
+            written.push(pod_ingest::test_fixtures::audio(
+                1,
+                AUDIO_BASE + (frame * FRAME) as u64,
+                FRAME,
+            ));
+        }
+        written.push(pod_ingest::test_fixtures::seg_end(
+            1,
+            (frames * FRAME) as u64,
+        ));
+        pod_ingest::test_fixtures::write_log(&dir.join(log), &written);
+        dir
+    }
+
+    /// A store covering every span the default fixture lines carve.
+    fn whole_store(records: &Path) -> PathBuf {
+        store(records, "a.framelog", 72)
+    }
+
+    /// The samples one written clip holds, read back out of the file.
+    ///
+    /// The chunks are walked rather than the header assumed, so the reader is
+    /// held to the file being a `.wav` and not to a byte count.
+    fn clip_samples(at: &Path) -> Vec<i16> {
+        let bytes = std::fs::read(at).unwrap_or_else(|why| panic!("{}: {why}", at.display()));
+        assert_eq!(&bytes[..4], b"RIFF", "{}", at.display());
+        assert_eq!(&bytes[8..12], b"WAVE", "{}", at.display());
+        let mut cursor = 12;
+        while cursor + 8 <= bytes.len() {
+            let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+            let body = cursor + 8;
+            let end = body + size as usize;
+            if &bytes[cursor..cursor + 4] == b"data" {
+                return bytes[body..end.min(bytes.len())]
+                    .chunks_exact(2)
+                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+            }
+            cursor = end + (end % 2);
+        }
+        panic!("no data chunk in {}", at.display());
+    }
+
+    /// One clip line of a report, by the file it names.
+    fn clip_line(report: &Report, holds: &str) -> String {
+        report
+            .measured
+            .iter()
+            .find(|line| line.starts_with("turn #") && line.contains(holds))
+            .unwrap_or_else(|| panic!("no turn line holding {holds}: {:?}", report.measured))
+            .clone()
+    }
+
+    /// The clip is the carve: the samples the listener handed the recogniser,
+    /// out of the log the utterance's own line named.
+    #[test]
+    fn a_turn_clip_holds_exactly_the_carve() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-carve", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav [16128–59968)").contains("dispatched"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "turn clips: 1 of 1 written to "),
+            "{:?}",
+            report.measured
+        );
+        let held = clip_samples(&sibling(&at, TURNS_SUFFIX).join("turn-01.wav"));
+        assert_eq!(held.len(), 59968 - 16128, "the carve's own length");
+        for offset in [0usize, 1, 639, 640, 4321, 43839] {
+            assert_eq!(
+                held[offset],
+                sawtooth(16128 + offset as u64),
+                "sample {offset} of the carve"
+            );
+        }
+    }
+
+    /// A turn whose line named no segment is cut all the same: the segment list
+    /// is empty on exactly the turns whose recogniser ran long, which are the
+    /// ones this report exists for.
+    #[test]
+    fn a_turn_naming_no_segment_is_still_cut() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 16128, 59968, None, 0.04, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-segmentless", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "clip turn-01.wav [16128–59968)"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            clip_samples(&sibling(&at, TURNS_SUFFIX).join("turn-01.wav")).len(),
+            59968 - 16128
+        );
+    }
+
+    /// The file is named by the token its line prints after `#`, so the clip is
+    /// found from the report by reading — including where the utterance ids and
+    /// the wake ordinals have diverged.
+    #[test]
+    fn a_clip_is_named_by_the_token_its_turn_line_prints() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 16128, 20000, None, 0.04, "One."),
+            dispatched(1),
+            wake(0.80),
+            wake(0.99),
+            carved(2, 30000, 40000, None, 0.04, "Two."),
+            dispatched(2),
+        ];
+        let (_dir, at) = records("speech-report-clip-names", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav [16128–20000)").starts_with("turn #1 "),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            clip_line(&report, "clip turn-02.wav [30000–40000)").starts_with("turn #2 "),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "turn #? (wake 2)"),
+            "{:?}",
+            report.measured
+        );
+        // The wake nobody answered stated no span, so it gave no reason for
+        // having no clip and the summary names none for the run.
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.starts_with("turn clips: 2 of 3 written to ")
+                    && !line.contains(" — ")),
+            "{:?}",
+            report.measured
+        );
+        let turns = sibling(&at, TURNS_SUFFIX);
+        assert_eq!(
+            clip_samples(&turns.join("turn-02.wav"))[0],
+            sawtooth(30000),
+            "the file each line names holds that line's span"
+        );
+        assert_eq!(
+            std::fs::read_dir(&turns).expect("a clip directory").count(),
+            2,
+            "the wake nobody answered carved nothing"
+        );
+    }
+
+    /// The recogniser heard the carve minus its trim, and the console states
+    /// the trim on a decline. The clip is the whole carve either way; the line
+    /// says where the recogniser began.
+    #[test]
+    fn a_declined_turn_says_where_the_recogniser_began() {
+        let trimmed = r#"{"ts_ms":3,"event":"wake_command_absent","utterance":1,"pod":"reachy00","reason":"low_confidence","no_speech":0.45,"logprob":-1.05,"stt_trim_samples":13504,"log":"a.framelog","start_sample":16128,"end_sample":59968,"segments":[]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "service.", 0.45),
+            trimmed.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-clip-trim", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav").contains("STT from +0.84 s"),
+            "{:?}",
+            report.measured
+        );
+        let dispatched_lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_other, elsewhere) = records("speech-report-clip-untrimmed", &dispatched_lines);
+        whole_store(&elsewhere);
+        let report = judge(&elsewhere);
+        assert!(
+            !clip_line(&report, "clip turn-01.wav").contains("STT from"),
+            "a dispatch states no trim: {:?}",
+            report.measured
+        );
+    }
+
+    /// A carve whose pre-roll reaches back before the log's first frame is
+    /// written all the same, and the line says how much of it is silence.
+    #[test]
+    fn a_carve_beginning_before_the_log_is_written_with_its_silence_stated() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 15_000, 16_000, None, 0.04, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-preroll", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav [15000–16000)")
+                .contains("at most 360 samples of silence"),
+            "{:?}",
+            report.measured
+        );
+        let held = clip_samples(&sibling(&at, TURNS_SUFFIX).join("turn-01.wav"));
+        assert!(held[..360].iter().all(|sample| *sample == 0), "the head");
+        assert_eq!(held[360], sawtooth(AUDIO_BASE), "the log's first sample");
+    }
+
+    /// A fetch with no store beside it: one sentence about the run, not one
+    /// refusal per turn, and no directory nobody put anything in.
+    #[test]
+    fn a_fetch_with_no_audio_writes_nothing_and_says_so_once() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-no-store", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "turn clips: none written — no recorded audio beside this fetch"
+            ) && measured(
+                &report,
+                "clip not written (no recorded audio beside this fetch)"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !sibling(&at, TURNS_SUFFIX).exists(),
+            "nothing to hold means no directory"
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// And a store that came back empty, which is what a site recording nothing
+    /// leaves: the rsync of a store with nothing in it succeeds, so the
+    /// directory is there and holds no file.
+    #[test]
+    fn an_empty_store_reads_as_no_audio_and_not_as_a_missing_log() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-empty-store", &lines);
+        std::fs::create_dir_all(sibling(&at, AUDIO_SUFFIX)).expect("an empty store");
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "turn clips: none written — no recorded audio beside this fetch"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "is not in the store"),
+            "an empty store is not a pruned log: {:?}",
+            report.measured
+        );
+    }
+
+    /// A store that holds no log of this name: the pruner is an independent
+    /// actor, so this is a sentence about the audio and not a fault.
+    #[test]
+    fn a_log_the_store_does_not_hold_is_named_as_missing() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-pruned", &lines);
+        store(&at, "b.framelog", 4);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "clip not written (a.framelog is not in the store)"),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A run nobody spoke in says nothing about clips: the count of an empty
+    /// set is not a reading, and the summary already says the run had no wake
+    /// in it.
+    #[test]
+    fn a_run_with_no_turns_says_nothing_about_clips() {
+        let lines = [STARTED.to_owned(), COMPOSED.to_owned()];
+        let (_dir, at) = records("speech-report-clip-no-turns", &lines);
+        let report = judge(&at);
+        assert!(
+            !report
+                .measured
+                .iter()
+                .any(|line| line.starts_with("turn clips:")),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A store fault is said and never mistaken for silence, and never kills
+    /// the report the run is read by.
+    #[test]
+    fn a_log_that_will_not_open_is_said_and_the_report_goes_on() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-fault", &lines);
+        let dir = sibling(&at, AUDIO_SUFFIX);
+        std::fs::create_dir_all(&dir).expect("a store");
+        std::fs::write(dir.join("a.framelog"), b"not a frame log at all").expect("a bad log");
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip not written (a.framelog:").contains("dispatched"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "turn clips: none written"),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A span the console did not finish stating is not carved with: the
+    /// fragment prints as missing, as every value this tool cannot state does.
+    #[test]
+    fn a_turn_whose_span_is_missing_a_field_writes_no_clip() {
+        const NO_END: &str = r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","audio_ref":{"log":"a.framelog","start_sample":16128,"segments":[]},"transcript":{"text":"Test.","confidence":{"no_speech_prob":0.04}}}"#;
+        const NO_LOG: &str = r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","audio_ref":{"start_sample":16128,"end_sample":59968,"segments":[]},"transcript":{"text":"Test.","confidence":{"no_speech_prob":0.04}}}"#;
+        for (name, line, says) in [
+            ("speech-report-clip-no-end", NO_END, "; clip ?;"),
+            // The one field that names the file is the one this line lost, so
+            // the coordinates stay: they are what somebody opening the store by
+            // hand has to have.
+            (
+                "speech-report-clip-no-log",
+                NO_LOG,
+                "; clip ? [16128–59968)",
+            ),
+        ] {
+            let lines = [STARTED, COMPOSED, &wake(0.99), line, &dispatched(1)];
+            let (_dir, at) = records(name, &lines);
+            whole_store(&at);
+            let report = judge(&at);
+            assert!(measured(&report, says), "{name}: {:?}", report.measured);
+            assert!(
+                !sibling(&at, TURNS_SUFFIX).exists(),
+                "{name}: nothing is written"
+            );
+        }
+    }
+
+    /// A sample index a torn line lost its sign on is refused in the resolver's
+    /// own words, and nothing panics.
+    #[test]
+    fn a_span_that_is_not_a_sample_index_is_refused() {
+        const NEGATIVE: &str = r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","audio_ref":{"log":"a.framelog","start_sample":-16128,"end_sample":59968,"segments":[]},"transcript":{"text":"Test.","confidence":{"no_speech_prob":0.04}}}"#;
+        let lines = [STARTED, COMPOSED, &wake(0.99), NEGATIVE, &dispatched(1)];
+        let (_dir, at) = records("speech-report-clip-negative", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "clip not written (invalid span)"),
+            "{:?}",
+            report.measured
+        );
+        assert!(!sibling(&at, TURNS_SUFFIX).exists(), "nothing is written");
+    }
+
+    /// The clips are a function of the fetch, so reading a run twice writes the
+    /// same bytes — and leaves whatever else is in the directory alone.
+    #[test]
+    fn reading_one_fetch_twice_writes_the_same_clips() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-twice", &lines);
+        whole_store(&at);
+        judge(&at);
+        let turns = sibling(&at, TURNS_SUFFIX);
+        std::fs::write(turns.join("someone-elses.txt"), b"kept").expect("a stranger's file");
+        let first = std::fs::read(turns.join("turn-01.wav")).expect("a clip");
+        judge(&at);
+        assert_eq!(
+            std::fs::read(turns.join("turn-01.wav")).expect("a clip"),
+            first,
+            "the same fetch reads the same bytes"
+        );
+        assert_eq!(
+            std::fs::read(turns.join("someone-elses.txt")).expect("the stranger's file"),
+            b"kept",
+            "nothing else in the directory is touched"
+        );
+    }
+    /// A log whose tail was cut off mid-frame still yields the audio it holds:
+    /// partial beats nothing, and the line says the record stopped so a silent
+    /// stretch is not read as a wire gap.
+    #[test]
+    fn a_torn_log_is_written_and_the_line_says_it_was_torn() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-torn-log", &lines);
+        let dir = whole_store(&at);
+        let log = dir.join("a.framelog");
+        let whole = std::fs::metadata(&log).expect("a log").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .expect("the log")
+            .set_len(whole / 2)
+            .expect("a torn tail");
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav [16128–59968)")
+                .contains(", a.framelog torn (torn tail)"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            clip_samples(&sibling(&at, TURNS_SUFFIX).join("turn-01.wav"))[0],
+            sawtooth(16128),
+            "what the log did hold is written"
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+    /// A store that would not open is said, and never in the words for a store
+    /// that recorded nothing: the audio is on disk and the fault is the one
+    /// thing an operator has to know to go and get it.
+    #[test]
+    fn a_store_that_will_not_open_is_not_read_as_no_audio() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-unreadable-store", &lines);
+        let store = sibling(&at, AUDIO_SUFFIX);
+        std::fs::write(&store, b"not a store at all").expect("a store that is a file");
+        let report = judge(&at);
+        let line = clip_line(&report, "clip not written (");
+        assert!(
+            line.contains(&format!("clip not written ({}: ", store.display())),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "no recorded audio beside this fetch"),
+            "a fault is not silence: {:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A wake nobody answered carries its own span on the decline line, so it
+    /// is cut like any other turn — and the file is named by the ordinal its
+    /// line prints, since there is no utterance id to name it by.
+    #[test]
+    fn a_wake_nobody_answered_is_cut_under_its_wake_name() {
+        const UNANSWERED: &str = r#"{"ts_ms":3,"event":"wake_command_absent","pod":"reachy00","reason":"arm_expired","score":0.99,"log":"a.framelog","start_sample":16128,"end_sample":20000,"segments":[]}"#;
+        let lines = [STARTED, COMPOSED, &wake(0.99), UNANSWERED];
+        let (_dir, at) = records("speech-report-clip-wake-name", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-wake-1.wav [16128–20000)")
+                .starts_with("turn #? (wake 1)"),
+            "{:?}",
+            report.measured
+        );
+        let held = clip_samples(&sibling(&at, TURNS_SUFFIX).join("turn-wake-1.wav"));
+        assert_eq!(held.len(), 20000 - 16128, "the carve's own length");
+        assert_eq!(held[0], sawtooth(16128), "the decline line named the log");
+    }
+
+    /// A store that covered part of the carve twice says the silence figure is
+    /// unknown rather than zero: an outage read as silence is the one wrong
+    /// inference this fragment exists to prevent.
+    #[test]
+    fn a_span_the_store_covered_twice_leaves_its_silence_unknown() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(
+                1,
+                AUDIO_BASE as i64,
+                (AUDIO_BASE + FRAME as u64) as i64,
+                None,
+                0.04,
+                "Test.",
+            ),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-covered-twice", &lines);
+        let dir = sibling(&at, AUDIO_SUFFIX);
+        std::fs::create_dir_all(&dir).expect("an audio store");
+        pod_ingest::test_fixtures::write_log(
+            &dir.join("a.framelog"),
+            &[
+                pod_ingest::test_fixtures::hello("reachy00"),
+                pod_ingest::test_fixtures::seg_start(1, AUDIO_BASE),
+                pod_ingest::test_fixtures::audio(1, AUDIO_BASE, FRAME),
+                // The same samples a second time, which is what a store that
+                // re-covered a span holds.
+                pod_ingest::test_fixtures::audio(1, AUDIO_BASE, FRAME),
+                pod_ingest::test_fixtures::seg_end(1, FRAME as u64),
+            ],
+        );
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav").contains(
+                ", how much of it is silence is unknown (the store covered part of this span twice)"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A replay that met a non-fatal protocol error counts it on the line: the
+    /// samples it lost are silence in the clip and are otherwise
+    /// indistinguishable from a wire gap.
+    #[test]
+    fn a_replay_that_met_a_protocol_error_says_how_many() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(
+                1,
+                AUDIO_BASE as i64,
+                (AUDIO_BASE + FRAME as u64) as i64,
+                None,
+                0.04,
+                "Test.",
+            ),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-protocol-errors", &lines);
+        let dir = sibling(&at, AUDIO_SUFFIX);
+        std::fs::create_dir_all(&dir).expect("an audio store");
+        pod_ingest::test_fixtures::write_log(
+            &dir.join("a.framelog"),
+            &[
+                pod_ingest::test_fixtures::hello("reachy00"),
+                // Audio ahead of any segment: a non-fatal protocol error, and
+                // replay goes on.
+                pod_ingest::test_fixtures::audio(1, AUDIO_BASE, FRAME),
+                pod_ingest::test_fixtures::seg_start(1, AUDIO_BASE),
+                pod_ingest::test_fixtures::audio(1, AUDIO_BASE, FRAME),
+                pod_ingest::test_fixtures::seg_end(1, FRAME as u64),
+            ],
+        );
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav").contains(", 1 protocol errors"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The three ways a replay stops read alike collapsed into one word, and
+    /// the resolver's message is the only description of what was wrong with
+    /// the store: a corrupt record says so, and says what it said.
+    #[test]
+    fn a_corrupt_record_names_what_stopped_the_replay() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Test.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-corrupt-log", &lines);
+        let dir = store(&at, "a.framelog", 4);
+        // A whole record header claiming a length no frame can have, which is
+        // the corruption a torn tail is not.
+        let mut header = 99u64.to_le_bytes().to_vec();
+        header.extend_from_slice(&u16::MAX.to_le_bytes());
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("a.framelog"))
+                .expect("the log"),
+            &header,
+        )
+        .expect("a corrupt record");
+        let report = judge(&at);
+        assert!(
+            clip_line(&report, "clip turn-01.wav").contains(", a.framelog torn (corrupt: "),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// A span whose end precedes its start is the resolver's own refusal, in
+    /// the resolver's own words — the same fact and the same sentence as a
+    /// sample index this tool refused before asking.
+    #[test]
+    fn a_span_the_resolver_refuses_is_said_in_its_own_words() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 30000, 20000, None, 0.04, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-backwards-span", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "clip not written (invalid span)"),
+            "{:?}",
+            report.measured
+        );
+        assert!(!sibling(&at, TURNS_SUFFIX).exists(), "nothing is written");
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    /// Two turns without clips for two different reasons name neither in the
+    /// summary: the one reason is stated only where it is the whole story, and
+    /// each turn's own line carries its own.
+    #[test]
+    fn two_unwritten_turns_with_different_reasons_share_none() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 16128, 20000, None, 0.04, "One."),
+            dispatched(1),
+            wake(0.99),
+            carved(2, 30000, 20000, None, 0.04, "Two."),
+            dispatched(2),
+        ];
+        let (_dir, at) = records("speech-report-clip-mixed-reasons", &lines);
+        // A store holding some other run's log: turn 1's log is pruned from it.
+        store(&at, "b.framelog", 4);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "clip not written (a.framelog is not in the store)")
+                && measured(&report, "clip not written (invalid span)"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line == "turn clips: none written"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A clips directory that cannot be made is one fact about the filesystem,
+    /// said the same way on every turn and attempted once.
+    #[test]
+    fn a_clips_directory_that_cannot_be_made_is_one_fact() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved(1, 16128, 20000, None, 0.04, "One."),
+            dispatched(1),
+            wake(0.99),
+            carved(2, 30000, 40000, None, 0.04, "Two."),
+            dispatched(2),
+        ];
+        let (_dir, at) = records("speech-report-clip-unwritable-dir", &lines);
+        whole_store(&at);
+        let turns = sibling(&at, TURNS_SUFFIX);
+        std::fs::write(&turns, b"in the way").expect("a file where the directory goes");
+        let report = judge(&at);
+        let refusals: Vec<&String> = report
+            .measured
+            .iter()
+            .filter(|line| line.starts_with("turn #"))
+            .collect();
+        assert_eq!(refusals.len(), 2, "{:?}", report.measured);
+        for line in &refusals {
+            assert!(
+                line.contains(&format!("clip not written ({}: ", turns.display())),
+                "{:?}",
+                report.measured
+            );
+        }
+        assert_eq!(
+            std::fs::read(&turns).expect("the file in the way"),
+            b"in the way",
+            "nothing wrote through it"
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+    /// A log name is console-authored text, so it is printed the way every
+    /// other free string off the console is: a name carrying a newline would
+    /// otherwise fabricate a line of this report, which reads by prefix.
+    #[test]
+    fn a_log_name_off_a_torn_line_cannot_fabricate_a_report_line() {
+        const SPLIT: &str = r#"{"ts_ms":2,"event":"utterance","id":1,"pod":"reachy00","audio_ref":{"log":"a.framelog\nturn clips: 9 of 9 written to nowhere","start_sample":16128,"end_sample":20000,"segments":[]},"transcript":{"text":"Test.","confidence":{"no_speech_prob":0.04}}}"#;
+        let lines = [STARTED, COMPOSED, &wake(0.99), SPLIT, &dispatched(1)];
+        let (_dir, at) = records("speech-report-clip-split-log-name", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            report.measured.iter().all(|line| !line.contains('\n')),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.starts_with("turn clips:"))
+                .count(),
+            1,
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "clip not written (a.framelog turn clips: 9 of 9 written to nowhere is not in the store)"
+            ),
+            "{:?}",
+            report.measured
         );
     }
 }

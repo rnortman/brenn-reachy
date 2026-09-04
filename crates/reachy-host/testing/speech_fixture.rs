@@ -219,6 +219,64 @@ pub const ENDPOINTER_MODEL: &str = "endpointer-vad.onnx";
 /// The file `brain.clip` names in [`modelled_named`].
 pub const BRAIN_CLIP: &str = "brain-answer.wav";
 
+/// The recording block every written fixture carries, as `records` finds it.
+const RECORDING_OFF: &str = "[record]\nenabled = false\n";
+
+/// Turn a written fixture's recording on, into `dir` under `cap_bytes`.
+///
+/// The fixtures record nothing, because a composition that runs no turn has
+/// nothing to record and a test that wrote a store would write it into the
+/// machine it is running on. What a preflight says about recording is decided
+/// by the switch and the cap together, so a case that is about that sentence
+/// states both here rather than editing TOML of its own.
+///
+/// # Panics
+///
+/// If the file cannot be read back and rewritten, if it carries no recording
+/// block for the switch to go into, or if `dir` is a path this fixture cannot
+/// write into TOML.
+pub fn records(config: &Path, dir: &Path, cap_bytes: u64) {
+    let text = std::fs::read_to_string(config).expect("the fixture");
+    let recording = format!(
+        "[record]\nenabled = true\ndir = {}\ncap_bytes = {cap_bytes}\n",
+        quoted(dir),
+    );
+    // The anchor is asserted rather than assumed: a case that turns recording
+    // on and silently gets a fixture recording nothing still passes wherever it
+    // asserts the *absence* of a conclusion, which is what the two cases
+    // guarding the flash-write refusal do.
+    assert!(
+        text.contains(RECORDING_OFF),
+        "a fixture with a recording block to turn on: {config:?}"
+    );
+    let text = text.replace(RECORDING_OFF, &recording);
+    std::fs::write(config, text).expect("a file");
+}
+
+/// Give a written fixture's `[stt]` table the optional secondary gate.
+///
+/// The floor is off by default, so the sentence a preflight prints about the
+/// gate has two shapes and this is what a case asks for the second one. Written
+/// into the table rather than appended to the file: a key after the last table
+/// belongs to that table, which here would be the bridge's.
+///
+/// # Panics
+///
+/// If the file cannot be read back and rewritten, or if it carries no `[stt]`
+/// table for the key to go into.
+pub fn declining_below(config: &Path, avg_logprob_min: f32) {
+    let text = std::fs::read_to_string(config).expect("the fixture");
+    assert!(
+        text.contains("[stt]\n"),
+        "a fixture with an [stt] table to put a gate floor in: {config:?}"
+    );
+    let text = text.replace(
+        "[stt]\n",
+        &format!("[stt]\navg_logprob_min = {avg_logprob_min:?}\n"),
+    );
+    std::fs::write(config, text).expect("a file");
+}
+
 /// The same fixture with a bus brain: the deployment whose alerts travel.
 ///
 /// Everything `mode = "brenn"` requires and nothing that dials anybody: the

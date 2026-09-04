@@ -190,15 +190,21 @@ crate.spec(
     version = "0.9",
 )
 
-# The brenn-pod voice pipeline, which `reachy-host` composes. Three specs
-# rather than the whole closure: a spec exists to produce a label, and these are
-# the three the robot's host states its own wiring in. Everything the pipeline
-# reaches through them is resolved by the same cargo run and pinned by the same
-# lockfile, at the same revision, without a label of its own.
+# The brenn-pod voice pipeline, which `reachy-host` composes. Four specs rather
+# than the whole closure: a spec exists to produce a label, and three of these
+# are the ones the robot's host states its own wiring in. Everything the
+# pipeline reaches through them is resolved by the same cargo run and pinned by
+# the same lockfile, at the same revision, without a label of its own.
 #
-# `//crates/reachy-host:host_closure_test` names all three in their own right: a
-# crate reached only through the surface's internal edges is proved to link only
-# for as long as that edge exists.
+# The fourth is `pod-ingest`, and its reason is a different one: the speech run
+# report writes a `.wav` per turn out of the frame-log store a run brought home,
+# and its cases need a store on disk written by the writer that produced every
+# real one. It is not the host's wiring and is linked into nothing but that
+# report's test.
+#
+# `//crates/reachy-host:host_closure_test` names the first three in their own
+# right: a crate reached only through the surface's internal edges is proved to
+# link only for as long as that edge exists.
 #
 # Git pins at a revision published on brenn-pod's public remote, so that CI and
 # a fresh clone can fetch what this tree builds. The dependency arrow is the
@@ -225,17 +231,17 @@ crate.spec(
 # publishes behind this tree's. Nothing carries a `MotionScript` value across the
 # two seams, so the two types never meet. TODO(motion-proto-two-copies)
 #
-# The remote and the revision are named once each and the three specs read them,
-# so a fork, a mirror or a bump cannot reach two of the three.
+# The remote and the revision are named once each and the four specs read them,
+# so a fork, a mirror or a bump cannot reach some of them and not the rest.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "f5fa3f77116706203adffdc28c61accdaa8e77de"
+BRENN_POD_REV = "97cd7889207f877538d001e56e930c68ff2ca699"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
 # resolve them from a working tree beside this one, and put them back before
-# anything is pushed. `crate.spec` has no override form, so all three are edited
-# by hand and all three must be in the same form at once. Three things come back
+# anything is pushed. `crate.spec` has no override form, so all four are edited
+# by hand and all four must be in the same form at once. Three things come back
 # with them: `BRENN_POD_REV` has to name a revision *published* on the remote
 # and carrying the seam before the specs return to `git`/`rev`, or the tree does
 # not compile; `MODULE.bazel.lock` records an absolute path under a `path =`
@@ -268,6 +274,30 @@ crate.spec(
 crate.spec(
     git = BRENN_POD_GIT,
     package = "brenn-bridge",
+    rev = BRENN_POD_REV,
+)
+
+# The frame-log format the pod records into and the store the fetch brings home.
+# Named here for its `test-util` fixtures, which are the only writer of that
+# format: `//cogs:speech_run_report_test` writes a store with them and holds the
+# report's turn clips to what comes back out, and `//cogs:speech_run_report`
+# names the crate for the cause a clip's replay stopped for.
+#
+# A spec's features are a property of the package and not of the edge that
+# names it, so this turns `test-util` on for every consumer in the closure --
+# `speech-pipeline` and `speech-surface` both take the crate as an ordinary
+# dependency, so the voice host staged on the robot compiles the fixtures
+# module too. Today they are inert (no dependencies of their own, nothing
+# constructed at load), which is what makes the trade payable; what it costs is
+# that the upstream manifest's rule for the feature -- "never enabled in a
+# production build" -- is no longer true from this side, and nothing here
+# enforces it. A fixture builder that grows a dependency, a panic or an unsafe
+# helper lands in the robot's host binary.
+# TODO(pod-ingest-test-util-in-host): say so in the upstream manifest too.
+crate.spec(
+    features = ["test-util"],
+    git = BRENN_POD_GIT,
+    package = "pod-ingest",
     rev = BRENN_POD_REV,
 )
 

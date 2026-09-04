@@ -1731,13 +1731,16 @@ rust_clk_module(
 # `bazel run //cogs:speech_run_report -- <records>` over a fetched record pair.
 #
 # The console for what was asked and how the process fared, the channel log for
-# what the machine did. The log half is read through the same `:log_read`
+# what the machine did, and the recorded-audio store beside them, which it cuts
+# one `.wav` per turn out of into `<records>.turns` so a turn is listened to by
+# reading the line that names its file. The log half is read through the same `:log_read`
 # binding machinery the motion report uses, over three of the channels
 # `:motion_channels` names, and judges the head's movement by `:motion_evidence`
 # -- the one copy of the tolerances and the solver both analyzers share. It
 # depends on the edge and the host for the words the console is spelled with, so
 # the vocabulary it counts is the vocabulary those two emit rather than a copy
-# of it that drifts silently.
+# of it that drifts silently. `pod-ingest` is named for `SpliceStop`, the cause
+# a clip's replay stopped for, which the resolver hands back by that type.
 rust_binary(
     name = "speech_run_report",
     srcs = ["speech_run_report.rs"],
@@ -1758,7 +1761,9 @@ rust_binary(
         "//motion:reports_clk_rs",
         "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:pod-ingest",
         "@brenn_reachy_crates//:serde_json",
+        "@brenn_reachy_crates//:speech-pipeline",
     ],
 )
 
@@ -1767,6 +1772,11 @@ rust_binary(
 # head's own account over a channel log written by the framework's own writer.
 # The cases write a record pair into a scratch directory, which
 # `//crates/reachy-scratch` removes however a case ended.
+#
+# The clip cases need a store on disk and reach `pod-ingest`'s frame-log fixture
+# builders through the binary's own dependency on that crate: the writer that
+# produced every real store is the only thing that should write a fixture of
+# that format.
 rust_test(
     name = "speech_run_report_test",
     size = "small",

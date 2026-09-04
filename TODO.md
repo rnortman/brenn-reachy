@@ -991,3 +991,66 @@ own rather than a rider on one.
 Done = the detector judges a run against a predicted position, the crossed-run
 machinery is gone, and the model is fitted against a recorded reversal. Marked
 at the fresh-open arm of `tracking::look` in `crates/reachy-motion/src/tick.rs`.
+
+## `beam-gappy-segment-extent`
+
+Let a closed segment's range be the span of the pod's index space it actually
+covers. The run report attributes a turn whose span names no segment to the
+closed segment whose `[base_sample, base_sample + samples)` range holds the
+turn's carve. A segment with dropped samples in it spans more of the index space
+than it holds samples of — the assembler's own successor part anchors on the
+absolute index for exactly this reason — so such a segment's range stops short
+of its last sample, and a carve near its tail is held by nothing and prints its
+beam figure as missing.
+
+Deferral context: the console does not say how many samples were dropped.
+`segment_closed` carries `samples` (the assembled length) and `gap_count` (how
+many gaps, not how long they were), so the true extent is not computable from
+what the pipeline writes today; closing this means the pipeline stating the
+dropped count, which is another repository's wire and a design cycle of its own.
+The failure is a reading printed as missing rather than a wrong one, and every
+segment in the runs fetched so far has `gap_count: 0`.
+
+Done = a gappy segment's range covers its whole extent, and a carve in its tail
+reads a figure. Marked at `Closed::samples` in `cogs/speech_run_report.rs`.
+
+## `clip-one-pass-per-log`
+
+Cut a run's turn clips in one pass per frame log. The run report resolves each
+turn's carve on its own, and the resolver has no index to seek by: it decodes
+every record from the head of the log and stops when it reaches the span's end.
+Every turn of a session is carved from the same log, so turn *k* re-decodes what
+turns 1..k-1 already decoded, and the work is quadratic in the turns of a
+session. At the recorded store's configured cap — about 35 minutes, some 52,000
+frames — an eight-turn session decodes roughly 200,000 frames instead of 52,000.
+
+Deferral context: seconds, not minutes, at the session lengths run so far, and
+the report is on the `make speech-run` critical path where that cost is
+invisible. Closing it means splicing one pass into several output buffers, which
+is an entry point beside `AudioSpan::resolve` in the pipeline crate — another
+repository's public surface, and a pinned one — rather than anything this tool
+can do over the API it has. The ceiling grows as the square of the turns per
+session, which is the thing an acceptance run wants more of.
+
+Done = a run's clips cost one decode of each log they come out of. Marked at
+`cut` in `cogs/speech_run_report.rs`.
+
+## `pod-ingest-test-util-in-host`
+
+State, in the frame-log crate's own manifest, that its `test-util` feature is
+enabled from outside it. The feature's comment there says it is never enabled in
+a production build. This repository's dependency spec enables it — features are
+a property of the package, not of the edge naming it — so every consumer in the
+closure compiles the fixtures module, the voice host binary staged on the robot
+included. The fixtures are inert today, so the cost is only that the rule the
+upstream comment states is no longer the rule, and the next person to give a
+fixture builder a dependency or a panic has nothing telling them otherwise.
+
+Deferral context: the fix is one comment in the other repository, but that
+repository's revision is the one this repository's pin is about to name, and
+which revision is published and pinned is the operator's call rather than an
+implementer's. It rides on that move.
+
+Done = the frame-log crate's feature comment says who enables it and what
+carries the module, and this repository's spec comment agrees. Marked at the
+`pod-ingest` spec in `MODULE.bazel`.
