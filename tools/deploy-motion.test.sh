@@ -83,6 +83,11 @@ CONFIG
 # back on and every stamp assertion below the fallback reads.
 BUILD_COMMIT=""
 
+# The other half of the same record: which brenn-pod the payload's voice host
+# was linked from. Empty stages the line's absence, which is a payload from a
+# build script that wrote no such field, and the fallback below reads it.
+BUILD_POD=""
+
 stage_payload() {
 	local when=$1
 	local name
@@ -101,8 +106,11 @@ stage_payload() {
 	done
 	stage_logger_config
 	rm -f -- "${payload}/build-commit.txt"
-	[ -z "$BUILD_COMMIT" ] ||
+	if [ -n "$BUILD_COMMIT" ]; then
 		echo "commit=${BUILD_COMMIT}" >"${payload}/build-commit.txt"
+		[ -z "$BUILD_POD" ] ||
+			echo "brenn_pod=${BUILD_POD}" >>"${payload}/build-commit.txt"
+	fi
 	touch -d "@${when}" -- "${payload}/cogs/robot_clk_exe"
 }
 
@@ -723,6 +731,28 @@ assert_contains "so reading the log names the build, not the push" "$stamp" \
 	"git switch --detach ${BUILD_COMMIT}"
 assert_contains "and the push says both out loud" "$(output_of "$result")" \
 	"commit ${BUILD_COMMIT} (build), pushed from ${GIT_HEAD}"
+assert_contains "a payload that recorded no brenn-pod is stamped unknown" "$stamp" \
+	"brenn_pod=unknown"
+
+# The voice host is linked from brenn-pod, and this tree's commit says nothing
+# about which revision that was: a run's records are the only place that fact
+# survives, and the pushing tree's MODULE.bazel is where it stands now rather
+# than where it stood at the build. So the build records it and the push copies
+# it through, whichever of the two forms it took.
+BUILD_POD=97cd7889207f877538d001e56e930c68ff2ca699
+stage_payload "$after"
+result=$(deploy unit --push)
+assert_status "a push over a payload that names its brenn-pod succeeds" 0 \
+	"$(status_of "$result")"
+assert_contains "and the stamp carries the revision the voice host came from" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "brenn_pod=${BUILD_POD}"
+
+BUILD_POD="overlay:../brenn-pod/host/crates/speech-surface"
+stage_payload "$after"
+result=$(deploy unit --push)
+assert_contains "a payload built over a working tree says so, naming no revision" \
+	"$(cat -- "$PUSHED_PROVENANCE")" "brenn_pod=${BUILD_POD}"
+BUILD_POD=""
 
 # A build in a tree with no history records `unknown` rather than a guess, and
 # the push falls back the way it does for a payload that recorded nothing.
@@ -1859,6 +1889,14 @@ assert_contains "and names the analyzer of a speech run" "$(output_of "$result")
 assert_eq "and lands under the speech name" 1 \
 	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name 'speech-log-*' \
 		! -name '*.console' ! -name '*.audio' | wc -l)"
+# The whole composed command, not its pieces: the comparison is only meaningful
+# against the configuration the run was recorded under, and against the clips
+# beside the records just fetched.
+speech_fetched=$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d \
+	-name 'speech-log-*' ! -name '*.console' ! -name '*.audio')
+assert_contains "and the comparison over the report's clips after it" \
+	"$(output_of "$result")" \
+	"stt_compare -- --speech-config ${payload}/host/speech.toml ${speech_fetched}.turns"
 # The fetch on its own brings the audio too: a report wanted a second time is
 # read beside the clips it names, and this is the mode an operator reaches for
 # when the run's own terminal died.

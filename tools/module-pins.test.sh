@@ -43,7 +43,8 @@ module="${MODULE_PINS_FILE:-$(checkout_root)/MODULE.bazel}"
 
 # The packages this tree takes from brenn-pod. Named here rather than derived
 # from the file, so a spec that quietly loses its remote is a missing spec
-# rather than a package this suite stops looking for.
+# rather than a package this suite stops looking for. `tools/lib.sh` keeps its
+# own copy for the build's overlay reader; the two are held equal below.
 pod_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
 
 # Every `crate.spec` block, one tab-separated record each: package, git, rev,
@@ -132,6 +133,31 @@ fi
 # says must never read as agreement -- with nothing else in the gate noticing.
 assert_eq "the build's provenance line reads the same revision off this file" \
 	"$pinned" "$(pinned_pod_rev "$module")"
+
+# The build's other reader of these same blocks, held to this suite's parse of
+# them. `pod_overlay_path` answers a question this suite cannot answer for
+# itself -- an overlay is by construction uncommitted, the one state in which
+# the payload's stamp is the only record of which brenn-pod built it -- so the
+# two parsers can only be kept honest against each other: on a healthy file both
+# say there is no overlay, and on an overlaid one both name the same path.
+overlaid=-
+while IFS=$'\t' read -r pkg git rev path; do
+	case $pod_packages in
+	*" ${pkg} "*) ;;
+	*) continue ;;
+	esac
+	if [ "$path" != "-" ]; then
+		overlaid=$path
+		break
+	fi
+done <<<"$specs"
+
+assert_eq "the build's overlay reader agrees with this suite's parse" \
+	"$([ "$overlaid" = "-" ] || echo "$overlaid")" \
+	"$(pod_overlay_path "$module")"
+
+assert_eq "the build's overlay reader looks at the same four packages" \
+	"$pod_packages" "$pod_crate_packages"
 
 # The other half of the overlay, which leaves no `crate.spec` behind: a module
 # resolved from somewhere off this machine's remotes by an override. Every
@@ -317,6 +343,18 @@ if [ -z "${MODULE_PINS_FILE:-}" ]; then
 	} >"${fixtures}/other-override"
 	over_fixture "another module's override is not mistaken for one" \
 		"${fixtures}/other-override" 0 ""
+
+	# Negative case: some other crate resolved from a working tree. Nothing here
+	# is brenn-pod's, so this suite passes -- and the agreement assertion above
+	# is what holds the build's overlay reader to the same answer, because a
+	# stamp naming this path would name a tree the voice host was not built from
+	# and hide the pin that built it.
+	{
+		healthy_module
+		printf '\ncrate.spec(\n    package = "nalgebra",\n    path = "../nalgebra",\n)\n'
+	} >"${fixtures}/foreign-overlay"
+	over_fixture "another crate's working-tree path is not brenn-pod's" \
+		"${fixtures}/foreign-overlay" 0 ""
 fi
 
 tally

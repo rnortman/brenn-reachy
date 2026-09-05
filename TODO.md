@@ -848,8 +848,8 @@ attribution back with it. Marked at the host's copy in
 One argument grammar for the repo's binaries, instead of a hand-rolled `while
 let Some(word)` loop per binary.
 
-Deferral context: `reachy-motord`, `reachy-host` and `reachy-ask` each spell the
-same shape — the `main` that dispatches to `parse`/`run` and prints `prog:
+Deferral context: `reachy-motord`, `reachy-host` (twice: the host itself and
+`stt_compare`) and `reachy-ask` each spell the same shape — the `main` that dispatches to `parse`/`run` and prints `prog:
 message`, the word loop, a `given` bool per flag, and a `usage()` string. The
 refusal wording is operator-facing and already varies between the three for the
 same mistake, and the per-flag bool scales with the flag count in every copy.
@@ -866,10 +866,11 @@ shape wanted is a small table of `(flag, arity)` with once-only enforcement and
 one refusal vocabulary — a decision about a shared home and about whether an
 existing dependency already carries a parser worth adopting.
 
-Done = the three binaries parse their arguments through one helper and refuse
+Done = the four binaries parse their arguments through one helper and refuse
 the same mistake with the same words. Marked at the harness's copy in
-`crates/reachy-ask/src/main.rs` and at the host's in
-`crates/reachy-host/src/main.rs`.
+`crates/reachy-ask/src/main.rs`, at the host's in
+`crates/reachy-host/src/main.rs`, and at the comparison tool's in
+`crates/reachy-host/src/bin/stt_compare.rs`.
 
 ## `story-restart-discriminator`
 
@@ -1054,3 +1055,21 @@ implementer's. It rides on that move.
 Done = the frame-log crate's feature comment says who enables it and what
 carries the module, and this repository's spec comment agrees. Marked at the
 `pod-ingest` spec in `MODULE.bazel`.
+
+## `stt-compare-shared-drain`
+
+Call brenn-pod's published `speech_pipeline::transcribe_pcm` from `stt_compare`
+instead of reading the transcriber's stream a second time here.
+
+Deferral context: the voice host and this tool both hand a PCM buffer to a
+`Transcriber` and read the stream for its settled transcript, and the tool's
+whole claim is that it asks the recogniser the way production does. The reading
+now exists once in brenn-pod, beside the trait whose stream contract it applies,
+but the revision this repository pins predates it — which revision is published
+and pinned is the operator's call rather than an implementer's, so it rides on
+that move. Until then the copy here settles on the first final event exactly as
+the shared one does; what remains is that the agreement is by hand.
+
+Done = `stt_compare` has no stream loop of its own, and `futures` is named by
+this repository only if something else still needs it. Marked at `transcribe` in
+`crates/reachy-host/src/bin/stt_compare.rs`.

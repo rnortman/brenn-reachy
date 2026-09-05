@@ -534,10 +534,23 @@ assert_file "the logger process description is staged" \
 # of. A payload built here and pushed from another checkout would otherwise be
 # stamped with the pushing tree's HEAD, which never produced it, and the
 # freshness refusal there only turns away a payload that is too old.
+#
+# One field at a time, the way `deploy-motion.sh` reads the file: the stamp
+# carries a second line naming the brenn-pod side, and a whole-file comparison
+# would make every case here fail on a field it is not about.
+stamped_field() {
+	sed -n "s/^$1=//p" -- "${payload}/build-commit.txt"
+}
+
 assert_file "the payload names the commit it was built from" \
 	"${payload}/build-commit.txt"
-assert_eq "and it is the commit the tree was at" "commit=${GIT_HEAD}" \
-	"$(cat -- "${payload}/build-commit.txt")"
+assert_eq "and it is the commit the tree was at" "${GIT_HEAD}" \
+	"$(stamped_field commit)"
+
+# This fixture tree has no MODULE.bazel until a later case writes one, so the
+# absent-file answer is the one under test here.
+assert_eq "a tree with no MODULE.bazel names no brenn-pod either" "unknown" \
+	"$(stamped_field brenn_pod)"
 
 # A tree with no history is not a build refusal — provenance is the push's
 # refusal to make — but it is not a guess either.
@@ -545,8 +558,8 @@ GIT_HEAD=""
 result=$(build)
 assert_status "a build in a tree that cannot state its commit succeeds" 0 \
 	"$(status_of "$result")"
-assert_eq "and says so rather than naming one" "commit=unknown" \
-	"$(cat -- "${payload}/build-commit.txt")"
+assert_eq "and says so rather than naming one" "unknown" \
+	"$(stamped_field commit)"
 GIT_HEAD=0123456789abcdef0123456789abcdef01234567
 result=$(build)
 assert_status "and the stamped build is back" 0 "$(status_of "$result")"
@@ -763,7 +776,49 @@ assert_status "and the default is back" 0 "$(status_of "$result")"
 module_pin="${repo}/MODULE.bazel"
 stage_module_pin() { printf 'BRENN_POD_REV = "%s"\n' "$1" >"$module_pin"; }
 
+# The overlay the pin's own comment block describes: a spec resolved from a
+# working tree beside the checkout. The pin line stays -- that is the whole
+# reason the stamp asks about the overlay first -- and a commented `path =` for
+# another dependency sits above it, because a line reader that took one would
+# name a tree nothing was built from.
+stage_module_overlay() {
+	cat >"$module_pin" <<'OVERLAY'
+# local_path_override(
+#     module_name = "rusty_cogs",
+#     path = "../rusty-cogs",
+# )
+
+BRENN_POD_REV = "0000000000000000000000000000000000000000"
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+OVERLAY
+}
+
 other_rev=fedcba9876543210fedcba9876543210fedcba98
+
+# Somebody else's crate resolved from a working tree, with the brenn-pod specs
+# still on the pin. Most of the twenty specs in the real file are of this kind,
+# and a reader that took the first `path =` it saw would stamp a tree the voice
+# host was not built from while hiding the revision that built it.
+stage_module_overlay_foreign() {
+	cat >"$module_pin" <<OVERLAY
+BRENN_POD_REV = "${other_rev}"
+
+crate.spec(
+    package = "nalgebra",
+    path = "../nalgebra",
+)
+
+crate.spec(
+    git = BRENN_POD_GIT,
+    package = "speech-surface",
+    rev = BRENN_POD_REV,
+)
+OVERLAY
+}
 
 # No MODULE.bazel at all: this fixture tree has none until the next case writes
 # one.
@@ -780,6 +835,44 @@ assert_contains "a pin this cannot read is named as unreadable" \
 	"$(output_of "$result")" "states no BRENN_POD_REV this can read"
 assert_lacks "and is not reported as a missing file" \
 	"$(output_of "$result")" "there is no MODULE.bazel"
+assert_eq "and the stamp cannot name a brenn-pod either" "unknown" \
+	"$(stamped_field brenn_pod)"
+
+# The overlay: the payload's speech crates came out of a working tree, so no
+# published revision names those binaries and the pin that is still in the file
+# would name one that does not.
+stage_module_overlay
+result=$(build)
+assert_status "a build over an overlaid spec succeeds" 0 "$(status_of "$result")"
+assert_eq "and the stamp names the tree the crates came from" \
+	"overlay:../brenn-pod/host/crates/speech-surface" "$(stamped_field brenn_pod)"
+
+# The same file shape with the working tree belonging to some other crate: the
+# voice host still came from the pinned revision, and that is what the stamp has
+# to say.
+stage_module_overlay_foreign
+result=$(build)
+assert_status "a build over another crate's overlay succeeds" 0 \
+	"$(status_of "$result")"
+assert_eq "and the stamp names the pin, not that crate's tree" "$other_rev" \
+	"$(stamped_field brenn_pod)"
+
+# A spec written compactly rather than one attribute per line. The overlay is
+# the state where the stamp is the only record, so a wrong answer here reads
+# as authoritative; the reader refuses rather than silently missing the spec.
+stage_module_overlay_compact() {
+	cat >"$module_pin" <<OVERLAY
+BRENN_POD_REV = "${other_rev}"
+
+crate.spec(package = "speech-surface", path = "../brenn-pod/host/crates/speech-surface")
+OVERLAY
+}
+
+stage_module_overlay_compact
+result=$(build)
+assert_status "a build over a compact spec succeeds" 0 "$(status_of "$result")"
+assert_eq "and the stamp refuses rather than naming the pin that did not build it" \
+	"unknown" "$(stamped_field brenn_pod)"
 
 # A pin, and a checkout that answers no revision -- an unpacked archive, or a
 # tree somebody copied out of one.
@@ -815,8 +908,10 @@ assert_lacks "the answer is brenn-pod's tree's, not this one's" \
 	"$(output_of "$result")" "${GIT_HEAD:0:12}"
 # The same build's stamp names this tree, so the two questions demonstrably went
 # to two directories.
-assert_eq "while the build stamp names this tree" "commit=${GIT_HEAD}" \
-	"$(cat -- "${payload}/build-commit.txt")"
+assert_eq "while the build stamp names this tree" "${GIT_HEAD}" \
+	"$(stamped_field commit)"
+assert_eq "and the pin beside it, which is the other half of the payload" \
+	"$POD_GIT_HEAD" "$(stamped_field brenn_pod)"
 
 # The pin and the checkout agreeing and the binary older than that commit: the
 # case the agreement hides, because a pull or a pin bump moves HEAD and leaves

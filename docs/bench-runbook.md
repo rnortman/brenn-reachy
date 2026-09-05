@@ -16,15 +16,15 @@ rules: `docs/fault-management.md`.
       REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
       REACHY_HOST_PARAMS ?= /elsewhere/reachy00/host_params.textproto
 
-  Only make reads the file — it is not shell syntax, so for the `ssh` lines
-  below `export REACHY_HOST=reachy00` in your shell as well.
+  Only make reads the file, and it is not shell syntax: for the `ssh` lines
+  below, `export REACHY_HOST=reachy00` too.
 - **`.local/reachy-bench.toml`** (`BENCH_CONFIG=` overrides): start from
   `crates/reachy-bench/reachy-bench.example.toml`, fill in `[bus]`'s serial
   node.
 - **A sibling brenn-pod checkout** (`BRENN_POD_DIR=<path>` otherwise), doing
   double duty: `make motion-build` stages its prebuilt audio binary — build it
-  once with `make -C ../brenn-pod/firmware reachy-pod`, or name the artifact
-  with `REACHY_POD_BINARY=<path>` — and `make speech-run` invokes its
+  once with `make -C ../brenn-pod/firmware reachy-pod`, or name it with
+  `REACHY_POD_BINARY=<path>` — and `make speech-run` invokes its
   provisioning for the pod's half of the voice link.
 - For a speech run, the mic array plugged in.
 
@@ -33,7 +33,7 @@ rules: `docs/fault-management.md`.
 | | |
 |---|---|
 | `target/motion-arm64/release/` | the staged payload |
-| `.local/motion-logs/`, `.local/speech-logs/` | fetched runs, one timestamped directory each, a `.console` beside it, `provenance.txt` naming the build |
+| `.local/motion-logs/`, `.local/speech-logs/` | fetched runs, one timestamped directory each with a `.console`, and `provenance.txt` naming the build: this tree's commit and the brenn-pod revision (or `overlay:` tree) behind it |
 | `/run/brenn-app/releases/motion/` | the payload, and every process's working directory |
 | `/run/brenn-app/logs/motion/`, `logs/launch/` | `.olog` directories; per-process consoles |
 | `/run/brenn-app/conf/audio.conf` | the pod's link credentials, brenn-pod's to write |
@@ -64,8 +64,8 @@ motion daemon and takes the bus back.
     make bench-fetch
 
 `bench-run` builds first, so it cannot run a binary older than your tree;
-`--stale-ok` first after `--run` runs an old one deliberately. An unexpected
-reading goes to a person before anything is made green.
+`--stale-ok` first after `--run` runs an old one deliberately. An unexpected reading
+goes to a person before anything is made green.
 
 ## The motion test
 
@@ -90,7 +90,7 @@ stops the run; the driver de-torques on the way out.
 The build and push are a motion run's. The provision step is brenn-pod's
 `reachy-provision`, run for you every time: `audio.conf` is tmpfs, so a
 rebooted unit needs it again and no command of yours says so;
-`make speech-provision` runs that step alone. The far end is the production
+`make speech-provision` runs it alone. The far end is the production
 launcher config, which adds the voice host and the audio device, and there is
 no budget: you end the run with Ctrl-C, so a non-terminal stdin is refused
 before anything is provisioned or built.
@@ -101,7 +101,7 @@ outside this tree and named by `REACHY_SPEECH_CONFIG`. It names them by the
 `pod_psk_file = "secrets/pod-psk.toml"`, the file at
 `<assembly>/secrets/pod-psk.toml` — because the host resolves from the payload
 root; an absolute path is a refused build. The build stages each at 0600; the
-push refuses one rotated since. Shape only, the values being a site's own:
+push refuses one rotated since. Shape only; a site's own values:
 loopback `listen_addr`; `[stt]`/`[tts]` URLs reachable *from the robot*, never
 `localhost`; `[brenn.bridge]`'s `wss://` URL and `token_file`, absent for a
 valid bus-less pipeline; four model paths spelling the staged `models/...`
@@ -109,8 +109,8 @@ names; `[jsonl] sink = "stdout"`, so the pipeline's events ride
 `voice_host_0.log` home.
 
 Talk to it, then Ctrl-C. However the launcher ends, the run is fetched and
-`speech_run_report` judges it — why it ended is the report's question. A run
-that recorded no channels is fetched too: its console is the evidence.
+`speech_run_report` judges it; why it ended is the report's question. A run
+that recorded no channels is fetched too, its console the evidence.
 
 ## Exit codes
 
@@ -137,4 +137,5 @@ sentinel once past its last refusal.
   turn a fold leaves. Never widen that bound.
 - **A log recorded before a schema append cannot be read by a later build.**
   This reader binds schemas by byte equality and declares no evolution history.
-  Analyze a run with the build that recorded it; `provenance.txt` names it.
+  Analyze a run with the build that recorded it; `provenance.txt` names both
+  sides.

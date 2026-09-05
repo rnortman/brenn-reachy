@@ -435,6 +435,102 @@ pinned_pod_rev() {
 		head -n 1
 }
 
+# The packages this tree takes from brenn-pod, space-padded for a substring
+# test. Named here rather than derived from the file, so a spec that quietly
+# loses its remote is a missing spec rather than a package this stops looking
+# for. `tools/module-pins.test.sh` keeps its own copy of the list and holds the
+# two equal, so a package added on one side alone is a failed case.
+pod_crate_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
+
+# The working tree a `crate.spec` resolves from, when one does.
+#
+#   pod_overlay_path <MODULE.bazel path>
+#
+# The overlay form the developing-a-seam block above `BRENN_POD_REV` describes:
+# a spec's `git`/`rev` pair replaced by `path = "../brenn-pod/<crate path>"`.
+# An overlaid tree keeps its `BRENN_POD_REV` line, so the pin alone would name a
+# revision the binaries did not come from; this is the question that tells the
+# two apart, and it is asked first.
+#
+# The first uncommented `path =` inside a `crate.spec(` … `)` block whose
+# `package` is one of brenn-pod's, and empty when there is none. A line reader
+# over the literals a person typed, like the self-check's: commented text is not
+# a spec attribute, and a `path =` outside a spec belongs to some other
+# dependency's override. The package decides, because most of the twenty specs
+# in the file are somebody else's crate: an overlaid `nalgebra` says nothing
+# about which brenn-pod the voice host was built from, and a field that named it
+# would hide the pin that did build it.
+#
+# The whole block is read to its closing paren before it answers, so the
+# attribute order inside a spec cannot hide either key.
+#
+# The block form -- `crate.spec(` alone on its line, one attribute per line --
+# is a precondition, and a spec written any other way is refused rather than
+# read past: a compact `crate.spec(package = "…", path = "…")` would otherwise
+# be invisible here and the payload would be stamped with the pin that did not
+# build it, which reads as authoritative where `unknown` reads as "cannot tell".
+# A nonzero status is that refusal; the printed answer stays empty.
+pod_overlay_path() {
+	awk -v packages="$pod_crate_packages" -- '
+		/^[ \t]*#/ { next }
+		/crate\.spec\(/ && !/^crate\.spec\($/ { exit 2 }
+		/^crate\.spec\($/ { inspec = 1; pkg = ""; path = ""; next }
+		inspec && /^\)/ {
+			if (path != "" && index(packages, " " pkg " ")) {
+				print path
+				exit
+			}
+			inspec = 0
+			next
+		}
+		inspec && /^[ \t]*path[ \t]*=[ \t]*"/ {
+			path = $0
+			sub(/^[^"]*"/, "", path)
+			sub(/".*/, "", path)
+		}
+		inspec && /^[ \t]*package[ \t]*=[ \t]*"/ {
+			pkg = $0
+			sub(/^[^"]*"/, "", pkg)
+			sub(/".*/, "", pkg)
+		}
+	' "$1" 2>/dev/null
+}
+
+# Which brenn-pod the payload's voice host was built from, as one field value.
+#
+#   pod_build_source <MODULE.bazel path>
+#
+# `overlay:<path>` when a spec resolves from a working tree, the pinned revision
+# when they resolve from the remote, and `unknown` when the file is absent, when
+# it states a pin in a form `pinned_pod_rev` cannot read, or when it writes a
+# `crate.spec` in a form `pod_overlay_path` refuses. The overlay is checked
+# first because an overlaid tree still carries the pin line, and its refusal is
+# taken as the whole answer: a file whose specs cannot be read cannot be said to
+# resolve from the remote either.
+#
+# This is a record and not a warning: `pod_provenance` above already says at
+# build time whether the checkout beside this tree stands at the pin. What that
+# line cannot do is survive into a run's records, where an operator reading a
+# fetched run months later has nothing else to tell a pre-fix payload from a
+# post-fix one.
+pod_build_source() {
+	local module=$1 overlay pinned
+	[ -f "$module" ] || {
+		echo unknown
+		return
+	}
+	overlay=$(pod_overlay_path "$module") || {
+		echo unknown
+		return
+	}
+	if [ -n "$overlay" ]; then
+		echo "overlay:${overlay}"
+		return
+	fi
+	pinned=$(pinned_pod_rev "$module")
+	echo "${pinned:-unknown}"
+}
+
 # What a payload's two halves of brenn-pod are, said in one line.
 #
 #   pod_provenance

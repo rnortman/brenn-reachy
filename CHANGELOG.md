@@ -41,6 +41,20 @@ Nothing has been released, and nothing here has driven a motor.
   A mismatch is an unheld conclusion, which `make speech-run` refuses on (exit
   11) before anything is provisioned.
 
+- **Offline STT comparison for wake-trim tuning.** `stt_compare` transcribes
+  both clips a run's turns export — the whole carve and the carve from the
+  wake-trim boundary — through the same recogniser and request the pipeline
+  uses, and prints the two readings side by side with a count of turns that
+  differ. It runs offline from a fetched run, so measuring whether keeping the
+  wake word improves recognition costs no extra on-device time.
+  `make speech-run` prints the invocation after fetching records.
+
+- **Async-runtime quarantine gate.** `tokio-quarantine.test.sh` queries the
+  build graph for every target that reaches `tokio` and holds the answer to an
+  allowlist: the voice host, the filegroups that ship it, and the offline run
+  report. A crate on the motion or control path that grows a transitive runtime
+  edge now fails `make check` instead of shipping a runtime to a unit.
+
 - **Every payload build says which two brenn-pod revisions it is made of** — the
   revision `MODULE.bazel` pins for the crates the host links, and the one the
   brenn-pod checkout stands at, with the staged audio-device binary's age
@@ -117,6 +131,20 @@ Nothing has been released, and nothing here has driven a motor.
   directly. The summary counts dispatched and declined turns and prints the
   `no_speech` range for each group, which is the reading that says whether audio
   quality degraded across a session.
+
+- **The run report exports the clip the recogniser actually heard.** A turn
+  whose records state the wake-trim boundary now gets a second file beside its
+  whole carve, `turn-NN.command.wav`, holding the span from that boundary
+  onward. The turn line states both offsets: where the wake word ends and where
+  transcription began. A wake the listener held back for its command says so on
+  the turn line, and a held wake that no command answered is counted apart from
+  a wake nobody followed at all.
+
+- **A run's records name the brenn-pod the voice host was built from.** The
+  payload's `build-commit.txt` and the `provenance.txt` a fetched run carries
+  home gain a `brenn_pod=` line: the pinned revision, or `overlay:<path>` where
+  the build resolved the speech crates from a local working tree rather than a
+  published revision.
 
 - **Deploy fetches recorded audio alongside console logs.** `make speech-run`
   now brings back the frame-log recording store as `<run>.audio` after each

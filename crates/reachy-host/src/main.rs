@@ -144,8 +144,8 @@ fn main() -> ExitCode {
 /// configuration when an operator meant a unit's own would answer to the wrong
 /// pod name.
 ///
-/// One of three copies of this argument-parsing shape; the driver and the
-/// harness carry the others.
+/// One of four copies of this argument-parsing shape; the driver, the harness
+/// and the clip comparison carry the others.
 /// TODO(cli-argv-shared)
 fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options::default();

@@ -28,8 +28,30 @@ with nothing said after it is rightly declined.
 ## Listening to a turn
 
 The turn line names its `.wav` under `<run>.turns/`. The clip is the whole
-carve, wake word included; `STT from +N s` is where the recogniser began.
-`clip not written (…)` says why.
+carve, wake word included. Beside it, `turn-NN.command.wav` holds the same span
+from the wake-trim boundary, where the boundary was known. The line states both
+offsets: `STT boundary +N s` is where the wake word ends, `sent from +M s` is
+where transcription actually began. The two are equal under `[stt] wake_word =
+"trim"`, and that is the run in which the second file is what the recogniser was
+given; under `"keep"` the second offset is zero and the recogniser was given the
+whole first file. `clip not written (…)` says why there is no file, and `no
+turn-NN.command.wav (…)` says why only the second one is missing.
+
+`held up to N s for the command` on a turn line says the wake word arrived
+alone and the listener kept the wake open for the command that followed. A wake
+that was held and never answered is counted on its own line.
+
+To ask which of the two clips reads better, hand both to the recogniser:
+
+```
+bazel run //crates/reachy-host:stt_compare -- \
+    --speech-config <the speech.toml the run used> <run>.turns
+```
+
+One line per turn with both transcripts and their confidence figures, and a
+count of the turns that read differently once case and punctuation are folded
+away. It dials the recogniser the configuration names, so it is the one tool
+here that is not offline; a turn with no second clip is listed and not asked.
 
 ## The chip
 

@@ -235,7 +235,7 @@ crate.spec(
 # so a fork, a mirror or a bump cannot reach some of them and not the rest.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "97cd7889207f877538d001e56e930c68ff2ca699"
+BRENN_POD_REV = "b8e1c21a1bcf90b17cd45fc44a020cf61baa761c"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
@@ -301,7 +301,9 @@ crate.spec(
     rev = BRENN_POD_REV,
 )
 
-# The async runtime the voice host runs on. Quarantined to that binary -- the
+# The async runtime the voice host runs on, named by reachy-host alone and
+# reached by the offline run report through the host library. The set of targets
+# allowed to reach it at all is held by tools/tokio-quarantine.test.sh -- the
 # motion and control stack is sans-I/O and async-free. reachy-host.
 crate.spec(
     features = [
@@ -318,6 +320,16 @@ crate.spec(
     ],
     package = "tokio",
     version = "1",
+)
+
+# Stream combinators for consuming transcriber output. stt_compare. Default
+# features off, `std` on: the bundled executor is not wanted (`tokio` runs
+# futures in this tree); `std` is what the boxed stream type needs.
+crate.spec(
+    default_features = False,
+    features = ["std"],
+    package = "futures",
+    version = "0.3",
 )
 
 # The inference backend the wake and VAD stages run on, and the TLS stack the

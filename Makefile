@@ -205,8 +205,10 @@ BAZEL_FLAGS ?=
 # needs bazel asks for this first and gets the same explanation, rather than each
 # one carrying its own copy.
 #
-# tools/build-bench.sh carries the one deliberate second copy: it is a script
-# run outside make, and its REACHY_BAZEL knob gives it a third line to say.
+# A script that is run outside make cannot ask for it, so it carries the refusal
+# itself: tools/build-bench.sh (whose REACHY_BAZEL knob gives it a third line to
+# say) and tools/tokio-quarantine.test.sh. That is the rule, not a budget — a new
+# bazel-needing script run outside make copies these two lines too.
 .PHONY: require-bazel
 require-bazel:
 	@command -v bazel >/dev/null 2>&1 || { \

@@ -20,7 +20,10 @@ rust_library(
     name = "reachy_host_lib",
     srcs = glob(
         ["src/**/*.rs"],
-        exclude = ["src/main.rs"],
+        exclude = [
+            "src/main.rs",
+            "src/bin/*.rs",
+        ],
     ),
     compile_data = ["//host:host_config_clk_proto.proto"],
     crate_name = "reachy_host",
@@ -104,6 +107,34 @@ rust_test(
         ":reachy_host_lib",
         ":speech_fixture",
     ],
+)
+
+# Offline with/without-wake-word comparison over a fetched run's turn clips.
+#
+# In this package rather than `//cogs` because it needs `HttpTranscriber` and
+# `tokio`, both already here. It talks to the network, so it is separate from
+# the report (which must stay offline).
+rust_binary(
+    name = "stt_compare",
+    srcs = ["src/bin/stt_compare.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":reachy_host_lib",
+        "@brenn_reachy_crates//:futures",
+        "@brenn_reachy_crates//:speech-pipeline",
+        "@brenn_reachy_crates//:speech-surface",
+        "@brenn_reachy_crates//:tokio",
+    ],
+)
+
+# Separate test target: a binary's root is its own crate, invisible to the
+# package's other tests. No network; cases use a scripted recogniser.
+rust_test(
+    name = "stt_compare_test",
+    size = "small",
+    crate = ":stt_compare",
+    deps = ["//crates/reachy-scratch:reachy_scratch"],
 )
 
 # The configuration parse, the intent queue, and the two motion seams the voice

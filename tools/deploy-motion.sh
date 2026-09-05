@@ -721,16 +721,22 @@ fetch_records() {
 # nothing: the whole point of the file is that a fetched log names its build.
 stamp_provenance() {
 	local into=$1 age_unchecked=$2
-	local pushed_from dirty built commit commit_source
+	local pushed_from dirty built commit commit_source brenn_pod
 	pushed_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || pushed_from=
 	[ -n "$pushed_from" ] ||
 		die "this tree cannot state its own commit, so a push from it could not say which build ran." \
 			"Every fetched records directory carries that commit, because a log is only" \
 			"readable by the build that recorded it. Push from a checkout with history."
 	built=
+	brenn_pod=
 	if [ -f "${payload}/${build_commit_name}" ]; then
 		built=$(sed -n 's/^commit=//p' -- "${payload}/${build_commit_name}")
+		brenn_pod=$(sed -n 's/^brenn_pod=//p' -- "${payload}/${build_commit_name}")
 	fi
+	# A payload staged by a build that recorded no brenn-pod field: an older
+	# build script. Nothing here can work the value out — this tree's
+	# MODULE.bazel is where it stands now, not where it stood at the build.
+	brenn_pod=${brenn_pod:-unknown}
 	case $built in
 	'' | unknown)
 		# A payload staged by a build that recorded nothing — an older
@@ -773,8 +779,15 @@ stamp_provenance() {
 # not known. age_unchecked=yes means the push skipped the refusal that compares
 # the payload's age against the newest commit, so the payload may predate that
 # commit.
+#
+# brenn_pod is the other half of what built the voice host: the brenn-pod
+# revision the payload's build resolved its speech crates from. A value starting
+# overlay: means they came out of a working tree beside the building checkout
+# rather than a published revision, so no revision names those binaries. unknown
+# means the payload was staged by a build that recorded no such field.
 commit=${commit}
 commit_source=${commit_source}
+brenn_pod=${brenn_pod}
 pushed_from=${pushed_from}
 dirty=${dirty}
 age_unchecked=${age_unchecked}
@@ -1623,6 +1636,11 @@ case "$mode" in
 		log_root=$(config_string log_root_dir)
 		out=$(fetch_records "$dest" "$log_root" speech-log speech)
 		echo "${prog}: read it: bazel run //cogs:speech_run_report -- ${out}"
+		# Named after the report: the comparison reads the clips the report
+		# writes. The staged config is the one the run was recorded under.
+		echo "${prog}: compare what the recogniser hears with and without the wake word:" \
+			"bazel run //crates/reachy-host:stt_compare --" \
+			"--speech-config ${payload}/${speech_config_path} ${out}.turns"
 		;;
 
 	*) usage ;;

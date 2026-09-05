@@ -422,10 +422,20 @@ resolve_speech_credentials() {
 # A tree with no history for it says `unknown` rather than guessing: a build is
 # not the place to refuse over provenance, and the push is where a stamp that
 # cannot name a build says so.
+#
+# The commit is only half of what produced the payload. The voice host is linked
+# from brenn-pod at the revision `MODULE.bazel` pins, or from a working tree
+# beside this one under the overlay the pin's comment block describes, and this
+# tree's commit says nothing about either. So a second line names it:
+# `brenn_pod=<revision>`, `brenn_pod=overlay:<path>` when the binaries came out
+# of a working tree rather than a published revision, or `brenn_pod=unknown`.
 stamp_build_commit() {
 	local into=$1 commit
 	commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || commit=
-	printf 'commit=%s\n' "${commit:-unknown}" >"$into"
+	{
+		printf 'commit=%s\n' "${commit:-unknown}"
+		printf 'brenn_pod=%s\n' "$(pod_build_source "${repo_root}/MODULE.bazel")"
+	} >"$into"
 }
 
 # Build the payload directory from scratch every time. Removed rather than

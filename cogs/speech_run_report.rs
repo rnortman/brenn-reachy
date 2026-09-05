@@ -220,6 +220,18 @@ const BRAIN_NO_TRANSCRIPT: &str = "brain_no_transcript";
 const STT_FAILED: &str = "stt_failed";
 const UTTERANCE_SUPERSEDED: &str = "utterance_superseded";
 
+/// The wake that was kept back for the command it introduces.
+///
+/// Emitted where an utterance held the wake word alone: nothing is transcribed
+/// and no utterance is minted, and the next speech inside the wait is carved
+/// together with it. A turn carrying this line began further back than its own
+/// onset, and a wake that ends `arm_expired` carrying it waited for a command
+/// that never came -- which is a different failure from a wake nobody followed.
+const WAKE_HELD: &str = "wake_held";
+
+/// The reason word a wake goes unanswered under when its arm ran out.
+const ARM_EXPIRED: &str = "arm_expired";
+
 /// The events about a reply already playing: what cut it, and how long it ran.
 ///
 /// `barge_in` names no utterance — it is the moment somebody spoke over the
@@ -441,6 +453,28 @@ struct Spoken {
     span: Span,
 }
 
+/// A wake kept back for its command: the span held so far, and how long the
+/// listener was prepared to wait past it.
+///
+/// The deadline is a budget and not an observation -- a command arriving ends
+/// the wait early, and says so by the turn dispatching at all -- so the turn
+/// line reads it as an upper bound.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Held {
+    start_sample: Option<i64>,
+    end_sample: Option<i64>,
+    deadline_sample: Option<i64>,
+}
+
+impl Held {
+    /// How long the listener was prepared to wait past the held speech, in
+    /// seconds, where both ends of the wait were stated.
+    fn waited_s(self) -> Option<f64> {
+        let (end, deadline) = (self.end_sample?, self.deadline_sample?);
+        Some((deadline - end) as f64 / f64::from(speech_pipeline::SPINE_FORMAT.sample_rate_hz))
+    }
+}
+
 /// One event of the utterance lifecycle, read by field.
 ///
 /// The fourth variant group [`Line`] holds another repo's schema for, grouped
@@ -458,8 +492,17 @@ enum Turned {
     /// A pod's connection announced itself, fencing the sample-index space
     /// every line before it counted in off from every line after it.
     Connected,
+    /// The wake was kept back for the command that follows it.
+    Held(Held),
     /// The transcript itself.
-    Said(Box<Spoken>),
+    Said {
+        spoken: Box<Spoken>,
+        /// How many samples at the head of the carve the recogniser was not to
+        /// be given, and where it was actually started. Not what was said, so
+        /// not on [`Spoken`].
+        stt_trim: Option<i64>,
+        stt_sent_from: Option<i64>,
+    },
     /// The turn reached the brain.
     Dispatched { id: Option<u64> },
     /// The gate declined it, in its own word, with the two numbers it judged on.
@@ -617,6 +660,14 @@ enum Outcome {
     SttFailed(String),
 }
 
+/// The suffix on a turn's whole-carve clip. These two names are the contract
+/// between the report and `//crates/reachy-host:stt_compare`;
+/// `the_two_clip_names_are_the_pair_the_comparison_looks_for` pins them.
+const WHOLE_SUFFIX: &str = ".wav";
+
+/// The suffix on the same turn's recogniser-facing clip.
+const COMMAND_SUFFIX: &str = ".command.wav";
+
 /// What one turn is called, in the two places it is named.
 ///
 /// One value with two spellings rather than two spellings decided apart: the
@@ -641,12 +692,24 @@ impl Label {
         }
     }
 
+    /// The turn's own token, which both of its clip names are built from.
+    fn stem(self) -> String {
+        match self {
+            Self::Utterance(id) => format!("turn-{id:02}"),
+            Self::Wake(ordinal) => format!("turn-wake-{ordinal}"),
+        }
+    }
+
     /// What the turn's clip is called.
     fn file_name(self) -> String {
-        match self {
-            Self::Utterance(id) => format!("turn-{id:02}.wav"),
-            Self::Wake(ordinal) => format!("turn-wake-{ordinal}.wav"),
-        }
+        format!("{}{WHOLE_SUFFIX}", self.stem())
+    }
+
+    /// What the same turn's recogniser-facing clip is called: the carve from
+    /// the wake-trim boundary, as a sibling of the whole one so a pairing is a
+    /// name and never a record to parse.
+    fn command_file_name(self) -> String {
+        format!("{}{COMMAND_SUFFIX}", self.stem())
     }
 }
 
@@ -690,10 +753,18 @@ struct Turn {
     /// How many times what was left of that reply was thrown away.
     flushed: usize,
     /// How many samples at the head of the carve the recogniser was not given,
-    /// where a line of this turn said. Known on a decline and unstated on a
-    /// dispatch, so the clip fragment says where the recogniser began only
-    /// where the console did.
+    /// where a line of this turn said. Carried by both the decline lines and
+    /// the utterance line, so the clip fragment states the boundary on a
+    /// dispatched turn as well as on a declined one.
     stt_trim: Option<i64>,
+    /// Which sample of the carve the recogniser was actually started at, where
+    /// the utterance line said. Equal to [`Turn::stt_trim`] where the wake word
+    /// was cut out of the clip and zero where it was left in, which is the one
+    /// record of which way the run was configured.
+    stt_sent_from: Option<i64>,
+    /// The wake this turn opened with was kept back for its command, where the
+    /// console said so.
+    held: Option<Held>,
 }
 
 impl Turn {
@@ -1195,7 +1266,11 @@ impl Console {
             // was counted in: nothing read afterwards answers for a turn from
             // before it, and nothing before answers for a turn after.
             Turned::Connected => self.connection = self.connection.saturating_add(1),
-            Turned::Said(spoken) => {
+            Turned::Said {
+                spoken,
+                stt_trim,
+                stt_sent_from,
+            } => {
                 let at = self.turn_for(spoken.id);
                 let turn = &mut self.turns[at];
                 let mut span = spoken.span;
@@ -1204,6 +1279,20 @@ impl Console {
                     turn.pod = spoken.pod.clone();
                 }
                 turn.said = Spoken { span, ..*spoken };
+                turn.stt_trim = turn.stt_trim.or(stt_trim);
+                turn.stt_sent_from = turn.stt_sent_from.or(stt_sent_from);
+            }
+            // No utterance was minted, so there is no id to join on and no
+            // open turn to consume: the hold belongs to the wake still standing,
+            // and the command's own utterance line has yet to land on it. With no
+            // wake standing this console never saw the wake line the hold belongs
+            // to, and no other turn answers for it -- writing it onto whichever
+            // turn came last would grow a fragment, and a tally, on a turn that
+            // was never held.
+            Turned::Held(held) => {
+                if let Some(at) = self.open_turn {
+                    self.turns[at].held = Some(held);
+                }
             }
             Turned::Dispatched { id } => {
                 let at = self.turn_for(id);
@@ -2352,7 +2441,16 @@ fn turned(event: &str, object: &serde_json::Map<String, Value>) -> Option<Turned
             wake_end_sample: whole(object, "wake_end_sample"),
         },
         CONN_HELLO => Turned::Connected,
-        UTTERANCE => Turned::Said(Box::new(spoken(object))),
+        WAKE_HELD => Turned::Held(Held {
+            start_sample: whole(object, "start_sample"),
+            end_sample: whole(object, "end_sample"),
+            deadline_sample: whole(object, "deadline_sample"),
+        }),
+        UTTERANCE => Turned::Said {
+            spoken: Box::new(spoken(object)),
+            stt_trim: whole(object, "stt_trim_samples"),
+            stt_sent_from: whole(object, "stt_sent_from_sample"),
+        },
         BRAIN_DISPATCHED => Turned::Dispatched { id },
         WAKE_COMMAND_ABSENT | BARGE_COMMAND_ABSENT => Turned::Declined {
             id,
@@ -3047,6 +3145,12 @@ fn turn_line(console: &Console, clips: &Clips, at: usize) -> String {
     if !turn.said.endpoint_cause.is_empty() {
         line.push_str(&format!("; endpoint {}", quote(&turn.said.endpoint_cause)));
     }
+    if let Some(held) = turn.held {
+        line.push_str(&match held.waited_s() {
+            Some(waited) => format!("; held up to {waited:.1} s for the command"),
+            None => "; held for the command".to_owned(),
+        });
+    }
     for (count, what) in [
         (turn.superseded, "superseded"),
         (turn.barge_ins, "barge-in"),
@@ -3087,11 +3191,15 @@ fn clip(console: &Console, clips: &Clips, at: usize) -> String {
     };
     let mut said = format!("; clip {}{span}", outcome.what);
     said.push_str(&outcome.notes);
+    // The boundary and what was done with it are two figures: a run configured
+    // to keep the wake word in the clip computes the first and starts at zero.
+    let seconds =
+        |samples: i64| samples as f64 / f64::from(speech_pipeline::SPINE_FORMAT.sample_rate_hz);
     if let Some(trim) = turn.stt_trim {
-        said.push_str(&format!(
-            ", STT from +{:.2} s",
-            trim as f64 / f64::from(speech_pipeline::SPINE_FORMAT.sample_rate_hz)
-        ));
+        said.push_str(&format!(", STT boundary +{:.2} s", seconds(trim)));
+    }
+    if let Some(sent_from) = turn.stt_sent_from {
+        said.push_str(&format!(", sent from +{:.2} s", seconds(sent_from)));
     }
     said
 }
@@ -3168,7 +3276,7 @@ impl Clips {
         // filesystem rather than one refusal per turn.
         let mut made = None;
         for (at, turn) in console.turns.iter().enumerate() {
-            let Some((name, log, start, end)) = named(turn) else {
+            let Some((label, log, start, end)) = named(turn) else {
                 continue;
             };
             match &recorded {
@@ -3185,8 +3293,19 @@ impl Clips {
                     continue;
                 }
             }
-            held.by_turn
-                .insert(at, cut(&name, log, start, end, store, into, &mut made));
+            held.by_turn.insert(
+                at,
+                cut(
+                    label,
+                    log,
+                    start,
+                    end,
+                    turn.stt_trim,
+                    store,
+                    into,
+                    &mut made,
+                ),
+            );
         }
         held
     }
@@ -3202,11 +3321,11 @@ impl Clips {
 /// The name is [`Turn::label`]'s, which is the token the turn line prints after
 /// `#`, so the clip is found from the report by reading. A turn the console
 /// named neither an utterance nor a wake for cannot be named and is not cut.
-fn named(turn: &Turn) -> Option<(String, String, i64, i64)> {
-    let name = turn.label()?.file_name();
+fn named(turn: &Turn) -> Option<(Label, String, i64, i64)> {
+    let label = turn.label()?;
     let log = turn.said.span.log.clone()?;
     Some((
-        name,
+        label,
         log,
         turn.said.span.start_sample?,
         turn.said.span.end_sample?,
@@ -3245,18 +3364,31 @@ fn stopped_because(stop: &pod_ingest::SpliceStop) -> String {
 /// `made` carries the one attempt at creating the output directory, made by the
 /// first turn that gets as far as audio to write.
 ///
+/// Where the wake-trim boundary is known, a second file holds the same span from
+/// that boundary, so it is opened and heard rather than sought to. That is what
+/// the recogniser was given when the run trimmed the wake word; under `[stt]
+/// wake_word = "keep"` the recogniser got the whole first file instead, and the
+/// turn line's `sent from` offset says which. It is a suffix of the first and
+/// carries nothing the turn line does not, and it comes off the one decode this
+/// call already paid for -- a second resolve would double the cost the TODO
+/// below is about.
+///
 /// TODO(clip-one-pass-per-log): every turn of a run is carved from the same log
 /// and each call here decodes it from the head, so a session's clips cost work
 /// quadratic in its turns.
+#[allow(clippy::too_many_arguments)]
 fn cut(
-    name: &str,
+    label: Label,
     log: String,
     start: i64,
     end: i64,
+    stt_trim: Option<i64>,
     store: &Path,
     into: &Path,
     made: &mut Option<Result<(), String>>,
 ) -> Clip {
+    let name = label.file_name();
+    let name = name.as_str();
     // A sample index off a line that tore is a number this tool does not carve
     // with: the same fact the resolver names `InvalidSpan`, said in the same
     // words, rather than a panic in the report the run is read by.
@@ -3290,6 +3422,26 @@ fn cut(
         return Clip::not_written(format!("{name}: {why}"));
     }
     let mut notes = String::new();
+    // A boundary past the decoded audio states no suffix to write, and a write
+    // that fails leaves the whole clip on disk regardless. Nothing is wrong with
+    // that clip either way, so both are a note and not a refusal -- a refusal
+    // here would tell the operator the audio they can open does not exist.
+    if let Some(trim) = stt_trim {
+        let command = label.command_file_name();
+        match usize::try_from(trim)
+            .ok()
+            .and_then(|trim| audio.pcm.get(trim..))
+        {
+            Some(tail) => {
+                if let Err(why) = speech_pipeline::write_spine_wav(&into.join(&command), tail) {
+                    notes.push_str(&format!(", no {command} ({why})"));
+                }
+            }
+            None => notes.push_str(&format!(
+                ", no {command} (the STT boundary is outside this clip)"
+            )),
+        }
+    }
     // `covered_samples` counts overlapping copies, so it is an upper bound on
     // distinct audio and `pcm.len() - covered_samples` is an upper bound on
     // silence when positive. A count past the carve's own length means the
@@ -3350,9 +3502,16 @@ fn turns(console: &Console, clips: &Clips, report: &mut Report) {
         if let Outcome::Declined(reason) = &turn.outcome
             && reason != LOW_CONFIDENCE
         {
-            *otherwise
-                .entry(if reason.is_empty() { "unsaid" } else { reason })
-                .or_default() += 1;
+            // An arm that expired after the wake was held waited out a command
+            // that never came; a bare one was never followed at all. Counting
+            // them under one word would hide the wait, which is the part an
+            // operator can tune.
+            let word = match reason.as_str() {
+                ARM_EXPIRED if turn.held.is_some() => "arm_expired after a hold",
+                "" => "unsaid",
+                said => said,
+            };
+            *otherwise.entry(word).or_default() += 1;
         }
     }
     let barge_ins: usize =
@@ -3387,6 +3546,14 @@ fn turns(console: &Console, clips: &Clips, report: &mut Report) {
             String::new()
         },
     ));
+    let held_out = count(|turn| {
+        turn.held.is_some() && matches!(&turn.outcome, Outcome::Declined(r) if r == ARM_EXPIRED)
+    });
+    if held_out > 0 {
+        report.note(format!(
+            "{held_out} wake(s) held for a command that never came"
+        ));
+    }
     let readings = |wanted: fn(&Turn) -> bool| -> Vec<f64> {
         console
             .turns
@@ -6031,6 +6198,23 @@ mod tests {
         )
     }
 
+    /// The same utterance, carrying the two clip boundaries: where the wake
+    /// word ends and where the recogniser was actually started.
+    fn carved_with_boundary(id: u64, trim: i64, sent_from: i64, text: &str) -> String {
+        let line = carved(id, 16128, 59968, Some(1), 0.04, text);
+        format!(
+            r#"{},"stt_trim_samples":{trim},"stt_sent_from_sample":{sent_from}}}"#,
+            line.strip_suffix('}').expect("an object")
+        )
+    }
+
+    /// The wake being kept back for the command that follows it.
+    fn held_line(start: i64, end: i64, deadline: i64) -> String {
+        format!(
+            r#"{{"ts_ms":2,"event":"wake_held","pod":"reachy00","epoch":1,"start_sample":{start},"end_sample":{end},"wake_end_sample":34880,"deadline_sample":{deadline}}}"#
+        )
+    }
+
     /// The gate declining one utterance as a likely hallucination.
     fn declined(id: u64, no_speech: f64) -> String {
         format!(
@@ -7537,7 +7721,7 @@ mod tests {
         whole_store(&at);
         let report = judge(&at);
         assert!(
-            clip_line(&report, "clip turn-01.wav").contains("STT from +0.84 s"),
+            clip_line(&report, "clip turn-01.wav").contains("STT boundary +0.84 s"),
             "{:?}",
             report.measured
         );
@@ -7552,9 +7736,216 @@ mod tests {
         whole_store(&elsewhere);
         let report = judge(&elsewhere);
         assert!(
-            !clip_line(&report, "clip turn-01.wav").contains("STT from"),
-            "a dispatch states no trim: {:?}",
+            !clip_line(&report, "clip turn-01.wav").contains("STT boundary"),
+            "an utterance line with no boundary states none: {:?}",
             report.measured
+        );
+        assert!(
+            !sibling(&elsewhere, TURNS_SUFFIX)
+                .join("turn-01.command.wav")
+                .exists(),
+            "no boundary, no second clip"
+        );
+    }
+
+    /// A dispatched turn whose utterance line carries the boundary: both clips
+    /// are written, and the second is exactly the tail of the first.
+    ///
+    /// The one-decode invariant -- that both clips come from cutting one decoded
+    /// buffer, not two independent resolves -- has no assertion seam here.
+    /// Suffix identity is the proxy: two independent decodes would only
+    /// coincidentally produce the same samples. A refactor into two `cut` calls
+    /// would double a decode that is already quadratic per run
+    /// (`TODO(clip-one-pass-per-log)`), and this test would not object.
+    #[test]
+    fn a_turn_with_a_boundary_writes_the_clip_the_recogniser_heard() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved_with_boundary(1, 13_504, 13_504, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-command", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(
+            line.contains("STT boundary +0.84 s, sent from +0.84 s"),
+            "{line}"
+        );
+        let turns = sibling(&at, TURNS_SUFFIX);
+        let whole = clip_samples(&turns.join("turn-01.wav"));
+        let command = clip_samples(&turns.join("turn-01.command.wav"));
+        assert_eq!(whole.len(), 59968 - 16128, "the carve's own length");
+        assert_eq!(command.len(), 59968 - 16128 - 13_504, "the carve past it");
+        assert_eq!(command, whole[13_504..], "a suffix of the same audio");
+    }
+
+    /// A boundary past the end of the decoded audio -- a torn or truncated record
+    /// -- states no suffix to write. The whole clip is still on disk and still
+    /// named, and the line says why its companion is not: a refusal here would
+    /// tell the operator the audio they can open does not exist.
+    #[test]
+    fn a_boundary_outside_the_clip_is_a_note_and_not_a_refusal() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            // The carve is 16128..59968; this boundary is past its far end.
+            carved_with_boundary(1, 99_999, 99_999, "Test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-outside", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(
+            line.contains("no turn-01.command.wav (the STT boundary is outside this clip)"),
+            "{line}"
+        );
+        let turns = sibling(&at, TURNS_SUFFIX);
+        assert!(
+            turns.join("turn-01.wav").exists(),
+            "the clip the operator can open is written"
+        );
+        assert!(
+            !turns.join("turn-01.command.wav").exists(),
+            "and the one there is no audio for is not"
+        );
+    }
+
+    /// A `wake_held` line that tore before its deadline states a hold with no
+    /// budget. The turn still says the wake was held; it just does not invent a
+    /// duration for it.
+    #[test]
+    fn a_hold_with_no_deadline_says_so_without_a_duration() {
+        let torn = r#"{"ts_ms":2,"event":"wake_held","pod":"reachy00","epoch":1,"start_sample":16128,"end_sample":20000,"wake_end_sample":34880}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            torn.to_owned(),
+            said(1, "Lights on.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-held-no-deadline", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(line.contains("; held for the command"), "{line}");
+        assert!(
+            !line.contains("held up to"),
+            "no duration is invented: {line}"
+        );
+    }
+
+    /// The wake word kept in the clip: the boundary is still computed and still
+    /// printed, and the second file still holds the audio from it.
+    #[test]
+    fn a_kept_wake_word_says_the_boundary_and_where_it_was_sent_from() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            carved_with_boundary(1, 13_504, 0, "Hey Jarvis, test."),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-clip-kept", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(
+            line.contains("STT boundary +0.84 s, sent from +0.00 s"),
+            "{line}"
+        );
+    }
+
+    /// A wake held for its command, then answered: the turn line says the wait
+    /// the listener was prepared to keep.
+    #[test]
+    fn a_held_wake_says_so_on_the_turn_it_opened() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            held_line(16_128, 20_000, 84_000),
+            said(1, "Lights on.", 0.04),
+            dispatched(1),
+        ];
+        let (_dir, at) = records("speech-report-held", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(line.contains("held up to 4.0 s for the command"), "{line}");
+        assert!(line.contains("dispatched"), "one turn, not two: {line}");
+    }
+
+    /// A wake held for a command that never came. It is an arm expiry like any
+    /// other and is counted apart from one: the wait ran out, which is the part
+    /// an operator tunes.
+    #[test]
+    fn a_hold_that_ran_out_is_counted_apart_from_a_bare_arm_expiry() {
+        const EXPIRED: &str = r#"{"ts_ms":8,"event":"wake_command_absent","pod":"reachy00","reason":"arm_expired","score":0.99,"log":"a.framelog","start_sample":16128,"end_sample":20000,"segments":[]}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            held_line(16_128, 20_000, 84_000),
+            EXPIRED.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-held-expired", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        assert!(
+            measured(&report, "1 wake(s) held for a command that never came"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "arm_expired after a hold ×1"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A hold whose wake line this console never carried belongs to no turn it
+    /// saw. Written onto the last turn instead, it would grow a fragment -- and
+    /// a tally entry -- on a turn that was never held.
+    #[test]
+    fn a_hold_with_no_wake_ahead_of_it_lands_on_no_turn() {
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            wake(0.99),
+            said(1, "Lights on.", 0.04),
+            dispatched(1),
+            held_line(60_000, 64_000, 128_000),
+        ];
+        let (_dir, at) = records("speech-report-held-orphan", &lines);
+        whole_store(&at);
+        let report = judge(&at);
+        let line = clip_line(&report, "clip turn-01.wav");
+        assert!(
+            !line.contains("held up to"),
+            "the finished turn was not the one held: {line}"
+        );
+    }
+
+    /// The two clip names of a turn, as `//crates/reachy-host:stt_compare` pairs
+    /// them: the second is the first with `.command` before the extension, for
+    /// both kinds of turn. The comparison holds the same literals.
+    #[test]
+    fn the_two_clip_names_are_the_pair_the_comparison_looks_for() {
+        assert_eq!(crate::Label::Utterance(1).file_name(), "turn-01.wav");
+        assert_eq!(
+            crate::Label::Utterance(1).command_file_name(),
+            "turn-01.command.wav"
+        );
+        assert_eq!(crate::Label::Wake(3).file_name(), "turn-wake-3.wav");
+        assert_eq!(
+            crate::Label::Wake(3).command_file_name(),
+            "turn-wake-3.command.wav"
         );
     }
 
