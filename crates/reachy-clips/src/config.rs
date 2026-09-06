@@ -37,7 +37,7 @@
 use crate::format::{
     Channel, ChannelMask, Clip, DeltaFrame, MAX_SPEED, MIN_SPEED, QUAT_NORM_TOL, clip_duration_ms,
 };
-use crate::library::{Motion, Segment, speed_in_bounds, within_ceiling};
+use crate::library::{Motion, Segment, speed_in_bounds};
 use brenn_reachy__cogs__config_clk_rs::{
     ClipConfig, ClipFrame, ClipLibraryConfig, MotionConfig, MotionSegment,
 };
@@ -50,13 +50,13 @@ use thiserror::Error;
 /// How many clips the library message holds. The schema's own capacity, checked
 /// against it below rather than restated: a bound stated twice is a bound that
 /// can drift.
-pub const MAX_CLIPS: usize = 16;
+pub const MAX_CLIPS: usize = 96;
 
 /// How many frames one clip may carry.
-pub const MAX_CLIP_FRAMES: usize = 512;
+pub const MAX_CLIP_FRAMES: usize = 1024;
 
 /// How many motions the library message holds.
-pub const MAX_MOTIONS: usize = 32;
+pub const MAX_MOTIONS: usize = 128;
 
 /// How many segments one motion may carry.
 pub const MAX_SEGMENTS: usize = 32;
@@ -132,16 +132,6 @@ pub enum ClipViewError {
         channel: Channel,
         /// What it held.
         value: f64,
-    },
-
-    /// The clip's speed ceiling is not a rate anything can be played at.
-    ///
-    /// A derived number: the load takes the tightest frame pair against the
-    /// machine's step bounds, so a clip that loaded has a positive one.
-    #[error("clip speed ceiling {max_speed} is not finite and positive")]
-    SpeedCeiling {
-        /// What the field held.
-        max_speed: f64,
     },
 
     /// A script named a clip the library does not have.
@@ -289,7 +279,6 @@ pub fn write_clip(clip: &Clip, out: &mut ClipConfig) -> Result<(), LibraryWriteE
     out.frame_rate_hz = FLOOR_TICK_HZ;
     out.blend_in_ms = clip.blend_in_ms();
     out.blend_out_ms = clip.blend_out_ms();
-    out.max_speed = clip.max_speed();
     out.frames.clear();
     for frame in frames {
         let slot = out
@@ -619,17 +608,6 @@ pub enum MotionViewError {
         /// The flattened speed.
         speed: f64,
     },
-
-    /// A flattened segment speed above what that segment's clip admits.
-    #[error("segment {segment} plays at {speed}x, above its clip's ceiling of {ceiling}x")]
-    SegmentPastCeiling {
-        /// Which segment.
-        segment: usize,
-        /// The flattened speed.
-        speed: f64,
-        /// What the clip admits.
-        ceiling: f64,
-    },
 }
 
 /// Which asset of a library will not play, and why.
@@ -882,8 +860,8 @@ impl SegmentView<'_> {
 /// One configured motion a player can play: its segments, and what it is like
 /// to play them.
 ///
-/// The derived facts — which channels it drives, how long it runs, how fast it
-/// may be invoked, how it blends — are computed here from the segments' clips
+/// The derived facts — which channels it drives, how long it runs, how it
+/// blends — are computed here from the segments' clips
 /// and are stored nowhere: the asset carries the segments alone, so no second
 /// opinion about a motion can disagree with the frames it is made of.
 #[derive(Clone, Copy, Debug)]
@@ -896,8 +874,6 @@ pub struct MotionView<'a> {
     mask: ChannelMask,
     /// How long the whole walk runs at 1.0x, seconds, holds included.
     duration_s: f64,
-    /// The fastest invocation the segments admit together.
-    max_speed: f64,
     /// The entry ramp, from the first segment's clip.
     blend_in_ms: u32,
     /// The exit ramp, from the last segment's clip.
@@ -916,12 +892,9 @@ impl<'a> MotionView<'a> {
         }
         let mut mask = ChannelMask::empty();
         let mut duration_s = gap_s(motion.lead_gap_ms);
-        // The tightest ceiling any segment leaves, never above the global one.
-        let mut max_speed = MAX_SPEED;
         // The edges of the whole walk: a motion ramps in on the clip it starts
         // with and out of the one it ends on. The seams in between are stepped
-        // across rather than blended, which is what the load-time seam check
-        // bounds.
+        // across rather than blended.
         let (mut blend_in_ms, mut blend_out_ms) = (0, 0);
         for (segment, config) in motion.segments.iter().enumerate() {
             let clip_id = usize::from(config.clip_id);
@@ -940,38 +913,22 @@ impl<'a> MotionView<'a> {
             if !speed_in_bounds(speed) {
                 return Err(MotionViewError::SegmentSpeed { segment, speed });
             }
-            let ceiling = clip.max_speed();
-            if !within_ceiling(speed, ceiling) {
-                return Err(MotionViewError::SegmentPastCeiling {
-                    segment,
-                    speed,
-                    ceiling,
-                });
-            }
             for channel in Channel::ALL {
                 if clip.mask().contains(channel) {
                     mask.insert(channel);
                 }
             }
             duration_s += clip.duration_s() / speed + gap_s(config.gap_after_ms);
-            max_speed = max_speed.min(ceiling / speed);
             if segment == 0 {
                 blend_in_ms = clip.blend_in_ms();
             }
             blend_out_ms = clip.blend_out_ms();
         }
-        // Every segment has just been proven playable at 1.0x, so the motion is
-        // too. Without the floor it need not say so: a nesting product an ulp
-        // above a clip's own ceiling is admitted by `SPEED_EPS` and divides
-        // back out an ulp below one, which would refuse the default invocation
-        // of a motion the emitter accepted.
-        let max_speed = max_speed.max(1.0);
         Ok(Self {
             library,
             motion,
             mask,
             duration_s,
-            max_speed,
             blend_in_ms,
             blend_out_ms,
         })
@@ -1028,15 +985,6 @@ impl<'a> MotionView<'a> {
     #[must_use]
     pub fn duration_s(&self) -> f64 {
         self.duration_s
-    }
-
-    /// The highest invocation speed the segments admit together.
-    ///
-    /// The tightest clip's ceiling after the nesting has spent its share of it,
-    /// never above the global bound and never below 1.0x.
-    #[must_use]
-    pub fn max_speed(&self) -> f64 {
-        self.max_speed
     }
 
     /// The entry blend ramp, milliseconds, from the first segment's clip.
@@ -1130,11 +1078,6 @@ impl<'a> ClipView<'a> {
         if clip.frames.is_empty() {
             return Err(ClipViewError::NoFrames);
         }
-        if !clip.max_speed.is_finite() || clip.max_speed <= 0.0 {
-            return Err(ClipViewError::SpeedCeiling {
-                max_speed: clip.max_speed,
-            });
-        }
         Ok(Self { clip, mask })
     }
 
@@ -1166,15 +1109,6 @@ impl<'a> ClipView<'a> {
     #[must_use]
     pub fn blend_out_ms(&self) -> u32 {
         self.clip.blend_out_ms
-    }
-
-    /// The highest invocation speed the frames admit.
-    ///
-    /// Derived at load and carried, never re-derived: the derivation costs a
-    /// kinematic solve per frame.
-    #[must_use]
-    pub fn max_speed(&self) -> f64 {
-        self.clip.max_speed
     }
 
     /// Frame `frame` of the clip.
@@ -1341,22 +1275,12 @@ mod tests {
 
     use brenn_reachy__cogs__config_clk_rs::{ClipConfigWire, ClipLibraryConfigWire};
 
+    use crate::envelope::ClipLimits;
     use crate::format::{ClipDoc, FrameDoc};
-    use crate::library::SPEED_EPS;
-    use crate::speed::ClipLimits;
-    use reachy_motion::joints::JointStep;
 
-    /// Generous step bounds, so a fixture's round numbers load as written: what
-    /// is under test here is the crossing, not the derivation.
+    /// The machine's own bounds: what is under test here is the crossing.
     fn limits() -> ClipLimits {
-        ClipLimits {
-            max_step: JointStep {
-                legs: 100.0,
-                body_yaw: 100.0,
-                antennas: 100.0,
-            },
-            ..ClipLimits::default()
-        }
+        ClipLimits::default()
     }
 
     /// A clip driving all three channels, `frames` frames long, whose values
@@ -1369,7 +1293,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 1.0,
             blend_in_ms: Some(0),
             blend_out_ms: Some(0),
             frames: (0..frames)
@@ -1554,7 +1477,7 @@ mod tests {
     fn a_library_answers_by_index_and_refuses_anything_else() {
         let first = load(all_channels_doc("first", 3));
         let second = load(antenna_doc("second", 5));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&[&first, &second], &[], message.clear_valid()).expect("two clips fit");
 
         let library = valid_library(&message);
@@ -1589,7 +1512,7 @@ mod tests {
     fn a_validated_library_plays_the_same_clips_it_was_checked_as() {
         let first = load(all_channels_doc("first", 4));
         let second = load(antenna_doc("second", 6));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&[&first, &second], &[], message.clear_valid()).expect("two clips fit");
 
         let library = valid_library(&message);
@@ -1637,7 +1560,6 @@ mod tests {
             let again = resumed.playable_motion(motion_id).expect("playable");
             assert_eq!(again.segments(), taken.segments());
             assert_eq!(again.duration_s(), taken.duration_s());
-            assert_eq!(again.max_speed(), taken.max_speed());
             assert_eq!(again.mask(), taken.mask());
             assert_eq!(again.blend_in_ms(), taken.blend_in_ms());
             assert_eq!(again.blend_out_ms(), taken.blend_out_ms());
@@ -1702,7 +1624,7 @@ mod tests {
     #[test]
     fn validating_a_library_names_the_clip_that_will_not_play() {
         let good = load(antenna_doc("good", 2));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&[&good, &good], &[], message.clear_valid()).expect("two clips fit");
         // Second clip only: a value in a channel its mask does not name.
         message
@@ -1855,7 +1777,7 @@ mod tests {
     fn a_library_past_capacity_is_refused() {
         let clip = load(antenna_doc("one", 2));
         let clips: Vec<&Clip> = (0..MAX_CLIPS + 1).map(|_| &clip).collect();
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         assert_eq!(
             write_library(&clips, &[], message.clear_valid()),
             Err(LibraryWriteError::TooManyClips {
@@ -1874,7 +1796,7 @@ mod tests {
     fn a_library_that_fills_the_message_is_accepted() {
         let clip = load(antenna_doc("one", 2));
         let clips: Vec<&Clip> = (0..MAX_CLIPS).map(|_| &clip).collect();
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &[], message.clear_valid()).expect("a full library fits");
         let library = valid_library(&message);
         assert_eq!(library.clips.len(), MAX_CLIPS);
@@ -1885,7 +1807,7 @@ mod tests {
     /// a clip gets a typed refusal naming what it has, not a panic.
     #[test]
     fn an_empty_library_names_no_clip() {
-        let message = Box::new(ClipLibraryConfigWire::new());
+        let message = ClipLibraryConfigWire::new_boxed();
         let library = valid_library(&message);
         assert!(library.clips.is_empty());
         let checked = ValidatedLibrary::of(library).expect("an empty library holds no clip");
@@ -1920,6 +1842,22 @@ mod tests {
         );
     }
 
+    /// The library message carries every slot it declares, used or not, so its
+    /// footprint is the product of the three caps and is paid in full by every
+    /// process that binds the asset. This is what says the number is the one the
+    /// schema has rather than the one a design assumed: raise a cap without
+    /// meaning to and the cost shows up here.
+    #[test]
+    fn the_message_carries_every_frame_slot_the_caps_declare() {
+        assert!(
+            size_of::<ClipLibraryConfigWire>()
+                >= MAX_CLIPS * MAX_CLIP_FRAMES * size_of::<ClipFrame>(),
+            "the message is smaller than its own frame storage: {} bytes for \
+             {MAX_CLIPS} clips of {MAX_CLIP_FRAMES} frames",
+            size_of::<ClipLibraryConfigWire>()
+        );
+    }
+
     /// The one path to the per-frame fast accessor is the walk that makes it
     /// sound, so a library holding a frame the walk refuses hands back no
     /// handle to take clips out of — which is why a non-finite value cannot
@@ -1927,7 +1865,7 @@ mod tests {
     #[test]
     fn a_library_with_a_non_finite_frame_hands_back_no_tick_handle() {
         let clip = load(antenna_doc("wiggle", 3));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&[&clip], &[], message.clear_valid()).expect("one clip fits");
         message
             .validate_mut()
@@ -1976,7 +1914,7 @@ mod tests {
         );
 
         let short = load(antenna_doc("short", 2));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         assert_eq!(
             write_library(&[&short, &long], &[], message.clear_valid()),
             Err(LibraryWriteError::TooManyFrames {
@@ -2125,7 +2063,7 @@ mod tests {
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["antennas"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": 2.0, "frames": [{}]}}"#,
+                 "frames": [{}]}}"#,
             track.join(",")
         )
     }
@@ -2180,7 +2118,7 @@ mod tests {
             ),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("the library fits");
 
         let written = valid_library(&message);
@@ -2235,7 +2173,7 @@ mod tests {
             ),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("the library fits");
 
         // 100 ms under a 1.5x nesting is 66.66… ms, which rounds up.
@@ -2254,7 +2192,6 @@ mod tests {
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["head", "body_yaw"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": 2.0,
                  "frames": [{{"dt": [0.0, 0.0, 0.0], "dq": [1.0, 0.0, 0.0, 0.0],
                               "body_yaw": 0.1}}]}}"#
         )
@@ -2275,7 +2212,7 @@ mod tests {
             ),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("the library fits");
         message
     }
@@ -2345,7 +2282,7 @@ mod tests {
             ),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("the library fits");
 
         let checked = ValidatedLibrary::of(valid_library(&message)).expect("both clips play");
@@ -2356,86 +2293,6 @@ mod tests {
         for channel in Channel::ALL {
             assert!(mask.contains(channel), "{channel} is not in the union");
         }
-    }
-
-    /// A motion's ceiling is the tightest clip's after the nesting has already
-    /// spent its share, and never below 1.0x — every segment was proven legal
-    /// at 1.0x when the sequence resolved.
-    #[test]
-    fn a_motions_ceiling_is_the_tightest_clip_after_the_nesting_spends_it() {
-        let message = composed_message();
-        let checked = ValidatedLibrary::of(valid_library(&message)).expect("the library plays");
-
-        // A bare clip is the clip's own ceiling.
-        let bare = checked.playable_motion(0).expect("the first clip's motion");
-        let clip = checked.playable(0).expect("the first clip");
-        assert!((bare.max_speed() - clip.max_speed()).abs() < 1e-12);
-
-        // The composed motion plays its second clip at 2.0x already, which is
-        // all that clip admits, so the motion admits 1.0x and no more.
-        let composed = checked.playable_motion(2).expect("the composed motion");
-        assert!(
-            (composed.max_speed() - 1.0).abs() < 1e-9,
-            "{}",
-            composed.max_speed()
-        );
-    }
-
-    /// The cap: a segment the nesting left below 1.0x divides its clip's
-    /// ceiling back up, and the global bound is what stops the motion
-    /// advertising a speed no clip was authored for.
-    #[test]
-    fn a_motions_ceiling_never_rises_above_the_global_bound() {
-        let library = loaded_library(&[
-            ("a.json", clip_json("pod/a", 4)),
-            (
-                "z.json",
-                sequence_json("pod/slow", r#"{"ref": "pod/a", "speed": 0.5}"#),
-            ),
-        ]);
-        let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
-        write_library(&clips, &motions, message.clear_valid()).expect("the library fits");
-        let checked = ValidatedLibrary::of(valid_library(&message)).expect("the library plays");
-
-        // The clip admits 2.0x and the segment spends half of it, so the
-        // quotient is 4.0x — twice what any clip may be invoked at.
-        let clip = checked.playable(0).expect("the first clip");
-        assert!((clip.max_speed() - MAX_SPEED).abs() < 1e-12);
-        let motion = checked.playable_motion(1).expect("the slowed motion");
-        assert!(
-            (motion.max_speed() - MAX_SPEED).abs() < 1e-12,
-            "{}",
-            motion.max_speed()
-        );
-    }
-
-    /// The floor: a nesting product an ulp above a clip's ceiling is admitted by
-    /// `SPEED_EPS` and divides back out an ulp below one. Without the floor the
-    /// default invocation of a motion the emitter accepted would be refused.
-    #[test]
-    fn a_motion_the_walk_accepted_is_always_playable_at_one_times() {
-        let mut message = composed_message();
-        let ceiling = valid_library(&message)
-            .clips
-            .get(1)
-            .expect("two clips")
-            .max_speed;
-        message
-            .validate_mut()
-            .expect("a written library validates")
-            .motions
-            .get_mut(2)
-            .expect("three motions")
-            .segments
-            .get_mut(1)
-            .expect("two segments")
-            .speed = ceiling + SPEED_EPS / 2.0;
-
-        let checked = ValidatedLibrary::of(valid_library(&message))
-            .expect("a segment an ulp over its clip's ceiling is arithmetic, not motion");
-        let motion = checked.playable_motion(2).expect("the composed motion");
-        assert!(motion.max_speed() >= 1.0, "{}", motion.max_speed());
     }
 
     /// A motion with no segments would play nothing at all, which is the same
@@ -2488,41 +2345,6 @@ mod tests {
                         clip_id: 7,
                         clips: 2,
                     },
-                },
-            }
-        );
-    }
-
-    /// A flattened speed past what its clip admits, by more than arithmetic.
-    ///
-    /// The clip's ceiling is lowered rather than the speed raised past the
-    /// global bound, so what refuses is the clip's own limit and not the bound
-    /// every clip shares.
-    #[test]
-    fn a_segment_past_its_clips_ceiling_is_refused() {
-        let mut message = composed_message();
-        let ceiling = 1.5;
-        {
-            let library = message.validate_mut().expect("a written library validates");
-            library.clips.get_mut(0).expect("two clips").max_speed = ceiling;
-            library
-                .motions
-                .get_mut(2)
-                .expect("three motions")
-                .segments
-                .get_mut(0)
-                .expect("two segments")
-                .speed = ceiling + 0.001;
-        }
-
-        assert_eq!(
-            ValidatedLibrary::of(valid_library(&message)).expect_err("past the clip's ceiling"),
-            UnplayableAsset::Motion {
-                motion_id: 2,
-                source: MotionViewError::SegmentPastCeiling {
-                    segment: 0,
-                    speed: ceiling + 0.001,
-                    ceiling,
                 },
             }
         );
@@ -2627,7 +2449,7 @@ mod tests {
             ),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         let refusal = write_library(&clips, &motions, message.clear_valid())
             .expect_err("a gap four times the range of the field");
         assert!(
@@ -2660,7 +2482,7 @@ mod tests {
         let (clips, motions) = numbered(&library);
         assert_eq!(motions.len(), MAX_MOTIONS + 1);
 
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         assert_eq!(
             write_library(&clips, &motions, message.clear_valid()),
             Err(LibraryWriteError::TooManyMotions {
@@ -2693,7 +2515,7 @@ mod tests {
         let (clips, motions) = numbered(&library);
         assert_eq!(motions.len(), MAX_MOTIONS);
 
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("a full motion table fits");
         assert_eq!(valid_library(&message).motions.len(), MAX_MOTIONS);
     }
@@ -2714,7 +2536,7 @@ mod tests {
             ("z.json", sequence_json("pod/long", &entries.join(", "))),
         ]);
         let (clips, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         write_library(&clips, &motions, message.clear_valid()).expect("a full motion fits");
 
         let written = valid_library(&message);
@@ -2732,35 +2554,6 @@ mod tests {
         assert_eq!((last.clip_id, last.speed, last.gap_after_ms), (1, 1.0, 0));
     }
 
-    /// A configuration an earlier build emitted has no speed ceiling, so the
-    /// field it never wrote reads as zero — and a zero ceiling is refused for
-    /// the whole library rather than played as "no speed at all". This is the
-    /// loud, typed refusal of a stale asset the changelog promises; nothing
-    /// about it is a partial load.
-    #[test]
-    fn a_clip_carrying_no_speed_ceiling_refuses_the_whole_library() {
-        let clip = load(antenna_doc("stale", 2));
-        let mut message = Box::new(ClipLibraryConfigWire::new());
-        write_library(&[&clip, &clip], &[], message.clear_valid()).expect("two clips fit");
-        message
-            .validate_mut()
-            .expect("a written library validates")
-            .clips
-            .get_mut(1)
-            .expect("the library has two clips")
-            .max_speed = 0.0;
-
-        let refusal = ValidatedLibrary::of(valid_library(&message))
-            .expect_err("a clip with no ceiling is not playable");
-        assert_eq!(
-            refusal,
-            UnplayableAsset::Clip {
-                clip_id: 1,
-                source: ClipViewError::SpeedCeiling { max_speed: 0.0 }
-            }
-        );
-    }
-
     /// The two halves of one emit have to agree about what the library holds: a
     /// segment naming a clip that is not being written is a caller pairing a
     /// motion table with the wrong clips.
@@ -2768,7 +2561,7 @@ mod tests {
     fn a_segment_naming_a_clip_the_message_does_not_carry_is_refused() {
         let library = loaded_library(&[("a.json", clip_json("pod/a", 4))]);
         let (_, motions) = numbered(&library);
-        let mut message = Box::new(ClipLibraryConfigWire::new());
+        let mut message = ClipLibraryConfigWire::new_boxed();
         assert_eq!(
             write_library(&[], &motions, message.clear_valid()),
             Err(LibraryWriteError::SegmentClipMissing {

@@ -34,11 +34,18 @@ rust_library(
 )
 
 # The validation and sampling suite: pure arithmetic over in-memory documents,
-# plus a few round-trips through temporary directories.
+# plus a few round-trips through scratch directories, which
+# `//crates/reachy-scratch` removes however a case ended.
+#
+# The one published vendor recording in the tree reaches the conversion tests
+# through `include_str!`, whose path is relative to the source file, so the
+# fixture is `compile_data` here and needs no runfiles.
 rust_test(
     name = "reachy_clips_test",
     size = "small",
+    compile_data = ["tests/fixtures/vendor/simple_nod.json"],
     crate = ":reachy_clips",
+    deps = ["//crates/reachy-scratch:reachy_scratch"],
 )
 
 # The offline vendor-recording converter, run as
@@ -55,10 +62,13 @@ rust_binary(
 )
 
 # A binary's root is its own crate, so the library's test target never sees the
-# argument parsing and the channel-mask spelling this file owns. Its tests use
-# temporary directories only.
+# argument parsing and the channel-mask spelling this file owns. Its cases write
+# recordings into scratch directories and run the tool over them; the
+# directories come from `//crates/reachy-scratch`, which removes them however a
+# case ended.
 rust_test(
     name = "reachy_clip_import_test",
     size = "small",
     crate = ":reachy_clip_import",
+    deps = ["//crates/reachy-scratch:reachy_scratch"],
 )

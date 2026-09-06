@@ -192,6 +192,19 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// is what `progress_min_rad` measures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackingFaultConfig {
+    /// Whether an expired window raises anything. Shipped `false`.
+    ///
+    /// The detector judges a joint against its goal, and the numbers below were
+    /// read off two gestures this repo planned. Library content moves faster
+    /// than those, and against a fast reversal the detector cannot tell a joint
+    /// still carrying the old direction from one that stopped. Until
+    /// `TODO(tracking-response-model)` judges a run against a predicted
+    /// position rather than against the goal, it raises nothing: an obstruction
+    /// is a servo working against a hand and warming, which this platform
+    /// accepts. The measurement runs either way — `tracking_errors` and
+    /// `tracking_count` are reported disarmed — so the record a plant model is
+    /// fitted from is still collected.
+    pub armed: bool,
     /// How far a joint may sit from its goal without being examined at all,
     /// radians.
     ///
@@ -254,9 +267,11 @@ pub struct TrackingFaultConfig {
 impl Default for TrackingFaultConfig {
     /// The threshold is measured off the recorded runs this repo keeps as
     /// fixtures; the window and the progress minimum are sized rather than
-    /// measured.
+    /// measured. All four are kept for the plant model to reuse; disarmed, they
+    /// decide only what the report's figures are measured against.
     fn default() -> Self {
         Self {
+            armed: false,
             // 28.6° of crank, better than twice
             // `RECORDED_WORST_HEAD_LAG_RAD`. Only a screen for which joints
             // are worth examining, not a verdict: the antennas cross it while
@@ -869,18 +884,6 @@ pub enum CommandRejection {
         joint: JointRef,
         /// The goal that has no count, radians.
         angle: f64,
-    },
-    /// A tracked setpoint stood further from the last goal than one tick's step
-    /// bound allows. The same bound [`MoveAbort::StepTooLarge`] guards a
-    /// sampled path with, answered to the caller instead of abandoning a move,
-    /// because a tracked setpoint *is* the caller's plan and there is no
-    /// trajectory to abandon.
-    #[error("{} would step {delta:.4} rad in one tick", Name(*.joint))]
-    StepTooLarge {
-        /// The joint whose step was too large.
-        joint: JointRef,
-        /// How far it would have moved, radians.
-        delta: f64,
     },
 }
 
@@ -1779,54 +1782,60 @@ pub fn motion_tick(
         // group because the two groups are answered differently. Every other
         // row holds a value no measurement can beat, so the same worst-of sweep
         // names the joint among them.
-        let mut head_out = [f64::NEG_INFINITY; ROW_COUNT];
-        let mut antennas_out = [f64::NEG_INFINITY; ROW_COUNT];
-        let mut head_exhausted = false;
-        let mut antennas_exhausted = false;
-        for (row, id) in ROWS.into_iter().enumerate() {
-            if !flags::contains(look.exhausted, id) {
-                continue;
-            }
-            if group_of(id) == Some(JointGroup::Antennas) {
-                antennas_out[row] = look.errors[row];
-                antennas_exhausted = true;
-            } else {
-                head_out[row] = look.errors[row];
-                head_exhausted = true;
-            }
-        }
-        // The head decides the tick when both groups run out together: its
-        // answer winds the whole machine down, which subsumes taking the
-        // antennas out of service.
         //
-        // The count comes off the run itself, read here while it still stands:
-        // `raise` and `degrade` both forget the run, and the count is the
-        // window that judged it.
-        if head_exhausted {
-            let (joint, error, count) = worst_run(&head_out, &state.tracking);
-            raise(
-                state,
-                Fault::HeadObstructed {
-                    joint,
-                    error,
-                    count,
-                },
-                out,
-            );
-            return;
-        }
-        if antennas_exhausted {
-            let (joint, error, count) = worst_run(&antennas_out, &state.tracking);
-            degrade(
-                state,
-                Fault::AntennaObstructed {
-                    joint,
-                    error,
-                    count,
-                },
-                JointGroup::Antennas.joints(),
-                out,
-            );
+        // Only when the detector is armed. Disarmed, the look above still ran
+        // and its figures are still reported; an expired window then buys a
+        // figure in the record and nothing else.
+        if cfg.tracking.armed {
+            let mut head_out = [f64::NEG_INFINITY; ROW_COUNT];
+            let mut antennas_out = [f64::NEG_INFINITY; ROW_COUNT];
+            let mut head_exhausted = false;
+            let mut antennas_exhausted = false;
+            for (row, id) in ROWS.into_iter().enumerate() {
+                if !flags::contains(look.exhausted, id) {
+                    continue;
+                }
+                if group_of(id) == Some(JointGroup::Antennas) {
+                    antennas_out[row] = look.errors[row];
+                    antennas_exhausted = true;
+                } else {
+                    head_out[row] = look.errors[row];
+                    head_exhausted = true;
+                }
+            }
+            // The head decides the tick when both groups run out together: its
+            // answer winds the whole machine down, which subsumes taking the
+            // antennas out of service.
+            //
+            // The count comes off the run itself, read here while it still
+            // stands: `raise` and `degrade` both forget the run, and the count
+            // is the window that judged it.
+            if head_exhausted {
+                let (joint, error, count) = worst_run(&head_out, &state.tracking);
+                raise(
+                    state,
+                    Fault::HeadObstructed {
+                        joint,
+                        error,
+                        count,
+                    },
+                    out,
+                );
+                return;
+            }
+            if antennas_exhausted {
+                let (joint, error, count) = worst_run(&antennas_out, &state.tracking);
+                degrade(
+                    state,
+                    Fault::AntennaObstructed {
+                        joint,
+                        error,
+                        count,
+                    },
+                    JointGroup::Antennas.joints(),
+                    out,
+                );
+            }
         }
     }
 
@@ -1935,11 +1944,13 @@ pub fn motion_tick(
             abort(state, MoveAbort::EnvelopePath(violations), out);
             return;
         }
-        Staged::Step { joint, delta } => {
-            abort(state, MoveAbort::StepTooLarge { joint, delta }, out);
-            return;
-        }
-        Staged::Emitted => {}
+        Staged::Admitted(candidate) => match step_over(cfg, state, &candidate) {
+            Some(StepTooFar { joint, delta }) => {
+                abort(state, MoveAbort::StepTooLarge { joint, delta }, out);
+                return;
+            }
+            None => command(state, out, &sampled, &candidate),
+        },
     }
 
     if done {
@@ -1952,42 +1963,51 @@ pub fn motion_tick(
     out.report.mode = state.mode;
 }
 
-/// How a pose the envelope refuses is judged.
+/// Which of the two command paths a candidate pose arrived on.
+///
+/// The split decides one thing: a pose the envelope refuses is judged on the
+/// bounds alone for a tracked setpoint and against the excursion the move
+/// started from for a sample, which is how a machine standing outside the
+/// envelope travels back inside. The per-tick step guard is not on this axis —
+/// it is a question the sampled path asks of an admitted pose ([`step_over`])
+/// and the tracked path never asks, so there is no step outcome for a tracked
+/// setpoint to have to answer for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Judged {
-    /// On the bounds alone: a refused pose is refused.
+    /// A tracked setpoint: judged on the bounds alone.
     OnTheBounds,
-    /// Against the excursion the machine started this move from, which is how a
-    /// machine standing outside the envelope travels back inside.
+    /// A sample of a move this crate planned, judged against the excursion the
+    /// machine started that move from.
     AgainstTheStart,
 }
 
-/// What became of one candidate pose.
+/// What became of one candidate pose at the envelope gate.
 enum Staged {
-    /// It passed both gates; the goal and the last-commanded targets are it.
-    Emitted,
+    /// It passed, and these are the joint angles it means.
+    Admitted(JointVector),
     /// The envelope refused it.
     Envelope(EnvelopeViolations),
-    /// One joint would have had to move further in a period than it may.
-    Step {
-        /// Which joint.
-        joint: JointRef,
-        /// How far it was asked to travel, radians.
-        delta: f64,
-    },
 }
 
-/// Check one pose the machine is about to be commanded to, and stage it as this
-/// period's goal if it passes.
+/// A joint asked to move further in one period than it may.
+struct StepTooFar {
+    /// Which joint.
+    joint: JointRef,
+    /// How far it was asked to travel, radians.
+    delta: f64,
+}
+
+/// Put one pose the machine is about to be commanded to through the envelope
+/// gate, and hand back the joint angles it solved to if it passes.
 ///
-/// The two gates every commanded pose is held to — a pose the envelope will
-/// have, and a step no servo may take in one period — are one piece of code
-/// because they are one rule: a sampled move and a tracked setpoint ask the same
-/// two questions of the same machine, and a per-tick bound that meant one thing
-/// on one path and another on the other is the divergence the single gate exists
-/// to prevent. What differs is the answer to a failure, which is the caller's: a
-/// sample aborts the move it came from, a setpoint is refused to whoever sent
-/// it.
+/// The envelope gate is one rule for both paths: a sampled move and a tracked
+/// setpoint ask the same question of the same machine, and a geometry check that
+/// meant one thing on one path and another on the other is the divergence the
+/// single gate exists to prevent. What differs on a failure is the answer, which
+/// is the caller's: a sample aborts the move it came from, a setpoint is refused
+/// to whoever sent it. What a caller does with an admitted pose is the caller's
+/// too — the sampled path bounds its step ([`step_over`]) before commanding it,
+/// and the tracked path commands it as asked.
 fn stage_target(
     cfg: &MotionConfig,
     state: &mut MotionSnap,
@@ -2039,19 +2059,28 @@ fn stage_target(
         antennas: target.antennas,
     };
 
-    // Step guard. An oversized step is a slam, and the bug that produced it is
-    // the thing worth reporting; it is never trimmed and sent. A move whose
-    // clock is too short for its span does not reach here:
-    // `floor_move_clock` right-sizes it before it is commanded, so what
-    // remains for this guard to catch on that path is an interpolator or a seed
-    // that is wrong. What the bound bounds is therefore the plan, which is why
-    // passing it kills the plan and not the machine.
-    //
-    // A masked joint is skipped: nothing of what the plan or the setpoint says
-    // about it goes anywhere, so there is no step to bound. The plan itself is
-    // left whole — the mask decides what reaches the wire, not what the
-    // trajectory says.
-    let mut changed = false;
+    Staged::Admitted(candidate)
+}
+
+/// The joint an admitted pose would move further than a period allows, if there
+/// is one.
+///
+/// An oversized step is a slam, and the bug that produced it is the thing worth
+/// reporting; it is never trimmed and sent. A move whose clock is too short for
+/// its span does not reach here: `floor_move_clock` right-sizes it before it is
+/// commanded, so what remains for this to catch is an interpolator or a seed
+/// that is wrong on a path this crate planned. Only the sampled path asks, which
+/// is why the question is a call of its own: a tracked setpoint is content, sent
+/// as asked, and has no answer to give.
+///
+/// A masked joint is skipped: nothing of what the plan says about it goes
+/// anywhere, so there is no step to bound. The plan itself is left whole — the
+/// mask decides what reaches the wire, not what the trajectory says.
+fn step_over(
+    cfg: &MotionConfig,
+    state: &MotionSnap,
+    candidate: &JointVector,
+) -> Option<StepTooFar> {
     for ((id, angle), (_, last)) in candidate
         .joints()
         .into_iter()
@@ -2062,7 +2091,31 @@ fn stage_target(
         }
         let delta = (angle - last).abs();
         if outside_limit(delta, cfg.max_step.for_joint(id)) {
-            return Staged::Step { joint: id, delta };
+            return Some(StepTooFar { joint: id, delta });
+        }
+    }
+    None
+}
+
+/// Command an admitted pose: this period's goal, and the state it leaves behind.
+///
+/// `target` is the pose as it was asked for, which is what the next move chains
+/// from; `candidate` is the joint angles it solved to, which is what goes to the
+/// servos.
+fn command(
+    state: &mut MotionSnap,
+    out: &mut TickOutputs,
+    target: &JointTargets,
+    candidate: &JointVector,
+) {
+    let mut changed = false;
+    for ((id, angle), (_, last)) in candidate
+        .joints()
+        .into_iter()
+        .zip(last_goal(state).joints())
+    {
+        if flags::contains(state.masked, id) {
+            continue;
         }
         changed |= angle != last;
     }
@@ -2071,11 +2124,10 @@ fn stage_target(
     // A period whose only movement is on a masked joint has nothing to say.
     out.report.emitted = changed;
     if changed {
-        out.goal = Some(candidate);
+        out.goal = Some(*candidate);
     }
-    joints::write_vector(&mut state.last_goal, &candidate);
+    joints::write_vector(&mut state.last_goal, candidate);
     traj::write_targets(&mut state.last_targets, target);
-    Staged::Emitted
 }
 
 /// Take at most one command, returning what became of it. Mutates the state
@@ -2220,11 +2272,12 @@ pub fn plan_move(
 /// Take one tracked setpoint: check it as a sampled path pose is checked, and
 /// command it on this tick.
 ///
-/// The refusals are the same two facts a planned move is held to, answered to
-/// the caller rather than written into the machine's mode: a pose the envelope
-/// will not have, and a step no servo may take in one period. Neither is a
-/// fault and neither changes anything — the mask, the mode and the last goal
-/// are exactly what they were, so a caller whose composition went out of bounds
+/// The refusals are geometry, answered to the caller rather than written into
+/// the machine's mode: an antenna angle no goal register holds, and a pose the
+/// envelope will not have. How far the setpoint moves in one period is not one
+/// of them — that bounds a plan, and this is the caller's. Neither refusal is a
+/// fault and neither changes anything — the mask, the mode and the last goal are
+/// exactly what they were, so a caller whose composition went out of bounds
 /// drops it and carries on from a machine that never moved.
 fn take_track(
     cfg: &MotionConfig,
@@ -2260,13 +2313,13 @@ fn take_track(
         Staged::Envelope(violations) => {
             CommandDisposition::Rejected(CommandRejection::Envelope(violations))
         }
-        Staged::Step { joint, delta } => {
-            CommandDisposition::Rejected(CommandRejection::StepTooLarge { joint, delta })
-        }
-        // Accepted. Any move in flight is over — its samples and this setpoint
-        // cannot both be what the servos are holding — and the machine is
-        // holding wherever this period puts it.
-        Staged::Emitted => {
+        // Accepted, and commanded without asking the step question: a tracked
+        // setpoint is content, and there is no plan of ours to bound. Any move
+        // in flight is over — its samples and this setpoint cannot both be what
+        // the servos are holding — and the machine is holding wherever this
+        // period puts it.
+        Staged::Admitted(candidate) => {
+            command(state, out, target, &candidate);
             hold(state);
             CommandDisposition::Tracked
         }
@@ -6287,6 +6340,7 @@ mod tests {
     fn a_tracking_run_clears_on_a_good_tick() {
         let cfg = MotionConfig {
             tracking: TrackingFaultConfig {
+                armed: true,
                 threshold_rad: 0.1,
                 progress_min_rad: 0.01,
                 ticks: 3,
@@ -6426,6 +6480,7 @@ mod tests {
     fn tracking_cfg(threshold_rad: f64, progress_min_rad: f64, ticks: u32) -> MotionConfig {
         MotionConfig {
             tracking: TrackingFaultConfig {
+                armed: true,
                 threshold_rad,
                 progress_min_rad,
                 ticks,
@@ -6550,15 +6605,22 @@ mod tests {
     ///
     /// The first is tuned by hand — a tight threshold and a slow move, which
     /// separates the arithmetic from the numbers the machine happens to ship
-    /// with. The second is the shipped configuration driven at the fastest
-    /// gesture it admits: a mirrored antenna sweep whose lag runs to several
-    /// times the threshold, which is the regime the shipped numbers have to
-    /// hold in. A joint following at a distance has to survive both.
+    /// with. The second is the shipped numbers, armed, driven at the fastest
+    /// gesture they admit: a mirrored antenna sweep whose lag runs to several
+    /// times the threshold, which is the regime those numbers have to hold in
+    /// once a plant model arms them. A joint following at a distance has to
+    /// survive both.
     fn regimes() -> [(MotionConfig, JointTargets, Duration, usize); 2] {
         [
             (tracking_cfg(0.02, 0.002, 10), pose_at(0.19), secs(2.0), 8),
             (
-                MotionConfig::default(),
+                MotionConfig {
+                    tracking: TrackingFaultConfig {
+                        armed: true,
+                        ..MotionConfig::default().tracking
+                    },
+                    ..MotionConfig::default()
+                },
                 antennas_at([3.0, -3.0]),
                 secs(0.5),
                 8,
@@ -6626,6 +6688,39 @@ mod tests {
             state.mode == MotionMode::Holding,
             "the motors still command, so the stow that answers this is driven \
              from right here"
+        );
+    }
+
+    /// The shipped configuration answers that same stall with nothing.
+    ///
+    /// The detector is disarmed until a plant model replaces what it judges a
+    /// run against, so a joint standing still with its goal far beyond every
+    /// window raises no fault and leaves the machine commanding. The
+    /// measurement is untouched: the count climbs tick by tick and the errors
+    /// are reported, which is the record the model is fitted from.
+    #[test]
+    fn the_shipped_detector_measures_a_stall_and_raises_nothing() {
+        let cfg = MotionConfig::default();
+        assert!(!cfg.tracking.armed, "the shipped detector is disarmed");
+        let (mut state, pinned) = armed_at(&cfg, &JointTargets::default());
+
+        let mut stuck = pinned;
+        stuck.body_yaw += 2.0;
+
+        for n in 1..=(cfg.tracking.ticks + cfg.tracking.reversal_ticks + 5) {
+            let out = tick_with(&cfg, &mut state, secs(f64::from(n) * 0.02), &stuck, None);
+            assert_eq!(out.report.tracking_count, n, "tick {n}");
+            assert_eq!(out.report.fault, None, "tick {n}");
+            assert!(
+                out.report.tracking_errors.is_some_and(|errors| errors
+                    .iter()
+                    .any(|error| *error > cfg.tracking.threshold_rad)),
+                "tick {n} still measures the error"
+            );
+        }
+        assert!(
+            state.mode == MotionMode::Holding,
+            "and the machine is still under command"
         );
     }
 
@@ -6958,6 +7053,7 @@ mod tests {
                 antennas: 2.0,
             },
             tracking: TrackingFaultConfig {
+                armed: true,
                 threshold_rad: 0.05,
                 progress_min_rad: 0.01,
                 ticks: 5,
@@ -7980,6 +8076,7 @@ mod tests {
                 ..MotionConfig::default().max_step
             },
             tracking: TrackingFaultConfig {
+                armed: true,
                 threshold_rad: 5e-4,
                 ticks: 20,
                 ..MotionConfig::default().tracking
@@ -8613,6 +8710,7 @@ mod tests {
     fn the_tracking_fault_names_the_joint_nobody_could_place() {
         let cfg = MotionConfig {
             tracking: TrackingFaultConfig {
+                armed: true,
                 threshold_rad: 0.1,
                 progress_min_rad: 0.01,
                 ticks: 1,
@@ -9677,38 +9775,39 @@ mod tests {
     }
 
     /// A setpoint further from the last goal than one tick's bound allows is
-    /// refused to the caller — where a sampled path pose would abandon a move,
-    /// there is no move to abandon and the caller is the planner.
+    /// emitted. The step bound bounds a plan of this crate's own, and a tracked
+    /// setpoint is the caller's content, sent as asked.
     #[test]
-    fn a_tracked_setpoint_past_the_step_bound_is_refused() {
+    fn a_tracked_setpoint_past_the_step_bound_is_emitted() {
         let cfg = MotionConfig::default();
         let start = JointTargets::default();
         let (mut state, pinned) = armed_at(&cfg, &start);
 
         // A pose the envelope has no objection to — it is a target moves are
         // commanded to elsewhere here — reached in one period.
+        let target = pose_at(0.19);
         let out = tick_with(
             &cfg,
             &mut state,
             secs(0.0),
             &pinned,
-            Some(&MotionCommand::Track(pose_at(0.19))),
+            Some(&MotionCommand::Track(target)),
         );
 
-        let CommandDisposition::Rejected(CommandRejection::StepTooLarge { joint, delta }) =
-            out.report.command
-        else {
-            panic!("expected a step refusal, got {:?}", out.report.command);
-        };
-        assert_eq!(group_of(joint), Some(JointGroup::Legs));
-        assert!(delta > cfg.max_step.legs, "{delta} rad in one tick");
-        assert!(out.goal.is_none());
+        assert_eq!(out.report.command, CommandDisposition::Tracked);
+        let goal = out.goal.expect("the setpoint went out");
+        // Some leg moved further in one period than the guard would have
+        // allowed on a sampled path, or this proves nothing.
+        assert!(
+            (0..6).any(|leg| (goal.legs[leg] - pinned.legs[leg]).abs() > cfg.max_step.legs),
+            "no leg stepped past the bound: {goal:?}"
+        );
         assert_eq!(out.report.aborted, None, "there was no move to abandon");
         assert_eq!(out.report.fault, None);
-        assert_eq!(&last_goal(&state), &pinned);
+        assert_eq!(&last_goal(&state), &goal);
 
-        // And the machine still takes a setpoint it can reach, so a refusal
-        // left nothing behind.
+        // And the machine still takes the next setpoint from where this one put
+        // it.
         let out = tick_with(
             &cfg,
             &mut state,

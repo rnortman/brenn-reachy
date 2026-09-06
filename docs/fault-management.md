@@ -125,9 +125,10 @@ requirement of this project; it must not reappear.
   limp for the session, because one latched antenna overload must not make the
   head un-armable until somebody power-cycles it.
 - **Commanding rules are unchanged and are not fault management.** The
-  envelope check on every commanded target, typed errors instead of clamps,
-  and per-tick step bounds all remain binding — they gate what we *ask* the
-  machine to do. None of them may ever gate a torque-off.
+  envelope check on every commanded target and typed errors instead of clamps
+  remain binding on everything we ask the machine to do; the per-tick step
+  bound remains binding on the moves this stack plans for itself. None of them
+  may ever gate a torque-off.
 - **A step bound bounds the plan, and only the plan.** The loop advances a
   move's own clock by at most one nominal period however late it wakes, so a
   period that starts a second late resumes the same path a second later
@@ -135,7 +136,9 @@ requirement of this project; it must not reappear.
   lateness therefore cannot push a healthy move past a bound; a bound that is
   crossed is an interpolator or a seed that is wrong. That is what makes it
   safe to size the bounds against the plan's own measured peak and nothing on
-  top of it.
+  top of it. A composed setpoint is not a plan of ours and is not bounded: it
+  is the caller's content, commanded as asked, and the envelope check is the
+  only screen it faces.
 
 ## Faults and the responses that answer them
 
@@ -163,9 +166,9 @@ about anything a control step can see.
 
 | slug | what it detects | response |
 |---|---|---|
-| `antenna_obstructed` | an antenna past the tracking threshold for a whole window without closing: interference, a snag, a hand | `degrade_antennas` |
+| `antenna_obstructed` | an antenna past the tracking threshold for a whole window without closing: interference, a snag, a hand. Not raised while the detector is disarmed (`TrackingFaultConfig::armed`) | `degrade_antennas` |
 | `antenna_servo_fault` | hardware-error bits on an antenna servo, mid-run or at engage | `degrade_antennas` |
-| `head_obstructed` | a leg or the body yaw past the threshold for a whole window without closing: a grab, a snag, a jam. Not a motor failure — the servo still commands | `slow_stow_to_rest` |
+| `head_obstructed` | a leg or the body yaw past the threshold for a whole window without closing: a grab, a snag, a jam. Not a motor failure — the servo still commands. Not raised while the detector is disarmed (`TrackingFaultConfig::armed`) | `slow_stow_to_rest` |
 | `head_servo_fault` | hardware-error bits on a leg or body-yaw servo mid-run | `masked_slow_stow_to_park` |
 | `position_feedback_lost` | too many consecutive periods with no usable position read; a reading nobody can place counts as one of them | `immediate_all_torque_off_to_park` |
 | `measured_pose_invalid` | the measured cranks yield no believable head pose for a whole run of live reads — a mechanism outside its own model | `immediate_all_torque_off_to_park` |
@@ -182,14 +185,17 @@ a whole window, and that presents as `head_obstructed`. So the two conditions
 answer differently — the seized crank parks and goes limp, the obstruction stows
 under control — and the reason driving five legs against a seized sixth is not
 answered with a stow is the parallel-linkage argument in the escalation ladder
-below.
+below. While the detector is disarmed only one of them is answered: a grabbed
+head presents as lag in the record and nothing acts on it, and the seized crank
+still parks through `measured_pose_invalid`. The two conditions still tell apart
+in the record; the difference is which of them the machine does anything about.
 
 Classification happens exactly once, at the point the condition becomes one of
 these values, and travels as that value. No layer re-derives a class from a
 message, and no layer invents a response outside the table.
 
-**What is not a fault.** A goal that steps further in one period than the
-bound allows, a sampled path that leaves the envelope, our own clock or budget
+**What is not a fault.** A planned path whose goal steps further in one period
+than the bound allows, a sampled path that leaves the envelope, our own clock or budget
 running out, a malformed configuration, a command the envelope refuses. These
 say the plan was wrong, not the platform. The move is abandoned where it
 stands, the offending sample is never emitted, and the machine — healthy, and

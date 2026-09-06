@@ -41,10 +41,10 @@
 
 pub mod compose;
 pub mod config;
+pub mod envelope;
 pub mod files;
 pub mod format;
 pub mod library;
 pub mod player;
 pub mod sequence;
-pub mod speed;
 pub mod vendor;

@@ -5,7 +5,6 @@
   "description": "both antennas up and back down, 0.6 s",
   "channels": ["antennas"],
   "frame_hz": 50.0,
-  "max_speed": 2.0,
   "frames": [
     {"antennas": [0.0, 0.0]},
     {"antennas": [0.00382417, -0.00382417]},

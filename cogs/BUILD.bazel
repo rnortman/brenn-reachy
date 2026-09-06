@@ -288,6 +288,7 @@ rust_binary(
         ":motion_channels",
         ":motion_evidence",
         ":motion_slots",
+        ":pose_reading",
         ":run_report",
         ":schedule_clk_rs",
         ":script_clk_rs",
@@ -382,13 +383,14 @@ rust_test(
 rust_binary(
     name = "gen_clip_config",
     srcs = ["gen_clip_config.rs"],
-    # The committed asset and the documents it comes from are embedded, so the
-    # drift case below compares a fresh emit against the file without needing
-    # runfiles or a working directory.
+    # The committed asset is embedded, so the drift case compares a fresh emit
+    # against the file itself. The documents it comes from are not: they are a
+    # tree that grows by import, and the test target below supplies them through
+    # runfiles so adding one is not a code change.
     compile_data = [
         "clip_library.names.json",
         "clip_library.textproto",
-    ] + glob(["clips/*.json"]),
+    ],
     edition = "2024",
     deps = [
         ":config_clk_rs",
@@ -400,10 +402,19 @@ rust_binary(
 
 # A binary's root is its own crate, so the library's test target never sees the
 # argument parsing, the printer, or the drift check against the committed asset.
+#
+# The clip documents arrive here rather than on the binary: a `rust_test` with
+# `crate =` inherits the binary's `compile_data` but takes its runfiles from its
+# own `data`. `CLIP_DOCUMENTS` names the directory beside the attribute that
+# supplies it, relative to the runfiles root, which is a test's working
+# directory.
 rust_test(
     name = "gen_clip_config_test",
     size = "small",
     crate = ":gen_clip_config",
+    data = glob(["clips/**/*.json"]),
+    env = {"CLIP_DOCUMENTS": "cogs/clips"},
+    deps = ["//crates/reachy-scratch:reachy_scratch"],
 )
 
 # The configuration the host composition's three processes read by path at setup,
@@ -447,6 +458,47 @@ merge_simplelaunch_config(
         "system_host.motion_host.diagnostics_database_config.tachyon",
         ":robot_host_clk_exe",
         "@clockwork//clockwork/pinion:tcp_bridge_main",
+    ],
+)
+
+# What one library tour did, read off its log: the operator's tool for judging
+# a tour run. Run as
+# `bazel run //cogs:library_tour_report -- <log-dir> <names.json>`, which is what
+# `make library-run` does with the fetched records and the committed sidecar.
+# Reads the names sidecar through `reachy-edge` because the log carries motion
+# indices and the list a tour is judged against is a list of names.
+rust_binary(
+    name = "library_tour_report",
+    srcs = ["library_tour_report.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":pose_reading",
+        ":run_report",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+    ],
+)
+
+# The analyzer over crafted runs: a tour that played, and each way one did not.
+# Cases build the streams a tour writes rather than a log file; what is under
+# test is the reading.
+rust_test(
+    name = "library_tour_report_test",
+    size = "small",
+    crate = ":library_tour_report",
+    deps = [
+        "//crates/motion-proto:motion_proto",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
 
@@ -776,6 +828,36 @@ rust_test(
         "@brenn_reachy_crates//:nalgebra",
         "@brenn_reachy_crates//:serde_json",
     ],
+)
+
+# Reading a driver's sample stream: the nine angles off a sample, the run-wide
+# lag figures, the fault lines, and the cycle grid a log's skipped slots are
+# placed on. Its own crate because both log analyzers in this package read the
+# same stream and an operator compares their numbers against each other: a
+# second copy of the measurement drifts on the first change nobody made twice.
+rust_library(
+    name = "pose_reading",
+    srcs = ["pose_reading.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":run_report",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The grid arithmetic and the skip accounting: which cycles a driver's own skip
+# report explains, which is what tells a hole in the record apart from the
+# machine saying it missed a slot.
+rust_test(
+    name = "pose_reading_test",
+    size = "small",
+    crate = ":pose_reading",
 )
 
 # What the pose estimator keeps between samples, in a module of its own: the
@@ -1178,7 +1260,8 @@ scenario_suite(
 )
 
 # S2, obstruction: the same three cogs S1 runs on, with a hand held against the
-# head cranks part way through the raise.
+# head cranks part way through the raise, which the disarmed tracking detector
+# leaves as lag in the record.
 scenario_suite(
     name = "s2",
     author_deps = [
@@ -1193,10 +1276,7 @@ scenario_suite(
         ":sim_state_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
-        "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
-        "//motion:reports_clk_rs",
-        "//motion:timeline_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,

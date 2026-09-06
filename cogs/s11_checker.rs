@@ -72,43 +72,33 @@ fn main() -> ExitCode {
         check::room("stow", STOW_CYCLES, &stow_clocks(), failures);
         check_the_answer_fits_the_posture(failures);
 
-        // The two conditions of this run, and nothing else: the servo's own
+        // The one condition of this run, and nothing else: the servo's own
         // account of itself, once -- the byte latches in the servo and the
         // rotation carries it on every lap, so a session that recorded what it
         // read would fill the timeline with one standing condition at the poll
-        // rate -- and the pair that stopped closing on the fold once nothing
-        // held it. The second is the tick's and is *expected*: the schedule's
-        // last step asks the antennas to fold and nothing holds them any more.
-        // Where it falls is the assertion: not before the fold was commanded,
-        // because a limp antenna holding the posture it had already reached
-        // follows it perfectly and an obstruction raised while nothing was
-        // asking the pair to move is a mechanical claim this scenario never
-        // made. That the pair had let go by then is the premise asserted
-        // above.
+        // rate. The pair that stops closing on the fold once nothing holds it is
+        // no second condition: the tracking detector ships disarmed, so a limp
+        // antenna commanded to move is lag in the record and is answered by
+        // nothing. Re-arming it puts an `antenna_obstructed` raise inside the
+        // fold and a second drain after it
+        // (`TODO(tracking-response-model)`).
         check::faults_recorded(
             run,
-            &[
-                check::Expected {
-                    kind: FaultKindWire::ANTENNA_SERVO_FAULT,
-                    rows: flags::bit(faulted_joint()),
-                    from: fault_cycle(),
-                    through: answered_by_cycle(),
-                    how_many: check::Recorded::Times(1),
-                    raised_by_tick: false,
-                    why: "the antenna complaining about itself",
-                },
-                check::Expected {
-                    kind: FaultKindWire::ANTENNA_OBSTRUCTED,
-                    rows: degraded_rows(),
-                    from: stow_start_cycle(),
-                    through: end_cycle(),
-                    how_many: check::Recorded::AtLeastOnce,
-                    raised_by_tick: true,
-                    why: "the limp pair no longer closing on its goals",
-                },
-            ],
+            &[check::Expected {
+                kind: FaultKindWire::ANTENNA_SERVO_FAULT,
+                rows: flags::bit(faulted_joint()),
+                from: fault_cycle(),
+                through: answered_by_cycle(),
+                how_many: check::Recorded::Times(1),
+                raised_by_tick: false,
+                why: "the antenna complaining about itself",
+            }],
             failures,
         );
+        // And the tick's own channel is empty, which is this run's subject: the
+        // limp pair is commanded to fold and answers with nothing, so a raise
+        // here of any kind would be a detector that came back armed.
+        check::no_faults(run, failures);
         check_the_answer(run, failures);
         check_the_writes(run, engaged.map(|engaged| engaged.released), failures);
         // The pair really did let go: from the cycle the drain must have
@@ -206,14 +196,12 @@ fn check_the_answer(run: &Run, failures: &mut Vec<String>) {
             ));
         }
     }
-    // Two conditions, so two drains, and the run says which is which by when it
-    // ran. The first is the servo's own byte, answered while the machine held
-    // its working posture and inside the wakes one verified write apiece takes.
-    // The second is the tick's own evidence once the fold is commanded: writing
-    // torque off a row that is already limp is the honest answer to being told
-    // again that it will not move, and it costs two more wakes.
-    match (releases.first(), releases.get(1), releases.len()) {
-        (Some((first, ..)), Some((second, ..)), 2) => {
+    // One condition, so one drain: the servo's own byte, answered while the
+    // machine held its working posture and inside the wakes one verified write
+    // apiece takes. The fold the limp pair cannot join raises nothing while the
+    // tracking detector is disarmed, so nothing asks for the group again.
+    match (releases.first(), releases.len()) {
+        (Some((first, ..)), 1) => {
             if *first < fault_cycle() || *first > released_by_cycle() {
                 failures.push(format!(
                     "the pair was released at cycle {first}, outside the {}..{} one verified write \
@@ -222,19 +210,11 @@ fn check_the_answer(run: &Run, failures: &mut Vec<String>) {
                     released_by_cycle()
                 ));
             }
-            if *second < stow_start_cycle() {
-                failures.push(format!(
-                    "the pair was released again at cycle {second}, before the fold was commanded \
-                     on {}: the second drain answers the tick's own evidence about joints that \
-                     will not follow, and nothing asks the antennas to move before then",
-                    stow_start_cycle()
-                ));
-            }
         }
         _ => failures.push(format!(
-            "the session released the pair on cycles {:?}: this run has two conditions in it -- \
-             the byte the servo holds, and the fold the limp pair cannot join -- and each is \
-             answered by draining the group once",
+            "the session released the pair on cycles {:?}: this run has one condition in it -- \
+             the byte the servo holds -- answered by draining the group once, and the fold the \
+             limp pair cannot join is answered by nothing",
             releases.iter().map(|(at, ..)| *at).collect::<Vec<_>>()
         )),
     }

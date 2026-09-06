@@ -80,6 +80,29 @@ Nothing has been released, and nothing here has driven a motor.
   pin, and a payload built out of two revisions otherwise fails on the unit as a
   handshake.
 
+- **Both vendor clip sets — dances and emotions — are imported into the clip
+  library and confirmed on hardware.** 69 motions from Pollen's published
+  recordings now load, play at their recorded pace, and have human-readable
+  names in the sidecar. A new `make library-run` tours every motion in the
+  library on the unit in a single unattended session and records servo goals
+  and positions throughout, producing the plant-response data the tracking
+  detector needs to be re-armed. The importer (`reachy-clip-import`) gained
+  automatic still-channel detection, quaternion renormalisation with drift
+  reporting, and a per-clip envelope check that refuses frames with no crank
+  solution rather than clamping them. Audio sidecars (`.ogg` files shipped
+  with the emotions set) are copied alongside their clips.
+
+- **Content plays without a speed ceiling, and the tracking detector ships
+  disarmed.** The per-tick step bound and the clip speed policy derived from it
+  were sized off two hand-recorded gestures and refused seven vendor clips
+  outright. Both are removed: a clip carries no ceiling, a composed setpoint is
+  not step-guarded, and the per-tick step bound guards only the moves this repo
+  plans for itself. The tracking detector (`head_obstructed`,
+  `antenna_obstructed`) judged a joint against its goal using direction
+  heuristics calibrated on the same two gestures; it now ships disarmed and
+  measures every run without raising, until a plant model fitted to the
+  library-run recordings replaces what it judges against.
+
 ### Changed
 
 - **The clip library asset carries motions, and sequence documents load

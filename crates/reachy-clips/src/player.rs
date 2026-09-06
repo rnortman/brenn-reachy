@@ -136,15 +136,6 @@ pub enum PlayerStateError {
         /// What the slot held.
         speed: f64,
     },
-    /// An invocation speed above what the motion's clips admit together.
-    /// Played, it steps between frames further than the derivation admitted.
-    #[error("a player's speed of {speed} is past the motion's ceiling of {ceiling}")]
-    PastCeiling {
-        /// What the slot held.
-        speed: f64,
-        /// The fastest invocation the motion's segments admit together.
-        ceiling: f64,
-    },
     /// The motion clock is not finite and non-negative. It is a sum of
     /// non-negative periods from zero.
     #[error("a player's motion clock must be finite and non-negative, not {value}")]
@@ -362,12 +353,6 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
         let speed = state.speed;
         if !speed.is_finite() || speed <= 0.0 {
             return Err(PlayerStateError::BadSpeed { speed });
-        }
-        // A pick-up keeps the speed it was joined at; this is the only place
-        // a stored one is judged against the motion's ceiling.
-        let ceiling = motion.max_speed();
-        if speed > ceiling {
-            return Err(PlayerStateError::PastCeiling { speed, ceiling });
         }
         let clock_s = state.clock_s;
         if !clock_s.is_finite() || clock_s < 0.0 {
@@ -831,12 +816,12 @@ mod tests {
     use crate::format::Clip;
 
     use crate::compose::compose;
-    use crate::speed::ClipLimits;
+    use crate::envelope::ClipLimits;
     use brenn_reachy__motion__joints_clk_rs::JointFlags;
     use reachy_kin::{LegAngles, inverse_kinematics};
     use reachy_motion::{
-        ArmRecord, CommandDisposition, JointStep, JointTargets, JointVector, MotionCommand,
-        MotionConfig, MotionSnapWire, TickInputs, TickOutputs, arm, motion_tick,
+        ArmRecord, CommandDisposition, JointTargets, JointVector, MotionCommand, MotionConfig,
+        MotionSnapWire, TickInputs, TickOutputs, arm, motion_tick,
     };
 
     /// One way of spoiling a frozen frame, and what to call it in a message.
@@ -897,23 +882,11 @@ mod tests {
         }
     }
 
-    /// The bounds these fixtures load under: generous ones.
+    /// The bounds these fixtures load under: the machine's own.
     ///
-    /// What is under test here is the clock and the weight ramps, so the
-    /// fixtures use round numbers — a tenth of a radian a frame,
-    /// a zero-length blend — that the machine's real per-tick bounds would
-    /// floor or refuse outright. Deriving against wide bounds keeps those
-    /// numbers exactly as written. The derivation itself is pinned in
-    /// `speed.rs`, and what it does to a load in `format.rs`.
+    /// What is under test here is the clock and the weight ramps.
     fn limits() -> ClipLimits {
-        ClipLimits {
-            max_step: JointStep {
-                legs: 100.0,
-                body_yaw: 100.0,
-                antennas: 100.0,
-            },
-            ..ClipLimits::default()
-        }
+        ClipLimits::default()
     }
 
     use crate::format::{ClipDoc, FrameDoc};
@@ -929,7 +902,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: Some(blend_ms),
             blend_out_ms: Some(blend_ms),
             frames: values
@@ -952,7 +924,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Head],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: Some(blend_ms),
             blend_out_ms: Some(blend_ms),
             frames: values
@@ -976,7 +947,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Head],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: Some(0),
             blend_out_ms: Some(0),
             frames: rotations
@@ -1010,7 +980,7 @@ mod tests {
         /// `segments` — each a clip's index, the speed the flattening left on
         /// it, and the hold that follows.
         fn composed(clips: &[&Clip], lead_gap_ms: u32, segments: &[(u16, f64, u32)]) -> Self {
-            let mut message = Box::new(ClipLibraryConfigWire::new());
+            let mut message = ClipLibraryConfigWire::new_boxed();
             {
                 let out = message.clear_valid();
                 for clip in clips {
@@ -1050,7 +1020,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: Some(100),
             blend_out_ms: Some(100),
             frames: (0..20)
@@ -1322,76 +1291,6 @@ mod tests {
         assert!((half - whole / 2.0).abs() < 1e-12, "{half} vs {whole}");
     }
 
-    #[test]
-    fn a_derived_ramp_longer_than_the_clip_plays_the_whole_track_at_no_weight() {
-        // An authored ramp longer than its clip is refused at load, so the only
-        // way to reach this state is the floor: against a tight antenna step
-        // bound the derivation stretches a zero ramp to many times the clip's
-        // length, which is stretch-and-report rather than refusal. The
-        // accepting load below is that exemption; the weights are what the
-        // player does with the result.
-        let tight = ClipLimits {
-            max_step: JointStep {
-                antennas: 0.001,
-                ..limits().max_step
-            },
-            ..limits()
-        };
-        let doc = ClipDoc {
-            version: 1,
-            kind: "clip".to_owned(),
-            name: "walk".to_owned(),
-            description: None,
-            channels: vec![Channel::Antennas],
-            frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
-            blend_in_ms: Some(0),
-            blend_out_ms: Some(0),
-            frames: (0..10)
-                .map(|_| FrameDoc {
-                    antennas: Some([0.5, -0.5]),
-                    ..FrameDoc::default()
-                })
-                .collect(),
-        };
-        let clip = Clip::from_doc(doc, &tight).expect("a floored ramp is not a refusal");
-        // Ten frames at 50 Hz is 200 ms of clip; the floor is orders longer.
-        assert!(clip.blend_in_ms() > 10_000, "{}", clip.blend_in_ms());
-
-        let track = Track::of(&clip);
-        let mut row_player = Row::new();
-        let mut player = row_player.play(track.view(), 1.0);
-        let samples = run(&mut player, 200);
-        for sample in &samples[..10] {
-            assert!(sample.weights.get(Channel::Antennas) < 0.01);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "finite and positive")]
-    fn a_zero_speed_player_is_refused() {
-        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
-        let mut row = Row::new();
-        let _ = row.play(track.view(), 0.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "finite and positive")]
-    fn a_nan_speed_player_is_refused() {
-        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
-        let mut row = Row::new();
-        let _ = row.join(track.view(), f64::NAN, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn a_join_past_the_whole_motion_is_finished_immediately() {
-        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
-        let mut row_player = Row::new();
-        let mut player = row_player.join(track.view(), 1.0, Duration::from_secs(5));
-        assert!(player.advance(TICK).is_none());
-        assert!(player.is_finished());
-    }
-
     /// A machine armed and holding the neutral pose, and the goals it holds.
     ///
     /// The state is the slot: the caller owns the bytes for the life of the run.
@@ -1412,17 +1311,12 @@ mod tests {
         (slot, joints)
     }
 
-    /// The whole playback path against the machine's own per-tick guard: a clip
-    /// loaded under the shipped bounds, played at the speed the loader derived
-    /// for it, composed over a static neutral base and handed to the tick one
-    /// setpoint per period. Every period is taken and none is refused, which is
-    /// what the derivation's margin claims over a base that is not moving.
-    ///
-    /// The end of the chain the offline derivation exists to protect: `speed.rs`
-    /// pins the arithmetic, and this pins the arithmetic against the code that
-    /// actually decides what goes on the wire.
+    /// The whole playback path end to end: a clip loaded under the shipped
+    /// bounds, composed over a static neutral base and handed to the tick one
+    /// setpoint per period. Every period is taken, which is what the import-time
+    /// envelope walk claims over a base that is not moving.
     #[test]
-    fn a_clip_at_its_derived_speed_plays_through_the_real_tick() {
+    fn a_clip_plays_through_the_real_tick() {
         let cfg = MotionConfig::default();
         let shipped = ClipLimits::from_motion_config(&cfg);
 
@@ -1434,7 +1328,6 @@ mod tests {
             description: None,
             channels: vec![Channel::Head, Channel::Antennas, Channel::BodyYaw],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: None,
             blend_out_ms: None,
             frames: (0..40)
@@ -1450,69 +1343,12 @@ mod tests {
                 .collect(),
         };
         let clip = Clip::from_doc(doc, &shipped).expect("the track stays in the envelope");
-        let speed = clip.max_speed();
-        assert!(speed >= 1.0, "a clip plays at its own recorded speed");
+        let speed = 1.0;
         let track = Track::of(&clip);
         let mut row = Row::new();
         let (ticks, moved) = play_through_the_tick(&cfg, row.play(track.view(), speed));
         assert!(moved, "the clip commanded something");
         assert!(ticks > 20, "the whole track played: {ticks} ticks");
-    }
-
-    /// The same guard, joined mid-window at the far end of a track that is both
-    /// far from zero and moving at its ceiling.
-    ///
-    /// This is the tick where the two terms of a blend-in coincide: the ramp
-    /// commands `Δw` of the frame it joined at — the clip's largest delta — and
-    /// the clock commands one period of advance beside it, on the same joint,
-    /// on the same period. A floor and a ceiling each sized to spend the whole
-    /// usable step would together spend twice it and be refused here.
-    #[test]
-    fn a_late_join_at_a_clips_far_end_stays_inside_the_step_bound() {
-        let cfg = MotionConfig::default();
-        let shipped = ClipLimits::from_motion_config(&cfg);
-
-        // An antenna held far off neutral throughout, jogging back and forth by
-        // a whole frame-step: every frame is near the track's largest delta and
-        // every pair asks for the ceiling's worth of travel, so a ramp climbing
-        // over it spends both terms on the same tick.
-        let step = cfg.max_step.antennas / 3.0;
-        let held = step * 20.0;
-        let doc = ClipDoc {
-            version: 1,
-            kind: "clip".to_owned(),
-            name: "test/far-end".to_owned(),
-            description: None,
-            channels: vec![Channel::Antennas],
-            frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
-            blend_in_ms: Some(0),
-            blend_out_ms: Some(0),
-            frames: (0..60)
-                .map(|index| {
-                    // A triangle of period eight, so the jog survives a clock
-                    // advancing two frames a tick.
-                    let phase = index % 8;
-                    let up = if phase <= 4 { phase } else { 8 - phase };
-                    FrameDoc {
-                        dt: None,
-                        dq: None,
-                        antennas: Some([held + f64::from(up) * step, 0.0]),
-                        body_yaw: None,
-                    }
-                })
-                .collect(),
-        };
-        let clip = Clip::from_doc(doc, &shipped).expect("antennas stay in range");
-        let speed = clip.max_speed();
-        // A third of the way in, so the ramp is still climbing over a delta at
-        // the track's largest while the clock keeps advancing under it.
-        let joined = Duration::from_secs_f64(clip.duration_s() / speed / 3.0);
-        let track = Track::of(&clip);
-        let mut row = Row::new();
-        let (ticks, moved) = play_through_the_tick(&cfg, row.join(track.view(), speed, joined));
-        assert!(moved, "the join commanded something");
-        assert!(ticks > 5, "the join played and faded: {ticks} ticks");
     }
 
     /// Play a player out through the real tick over a static neutral base,
@@ -1558,6 +1394,40 @@ mod tests {
     #[test]
     fn a_pick_up_plays_what_a_player_never_put_down_plays() {
         the_resume_law_holds(&Track::of(&busy_clip()), 1.0, Duration::ZERO);
+    }
+
+    /// `Row::play`'s documented `# Panics`: a speed that is not finite and
+    /// positive is a caller bug, and the constructor says so rather than
+    /// dividing a clock by it. `resumable`'s `BadSpeed` is the other entry
+    /// point and is covered separately.
+    #[test]
+    #[should_panic(expected = "finite and positive")]
+    fn a_zero_speed_player_is_refused() {
+        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
+        let mut row = Row::new();
+        let _ = row.play(track.view(), 0.0);
+    }
+
+    /// The same contract on `Row::join`, whose speed divides an offset as well
+    /// as a clock.
+    #[test]
+    #[should_panic(expected = "finite and positive")]
+    fn a_nan_speed_player_is_refused() {
+        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
+        let mut row = Row::new();
+        let _ = row.join(track.view(), f64::NAN, Duration::from_millis(100));
+    }
+
+    /// A live path: a play window that opens after the motion's own duration.
+    /// The player is finished before it samples, rather than handing back a
+    /// first frame the schedule is already past.
+    #[test]
+    fn a_join_past_the_whole_motion_is_finished_immediately() {
+        let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
+        let mut row_player = Row::new();
+        let mut player = row_player.join(track.view(), 1.0, Duration::from_secs(5));
+        assert!(player.advance(TICK).is_none());
+        assert!(player.is_finished());
     }
 
     #[test]
@@ -1817,26 +1687,6 @@ mod tests {
                 ms: stray,
             })
         );
-    }
-
-    /// A stored speed past the motion's ceiling is a slot nothing wrote,
-    /// refused before the clock races.
-    #[test]
-    fn a_speed_past_the_motions_ceiling_is_refused() {
-        let (track, mut row) = live_row();
-        let ceiling = track.view().max_speed();
-        row.state().speed = ceiling * 2.0;
-        assert_eq!(
-            refusal(&track, &row),
-            PlayerStateError::PastCeiling {
-                speed: ceiling * 2.0,
-                ceiling,
-            }
-        );
-
-        let (track, mut row) = live_row();
-        row.state().speed = ceiling;
-        assert!(ClipPlayer::resumable(&track.view(), row.held()).is_ok());
     }
 
     /// A frozen frame drives the clip's channels and no others: it starts as the

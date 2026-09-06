@@ -21,10 +21,10 @@
 //! the second one starting does not end the first.
 //!
 //! This crate holds no library, so every question that needs one — does this
-//! name resolve, is this speed inside the motion's own ceiling — is the daemon's
-//! to answer. What is here is the arithmetic that does not need one: the window
-//! a play step occupies given a duration the caller supplies, and how many
-//! overlays that timeline would ever run at once.
+//! name resolve, how long does that motion run — is the daemon's to answer.
+//! What is here is the arithmetic that does not need one: the window a play
+//! step occupies given a duration the caller supplies, and how many overlays
+//! that timeline would ever run at once.
 //!
 //! [`base_at`]: MotionScript::base_at
 //! [`overlays_at`]: MotionScript::overlays_at
@@ -114,10 +114,9 @@ impl std::fmt::Display for Posture {
 pub const MIN_SPEED: f64 = 0.25;
 
 /// The fastest an overlay may be asked to play. Above this even a gentle motion
-/// approaches the machine's per-tick step bounds and the content reads as
-/// glitch. A motion may name a tighter ceiling of its own, which the daemon
-/// checks against its library; this is the bound both ends can check without
-/// one.
+/// reads as glitch. Together with [`MIN_SPEED`] this is the wire-format sanity
+/// range and the only speed check either end makes: no motion carries a ceiling
+/// of its own, and nothing downstream narrows this pair.
 ///
 /// These two are the authoritative pair. `reachy-clips`, on the far side of the
 /// repo seam, carries a mirror of them and of [`MAX_MOTION_NAME_LEN`]; the
@@ -449,8 +448,8 @@ impl<'de> Deserialize<'de> for Step {
 ///
 /// Two numbers rather than one because they scale differently: the motion's own
 /// clock is what a speed factor multiplies, while the blend-out that follows it
-/// runs on the wall clock at any speed — it is the ramp that keeps the machine's
-/// per-tick step bounds satisfied, and speeding a motion up must not shorten it.
+/// is the overlay's own exit ramp and runs on the wall clock at any speed —
+/// speeding a motion up must not shorten the fade that ends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayWindow {
     /// How long the motion runs at its recorded speed, holds included.

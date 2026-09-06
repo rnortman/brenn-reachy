@@ -1,0 +1,91 @@
+reachy-clip-import
+--prefix pollen/emotions
+source: pollen-robotics/reachy-mini-emotions-library@873ae49f
+
+85 recording(s)
+pollen/emotions/amazed1: 3.44 s, 172 frames (from 172 over 3.42 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/anxiety1: 8.14 s, 407 frames (from 407 over 8.12 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/attentive1: 4.30 s, 215 frames (from 215 over 4.28 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/attentive2: 6.48 s, 324 frames (from 324 over 6.46 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/boredom1: 15.72 s, 786 frames (from 786 over 15.70 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/boredom2: the converted clip does not load: a frame this machine cannot hold: frame 186 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/calming1: the converted clip does not load: a frame this machine cannot hold: frame 192 leaves the envelope over the neutral base: leg 1 outside its travel window
+REFUSED pollen/emotions/cheerful1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 6 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/come1: the converted clip does not load: a frame this machine cannot hold: frame 51 leaves the envelope over the neutral base: leg 6 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/confused1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 6 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/contempt1: the converted clip does not load: a frame this machine cannot hold: frame 40 leaves the envelope over the neutral base: leg 6 outside its travel window
+REFUSED pollen/emotions/curious1: the converted clip does not load: a frame this machine cannot hold: frame 222 leaves the envelope over the neutral base: leg 4 outside its travel window
+pollen/emotions/dance1: 3.26 s, 163 frames (from 163 over 3.24 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/dance2: the converted clip does not load: a frame this machine cannot hold: frame 447 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/dance3: the converted clip does not load: a frame this machine cannot hold: frame 215 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/disgusted1: 6.96 s, 348 frames (from 348 over 6.94 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/displeased1: 3.38 s, 169 frames (from 169 over 3.36 s), [head], blends 200/200 ms; dropped as still: body_yaw,antennas
+pollen/emotions/displeased2: 2.96 s, 148 frames (from 148 over 2.94 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/downcast1: 5.90 s, 295 frames (from 295 over 5.88 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/dying1: the converted clip does not load: a frame this machine cannot hold: frame 98 leaves the envelope over the neutral base: head attitude outside the cone
+pollen/emotions/electric1: 3.52 s, 176 frames (from 176 over 3.50 s), [head,body_yaw,antennas], blends 200/200 ms
+REFUSED pollen/emotions/enthusiastic1: the converted clip does not load: a frame this machine cannot hold: frame 35 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/enthusiastic2: 3.44 s, 172 frames (from 172 over 3.42 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/exhausted1: 18.28 s, 914 frames (from 914 over 18.26 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/fear1: the converted clip does not load: a frame this machine cannot hold: frame 26 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/frustrated1: 5.98 s, 299 frames (from 299 over 5.96 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/furious1: the converted clip does not load: a frame this machine cannot hold: frame 59 leaves the envelope over the neutral base: leg 1 outside its travel window
+REFUSED pollen/emotions/go_away1: the converted clip does not load: a frame this machine cannot hold: frame 117 leaves the envelope over the neutral base: leg 1 outside its travel window
+pollen/emotions/grateful1: 2.52 s, 126 frames (from 126 over 2.50 s), [head,body_yaw], blends 200/200 ms; dropped as still: antennas
+pollen/emotions/helpful1: 4.38 s, 219 frames (from 219 over 4.36 s), [head,body_yaw], blends 200/200 ms; dropped as still: antennas
+pollen/emotions/helpful2: 3.86 s, 193 frames (from 193 over 3.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/impatient1: 4.04 s, 202 frames (from 202 over 4.02 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/impatient2: 3.92 s, 196 frames (from 196 over 3.90 s), [head,body_yaw], blends 200/200 ms; dropped as still: antennas
+pollen/emotions/incomprehensible2: 3.46 s, 173 frames (from 173 over 3.44 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/indifferent1: 2.58 s, 129 frames (from 129 over 2.56 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/inquiring1: the converted clip does not load: a frame this machine cannot hold: frame 66 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/inquiring2: 2.60 s, 130 frames (from 130 over 2.58 s), [head], blends 200/200 ms; dropped as still: body_yaw,antennas
+pollen/emotions/inquiring3: 2.94 s, 147 frames (from 147 over 2.92 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/irritated1: 2.50 s, 125 frames (from 125 over 2.48 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/irritated2: the converted clip does not load: a frame this machine cannot hold: frame 47 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/laughing1: the converted clip does not load: a frame this machine cannot hold: frame 55 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/laughing2: 2.94 s, 147 frames (from 147 over 2.92 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/lonely1: 10.24 s, 512 frames (from 512 over 10.22 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/lost1: 8.14 s, 407 frames (from 407 over 8.12 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/loving1: 5.62 s, 281 frames (from 281 over 5.60 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/mini-deep-sleep: 16.00 s, 800 frames (from 773 over 15.98 s), [head,body_yaw,antennas], blends 200/200 ms; rotation drift 5.2e-4
+pollen/emotions/no1: 2.70 s, 135 frames (from 135 over 2.68 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/no_excited1: 4.50 s, 225 frames (from 225 over 4.48 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/no_sad1: 7.06 s, 353 frames (from 353 over 7.04 s), [head,body_yaw,antennas], blends 200/200 ms
+pollen/emotions/oops1: 2.48 s, 124 frames (from 124 over 2.46 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/oops2: the converted clip does not load: a frame this machine cannot hold: frame 85 leaves the envelope over the neutral base: leg 2 outside its travel window, toggle margin below the floor
+pollen/emotions/proud1: 3.78 s, 189 frames (from 189 over 3.76 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/proud2: 3.20 s, 160 frames (from 160 over 3.18 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/proud3: the converted clip does not load: a frame this machine cannot hold: frame 71 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/rage1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 4 outside its travel window, toggle margin below the floor
+pollen/emotions/relief1: 5.02 s, 251 frames (from 251 over 5.00 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/relief2: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 1 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/reprimand1: the converted clip does not load: a frame this machine cannot hold: frame 24 leaves the envelope over the neutral base: leg 3 unreachable, leg 4 unreachable, toggle margin below the floor
+REFUSED pollen/emotions/reprimand2: the converted clip does not load: a frame this machine cannot hold: frame 134 leaves the envelope over the neutral base: leg 1 outside its travel window
+REFUSED pollen/emotions/reprimand3: the converted clip does not load: a frame this machine cannot hold: frame 75 leaves the envelope over the neutral base: leg 2 unreachable, toggle margin below the floor
+pollen/emotions/resigned1: 4.76 s, 238 frames (from 238 over 4.74 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/sad1: 9.04 s, 452 frames (from 452 over 9.02 s), [head,body_yaw,antennas], blends 200/200 ms
+REFUSED pollen/emotions/sad2: the converted clip does not load: a frame this machine cannot hold: frame 327 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/scared1: the converted clip does not load: a frame this machine cannot hold: frame 317 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/serenity1: 4.60 s, 230 frames (from 230 over 4.58 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/emotions/shy1: 7.82 s, 391 frames (from 391 over 7.80 s), [head,body_yaw,antennas], blends 200/200 ms
+REFUSED pollen/emotions/sleep1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/success1: the converted clip does not load: a frame this machine cannot hold: frame 76 leaves the envelope over the neutral base: leg 1 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/success2: the converted clip does not load: a frame this machine cannot hold: frame 101 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/surprised1: the converted clip does not load: a frame this machine cannot hold: frame 60 leaves the envelope over the neutral base: leg 2 outside its travel window
+REFUSED pollen/emotions/surprised2: the converted clip does not load: a frame this machine cannot hold: frame 71 leaves the envelope over the neutral base: leg 1 outside its travel window, toggle margin below the floor
+pollen/emotions/thoughtful1: 5.92 s, 296 frames (from 296 over 5.90 s), [head], blends 200/200 ms; dropped as still: body_yaw,antennas
+pollen/emotions/thoughtful2: 5.48 s, 274 frames (from 274 over 5.46 s), [head], blends 200/200 ms; dropped as still: body_yaw,antennas
+REFUSED pollen/emotions/tired1: the converted clip does not load: a frame this machine cannot hold: frame 97 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/toc-toc-toc: 13.38 s, 669 frames (from 645 over 13.37 s), [head,body_yaw,antennas], blends 200/200 ms; rotation drift 5.1e-4
+REFUSED pollen/emotions/uncertain1: the converted clip does not load: a frame this machine cannot hold: frame 304 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/uncomfortable1: the converted clip does not load: a frame this machine cannot hold: frame 290 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/understanding1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 1 unreachable, leg 2 unreachable, leg 3 outside its travel window, toggle margin below the floor
+REFUSED pollen/emotions/understanding2: the converted clip does not load: a frame this machine cannot hold: frame 3 leaves the envelope over the neutral base: toggle margin below the floor
+pollen/emotions/waiting: 9.98 s, 499 frames (from 483 over 9.96 s), [head,body_yaw,antennas], blends 200/200 ms; rotation drift 5.1e-4
+pollen/emotions/wake-mini-up: 15.68 s, 784 frames (from 761 over 15.66 s), [head,body_yaw,antennas], blends 200/200 ms; rotation drift 6.1e-4
+pollen/emotions/welcoming1: 3.48 s, 174 frames (from 174 over 3.46 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/emotions/welcoming2: the converted clip does not load: a frame this machine cannot hold: frame 125 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/yes1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: toggle margin below the floor
+REFUSED pollen/emotions/yes_sad1: the converted clip does not load: a frame this machine cannot hold: frame 0 leaves the envelope over the neutral base: leg 3 outside its travel window, toggle margin below the floor
+46 converted, 39 refused

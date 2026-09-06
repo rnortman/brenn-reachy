@@ -43,6 +43,13 @@ cp -- "${script_dir}/deploy-motion.sh" "${script_dir}/lib.sh" "${repo}/tools/"
 
 subject="${repo}/tools/deploy-motion.sh"
 
+# The committed clip name table, which a tour computes its budget from and its
+# analyzer is judged against. Contents are nobody's business here -- both
+# readers are stubbed -- but the file has to exist, because a tour of a tree
+# that has none is a refusal before anything is pushed.
+names_table="${repo}/cogs/clip_library.names.json"
+echo '{"motions": []}' >"$names_table"
+
 # The logger configuration as the build stages it, in the syntax the real one is
 # written in: one field per line, strings quoted, and one of them indented — the
 # subject reads a scalar wherever the line puts it, so the file's formatting is
@@ -136,6 +143,9 @@ export RSYNC_OLOG=full
 export RSYNC_CONSOLE=full
 export RSYNC_AUDIO=full
 export TEE_STATUS=0
+# The backstop a tour is given, and whether the sender could compute one at all.
+export TOUR_BUDGET=900
+export TOUR_BUDGET_STATUS=0
 
 # Every stub records its whole invocation on one line, so a case can assert both
 # that a command ran and that it did not.
@@ -228,6 +238,11 @@ if [ "$status" = 0 ]; then
 				echo 'cycles=1500 session_cmds=223 taken=223 aux_refused=2' \
 					>"${dest}motord_0.log"
 				echo 'the control process said things' >"${dest}proc_0.log"
+				# The intent source's own console, which a
+				# tour's refusals quote the last line of.
+				printf '%s\n%s\n' '{"kind":"played"}' \
+					'{"kind":"ending","why":"the tour said why"}' \
+					>"${dest}reachy_ask.log"
 				;;
 			nodriver) echo 'no driver here' >"${dest}proc_0.log" ;;
 			none) ;;
@@ -296,6 +311,14 @@ case " $* " in
 		exit 0
 		;;
 	*" build "*) exit "${BAZEL_BUILD_STATUS:-0}" ;;
+	*" --tour-budget "*)
+		# The sender, asked what backstop a tour of this library
+		# needs. Its own knob, because a budget that will not
+		# compute is a refusal before anything is pushed and is
+		# not the analyzer's verdict.
+		[ -n "${TOUR_BUDGET:-}" ] && echo "$TOUR_BUDGET"
+		exit "${TOUR_BUDGET_STATUS:-0}"
+		;;
 esac
 exit "${BAZEL_STATUS:-0}"
 STUB
@@ -1202,6 +1225,175 @@ assert_contains "the refusal names the field" "$(output_of "$result")" \
 	"states no log_root_dir"
 assert_lacks "and nothing was started" "$(calls)" "simplelaunch"
 stage_logger_config
+
+# ---------------------------------------------------------------------------
+# The library tour
+# ---------------------------------------------------------------------------
+#
+# `--run`'s chain with four substitutions: the sender is told to play the
+# library instead of the gesture, the `timeout` carries the backstop the sender
+# computed instead of a fixed budget, the ssh status is the sender's whenever
+# the launcher's is 0, and the records are fetched before the run is judged.
+# The remote command is pinned to the letter for the reason `--run`'s is: it is
+# what moves the machine.
+
+SSH_RUN_STATUS=0
+SSH_RUN_REACHED=yes
+tour_dest="${work}/tour-records"
+result=$(deploy unit --tour "$tour_dest")
+toured=$(calls)
+assert_status "a tour that ended itself and passed the analyzer succeeds" 0 \
+	"$(status_of "$result")"
+assert_contains "the budget is asked of the sender, over the committed table" "$toured" \
+	"bazel run -- //crates/reachy-ask:reachy_ask --tour-budget ${names_table}"
+assert_contains "the bus question, the log root's clear and the tour are one invocation" "$toured" \
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/clip_library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+# The sender knows its own end, so it is given neither of the gesture's clocks:
+# a run window would be a second opinion about when the tour is over, and the
+# commissioning timeout it ships with is the one that says a unit never came up.
+assert_lacks "the tour is given no run window" "$toured" "--run-window"
+assert_lacks "and no commissioning timeout of the harness's own" "$toured" \
+	"--resting-timeout"
+assert_lacks "and the launcher is not told where to serve its quit API" "$toured" \
+	"simplelaunch robotcpu_harness.textproto -p"
+assert_contains "the records are fetched under a name that says which run they came off" \
+	"$toured" "${tour_dest}/tour-log-"
+assert_contains "the analyzer judges the run directory that was discovered" "$toured" \
+	"bazel run -- //cogs:library_tour_report ${tour_dest}/tour-log-"
+assert_contains "and is handed the library the tour was supposed to play" "$toured" \
+	"${names_table}"
+assert_lacks "the tour is not judged by the gesture's analyzer" "$toured" \
+	"first_motion_report"
+assert_contains "the tour says the machine moves for minutes with nobody at it" \
+	"$(output_of "$result")" "several minutes"
+assert_contains "and says what the backstop is" "$(output_of "$result")" "900s is the backstop"
+
+# A relative records directory, which is what the Makefile passes: both paths
+# the analyzer is handed have to be absolute, because it runs from its own
+# runfiles tree.
+rel_tour=$(basename -- "${work}")/tour-records-relative
+result=$(cd -- "$(dirname -- "${work}")" && deploy unit --tour "$rel_tour")
+assert_status "a relative records directory tours" 0 "$(status_of "$result")"
+assert_contains "and the analyzer is handed an absolute records path" "$(calls)" \
+	"//cogs:library_tour_report ${work}/tour-records-relative/tour-log-"
+assert_contains "and an absolute sidecar beside it" "$(calls)" "${names_table}"
+
+# The analyzer's verdict is the tour's, as the motion report's is a run's.
+BAZEL_STATUS=7
+result=$(deploy unit --tour "${work}/tour-judged")
+assert_status "the analyzer's verdict is the tour's" 7 "$(status_of "$result")"
+BAZEL_STATUS=0
+
+# The backstop, which a tour should never reach: the sender ends the run
+# itself, so a launcher stopped by the timeout is a tour that did not.
+SSH_RUN_STATUS=124
+result=$(deploy unit --tour "${work}/tour-backstop")
+assert_status "a tour that rode its backstop fails" 1 "$(status_of "$result")"
+assert_contains "the refusal says the tour did not end itself" "$(output_of "$result")" \
+	"did not end within its 900s backstop"
+assert_contains "and quotes the sender's last line out of the fetched console" \
+	"$(output_of "$result")" "the tour said why"
+assert_contains "and the records were fetched anyway" "$(calls)" \
+	"root@unit:/run/brenn-app/logs/testing/"
+assert_contains "and says where they landed" "$(output_of "$result")" \
+	"${work}/tour-backstop/tour-log-"
+assert_lacks "and the analyzer is not run over a run that did not finish" "$(calls)" \
+	"library_tour_report"
+
+# The sender's own red, which reaches here as the ssh status because the
+# launcher returned 0: only the sender knows whether it quit the launcher or
+# the launcher fell over on its own.
+SSH_RUN_STATUS=9
+result=$(deploy unit --tour "${work}/tour-sender-red")
+assert_status "a tour the sender ended red fails" 1 "$(status_of "$result")"
+assert_contains "and carries the sender's code" "$(output_of "$result")" \
+	"the tour on unit failed (exit 9)"
+assert_contains "and quotes its line" "$(output_of "$result")" "the tour said why"
+assert_contains "and the records came back first" "$(calls)" \
+	"root@unit:/run/brenn-app/logs/testing/"
+
+# A console that did not come back is a sentence rather than a second failure:
+# the records are what the run was for and they were fetched either way.
+RSYNC_CONSOLE=nodriver
+result=$(deploy unit --tour "${work}/tour-noask-console")
+assert_status "a tour whose sender console was lost still fails on its own code" 1 \
+	"$(status_of "$result")"
+assert_contains "and says the line is not there to quote" "$(output_of "$result")" \
+	"its console did not come back"
+RSYNC_CONSOLE=full
+
+# A budget the sender could not compute is a refusal before the unit is
+# touched: the backstop is pasted into a `timeout`, and a run with no backstop
+# is a launcher nothing would stop.
+TOUR_BUDGET_STATUS=1
+TOUR_BUDGET=""
+result=$(deploy unit --tour "${work}/tour-nobudget")
+assert_status "a budget the sender would not print refuses the tour" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the run would have no backstop" \
+	"$(output_of "$result")" "has no backstop"
+assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
+TOUR_BUDGET_STATUS=0
+TOUR_BUDGET=notanumber
+result=$(deploy unit --tour "${work}/tour-badbudget")
+assert_status "a budget that is not a number of seconds refuses the tour" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal quotes what it was answered" "$(output_of "$result")" \
+	"answered 'notanumber'"
+assert_lacks "and nothing was started" "$(calls)" "simplelaunch"
+TOUR_BUDGET=900
+
+# A launcher that would not stop on the SIGINT its backstop sent and had to be
+# killed. The records still come back -- they are the point of the run -- and
+# the analyzer does not run over a tour that ended in a killed launcher.
+SSH_RUN_STATUS=137
+result=$(deploy unit --tour "${work}/tour-wedged")
+assert_status "a launcher killed after the SIGINT grace fails the tour" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says it did not stop on SIGINT" "$(output_of "$result")" \
+	"did not stop on SIGINT"
+assert_contains "and the records came back first" "$(calls)" \
+	"root@unit:/run/brenn-app/logs/testing/"
+assert_lacks "and the analyzer is not run over it" "$(calls)" "library_tour_report"
+SSH_RUN_STATUS=0
+
+# The chain's own refusals, which happen before the launcher is reached: no
+# sentinel in the console, so nothing was recorded and nothing is fetched. The
+# tour names itself in them, because what an operator is told to stop is the
+# thing that holds the servo bus.
+SSH_RUN_REACHED=no
+SSH_RUN_STATUS=3
+result=$(deploy unit --tour "${work}/tour-bus-busy")
+assert_status "a tour that cannot have the bus refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names the run it is about" "$(output_of "$result")" \
+	"a library tour will not share the servo bus"
+assert_lacks "and nothing is fetched from a run that never started" "$(calls)" "rsync"
+assert_lacks "and the analyzer is not run over nothing" "$(calls)" "library_tour_report"
+
+SSH_RUN_STATUS=8
+result=$(deploy unit --tour "${work}/tour-noconfig")
+assert_status "a payload with no launcher config refuses the tour" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the harness config the tour needs" \
+	"$(output_of "$result")" "robotcpu_harness.textproto"
+assert_contains "and says to push again" "$(output_of "$result")" "--push"
+assert_lacks "and nothing is fetched" "$(calls)" "rsync"
+SSH_RUN_REACHED=yes
+SSH_RUN_STATUS=0
+
+# A tree with no name table has no library to tour, which is knowable before
+# anything is pushed or asked of the unit.
+mv -- "$names_table" "${names_table}.aside"
+result=$(deploy unit --tour "${work}/tour-notable")
+assert_status "a tree carrying no clip name table refuses the tour" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the table and how to make one" \
+	"$(output_of "$result")" "make clip-config"
+assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
+mv -- "${names_table}.aside" "$names_table"
+
+SSH_RUN_STATUS=124
+SSH_RUN_REACHED=no
 
 # ---------------------------------------------------------------------------
 # Values that mean something to a shell

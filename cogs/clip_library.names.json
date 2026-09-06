@@ -10,10 +10,266 @@
     },
     {
       "clip_id": 2,
-      "name": "bench/sway"
+      "name": "pollen/dances/chicken_peck"
     },
     {
       "clip_id": 3,
+      "name": "pollen/dances/chin_lead"
+    },
+    {
+      "clip_id": 4,
+      "name": "pollen/dances/dizzy_spin"
+    },
+    {
+      "clip_id": 5,
+      "name": "pollen/dances/grid_snap"
+    },
+    {
+      "clip_id": 6,
+      "name": "pollen/dances/groovy_sway_and_roll"
+    },
+    {
+      "clip_id": 7,
+      "name": "pollen/dances/head_tilt_roll"
+    },
+    {
+      "clip_id": 8,
+      "name": "pollen/dances/interwoven_spirals"
+    },
+    {
+      "clip_id": 9,
+      "name": "pollen/dances/neck_recoil"
+    },
+    {
+      "clip_id": 10,
+      "name": "pollen/dances/pendulum_swing"
+    },
+    {
+      "clip_id": 11,
+      "name": "pollen/dances/polyrhythm_combo"
+    },
+    {
+      "clip_id": 12,
+      "name": "pollen/dances/sharp_side_tilt"
+    },
+    {
+      "clip_id": 13,
+      "name": "pollen/dances/side_glance_flick"
+    },
+    {
+      "clip_id": 14,
+      "name": "pollen/dances/side_peekaboo"
+    },
+    {
+      "clip_id": 15,
+      "name": "pollen/dances/side_to_side_sway"
+    },
+    {
+      "clip_id": 16,
+      "name": "pollen/dances/simple_nod"
+    },
+    {
+      "clip_id": 17,
+      "name": "pollen/dances/stumble_and_recover"
+    },
+    {
+      "clip_id": 18,
+      "name": "pollen/dances/uh_huh_tilt"
+    },
+    {
+      "clip_id": 19,
+      "name": "pollen/dances/yeah_nod"
+    },
+    {
+      "clip_id": 20,
+      "name": "pollen/emotions/amazed1"
+    },
+    {
+      "clip_id": 21,
+      "name": "pollen/emotions/anxiety1"
+    },
+    {
+      "clip_id": 22,
+      "name": "pollen/emotions/attentive1"
+    },
+    {
+      "clip_id": 23,
+      "name": "pollen/emotions/attentive2"
+    },
+    {
+      "clip_id": 24,
+      "name": "pollen/emotions/boredom1"
+    },
+    {
+      "clip_id": 25,
+      "name": "pollen/emotions/dance1"
+    },
+    {
+      "clip_id": 26,
+      "name": "pollen/emotions/disgusted1"
+    },
+    {
+      "clip_id": 27,
+      "name": "pollen/emotions/displeased1"
+    },
+    {
+      "clip_id": 28,
+      "name": "pollen/emotions/displeased2"
+    },
+    {
+      "clip_id": 29,
+      "name": "pollen/emotions/downcast1"
+    },
+    {
+      "clip_id": 30,
+      "name": "pollen/emotions/electric1"
+    },
+    {
+      "clip_id": 31,
+      "name": "pollen/emotions/enthusiastic2"
+    },
+    {
+      "clip_id": 32,
+      "name": "pollen/emotions/exhausted1"
+    },
+    {
+      "clip_id": 33,
+      "name": "pollen/emotions/frustrated1"
+    },
+    {
+      "clip_id": 34,
+      "name": "pollen/emotions/grateful1"
+    },
+    {
+      "clip_id": 35,
+      "name": "pollen/emotions/helpful1"
+    },
+    {
+      "clip_id": 36,
+      "name": "pollen/emotions/helpful2"
+    },
+    {
+      "clip_id": 37,
+      "name": "pollen/emotions/impatient1"
+    },
+    {
+      "clip_id": 38,
+      "name": "pollen/emotions/impatient2"
+    },
+    {
+      "clip_id": 39,
+      "name": "pollen/emotions/incomprehensible2"
+    },
+    {
+      "clip_id": 40,
+      "name": "pollen/emotions/indifferent1"
+    },
+    {
+      "clip_id": 41,
+      "name": "pollen/emotions/inquiring2"
+    },
+    {
+      "clip_id": 42,
+      "name": "pollen/emotions/inquiring3"
+    },
+    {
+      "clip_id": 43,
+      "name": "pollen/emotions/irritated1"
+    },
+    {
+      "clip_id": 44,
+      "name": "pollen/emotions/laughing2"
+    },
+    {
+      "clip_id": 45,
+      "name": "pollen/emotions/lonely1"
+    },
+    {
+      "clip_id": 46,
+      "name": "pollen/emotions/lost1"
+    },
+    {
+      "clip_id": 47,
+      "name": "pollen/emotions/loving1"
+    },
+    {
+      "clip_id": 48,
+      "name": "pollen/emotions/mini-deep-sleep"
+    },
+    {
+      "clip_id": 49,
+      "name": "pollen/emotions/no1"
+    },
+    {
+      "clip_id": 50,
+      "name": "pollen/emotions/no_excited1"
+    },
+    {
+      "clip_id": 51,
+      "name": "pollen/emotions/no_sad1"
+    },
+    {
+      "clip_id": 52,
+      "name": "pollen/emotions/oops1"
+    },
+    {
+      "clip_id": 53,
+      "name": "pollen/emotions/proud1"
+    },
+    {
+      "clip_id": 54,
+      "name": "pollen/emotions/proud2"
+    },
+    {
+      "clip_id": 55,
+      "name": "pollen/emotions/relief1"
+    },
+    {
+      "clip_id": 56,
+      "name": "pollen/emotions/resigned1"
+    },
+    {
+      "clip_id": 57,
+      "name": "pollen/emotions/sad1"
+    },
+    {
+      "clip_id": 58,
+      "name": "pollen/emotions/serenity1"
+    },
+    {
+      "clip_id": 59,
+      "name": "pollen/emotions/shy1"
+    },
+    {
+      "clip_id": 60,
+      "name": "pollen/emotions/thoughtful1"
+    },
+    {
+      "clip_id": 61,
+      "name": "pollen/emotions/thoughtful2"
+    },
+    {
+      "clip_id": 62,
+      "name": "pollen/emotions/toc-toc-toc"
+    },
+    {
+      "clip_id": 63,
+      "name": "pollen/emotions/waiting"
+    },
+    {
+      "clip_id": 64,
+      "name": "pollen/emotions/wake-mini-up"
+    },
+    {
+      "clip_id": 65,
+      "name": "pollen/emotions/welcoming1"
+    },
+    {
+      "clip_id": 66,
+      "name": "bench/sway"
+    },
+    {
+      "clip_id": 67,
       "name": "bench/tip"
     }
   ],
@@ -32,20 +288,404 @@
     },
     {
       "blend_out_ms": 200,
-      "duration_ms": 800,
+      "duration_ms": 1860,
       "motion_id": 2,
+      "name": "pollen/dances/chicken_peck"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 3,
+      "name": "pollen/dances/chin_lead"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 4,
+      "name": "pollen/dances/dizzy_spin"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 5,
+      "name": "pollen/dances/grid_snap"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 6,
+      "name": "pollen/dances/groovy_sway_and_roll"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 7,
+      "name": "pollen/dances/head_tilt_roll"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3980,
+      "motion_id": 8,
+      "name": "pollen/dances/interwoven_spirals"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1880,
+      "motion_id": 9,
+      "name": "pollen/dances/neck_recoil"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 10,
+      "name": "pollen/dances/pendulum_swing"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2900,
+      "motion_id": 11,
+      "name": "pollen/dances/polyrhythm_combo"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2900,
+      "motion_id": 12,
+      "name": "pollen/dances/sharp_side_tilt"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1880,
+      "motion_id": 13,
+      "name": "pollen/dances/side_glance_flick"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5020,
+      "motion_id": 14,
+      "name": "pollen/dances/side_peekaboo"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1880,
+      "motion_id": 15,
+      "name": "pollen/dances/side_to_side_sway"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1840,
+      "motion_id": 16,
+      "name": "pollen/dances/simple_nod"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1860,
+      "motion_id": 17,
+      "name": "pollen/dances/stumble_and_recover"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1840,
+      "motion_id": 18,
+      "name": "pollen/dances/uh_huh_tilt"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 1880,
+      "motion_id": 19,
+      "name": "pollen/dances/yeah_nod"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3440,
+      "motion_id": 20,
+      "name": "pollen/emotions/amazed1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 8141,
+      "motion_id": 21,
+      "name": "pollen/emotions/anxiety1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4300,
+      "motion_id": 22,
+      "name": "pollen/emotions/attentive1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 6480,
+      "motion_id": 23,
+      "name": "pollen/emotions/attentive2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 15720,
+      "motion_id": 24,
+      "name": "pollen/emotions/boredom1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3260,
+      "motion_id": 25,
+      "name": "pollen/emotions/dance1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 6960,
+      "motion_id": 26,
+      "name": "pollen/emotions/disgusted1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3380,
+      "motion_id": 27,
+      "name": "pollen/emotions/displeased1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2960,
+      "motion_id": 28,
+      "name": "pollen/emotions/displeased2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5900,
+      "motion_id": 29,
+      "name": "pollen/emotions/downcast1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3520,
+      "motion_id": 30,
+      "name": "pollen/emotions/electric1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3440,
+      "motion_id": 31,
+      "name": "pollen/emotions/enthusiastic2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 18280,
+      "motion_id": 32,
+      "name": "pollen/emotions/exhausted1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5980,
+      "motion_id": 33,
+      "name": "pollen/emotions/frustrated1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2520,
+      "motion_id": 34,
+      "name": "pollen/emotions/grateful1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4380,
+      "motion_id": 35,
+      "name": "pollen/emotions/helpful1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3860,
+      "motion_id": 36,
+      "name": "pollen/emotions/helpful2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4040,
+      "motion_id": 37,
+      "name": "pollen/emotions/impatient1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3920,
+      "motion_id": 38,
+      "name": "pollen/emotions/impatient2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3460,
+      "motion_id": 39,
+      "name": "pollen/emotions/incomprehensible2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2580,
+      "motion_id": 40,
+      "name": "pollen/emotions/indifferent1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2600,
+      "motion_id": 41,
+      "name": "pollen/emotions/inquiring2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2940,
+      "motion_id": 42,
+      "name": "pollen/emotions/inquiring3"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2500,
+      "motion_id": 43,
+      "name": "pollen/emotions/irritated1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2940,
+      "motion_id": 44,
+      "name": "pollen/emotions/laughing2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 10240,
+      "motion_id": 45,
+      "name": "pollen/emotions/lonely1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 8141,
+      "motion_id": 46,
+      "name": "pollen/emotions/lost1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5620,
+      "motion_id": 47,
+      "name": "pollen/emotions/loving1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 16000,
+      "motion_id": 48,
+      "name": "pollen/emotions/mini-deep-sleep"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2700,
+      "motion_id": 49,
+      "name": "pollen/emotions/no1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4500,
+      "motion_id": 50,
+      "name": "pollen/emotions/no_excited1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 7060,
+      "motion_id": 51,
+      "name": "pollen/emotions/no_sad1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 2480,
+      "motion_id": 52,
+      "name": "pollen/emotions/oops1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3780,
+      "motion_id": 53,
+      "name": "pollen/emotions/proud1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3200,
+      "motion_id": 54,
+      "name": "pollen/emotions/proud2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5020,
+      "motion_id": 55,
+      "name": "pollen/emotions/relief1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4760,
+      "motion_id": 56,
+      "name": "pollen/emotions/resigned1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 9040,
+      "motion_id": 57,
+      "name": "pollen/emotions/sad1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 4600,
+      "motion_id": 58,
+      "name": "pollen/emotions/serenity1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 7820,
+      "motion_id": 59,
+      "name": "pollen/emotions/shy1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5920,
+      "motion_id": 60,
+      "name": "pollen/emotions/thoughtful1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 5480,
+      "motion_id": 61,
+      "name": "pollen/emotions/thoughtful2"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 13380,
+      "motion_id": 62,
+      "name": "pollen/emotions/toc-toc-toc"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 9980,
+      "motion_id": 63,
+      "name": "pollen/emotions/waiting"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 15680,
+      "motion_id": 64,
+      "name": "pollen/emotions/wake-mini-up"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 3480,
+      "motion_id": 65,
+      "name": "pollen/emotions/welcoming1"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 800,
+      "motion_id": 66,
       "name": "bench/sway"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 500,
-      "motion_id": 3,
+      "motion_id": 67,
       "name": "bench/tip"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 1701,
-      "motion_id": 4,
+      "motion_id": 68,
       "name": "bench/tour"
     }
   ]

@@ -10,25 +10,22 @@
 //! control by the servos that still work, and then a park nothing clears but an
 //! operator.
 //!
-//! It is also the run where a condition arriving *during* the maneuver is
-//! answered, and the jam is the case that owns that in this suite. The head
-//! cranks are jammed while the fold is under way, so the decision tick raises
-//! about a machine that has stopped closing on the stow it was commanded to; the
-//! session re-ranks the maneuver it is already running rather than beginning a
-//! second one, and re-commands the stow on what is left of the one clock it was
-//! opened with. The hand comes off in time for the machine to reach the fold, so
-//! the maneuver is measured there -- and the park is what the *first* condition
-//! decided, not the jam. What pins it as a mid-maneuver arrival is the checker's
-//! pair of assertions: the jam lands strictly inside the maneuver's span, and
-//! the run carries more than one stow, which only a fold re-commanded while it
-//! was running produces.
+//! It is also the run where the head stalls *during* the maneuver. The cranks
+//! are jammed while the fold is under way, so the machine stops closing on the
+//! stow it was commanded to -- and the tracking detector ships disarmed, so
+//! nothing is raised about it. The maneuver runs on the one clock the first
+//! condition opened it with, the hand comes off in time for the machine to reach
+//! the fold, and the park is what that first condition decided. What pins the
+//! stall as a mid-maneuver one is the checker's pair of assertions: the jam
+//! lands strictly inside the maneuver's span, and no obstruction is raised
+//! anywhere in the run. Re-arming the detector puts a raise inside that span and
+//! a re-commanded stow after it (`TODO(tracking-response-model)`).
 //!
-//! The condition the jam raises is the decision tick's own. A condition read
-//! *off the bus* -- a servo's error byte -- arriving mid-maneuver is covered by
-//! no scenario in this suite, for the reason the servo fault below is written
-//! from a settled posture: which cycle of the rotation's lap carries the byte is
-//! a fact about the run, so a byte written mid-move is answered from wherever
-//! the machine happened to have got to.
+//! A condition read *off the bus* -- a servo's error byte -- arriving
+//! mid-maneuver is covered by no scenario in this suite, for the reason the
+//! servo fault below is written from a settled posture: which cycle of the
+//! rotation's lap carries the byte is a fact about the run, so a byte written
+//! mid-move is answered from wherever the machine happened to have got to.
 //! TODO(mid-move-servo-condition)
 //!
 //! A second script arrives once all of that is over, and is refused: a parked
@@ -95,8 +92,9 @@ pub const JAM_AFTER: i64 = 10;
 /// How long the jam lasts, in cycles.
 ///
 /// Long enough for the tracking detector's window to run out more than once, so
-/// the maneuver is re-commanded rather than merely re-ranked; and short enough
-/// that the fold still fits in what is left of the maneuver's one clock.
+/// what says nothing was raised is a stall a detector would have judged; and
+/// short enough that the fold still fits in what is left of the maneuver's one
+/// clock.
 pub const JAM_CYCLES: i64 = 40;
 
 /// The rows the scenario jams: the six cranks that carry the head.

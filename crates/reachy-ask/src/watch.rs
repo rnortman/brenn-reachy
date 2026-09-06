@@ -29,6 +29,22 @@ pub fn is_commissioned(row: &TimelineEntryWire) -> bool {
         && row.b() == u32::from(SessionPhaseWire::STARTING.0)
 }
 
+/// Whether `row` is the session saying an engagement ended.
+///
+/// The commissioning row's twin: entry into `resting` out of `stopping` rather
+/// than out of `starting`. It is what a tour watches for once its last script
+/// has gone out — the session runs its last schedule to the stow and then
+/// releases, and that release is the story being over.
+///
+/// Named on both sides for the same reason `is_commissioned` is: the phase
+/// entered says nothing on its own.
+#[must_use]
+pub fn is_released(row: &TimelineEntryWire) -> bool {
+    row.kind() == ReportKindWire::PHASE_CHANGED
+        && row.a() == u32::from(SessionPhaseWire::RESTING.0)
+        && row.b() == u32::from(SessionPhaseWire::STOPPING.0)
+}
+
 /// The trigger, latched: has the run asked yet.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Watch {
@@ -76,7 +92,7 @@ mod tests {
     use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
-    use super::{Watch, is_commissioned};
+    use super::{Watch, is_commissioned, is_released};
 
     /// One narration row: a kind and its two numbers.
     fn row(kind: ReportKindWire, a: u32, b: u32) -> TimelineEntryWire {
@@ -113,6 +129,21 @@ mod tests {
             !is_commissioned(&session_ended()),
             "a session that ended is also in `resting`, and it is not an invitation to ask again",
         );
+    }
+
+    #[test]
+    fn the_release_row_is_the_one_out_of_stopping() {
+        assert!(is_released(&session_ended()));
+        assert!(
+            !is_released(&commissioned()),
+            "a session that just commissioned is in `resting` too, and it is the start of the \
+             story rather than its end",
+        );
+        assert!(!is_released(&row(
+            ReportKindWire::SCRIPT_ACCEPTED,
+            u32::from(SessionPhaseWire::RESTING.0),
+            u32::from(SessionPhaseWire::STOPPING.0),
+        )));
     }
 
     #[test]

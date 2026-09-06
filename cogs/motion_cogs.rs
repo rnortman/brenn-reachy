@@ -875,7 +875,6 @@ impl Raise {
             // nothing is nothing.
             CommandRejection::Trajectory(_) => (JointRef::None, 0.0, 0),
             CommandRejection::AntennaUnreachable { joint, angle } => (*joint, *angle, 0),
-            CommandRejection::StepTooLarge { joint, delta } => (*joint, *delta, 0),
         };
         Self {
             time_ns: nominal,
@@ -973,17 +972,6 @@ mod tests {
             "the antenna asked for"
         );
         assert_eq!(refused.detail, 1600.5, "the arc it was asked for");
-        assert_eq!(refused.count, 0);
-
-        let refused = Raise::of_rejection(
-            &CommandRejection::StepTooLarge {
-                joint: JointRef::Leg4,
-                delta: -0.75,
-            },
-            AT,
-        );
-        assert_eq!(refused.joint, JointRef::Leg4, "the servo asked to jump");
-        assert_eq!(refused.detail, -0.75, "how far, sign kept");
         assert_eq!(refused.count, 0);
     }
 

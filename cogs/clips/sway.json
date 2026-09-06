@@ -5,7 +5,6 @@
   "description": "one body-yaw cycle either side of centre, 0.8 s",
   "channels": ["body_yaw"],
   "frame_hz": 50.0,
-  "max_speed": 2.0,
   "frames": [
     {"body_yaw": 0.0},
     {"body_yaw": 0.018772136},

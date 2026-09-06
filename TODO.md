@@ -10,25 +10,6 @@ a real TODO. You would reference it in code with a `TODO(example-placeholder)`
 comment. That is the whole design: an entry here with a slug, joined to code
 comments by that slug. Add real TODOs below this one, in this format.
 
-## `clip-doc-faithful-blends`
-
-Let a written clip document state the ramps it actually plays. `Clip::to_doc`
-omits any blend longer than the clip itself, because a stated ramp that long is
-refused at load, so the reload re-derives it instead of reading it.
-
-Deferral context: the omission works — the reload lands on the same clip under
-the same limits, pinned by
-`a_clip_whose_derived_ramps_outrun_it_survives_a_round_trip` — but it costs
-three things: the file no longer says what plays for exactly the clips whose
-ramps were unusual, a reader with different step bounds derives a different ramp
-with nothing in the file to compare against, and every reload of such a clip
-reports a `BlendStretched` correction against a file that stated nothing. The
-fixes are both design decisions rather than code ones: exempting a stated ramp
-that equals the derived floor is the load-time interaction between authored and
-derived numbers that the ceiling's design explicitly ruled out, and a separate
-document field for a derived ramp is a format change. Marked at `Clip::to_doc`
-in `crates/reachy-clips/src/format.rs`.
-
 ## `collision-envelope`
 
 Bound the linkage against itself. Nothing in the envelope check currently does:
@@ -980,18 +961,32 @@ its goal has left, and each is correct where it fires with a shape it cannot
 see. The one the code records is that `side` is written only while a run is
 open, so a reversal of a move the joint followed inside the threshold is judged
 against the move before it and gets the ordinary window while the joint may
-still be coasting; the cost is a scoped antenna release with a warning, not a
-hazard. The model cannot be written yet: it has to be fitted and validated
-against a recorded reversal, and no recording of one exists — the replay traces
-measure following only, and the simulated plant is a transport delay
-(`cogs/sim_lag.rs`) that a lag model does not describe, so a proportional-lag
-plant mode has to come first for S12 and the `Follower` tests to drive it. It
-also deletes the machinery two design cycles have built, which is a cycle of its
-own rather than a rider on one.
+still be coasting. Library content moves faster than the two gestures those
+rules were read off, so the detector ships **disarmed**
+(`TrackingFaultConfig::armed`, `false`): it measures every run and raises
+nothing, and an obstruction is accepted as a servo warming against a hand
+rather than answered. `make library-run` is what records the reversals the model
+needs — goals and positions through every motion in the library at recorded
+pace — so the recording this entry used to say does not exist is now the run's
+output. Fitting still needs a plant the simulator can drive: the simulated plant
+is a transport delay (`cogs/sim_lag.rs`) that a lag model does not describe, so
+a proportional-lag plant mode has to come first for S12 and the `Follower` tests
+to drive it. It also deletes the machinery two design cycles have built, which
+is a cycle of its own rather than a rider on one.
+
+Re-arming restores coverage three scenarios gave up while it is off: S2's fault
+half — the report spacing, the tick abandoning the move, the rest-class stow to
+rest end to end — S8's `HEAD_OBSTRUCTED` raise inside the masked stow, with the
+re-commanded fold that follows it, and S11's second condition, the
+`ANTENNA_OBSTRUCTED` raise about the limp pair once the fold is commanded, with
+the second `DEGRADE_RELEASED` drain that answers it. All three scenarios are
+rewritten again then rather than forked now; while the detector is disarmed that
+coverage is the motion crate's, in the `motion_tick` cases that arm it.
 
 Done = the detector judges a run against a predicted position, the crossed-run
-machinery is gone, and the model is fitted against a recorded reversal. Marked
-at the fresh-open arm of `tracking::look` in `crates/reachy-motion/src/tick.rs`.
+machinery is gone, the model is fitted against a recorded reversal, and `armed`
+ships `true`. Marked at the fresh-open arm of `tracking::look` in
+`crates/reachy-motion/src/tick.rs`.
 
 ## `beam-gappy-segment-extent`
 

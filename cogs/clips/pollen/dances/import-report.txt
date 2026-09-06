@@ -1,0 +1,25 @@
+reachy-clip-import
+--prefix pollen/dances
+source: pollen-robotics/reachy-mini-dances-library@3564295e
+
+19 recording(s)
+pollen/dances/chicken_peck: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/chin_lead: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/dizzy_spin: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/grid_snap: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/groovy_sway_and_roll: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/head_tilt_roll: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/interwoven_spirals: 3.98 s, 199 frames (from 199 over 3.96 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+REFUSED pollen/dances/jackson_square: the converted clip does not load: a frame this machine cannot hold: frame 30 leaves the envelope over the neutral base: leg 5 outside its travel window, toggle margin below the floor
+pollen/dances/neck_recoil: 1.88 s, 94 frames (from 94 over 1.86 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/pendulum_swing: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/polyrhythm_combo: 2.90 s, 145 frames (from 145 over 2.88 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/sharp_side_tilt: 2.90 s, 145 frames (from 145 over 2.88 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/side_glance_flick: 1.88 s, 94 frames (from 94 over 1.86 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/side_peekaboo: 5.02 s, 251 frames (from 251 over 5.00 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/side_to_side_sway: 1.88 s, 94 frames (from 94 over 1.86 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/simple_nod: 1.84 s, 92 frames (from 92 over 1.82 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/stumble_and_recover: 1.86 s, 93 frames (from 93 over 1.84 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/uh_huh_tilt: 1.84 s, 92 frames (from 92 over 1.82 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+pollen/dances/yeah_nod: 1.88 s, 94 frames (from 94 over 1.86 s), [head,antennas], blends 200/200 ms; dropped as still: body_yaw
+18 converted, 1 refused

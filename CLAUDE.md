@@ -10,7 +10,9 @@ binding on every change in this repo.
 - **Every command path runs the envelope check first.** Reachability, per-leg
   travel windows, per-pose clearance from the linkage's singular configurations,
   yaw caps, antenna representability (finite, within the extended-position
-  range).
+  range). There is no speed policy on content: a clip carries no ceiling and a
+  composed setpoint is not step-guarded. The per-tick step bound guards only the
+  moves this repo plans for itself.
 - **A violation is a typed error.** Never a clamp, never saturation, never a
   non-finite number handed onward. If you find yourself reaching for
   `clamp`/`min`/`max` on a commanded value, stop.
@@ -23,7 +25,12 @@ binding on every change in this repo.
   with torque held is this machine's only pinch hazard. "The motors it covers"
   is load-bearing: a response may be scoped to one group, and an antenna pair
   going limp while the head keeps its presence is a fault answered, not an
-  exception to this rule.
+  exception to this rule. The tracking detector (`head_obstructed`,
+  `antenna_obstructed`) is the one condition currently answered by nothing: it
+  judges a joint against its goal, which it cannot do on content faster than the
+  gestures its thresholds were read off, so it ships disarmed until a plant
+  model replaces what it judges against. An obstruction is accepted as a motor
+  warming against a hand.
 - **No automatic fault recovery.** Nothing clears a fault, and nothing retries
   a failed operation with perturbed inputs. The park-class responses wait for
   an operator to restart the process. The rest-class ones end the session

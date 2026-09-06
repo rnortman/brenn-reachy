@@ -66,13 +66,11 @@ use motion_channels::{
 use motion_evidence::{ARRIVAL_TURN_RAD, closest, solved_pose};
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
+use pose_reading::{Grid, Skips, lags, no_faults, present_rows};
 use reachy_driver::NOMINAL_CYCLE_NS;
-use reachy_motion::joints::{JointGroup, ROW_COUNT, ROWS, flags, group_of, row, rows_of};
+use reachy_motion::joints::{ROW_COUNT, ROWS, flags, row, rows_of};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::seq::failure::Name as FailureName;
-use reachy_motion::tick::{
-    RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, TrackingFaultConfig,
-};
 use reachy_motion::value;
 use run_report::{Report, verdict};
 use stillness_report::{Standard, Stillness, say};
@@ -354,48 +352,6 @@ impl Run {
     }
 }
 
-/// The grid the run's samples sit on, derived from the samples themselves.
-///
-/// A hardware run starts at whatever top of a second the driver started at, so
-/// nothing about the epoch can be assumed; what can be is the period, which is
-/// the one number both hosts are built against. The origin is the first sample's
-/// own nominal instant.
-#[derive(Clone, Copy)]
-struct Grid {
-    origin_ns: i64,
-    period_ns: i64,
-}
-
-impl Grid {
-    /// The cycle index of a nominal instant, and how far off the grid it sits.
-    fn at(&self, nominal_ns: i64) -> (i64, i64) {
-        let elapsed = nominal_ns - self.origin_ns;
-        (
-            elapsed.div_euclid(self.period_ns),
-            elapsed.rem_euclid(self.period_ns),
-        )
-    }
-
-    /// The same, with an instant within `jitter_ns` of a cycle counted as being
-    /// on it.
-    ///
-    /// An instant that arrived late is over its own cycle's mark by the offset;
-    /// one that arrived early is under the *next* cycle's, which the remainder
-    /// reports as nearly a whole period. So both ends of the band are checked and
-    /// the answer is the cycle the instant is nearest, with a zero offset when it
-    /// is inside the band.
-    fn within(&self, nominal_ns: i64, jitter_ns: i64) -> (i64, i64) {
-        let (cycle, off) = self.at(nominal_ns);
-        if off <= jitter_ns {
-            (cycle, 0)
-        } else if off >= self.period_ns - jitter_ns {
-            (cycle + 1, 0)
-        } else {
-            (cycle, off)
-        }
-    }
-}
-
 /// The driver's heartbeat: one sample per cycle, on one grid, without a gap.
 ///
 /// The assertion every other one rests on, for the reason the scenario harness
@@ -506,51 +462,6 @@ fn grid_of(run: &Run) -> Option<Grid> {
     })
 }
 
-/// The grid points the driver reported missing, and the reports themselves.
-///
-/// A skip report is published by the first cycle attended after the run of
-/// missed slots, and it says how many they were, so the slots it accounts for
-/// are the ones immediately before it. Which cycles those are is what lets a
-/// hole in the heartbeat be recognised as the same event rather than counted a
-/// second time.
-struct Skips<'a> {
-    events: Vec<&'a Logged<DriverEventWire>>,
-    /// Every cycle a report accounts for.
-    missed: BTreeSet<i64>,
-}
-
-impl<'a> Skips<'a> {
-    fn of(run: &'a Run, grid: Grid) -> Self {
-        let events: Vec<&Logged<DriverEventWire>> = run
-            .events
-            .iter()
-            .filter(|event| event.message.kind() == EventKindWire::CYCLE_SKIPPED)
-            .collect();
-        let mut missed = BTreeSet::new();
-        for event in &events {
-            let (cycle, off) = grid.within(event.message.time().as_nanos(), run.grid_jitter_ns);
-            // A report that does not sit on the grid places no slots: it is
-            // still counted as a report, and the gap it would have explained
-            // stays unexplained rather than being explained by a guess.
-            if off != 0 {
-                continue;
-            }
-            for slot in cycle - i64::from(event.message.count())..cycle {
-                missed.insert(slot);
-            }
-        }
-        Self { events, missed }
-    }
-
-    /// The slots the reports account for, all told.
-    fn slots(&self) -> u64 {
-        self.events
-            .iter()
-            .map(|event| u64::from(event.message.count()))
-            .sum()
-    }
-}
-
 /// How far the bus read ran from the instant it was meant to run at.
 ///
 /// The jitter measurement the driver takes for free on every cycle: a sample
@@ -632,57 +543,6 @@ fn reads(run: &Run, report: &mut Report) {
             ));
         }
     }
-}
-
-/// How far the machine ran behind what it was told to hold.
-///
-/// Off the samples alone: each carries the setpoint the driver is holding beside
-/// the position it read, so the lag needs no join against the goal stream. Two
-/// figures, head and antennas, because those are the two the recorded hardware
-/// gestures pinned and the tracking screen is sized against -- and both of those
-/// numbers are printed beside the measurement, so a run can be read against the
-/// only hardware evidence this repo has.
-fn lags(run: &Run, report: &mut Report) {
-    let mut head = 0_f64;
-    let mut antenna = 0_f64;
-    let mut compared = 0_usize;
-    for sample in &run.samples {
-        if !sample.message.present_valid() || !sample.message.commanded_valid() {
-            continue;
-        }
-        let Ok(present) = sample.message.present().validate().map(rows_of) else {
-            continue;
-        };
-        let Ok(commanded) = sample.message.commanded().validate().map(rows_of) else {
-            continue;
-        };
-        compared += 1;
-        for joint in ROWS {
-            let Some(index) = row(joint) else { continue };
-            let lag = (commanded[index] - present[index]).abs();
-            match group_of(joint) {
-                Some(JointGroup::Antennas) => antenna = antenna.max(lag),
-                Some(_) => head = head.max(lag),
-                None => {}
-            }
-        }
-    }
-    let threshold = TrackingFaultConfig::default().threshold_rad;
-    // How many samples the two figures came off, because a zero lag and a
-    // measurement nothing was compared on print the same otherwise -- and a run
-    // in which the driver held nothing is the second one.
-    report.note(format!(
-        "{compared} of {} samples carried both a reading and a setpoint to compare",
-        run.samples.len()
-    ));
-    report.note(format!(
-        "worst head lag {head:.4} rad; the recorded healthy gesture ran at \
-         {RECORDED_WORST_HEAD_LAG_RAD:.4} rad and the tracking screen sits at {threshold:.4} rad"
-    ));
-    report.note(format!(
-        "worst antenna lag {antenna:.4} rad; the recorded fast sweep ran at \
-         {RECORDED_WORST_ANTENNA_LAG_RAD:.4} rad"
-    ));
 }
 
 /// Whether the machine stood still while it was asked to.
@@ -965,24 +825,6 @@ fn named_rows(bits: brenn_reachy__motion__joints_clk_rs::JointFlagsWire) -> Stri
     match joint_set(bits) {
         Ok(set) => flags::Names(set).to_string(),
         Err(_) => format!("servo set {:#x}, which this build does not name", bits.0),
-    }
-}
-
-/// The decision tick raised nothing.
-///
-/// The count travels with the kind: on a tracking fault it is the window the
-/// run was judged by, which is what says whether the figure was too short or
-/// the run was never recognised as a reversal, and reading it out here saves a
-/// dig through the log.
-fn no_faults(run: &Run, report: &mut Report) {
-    for fault in &run.faults {
-        report.fail(format!(
-            "the decision tick raised {:?} at {}, count {}, and nothing in a wake gesture is \
-             wrong with the machine",
-            fault.message.kind(),
-            fault.message.time().as_nanos(),
-            fault.message.count()
-        ));
     }
 }
 
@@ -1480,7 +1322,7 @@ fn antennas_arrived(run: &Run, traffic: &AuxTraffic<'_>, schedule_end: i64, repo
         }
     };
     judge_antennas(
-        sample.message.present().validate().ok().map(rows_of),
+        present_rows(&sample.message),
         release_ns.unwrap_or(schedule_end),
         report,
     );
@@ -2432,7 +2274,7 @@ fn analyze(run: &Run) -> Report {
     let Some(grid) = grid_of(run) else {
         return report;
     };
-    let skips = Skips::of(run, grid);
+    let skips = Skips::of(&run.events, grid, run.grid_jitter_ns);
     carriers(run, &mut report);
     the_whole_story(run, &mut report);
     the_startup_release(run, &mut report);
@@ -2441,7 +2283,7 @@ fn analyze(run: &Run) -> Report {
     what_the_session_said(run, &mut report);
     the_park_says_why(run, &mut report);
     the_survey_waited(run, &mut report);
-    no_faults(run, &mut report);
+    no_faults(&run.faults, &mut report);
     driver_events(run, &mut report);
     cycle_timing(run, &skips, &mut report);
     cycle_skips(run, grid, &skips, folded, &mut report);
@@ -2450,7 +2292,7 @@ fn analyze(run: &Run) -> Report {
     the_release(run, &traffic, &mut report);
     jitter(run, &mut report);
     reads(run, &mut report);
-    lags(run, &mut report);
+    lags(&run.samples, &mut report);
     stillness(run, &mut report);
     health(run, &mut report);
     transactions(run, &traffic, &mut report);

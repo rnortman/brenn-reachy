@@ -88,8 +88,13 @@ impl Default for AntennaPhaseConfig {
 
 /// Whether an antenna standing at `angle` is inside a contact band `band` wide
 /// either side of vertical.
+///
+/// Public because the same question is asked of a recorded run: a reader
+/// measuring how near a pair came to meeting must ask it exactly as the planner
+/// does, and a second spelling of the wrap would answer differently on the turn
+/// an antenna angle carries.
 #[must_use]
-fn inside_band(angle: f64, band: f64) -> bool {
+pub fn inside_band(angle: f64, band: f64) -> bool {
     wrap_to_pi(angle).abs() <= band
 }
 

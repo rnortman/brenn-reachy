@@ -6,8 +6,7 @@
 //! - **The window screen.** A schedule's overlay windows arrive as whatever the
 //!   session put in them. [`Windows`] is the screened form: a window naming a
 //!   motion the library does not have, asking for a gain or a speed that is not
-//!   one, asking for a speed past what the motion's clips admit, or spanning no
-//!   time at all is refused and counted, and the rest play.
+//!   one, or spanning no time at all is refused and counted, and the rest play.
 //!   An overlay is presence, never safety, so a refusal costs the run an overlay
 //!   and nothing else.
 //! - **The players.** [`Overlays`] is the set of playing motions for one
@@ -26,9 +25,9 @@
 //!   sampled, from the same seed.
 //!
 //! Nothing here is a safety check and nothing here clamps. A composed setpoint
-//! faces the tick's envelope check and per-tick step bound like any other
-//! commanded target, and that check is the gate. What this module refuses, it
-//! refuses outright: a window that will not play plays nothing.
+//! faces the tick's envelope check like any other commanded target, and that
+//! check is the gate. What this module refuses, it refuses outright: a window
+//! that will not play plays nothing.
 //!
 //! No clock is read and nothing is allocated. Every instant arrives as an
 //! argument, and the four rows are a fixed array whose length is the schema's.
@@ -101,25 +100,6 @@ pub enum OverlayError {
         speed: f64,
     },
 
-    /// The speed is past what the motion's own clips admit.
-    ///
-    /// Refused rather than played for the reason the gain is: the ceiling is
-    /// derived at load from each clip's frame-to-frame deltas against the
-    /// machine's step bounds and by what the flattening already spent of it, and
-    /// above it consecutive composed setpoints step further than the tick
-    /// accepts. Played, the overlay is not slowed but shredded -- a refused
-    /// setpoint and a fault report every period, while the player's clock runs
-    /// on.
-    #[error("overlay speed {speed} is past motion {motion_id}'s ceiling of {ceiling}")]
-    PastCeiling {
-        /// Which motion.
-        motion_id: u16,
-        /// What the window held.
-        speed: f64,
-        /// What the motion admits.
-        ceiling: f64,
-    },
-
     /// The motion the window names is not one the library will play.
     ///
     /// A motion id the library does not have reaches here, which is a window
@@ -188,14 +168,6 @@ impl<'a> Window<'a> {
         }
         if !speed.is_finite() || speed <= 0.0 {
             return Err(OverlayError::Speed { speed });
-        }
-        let ceiling = motion.max_speed();
-        if speed > ceiling {
-            return Err(OverlayError::PastCeiling {
-                motion_id,
-                speed,
-                ceiling,
-            });
         }
         if end_ns <= start_ns {
             return Err(OverlayError::EmptyWindow { start_ns, end_ns });
@@ -633,10 +605,9 @@ mod tests {
     use brenn_reachy__cogs__config_clk_rs::{ClipLibraryConfig, ClipLibraryConfigWire};
     use clockwork_rs::SyncTime;
     use reachy_clips::config::{ValidatedLibrary, write_clip};
+    use reachy_clips::envelope::ClipLimits;
     use reachy_clips::format::{Channel as Ch, Clip, ClipDoc, FrameDoc};
-    use reachy_clips::speed::ClipLimits;
     use reachy_motion::FLOOR_TICK_HZ;
-    use reachy_motion::joints::JointStep;
     use reachy_motion::postures::{neutral_targets, stow_pose_targets};
     use reachy_motion::traj::{MoveDurations, TrajectoryError, WarpKind};
 
@@ -644,17 +615,9 @@ mod tests {
     /// advanced by.
     const PERIOD: Duration = Duration::from_millis(20);
 
-    /// Generous step bounds, so a fixture's round numbers load as written. What
-    /// is under test is the layer, not the speed derivation.
+    /// The machine's own bounds: what is under test is the layer.
     fn limits() -> ClipLimits {
-        ClipLimits {
-            max_step: JointStep {
-                legs: 100.0,
-                body_yaw: 100.0,
-                antennas: 100.0,
-            },
-            ..ClipLimits::default()
-        }
+        ClipLimits::default()
     }
 
     /// A clip driving all three channels, whose frames walk so that a frame
@@ -667,7 +630,6 @@ mod tests {
             description: None,
             channels: vec![Ch::Head, Ch::BodyYaw, Ch::Antennas],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: Some(40),
             blend_out_ms: Some(60),
             frames: (0..frames)
@@ -695,7 +657,7 @@ mod tests {
             Clip::from_doc(doc("walk", 20), &limits()).expect("fixture loads"),
             Clip::from_doc(doc("short", 6), &limits()).expect("fixture loads"),
         ];
-        let mut out = Box::new(ClipLibraryConfigWire::new());
+        let mut out = ClipLibraryConfigWire::new_boxed();
         {
             let message = out.clear_valid();
             for clip in &clips {
@@ -778,16 +740,6 @@ mod tests {
         Window::screen(one(&message), &validated).expect_err("the fixture window is refused")
     }
 
-    /// The ceiling the two single-clip fixture motions carry.
-    fn ceiling() -> f64 {
-        let library = library();
-        let validated = ValidatedLibrary::of(read(&library)).expect("the fixture plays");
-        validated
-            .playable_motion(0)
-            .expect("the fixture motion plays")
-            .max_speed()
-    }
-
     /// Every number a window carries reaches the screened form, unchanged.
     #[test]
     fn a_window_this_build_plays_crosses_the_screen_whole() {
@@ -805,7 +757,7 @@ mod tests {
     /// A window names a motion, not a clip: the third fixture motion is two
     /// segments over the two clips in the other order, so a screen that resolved
     /// the id through the clips would carry the wrong walk — and answer for a
-    /// duration and a ceiling that are no single clip's.
+    /// duration that is no single clip's.
     #[test]
     fn a_window_naming_a_composed_motion_carries_the_whole_walk() {
         let window = screened(2, 0, 10_000, 1.0, 1.0);
@@ -814,20 +766,6 @@ mod tests {
         assert_eq!(motion.segment(0).clip.frames(), 6);
         assert_eq!(motion.segment(1).clip.frames(), 20);
         assert_eq!(motion.duration_s(), 26.0 / FLOOR_TICK_HZ);
-
-        // The tightest of the two clips' ceilings, which the single-clip
-        // motions do not have to be.
-        let library = library();
-        let validated = ValidatedLibrary::of(read(&library)).expect("the fixture plays");
-        let tightest = (0..2)
-            .map(|clip_id| {
-                validated
-                    .playable(clip_id)
-                    .expect("a fixture clip")
-                    .max_speed()
-            })
-            .fold(f64::INFINITY, f64::min);
-        assert_eq!(motion.max_speed(), tightest);
     }
 
     /// Each refusal is its own, and each is refused outright: no clamping, no
@@ -868,26 +806,6 @@ mod tests {
                 start_ns: 10,
                 end_ns: 9
             }
-        );
-    }
-
-    /// A window asking for more speed than the motion's clips admit is refused
-    /// here rather than shredded a layer later.
-    #[test]
-    fn a_window_faster_than_the_motion_admits_is_refused() {
-        let ceiling = ceiling();
-        assert_eq!(
-            refusal(0, 0, 10, 1.0, ceiling + 0.5),
-            OverlayError::PastCeiling {
-                motion_id: 0,
-                speed: ceiling + 0.5,
-                ceiling,
-            }
-        );
-        assert_eq!(
-            screened(0, 0, 10, 1.0, ceiling).speed,
-            ceiling,
-            "the ceiling is a speed the derivation admits"
         );
     }
 

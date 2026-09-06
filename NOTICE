@@ -31,3 +31,37 @@ crates/reachy-kin/src/geometry.rs is derived from the sleep head pose in
 src/reachy_mini/daemon/backend/abstract.py. No reachy_mini code is included.
 
 Upstream: https://github.com/pollen-robotics/reachy_mini
+
+--------------------------------------------------------------------------------
+
+reachy-mini-dances-library
+Copyright Pollen Robotics
+Licensed under the Apache License, Version 2.0
+
+crates/reachy-clips/tests/fixtures/vendor/simple_nod.json is a verbatim copy of
+simple_nod.json from that dataset at revision 3564295e, vendored so that the
+vendor-recording conversion in crates/reachy-clips/src/vendor.rs is tested
+against a real published recording rather than only against matrices built in
+code. No Pollen Robotics code is included.
+
+cogs/clips/pollen/dances/ holds the clip documents converted from that dataset
+at the same revision by crates/reachy-clips/src/bin/reachy-clip-import.rs: the
+recorded head poses, body yaw and antenna angles of each recording, rewritten as
+deltas over this machine's neutral pose. cogs/clips/pollen/dances/import-report.txt
+records the conversion, including which recordings were refused and why.
+
+Upstream: https://huggingface.co/datasets/pollen-robotics/reachy-mini-dances-library
+
+--------------------------------------------------------------------------------
+
+reachy-mini-emotions-library
+Copyright Pollen Robotics
+Licensed under the Apache License, Version 2.0
+
+cogs/clips/pollen/emotions/ holds the clip documents converted from that dataset
+at revision 873ae49f by crates/reachy-clips/src/bin/reachy-clip-import.rs, in
+the same way as the dances above, together with the .ogg files of that dataset
+copied verbatim beside the clip each belongs to. cogs/clips/pollen/emotions/import-report.txt
+records the conversion. No Pollen Robotics code is included.
+
+Upstream: https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library

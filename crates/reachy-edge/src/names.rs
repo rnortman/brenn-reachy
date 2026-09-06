@@ -31,7 +31,7 @@ use thiserror::Error;
 /// the clip library. `cogs/edge_caps_test.rs` joins the two numbers, so a
 /// library that grows fails there rather than at the session, which refuses an
 /// index past its own table and would blame the sender for the sidecar.
-pub const MAX_MOTIONS: usize = 32;
+pub const MAX_MOTIONS: usize = 128;
 
 /// What one motion name resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +117,18 @@ impl MotionTable {
     #[must_use]
     pub fn resolve(&self, name: &str) -> Option<MotionEntry> {
         self.by_name.get(name).copied()
+    }
+
+    /// Every motion the table holds, name and entry, in name order.
+    ///
+    /// For a caller that has to visit the whole library rather than look one
+    /// motion up. Reading the table this crate already parsed rather than the
+    /// sidecar again avoids a second opinion about the numbering, which is the
+    /// thing this module exists to prevent.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &MotionEntry)> {
+        self.by_name
+            .iter()
+            .map(|(name, entry)| (name.as_str(), entry))
     }
 
     /// How many motions the table holds.
@@ -229,6 +241,32 @@ mod tests {
         assert_eq!(tour.window.duration_ms, 4500);
         assert_eq!(tour.window.blend_out_ms, 120);
         assert_eq!(table.resolve("bench/absent"), None);
+    }
+
+    /// The documented order, over a table built out of it: a caller visiting
+    /// the whole library — a tour, a listing — reads the names sorted and each
+    /// with the index the sidecar gave it, and swapping the map underneath for
+    /// one that does not sort is a behaviour change rather than a detail.
+    #[test]
+    fn the_whole_table_comes_back_in_name_order() {
+        let text = r#"{"motions": [
+            {"motion_id": 0, "name": "pollen/emotions/oops", "duration_ms": 1, "blend_out_ms": 0},
+            {"motion_id": 1, "name": "bench/nod", "duration_ms": 2, "blend_out_ms": 0},
+            {"motion_id": 2, "name": "pollen/dances/nod", "duration_ms": 3, "blend_out_ms": 0}
+        ]}"#;
+        let table = MotionTable::from_sidecar(text).expect("a table out of name order");
+        let visited: Vec<(&str, u16)> = table
+            .entries()
+            .map(|(name, entry)| (name, entry.motion_id))
+            .collect();
+        assert_eq!(
+            visited,
+            vec![
+                ("bench/nod", 1),
+                ("pollen/dances/nod", 2),
+                ("pollen/emotions/oops", 0),
+            ],
+        );
     }
 
     #[test]

@@ -4,12 +4,13 @@
 //! `{description, time[], set_target_data[]}`, where each frame carries a 4x4
 //! head pose in the **world** frame with the neutral head height subtracted
 //! from z, antenna angles `[right, left]` in radians, and an absolute
-//! `body_yaw`. Timestamps are whatever the recording loop ran at, and nothing
-//! in that format is versioned or validated.
+//! `body_yaw`. Timestamps are whatever the recording loop ran at, every number
+//! is written to six decimal places, and nothing in that format is versioned or
+//! validated.
 //!
 //! What comes out the other side is one of our clips: per-channel **deltas**
 //! against the neutral reference, uniformly sampled at the tick rate, masked to
-//! the channels the recording actually drives. The conversion is where the two
+//! the channels the recording actually moves. The conversion is where the two
 //! frame conventions are reconciled — the vendor's head pose is world-frame and
 //! yaw-independent while ours rides on the yawing body — and where a file that
 //! is not what it claims to be is refused rather than silently played.
@@ -28,21 +29,37 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::compose::{interpolate_pose, lerp};
+use crate::envelope::ClipLimits;
 use crate::format::{
     Channel, ChannelMask, Clip, ClipDoc, ClipError, DeltaFrame, FORMAT_VERSION, FrameDoc,
-    MAX_SPEED, validate_name,
+    validate_name,
 };
-use crate::speed::ClipLimits;
 
 /// How far a recorded rotation block may sit from orthonormal and still be
 /// read as a rotation.
 ///
-/// JSON-serialised rotation matrices drift: the vendor writes what its solver
-/// produced, through Python's float formatting, and nothing on either side
-/// renormalises. What this tolerance separates is that drift — parts in a
-/// billion — from a matrix that is not a rotation at all, which is a file we
-/// have misread rather than a file that lost precision.
-pub const ROTATION_TOL: f64 = 1e-6;
+/// Two populations sit below this, and both are drift rather than content.
+/// Every number in the published recordings is written to **six decimal
+/// places**, so each entry carries up to 5e-7 of rounding and `RᵀR − I` reaches
+/// ~3e-6 on quantisation alone; the recordings measure 0.9–1.7e-6. A second
+/// population, four files, measures 5.1–6.1e-4 — a uniform quarter-permille
+/// stretch, as if one recorder composed rotations with an unnormalised
+/// quaternion — whose polar factor is under 0.02° of attitude away, less than
+/// the mechanism can express.
+///
+/// What the check is for is a matrix that is not a rotation at all, meaning a
+/// file we have misread: a reflection sits at `|det − 1| = 2`, a translation
+/// block read into the rotation is off by whole units, and a scale worth
+/// noticing is ≥1e-2. Nothing real lives between 6.1e-4 and 1e-2.
+pub const ROTATION_TOL: f64 = 1e-3;
+
+/// The orthonormality error above which a conversion's drift is worth saying
+/// out loud.
+///
+/// Above anything six-decimal rounding can produce, so the report names the few
+/// recordings whose matrices were stretched by their recorder and stays quiet
+/// about the hundred that merely lost decimals.
+pub const ROTATION_DRIFT_NOTED: f64 = 1e-5;
 
 /// How far a channel's values may spread and still be called constant.
 ///
@@ -86,6 +103,10 @@ pub struct VendorFrame {
     /// Body yaw, radians, absolute. Absent in recordings that never turned.
     #[serde(default)]
     pub body_yaw: Option<f64>,
+    /// Present in vendor recordings but unused by this converter. Declared so
+    /// it does not land in `extra` as an unknown key.
+    #[serde(default)]
+    pub check_collision: Option<bool>,
     /// Every per-frame key this reader does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -167,9 +188,10 @@ pub enum ImportError {
 
     /// The operator's mask drops a channel the recording actually moves.
     ///
-    /// The override exists for a channel a recording states and never touches;
-    /// dropping one that moves is a different motion, and for body yaw it is a
-    /// wrong one: the head deltas are expressed in the body frame at each
+    /// A channel a recording states and never touches is already dropped by
+    /// default, so an override that drops one is asking for something else:
+    /// dropping a channel that moves is a different motion, and for body yaw it
+    /// is a wrong one — the head deltas are expressed in the body frame at each
     /// frame's own yaw, so a clip that keeps the head and drops a turning yaw
     /// keeps the counter-rotation for a turn it no longer performs.
     #[error("the recording moves its {channel}, so dropping it would change the motion")]
@@ -194,18 +216,6 @@ pub enum ImportError {
         /// The loader's own refusal.
         source: ClipError,
     },
-
-    /// A clip our stack cannot play at the speed it was recorded at.
-    ///
-    /// Not content: a recording whose own frames step further per tick than the
-    /// machine's bounds allow at 1.0× would have to be slowed below its own
-    /// pace to play at all, and a motion played slower than it was performed is
-    /// a different motion.
-    #[error("the clip admits at most {max_speed}x, below its own recorded pace")]
-    TooFast {
-        /// The derived ceiling.
-        max_speed: f64,
-    },
 }
 
 /// What the operator asked of one conversion.
@@ -224,8 +234,13 @@ pub struct Import {
     /// [`Import::doc`], so there is one copy of the frame track rather than two
     /// that could disagree.
     pub clip: Clip,
-    /// Masked channels whose delta never changes across the whole track.
+    /// The channels the recording states and never moves, whether or not they
+    /// are masked: the dropped ones say why the clip drives less than the file
+    /// mentions, and a masked one says the clip pins a channel that stood still.
     pub constant: Vec<Channel>,
+    /// The largest orthonormality error any frame's rotation block carried,
+    /// measured before renormalisation.
+    pub rotation_drift: f64,
     /// Every key in the file this reader does not know, top-level keys bare and
     /// per-frame keys prefixed `set_target_data.`.
     pub unknown_keys: Vec<String>,
@@ -236,8 +251,7 @@ pub struct Import {
 }
 
 impl Import {
-    /// The clip document to write: the derived ceiling and the floored ramps,
-    /// as the loader settled them.
+    /// The clip document to write, with the ramps as the loader settled them.
     pub fn doc(&self) -> ClipDoc {
         self.clip.to_doc()
     }
@@ -261,7 +275,10 @@ struct Sample {
 ///
 /// The loader is the validator: it is the same code the daemon runs, so a file
 /// this accepts is a file that loads, and import-time and load-time validation
-/// cannot drift.
+/// cannot drift. A recording is refused for a frame the envelope refuses over
+/// the neutral base or an antenna angle no goal register holds, and for nothing
+/// about its speed — how fast a recording moves is a property of the recording,
+/// not a claim this machine judges.
 pub fn convert(
     json: &str,
     name: &str,
@@ -278,18 +295,21 @@ pub fn convert(
     })?;
 
     let times = rebased_times(&move_doc)?;
-    let samples = samples(&move_doc)?;
-    let mask = mask_for(&move_doc, &samples, options)?;
+    let (samples, rotation_drift) = samples(&move_doc)?;
+    let stated = stated_channels(&move_doc);
+    let moving = moving_channels(&samples);
+    let mask = mask_for(stated, moving, options)?;
     let resampled = resample(&times, &samples);
     let frames: Vec<DeltaFrame> = resampled.iter().map(|s| delta(s, mask)).collect();
-    let constant = constant_channels(&frames, mask);
+    let constant: Vec<Channel> = Channel::ALL
+        .into_iter()
+        .filter(|channel| stated.contains(*channel) && !moving.contains(*channel))
+        .collect();
 
-    // Placeholders: the loader re-derives ceiling and ramps from the frames
-    // alone, so computing them here would double the cost for numbers it
-    // recomputes anyway. The written document comes from the loaded clip. The
-    // ramps are left unsaid rather than set to the default, because a recording
-    // states no blend intent and a stated ramp longer than the clip is refused;
-    // omitted, the default is capped at the clip's own length instead.
+    // The ramps are left unsaid rather than set to the default, because a
+    // recording states no blend intent and a stated ramp longer than the clip is
+    // refused; omitted, the default is capped at the clip's own length instead.
+    // The written document comes from the loaded clip.
     let asked = ClipDoc {
         version: FORMAT_VERSION,
         kind: "clip".to_owned(),
@@ -300,7 +320,6 @@ pub fn convert(
             .filter(|channel| mask.contains(*channel))
             .collect(),
         frame_hz: FLOOR_TICK_HZ,
-        max_speed: MAX_SPEED,
         blend_in_ms: None,
         blend_out_ms: None,
         frames: frames.iter().map(frame_doc).collect(),
@@ -308,15 +327,11 @@ pub fn convert(
     let mut clip =
         Clip::from_doc(asked, limits).map_err(|source| ImportError::Unloadable { source })?;
     clip.forget_notes();
-    if clip.max_speed() < 1.0 {
-        return Err(ImportError::TooFast {
-            max_speed: clip.max_speed(),
-        });
-    }
 
     Ok(Import {
         clip,
         constant,
+        rotation_drift,
         unknown_keys: unknown_keys(&move_doc),
         source_frames: samples.len(),
         source_duration_s: times.last().copied().unwrap_or(0.0),
@@ -359,13 +374,14 @@ fn rebased_times(doc: &VendorMove) -> Result<Vec<f64>, ImportError> {
 }
 
 /// Every frame in the vendor's conventions, with its head pose lifted back to
-/// the world frame.
+/// the world frame, and the largest orthonormality error any of them carried.
 ///
 /// Their matrices carry the neutral head height subtracted from z and nothing
 /// else — identity is the neutral pose — so recovering the pose is adding the
 /// one constant back. Both stacks hold the same number, from the same machine.
-fn samples(doc: &VendorMove) -> Result<Vec<Sample>, ImportError> {
+fn samples(doc: &VendorMove) -> Result<(Vec<Sample>, f64), ImportError> {
     let mut samples = Vec::with_capacity(doc.set_target_data.len());
+    let mut worst_drift = 0.0f64;
     for (index, frame) in doc.set_target_data.iter().enumerate() {
         let body_yaw = frame.body_yaw.unwrap_or(0.0);
         for (value, key) in [
@@ -377,7 +393,8 @@ fn samples(doc: &VendorMove) -> Result<Vec<Sample>, ImportError> {
                 return Err(ImportError::NonFinite { frame: index, key });
             }
         }
-        let mut head = rotation(index, &frame.head)?;
+        let (mut head, drift) = rotation(index, &frame.head)?;
+        worst_drift = worst_drift.max(drift);
         head.translation.vector.z += HEAD_Z_OFFSET;
         samples.push(Sample {
             head_world: head,
@@ -385,17 +402,22 @@ fn samples(doc: &VendorMove) -> Result<Vec<Sample>, ImportError> {
             body_yaw,
         });
     }
-    Ok(samples)
+    Ok((samples, worst_drift))
 }
 
-/// One 4x4 as an isometry, refusing anything that is not one.
+/// One 4x4 as an isometry and how far its rotation block sat from orthonormal,
+/// refusing anything that is not an isometry at all.
 ///
-/// The rotation block is checked against orthonormality rather than trusted:
-/// a matrix that has drifted is renormalised through a quaternion, and a matrix
-/// that is not a rotation — a reflection, a scale, a transposed convention —
-/// means we have misread the file, which is worth a refusal and not a silent
-/// nearest fit.
-fn rotation(index: usize, head: &[[f64; 4]; 4]) -> Result<Isometry3<f64>, ImportError> {
+/// The rotation block is checked against orthonormality rather than trusted.
+/// What survives the check is projected onto the nearest rotation — nalgebra's
+/// iterative polar extraction, then a quaternion off that, so the `dq` written
+/// out is unit to floating precision rather than to luck. Six-decimal
+/// quantisation is what most of the drift is; the rest is one recorder's
+/// unnormalised composition, and both are inside what the polar factor
+/// answers. A matrix that is not a rotation — a reflection, a real scale, a
+/// transposed convention — means we have misread the file, which is worth a
+/// refusal and not a silent nearest fit.
+fn rotation(index: usize, head: &[[f64; 4]; 4]) -> Result<(Isometry3<f64>, f64), ImportError> {
     for row in head {
         for value in row {
             if !value.is_finite() {
@@ -428,77 +450,103 @@ fn rotation(index: usize, head: &[[f64; 4]; 4]) -> Result<Isometry3<f64>, Import
             detail: format!("a determinant of {}", matrix.determinant()),
         });
     }
-    let quaternion =
-        UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(matrix));
-    Ok(Isometry3::from_parts(
-        Translation3::new(head[0][3], head[1][3], head[2][3]),
-        quaternion,
+    let quaternion = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix(&matrix));
+    Ok((
+        Isometry3::from_parts(
+            Translation3::new(head[0][3], head[1][3], head[2][3]),
+            quaternion,
+        ),
+        drift,
     ))
 }
 
-/// The channels the clip drives.
+/// The channels the recording mentions at all.
 ///
-/// The recording's own answer is derived: head and antennas are required keys,
-/// so they are always driven; body yaw is masked only if some frame states it.
-/// An operator override may drop channels — an emote whose antennas never move
-/// should not pin them — but never add one the recording does not carry, and
-/// never one the recording moves: that is a silently different motion, which is
-/// the one thing this importer refuses on principle.
-fn mask_for(
-    doc: &VendorMove,
-    samples: &[Sample],
-    options: &ImportOptions,
-) -> Result<ChannelMask, ImportError> {
-    let mut derived = ChannelMask::empty();
-    derived.insert(Channel::Head);
-    derived.insert(Channel::Antennas);
+/// Head and antennas are required keys, so every recording states them; body
+/// yaw is stated only if some frame carries it. Stating a channel is what makes
+/// it maskable — it says nothing about whether the recording drives it.
+fn stated_channels(doc: &VendorMove) -> ChannelMask {
+    let mut stated = ChannelMask::empty();
+    stated.insert(Channel::Head);
+    stated.insert(Channel::Antennas);
     if doc
         .set_target_data
         .iter()
         .any(|frame| frame.body_yaw.is_some())
     {
-        derived.insert(Channel::BodyYaw);
+        stated.insert(Channel::BodyYaw);
     }
+    stated
+}
+
+/// The channels the clip drives.
+///
+/// The default is what the recording states **and moves**. The recorder writes
+/// every channel whether or not the puppeteer touched it, so presence carries
+/// no intent, while a masked channel is pinned for the whole playback: a clip
+/// holding the antennas at the vendor's rest angle for three seconds yanks the
+/// live base's antenna posture to that angle and back. Pinning a still channel
+/// on purpose is the rare case, and it has a spelling.
+///
+/// An operator override may name any stated channel, moving or still — that is
+/// the spelling — but never one the recording does not carry, and never one it
+/// moves: dropping a moving channel is a silently different motion, which is
+/// the one thing this importer refuses on principle.
+fn mask_for(
+    stated: ChannelMask,
+    moving: ChannelMask,
+    options: &ImportOptions,
+) -> Result<ChannelMask, ImportError> {
     let Some(asked) = options.channels else {
-        return Ok(derived);
+        return Ok(moving);
     };
     for channel in Channel::ALL {
-        if asked.contains(channel) && !derived.contains(channel) {
+        if asked.contains(channel) && !stated.contains(channel) {
             return Err(ImportError::ChannelAbsent { channel });
         }
-        if derived.contains(channel) && !asked.contains(channel) && moves(samples, channel) {
+        if moving.contains(channel) && !asked.contains(channel) {
             return Err(ImportError::ChannelMoves { channel });
         }
     }
     Ok(asked)
 }
 
-/// Whether a recording's own samples move a channel at all.
+/// The channels a recording's own samples actually move, by the [`CONSTANT_TOL`]
+/// spread the report calls a channel still by.
 ///
-/// The same [`CONSTANT_TOL`] spread the report calls a channel still by, asked
-/// of the vendor's quantities rather than of the converted deltas: a dropped
-/// channel has no deltas to ask about.
-fn moves(samples: &[Sample], channel: Channel) -> bool {
+/// Asked of the vendor's quantities rather than of the converted deltas, since
+/// a dropped channel has no deltas to ask about — with one correction. The head
+/// is measured **in the body frame**, which is the frame the clip stores it in:
+/// a recording whose head stands still in the world while the body turns under
+/// it moves its head relative to the body every frame, and dropping that
+/// channel would strand the counter-rotation and drag the head around with the
+/// turn. A moving channel is a subset of the stated ones: an absent body yaw
+/// reads as a constant zero and moves nothing.
+fn moving_channels(samples: &[Sample]) -> ChannelMask {
+    let mut moving = ChannelMask::empty();
     let Some(first) = samples.first() else {
-        return false;
+        return moving;
     };
-    samples.iter().any(|sample| match channel {
-        Channel::Head => {
-            (first.head_world.translation.vector - sample.head_world.translation.vector)
-                .abs()
-                .max()
-                > CONSTANT_TOL
-                || first
-                    .head_world
-                    .rotation
-                    .angle_to(&sample.head_world.rotation)
-                    > CONSTANT_TOL
+    let body = |sample: &Sample| world_to_body(&sample.head_world, sample.body_yaw);
+    let first_head = body(first);
+    for sample in samples {
+        let head = body(sample);
+        if (first_head.translation.vector - head.translation.vector)
+            .abs()
+            .max()
+            > CONSTANT_TOL
+            || first_head.rotation.angle_to(&head.rotation) > CONSTANT_TOL
+        {
+            moving.insert(Channel::Head);
         }
-        Channel::Antennas => {
-            (0..2).any(|side| (first.antennas[side] - sample.antennas[side]).abs() > CONSTANT_TOL)
+        if (0..2).any(|side| (first.antennas[side] - sample.antennas[side]).abs() > CONSTANT_TOL) {
+            moving.insert(Channel::Antennas);
         }
-        Channel::BodyYaw => (first.body_yaw - sample.body_yaw).abs() > CONSTANT_TOL,
-    })
+        if (first.body_yaw - sample.body_yaw).abs() > CONSTANT_TOL {
+            moving.insert(Channel::BodyYaw);
+        }
+    }
+    moving
 }
 
 /// The recording's quantities on our uniform tick grid.
@@ -589,49 +637,6 @@ fn frame_doc(frame: &DeltaFrame) -> FrameDoc {
     }
 }
 
-/// Masked channels that never move across the whole track.
-///
-/// Reported, never acted on. A clip that masks a channel it holds constant
-/// pins that channel at its recorded value for the whole playback and forbids
-/// anything else from driving it — which is occasionally what an author wants
-/// and much more often a recording that simply never touched it.
-fn constant_channels(frames: &[DeltaFrame], mask: ChannelMask) -> Vec<Channel> {
-    let Some(first) = frames.first() else {
-        return Vec::new();
-    };
-    let mut constant = Vec::new();
-    for channel in Channel::ALL {
-        if !mask.contains(channel) {
-            continue;
-        }
-        let still = frames.iter().all(|frame| match channel {
-            Channel::Head => {
-                let (a, b) = (
-                    first.head.unwrap_or_else(Isometry3::identity),
-                    frame.head.unwrap_or_else(Isometry3::identity),
-                );
-                (a.translation.vector - b.translation.vector).abs().max() <= CONSTANT_TOL
-                    && a.rotation.angle_to(&b.rotation) <= CONSTANT_TOL
-            }
-            Channel::Antennas => {
-                let (a, b) = (
-                    first.antennas.unwrap_or_default(),
-                    frame.antennas.unwrap_or_default(),
-                );
-                (a[0] - b[0]).abs() <= CONSTANT_TOL && (a[1] - b[1]).abs() <= CONSTANT_TOL
-            }
-            Channel::BodyYaw => {
-                (first.body_yaw.unwrap_or_default() - frame.body_yaw.unwrap_or_default()).abs()
-                    <= CONSTANT_TOL
-            }
-        });
-        if still {
-            constant.push(channel);
-        }
-    }
-    constant
-}
-
 /// Every key in the file this reader does not know.
 ///
 /// An unknown key is news about the datasets, not a reason to refuse content.
@@ -655,8 +660,6 @@ mod tests {
 
     use nalgebra::Vector3;
     use serde_json::json;
-
-    use crate::format::ClipNote;
 
     /// A 4x4 identity, which is the vendor's spelling of the neutral head pose.
     fn identity() -> Vec<Vec<f64>> {
@@ -692,12 +695,13 @@ mod tests {
         value
     }
 
-    /// The vendor's own minimal fixture — two identity frames — converts, and
-    /// what it produces is a clip of zero deltas.
+    /// The vendor's own minimal fixture — two identity frames — converts under
+    /// an explicit mask, and what it produces is a clip of zero deltas.
     ///
     /// The one literal instance of the format anywhere in their repositories,
     /// and the anchor for the convention: identity is *neutral*, not a
-    /// degenerate value, so it must come out as the delta that does nothing.
+    /// degenerate value, so it must come out as the delta that does nothing. It
+    /// moves nothing at all, so every channel has to be asked for by name.
     #[test]
     fn the_vendors_minimal_fixture_converts_to_a_clip_of_no_motion() {
         let json = recording(
@@ -707,11 +711,17 @@ mod tests {
                 frame(identity(), [0.0, 0.0], Some(0.0)),
             ],
         );
+        let mut everything = ChannelMask::empty();
+        for channel in Channel::ALL {
+            everything.insert(channel);
+        }
         let import = convert(
             &json,
             "pollen/test/minimal",
             &ClipLimits::default(),
-            &ImportOptions::default(),
+            &ImportOptions {
+                channels: Some(everything),
+            },
         )
         .expect("the vendor's own fixture converts");
 
@@ -734,6 +744,118 @@ mod tests {
             vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
             "nothing in it moves, and the report says so of every channel",
         );
+    }
+
+    /// A recording that moves nothing at all drives nothing, and a clip that
+    /// drives nothing is not a clip.
+    ///
+    /// The refusal comes from the loader rather than from here: an empty mask is
+    /// what "states three channels and touches none of them" derives to, and
+    /// what an operator wants from such a file — pin it anyway — is spelled with
+    /// `--channels`.
+    #[test]
+    fn a_recording_that_moves_nothing_drives_nothing() {
+        let json = recording(
+            0.1,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+            ],
+        );
+        let refused = convert(
+            &json,
+            "pollen/test/inert",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect_err("nothing moves, so nothing is masked");
+        assert!(
+            matches!(
+                refused,
+                ImportError::Unloadable {
+                    source: ClipError::NoChannels
+                }
+            ),
+            "{refused:?}",
+        );
+    }
+
+    /// The default mask is what the recording moves, not what it mentions: a
+    /// stated channel that stands still is dropped rather than pinned, and named
+    /// as constant so the report can say so.
+    #[test]
+    fn the_default_mask_drops_a_stated_channel_that_never_moves() {
+        let json = recording(
+            0.1,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+                frame(identity(), [0.2, -0.1], Some(0.0)),
+            ],
+        );
+        let import = convert(
+            &json,
+            "pollen/test/still",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("the antennas move");
+        assert_eq!(import.doc().channels, vec![Channel::Antennas]);
+        assert_eq!(import.constant, vec![Channel::Head, Channel::BodyYaw]);
+        for frame in &import.doc().frames {
+            assert_eq!(frame.body_yaw, None, "a still yaw is not pinned");
+            assert_eq!(frame.dt, None);
+        }
+    }
+
+    /// A recording whose body yaw stands still somewhere other than zero: the
+    /// clip drives no yaw, and the head keeps the pose relative to the body that
+    /// the puppeteer set it at.
+    ///
+    /// What is dropped is the body's constant world-frame offset, which a clip
+    /// has no claim to — it is a delta over whatever base the session is at.
+    /// Pinning the yaw instead would swing the body to the recording's starting
+    /// posture and back.
+    #[test]
+    fn a_still_body_yaw_is_dropped_and_the_head_keeps_its_pose_in_the_body() {
+        let yaw = 0.15;
+        let json = recording(
+            0.1,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(yaw)),
+                frame(lifted(0.01), [0.0, 0.0], Some(yaw)),
+            ],
+        );
+        let import = convert(
+            &json,
+            "pollen/test/offset",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("a centimetre of lift is inside the envelope");
+
+        assert_eq!(import.doc().channels, vec![Channel::Head]);
+        assert!(import.constant.contains(&Channel::BodyYaw));
+        let last = import.clip.frames().last().expect("frames");
+        let head = last.head.expect("the head is masked");
+        // The recording's head is level in the world while the body sits at
+        // 0.15 rad, so relative to the body it is turned the other way by the
+        // same angle — for every frame, including the first.
+        let axis = head.rotation.scaled_axis();
+        assert!(
+            (axis - Vector3::new(0.0, 0.0, -yaw)).abs().max() < 1e-9,
+            "{axis:?}",
+        );
+        assert!(
+            (head.translation.vector - Vector3::new(0.0, 0.0, 0.01))
+                .abs()
+                .max()
+                < 1e-9,
+            "{:?}",
+            head.translation.vector,
+        );
+        for frame in &import.doc().frames {
+            assert_eq!(frame.body_yaw, None, "the clip drives no yaw");
+        }
     }
 
     /// A pure vertical lift in the vendor's frame becomes a pure translation
@@ -889,6 +1011,61 @@ mod tests {
         }
     }
 
+    /// A number no arithmetic can use, at each of the three places the file can
+    /// carry one.
+    ///
+    /// The rule is that a non-finite number is never handed onward, and this is
+    /// where one enters: an infinity in a timestamp divides the resampler, one
+    /// in an antenna reaches a goal register, one in the head matrix reaches the
+    /// polar extraction. Each guard is its own loop, so each gets its own input.
+    #[test]
+    fn a_non_finite_number_is_refused_at_the_frame_and_key_that_carried_it() {
+        // Driven through the parsed document rather than through JSON text:
+        // `1e400` is refused by the JSON parser itself as out of range, so no
+        // text reaches these guards, and they exist for the value a future
+        // reader hands them.
+        let parsed = || {
+            let json = recording(
+                0.1,
+                vec![
+                    frame(identity(), [0.0, 0.0], Some(0.0)),
+                    frame(identity(), [0.0, 0.0], Some(0.0)),
+                ],
+            );
+            serde_json::from_str::<VendorMove>(&json).expect("a recording parses")
+        };
+
+        let mut times = parsed();
+        times.time[1] = f64::INFINITY;
+        assert_eq!(
+            rebased_times(&times).expect_err("a timestamp nothing can subtract"),
+            ImportError::NonFinite {
+                frame: 1,
+                key: "time"
+            }
+        );
+
+        for (key, poison) in [
+            ("body_yaw", 0usize),
+            ("antennas", 1),
+            ("antennas", 2),
+            ("head", 3),
+        ] {
+            let mut doc = parsed();
+            let frame = &mut doc.set_target_data[1];
+            match poison {
+                0 => frame.body_yaw = Some(f64::INFINITY),
+                1 => frame.antennas[0] = f64::NAN,
+                2 => frame.antennas[1] = f64::INFINITY,
+                _ => frame.head[0][0] = f64::NAN,
+            }
+            assert_eq!(
+                samples(&doc).expect_err("a number no arithmetic can use"),
+                ImportError::NonFinite { frame: 1, key },
+            );
+        }
+    }
+
     /// Every structural refusal in the format, each named for what it was.
     #[test]
     fn a_recording_that_is_not_one_is_refused_by_name() {
@@ -988,8 +1165,13 @@ mod tests {
         );
     }
 
-    /// A drifted rotation — the parts-per-billion a JSON round trip costs —
-    /// is renormalised rather than refused.
+    /// A drifted rotation — what six-decimal rounding and an unnormalised
+    /// composition cost — is renormalised rather than refused, and the
+    /// quaternion written out is a unit one.
+    ///
+    /// The drift here is a quarter of the tolerance, which is far past the
+    /// loader's own norm check: nothing but real renormalisation gets this
+    /// document back through a load.
     #[test]
     fn a_rotation_that_only_drifted_is_renormalised() {
         let mut drifted = identity();
@@ -999,11 +1181,125 @@ mod tests {
             &json,
             "pollen/test/drift",
             &ClipLimits::default(),
-            &ImportOptions::default(),
+            &ImportOptions {
+                channels: Some(ChannelMask::of(Channel::Head)),
+            },
         )
         .expect("drift is not a wrong matrix");
         let head = import.clip.frames()[0].head.expect("masked");
         assert!(head.rotation.angle() < 1e-6, "{:?}", head.rotation);
+        let dq = import.doc().frames[0].dq.expect("a head frame carries one");
+        let norm = dq.iter().map(|term| term * term).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-15, "{norm}");
+        assert!(
+            import.rotation_drift > ROTATION_DRIFT_NOTED,
+            "{}",
+            import.rotation_drift
+        );
+    }
+
+    /// The stretched population: a rotation scaled by a quarter permille, which
+    /// is what one of the vendor's recorders wrote, converts to the attitude it
+    /// was trying to express.
+    ///
+    /// The polar factor is the answer, and it is under a hundredth of a degree
+    /// from the matrix in the file — less than the mechanism resolves and less
+    /// than the six decimals the vendor already quantised to.
+    #[test]
+    fn a_uniformly_stretched_rotation_converts_to_the_attitude_it_meant() {
+        let stretch = 1.00025;
+        let turned = |scale: f64| {
+            let (sin, cos) = 0.3_f64.sin_cos();
+            vec![
+                vec![cos * scale, -sin * scale, 0.0, 0.0],
+                vec![sin * scale, cos * scale, 0.0, 0.0],
+                vec![0.0, 0.0, scale, 0.0],
+                vec![0.0, 0.0, 0.0, 1.0],
+            ]
+        };
+        let head_only = ImportOptions {
+            channels: Some(ChannelMask::of(Channel::Head)),
+        };
+        let convert_one = |head: Vec<Vec<f64>>| {
+            convert(
+                &recording(0.1, vec![frame(head, [0.0, 0.0], None)]),
+                "pollen/test/stretched",
+                &ClipLimits::default(),
+                &head_only,
+            )
+        };
+        let stretched = convert_one(turned(stretch)).expect("a stretch is drift, not content");
+        let exact = convert_one(turned(1.0)).expect("the same attitude, written exactly");
+
+        assert!(
+            (4e-4..1e-3).contains(&stretched.rotation_drift),
+            "{}",
+            stretched.rotation_drift,
+        );
+        let (got, want) = (
+            stretched.clip.frames()[0].head.expect("masked").rotation,
+            exact.clip.frames()[0].head.expect("masked").rotation,
+        );
+        assert!(got.angle_to(&want) < 1e-3, "{}", got.angle_to(&want));
+        let dq = stretched.doc().frames[0]
+            .dq
+            .expect("a head frame carries one");
+        let norm = dq.iter().map(|term| term * term).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-15, "{norm}");
+    }
+
+    /// A percent of scale is not drift: nothing rounds or composes its way to
+    /// that, so the file is one we have misread.
+    #[test]
+    fn a_matrix_scaled_by_a_percent_is_refused_on_drift() {
+        let mut scaled = identity();
+        for (axis, row) in scaled.iter_mut().enumerate().take(3) {
+            row[axis] = 1.01;
+        }
+        let refused = convert(
+            &recording(0.1, vec![frame(scaled, [0.0, 0.0], None)]),
+            "pollen/test/scaled",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect_err("a percent is content, not precision");
+        let ImportError::Rotation { frame: at, detail } = &refused else {
+            panic!("expected a rotation refusal: {refused:?}");
+        };
+        assert_eq!(*at, 0);
+        assert!(detail.contains("orthonormal"), "{detail}");
+    }
+
+    /// A real recording from the published dataset converts, and what it says
+    /// about itself is what the report will print.
+    ///
+    /// The drift here is the whole reason the first tolerance refused a hundred
+    /// good files: it sits above 1e-6 and below anything worth mentioning.
+    #[test]
+    fn the_published_simple_nod_converts() {
+        let json = include_str!("../tests/fixtures/vendor/simple_nod.json");
+        let import = convert(
+            json,
+            "pollen/dances/simple_nod",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("a published recording converts");
+
+        assert_eq!(import.source_frames, 92);
+        assert_eq!(import.clip.frames().len(), 92, "recorded at the tick rate");
+        assert_eq!(
+            import.doc().channels,
+            vec![Channel::Head, Channel::Antennas],
+            "the yaw is stated and never moves",
+        );
+        assert_eq!(import.constant, vec![Channel::BodyYaw]);
+        assert!(import.unknown_keys.is_empty(), "{:?}", import.unknown_keys);
+        assert!(
+            (1e-6..ROTATION_DRIFT_NOTED).contains(&import.rotation_drift),
+            "six-decimal quantisation, past the tolerance this used to carry: {}",
+            import.rotation_drift,
+        );
     }
 
     /// A name the library would not take is refused before any conversion work.
@@ -1020,10 +1316,10 @@ mod tests {
         assert!(matches!(refused, ImportError::Name { .. }), "{refused:?}");
     }
 
-    /// The mask override drops a channel the recording carries and holds still,
-    /// and refuses to invent one it does not.
+    /// The mask override force-pins a channel the recording carries and holds
+    /// still, and refuses to invent one it does not.
     #[test]
-    fn the_mask_override_may_drop_a_channel_but_never_add_one() {
+    fn the_mask_override_may_pin_a_still_channel_but_never_add_an_absent_one() {
         let json = recording(
             0.2,
             vec![
@@ -1124,17 +1420,19 @@ mod tests {
     }
 
     /// Keys neither reader knows are reported and carried past — the opposite
-    /// of the vendor's silence, which is how an inert `check_collision` flag
-    /// came to sit in the data with nothing saying so.
+    /// of the vendor's silence. `check_collision` is not one of them: it is
+    /// declared by name and parsed, not caught by `extra`.
     #[test]
     fn keys_we_do_not_read_are_reported_and_not_refused() {
         let mut first = frame(identity(), [0.0, 0.0], None);
         first["check_collision"] = json!(false);
+        let mut second = frame(identity(), [0.2, -0.1], None);
+        second["check_collision"] = Value::Null;
         let times = [0.0, 0.1];
         let json = json!({
             "description": "d",
             "time": times,
-            "set_target_data": [first, frame(identity(), [0.0, 0.0], None)],
+            "set_target_data": [first, second],
             "recorded_by": "marionette",
         })
         .to_string();
@@ -1145,19 +1443,14 @@ mod tests {
             &ImportOptions::default(),
         )
         .expect("an unknown key is news, not a refusal");
-        assert_eq!(
-            import.unknown_keys,
-            vec![
-                "recorded_by".to_owned(),
-                "set_target_data.check_collision".to_owned()
-            ],
-        );
+        assert_eq!(import.unknown_keys, vec!["recorded_by".to_owned()]);
     }
 
-    /// A recording whose frames step further per tick than the machine allows
-    /// is refused rather than written out unplayable.
+    /// A recording whose frames step further per tick than any move this stack
+    /// plans converts and loads with nothing said about it: content is not
+    /// judged on its speed.
     #[test]
-    fn a_recording_too_fast_for_its_own_pace_is_refused() {
+    fn a_recording_stepping_further_per_tick_than_our_own_moves_converts() {
         // Six tenths of a radian of antenna in one recorded period, past the
         // per-tick step the machine allows once the derivation's margin is
         // taken off it.
@@ -1168,20 +1461,15 @@ mod tests {
                 frame(identity(), [0.6, 0.0], None),
             ],
         );
-        let refused = convert(
+        let import = convert(
             &json,
             "pollen/test/snap",
             &ClipLimits::default(),
             &ImportOptions::default(),
         )
-        .expect_err("nothing plays that");
-        assert!(
-            matches!(
-                refused,
-                ImportError::TooFast { .. } | ImportError::Unloadable { .. }
-            ),
-            "{refused:?}",
-        );
+        .expect("a fast recording is content, not a malformed file");
+        assert_eq!(import.clip.frames().len(), 2);
+        assert!(import.clip.notes().is_empty(), "{:?}", import.clip.notes());
     }
 
     /// A frame outside the envelope over the neutral base refuses the file,
@@ -1210,15 +1498,11 @@ mod tests {
         );
     }
 
-    /// The written document is the one the loader reads back: the max speed in
-    /// the file is the derived one rather than the placeholder, and a reload
-    /// lands on the same clip.
+    /// The written document is the one the loader reads back: the blends in the
+    /// file are the ones the load settled on, and a reload lands on the same
+    /// clip.
     #[test]
     fn the_written_document_carries_what_the_loader_derived() {
-        // Fast enough that the derivation lands under the global ceiling and
-        // stretches the ramps past the clip's own length: a track the
-        // placeholder happened to fit would prove nothing about what was
-        // written.
         let json = recording(
             0.04,
             vec![
@@ -1233,32 +1517,14 @@ mod tests {
             &ImportOptions::default(),
         )
         .expect("converts");
-        assert!(
-            import.doc().max_speed < MAX_SPEED,
-            "the fixture derives a ceiling below the placeholder, or this proves nothing",
-        );
-        assert_eq!(import.doc().max_speed, import.clip.max_speed());
-        // The entry ramp these frames derive is longer than the clip, which is
-        // a length no document may state, so the file leaves it unsaid and the
-        // reload derives it again from the same frames. The exit ramp fits, so
-        // it is written as it stands.
-        assert!(f64::from(import.clip.blend_in_ms()) > import.clip.duration_s() * 1000.0);
-        assert_eq!(import.doc().blend_in_ms, None);
+        // Two frames at 50 Hz is 40 ms of clip, so the unstated default blend is
+        // capped at the clip's own length and both ends are written as they
+        // stand.
+        assert_eq!(import.doc().blend_in_ms, Some(import.clip.blend_in_ms()));
         assert_eq!(import.doc().blend_out_ms, Some(import.clip.blend_out_ms()));
 
         let text = serde_json::to_string(&import.doc()).expect("renders");
-        let mut reloaded = Clip::from_json(&text, &ClipLimits::default()).expect("loads back");
-        assert_eq!(reloaded.blend_in_ms(), import.clip.blend_in_ms());
-        assert_eq!(reloaded.blend_out_ms(), import.clip.blend_out_ms());
-        assert!(
-            reloaded
-                .notes()
-                .iter()
-                .all(|note| matches!(note, ClipNote::BlendStretched { .. })),
-            "the only correction on the way back in is the ramp derivation: {:?}",
-            reloaded.notes(),
-        );
-        reloaded.forget_notes();
+        let reloaded = Clip::from_json(&text, &ClipLimits::default()).expect("loads back");
         assert_eq!(reloaded, import.clip);
     }
 }

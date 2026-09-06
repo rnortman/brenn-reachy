@@ -68,6 +68,7 @@ help:
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
 	@echo "  make clip-config   regenerate the clip library asset from cogs/clips/"
+	@echo "  make clip-import   convert the fetched vendor recording sets (EMOTIONS=, DANCES=)"
 	@echo "  make motion-host-run  run the online system here, against the simulated plant"
 	@echo ""
 	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
@@ -81,6 +82,7 @@ help:
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
 	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
+	@echo "  make library-run     play every motion in the library on the unit and judge it"
 	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
@@ -321,6 +323,45 @@ clip-config: require-bazel
 	    --out $(CURDIR)/cogs/clip_library.textproto \
 	    --names $(CURDIR)/cogs/clip_library.names.json
 
+# Convert the two vendor recording sets into library documents and regenerate
+# the asset over them. Fetches nothing: the operator downloads each dataset and
+# names the directory it landed in, plus a source string — the repository and
+# the revision it was fetched at — which goes into the committed report as the
+# provenance of what was imported.
+#
+# A dataset directory may be named relatively: `bazel run` runs the tool in its
+# runfiles tree, so the recipe makes both absolute before passing them on.
+#
+#   make clip-import EMOTIONS=~/tps/reachy-mini-emotions-library \
+#                    EMOTIONS_SOURCE="org/set@revision" \
+#                    DANCES=~/tps/reachy-mini-dances-library \
+#                    DANCES_SOURCE="org/set@revision"
+#
+# The output directories are emptied first: a recording refused this time leaves
+# no document, and a document from an earlier import would otherwise survive as a
+# clip nothing produced. Not part of the gate — `make check` fails on the asset
+# being stale, which is what says this was not run.
+.PHONY: clip-import
+clip-import: require-bazel
+	@[ -n "$(EMOTIONS)" ] || { echo "EMOTIONS is required: the emotions dataset directory" >&2; exit 1; }
+	@[ -n "$(EMOTIONS_SOURCE)" ] || { echo "EMOTIONS_SOURCE is required: repository@revision" >&2; exit 1; }
+	@[ -n "$(DANCES)" ] || { echo "DANCES is required: the dances dataset directory" >&2; exit 1; }
+	@[ -n "$(DANCES_SOURCE)" ] || { echo "DANCES_SOURCE is required: repository@revision" >&2; exit 1; }
+	rm -rf $(CURDIR)/cogs/clips/pollen/emotions $(CURDIR)/cogs/clips/pollen/dances
+	bazel run //crates/reachy-clips:reachy_clip_import -- \
+	    --input $(abspath $(EMOTIONS)) \
+	    --output $(CURDIR)/cogs/clips/pollen/emotions \
+	    --prefix pollen/emotions \
+	    --report $(CURDIR)/cogs/clips/pollen/emotions/import-report.txt \
+	    --source "$(EMOTIONS_SOURCE)"
+	bazel run //crates/reachy-clips:reachy_clip_import -- \
+	    --input $(abspath $(DANCES)) \
+	    --output $(CURDIR)/cogs/clips/pollen/dances \
+	    --prefix pollen/dances \
+	    --report $(CURDIR)/cogs/clips/pollen/dances/import-report.txt \
+	    --source "$(DANCES_SOURCE)"
+	@$(MAKE) clip-config
+
 # The online system, on this machine: the real control loop and the real logger,
 # with the simulated plant behind the real UDP seam, all three under the launcher
 # a unit uses. A fixed budget of wall clock — the script states it and derives it
@@ -465,6 +506,23 @@ motion-deploy: device-host motion-build
 .PHONY: motion-run
 motion-run: device-host motion-deploy require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --run $(MOTION_RECORDS)
+
+# Play the whole clip library on the unit at recorded pace, fetch and judge.
+#
+# The same build, push and fetch as `motion-run`, and three differences: the
+# intent source asks for every motion in the committed name table instead of the
+# wake gesture, the run is as long as the library rather than as long as a fixed
+# budget — the tour stops the launcher itself when the story is over — and the
+# verdict is `library_tour_report`'s over the same name table.
+#
+# No variable of its own: the unit and the operator's host parameters are read
+# where every device target reads them, and what the run plays is the committed
+# library. Several minutes of motion with nobody at the machine, so the space
+# around it has to be clear for the whole run; `docs/bench-runbook.md` is the
+# procedure.
+.PHONY: library-run
+library-run: device-host motion-deploy require-bazel
+	tools/deploy-motion.sh $(REACHY_HOST) --tour $(MOTION_RECORDS)
 
 # Bring a run's records back. Each fetch lands under its own timestamped
 # directory, so a session's runs accumulate rather than overwrite.

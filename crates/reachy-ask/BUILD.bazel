@@ -1,9 +1,10 @@
 # Apache-2.0; see LICENSE and NOTICE at the repository root.
 #
-# The harness's intent source: one gesture, through the real intent edge. It
-# stands where the voice host stands -- outside the composition, holding the two
-# loopback ports -- so a motion run's verdict covers the decode, the screens, the
-# compile, the datagram and the timeline diff rather than a rehearsal of them.
+# The harness's intent source: the wake gesture, or the library tour, through
+# the real intent edge. It stands where the voice host stands -- outside the
+# composition, holding the two loopback ports -- so a run's verdict covers the
+# decode, the screens, the compile, the datagram and the timeline diff rather
+# than a rehearsal of them.
 #
 # A binary and no library: everything it holds is about this one run, and
 # `rust_test(crate = ...)` over a binary is how its own modules are tested.
@@ -31,9 +32,11 @@ rust_binary(
     ],
 )
 
-# The gesture's shape and offsets, the engagement and the holds they have to
-# cover, and the argument grammar. Hermetic: the compile runs in memory over an
-# injected instant, and nothing here binds a port or reads a clock.
+# The gesture's shape and offsets, the tour's plan and budget, the engagement
+# and the holds they have to cover, and the argument grammar. The compiles run
+# in memory over an injected instant; what does bind a socket binds an ephemeral
+# one -- a loopback listener standing in for the launcher's control API, and the
+# narration port on 0 -- so two of these run side by side.
 #
 # `//cogs:scenario` and `//crates/reachy-motion:reachy_motion` are test
 # dependencies and only that: the raise's offset has to cover the engagement,

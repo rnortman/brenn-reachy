@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use reachy_motion::FLOOR_TICK_HZ;
 
-use crate::speed::{ClipLimits, DeriveError, FrameMetrics, derive};
+use crate::envelope::{ClipLimits, FrameError, check_frames};
 
 /// The document version this crate reads and writes.
 ///
@@ -80,15 +80,6 @@ pub const MAX_SPEED: f64 = 2.0;
 /// beyond it did not come out of a rotation, and normalising it would invent an
 /// orientation nobody recorded.
 pub const QUAT_NORM_TOL: f64 = 1e-6;
-
-/// How far a document's cached `max_speed` may sit from the derived one before
-/// the load says so.
-///
-/// The cache is written by a producer that ran the same derivation, so the only
-/// difference a correct document shows is what the number lost passing through
-/// a decimal literal. Anything wider is a document that was edited, produced by
-/// a different derivation, or produced from different frames.
-pub const SPEED_CACHE_TOL: f64 = 1e-6;
 
 /// One of the three independently commandable target groups.
 ///
@@ -436,34 +427,12 @@ pub enum ClipError {
         norm: f64,
     },
 
-    /// A `max_speed` that is not a usable speed limit.
-    #[error("clip max_speed must be finite and within (0, {MAX_SPEED}]; it is {max_speed}")]
-    MaxSpeed {
-        /// What the document said.
-        max_speed: f64,
-    },
-
-    /// The frame track admits no derivation at all: applied to the neutral base
-    /// it leaves the envelope, asks an antenna for an angle with no goal count,
-    /// or blends in through a pose the head cannot hold.
-    #[error("clip cannot be derived: {source}")]
-    Derive {
+    /// The frame track leaves the envelope over the neutral base, or asks an
+    /// antenna for an angle with no goal count.
+    #[error("a frame this machine cannot hold: {source}")]
+    Frames {
         /// Which frame failed what.
-        source: DeriveError,
-    },
-
-    /// The derived ceiling is below the slowest invocation the wire allows, so
-    /// no legal speed plays this clip.
-    ///
-    /// Refused rather than loaded-and-unplayable: an asset that resolves by name
-    /// and refuses every invocation of itself is a load-time fact reported at
-    /// invocation time, which is the wrong place to find it.
-    #[error(
-        "clip's own frames admit at most {derived}x, below the slowest invocation {MIN_SPEED}x"
-    )]
-    Underivable {
-        /// The speed ceiling the frames themselves impose.
-        derived: f64,
+        source: FrameError,
     },
 
     /// An authored blend ramp longer than the clip it ramps.
@@ -487,9 +456,9 @@ pub enum ClipError {
     },
 }
 
-impl From<DeriveError> for ClipError {
-    fn from(source: DeriveError) -> Self {
-        Self::Derive { source }
+impl From<FrameError> for ClipError {
+    fn from(source: FrameError) -> Self {
+        Self::Frames { source }
     }
 }
 
@@ -538,8 +507,6 @@ pub struct ClipDoc {
     pub channels: Vec<Channel>,
     /// Frame rate; the tick rate, or refused.
     pub frame_hz: f64,
-    /// The highest invocation speed this clip may be played at.
-    pub max_speed: f64,
     /// Entry blend ramp, milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blend_in_ms: Option<u32>,
@@ -664,12 +631,9 @@ pub struct Clip {
     name: String,
     description: Option<String>,
     mask: ChannelMask,
-    max_speed: f64,
     blend_in_ms: u32,
     blend_out_ms: u32,
     frames: Vec<DeltaFrame>,
-    first_metrics: FrameMetrics,
-    last_metrics: FrameMetrics,
     notes: Vec<ClipNote>,
 }
 
@@ -680,29 +644,7 @@ pub struct Clip {
 /// looking for why a motion is gentler than they wrote it needs the difference
 /// reported rather than inferred.
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
-pub enum ClipNote {
-    /// A configured ramp was shorter than its floor and was stretched to it.
-    #[error(
-        "{end} ramp of {configured_ms} ms is below its floor and was stretched to {floor_ms} ms"
-    )]
-    BlendStretched {
-        /// Which ramp.
-        end: BlendEnd,
-        /// What the document asked for.
-        configured_ms: u32,
-        /// What it was stretched to.
-        floor_ms: u32,
-    },
-
-    /// The document's cached `max_speed` was not what the frames derive.
-    #[error("document caches max_speed {stored}x; the frames derive {derived}x, which stands")]
-    MaxSpeedDiffers {
-        /// What the document said.
-        stored: f64,
-        /// What the loader computed, and what the clip is played under.
-        derived: f64,
-    },
-}
+pub enum ClipNote {}
 
 /// Which end of a clip a blend ramp belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,12 +699,6 @@ impl Clip {
                 frame_hz: doc.frame_hz,
             });
         }
-        if !doc.max_speed.is_finite() || doc.max_speed <= 0.0 || doc.max_speed > MAX_SPEED {
-            return Err(ClipError::MaxSpeed {
-                max_speed: doc.max_speed,
-            });
-        }
-
         let mut mask = ChannelMask::empty();
         for channel in &doc.channels {
             if !mask.insert(*channel) {
@@ -781,45 +717,20 @@ impl Clip {
             frames.push(delta_frame(index, frame, mask)?);
         }
 
-        let derived = derive(&frames, mask, limits)?;
-        if derived.max_speed < MIN_SPEED {
-            return Err(ClipError::Underivable {
-                derived: derived.max_speed,
-            });
-        }
+        check_frames(&frames, limits)?;
 
-        let mut notes = Vec::new();
-        if (derived.max_speed - doc.max_speed).abs() > SPEED_CACHE_TOL {
-            notes.push(ClipNote::MaxSpeedDiffers {
-                stored: doc.max_speed,
-                derived: derived.max_speed,
-            });
-        }
         let clip_ms = clip_duration_ms(frames.len());
-        let blend_in_ms = floor_blend(
-            authored_blend(doc.blend_in_ms, BlendEnd::In, clip_ms)?,
-            derived.blend_in_floor_ms,
-            BlendEnd::In,
-            &mut notes,
-        );
-        let blend_out_ms = floor_blend(
-            authored_blend(doc.blend_out_ms, BlendEnd::Out, clip_ms)?,
-            derived.blend_out_floor_ms,
-            BlendEnd::Out,
-            &mut notes,
-        );
+        let blend_in_ms = authored_blend(doc.blend_in_ms, BlendEnd::In, clip_ms)?;
+        let blend_out_ms = authored_blend(doc.blend_out_ms, BlendEnd::Out, clip_ms)?;
 
         Ok(Self {
             name: doc.name,
             description: doc.description,
             mask,
-            max_speed: derived.max_speed,
             blend_in_ms,
             blend_out_ms,
             frames,
-            first_metrics: derived.first,
-            last_metrics: derived.last,
-            notes,
+            notes: Vec::new(),
         })
     }
 
@@ -841,27 +752,6 @@ impl Clip {
         self.mask
     }
 
-    /// The highest invocation speed this clip may be played at.
-    ///
-    /// The loader's own computation over the frame track, never the document's.
-    /// The number in the file is a cache written by whatever produced the clip;
-    /// trusting it would let a hand-edited or mis-imported document raise its
-    /// own ceiling, so it is checked for shape, compared, reported when it
-    /// disagrees, and then discarded.
-    #[must_use]
-    pub fn max_speed(&self) -> f64 {
-        self.max_speed
-    }
-
-    /// The first and last frames in joint coordinates over the neutral base.
-    ///
-    /// What a sequence measures a seam with: the step commanded where one
-    /// clip's final delta is replaced by the next clip's first.
-    #[must_use]
-    pub fn end_metrics(&self) -> (FrameMetrics, FrameMetrics) {
-        (self.first_metrics, self.last_metrics)
-    }
-
     /// What the load changed about this clip, in the order it changed it.
     #[must_use]
     pub fn notes(&self) -> &[ClipNote] {
@@ -873,10 +763,8 @@ impl Clip {
     ///
     /// A note says the load disagreed with something a document claimed, which
     /// is a fact about a file somebody wrote. The importer's document is not
-    /// one: it names the global ceiling as a placeholder and states no ramps at
-    /// all, precisely so the derivation runs once — here, in the loader — and
-    /// the numbers it settles on are the numbers that get written. Carrying the
-    /// loader's corrections of those placeholders into a report would be the
+    /// one: it states no ramps at all, so what the loader settles on is what
+    /// gets written, and reporting the loader's own defaults back would be the
     /// importer disagreeing with itself in front of an operator.
     pub(crate) fn forget_notes(&mut self) {
         self.notes.clear();
@@ -922,19 +810,11 @@ impl Clip {
 
     /// The document form of this clip, for a writer.
     ///
-    /// A ramp the load derived rather than read — a floor stretch, or a default
-    /// capped at the clip — can be longer than the clip itself, which is a
-    /// number no author may write. Written as authored it would produce a
-    /// document this same loader refuses, so such a ramp is left unsaid and
-    /// re-derived from the frames on the way back in. Everything within the
-    /// clip's own length is written as it stands.
-    ///
-    /// TODO(clip-doc-faithful-blends): the omission makes the writer keep the
-    /// reader's rule, and the document stops stating what plays.
+    /// Every ramp a clip carries is within its own length — the loader caps an
+    /// unstated one there and refuses an authored one past it — so each is
+    /// written as it stands.
     #[must_use]
     pub fn to_doc(&self) -> ClipDoc {
-        let clip_ms = self.duration_ms();
-        let writable = |ms: u32| (f64::from(ms) <= clip_ms).then_some(ms);
         ClipDoc {
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
@@ -942,9 +822,8 @@ impl Clip {
             description: self.description.clone(),
             channels: self.mask.iter().collect(),
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: self.max_speed,
-            blend_in_ms: writable(self.blend_in_ms),
-            blend_out_ms: writable(self.blend_out_ms),
+            blend_in_ms: Some(self.blend_in_ms),
+            blend_out_ms: Some(self.blend_out_ms),
             frames: self.frames.iter().map(|frame| frame.to_doc()).collect(),
         }
     }
@@ -991,23 +870,6 @@ fn authored_blend(
         });
     }
     Ok(blend_ms)
-}
-
-/// Take the longer of a configured ramp and its floor, noting a stretch.
-///
-/// Never a refusal: a ramp too short for the step bounds is an authoring
-/// mistake whose only consequence is a refused tick, and the stack's answer to
-/// a duration below a floor everywhere else is to lengthen it and say so.
-fn floor_blend(configured_ms: u32, floor_ms: u32, end: BlendEnd, notes: &mut Vec<ClipNote>) -> u32 {
-    if configured_ms >= floor_ms {
-        return configured_ms;
-    }
-    notes.push(ClipNote::BlendStretched {
-        end,
-        configured_ms,
-        floor_ms,
-    });
-    floor_ms
 }
 
 /// Validate one document frame against the mask and convert it.
@@ -1184,7 +1046,6 @@ mod tests {
             description: Some("a test".to_owned()),
             channels: vec![Channel::Head, Channel::Antennas, Channel::BodyYaw],
             frame_hz: FLOOR_TICK_HZ,
-            max_speed: 2.0,
             blend_in_ms: None,
             blend_out_ms: None,
             frames: vec![FrameDoc {
@@ -1221,10 +1082,9 @@ mod tests {
         assert_eq!(clip.description(), Some("a test"));
         assert!(Channel::ALL.iter().all(|c| clip.mask().contains(*c)));
         assert_eq!(clip.frames().len(), 1);
-        // One frame is 20 ms of clip, so the omitted default is capped there
-        // and then stretched to the floor its own delta derives.
-        assert_eq!(clip.blend_in_ms(), 180);
-        assert_eq!(clip.blend_out_ms(), 60);
+        // One frame is 20 ms of clip, so the omitted default is capped there.
+        assert_eq!(clip.blend_in_ms(), 20);
+        assert_eq!(clip.blend_out_ms(), 20);
     }
 
     /// The two whole-frame checks a consumer of an unvalidated source makes
@@ -1578,27 +1438,10 @@ mod tests {
     }
 
     #[test]
-    fn max_speed_must_be_a_usable_limit() {
-        for bad in [0.0, -1.0, MAX_SPEED + 0.1, f64::NAN, f64::INFINITY] {
-            let doc = ClipDoc {
-                max_speed: bad,
-                ..full_doc()
-            };
-            assert!(
-                matches!(
-                    Clip::from_doc(doc, &limits()),
-                    Err(ClipError::MaxSpeed { .. })
-                ),
-                "max_speed {bad} should be refused"
-            );
-        }
-    }
-
-    #[test]
     fn unknown_keys_are_refused() {
         let json = r#"{
             "version": 1, "kind": "clip", "name": "pod/x",
-            "channels": ["antennas"], "frame_hz": 50.0, "max_speed": 1.0,
+            "channels": ["antennas"], "frame_hz": 50.0,
             "loop": true,
             "frames": [{"antennas": [0.0, 0.0]}]
         }"#;
@@ -1693,98 +1536,7 @@ mod tests {
         assert!(!mask.insert(Channel::Head), "the second is not");
     }
 
-    /// A document asking for no entry ramp at all, over a delta several step
-    /// bounds wide: the load lengthens the ramp to its floor and says so, which
-    /// is the policy the player now relies on rather than defending itself.
-    #[test]
-    fn a_ramp_below_its_floor_is_stretched_and_noted() {
-        let limits = limits();
-        let big = limits.max_step.antennas * crate::speed::STEP_MARGIN * 4.0;
-        let doc = ClipDoc {
-            blend_in_ms: Some(0),
-            blend_out_ms: Some(600),
-            // Long enough that the authored exit ramp fits inside the clip:
-            // holding the same delta leaves both derived floors where they are.
-            frames: std::iter::once(FrameDoc {
-                antennas: Some([0.0, 0.0]),
-                ..FrameDoc::default()
-            })
-            .chain((0..30).map(|_| FrameDoc {
-                antennas: Some([big, 0.0]),
-                ..FrameDoc::default()
-            }))
-            .collect(),
-            ..antennas_doc()
-        };
-        let clip = Clip::from_doc(doc, &limits).expect("in range");
-
-        // Four usable-widths over the ramp's fifth of a bound: sixteen ticks.
-        assert_eq!(clip.blend_in_ms(), 320);
-        assert_eq!(clip.blend_out_ms(), 600, "a ramp above its floor is left");
-        assert!(
-            clip.notes().contains(&ClipNote::BlendStretched {
-                end: BlendEnd::In,
-                configured_ms: 0,
-                floor_ms: 320,
-            }),
-            "{:?}",
-            clip.notes()
-        );
-        assert!(
-            !clip.notes().iter().any(|note| matches!(
-                note,
-                ClipNote::BlendStretched {
-                    end: BlendEnd::Out,
-                    ..
-                }
-            )),
-            "the exit ramp was long enough and is not reported"
-        );
-    }
-
-    /// The write and the read are one invariant across two functions: a clip
-    /// whose derived ramps outrun its own length must survive a round trip
-    /// through the document, or the writer emits files this loader refuses.
-    #[test]
-    fn a_clip_whose_derived_ramps_outrun_it_survives_a_round_trip() {
-        let limits = limits();
-        let big = limits.max_step.antennas * crate::speed::STEP_MARGIN * 4.0;
-        let doc = ClipDoc {
-            blend_in_ms: Some(0),
-            blend_out_ms: Some(0),
-            frames: vec![
-                FrameDoc {
-                    antennas: Some([0.0, 0.0]),
-                    ..FrameDoc::default()
-                },
-                FrameDoc {
-                    antennas: Some([big, 0.0]),
-                    ..FrameDoc::default()
-                },
-            ],
-            ..antennas_doc()
-        };
-        let clip = Clip::from_doc(doc, &limits).expect("in range");
-        assert!(
-            f64::from(clip.blend_in_ms()) > clip.duration_ms()
-                && f64::from(clip.blend_out_ms()) > clip.duration_ms(),
-            "both floors outrun the clip, or this proves nothing: {} / {} over {}",
-            clip.blend_in_ms(),
-            clip.blend_out_ms(),
-            clip.duration_ms(),
-        );
-
-        let mut reloaded = Clip::from_doc(clip.to_doc(), &limits).expect("loads back");
-        assert_eq!(reloaded.blend_in_ms(), clip.blend_in_ms());
-        assert_eq!(reloaded.blend_out_ms(), clip.blend_out_ms());
-        reloaded.forget_notes();
-        let mut written = clip;
-        written.forget_notes();
-        assert_eq!(reloaded, written);
-    }
-
-    /// A track of `frames` frames the antennas hold still through: whatever the
-    /// ceiling tests do to the blends, the derivation has nothing to say.
+    /// A track of `frames` frames the antennas hold still through.
     fn still_doc(frames: usize) -> ClipDoc {
         ClipDoc {
             frames: (0..frames)
@@ -1896,27 +1648,21 @@ mod tests {
         assert_eq!(clip.blend_in_ms(), 100);
     }
 
-    /// A ceiling the author wrote *below* what the frames derive: the loader
-    /// still plays under its own number, and the difference is a note rather
-    /// than a silent substitution. The other direction is pinned in `vendor.rs`.
+    /// `max_speed` is not a key of this format: a document stating one is
+    /// refused as unknown rather than having the number silently ignored.
     #[test]
-    fn a_conservative_stored_ceiling_is_replaced_and_noted() {
-        let doc = ClipDoc {
-            max_speed: 1.05,
-            ..antennas_doc()
-        };
-        let clip = Clip::from_doc(doc, &limits()).expect("in range");
-        assert!(
-            clip.max_speed() > 1.05 + SPEED_CACHE_TOL,
-            "the frames allow more than the document claimed: {}",
-            clip.max_speed()
-        );
-        assert_eq!(
-            clip.notes(),
-            [ClipNote::MaxSpeedDiffers {
-                stored: 1.05,
-                derived: clip.max_speed(),
-            }]
-        );
+    fn a_document_stating_a_speed_ceiling_is_refused() {
+        let json = r#"{
+            "version": 1, "kind": "clip", "name": "pod/x",
+            "channels": ["antennas"], "frame_hz": 50.0, "max_speed": 1.0,
+            "frames": [{"antennas": [0.0, 0.0]}]
+        }"#;
+        let err = Clip::from_json(json, &limits()).expect_err("max_speed is not a key");
+        match err {
+            ClipError::Malformed { detail } => {
+                assert!(detail.contains("max_speed"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

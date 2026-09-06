@@ -4,6 +4,7 @@
 #
 #   tools/deploy-motion.sh <host> --push [--stale-ok]
 #   tools/deploy-motion.sh <host> --run <dir>
+#   tools/deploy-motion.sh <host> --tour <dir>
 #   tools/deploy-motion.sh <host> --fetch <dir>
 #   tools/deploy-motion.sh <host> --speech <dir>
 #   tools/deploy-motion.sh <host> --speech-preflight
@@ -28,6 +29,17 @@
 #                records judged are this run's: a run refused before its fetch
 #                leaves its records for the next run's clear, so `--fetch` them
 #                first if they are wanted.
+#   --tour       `--run`'s chain, driven by the library tour instead of the wake
+#                gesture: the intent source asks for every motion in the
+#                committed name table at recorded pace and then stops the
+#                launcher itself, so the run is as long as the library rather
+#                than as long as a budget. The `timeout` around the launcher
+#                stays as a backstop at the budget the tour computes here, and a
+#                run that reaches it is a failure. The records are fetched
+#                whatever ended the run — they are the point of it — and judged
+#                by `library_tour_report` against the same name table. Several
+#                minutes of motion with nobody at the machine, so the space
+#                around it has to be clear for the whole run.
 #   --fetch      copy the run's `.olog` directories back to a local directory,
 #                under a name stamped with the moment they were fetched so a
 #                session's runs accumulate rather than overwrite. Refuses a fetch
@@ -55,9 +67,10 @@
 #                or whose report is wanted a second time.
 #
 # A fetch brings back two things under one stamp, named for the kind of run it
-# came off — `motion-log-<stamp>` for a budgeted motion run and
-# `speech-log-<stamp>` for a supervised speech one, so a session's two kinds of
-# records sit side by side and say which is which. Under that name: the
+# came off — `motion-log-<stamp>` for a budgeted motion run, `tour-log-<stamp>`
+# for a library tour and `speech-log-<stamp>` for a supervised speech one, so a
+# session's kinds of records sit side by side and say which is which. Under
+# that name: the
 # records the analyzer judges — with `provenance.txt` at its root naming the
 # build that recorded them — and a `.console` directory of the same name beside
 # it, holding the console output of everything the launcher started. A run adds
@@ -397,6 +410,30 @@ refuse() {
 # stopped mid-gesture.
 run_seconds=36
 
+# The library the tour plays, in the two spellings a tour needs it in: the
+# committed one here, which the budget is computed from and the analyzer judges
+# against, and the payload-relative one the sender is given on the unit, where
+# tools/build-motion.sh stages the same file and the launcher's working
+# directory is the release root.
+#
+# One file in both places by construction — the payload's copy is built from
+# this one — so a tour whose plan and whose verdict came from the workstation
+# still describes the run the unit performed, and a payload staged before the
+# last `make clip-config` is the freshness refusal's business rather than this
+# script's.
+tour_names="${repo_root}/cogs/clip_library.names.json"
+tour_names_staged=cogs/clip_library.names.json
+
+# The intent source's own label, built and run here for the tour's backstop
+# budget alone.
+#
+# The budget is the sender's arithmetic over the library — the plan's clock plus
+# the allowances — so it is asked of the sender rather than computed here: the
+# plan and the backstop come from one function, and two of them could disagree
+# while the run rode the wrong one. A host build, like the analyzer's: nothing
+# about printing a number runs on the device.
+ask_target=//crates/reachy-ask:reachy_ask
+
 # The name of the intent source in the payload, and where its console goes.
 #
 # It is not a launcher app and cannot be: it binds the narration port, and the
@@ -404,6 +441,10 @@ run_seconds=36
 # before the launcher is. Started here, ahead of the launcher, and stopped with
 # it — a run's verdict is the analyzer's over the fetched records, so what this
 # console holds is why a run went the way it did rather than the verdict itself.
+#
+# A tour is the exception: there the sender ends the run, so its status is the
+# run's whenever the launcher's is 0, and its last line is what a refusal
+# quotes.
 ask_binary=reachy_ask
 ask_console_name=reachy_ask.log
 
@@ -495,7 +536,7 @@ workspace_paths=(
 )
 
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>"
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>"
 }
 
 # A scalar out of the staged protobuf text. One field per line and quoted
@@ -1024,6 +1065,213 @@ file_captures() {
 	echo "$console"
 }
 
+# Run a chain over a pty, with the host-side evidence captured around it.
+#
+#   launch_and_capture <remote chain> [<what a lost ^C costs, one line per arg>]
+#
+# Sets `aside`, the scratch directory the captures wait in until there is a
+# fetched records directory to file them beside, and `rc`, the chain's own exit
+# status. Every run mode captures the same four things — the clock either side,
+# the host's own facts, and the console stream — because they are what a run
+# that failed is diagnosed from, and a mode that captured three of them would
+# cost an operator the evidence for the run that just failed.
+#
+# A pty: the launcher's console prints as it goes and a ^C here reaches the
+# remote process group. A Ctrl-C aborts the caller before its fetch — the
+# driver's wind-down leaves the machine de-torqued, and the run is re-run.
+#
+# ssh allocates one only when this stdin is a terminal, and proceeds without it
+# otherwise, which silently costs the ^C: an operator watching a run they cannot
+# interrupt is the one thing the eyes-on rule assumes they can do, so the loss
+# is said out loud rather than left to a warning from ssh. What that loss costs
+# differs by mode, so the caller says it in its own words; a caller that passes
+# none is a mode nobody watches for a ^C.
+launch_and_capture() {
+	local remote=$1 line
+	shift
+	aside=$(mktemp -d)
+	trap 'rm -rf -- "$aside"' EXIT
+	capture_clock "${aside}/clock-before.txt"
+	capture_host_facts "${aside}/host-facts.txt"
+	if [ "$#" -gt 0 ] && [ ! -t 0 ]; then
+		echo "${prog}: stdin is not a terminal, so ssh allocates no pty and a ^C here" >&2
+		for line in "$@"; do
+			echo "${prog}: ${line}" >&2
+		done
+	fi
+	rc=0
+	run_over_pty "$remote" "${aside}/run-console.log"
+	rc=$pty_status
+	capture_clock "${aside}/clock-after.txt"
+}
+
+# The backstop budget for a tour of the committed library, in whole seconds.
+#
+#   tour_budget
+#
+# Asked of the sender, which is the only thing that knows the plan: it reads the
+# same name table the analyzer will judge against and prints the seconds its own
+# clock adds up to. A host build, run from its runfiles tree, so the sidecar is
+# named absolutely.
+#
+# Everything the answer is checked for is what it is about to be pasted into: a
+# `timeout` argument and the messages that quote it. A build that printed
+# nothing, or printed bazel's own chatter, would otherwise become a `timeout`
+# with no duration and a launcher that is never stopped.
+#
+# Everything it says goes to stderr: the caller reads the number off stdout.
+tour_budget() {
+	local seconds
+	[ -f "$tour_names" ] || die \
+		"no clip name table at ${tour_names}, so the tour has no library to play." \
+		"It is generated beside the library it describes: make clip-config"
+	echo "${prog}: asking ${ask_target} for the tour's backstop budget" >&2
+	seconds=$("$bazel" run "${build_flags[@]}" -- "$ask_target" \
+		--tour-budget "$tour_names") || die \
+		"the tour's budget could not be computed, so the run has no backstop." \
+		"That is a build failure or a name table the sender refused, and its output is above."
+	case $seconds in
+	'' | *[!0-9]* | 0)
+		die "${ask_target} answered '${seconds}' for the tour's budget, which is not a number of seconds." \
+			"The backstop is pasted into the unit's timeout, so it is not guessed at here."
+		;;
+	esac
+	echo "$seconds"
+}
+
+# The sender's last word, out of the console a tour brought home.
+#
+#   ask_last_line <fetched console directory>
+#
+# A tour that ended badly ended on the sender's own line — the ending it
+# reached, or the quit the launcher did not take — and that line is what a
+# refusal here quotes. The console is fetched best-effort like every other one,
+# so its absence is a sentence rather than a failure: the records came back
+# either way and the analyzer still has them.
+ask_last_line() {
+	local file="${1}/${ask_console_name}"
+	if [ -s "$file" ]; then
+		tail -n 1 -- "$file"
+	else
+		echo "its console did not come back, so it said nothing here"
+	fi
+}
+
+# The remote chain both run modes start with, up to the sentinel, as one string.
+#
+#   launch_chain <log root>
+#
+# Everything before the launcher: the bus question, the checks that can still
+# refuse, the wipe of the log root and the launcher's console directory, the
+# stamp into the log root, the `cd` into the release and the sentinel. One copy
+# because both modes make exactly these preparations and the reasoning behind
+# their order — what is asked before the wipe and what is answered after it — is
+# what a second copy would drift on. What differs is what is started at the end
+# of it, which is the caller's to append.
+launch_chain() {
+	local log_root=$1 remote
+	# The bus question and the run are one ssh invocation, which is
+	# what makes the question binding: asked separately, a service
+	# can start in between and the run meets a held bus anyway. That
+	# is bus_probe's stated contract and the bench deploy's shape.
+	# For --push the same probe is advisory, because a push starts
+	# nothing.
+	#
+	# The launcher resolves every path in its config against its
+	# working directory, so it is started from the release root and
+	# nowhere else.
+	#
+	# The log root is emptied in the same invocation, before the
+	# launcher starts, so what the fetch brings back is this run and
+	# only this run. The device's log root outlives a run — it is
+	# RAM, but a session's runs accumulate under it — and both
+	# refusals downstream read the *newest* records there: a run
+	# that wrote none would be fetched as an earlier run's directory
+	# with bytes in its .olog, so the empty-fetch refusal would not
+	# fire and the analyzer would judge, and pass, a log from a run
+	# that produced nothing. Emptying it also keeps each fetch to
+	# one run's records instead of every prior run's.
+	#
+	# The cost is that a run refused before its fetch leaves its
+	# records to be taken by the next run's clear: `--fetch` before
+	# re-running is how to keep them.
+	#
+	# This chain's own exit codes are `rc_no_stamp` and its
+	# neighbours, in the one table near the top of this script, and
+	# `chain_refusal` carries the four messages for both run modes.
+	remote="$(bus_probe)"
+	# The launcher config this run names, on the unit, asked about
+	# before anything is emptied. The push checks the local payload
+	# carries both configs, but a push and a run are separate
+	# invocations and a run starts whatever is already there: a
+	# unit still holding a payload staged before the harness twin
+	# existed passes every local check and dies inside `simplelaunch`
+	# with the log root already cleared and the run already stamped.
+	remote="${remote}; [ -f ${release}/${launch_config} ] || exit ${rc_no_launch_config}"
+	# The stamp is asked about before the log root is emptied, not
+	# after: this refusal fires on a payload pushed by an older
+	# script or landed before a reboot cleared the tmpfs, and the
+	# previous run's records are often still sitting in that log root
+	# unfetched. A refusal that had already destroyed them would cost
+	# an operator the only copy of a run's .ologs to say that this run
+	# could not name its build.
+	#
+	# The stamp is part of the payload, so a payload carrying none
+	# was put there by something else, and a run of it would record a
+	# log nobody can say the schema of. Refused rather than skipped,
+	# because a records directory that cannot name its build is the
+	# whole failure this closes.
+	remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
+	# The stamp is copied to its staging path before the wipe, for
+	# the same reason the probe runs before it: a copy that fails
+	# here has emptied nothing, so the refusal can send the operator
+	# to fetch the previous run's records rather than tell them about
+	# records that no longer exist.
+	remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
+	# Everything from here on runs with the log root already emptied,
+	# and every one of these steps answers with the one code that
+	# says so.
+	remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
+	# The push's stamp, into the log root the fetch brings home, so
+	# the records name the build that recorded them without the
+	# fetch having to know anything. A rename within the store's own
+	# tmpfs, so full-tmpfs and permission failures cannot reach it.
+	remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
+	# The payload's first publishes are started here, and the front
+	# of each stream is whatever the logger was late for: it opens
+	# its subscriptions on a poll after it opens the log and attaches
+	# to a channel at the write head. Nothing in the payload waits
+	# for it, looks for it, or knows about it -- a logger is never a
+	# precondition for driving motors -- so how much of a stream's
+	# head a run holds is the logger's attach time and nothing the
+	# driver decides. The log is self-contained anyway: every fact
+	# the report judges is republished periodically by the driver or
+	# retained on a persistent channel, so a late attach costs the
+	# log stream redundancy and no fact. The report measures the
+	# loss per channel and fails a run that is missing one of those
+	# carriers outright.
+	# The launcher's console directory is emptied with the log root,
+	# for the reason the log root is: the launcher numbers its files
+	# per run and never overwrites, so a directory left to
+	# accumulate holds several runs' driver consoles and nothing
+	# afterwards can say which run's counters are which. It is a
+	# script constant under the payload store, not a configured
+	# value, so it needs none of the checks above.
+	remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
+	# The trailing `exit $?` keeps the remote shell in front of the
+	# launcher: bash execs a final simple command in place of itself,
+	# and a command that dies by a signal makes ssh report its own
+	# 255 — the code that means "ssh failed" here, so a payload binary
+	# that faults would come back as an unreachable host. With a shell
+	# still there the status is 128+signal and says what happened.
+	remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
+	# Past the last step that can refuse: every code from here on is
+	# the launcher's own, and this line in the console is what says
+	# so.
+	remote="${remote}; echo ${launch_sentinel}"
+	echo "$remote"
+}
+
 # Refuse a staged speech configuration the host itself would refuse.
 #
 #   speech_preflight
@@ -1196,109 +1444,7 @@ case "$mode" in
 		log_root=$(config_string log_root_dir)
 		require_wipeable_log_root "$log_root"
 
-		# The bus question and the run are one ssh invocation, which is
-		# what makes the question binding: asked separately, a service
-		# can start in between and the run meets a held bus anyway. That
-		# is bus_probe's stated contract and the bench deploy's shape.
-		# For --push the same probe is advisory, because a push starts
-		# nothing.
-		#
-		# The launcher resolves every path in its config against its
-		# working directory, so it is started from the release root and
-		# nowhere else.
-		#
-		# The budget is how the run stops: SIGINT is the stop gesture,
-		# and --kill-after is for a launcher that does not answer it.
-		# Ten seconds is well beyond any controlled shutdown; a grace
-		# that expires is a wedged launcher.
-		# The log root is emptied in the same invocation, before the
-		# launcher starts, so what the fetch brings back is this run and
-		# only this run. The device's log root outlives a run — it is
-		# RAM, but a session's runs accumulate under it — and both
-		# refusals downstream read the *newest* records there: a run
-		# that wrote none would be fetched as an earlier run's directory
-		# with bytes in its .olog, so the empty-fetch refusal would not
-		# fire and the analyzer would judge, and pass, a log from a run
-		# that produced nothing. Emptying it also keeps each fetch to
-		# one run's records instead of every prior run's.
-		#
-		# The cost is that a run refused before its fetch leaves its
-		# records to be taken by the next run's clear: `--fetch` before
-		# re-running is how to keep them.
-		#
-		# This chain's own exit codes are `rc_no_stamp` and its
-		# neighbours, in the one table near the top of this script, and
-		# `chain_refusal` carries the four messages for both run modes.
-		remote="$(bus_probe)"
-		# The launcher config this run names, on the unit, asked about
-		# before anything is emptied. The push checks the local payload
-		# carries both configs, but a push and a run are separate
-		# invocations and `--run` starts whatever is already there: a
-		# unit still holding a payload staged before the harness twin
-		# existed passes every local check and dies inside `simplelaunch`
-		# with the log root already cleared and the run already stamped.
-		remote="${remote}; [ -f ${release}/${launch_config} ] || exit ${rc_no_launch_config}"
-		# The stamp is asked about before the log root is emptied, not
-		# after: this refusal fires on a payload pushed by an older
-		# script or landed before a reboot cleared the tmpfs, and the
-		# previous run's records are often still sitting in that log root
-		# unfetched. A refusal that had already destroyed them would cost
-		# an operator the only copy of a run's .ologs to say that this run
-		# could not name its build.
-		#
-		# The stamp is part of the payload, so a payload carrying none
-		# was put there by something else, and a run of it would record a
-		# log nobody can say the schema of. Refused rather than skipped,
-		# because a records directory that cannot name its build is the
-		# whole failure this closes.
-		remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
-		# The stamp is copied to its staging path before the wipe, for
-		# the same reason the probe runs before it: a copy that fails
-		# here has emptied nothing, so the refusal can send the operator
-		# to fetch the previous run's records rather than tell them about
-		# records that no longer exist.
-		remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
-		# Everything from here on runs with the log root already emptied,
-		# and every one of these steps answers with the one code that
-		# says so.
-		remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
-		# The push's stamp, into the log root the fetch brings home, so
-		# the records name the build that recorded them without the
-		# fetch having to know anything. A rename within the store's own
-		# tmpfs, so full-tmpfs and permission failures cannot reach it.
-		remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
-		# The payload's first publishes are started here, and the front
-		# of each stream is whatever the logger was late for: it opens
-		# its subscriptions on a poll after it opens the log and attaches
-		# to a channel at the write head. Nothing in the payload waits
-		# for it, looks for it, or knows about it -- a logger is never a
-		# precondition for driving motors -- so how much of a stream's
-		# head a run holds is the logger's attach time and nothing the
-		# driver decides. The log is self-contained anyway: every fact
-		# the report judges is republished periodically by the driver or
-		# retained on a persistent channel, so a late attach costs the
-		# log stream redundancy and no fact. The report measures the
-		# loss per channel and fails a run that is missing one of those
-		# carriers outright.
-		# The launcher's console directory is emptied with the log root,
-		# for the reason the log root is: the launcher numbers its files
-		# per run and never overwrites, so a directory left to
-		# accumulate holds several runs' driver consoles and nothing
-		# afterwards can say which run's counters are which. It is a
-		# script constant under the payload store, not a configured
-		# value, so it needs none of the checks above.
-		remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
-		# The trailing `exit $?` keeps the remote shell in front of the
-		# launcher: bash execs a final simple command in place of itself,
-		# and a command that dies by a signal makes ssh report its own
-		# 255 — the code that means "ssh failed" here, so a payload binary
-		# that faults would come back as an unreachable host. With a shell
-		# still there the status is 128+signal and says what happened.
-		remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
-		# Past the last step that can refuse: every code from here on is
-		# the launcher's own, and this line in the console is what says
-		# so.
-		remote="${remote}; echo ${launch_sentinel}"
+		remote=$(launch_chain "$log_root")
 		# The intent source, before the launcher and in the
 		# background: it binds the narration port, and the control
 		# process narrates from its first execution, so a bind that
@@ -1310,6 +1456,10 @@ case "$mode" in
 		remote="${remote} --run-window ${run_seconds}"
 		remote="${remote} >${launch_logs}/${ask_console_name} 2>&1 &"
 		remote="${remote} ask=\$!"
+		# The budget is how the run stops: SIGINT is the stop
+		# gesture, and --kill-after is for a launcher that does not
+		# answer it. Ten seconds is well beyond any controlled
+		# shutdown; a grace that expires is a wedged launcher.
 		remote="${remote}; timeout --signal=INT --kill-after=10"
 		remote="${remote} ${run_seconds} ./simplelaunch ${launch_config}"
 		remote="${remote} --logdir ${launch_logs}"
@@ -1318,37 +1468,10 @@ case "$mode" in
 		remote="${remote}; wait \$ask 2>/dev/null"
 		remote="${remote}; exit \$rc"
 
-		# Where the host-side evidence waits until there is a fetched
-		# records directory to file it beside: the clock captures and
-		# the console stream are made before that directory exists, and
-		# a run that never reaches its fetch has nothing for them to
-		# belong to.
-		aside=$(mktemp -d)
-		trap 'rm -rf -- "$aside"' EXIT
-		capture_clock "${aside}/clock-before.txt"
-		capture_host_facts "${aside}/host-facts.txt"
-
 		echo "${prog}: running on ${host} for ${run_seconds}s; eyes on the machine" >&2
-		rc=0
-		# A pty: the launcher's console prints as it goes and a ^C here
-		# reaches the remote process group. A Ctrl-C aborts this script
-		# before the fetch — the driver's wind-down leaves the machine
-		# de-torqued, and the run is re-run.
-		#
-		# ssh allocates one only when this stdin is a terminal, and
-		# proceeds without it otherwise, which silently costs the ^C: an
-		# operator watching a run they cannot interrupt is the one thing
-		# the eyes-on rule assumes they can do, so the loss is said out
-		# loud rather than left to a warning from ssh.
-		if [ ! -t 0 ]; then
-			echo "${prog}: stdin is not a terminal, so ssh allocates no pty and a ^C here" >&2
-			echo "${prog}: will not reach the unit: the run stops at the ${run_seconds}s budget," >&2
-			echo "${prog}: and stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'." >&2
-		fi
-		run_over_pty "$remote" "${aside}/run-console.log"
-		rc=$pty_status
-
-		capture_clock "${aside}/clock-after.txt"
+		launch_and_capture "$remote" \
+			"will not reach the unit: the run stops at the ${run_seconds}s budget," \
+			"and stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'."
 
 		# The chain's own refusals, asked only of a run that never
 		# reached its launcher: the sentinel is what tells a launcher
@@ -1405,6 +1528,114 @@ case "$mode" in
 		# into it, so the analyzer needs no console and a console that
 		# did not come back costs the verdict nothing.
 		report_verdict "$run_dir"
+		;;
+
+	--tour)
+		dest=${1:-}
+		[ -n "$dest" ] || usage
+		[ $# -eq 1 ] || usage
+		# Absolute for the reason --run's is: both the records and the
+		# name table are handed to an analyzer running out of its own
+		# runfiles tree.
+		case $dest in
+		/*) ;;
+		*) dest="${PWD}/${dest}" ;;
+		esac
+		require_bazel "the tour's budget and report"
+		budget=$(tour_budget)
+		log_root=$(config_string log_root_dir)
+		require_wipeable_log_root "$log_root"
+
+		remote=$(launch_chain "$log_root")
+		# The intent source, ahead of the launcher and in the
+		# background as --run's is, and told to play the library: the
+		# sidecar is named relative to the release directory the chain
+		# has already cd'd into, where the build staged it. No
+		# --resting-timeout, so commissioning uses the sender's own
+		# default, and no --run-window: a tour knows its
+		# own end and refuses to be given one.
+		remote="${remote}; ./${ask_binary} --tour ${tour_names_staged}"
+		remote="${remote} >${launch_logs}/${ask_console_name} 2>&1 &"
+		remote="${remote} ask=\$!"
+		# The budget is the backstop and not the stop: the tour ends
+		# the run itself, through the launcher's own quit API, and a
+		# run that reaches this timeout is one where that did not
+		# happen. --kill-after is the wedged-launcher grace --run's is.
+		remote="${remote}; timeout --signal=INT --kill-after=10"
+		remote="${remote} ${budget} ./simplelaunch ${launch_config}"
+		remote="${remote} --logdir ${launch_logs}"
+		# The sender's status is this run's whenever the launcher's is
+		# 0, which is where --run and a tour differ: the launcher
+		# returns 0 both when the tour quit it and when it fell over on
+		# its own, and only the sender knows which of those happened.
+		remote="${remote}; rc=\$?"
+		remote="${remote}; kill -INT \$ask 2>/dev/null"
+		remote="${remote}; wait \$ask; ask_rc=\$?"
+		remote="${remote}; exit \$(( rc != 0 ? rc : ask_rc ))"
+
+		echo "${prog}: touring ${host}'s library; the machine moves for" >&2
+		echo "${prog}: several minutes and stops itself. Keep the space" >&2
+		echo "${prog}: around it clear; ${budget}s is the backstop." >&2
+		launch_and_capture "$remote" \
+			"will not reach the unit: the tour ends the run itself, and" \
+			"stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'."
+
+		# The chain's own refusals, as --run's: a console with no
+		# sentinel in it is a chain that refused or an ssh that never
+		# connected, and nothing was recorded to fetch.
+		if ! launcher_reached "${aside}/run-console.log"; then
+			bus_refusal "$rc" "a library tour" \
+				"255 is ssh's own code and also the run's if the launcher exited with it" \
+				"Its own error is above. Check ${launch_logs} on ${host} before re-running," \
+				"and ${prog} ${host} --fetch <records-dir> first if this run's records matter:" \
+				"the next run empties the log root."
+			chain_refusal "$rc" "$launch_config" --fetch \
+				"The payload there predates the harness twin — push again:"
+		fi
+
+		# The fetch comes before the judgement here, which is the other
+		# way round from --run. A tour that ended badly ended after
+		# playing some of the library, and what it did play is the
+		# reading the run exists to take: the records are the point of
+		# it whatever stopped it, and they live on a tmpfs until they
+		# are brought home. The refusals below quote the sender's own
+		# last line, which is in the console this fetch carries.
+		out=$(fetch_records "$dest" "$log_root" tour-log motion)
+
+		console=$(file_captures "$aside" "$out")
+		echo "${prog}: console ${console}"
+
+		case "$rc" in
+		0)
+			# The sender ended the run and said nothing red: the
+			# expected end of a whole tour.
+			;;
+		124)
+			die "the tour did not end within its ${budget}s backstop, so the launcher was stopped for it." \
+				"The sender's last line: $(ask_last_line "$console")" \
+				"Its records were fetched to ${out} and say how far the tour got."
+			;;
+		137)
+			die "the launcher did not stop on SIGINT and was killed (exit ${rc})." \
+				"That is a launcher wedged in its own shutdown; its output is under ${launch_logs} on ${host}."
+			;;
+		*)
+			die "the tour on ${host} failed (exit ${rc})." \
+				"The sender's last line: $(ask_last_line "$console")" \
+				"Its records were fetched to ${out}; the launcher's output is under ${launch_logs} on ${host}."
+			;;
+		esac
+
+		run_dir=$(run_directory "$out" \
+			"Either it never started or it could not open a file there; its output is under ${launch_logs} on ${host}." \
+			"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
+		echo "${prog}: log  ${run_dir}"
+
+		# Judged against the library it was supposed to play: the
+		# analyzer needs the name table as well as the log, because
+		# every one of its findings is about a motion that should have
+		# been asked for.
+		tour_verdict "$run_dir" "$tour_names"
 		;;
 
 	--fetch)
@@ -1523,17 +1754,11 @@ case "$mode" in
 		# the ssh session open.
 		remote="${remote}; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
 
-		aside=$(mktemp -d)
-		trap 'rm -rf -- "$aside"' EXIT
-		capture_clock "${aside}/clock-before.txt"
-		capture_host_facts "${aside}/host-facts.txt"
-
 		echo "${prog}: running the pipeline on ${host}; eyes on the machine" >&2
 		echo "${prog}: talk to it, and stop the run with ^C when you are done" >&2
-		run_over_pty "$remote" "${aside}/run-console.log"
-		rc=$pty_status
-
-		capture_clock "${aside}/clock-after.txt"
+		# No ^C note: this run is ended by the operator's own ^C and
+		# `require_speech_tty` has already refused it without a terminal.
+		launch_and_capture "$remote"
 
 		# Only a run that never reached its launcher is refused here.
 		# Everything else — the launcher's own exit, a signal, a dropped

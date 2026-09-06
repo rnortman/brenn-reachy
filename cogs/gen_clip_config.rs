@@ -35,10 +35,10 @@ use brenn_reachy__cogs__config_clk_rs::{
     ClipFrame, ClipLibraryConfig, ClipLibraryConfigWire, MotionConfig,
 };
 use reachy_clips::config::{FRAME_FIELDS, UnplayableAsset, ValidatedLibrary, write_library};
+use reachy_clips::envelope::ClipLimits;
 use reachy_clips::files::documents;
 use reachy_clips::format::Clip;
 use reachy_clips::library::{Library, Motion};
-use reachy_clips::speed::ClipLimits;
 
 /// What the emitted asset says about itself before its first clip.
 ///
@@ -349,9 +349,8 @@ impl Emitted {
 /// depend on arrives in `texts`, which is what lets a case compare a fresh emit
 /// against the checked-in file byte for byte.
 fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
-    // The bounds the loader derives every clip's ceiling and blend floors
-    // against: the machine's own, so what this accepts is what the tick can
-    // command.
+    // The geometry and envelope the loader walks every clip's frames against:
+    // the machine's own, so what this accepts is what the tick can command.
     let limits = ClipLimits::default();
     let (library, skips) = Library::load(
         texts.iter().map(|(source, text)| (source.clone(), text)),
@@ -402,7 +401,7 @@ fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
         motions.push(motion);
     }
 
-    let mut message = Box::new(ClipLibraryConfigWire::new());
+    let mut message = ClipLibraryConfigWire::new_boxed();
     write_library(&clips, &motions, message.clear_valid())
         .context("the library does not fit the message")?;
     // What is written is read back the way a cog reads it -- one `validate()`
@@ -482,7 +481,6 @@ fn print_library(library: &ClipLibraryConfig, clips: &Numbering, motions: &Numbe
         let _ = writeln!(out, "  frame_rate_hz: {}", number(clip.frame_rate_hz));
         let _ = writeln!(out, "  blend_in_ms: {}", clip.blend_in_ms);
         let _ = writeln!(out, "  blend_out_ms: {}", clip.blend_out_ms);
-        let _ = writeln!(out, "  max_speed: {}", number(clip.max_speed));
         for frame in clip.frames.iter() {
             print_frame(&mut out, frame);
         }
@@ -560,18 +558,19 @@ fn write(path: &Path, text: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    use std::sync::OnceLock;
+
     use brenn_reachy__cogs__config_clk_rs::ClipFrameWire;
     use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS};
+    use reachy_scratch::scratch_dir;
 
-    /// The checked-in documents, embedded rather than read: a case that
-    /// compiles against the asset needs no runfiles and no working directory.
-    const DOCUMENTS: [(&str, &str); 5] = [
-        ("cogs/clips/nod.json", include_str!("clips/nod.json")),
-        ("cogs/clips/perk.json", include_str!("clips/perk.json")),
-        ("cogs/clips/sway.json", include_str!("clips/sway.json")),
-        ("cogs/clips/tip.json", include_str!("clips/tip.json")),
-        ("cogs/clips/tour.json", include_str!("clips/tour.json")),
-    ];
+    /// The environment variable naming the committed documents' directory,
+    /// relative to the runfiles root, which is a test's working directory.
+    ///
+    /// Read rather than embedded: the library is a tree of documents that grows
+    /// by import, and a list of file names in this file would make adding one a
+    /// code change.
+    const DOCUMENTS_ENV: &str = "CLIP_DOCUMENTS";
 
     /// The asset those documents emit, as committed.
     const ASSET: &str = include_str!("clip_library.textproto");
@@ -579,10 +578,60 @@ mod tests {
     /// The name sidecar, as committed.
     const NAMES: &str = include_str!("clip_library.names.json");
 
+    /// The directory the committed documents are in.
+    ///
+    /// Panics rather than answers: a missing runfile is a broken test target,
+    /// not a case.
+    fn documents_root() -> PathBuf {
+        let named = std::env::var(DOCUMENTS_ENV).unwrap_or_else(|_| {
+            panic!(
+                "{DOCUMENTS_ENV} is unset: the test target has to name the directory beside the \
+                 data attribute that supplies it"
+            )
+        });
+        PathBuf::from(named)
+    }
+
+    /// Every committed document, by path ascending — the same walk the tool's
+    /// own run does, so what these cases emit is what `make clip-config` emits.
+    ///
+    /// Panics below two documents: a runfiles arrangement that supplies none
+    /// would otherwise emit an empty library, and comparing that against the
+    /// committed asset fails in a way that reads as staleness and invites a
+    /// regeneration that would delete the library.
     fn texts() -> Vec<(String, String)> {
-        DOCUMENTS
-            .iter()
-            .map(|(source, text)| ((*source).to_owned(), (*text).to_owned()))
+        static READ: OnceLock<Vec<(String, String)>> = OnceLock::new();
+        READ.get_or_init(|| texts_under(&documents_root())).clone()
+    }
+
+    /// The emit of the committed tree, done once for every case that only reads
+    /// it.
+    ///
+    /// The tree is tens of documents of up to a thousand frames and every frame
+    /// costs a kinematic solve, so emitting it per case is most of this small
+    /// target's runtime. The cases that patch a document emit their own; nothing
+    /// mutates what this hands back.
+    fn baseline() -> &'static Emitted {
+        static EMITTED: OnceLock<Emitted> = OnceLock::new();
+        EMITTED.get_or_init(|| emit(&texts()).expect("the checked-in documents emit"))
+    }
+
+    /// [`texts`] over a named directory, so the guard below has something to
+    /// point at that is not the runfiles.
+    fn texts_under(root: &Path) -> Vec<(String, String)> {
+        let read = documents(root)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", root.display()));
+        assert!(
+            read.len() >= 2,
+            "{} holds {} document(s): the test target's data attribute is not supplying the tree",
+            root.display(),
+            read.len()
+        );
+        read.into_iter()
+            .map(|(source, text)| {
+                let text = text.unwrap_or_else(|error| panic!("cannot read {source}: {error}"));
+                (source, text)
+            })
             .collect()
     }
 
@@ -593,13 +642,37 @@ mod tests {
         serde_json::to_string(&value).expect("a patched document is JSON")
     }
 
+    /// A runfiles arrangement that supplies no documents is a broken test
+    /// target and has to read as one. Without this the drift case emits an
+    /// empty library, the comparison fails as staleness, and the invited
+    /// `make clip-config` writes that empty library over the real asset.
+    #[test]
+    #[should_panic(expected = "document(s)")]
+    fn a_walk_that_finds_no_tree_is_a_broken_target_rather_than_an_empty_library() {
+        let empty = scratch_dir("gen-clip-config-empty-tree");
+        let _ = texts_under(empty.as_ref());
+    }
+
+    /// The documents the cases emit are the committed tree itself, walked the
+    /// way the tool walks it: the drift check is against what `make
+    /// clip-config` would read, not against a list of names in this file.
+    #[test]
+    fn the_walk_finds_the_committed_documents_in_the_tree() {
+        let sources: Vec<String> = texts().into_iter().map(|(source, _)| source).collect();
+        assert!(
+            sources.iter().any(|source| source.ends_with("nod.json")),
+            "{sources:?}"
+        );
+        assert!(sources.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+    }
+
     /// The whole point of the tool having a committed output: the emit is
     /// reproducible, so a change to a document, to the mapping, or to the
     /// printer that nobody regenerated for is a red test rather than an asset
     /// that no longer says what the documents do.
     #[test]
     fn the_committed_asset_is_what_the_committed_documents_emit() {
-        let emitted = emit(&texts()).expect("the checked-in documents emit");
+        let emitted = baseline();
         assert_eq!(
             emitted.textproto, ASSET,
             "cogs/clip_library.textproto is stale; run `make clip-config`"
@@ -614,10 +687,42 @@ mod tests {
     /// The load's own opinion of the assets, which the emitter reports and does
     /// not silence. A note means the committed documents disagree with the
     /// derivation about something, and the operator gets to hear it.
+    ///
+    /// `ClipNote` is uninhabited today — nothing the load does can construct
+    /// one — so this gate cannot currently fail. It is kept as the gate for the
+    /// first note that returns, and the case below keeps the reporting path it
+    /// would come out through covered meanwhile.
     #[test]
     fn the_committed_documents_load_without_a_note() {
-        let emitted = emit(&texts()).expect("the checked-in documents emit");
+        let emitted = baseline();
         assert!(emitted.notes.is_empty(), "notes: {:?}", emitted.notes);
+    }
+
+    /// The path a note reaches the operator by, driven from a synthetic emit
+    /// because no load can produce a note today. The gate above is only worth
+    /// anything if a note that appears is also said.
+    #[test]
+    fn a_note_is_said_before_the_numberings() {
+        let emitted = Emitted {
+            textproto: String::new(),
+            clips: Numbering {
+                noun: "clip",
+                part: "frame",
+                entries: Vec::new(),
+            },
+            motions: Numbering {
+                noun: "motion",
+                part: "segment",
+                entries: Vec::new(),
+            },
+            notes: vec!["bench/nod: the derivation changed something".to_owned()],
+        };
+        let mut said = Vec::new();
+        emitted.report(&mut |line| said.push(line));
+        assert_eq!(
+            said,
+            vec!["note: bench/nod: the derivation changed something".to_owned()]
+        );
     }
 
     /// Every motion row states the window the compile of a `play` step needs,
@@ -627,7 +732,7 @@ mod tests {
     /// nothing can invoke would be a number nobody reads.
     #[test]
     fn a_motion_row_states_the_window_a_play_step_occupies() {
-        let emitted = emit(&texts()).expect("the checked-in documents emit");
+        let emitted = baseline();
         let sidecar: serde_json::Value =
             serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
         let tour = sidecar["motions"]
@@ -654,7 +759,7 @@ mod tests {
     fn a_clip_id_is_the_position_the_document_was_read_in() {
         let mut reversed = texts();
         reversed.reverse();
-        let forward = emit(&texts()).expect("the documents emit");
+        let forward = baseline();
         let backward = emit(&reversed).expect("the documents emit either way");
         let names = |emitted: &Emitted| -> Vec<String> {
             emitted
@@ -666,7 +771,7 @@ mod tests {
         };
         let mut flipped = names(&backward);
         flipped.reverse();
-        assert_eq!(names(&forward), flipped);
+        assert_eq!(names(forward), flipped);
         assert_ne!(
             forward.textproto, backward.textproto,
             "the order the documents arrive in is the numbering"
@@ -677,7 +782,7 @@ mod tests {
     /// author reading either gets the same id.
     #[test]
     fn the_sidecar_and_the_asset_agree_about_every_id() {
-        let emitted = emit(&texts()).expect("the documents emit");
+        let emitted = baseline();
         let sidecar: serde_json::Value =
             serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
         let listed = sidecar["clips"].as_array().expect("clips is an array");
@@ -734,31 +839,6 @@ mod tests {
         assert!(
             format!("{error:#}").contains("none of the documents is a clip"),
             "{error:#}"
-        );
-    }
-
-    /// What the loader changed about a clip is the operator's to hear: the note
-    /// is the only warning that the asset's blends are not the ones the document
-    /// authored.
-    #[test]
-    fn a_derivation_that_changed_a_clip_is_reported() {
-        let mut stretched = texts();
-        stretched[0].1 = doc(&stretched[0].1, |value| {
-            value["blend_in_ms"] = json!(1);
-        });
-        let emitted = emit(&stretched).expect("a stretched ramp still emits");
-        assert_eq!(emitted.notes.len(), 1, "notes: {:?}", emitted.notes);
-        assert!(
-            emitted.notes[0].contains("bench/nod") && emitted.notes[0].contains("stretched"),
-            "{:?}",
-            emitted.notes
-        );
-        let mut said = Vec::new();
-        emitted.report(&mut |line| said.push(line));
-        assert!(
-            said.iter()
-                .any(|line| line.starts_with("note: ") && line.contains("bench/nod")),
-            "{said:?}"
         );
     }
 
@@ -821,12 +901,28 @@ mod tests {
             .nth(1)
             .expect("the greeting motion is printed");
         assert!(printed.starts_with("  lead_gap_ms: 250\n"), "{printed}");
+
+        // Clip IDs are positional; adding a document before these shifts them.
+        let clip_id = |name: &str| {
+            emitted
+                .clips
+                .entries
+                .iter()
+                .position(|clip| clip.name == name)
+                .unwrap_or_else(|| panic!("{name} is a clip"))
+        };
         assert!(
-            printed.contains("    clip_id: 0\n    speed: 1.0\n    gap_after_ms: 300\n"),
+            printed.contains(&format!(
+                "    clip_id: {}\n    speed: 1.0\n    gap_after_ms: 300\n",
+                clip_id("bench/nod")
+            )),
             "{printed}"
         );
         assert!(
-            printed.contains("    clip_id: 2\n    speed: 2.0\n    gap_after_ms: 0\n"),
+            printed.contains(&format!(
+                "    clip_id: {}\n    speed: 2.0\n    gap_after_ms: 0\n",
+                clip_id("bench/sway")
+            )),
             "{printed}"
         );
     }
@@ -840,7 +936,7 @@ mod tests {
     /// clips and the motions carry more.
     #[test]
     fn every_clip_is_also_a_motion_of_one_segment() {
-        let emitted = emit(&texts()).expect("the checked-in documents emit");
+        let emitted = baseline();
         assert!(emitted.motions.len() >= emitted.clips.len());
         for clip in &emitted.clips.entries {
             let motion = emitted
@@ -1038,16 +1134,22 @@ mod tests {
     /// cannot cover: what it reads, what it writes, and what it says.
     #[test]
     fn the_tool_writes_both_files_and_reports_every_clip() {
-        let dir = std::env::temp_dir().join(format!(
-            "gen-clip-config-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir = scratch_dir("gen-clip-config-tool");
         let clips = dir.join("clips");
         std::fs::create_dir_all(&clips).expect("a temporary directory");
-        for (source, text) in DOCUMENTS {
-            let name = Path::new(source).file_name().expect("a file name");
-            std::fs::write(clips.join(name), text).expect("the document is written");
+        let root = documents_root();
+        for (source, text) in texts() {
+            // Copied at the same relative depth: a document's id is its full
+            // path's position in the sort, so flattening the tree here would
+            // emit a different numbering than the committed one.
+            let target = clips.join(
+                Path::new(&source)
+                    .strip_prefix(&root)
+                    .expect("a document under the documents root"),
+            );
+            std::fs::create_dir_all(target.parent().expect("a parent"))
+                .expect("the document's directory");
+            std::fs::write(target, text).expect("the document is written");
         }
         let args = Args {
             clips,
@@ -1068,24 +1170,26 @@ mod tests {
             said.iter().any(|line| line.contains("bench/nod")),
             "{said:?}"
         );
+        // Counted off the same walk rather than written in: the tree is
+        // whatever is committed, and adding a document is not a change to this
+        // case.
+        let baseline = baseline();
         assert!(
-            said.last()
-                .expect("a closing line")
-                .contains("4 clip(s) and 5 motion(s)"),
+            said.last().expect("a closing line").contains(&format!(
+                "{} clip(s) and {} motion(s)",
+                baseline.clips.entries.len(),
+                baseline.motions.entries.len()
+            )),
             "{said:?}"
         );
-        std::fs::remove_dir_all(&dir).expect("the temporary directory goes away");
     }
 
     /// An empty directory is the caller's own configuration being wrong, and
     /// says so rather than emitting a library with no clips.
     #[test]
     fn an_empty_directory_is_refused() {
-        let dir =
-            std::env::temp_dir().join(format!("gen-clip-config-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a temporary directory");
-        let error = read_documents(&dir).expect_err("nothing to read");
+        let dir = scratch_dir("gen-clip-config-empty");
+        let error = read_documents(dir.as_ref()).expect_err("nothing to read");
         assert!(format!("{error:#}").contains("no *.json"), "{error:#}");
-        std::fs::remove_dir_all(&dir).expect("the temporary directory goes away");
     }
 }

@@ -28,11 +28,11 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::config::MAX_SEGMENTS;
+use crate::envelope::ClipLimits;
 use crate::format::{
     CLIP_KIND, Clip, ClipError, ClipNote, MAX_SPEED, MIN_SPEED, SEQUENCE_KIND, document_kind,
 };
 use crate::sequence::{Entry, Sequence, SequenceError};
-use crate::speed::{ClipLimits, seam_step};
 
 /// How deeply sequences may nest before a reference is refused.
 ///
@@ -60,13 +60,6 @@ pub const SPEED_EPS: f64 = 1e-9;
 #[must_use]
 pub fn speed_in_bounds(speed: f64) -> bool {
     (MIN_SPEED - SPEED_EPS..=MAX_SPEED + SPEED_EPS).contains(&speed)
-}
-
-/// Whether `speed` is within `ceiling`, the highest rate a clip's own frames
-/// admit, to the same tolerance.
-#[must_use]
-pub fn within_ceiling(speed: f64, ceiling: f64) -> bool {
-    speed <= ceiling + SPEED_EPS
 }
 
 /// One flattened step of a motion: a clip, the speed it runs at, and the hold
@@ -243,47 +236,6 @@ pub enum ResolveError {
         /// The flattened speed.
         speed: f64,
     },
-
-    /// A flattened speed above what that clip may be played at.
-    #[error(
-        "sequence {sequence:?} plays clip {clip:?} at {speed}× even at 1.0×, \
-         above that clip's own limit of {max_speed}×"
-    )]
-    SpeedAboveClip {
-        /// The sequence being resolved.
-        sequence: String,
-        /// The clip whose limit is exceeded.
-        clip: String,
-        /// The flattened speed.
-        speed: f64,
-        /// The clip's limit.
-        max_speed: f64,
-    },
-
-    /// Two adjacent clips whose shared channels do not meet.
-    ///
-    /// At the tick where one segment's last frame gives way to the next
-    /// segment's first, nothing interpolates and — for a channel both clips
-    /// drive — nothing blends either, since the weight is already at one on
-    /// both sides. The difference of the two deltas is commanded whole, in one
-    /// tick, at every invocation speed, and a hold between them only postpones
-    /// it. Past a step bound that tick is refused, which drops every overlay on
-    /// the machine at the seam; refused at load instead, where the author can
-    /// see it.
-    #[error(
-        "sequence {sequence:?} joins clip {from:?} to clip {to:?} with a step of \
-         {step:.2}× the usable per-tick bound"
-    )]
-    Seam {
-        /// The sequence being resolved.
-        sequence: String,
-        /// The outgoing clip.
-        from: String,
-        /// The incoming clip.
-        to: String,
-        /// The step the seam commands, as a multiple of the usable bound.
-        step: f64,
-    },
 }
 
 /// Why a document was skipped at load.
@@ -401,9 +353,9 @@ impl Library {
     /// Load every document.
     ///
     /// Each item is a source label and the document's text. `limits` are the
-    /// bounds every clip's speed ceiling and blend floors are derived against —
-    /// the running machine's, so a daemon whose step bounds are configured
-    /// tighter than the defaults loads clips under its own.
+    /// geometry and envelope every clip's frames are walked against — the
+    /// running machine's, so a daemon whose envelope is configured tighter than
+    /// the defaults loads clips under its own.
     ///
     /// Returns the library alongside every document that was skipped, in the
     /// order the failures were decided.
@@ -738,7 +690,7 @@ fn flatten(
                         });
                     }
                     let effective = segment.speed * speed;
-                    check_speed(sequence.name(), &segment.clip, clips, effective)?;
+                    check_speed(sequence.name(), &segment.clip, effective)?;
                     segments.push(Segment {
                         clip: segment.clip.clone(),
                         speed: effective,
@@ -762,7 +714,6 @@ fn flatten(
         });
     }
     place_gap(&mut lead_gap_s, &mut segments, &mut pending_gap_s);
-    check_seams(sequence.name(), &segments, clips, limits)?;
 
     Ok(Motion {
         name: sequence.name().to_owned(),
@@ -788,65 +739,13 @@ fn place_gap(lead_gap_s: &mut f64, segments: &mut [Segment], pending_gap_s: &mut
     *pending_gap_s = 0.0;
 }
 
-/// Refuse a flattened list whose adjacent clips do not meet.
-///
-/// Run over the finished list rather than as each segment is pushed, so a seam
-/// between two clips that arrived from different nestings is checked exactly
-/// like one written side by side in a single sequence.
-fn check_seams(
-    sequence: &str,
-    segments: &[Segment],
-    clips: &BTreeMap<String, Clip>,
-    limits: &ClipLimits,
-) -> Result<(), ResolveError> {
-    for pair in segments.windows(2) {
-        // A segment exists only because its name was found in this map, so the
-        // lookups hold; a miss is this module having lost track of its own
-        // invariant, not a document saying something.
-        let (out_clip, in_clip) = (&clips[&pair[0].clip], &clips[&pair[1].clip]);
-        let (_, out_last) = out_clip.end_metrics();
-        let (in_first, _) = in_clip.end_metrics();
-        let step = seam_step(
-            &out_last,
-            out_clip.mask(),
-            &in_first,
-            in_clip.mask(),
-            limits,
-        );
-        if step > 1.0 {
-            return Err(ResolveError::Seam {
-                sequence: sequence.to_owned(),
-                from: pair[0].clip.clone(),
-                to: pair[1].clip.clone(),
-                step,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Refuse a flattened speed the nesting alone has already pushed out of range.
-fn check_speed(
-    sequence: &str,
-    clip: &str,
-    clips: &BTreeMap<String, Clip>,
-    speed: f64,
-) -> Result<(), ResolveError> {
+fn check_speed(sequence: &str, clip: &str, speed: f64) -> Result<(), ResolveError> {
     if !speed_in_bounds(speed) {
         return Err(ResolveError::SpeedOutOfBounds {
             sequence: sequence.to_owned(),
             clip: clip.to_owned(),
             speed,
-        });
-    }
-    // A segment exists only because its name was found in this map.
-    let max_speed = clips[clip].max_speed();
-    if !within_ceiling(speed, max_speed) {
-        return Err(ResolveError::SpeedAboveClip {
-            sequence: sequence.to_owned(),
-            clip: clip.to_owned(),
-            speed,
-            max_speed,
         });
     }
     Ok(())
@@ -857,7 +756,6 @@ mod tests {
     use super::*;
 
     use crate::format::Channel;
-    use crate::speed::STEP_MARGIN;
 
     /// The bounds every test derives clips against: the machine's defaults.
     fn limits() -> ClipLimits {
@@ -867,19 +765,17 @@ mod tests {
     use reachy_motion::FLOOR_TICK_HZ;
 
     /// A clip document of `frames` antennas-only frames, named `name`.
-    /// The frames alternate between zero and one step, so the track derives
-    /// exactly `max_speed` from its own per-frame deltas — the loader ignores
-    /// the number in the document.
-    fn clip_json(name: &str, frames: usize, max_speed: f64) -> String {
-        let limits = limits();
-        let step = limits.max_step.antennas * STEP_MARGIN / max_speed;
+    ///
+    /// The frames alternate between zero and a tenth of a radian, so the track
+    /// moves without going anywhere near an angle a goal register cannot hold.
+    fn clip_json(name: &str, frames: usize) -> String {
         let track: Vec<String> = (0..frames)
-            .map(|index| format!("{{\"antennas\": [{}, 0.0]}}", (index % 2) as f64 * step))
+            .map(|index| format!("{{\"antennas\": [{}, 0.0]}}", (index % 2) as f64 * 0.1))
             .collect();
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["antennas"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": {max_speed}, "frames": [{}]}}"#,
+                 "frames": [{}]}}"#,
             track.join(",")
         )
     }
@@ -890,23 +786,12 @@ mod tests {
     }
 
     /// A one-frame head clip holding the head `dz` metres off neutral.
-    ///
-    /// What a seam between two of these commands is the difference of their
-    /// crank solutions, which is the branch of the seam check a track of
-    /// antenna deltas never reaches.
     fn head_lift_json(name: &str, dz: f64) -> String {
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["head"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": 2.0,
                  "frames": [{{"dt": [0.0, 0.0, {dz}], "dq": [1.0, 0.0, 0.0, 0.0]}}]}}"#
         )
-    }
-
-    /// An antennas-only clip that *claims* a ceiling its frames do not derive,
-    /// so the loader's disagreement is reportable.
-    fn clip_json_claiming(name: &str, claims: f64) -> String {
-        clip_json(name, 4, 2.0).replace("\"max_speed\": 2", &format!("\"max_speed\": {claims}"))
     }
 
     /// Load and require that nothing was skipped.
@@ -927,15 +812,10 @@ mod tests {
 
     #[test]
     fn a_clip_loads_under_its_own_name() {
-        let library = library(&[("a.json", clip_json("pod/wiggle", 50, 1.5))]);
+        let library = library(&[("a.json", clip_json("pod/wiggle", 50))]);
         let clip = library.clip("pod/wiggle").expect("loaded");
         assert_eq!(clip.name(), "pod/wiggle");
         assert!((clip.duration_s() - 1.0).abs() < 1e-12);
-        assert!(
-            (clip.max_speed() - 1.5).abs() < 1e-9,
-            "{}",
-            clip.max_speed()
-        );
         assert!(clip.mask().contains(Channel::Antennas));
     }
 
@@ -943,11 +823,11 @@ mod tests {
     fn one_bad_document_does_not_take_the_library_with_it() {
         let (library, skips) = Library::load(
             [
-                ("good.json", clip_json("pod/good", 50, 2.0)),
+                ("good.json", clip_json("pod/good", 50)),
                 ("corrupt.json", "{ not json".to_owned()),
                 (
                     "wrong-rate.json",
-                    clip_json("pod/bad", 50, 2.0).replace("50", "30"),
+                    clip_json("pod/bad", 50).replace("50", "30"),
                 ),
                 ("empty-seq.json", sequence_json("pod/empty", "")),
             ],
@@ -990,7 +870,7 @@ mod tests {
 
     #[test]
     fn a_clip_is_a_one_segment_motion() {
-        let library = library(&[("a.json", clip_json("pod/wiggle", 50, 1.5))]);
+        let library = library(&[("a.json", clip_json("pod/wiggle", 50))]);
         let motion = library.motion("pod/wiggle").expect("loaded");
         assert_eq!(motion.name(), "pod/wiggle");
         assert_eq!(motion.segments().len(), 1);
@@ -1003,8 +883,8 @@ mod tests {
     #[test]
     fn a_sequence_flattens_to_its_clips_with_gaps_between() {
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
-            ("b.json", clip_json("pod/b", 100, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
+            ("b.json", clip_json("pod/b", 100)),
             (
                 "s.json",
                 sequence_json(
@@ -1025,7 +905,7 @@ mod tests {
     #[test]
     fn nested_entry_speeds_multiply_and_gaps_scale_with_them() {
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "inner.json",
                 sequence_json(
@@ -1040,7 +920,7 @@ mod tests {
         ]);
         let motion = library.motion("pod/outer").expect("loaded");
         assert_eq!(motion.segments().len(), 1);
-        // 1.6 × 1.25 = 2.0, the ceiling, admitted through the float tolerance.
+        // 1.6 × 1.25 = 2.0, the global bound, admitted through the float tolerance.
         assert!((motion.segments()[0].speed() - 2.0).abs() < 1e-12);
         // The inner sequence's own hold is divided by the outer entry's speed.
         assert!((motion.segments()[0].gap_after_s() - 0.32).abs() < 1e-12);
@@ -1049,7 +929,7 @@ mod tests {
     #[test]
     fn a_leading_gap_holds_before_the_first_clip_and_consecutive_gaps_merge() {
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "s.json",
                 sequence_json(
@@ -1067,7 +947,7 @@ mod tests {
     #[test]
     fn a_nested_leading_gap_merges_into_the_parents_hold() {
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "inner.json",
                 sequence_json("pod/inner", r#"{"gap_ms": 400}, {"ref": "pod/a"}"#),
@@ -1135,7 +1015,7 @@ mod tests {
 
     #[test]
     fn nesting_deeper_than_the_limit_is_refused() {
-        let mut documents = vec![("clip.json".to_owned(), clip_json("pod/a", 50, 2.0))];
+        let mut documents = vec![("clip.json".to_owned(), clip_json("pod/a", 50))];
         documents.push((
             "s0.json".to_owned(),
             sequence_json("pod/s0", r#"{"ref": "pod/a"}"#),
@@ -1175,7 +1055,7 @@ mod tests {
         // before any of its links is memoised: the refusal has to come from the
         // descent itself, not from a cached child.
         const LINKS: usize = 200;
-        let mut documents = vec![("clip.json".to_owned(), clip_json("pod/clip", 50, 2.0))];
+        let mut documents = vec![("clip.json".to_owned(), clip_json("pod/clip", 50))];
         documents.push((
             "root.json".to_owned(),
             sequence_json("pod/root", r#"{"ref": "pod/z000"}"#),
@@ -1256,30 +1136,10 @@ mod tests {
     }
 
     #[test]
-    fn a_flattened_speed_above_the_clips_limit_is_refused() {
-        let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 1.2)),
-            (
-                "s.json",
-                sequence_json("pod/s", r#"{"ref": "pod/a", "speed": 1.5}"#),
-            ),
-        ]);
-        match skip.error {
-            LoadError::Resolve(ResolveError::SpeedAboveClip {
-                clip, max_speed, ..
-            }) => {
-                assert_eq!(clip, "pod/a");
-                assert_eq!(max_speed, 1.2);
-            }
-            other => panic!("expected a clip-limit refusal, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn the_global_speed_bounds_admit_their_own_endpoints_and_refuse_past_them() {
         for speed in [MIN_SPEED, 1.0, MAX_SPEED] {
             let library = library(&[
-                ("a.json", clip_json("pod/a", 50, 2.0)),
+                ("a.json", clip_json("pod/a", 50)),
                 (
                     "s.json",
                     sequence_json("pod/s", &format!(r#"{{"ref": "pod/a", "speed": {speed}}}"#)),
@@ -1291,7 +1151,7 @@ mod tests {
 
         for speed in [MIN_SPEED - 1e-6, MAX_SPEED + 1e-6] {
             let skip = one_skip(&[
-                ("a.json", clip_json("pod/a", 50, 2.0)),
+                ("a.json", clip_json("pod/a", 50)),
                 (
                     "s.json",
                     sequence_json("pod/s", &format!(r#"{{"ref": "pod/a", "speed": {speed}}}"#)),
@@ -1313,7 +1173,7 @@ mod tests {
     #[test]
     fn a_sequence_referenced_twice_lands_twice_at_each_entrys_own_speed() {
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "i.json",
                 sequence_json(
@@ -1399,7 +1259,7 @@ mod tests {
         };
 
         let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             ("l0.json", sequence_json("pod/l0", &refs(6, "pod/a"))),
             ("l1.json", sequence_json("pod/l1", &refs(6, "pod/l0"))),
         ]);
@@ -1414,7 +1274,7 @@ mod tests {
         // One past the bound is refused, and the bound itself loads: the last
         // segment a motion carries is one an author may write.
         let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "m.json",
                 sequence_json("pod/many", &refs(MAX_SEGMENTS + 1, "pod/a")),
@@ -1427,7 +1287,7 @@ mod tests {
             })
         );
         let library = library(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             (
                 "m.json",
                 sequence_json("pod/many", &refs(MAX_SEGMENTS, "pod/a")),
@@ -1439,13 +1299,12 @@ mod tests {
         );
     }
 
-    /// Two head clips that end and begin at poses further apart than one tick's
-    /// leg travel: the handover commands the whole difference in one period, so
-    /// the sequence is refused where the author can see it rather than on the
-    /// machine mid-performance.
+    /// Two head clips that end and begin at poses far apart: the handover
+    /// commands the whole difference in one period, and that is what a sequence
+    /// of them means. Nothing at load has an opinion about the size of the step.
     #[test]
-    fn a_sequence_whose_clips_do_not_meet_is_refused_at_load() {
-        let skip = one_skip(&[
+    fn a_sequence_whose_clips_do_not_meet_still_loads() {
+        let library = library(&[
             ("low.json", head_lift_json("pod/low", 0.0)),
             ("high.json", head_lift_json("pod/high", 0.02)),
             (
@@ -1453,103 +1312,17 @@ mod tests {
                 sequence_json("pod/jump", r#"{"ref": "pod/low"}, {"ref": "pod/high"}"#),
             ),
         ]);
-        let LoadError::Resolve(ResolveError::Seam {
-            sequence,
-            from,
-            to,
-            step,
-        }) = skip.error
-        else {
-            panic!("expected a seam refusal: {:?}", skip.error);
-        };
-        assert_eq!(sequence, "pod/jump");
-        assert_eq!(from, "pod/low");
-        assert_eq!(to, "pod/high");
-        assert!(step > 1.0, "{step}");
-
-        // A seam the legs can cross in one period loads: the refusal is about
-        // the distance, not about joining two head clips at all.
-        let library = library(&[
-            ("low.json", head_lift_json("pod/low", 0.0)),
-            ("near.json", head_lift_json("pod/near", 0.0005)),
-            (
-                "s.json",
-                sequence_json("pod/step", r#"{"ref": "pod/low"}, {"ref": "pod/near"}"#),
-            ),
-        ]);
         assert_eq!(
-            library.motion("pod/step").expect("loaded").segments().len(),
+            library.motion("pod/jump").expect("loaded").segments().len(),
             2
-        );
-    }
-
-    /// The seam check runs over the finished flat list, so two clips that only
-    /// ever meet because one sequence was nested after another are checked
-    /// exactly like two written side by side. Neither child is refused: what
-    /// does not meet is the composition, and that is what the refusal names.
-    #[test]
-    fn clips_that_meet_only_across_two_nestings_are_refused_the_same_way() {
-        let (library, skips) = Library::load(
-            [
-                ("low.json", head_lift_json("pod/low", 0.0)),
-                ("high.json", head_lift_json("pod/high", 0.02)),
-                ("a.json", sequence_json("pod/a", r#"{"ref": "pod/low"}"#)),
-                ("b.json", sequence_json("pod/b", r#"{"ref": "pod/high"}"#)),
-                (
-                    "r.json",
-                    sequence_json("pod/root", r#"{"ref": "pod/a"}, {"ref": "pod/b"}"#),
-                ),
-            ],
-            &limits(),
-        );
-        assert_eq!(skips.len(), 1, "{skips:?}");
-        assert_eq!(skips[0].name.as_deref(), Some("pod/root"));
-        let LoadError::Resolve(ResolveError::Seam {
-            sequence, from, to, ..
-        }) = &skips[0].error
-        else {
-            panic!("expected a seam refusal: {:?}", skips[0].error);
-        };
-        assert_eq!(
-            (sequence.as_str(), from.as_str(), to.as_str()),
-            ("pod/root", "pod/low", "pod/high")
-        );
-        assert!(library.motion("pod/a").is_some());
-        assert!(library.motion("pod/b").is_some());
-    }
-
-    /// A hold between two clips that do not meet postpones the step; it does not
-    /// soften it. The same whole difference is still commanded in one tick when
-    /// the hold ends, so the seam is refused across a gap exactly as without it.
-    #[test]
-    fn a_hold_between_two_clips_does_not_excuse_a_seam() {
-        let skip = one_skip(&[
-            ("low.json", head_lift_json("pod/low", 0.0)),
-            ("high.json", head_lift_json("pod/high", 0.02)),
-            (
-                "s.json",
-                sequence_json(
-                    "pod/jump",
-                    r#"{"ref": "pod/low"}, {"gap_ms": 2000}, {"ref": "pod/high"}"#,
-                ),
-            ),
-        ]);
-        assert!(
-            matches!(
-                &skip.error,
-                LoadError::Resolve(ResolveError::Seam { from, to, .. })
-                    if from == "pod/low" && to == "pod/high"
-            ),
-            "{:?}",
-            skip.error
         );
     }
 
     #[test]
     fn a_duplicate_name_is_refused_rather_than_overwritten() {
         let skip = one_skip(&[
-            ("first.json", clip_json("pod/a", 50, 2.0)),
-            ("second.json", clip_json("pod/a", 100, 1.0)),
+            ("first.json", clip_json("pod/a", 50)),
+            ("second.json", clip_json("pod/a", 100)),
         ]);
         assert_eq!(
             skip.error,
@@ -1567,7 +1340,7 @@ mod tests {
         // A sequence may not take a clip's name either: what a script invokes
         // is one name over both kinds.
         let skip = one_skip(&[
-            ("a.json", clip_json("pod/a", 50, 2.0)),
+            ("a.json", clip_json("pod/a", 50)),
             ("s.json", sequence_json("pod/a", r#"{"ref": "pod/a"}"#)),
         ]);
         assert!(matches!(skip.error, LoadError::Duplicate { .. }));
@@ -1582,15 +1355,15 @@ mod tests {
     fn what_loaded_answers_is_the_read_order_of_what_was_accepted() {
         let (library, skips) = Library::load(
             [
-                ("c.json", clip_json("pod/c", 50, 1.0)),
-                ("a.json", clip_json("pod/a", 50, 1.0)),
-                ("again.json", clip_json("pod/a", 100, 1.0)),
+                ("c.json", clip_json("pod/c", 50)),
+                ("a.json", clip_json("pod/a", 50)),
+                ("again.json", clip_json("pod/a", 100)),
                 ("s.json", sequence_json("pod/s", r#"{"ref": "pod/a"}"#)),
                 (
                     "dead.json",
                     sequence_json("pod/dead", r#"{"ref": "pod/x"}"#),
                 ),
-                ("b.json", clip_json("pod/b", 50, 1.0)),
+                ("b.json", clip_json("pod/b", 50)),
             ],
             &limits(),
         );
@@ -1641,43 +1414,5 @@ mod tests {
         assert!(library.clip("pod/anything").is_none());
         assert_eq!(library.clip_names().count(), 0);
         assert_eq!(library.motion_names().count(), 0);
-    }
-
-    /// What the loader changed about a clip reaches the operator through the
-    /// library, named and attributed, rather than dying inside the clip.
-    #[test]
-    fn a_clips_load_notes_reach_the_library_named_and_attributed() {
-        let library = library(&[("cautious.json", clip_json_claiming("pod/cautious", 1.05))]);
-        let derived = library.clip("pod/cautious").expect("loaded").max_speed();
-        assert_eq!(
-            library.notes(),
-            [AssetNote {
-                source: "cautious.json".to_owned(),
-                name: "pod/cautious".to_owned(),
-                note: ClipNote::MaxSpeedDiffers {
-                    stored: 1.05,
-                    derived,
-                },
-            }]
-        );
-    }
-
-    /// The document that loses a name fight reports nothing: a note describes
-    /// an asset somebody will play, and this one is not in the library.
-    #[test]
-    fn the_losing_side_of_a_duplicate_name_notes_nothing() {
-        let (library, skips) = Library::load(
-            [
-                ("first.json", clip_json("pod/a", 4, 2.0)),
-                ("second.json", clip_json_claiming("pod/a", 1.05)),
-            ],
-            &limits(),
-        );
-        assert_eq!(skips.len(), 1);
-        assert!(
-            library.notes().is_empty(),
-            "the loser's note escaped: {:?}",
-            library.notes()
-        );
     }
 }

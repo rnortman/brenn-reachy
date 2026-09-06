@@ -43,8 +43,8 @@ use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWi
 use clockwork_rs::{Clear as _, Duration as SlotDuration, SyncTime};
 use nalgebra::Isometry3;
 use reachy_clips::config::write_clip;
+use reachy_clips::envelope::ClipLimits;
 use reachy_clips::format::{Channel as ClipChannel, Clip, ClipDoc, FrameDoc};
-use reachy_clips::speed::ClipLimits;
 use reachy_driver::{NOMINAL_CYCLE_NS, STARTUP_INIT_BUDGET_NS};
 use reachy_kin::{
     HeadGeometry, LegAngles, default_geometry, inverse_kinematics, neutral_head_pose,
@@ -1334,12 +1334,22 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
     assert!(snap.mode != MotionMode::Faulted);
 }
 
-/// A jammed antenna is a fault confined to a group: the pair goes out of
-/// service together -- one antenna limp and the other posed is a machine
-/// pulling a face -- the move carries on without them, and every goal after
-/// says so in its mask.
+/// A jammed antenna is answered by nothing: the tracking detector ships
+/// disarmed, so a servo standing still against a goal that has left it is lag in
+/// the record. The pair stays in service, every goal keeps naming it, and the
+/// move runs to its own end.
+///
+/// The stall's own arithmetic is the motion crate's
+/// (`the_shipped_detector_measures_a_stall_and_raises_nothing`); what this level
+/// says is that the goal stream went on moving through it, which is what
+/// separates a jam nothing answered from a goal stream that froze.
+///
+/// Re-arming the detector makes this a scoped release -- the pair out of service
+/// together, one raise, and every goal after saying so in its mask
+/// (`TODO(tracking-response-model)`). While it is disarmed, that behaviour is
+/// the motion crate's to cover from a config that arms it.
 #[test]
-fn a_jammed_antenna_takes_the_pair_out_of_service_and_the_goals_stop_naming_them() {
+fn a_jammed_antenna_leaves_the_pair_in_service_and_the_move_running() {
     let mut mover = standing_up();
     mover.frozen = {
         let mut set = JointFlags::NONE;
@@ -1348,47 +1358,44 @@ fn a_jammed_antenna_takes_the_pair_out_of_service_and_the_goals_stop_naming_them
     };
 
     let cycles = mover.run(60);
-    let raised = reports(&cycles);
-    let first = raised.first().expect("a jammed servo is reported");
-    assert_eq!(first.kind, FaultKindWire::ANTENNA_OBSTRUCTED);
-    assert_eq!(
-        first.joint,
-        JointRefWire::ANTENNA_RIGHT,
-        "the servo it is about",
+    assert!(
+        reports(&cycles).is_empty(),
+        "a stalled servo is a reading, not a condition",
     );
-    assert!(first.detail.abs() > 0.5, "how far it stood from its goal");
-
-    let after = cycles
-        .iter()
-        .position(|cycle| cycle.report.is_some())
-        .expect("it was raised");
-    for cycle in &cycles[after + 1..] {
-        let goal = cycle.goal.expect("the move carries on without it");
+    let opening = cycles
+        .first()
+        .expect("the run has cycles")
+        .goal
+        .expect("the move is commanded from the start");
+    let mut moved = false;
+    for cycle in &cycles {
+        let goal = cycle.goal.expect("the move carries on");
         let mask = goal.mask;
         for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
             assert!(
-                !flags::contains(mask, antenna),
-                "a servo out of service is never written again",
+                flags::contains(mask, antenna),
+                "nothing took the pair out of service",
             );
         }
         assert!(
             flags::contains(mask, JointRef::BodyYaw) && flags::contains(mask, JointRef::Leg0),
-            "the head is sound and still being commanded",
+            "and the head is commanded as it always was",
         );
+        moved |= goal.targets != opening.targets;
     }
-    assert_eq!(
-        raised.len(),
-        1,
-        "entry into the mask is the raise; the standing condition is not news",
-    );
+    assert!(moved, "and the move was still being carried out");
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert!(snap.mode != MotionMode::Faulted, "nothing latched");
 }
 
-/// A jammed head joint is not confined to a group: the move is abandoned and
-/// the tick holds. It does not latch, so the machine stays under command --
-/// which is the whole difference between a machine that cannot be commanded and
-/// one that must not be commanded further.
+/// A jammed head joint is answered by nothing either: the move is not abandoned,
+/// the goals keep naming every joint, and the machine runs the move out under
+/// command.
+///
+/// The stall is in the samples and nowhere else. Re-arming the detector makes
+/// this an abandoned move and a hold (`TODO(tracking-response-model)`).
 #[test]
-fn a_jammed_crank_abandons_the_move_and_the_machine_holds_under_command() {
+fn a_jammed_crank_leaves_the_move_running_and_the_machine_under_command() {
     let mut mover = standing_up();
     mover.frozen = {
         let mut set = JointFlags::NONE;
@@ -1401,23 +1408,23 @@ fn a_jammed_crank_abandons_the_move_and_the_machine_holds_under_command() {
     };
 
     let cycles = mover.run(60);
-    let raised = reports(&cycles);
-    let first = raised.first().expect("a jammed crank is reported");
-    assert_eq!(first.kind, FaultKindWire::HEAD_OBSTRUCTED);
-    assert_ne!(first.joint, JointRefWire::NONE, "the crank it is about");
+    assert!(
+        reports(&cycles).is_empty(),
+        "a jammed crank is a reading, not a condition",
+    );
 
-    let after = cycles
-        .iter()
-        .position(|cycle| cycle.report.is_some())
-        .expect("it was raised");
-    let held = cycles[after].goal.expect("holding is still commanding");
-    for cycle in &cycles[after + 1..] {
-        let goal = cycle.goal.expect("the keep-alive outlives a hold");
+    let first = cycles.first().expect("the run has cycles");
+    let opening = first.goal.expect("the move is commanded from the start");
+    let mut moved = false;
+    for cycle in &cycles {
+        let goal = cycle.goal.expect("the keep-alive outlives the jam");
         assert_eq!(
-            goal.targets, held.targets,
-            "a hold re-publishes what it is on",
+            goal.mask, opening.mask,
+            "nothing took a joint out of service",
         );
+        moved |= goal.targets != opening.targets;
     }
+    assert!(moved, "and the move was still being carried out");
     let snap = state_of(mover.cog.state_ctrl().snap());
     assert_eq!(snap.mode, MotionMode::Holding, "it holds, it does not park");
 }
@@ -1914,6 +1921,58 @@ fn a_fault_latching_mid_burst_leaves_the_window_commanding_nothing() {
     );
 }
 
+/// An execution has one report slot, so a window that raises twice publishes the
+/// first and counts the rest -- which is what lets a reader of the log know
+/// whether they are reading all of them.
+///
+/// Two commands the tick refuses, one per sample, both inside one window: a
+/// stranded antenna refuses every posture asked of it, and a schedule that
+/// steps from up to stow inside the window asks twice. This is the shape a
+/// scheduling stall online produces, where one window carries the samples a
+/// healthy loop would have taken one at a time.
+#[test]
+fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
+    // Far enough round that no arc back lands inside the antenna's goal band,
+    // which is what makes every posture step a refusal.
+    let stranded = 2000.0;
+
+    // What the refusal of the first step alone looks like, so the published
+    // report below can be identified as that one rather than the second.
+    let mut alone = standing_up();
+    alone.present[row(JointRef::AntennaRight).expect("a bus row")] = stranded;
+    let first_detail = alone
+        .step()
+        .report
+        .expect("the first step is refused")
+        .detail;
+
+    let mut mover = Mover::new();
+    mover.schedule(
+        true,
+        1,
+        &[(2, Some(PostureWire::UP)), (1000, Some(PostureWire::STOW))],
+    );
+    mover.present[row(JointRef::AntennaRight).expect("a bus row")] = stranded;
+
+    let cycle = mover.burst(3);
+    let report = cycle.report.expect("the window raised something");
+    assert_eq!(report.kind, FaultKindWire::COMMAND_REJECTED);
+    assert_eq!(
+        report.detail, first_detail,
+        "the first raise of the execution keeps the slot",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().faults_raised(),
+        2,
+        "both were raised, whatever the slot could carry",
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().reports_dropped(),
+        1,
+        "the one that lost the slot is counted, not silent",
+    );
+}
+
 /// A command the tick refuses changes nothing: it is reported, the machine goes
 /// nowhere, and the goal stream carries on holding what it was already on.
 ///
@@ -2077,53 +2136,6 @@ fn a_step_kind_this_build_cannot_read_holds() {
     );
 }
 
-/// An execution has one report slot, so a window that raises twice publishes
-/// the first and counts the rest -- which is what lets a reader of the log know
-/// whether it is reading all of them.
-#[test]
-fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
-    // A machine whose cranks are jammed from the start and whose antennas jam
-    // eleven cycles in: the antennas' window runs out one cycle before the
-    // cranks' does, so the two raises are one cycle apart.
-    let mut mover = standing_up();
-    mover.frozen = {
-        let mut set = JointFlags::NONE;
-        for joint in ROWS {
-            if group_of(joint) == Some(reachy_motion::joints::JointGroup::Legs) {
-                flags::insert(&mut set, joint);
-            }
-        }
-        set
-    };
-    mover.run(11);
-    mover.frozen = flags::all();
-
-    // Up to the cycle before the first of them, one sample per execution.
-    let quiet = mover.run(14);
-    assert!(reports(&quiet).is_empty(), "neither window has run out yet");
-    assert_eq!(mover.cog.state_ctrl().faults_raised(), 0);
-
-    // Both raises now fall in one window, which is what a scheduling stall
-    // online does to them.
-    let cycle = mover.burst(2);
-    let report = cycle.report.expect("the window raised something");
-    assert_eq!(
-        report.kind,
-        FaultKindWire::ANTENNA_OBSTRUCTED,
-        "the first raise of the execution keeps the slot",
-    );
-    assert_eq!(
-        mover.cog.state_ctrl().faults_raised(),
-        2,
-        "both were raised, whatever the slot could carry",
-    );
-    assert_eq!(
-        mover.cog.state_ctrl().reports_dropped(),
-        1,
-        "the one that lost the slot is counted, not silent",
-    );
-}
-
 /// Every configured length of time is checked at every execution, because a
 /// scenario that asked for a cycle of no length, or a move of none, would
 /// otherwise produce a plausible-looking run of a machine nobody meant.
@@ -2185,7 +2197,6 @@ fn antenna_clip(step: f64, frames: usize) -> Clip {
         description: None,
         channels: vec![ClipChannel::Antennas],
         frame_hz: reachy_motion::FLOOR_TICK_HZ,
-        max_speed: 2.0,
         blend_in_ms: Some(40),
         blend_out_ms: Some(60),
         frames: (0..frames)
@@ -2195,14 +2206,7 @@ fn antenna_clip(step: f64, frames: usize) -> Clip {
             })
             .collect(),
     };
-    let limits = ClipLimits {
-        max_step: reachy_motion::joints::JointStep {
-            legs: 100.0,
-            body_yaw: 100.0,
-            antennas: 100.0,
-        },
-        ..ClipLimits::default()
-    };
+    let limits = ClipLimits::default();
     Clip::from_doc(doc, &limits).expect("the fixture loads")
 }
 
@@ -2212,6 +2216,45 @@ fn one_motion(step: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
     library_naming(0, step, frames)
 }
 
+/// A head-only clip lifting the head `dz` metres in its own frame, `frames`
+/// frames long, as a library of one clip and its one-segment motion.
+///
+/// A lift the envelope has over the neutral base the loader walks it against,
+/// but not over every base a session composes it onto.
+fn one_head_motion(dz: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
+    let doc = ClipDoc {
+        version: 1,
+        kind: "clip".to_owned(),
+        name: "lift".to_owned(),
+        description: None,
+        channels: vec![ClipChannel::Head],
+        frame_hz: reachy_motion::FLOOR_TICK_HZ,
+        blend_in_ms: Some(0),
+        blend_out_ms: Some(0),
+        frames: (0..frames)
+            .map(|_| FrameDoc {
+                dt: Some([0.0, 0.0, dz]),
+                dq: Some([1.0, 0.0, 0.0, 0.0]),
+                ..FrameDoc::default()
+            })
+            .collect(),
+    };
+    let clip = Clip::from_doc(doc, &ClipLimits::default()).expect("the fixture loads over neutral");
+    let mut out = ClipLibraryConfigWire::new_boxed();
+    {
+        let message = out.clear_valid();
+        write_clip(&clip, message.clips.try_grow().expect("one clip fits"))
+            .expect("the fixture fits");
+        let motion = message.motions.try_grow().expect("one motion fits");
+        motion.lead_gap_ms = 0;
+        let segment = motion.segments.try_grow().expect("one segment fits");
+        segment.clip_id = 0;
+        segment.speed = 1.0;
+        segment.gap_after_ms = 0;
+    }
+    out
+}
+
 /// The same library, with the motion's one segment naming `clip_id`.
 ///
 /// A clip id the library does not hold is what a library that will not establish
@@ -2219,7 +2262,7 @@ fn one_motion(step: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
 /// cheap one as much as by the frame walk.
 fn library_naming(clip_id: u16, step: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
     let clip = antenna_clip(step, frames);
-    let mut out = Box::new(ClipLibraryConfigWire::new());
+    let mut out = ClipLibraryConfigWire::new_boxed();
     {
         let message = out.clear_valid();
         write_clip(&clip, message.clips.try_grow().expect("one clip fits"))
@@ -2468,10 +2511,10 @@ fn a_window_naming_no_motion_is_refused_once_and_the_base_carries_on() {
 /// refusal travels once, the base streams on, and a new epoch clears it.
 #[test]
 fn a_refused_composition_latches_the_layer_for_that_schedule() {
-    // A clip stepping further in one frame than any antenna may travel in a
-    // period, which the loader accepts under the fixture's wide bounds and the
-    // tick refuses on the wire's behalf.
-    let library = one_motion(1.0, 20);
+    // A head delta pushing the head 30 mm down in its own frame: a pose the
+    // envelope has over the neutral base the loader walks it against, and one it
+    // will not have over a base still rising out of stow.
+    let library = one_head_motion(-0.03, 20);
     let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
     mover.schedule_playing(1, &[(0, 2, 60, 1.0, 1.0)]);
 
@@ -3712,16 +3755,22 @@ fn an_overlay_naming_a_motion_no_library_could_hold_is_refused() {
     // The refused one first: accepting a script is the machine beginning to arm,
     // and every script after that is refused for the phase rather than for its
     // motions, which would tell this case nothing about the bound.
-    cog.publish_script(&legal(32), SyncTime::from_nanos(T0));
-    cog.publish_script(&legal(31), SyncTime::from_nanos(T0));
+    let past_the_end = u16::try_from(reachy_clips::config::MAX_MOTIONS)
+        .expect("the motion bound fits a motion id");
+    cog.publish_script(&legal(past_the_end), SyncTime::from_nanos(T0));
+    cog.publish_script(&legal(past_the_end - 1), SyncTime::from_nanos(T0));
 
     let refused = wake(&mut cog, T0 + 1).expect("the first index no library could hold");
     assert_eq!(refused.kind, ReportKindWire::SCRIPT_REFUSED);
-    assert_eq!(refused.a, 32);
+    assert_eq!(refused.a, u32::from(past_the_end));
     assert_eq!(refused.b, u32::from(RefusalReasonWire::UNKNOWN_MOTION.0));
     let accepted = wake(&mut cog, T0 + 1 + LAPSE_NS).expect("and the acceptance after it");
     assert_eq!(accepted.kind, ReportKindWire::SCRIPT_ACCEPTED);
-    assert_eq!(accepted.a, 31, "the last index a library could hold");
+    assert_eq!(
+        accepted.a,
+        u32::from(past_the_end - 1),
+        "the last index a library could hold"
+    );
 
     let state = cog.state_sess();
     assert_eq!(state.scripts_accepted(), 1);
@@ -3730,7 +3779,7 @@ fn an_overlay_naming_a_motion_no_library_could_hold_is_refused() {
     assert_eq!(overlays.len(), 1, "and the accepted script is what stands");
     assert_eq!(
         overlays.get(0).expect("the one window").motion_id(),
-        31,
+        past_the_end - 1,
         "the refusal wrote nothing over it",
     );
 }

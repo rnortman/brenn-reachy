@@ -262,16 +262,14 @@ schema ClipFrame
 }
 
 // One clip, as the cogs are handed it: what it drives, how it is sampled, how it
-// blends, how fast it may be played, and its frames.
+// blends, and its frames.
 //
 // Everything the library's own clip carries except its name, which is the
 // host-side scripter's business -- a script names a clip by its index in the
 // library below, so the running system never needs the string.
 //
-// The derived numbers cross with the frames rather than being re-derived here:
-// deriving one costs a kinematic solve per frame, which no play path can pay,
-// and what crosses is the loader's own output and never a number a document
-// claimed.
+// The frames cross with their authored ramps and the device re-derives nothing:
+// what plays is the track as it was written, at the pace it was recorded at.
 schema ClipConfig
 {
     uuid: d2ce8a93-cc18-4cf1-8986-7af3e38dda5b;
@@ -296,13 +294,7 @@ schema ClipConfig
         #3 blend_out_ms: UInt32;
 
         // The frame track, in time order. Never empty.
-        #4 frames: VarArray<ClipFrame, 512>;
-
-        // The highest invocation speed the frames admit: derived at load from
-        // the frame-to-frame deltas against the machine's step bounds. A window
-        // asking for more than this is refused, because above it consecutive
-        // composed setpoints step further than the tick will accept.
-        #5 max_speed: Float64;
+        #4 frames: VarArray<ClipFrame, 1024>;
     }
 }
 
@@ -344,9 +336,9 @@ schema MotionSegment
 // motions only and invoking a single clip costs nothing extra.
 //
 // What the motion is *like* to play -- which channels it drives, how long it
-// runs, how fast it may be invoked, how it blends -- is not here. Every one of
-// those is derived at load from the segments' clips, and a stored derivation is
-// a second opinion able to disagree with the frames.
+// runs, how it blends -- is not here. Each of those is derived at load from the
+// segments' clips, and a stored derivation is a second opinion able to disagree
+// with the frames.
 schema MotionConfig
 {
     uuid: eb61b453-f6d3-4c73-870c-fafd52d64dfd;
@@ -380,12 +372,12 @@ schema ClipLibraryConfig
     {
         // The clips, in the order the emitter wrote them. A script's clip id is
         // an index into this.
-        #0 clips: VarArray<ClipConfig, 16>;
+        #0 clips: VarArray<ClipConfig, 96>;
 
         // Every motion the system can play, in the order the emitter wrote
         // them: one per clip, plus one per composed sequence. A schedule's
         // motion id is an index into this, and it is a different numbering from
         // the clip ids above.
-        #1 motions: VarArray<MotionConfig, 32>;
+        #1 motions: VarArray<MotionConfig, 128>;
     }
 }

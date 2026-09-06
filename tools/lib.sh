@@ -1067,26 +1067,39 @@ run_directory() {
 	echo "$dir"
 }
 
+# Run one of this tree's log analyzers, and let its verdict be the caller's.
+#
+#   analyzer_verdict <analyzer target> [analyzer arguments...]
+#
+# One invariant behind all three analyzers, stated once here rather than beside
+# each of them. An analyzer is a host tool over a log that has stopped being
+# written, so it builds in the default configuration whatever configuration the
+# payload was built in: callers pass $bazel and $build_flags, and the device
+# harness's $build_flags is deliberately empty for that reason. The arguments
+# and their order are the analyzer's own, and the exit status is returned rather
+# than judged, because it is the analyzer's verdict and not this wrapper's.
+analyzer_verdict() {
+	local target=$1
+	shift
+	"$bazel" run "${build_flags[@]}" -- "$target" "$@"
+}
+
 # The label of the analyzer that judges a run's records. One string, because
 # both run harnesses invoke the same analyzer over their own fetched or staged
 # log and a rename has to reach both.
 report_target=//cogs:first_motion_report
 
-# Judge a run's records, and let the analyzer's verdict be the caller's.
+# Judge a run's records.
 #
 #   report_verdict <run directory> [extra analyzer arguments...]
 #
-# The analyzer is a host tool over a log that has stopped being written, so it
-# builds in the default configuration whatever configuration the payload was
-# built in: callers pass $bazel and $build_flags, and the device harness's
-# $build_flags is deliberately empty for that reason. The extra arguments are
-# the caller's — the host run reads a staged log with a jitter band, a device
-# run reads hardware timestamps strictly — and the exit status is returned
-# rather than judged, because it is the wrapper's verdict.
+# The extra arguments are the caller's — the host run reads a staged log with a
+# jitter band, a device run reads hardware timestamps strictly — and they go
+# ahead of the run directory, which is this analyzer's grammar.
 report_verdict() {
 	local run_dir=$1
 	shift
-	"$bazel" run "${build_flags[@]}" -- "$report_target" "$@" "$run_dir"
+	analyzer_verdict "$report_target" "$@" "$run_dir"
 }
 
 # The analyzer of a speech run, which reads both sides of a fetch: what a
@@ -1096,14 +1109,30 @@ report_verdict() {
 # arithmetic still has nothing to say about a session nobody budgeted.
 speech_report_target=//cogs:speech_run_report
 
-# Judge a speech run's fetch, and let the analyzer's verdict be the caller's.
+# Judge a speech run's fetch.
 #
 #   speech_verdict <fetched records directory>
 #
 # The argument is the fetch's own directory, not a run directory inside it: the
 # analyzer names the console beside it from that spelling and finds the run
-# directory within it the way `run_directory` above does. Host tool over a
-# stopped log, so it builds in the default configuration, like `report_verdict`.
+# directory within it the way `run_directory` above does.
 speech_verdict() {
-	"$bazel" run "${build_flags[@]}" -- "$speech_report_target" "$1"
+	analyzer_verdict "$speech_report_target" "$1"
+}
+
+# The analyzer of a library tour, which judges a run against the library it was
+# supposed to play: the motion analyzer reads one gesture off the records and
+# has no list of what should have happened, and a tour's whole question is
+# whether every motion in the sidecar was asked for and moved the machine.
+tour_report_target=//cogs:library_tour_report
+
+# Judge a library tour's records.
+#
+#   tour_verdict <run directory> <names.json>
+#
+# The run directory is the one `run_directory` found, and the sidecar is the
+# committed name table the tour was built from -- both absolute, because this
+# runs under `bazel run` from its own runfiles tree.
+tour_verdict() {
+	analyzer_verdict "$tour_report_target" "$1" "$2"
 }

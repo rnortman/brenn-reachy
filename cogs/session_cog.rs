@@ -73,7 +73,7 @@ use session_slots::{clear_timeline, held_reports, push_report, report_row};
 /// Stated here rather than borrowed from the library crate, which the session
 /// holds no part of: the number is the schema's, and a case below reads it off
 /// the schema and fails if the two ever disagree.
-const MAX_MOTIONS: usize = 32;
+const MAX_MOTIONS: usize = 128;
 
 counters! {
     /// The session's run totals, as the slot holds them and the signal group
@@ -2073,11 +2073,12 @@ mod tests {
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 
     /// The bound an overlay's motion id is screened against is the library
-    /// message's own capacity. Boxed because the message is most of a megabyte
-    /// of frames and only its count is being asked about.
+    /// message's own capacity. Built on the heap because the message is several
+    /// megabytes of frames — more than a test thread's stack holds — and only
+    /// its count is being asked about.
     #[test]
     fn the_motion_bound_is_the_library_messages_capacity() {
-        let library = Box::new(ClipLibraryConfigWire::new());
+        let library = ClipLibraryConfigWire::new_boxed();
         assert_eq!(library.motions().capacity(), MAX_MOTIONS);
     }
 

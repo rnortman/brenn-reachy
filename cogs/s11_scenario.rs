@@ -19,12 +19,13 @@
 //!
 //! The limp pair is then commanded to fold with everything else, because the
 //! schedule's last step is the stow the session ends at. They cannot: nothing
-//! holds them any more. So the decision tick's own tracking evidence finds two
-//! joints that have stopped closing on their goals, takes them out of service
-//! and carries the move on with what remains -- which is the consequence this
-//! run is here to show is survivable. The head reaches the fold; the antennas
-//! stay where they were when they let go; and the release the session ends at
-//! reports the fold it could not measure.
+//! holds them any more. The tracking detector ships disarmed, so that is lag in
+//! the record and no second condition -- the head reaches the fold, the antennas
+//! stay where they were when they let go, the goals keep naming them, and the
+//! release the session ends at reports the fold it could not measure. That the
+//! run survives it is the consequence this scenario is here to show. Re-arming
+//! the detector puts a raise inside the fold and a second drain after it
+//! (`TODO(tracking-response-model)`).
 //!
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. The instants are all cycle counts from the epoch, because the
