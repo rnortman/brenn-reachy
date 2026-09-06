@@ -18,7 +18,13 @@
 //! session's port. What a person said to the robot decides what is in either,
 //! and where they say the same thing twice the log is the better witness — the
 //! session republishes its whole story on its own channel, and the console
-//! holds whatever of it the edge was there for.
+//! holds whatever of it the edge was there for. The driver's own heartbeat
+//! rides that log too, and the stillness of every hold in it is printed from
+//! the same reduction the motion report judges by: a conversation is long
+//! listening holds at the rest posture with gestures between them, which is the
+//! realistic case for asking whether the machine stands still, and until a hold
+//! on this machine has been measured the answer is a figure rather than a
+//! verdict.
 //!
 //! The standard is deliberately permissive, because what a human said to the
 //! robot decides what the log contains. A run where nobody spoke and a run
@@ -89,13 +95,13 @@ use std::process::ExitCode;
 
 use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
-use brenn_reachy__driver__pose_clk_rs::PoseEstimateWire;
+use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__reports_clk_rs::{ReportKind, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use log_read::{
     Bound, Census, Complaints, Logged, Streams, binding, cumulative, each, read_with, typed,
 };
-use motion_channels::{ESTIMATE_CHANNEL, REPORT_CHANNEL, SCRIPT_CHANNEL};
+use motion_channels::{ESTIMATE_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL, SCRIPT_CHANNEL};
 use motion_evidence::{ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Motion};
 use motion_proto::DecodeError;
 use reachy_edge::{
@@ -109,6 +115,7 @@ use reachy_host::{
 use reachy_motion::postures::neutral_targets;
 use run_report::{Report, verdict};
 use serde_json::Value;
+use stillness_report::{Standard, Stillness, say};
 
 /// The launcher's name for the voice host's console.
 ///
@@ -1624,6 +1631,13 @@ struct Log {
     motion: Motion,
     /// The scripts that reached the session's port.
     scripts: Vec<Logged<ScriptWire>>,
+    /// Whether the machine stood still while it was asked to, folded off the
+    /// driver's sample stream as it was read.
+    ///
+    /// A fold for the reason the head's is one: the channel carries a message
+    /// per control cycle over a session that ends when an operator ends it, and
+    /// what this report asks of it is a handful of numbers per hold.
+    stillness: Stillness,
     /// Every channel the log carries and how much of each: a channel with no
     /// type bound here still says whether anything travelled on it.
     census: Census,
@@ -1644,6 +1658,7 @@ impl Default for Log {
             dropped: 0,
             motion: Motion::towards(&neutral_targets()),
             scripts: Vec::new(),
+            stillness: Stillness::default(),
             census: Census::default(),
             complaints: Complaints::default(),
         }
@@ -1660,14 +1675,14 @@ impl Streams for Log {
     }
 }
 
-/// The three channels this tool binds, checked before anything is decoded.
+/// The four channels this tool binds, checked before anything is decoded.
 ///
 /// Bindings are strict, as everywhere: a log recorded under other schemas than
 /// this build's is refused rather than read approximately, because a payload of
 /// the right size is not the right message and a report about a machine read
 /// that way is nonsense. Reading such a log means building this tool at the
 /// revision `provenance.txt` names.
-const CHANNELS: [Bound<Log>; 3] = [
+const CHANNELS: [Bound<Log>; 4] = [
     Bound {
         name: REPORT_CHANNEL,
         check: binding::<TimelineWire>,
@@ -1705,6 +1720,23 @@ const CHANNELS: [Bound<Log>; 3] = [
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
         route: |log, message| typed(message, &mut log.scripts, &mut log.complaints),
+    },
+    // The driver's heartbeat, for the holds in it. The stream may start
+    // mid-run (the logger joins late): a hold never seen is a hold unsaid,
+    // and the count of samples read is printed beside every figure.
+    Bound {
+        name: POSE_CHANNEL,
+        check: binding::<PoseSampleWire>,
+        route: |log, message| {
+            let Log {
+                stillness,
+                complaints,
+                ..
+            } = log;
+            each::<PoseSampleWire>(message, complaints, |logged| {
+                stillness.sample(&logged.message);
+            });
+        },
     },
 ];
 
@@ -1811,7 +1843,14 @@ impl Records {
             return held;
         };
         match read_with::<Log>(newest, &CHANNELS) {
-            Ok(log) => held.read = Some(log),
+            Ok(mut log) => {
+                // The stream is over the moment the reader returns, and the
+                // last hold of a run is as much a hold as any other -- without
+                // this the longest stretch of a quiet session would be the one
+                // never reported.
+                log.stillness.finish();
+                held.read = Some(log);
+            }
             Err(err) => held.unopened = Some(err.to_string()),
         }
         held
@@ -2997,6 +3036,26 @@ fn the_head_moved(records: &Records, session: &Session, report: &mut Report) {
     }
 }
 
+/// Whether the machine stood still while it was asked to.
+///
+/// The realistic case for the question: a conversation is long listening holds
+/// at the rest posture with gestures between them, which is exactly what the
+/// hold segmentation cuts out of a sample stream. Everything it finds is a
+/// figure and nothing here fails a run -- the bound is the encoder's own
+/// flicker and no hold on this machine has been measured against it yet, so a
+/// section red on every conversation would teach an operator to skim the one
+/// place the evidence is.
+///
+/// Silent where there is no log: which of the four ways there is none is
+/// [`the_log`]'s to say, and saying it twice would put the same sentence on two
+/// lines of the same report.
+fn the_machine_held_still(records: &Records, report: &mut Report) {
+    let Some(log) = records.readable() else {
+        return;
+    };
+    say(&log.stillness, Standard::Printed, report);
+}
+
 /// What the fetch's records held, whatever was made of it.
 ///
 /// The census is the difference between a channel that was silent and one this
@@ -3803,6 +3862,7 @@ fn analyze(console: &Console, clips: &Clips, records: &Records) -> Report {
     ended(console, &mut report);
     the_motion_path(console, &session, records, &mut report);
     the_head_moved(records, &session, &mut report);
+    the_machine_held_still(records, &mut report);
     alerts_travelled(console, &mut report);
     turns(console, clips, &mut report);
     kinds(console, &mut report);
@@ -3854,15 +3914,16 @@ mod tests {
     use clockwork_rs::{SyncTime, blob_as_bytes};
     use nalgebra::{Isometry3, UnitQuaternion, Vector3};
     use reachy_motion::record::write_pose;
+    use reachy_motion::stillness::COUNT_RAD;
     use reachy_scratch::{Scratch, scratch_dir};
     use run_report::Report;
 
     use super::{
         ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, AUDIO_SUFFIX, Clips, Console, ESTIMATE_CHANNEL,
-        HOST_LOG, Line, POD_LOG, PROVENANCE, PoseEstimateWire, REPORT_CHANNEL, Records, ReportKind,
-        ReportKindWire, SCRIPT_CHANNEL, ScriptWire, SessionPhaseWire, TURNS_SUFFIX,
-        TimelineEntryWire, TimelineWire, analyze, classify, console_dir, neutral_targets,
-        refusal_kinds, sibling,
+        HOST_LOG, Line, POD_LOG, POSE_CHANNEL, PROVENANCE, PoseEstimateWire, PoseSampleWire,
+        REPORT_CHANNEL, Records, ReportKind, ReportKindWire, SCRIPT_CHANNEL, ScriptWire,
+        SessionPhaseWire, TURNS_SUFFIX, TimelineEntryWire, TimelineWire, analyze, classify,
+        console_dir, neutral_targets, refusal_kinds, sibling,
     };
 
     /// The whole reading of one fetch, as a case has just written it.
@@ -3940,6 +4001,8 @@ mod tests {
         /// What the story channel is declared to carry, where a case wants
         /// something other than what it holds.
         story_schema: Option<ChannelMetadata>,
+        /// The driver's heartbeat, cycle by cycle.
+        samples: Vec<PoseSampleWire>,
     }
 
     /// Write a run directory under a fetch, through the framework's own writer.
@@ -4007,6 +4070,23 @@ mod tests {
                         blob_as_bytes(&estimate),
                     )
                     .expect("an estimate");
+            }
+        }
+        if !recorded.samples.is_empty() {
+            let channel = writer
+                .add_channel(&ChannelMetadata::for_schema::<PoseSampleWire>(POSE_CHANNEL))
+                .expect("a sample channel");
+            for (n, sample) in recorded.samples.iter().enumerate() {
+                writer
+                    .log_message(
+                        channel,
+                        u32::try_from(n).expect("a small run"),
+                        when(n as i64),
+                        when(n as i64),
+                        &[],
+                        blob_as_bytes(sample),
+                    )
+                    .expect("a sample");
             }
         }
         if recorded.scripts > 0 {
@@ -5958,6 +6038,103 @@ mod tests {
             found(&report, "never took the machine"),
             "{:?}",
             report.findings
+        );
+    }
+
+    /// The driver's cycle, nanoseconds: the grid the samples of a case sit on,
+    /// which is the machine's and not the one the log's own instants use.
+    const CYCLE_NS: i64 = 20_000_000;
+
+    /// The shared synthetic run, on the driver's grid from the log's origin.
+    ///
+    /// What its figures read as is pinned once, in the reduction's own suite;
+    /// what these cases ask is that this report feeds the section and asks for
+    /// the standard that prints rather than fails.
+    fn holding(cycles: i64, wobble: f64) -> Vec<PoseSampleWire> {
+        stillness_report::fixture::holding(0, CYCLE_NS, cycles, wobble)
+    }
+
+    /// An antenna that hunted through a long listening hold is printed with the
+    /// figures that say so, and fails nothing: the bound is the encoder's own
+    /// flicker and no hold on this machine has been measured against it yet.
+    #[test]
+    fn a_hunting_antenna_is_printed_and_never_fails_a_conversation() {
+        let (_dir, at) = records("speech-report-hunting-antenna", &[STARTED, COMPOSED]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                samples: holding(500, 3.0 * COUNT_RAD),
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "right antenna moved"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "stillness: 9 row-hold(s) judged across 9 watched row(s)"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The same conversation with the antennas standing still: the section
+    /// prints its figures and says nothing else.
+    #[test]
+    fn a_still_antenna_is_printed_with_nothing_said_against_it() {
+        let (_dir, at) = records("speech-report-still-antenna", &[STARTED, COMPOSED]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                samples: holding(500, 0.0),
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "right antenna over a"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "antenna moved"),
+            "a still antenna was reported as having moved: {:?}",
+            report.measured
+        );
+    }
+
+    /// A conversation nobody held the machine still through is a note here and
+    /// nothing more: a run may legitimately never hold that long, which is what
+    /// separates this report's standard from the harness's.
+    #[test]
+    fn a_conversation_with_no_long_hold_is_a_note() {
+        let (_dir, at) = records("speech-report-no-hold", &[STARTED, COMPOSED]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                samples: holding(50, 0.0),
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "no antenna held one setpoint"),
+            "{:?}",
+            report.measured
         );
     }
 

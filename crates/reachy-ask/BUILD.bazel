@@ -31,17 +31,22 @@ rust_binary(
     ],
 )
 
-# The gesture's shape and offsets, the commissioning row it waits for, and the
-# argument grammar. Hermetic: the compile runs in memory over an injected
-# instant, and nothing here binds a port or reads a clock.
+# The gesture's shape and offsets, the engagement and the holds they have to
+# cover, and the argument grammar. Hermetic: the compile runs in memory over an
+# injected instant, and nothing here binds a port or reads a clock.
 #
-# `//cogs:scenario` is a test dependency and only that: the raise's offset has to
-# cover the start-up survey, and the survey's size is derived there from the
-# provisioning table and the gains-and-profile write set. The binary links none
-# of it.
+# `//cogs:scenario` and `//crates/reachy-motion:reachy_motion` are test
+# dependencies and only that: the raise's offset has to cover the engagement,
+# whose allowance scales with the machine's joint count, and then holds long
+# enough for the
+# latter's stillness watch to judge at its default settle and minimum. The
+# binary links neither.
 rust_test(
     name = "reachy_ask_test",
     size = "small",
     crate = ":reachy_ask",
-    deps = ["//cogs:scenario"],
+    deps = [
+        "//cogs:scenario",
+        "//crates/reachy-motion:reachy_motion",
+    ],
 )

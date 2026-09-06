@@ -50,6 +50,7 @@ use reachy_kin::{
     HeadGeometry, LegAngles, default_geometry, inverse_kinematics, neutral_head_pose,
     rest_head_pose, stow_head_pose, wrap_to_pi,
 };
+use reachy_motion::NEUTRAL_ANTENNAS;
 use reachy_motion::arm::{SERVO_IDS, row_of_id};
 use reachy_motion::default_motion_config;
 use reachy_motion::disarm::{
@@ -976,12 +977,16 @@ fn engaging_arms_from_the_sample_and_commands_the_posture_the_schedule_names() {
     let cycles = mover.run(60);
     assert!(cycles.iter().all(|cycle| cycle.goal.is_some()));
     assert!(reports(&cycles).is_empty(), "a clean move raises nothing");
-    for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
+    for (side, antenna) in [JointRef::AntennaRight, JointRef::AntennaLeft]
+        .into_iter()
+        .enumerate()
+    {
         let angle = mover.at(antenna);
         assert!(
-            direction(angle).abs() < 1e-9,
-            "{} points upright, at {angle} rad",
+            (direction(angle) - NEUTRAL_ANTENNAS[side]).abs() < 1e-9,
+            "{} stands at {angle} rad rather than at its rest lean {}",
             Name(antenna),
+            NEUTRAL_ANTENNAS[side],
         );
     }
     assert_eq!(
@@ -1990,11 +1995,15 @@ fn a_move_no_servo_could_step_through_is_floored_and_counted() {
 
     let snap = state_of(mover.cog.state_ctrl().snap());
     assert_eq!(snap.mode, MotionMode::Holding, "the floored move finished");
-    for joint in [JointRef::AntennaRight, JointRef::AntennaLeft] {
+    for (side, joint) in [JointRef::AntennaRight, JointRef::AntennaLeft]
+        .into_iter()
+        .enumerate()
+    {
         assert!(
-            wrap_to_pi(mover.at(joint)).abs() < 1e-6,
-            "{joint:?} stands at {} rather than upright",
+            (wrap_to_pi(mover.at(joint)) - NEUTRAL_ANTENNAS[side]).abs() < 1e-6,
+            "{joint:?} stands at {} rather than at its rest lean {}",
             mover.at(joint),
+            NEUTRAL_ANTENNAS[side],
         );
     }
 }

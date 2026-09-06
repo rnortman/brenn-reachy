@@ -236,6 +236,10 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // Stiff enough to carry a 0.3 s sweep, which the vendor's 200 lags badly
     // enough to overshoot the crossing. No integral term: an antenna holds
     // nothing up, so there is no standing error to integrate away.
+    //
+    // TODO(antenna-hold-gains): the sweep this was measured against is not the
+    // one a session plays, and these are the next thing to move if resting the
+    // antennas off vertical does not quiet them.
     antennas: Gains {
         p: 500,
         i: 0,
@@ -1725,12 +1729,11 @@ mod tests {
         assert_eq!(outcome.pinned.antennas, present.antennas);
     }
 
-    /// The model angle a servo count denotes: a whole turn spread over 4096
-    /// counts, zero at the middle of the range. Spelled out here because nothing
-    /// in this crate knows what a count is, and the antenna readings below are
-    /// what a real machine reported.
+    /// The model angle a servo count denotes: a whole turn spread over the
+    /// crate's count, zero at the middle of the range. Spelled out here because
+    /// the antenna readings below are what a real machine reported, in counts.
     fn rad_from_counts(counts: i32) -> f64 {
-        core::f64::consts::TAU * f64::from(counts) / 4096.0 - PI
+        core::f64::consts::TAU * f64::from(counts) / crate::tick::COUNTS_PER_TURN - PI
     }
 
     /// The antennas wherever a machine is found with them: parked past the half

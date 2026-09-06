@@ -383,17 +383,19 @@ refuse() {
 	exit "$code"
 }
 
-# How long the run is given before the launcher is stopped. Commissioning is
-# about five seconds of bus transactions, the harness gesture's arming offset is
-# eight, the raise-hold-stow gesture about five, the release about four: the host
-# harness budgets twenty-seven for the same sum, and this one carries a few
-# seconds more of margin because it is talking to a real serial bus whose
-# transactions retry. Nothing about the run is judged by the clock — the analyzer
-# reads the records — so the budget only has to be long enough. The offset is a
-# number in another file, so the sum is checked against the shipped one by
-# tools/deploy-motion.test.sh: an offset growing without this following it is red
-# there rather than a launcher stopped mid-gesture.
-run_seconds=30
+# How long the run is given before the launcher is stopped. The harness
+# gesture ends nineteen seconds after the edge receives it — its arming offset,
+# the eight-second hold the stillness section is judged over, and the closing
+# stow — with commissioning's bus survey of about five seconds before it and the
+# release's four after: twenty-eight. The host harness budgets thirty-three for
+# the same sum, and this one carries a few seconds more of margin again because
+# it is talking to a real serial bus whose transactions retry. Nothing about the
+# run is judged by the clock — the analyzer reads the records — so the budget
+# only has to be long enough. The gesture's end is a number in another file, so
+# the sum is checked against the shipped one by tools/deploy-motion.test.sh: a
+# gesture growing without this following it is red there rather than a launcher
+# stopped mid-gesture.
+run_seconds=36
 
 # The name of the intent source in the payload, and where its console goes.
 #

@@ -486,4 +486,23 @@ assert_status "and the shipped set runs again" 0 "$(status_of "$result")"
 
 assert_run_budget_covers_lead "${script_dir}/host-motion-run.sh"
 
+# The other half of the guard: the gesture's end read from a file that no longer
+# spells it. The staged source carries the neighbouring constants and not
+# `TIMEOUT_MS`, which is what a rename looks like from here. Run in a subshell so
+# the helper's own failure stays out of this suite's tally, and asserted on the
+# refusal text rather than on a status, because `fail` returns zero.
+cat >"${work}/renamed-gesture.rs" <<'RUST'
+pub const UP_AFTER_MS: u64 = 8000;
+pub const STOW_AFTER_MS: u64 = 16_000;
+pub const REQUEST_CEILING_MS: u64 = 19_000;
+RUST
+refusal=$(
+	GESTURE_SOURCE="${work}/renamed-gesture.rs" \
+		assert_run_budget_covers_lead "${script_dir}/host-motion-run.sh" 2>&1
+)
+assert_contains "a renamed gesture constant is red here" "$refusal" \
+	"one of the names has moved"
+assert_contains "and the refusal names the file it read" "$refusal" \
+	"${work}/renamed-gesture.rs"
+
 tally

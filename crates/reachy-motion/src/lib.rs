@@ -89,6 +89,7 @@ pub mod postures;
 pub mod record;
 pub mod seq;
 pub mod snap;
+pub mod stillness;
 pub mod tick;
 pub mod traj;
 pub mod txn;
@@ -111,7 +112,7 @@ pub use phase::{
     ANTENNA_CONTACT_BAND_RAD, ANTENNA_PHASE_SEPARATION_RAD, AntennaPhaseConfig, PhaseSeparation,
     PhaseWatch, mirror_offset,
 };
-pub use postures::{neutral_targets, stow_pose_targets};
+pub use postures::{NEUTRAL_ANTENNAS, neutral_targets, stow_pose_targets};
 pub use resume::{GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError};
 pub use seq::{
     AbsentSet, AnswerShape, BusResult, RegId, SeqAction, SeqError, SeqFailureKind, SeqStepKind,
@@ -120,6 +121,10 @@ pub use seq::{
 pub use snap::{
     BusSourceKind, DurationError, FkFailureKind, FkFieldError, MotionMode, PoseSnapshot,
     PoseSnapshotError, TrackingSideKind, duration_from_nanos, duration_nanos, fk_cause, fk_fields,
+};
+pub use stillness::{
+    COUNT_RAD, DRIVER_PERIOD, HoldWindow, MAX_EXCURSION_RAD, Sample, StillnessConfig,
+    StillnessCounts, StillnessError, StillnessWatch, judge,
 };
 pub use tick::{
     ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, BusFailureSource, ClockStretch,

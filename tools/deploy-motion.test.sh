@@ -797,7 +797,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 30 --run-window 30 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 30 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 36 --run-window 36 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 36 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -1030,7 +1030,7 @@ SSH_RUN_STATUS=0
 result=$(deploy unit --run "${work}/run-early")
 assert_status "a launcher that exited before the budget refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal says the gesture did not finish" "$(output_of "$result")" \
-	"before the 30s budget was up"
+	"before the 36s budget was up"
 assert_contains "and says where its console output is" "$(output_of "$result")" \
 	"/run/brenn-app/logs/launch"
 assert_lacks "and nothing is fetched from a run that did not happen" "$(calls)" "rsync"

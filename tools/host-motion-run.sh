@@ -132,16 +132,17 @@ logger_config=cogs/host_logger.textproto
 # is what TODO(host-run-in-ci) has to measure anyway.
 grid_jitter_ns=3000000
 
-# How long the gesture is given before the launcher is stopped. Commissioning is
-# about five seconds of bus transactions, the harness gesture's arming offset is
-# eight, the raise-hold-stow gesture about five, the release about four;
-# twenty-seven leaves margin for a loaded workstation. Nothing about the run is
-# judged by the clock — the analyzer reads the log — so the budget only has to be
-# long enough. The offset is a number in another file, so the sum is checked
-# against the shipped one by host-motion-run.test.sh: an offset that grows
-# without this following it is red there rather than a launcher stopped
-# mid-gesture.
-run_seconds=27
+# How long the gesture is given before the launcher is stopped. The harness
+# gesture ends nineteen seconds after the edge receives it — its arming offset,
+# the eight-second hold the stillness section is judged over, and the closing
+# stow — with commissioning's bus survey of about five seconds before it and the
+# release's four after: twenty-eight, and thirty-three leaves margin for a
+# loaded workstation. Nothing about the run is judged by the clock — the
+# analyzer reads the log — so the budget only has to be long enough. The
+# gesture's end is a number in another file, so the sum is checked against the
+# shipped one by host-motion-run.test.sh: a gesture that grows without this
+# following it is red there rather than a launcher stopped mid-gesture.
+run_seconds=33
 
 # The launcher's HTTP control port. Probed rather than defaulted: 8080 is a port
 # a workstation routinely has something on, and a launcher that cannot bind it

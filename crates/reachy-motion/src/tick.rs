@@ -749,14 +749,20 @@ fn start_excursion(cfg: &MotionConfig, start: &JointTargets) -> Excursion {
     Excursion::of(&cfg.env, &report, start.body_yaw)
 }
 
-/// Counts the antennas' goal register reaches either side of its own zero, and
-/// the count that reads as zero radians.
+/// Counts the antennas' goal register reaches either side of its own zero.
 ///
-/// The wire layer owns the conversion; these two figures are repeated here
-/// because the bound below is a count bound and the two layers share no crate.
-/// A bench test pins them against the conversion itself.
+/// The wire layer owns the conversion; this figure is repeated here because the
+/// bound below is a count bound and the two layers share no crate. A bench test
+/// pins it against the conversion itself.
 const ANTENNA_GOAL_COUNTS: f64 = 1_048_575.0;
-const COUNTS_PER_TURN: f64 = 4096.0;
+
+/// Encoder counts in one turn.
+///
+/// The crate's one statement of it, for everything here that reasons in counts:
+/// the goal spans below, and the excursion bound in `stillness`. The wire
+/// layer's `dxl_proto::conv::COUNTS_PER_REV` is the same number where the
+/// conversion itself lives, and the two layers share no crate.
+pub(crate) const COUNTS_PER_TURN: f64 = 4096.0;
 
 /// The highest angle either antenna's goal may hold, radians.
 ///

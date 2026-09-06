@@ -35,7 +35,17 @@ pub const SCRIPT_ID: u32 = 1;
 /// hold. The hold is the point -- a goal stream that stopped when the machine
 /// arrived would trip the driver's dead-man, and this step is long enough that
 /// it would.
-pub const UP_CYCLES: i64 = 100;
+///
+/// Longer than the dead-man needs, and set by what the stillness section
+/// requires instead: the move streams a new setpoint every cycle for its whole
+/// clock, and only then does the watch spend its settle allowance and ask for
+/// its minimum hold, so a step that arrives and holds a second is a run nothing
+/// can be measured over. `scenario::unjudgeable_step` states that sum against
+/// the watch's own config and the clocks this move runs on, the case below
+/// drives it, S1's checker echoes it over each run, and
+/// `//cogs:first_motion_report_over_s1_test` fails a run holding no antenna
+/// long enough to ask.
+pub const UP_CYCLES: i64 = 400;
 
 /// How long the stow step lasts, in cycles: the longer move plus the same room.
 pub const STOW_CYCLES: i64 = 150;
@@ -73,4 +83,30 @@ pub fn steps() -> [Step; 2] {
             posture: Some(PostureWire::STOW),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use reachy_motion::stillness::StillnessConfig;
+    use scenario::{PERIOD_NS, unjudgeable_step, up_clocks};
+
+    use super::UP_CYCLES;
+
+    /// The scenario's own step is long enough for the analyzer that reads its
+    /// log to find a hold in it.
+    ///
+    /// Here rather than in the checker alone: the claim is arithmetic over
+    /// constants, and a guard that only runs when the simulated run produced a
+    /// readable log is silent in exactly the state a shortened step leaves the
+    /// tree in.
+    #[test]
+    fn the_upright_step_outlasts_what_the_watch_needs_to_judge_a_hold() {
+        let complaint = unjudgeable_step(
+            "upright",
+            UP_CYCLES * PERIOD_NS,
+            &up_clocks(),
+            &StillnessConfig::default(),
+        );
+        assert!(complaint.is_none(), "{complaint:?}");
+    }
 }

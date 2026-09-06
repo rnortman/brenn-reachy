@@ -1073,3 +1073,48 @@ the shared one does; what remains is that the agreement is by hand.
 Done = `stt_compare` has no stream loop of its own, and `futures` is named by
 this repository only if something else still needs it. Marked at `transcribe` in
 `crates/reachy-host/src/bin/stt_compare.rs`.
+
+## `antenna-hold-gains`
+
+Retune the antenna servo gains, if resting the antennas ten degrees off
+vertical does not stop them hunting when the machine is up. The order of trials
+is fixed so the next change is a number rather than a discussion: T0 is a
+baseline hardware run from a kept branch off the fix with `NEUTRAL_ANTENNAS` at
+`[0.0, 0.0]` and the stillness section reading — the branch is committed, not a
+dirty tree, so that the run's `provenance.txt` stamps the branch commit with
+`dirty=no`; T1 is the same run from `main`. If T1's stillness section still
+fails, T2 sets the antennas to the vendor's own shipped `{p: 200, i: 0, d: 0}`
+— the one value with a production record behind it — and T3, only if T2 costs a
+gesture the analyzer can see as lag or a late arrival, bisects the proportional
+term between 200 and 500 with the derivative term held at zero.
+
+Deferral context: two variables at once would make the hardware record
+uninterpretable, and the rest offset is the change with an upstream mechanism
+and a shipped fix behind it. The gains comment also carries a rationale
+measured against a bench sweep the session no longer plays — the session
+streams step-bounded setpoints under a profile whose velocity paces every
+antenna move — so the stiffness may be buying nothing; how much is a
+measurement, and `TODO(session-servo-profile)` is the one that takes it.
+
+Done = either the stillness section passes on hardware with the gains untouched
+and the stale sweep rationale rewritten, or the gains carry a figure measured
+against the run that moved them. Marked at `DEFAULT_GAINS.antennas` in
+`crates/reachy-motion/src/arm.rs`.
+
+## `antenna-hold-fixture`
+
+Turn a recorded antenna hold into a replay fixture: a per-tick exporter from a
+recording to the trace CSV the replay suite reads, a
+`fixtures/traces/trace-antenna-hunt.csv` with a case asserting the stillness
+watch fails it, and a post-fix `trace-antenna-still.csv` asserting it passes at
+the bound baked from that run.
+
+Deferral context: the exporter's riskiest part is the column mapping onto a
+strict parser, and landing it with no fixture to exercise it would ship exactly
+that part unproven. The recording it needs does not exist until the hardware
+hold test has been run. The parser's constraints are recorded beside `fixture`
+in `crates/reachy-motion/tests/replay_trace.rs`, where the work happens.
+
+Done = both fixtures are checked in, the replay suite fails on the hunting one
+and passes the still one, and the exporter is a target somebody can run against
+a fetched recording.

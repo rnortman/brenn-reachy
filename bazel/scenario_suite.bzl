@@ -14,7 +14,7 @@ rather than one per scenario, and a scenario that fell out of step with the
 others would fail its build rather than its run.
 """
 
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 def scenario_suite(
@@ -62,6 +62,18 @@ def scenario_suite(
         srcs = [scenario + ".rs"],
         edition = "2024",
         deps = [":scenario"] + scenario_deps,
+    )
+
+    # A scenario states numbers -- how long a step runs, when it starts -- whose
+    # fitness is arithmetic against the library's own constants, and arithmetic
+    # is worth asserting where it does not need a whole simulated run first: a
+    # guard that only runs once the run produced a readable log says nothing in
+    # the state a broken scenario leaves the tree in. Declared for every
+    # scenario, not only the ones that have a case today.
+    rust_test(
+        name = scenario + "_test",
+        size = "small",
+        crate = ":" + scenario,
     )
 
     rust_binary(

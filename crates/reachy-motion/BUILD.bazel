@@ -10,6 +10,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//hardware/dynamixel:registers_clk_rs",
         "//geometry:primitives_clk_rs",

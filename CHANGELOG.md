@@ -11,6 +11,22 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Added
 
+- **The antennas rest off vertical, and a stillness watch measures whether they
+  stay still.** At exactly vertical the gearbox backlash leaves the antenna rod
+  balanced on the play with nothing biasing it to one side, and the servo's
+  position loop hunts across the gap — the same mechanism the upstream Pollen
+  stack documents and shipped a fix for. The neutral antenna pose is now ten
+  degrees toward each side's outboard, so the rod's own weight holds the play
+  to one side and the loop has something to push against. A new streaming
+  stillness watch (`reachy_motion::stillness`) segments every joint's timeline
+  into hold windows, measures peak-to-peak excursion and reversal rate in each,
+  and judges antennas against a two-count bound that is deliberately written to
+  fail before the fix is confirmed on hardware. Both the motion-harness report
+  and the speech-run report print a `stillness` section with per-window
+  figures; the harness report fails on a hunting antenna, the speech-run report
+  notes it. The harness gesture's up-hold is lengthened to eight seconds (from
+  two) so the settle allowance and minimum-hold floor fit inside it.
+
 - **Repository scaffolding.** Apache-2.0 license and notice, charter, and TODO
   ledger; secret-scanning commit and push gates wired by `make setup-hooks`; CI
   that independently scans the tree and runs the same `make check` gate a

@@ -36,18 +36,28 @@ pub const ASK_SEQ: u64 = 1;
 /// When the head goes up, measured from the instant the edge receives the
 /// script.
 ///
-/// Eight seconds, which is the arming budget: the start-up survey is 99 bus
-/// transactions and the allowance around them, and a step opening inside it
-/// would be a step commanded to a machine that is not yet armed. An overrun
-/// costs the gesture its window — a late or truncated raise — never a command
-/// to an unarmed machine.
+/// Eight seconds, covering two things in order: the engagement that takes
+/// hold of the machine, and the stow hold that engagement pins, held under
+/// torque long enough for the stillness watch to judge it. The raise sits
+/// past both with the margin the case below asserts. An overrun costs the
+/// gesture its window — a late or truncated raise, or a pre-raise hold too
+/// short to judge — never a command to an unarmed machine.
 pub const UP_AFTER_MS: u64 = 8000;
 
-/// When the head folds again: two seconds of holding the raise.
+/// When the head folds again: eight seconds of holding the raise.
 ///
 /// Most of the step is the hold rather than the move, and deliberately: a goal
-/// stream that stopped when the move finished would trip the driver's dead-man.
-pub const STOW_AFTER_MS: u64 = 10_000;
+/// stream that stopped when the move finished would trip the driver's dead-man,
+/// and the hold is the only stretch of the run in which the analyzer can judge
+/// whether a joint standing at its rest posture actually stands still. Three
+/// terms fill the eight seconds: about a second of move, the pair being parted
+/// at its crossing and the later antenna carrying the clock; the watch's
+/// four-second settle allowance, which starts when the last setpoint of that
+/// move is written; and over three seconds judged, against a two-second
+/// minimum. All three are read off the move's own clocks and the watch's config
+/// by the case below, so a retune of any of them is read here rather than as a
+/// hardware run with an empty section.
+pub const STOW_AFTER_MS: u64 = 16_000;
 
 /// The ceiling on the whole request.
 ///
@@ -55,7 +65,7 @@ pub const STOW_AFTER_MS: u64 = 10_000;
 /// on the stow rather than past it: the edge ends a stow-terminal script at the
 /// stow, and this timeout is that instant exactly — the legal boundary case,
 /// not one past it.
-pub const TIMEOUT_MS: u64 = 13_000;
+pub const TIMEOUT_MS: u64 = 19_000;
 
 /// The gesture as a script.
 ///
@@ -95,7 +105,8 @@ mod tests {
     use motion_proto::{MotionScript, Posture};
     use reachy_edge::{Edge, EdgeConfig, MotionTable, STOW_DURATION_MS};
 
-    use scenario::{PERIOD_NS, commission_allowance_cycles, commission_transactions};
+    use reachy_motion::StillnessConfig;
+    use scenario::{PERIOD_NS, engage_allowance_cycles, unjudgeable_step, up_clocks};
 
     use super::{ASK_POD, ASK_SEQ, STOW_AFTER_MS, TIMEOUT_MS, UP_AFTER_MS, body, gesture};
 
@@ -139,41 +150,78 @@ mod tests {
         );
     }
 
-    /// The margin the raise's offset must hold over the survey's allowance, as a
-    /// fraction. Bare sufficiency — an offset that merely equals the allowance —
-    /// leaves no room for bus-retry noise; asserting the margin catches an edit
-    /// that erodes it before it shows up as a late first step.
+    /// The margin the raise's offset must hold over the engagement's allowance,
+    /// as a fraction. Bare sufficiency — an offset that merely equals the
+    /// allowance — leaves no room for bus-retry noise; asserting the margin
+    /// catches an edit that erodes it before it shows up as a late first step.
+    ///
+    /// It rides on the engagement's transactions and not on the watch's
+    /// durations: bus noise lands on the former, and the latter are fixed
+    /// numbers a config states.
     const HEADROOM_NUMERATOR: i64 = 5;
     const HEADROOM_DENOMINATOR: i64 = 4;
 
-    /// What the raise's offset has to cover: every transaction that takes hold of
-    /// the machine, at the cycles a transaction costs.
+    /// What the raise's offset has to cover: taking hold of the machine, and
+    /// then the stow hold that engagement pins, for long enough that the
+    /// stillness watch can judge it.
     ///
-    /// Both halves of that product are derived from tables this tree grows — the
-    /// provisioning table's cells and the gains-and-profile write set — so the
-    /// constant above is the one part of the derivation that cannot grow by
-    /// itself. This is what makes it grow: a register added to the sweep widens
-    /// the survey and fails here, rather than costing the gesture its window on a
-    /// machine whose survey is still running. An overrun costs a late, truncated
-    /// or skipped raise; it never commands an unarmed machine, because the
-    /// session is what arms and the session is what runs the step.
+    /// The engagement's allowance scales with the machine's joint count, so
+    /// a row added widens it and fails here rather than costing the gesture its
+    /// pre-raise window on a slower machine. The hold's floor is the
+    /// watch's own settle allowance and minimum, read from the config the
+    /// analyzers run at, so a change to either shows up here rather than as a
+    /// section that quietly stops judging the stow. An overrun costs a late,
+    /// truncated or skipped raise, or a stow hold too short to judge; it never
+    /// commands an unarmed machine, because the session is what arms and the
+    /// session is what runs the step.
     #[test]
-    fn the_raise_waits_out_the_survey_that_has_to_finish_before_it() {
+    fn the_raise_waits_out_the_engagement_and_the_hold_the_watch_needs() {
         let up_ns =
             i64::try_from(UP_AFTER_MS).expect("a pinned offset is a count of ms") * 1_000_000;
-        let allowance_ns = commission_allowance_cycles() * PERIOD_NS;
-        let required_ns = allowance_ns * HEADROOM_NUMERATOR / HEADROOM_DENOMINATOR;
+        let engage_ns = engage_allowance_cycles() * PERIOD_NS;
+        let watch = StillnessConfig::default();
+        let hold_ns = i64::try_from(watch.shortest_judgeable_hold().as_nanos())
+            .expect("the watch's allowances are seconds, not centuries");
+        let required_ns = engage_ns * HEADROOM_NUMERATOR / HEADROOM_DENOMINATOR + hold_ns;
         assert!(
             up_ns >= required_ns,
-            "the gesture raises at {} ms and taking hold of the machine allows {} transactions \
-             at three cycles each, which is {} ms: the offset has to clear that by a quarter of \
-             it again -- {} ms -- so that what a noisy bus costs beyond the per-transaction \
-             allowance still fits, and an edit that eats the margin is read here rather than as \
-             a late, truncated or skipped raise",
+            "the gesture raises at {} ms; taking hold of the machine allows {} ms, which the \
+             offset has to clear by a quarter of it again so that what a noisy bus costs \
+             beyond the per-transaction allowance still fits, and the stow that engagement \
+             pins has to outlast the watch's {} ms floor before the raise ends it -- {} ms \
+             in all, and an edit that eats the margin is read here rather than as a late \
+             raise or a hold too short to judge",
             up_ns / 1_000_000,
-            commission_transactions(),
-            allowance_ns / 1_000_000,
+            engage_ns / 1_000_000,
+            hold_ns / 1_000_000,
             required_ns / 1_000_000
+        );
+    }
+
+    /// What the raise's own step has to cover: the move up, then the watch's
+    /// settle allowance, then a judged remainder at least its minimum long.
+    ///
+    /// The move is in it because the mover streams a new setpoint every cycle
+    /// until the move's clock runs out, and the settle allowance only starts
+    /// running when the setpoint stops changing. The clock is the one the
+    /// scenarios plan the same move on -- the pair parted at its crossing, so
+    /// the later antenna's is the one that counts -- and the two allowances
+    /// come off the config the analyzers run at, so a retune of any of them is
+    /// read here rather than as a hardware run whose `stillness` section has
+    /// nothing in it. No headroom fraction: a fixed step against fixed numbers.
+    #[test]
+    fn the_raise_is_held_long_enough_for_the_watch_to_judge_it() {
+        let hold_ms = STOW_AFTER_MS
+            .checked_sub(UP_AFTER_MS)
+            .expect("the fold follows the raise");
+        let hold_ns = i64::try_from(hold_ms).expect("a pinned offset is a count of ms") * 1_000_000;
+        let complaint =
+            unjudgeable_step("raise", hold_ns, &up_clocks(), &StillnessConfig::default());
+        assert!(
+            complaint.is_none(),
+            "the gesture holds the raise for {hold_ms} ms: {complaint:?} -- a step shortened \
+             past the floor, or an allowance widened past it, costs the run the measurement it \
+             exists to take",
         );
     }
 
@@ -212,11 +260,11 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (8000, 2000, StepKindWire::BASE_POSTURE, PostureWire::UP),
-                (10_000, 3000, StepKindWire::BASE_POSTURE, PostureWire::STOW),
+                (8000, 8000, StepKindWire::BASE_POSTURE, PostureWire::UP),
+                (16_000, 3000, StepKindWire::BASE_POSTURE, PostureWire::STOW),
             ],
-            "raise at the arming budget, hold two seconds, fold on the configured stow, and end \
-             at the timeout",
+            "raise at the arming budget, hold eight seconds so the hold can be judged, fold on \
+             the configured stow, and end at the timeout",
         );
         assert!(
             accepted.message.overlays().is_empty(),

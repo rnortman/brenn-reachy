@@ -293,6 +293,7 @@ rust_binary(
         ":script_clk_rs",
         ":session_clk_rs",
         ":session_cmd_clk_rs",
+        ":stillness_report",
         "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
@@ -1063,6 +1064,7 @@ scenario_suite(
     process_description = SIM_PROCESS,
     scenario_deps = [
         ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
     ],
 )
@@ -1395,9 +1397,10 @@ rust_library(
     crate_root = "scenario.rs",
     edition = "2024",
     # One package outside this one, and only its test: `reachy-ask`'s gesture has
-    # to raise the head after the start-up survey, and how big that survey is is
-    # derived here from the provisioning table and the gains-and-profile write
-    # set. Nothing links this crate into a binary.
+    # to raise the head after the engagement, and hold it long enough for the
+    # stillness watch, and both the engagement's allowance and the clocks a move
+    # to the upright posture runs on are derived here. Nothing links this crate
+    # into a binary.
     visibility = ["//crates/reachy-ask:__pkg__"],
     deps = [
         ":log_read",
@@ -1734,7 +1737,7 @@ rust_clk_module(
 # what the machine did, and the recorded-audio store beside them, which it cuts
 # one `.wav` per turn out of into `<records>.turns` so a turn is listened to by
 # reading the line that names its file. The log half is read through the same `:log_read`
-# binding machinery the motion report uses, over three of the channels
+# binding machinery the motion report uses, over four of the channels
 # `:motion_channels` names, and judges the head's movement by `:motion_evidence`
 # -- the one copy of the tolerances and the solver both analyzers share. It
 # depends on the edge and the host for the words the console is spelled with, so
@@ -1753,6 +1756,7 @@ rust_binary(
         ":run_report",
         ":script_clk_rs",
         ":session_clk_rs",
+        ":stillness_report",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-host:reachy_host_lib",
@@ -1784,6 +1788,40 @@ rust_test(
     deps = [
         "//crates/reachy-scratch:reachy_scratch",
         "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# Whether the machine held still, read off a driver sample stream: the stillness
+# reduction both log analyzers in this package print. Its own crate for the
+# reason `:motion_evidence` is one -- the two reports must not disagree about
+# what a hold is, what is measured over it, or how it reads -- and the
+# measurement itself lives further down, in `reachy-motion`, which knows nothing
+# about a log.
+rust_library(
+    name = "stillness_report",
+    srcs = ["stillness_report.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":motion_slots",
+        ":run_report",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:pose_clk_rs",
+        "//motion:joints_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The reduction's own cases: what a steady hold reads as, what a hunting antenna
+# reads as under each of the two standards, that a head row is printed and never
+# judged, and that a run with no hold in it is said rather than passed over.
+rust_test(
+    name = "stillness_report_test",
+    size = "small",
+    crate = ":stillness_report",
+    deps = [
+        "//motion:joints_clk_rs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )

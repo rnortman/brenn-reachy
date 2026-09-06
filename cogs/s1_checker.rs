@@ -17,11 +17,12 @@
 use std::process::ExitCode;
 
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
+use reachy_motion::StillnessConfig;
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
 
-use scenario::{stow_clocks, up_clocks};
+use scenario::{PERIOD_NS, stow_clocks, unjudgeable_step, up_clocks};
 
 use s1_scenario::{
     SCRIPT_ID, UP_CYCLES, disengage_cycle, end_cycle, script_sent_cycle, stow_start_cycle,
@@ -82,7 +83,28 @@ fn main() -> ExitCode {
             failures,
         );
         check::signal_groups(run, failures);
+        check_upright_step_is_judgeable(failures);
     })
+}
+
+/// The upright step outlasts what the stillness watch needs to judge a hold.
+///
+/// Not a property of the log but of the scenario, and the scenario's own cases
+/// are what hold it -- they run whether or not this run produced a readable
+/// log. Echoed here because this is the report an operator reads when the run
+/// itself disappoints: `//cogs:first_motion_report_over_s1_test` reads this
+/// run's log expecting a judged antenna window in it, and a step too short to
+/// carry one is named beside the run rather than left to be inferred from a
+/// section that says nothing.
+fn check_upright_step_is_judgeable(failures: &mut Vec<String>) {
+    if let Some(says) = unjudgeable_step(
+        "upright",
+        UP_CYCLES * PERIOD_NS,
+        &up_clocks(),
+        &StillnessConfig::default(),
+    ) {
+        failures.push(says);
+    }
 }
 
 /// The machine arrives: upright by the end of the step that sends it there, and

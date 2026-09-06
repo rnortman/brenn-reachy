@@ -147,42 +147,48 @@ checkout_root() {
 #   assert_run_budget_covers_lead <harness script in the checkout>
 #
 # Both harnesses — the host one and the device one — stop their launcher on a
-# hand-maintained budget whose largest term is the harness gesture's arming
-# offset, which lives in another file and language: `UP_AFTER_MS` in
-# `crates/reachy-ask/src/gesture.rs`. An offset that grows without a budget
+# hand-maintained budget whose largest term is the harness gesture itself,
+# which lives in another file and language: `TIMEOUT_MS` in
+# `crates/reachy-ask/src/gesture.rs`. A gesture that grows without a budget
 # following it is red here rather than a launcher stopped mid-gesture.
 #
-# The sum around the offset is stated once, here: commissioning's bus survey
-# (~5 s), the raise-hold-stow gesture (~5 s), and the release (~4 s). The
-# margin each harness carries above this is deliberately excluded — that is for
-# a loaded workstation or a serial bus that retries, and each script's own
-# comment says which.
+# `TIMEOUT_MS` is the gesture's own end measured from the edge's receipt, so it
+# already carries the arming offset, the hold and the closing stow. The sum
+# around it is stated once, here: the two terms that are not in that file, which
+# are commissioning's bus survey (~5 s) and the release (~4 s). The margin each
+# harness carries above this is deliberately excluded — that is for a loaded
+# workstation or a serial bus that retries, and each script's own comment says
+# which.
 #
 # Both harnesses spend the same terms: neither driver waits for anything before
 # its first cycle.
+#
+# `GESTURE_SOURCE` overrides the file the gesture's end is read from, so a
+# self-check can hold the branch that fires when the name moves against a file
+# that does not carry it.
 assert_run_budget_covers_lead() {
 	local script=$1
-	local label="${script##*/}'s run budget covers the harness gesture's arming offset and the phases around it"
-	local checkout lead budget phases needed
-	checkout=$(checkout_root)
-	phases=14
-	lead=$(sed -n 's/^pub const UP_AFTER_MS: u64 = \([0-9_]*\);.*/\1/p' \
-		-- "${checkout}/crates/reachy-ask/src/gesture.rs" | tr -d _)
+	local label="${script##*/}'s run budget covers the harness gesture and the phases around it"
+	local gesture_source gesture budget phases needed
+	gesture_source="${GESTURE_SOURCE:-$(checkout_root)/crates/reachy-ask/src/gesture.rs}"
+	phases=9
+	gesture=$(sed -n 's/^pub const TIMEOUT_MS: u64 = \([0-9_]*\);.*/\1/p' \
+		-- "$gesture_source" | tr -d _)
 	budget=$(sed -n 's/^run_seconds=\([0-9]*\).*/\1/p' -- "$script")
-	if [ -z "$lead" ] || [ -z "$budget" ]; then
+	if [ -z "$gesture" ] || [ -z "$budget" ]; then
 		fail "$label" \
-			"read no UP_AFTER_MS from crates/reachy-ask/src/gesture.rs or no run_seconds" \
+			"read no TIMEOUT_MS from ${gesture_source} or no run_seconds" \
 			"from ${script} — one of the names has moved"
 		return
 	fi
-	needed=$((lead / 1000 + phases))
+	needed=$((gesture / 1000 + phases))
 	if [ "$budget" -ge "$needed" ]; then
 		pass "$label"
 	else
 		fail "$label" \
 			"the budget is ${budget} s" \
-			"the harness gesture raises at ${lead} ms, and commissioning, the gesture" \
-			"and the release want ${phases} s around it: ${needed} s" \
+			"the harness gesture ends at ${gesture} ms, and commissioning and the release" \
+			"want ${phases} s around it: ${needed} s" \
 			"the launcher would be stopped mid-gesture"
 	fi
 }

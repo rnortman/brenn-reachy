@@ -75,6 +75,7 @@ use reachy_motion::tick::{
 };
 use reachy_motion::value;
 use run_report::{Report, verdict};
+use stillness_report::{Standard, Stillness, say};
 
 /// How far an antenna may point away from where the posture puts it, radians.
 ///
@@ -682,6 +683,27 @@ fn lags(run: &Run, report: &mut Report) {
         "worst antenna lag {antenna:.4} rad; the recorded fast sweep ran at \
          {RECORDED_WORST_ANTENNA_LAG_RAD:.4} rad"
     ));
+}
+
+/// Whether the machine stood still while it was asked to.
+///
+/// Every sample carries the setpoint the driver is holding beside the position
+/// it read, so the holds are cut out of the sample stream alone. This is the
+/// bring-up assertion for the antennas: the harness gesture exists to produce
+/// one long hold at the rest posture, so an antenna that moved further over one
+/// than a still joint may is a finding here, and a run that produced no such
+/// hold at all is a finding of its own -- the harness did not do the one thing
+/// it was lengthened for.
+///
+/// The whole stream, not the gesture's window: the stow hold is the control
+/// case, and a hold before the gesture is as much evidence as one during it.
+fn stillness(run: &Run, report: &mut Report) {
+    let mut held = Stillness::default();
+    for sample in &run.samples {
+        held.sample(&sample.message);
+    }
+    held.finish();
+    say(&held, Standard::Judged, report);
 }
 
 /// The session's narration, in the order the wake gesture puts it in.
@@ -2429,6 +2451,7 @@ fn analyze(run: &Run) -> Report {
     jitter(run, &mut report);
     reads(run, &mut report);
     lags(run, &mut report);
+    stillness(run, &mut report);
     health(run, &mut report);
     transactions(run, &traffic, &mut report);
     head_of_the_log(run, &mut report);
@@ -2515,6 +2538,8 @@ mod tests {
     use nalgebra::{Isometry3, UnitQuaternion, Vector3};
     use reachy_driver::NOMINAL_CYCLE_NS;
     use reachy_motion::joints::{JointRef, ROW_COUNT, flags, write_rows};
+    use reachy_motion::stillness::COUNT_RAD;
+    use stillness_report::fixture;
 
     /// An arbitrary instant a synthetic run starts at, chosen for being nothing
     /// round: the analyzer derives its grid, so a run beginning off any tidy
@@ -4018,6 +4043,221 @@ mod tests {
             write_rows(&mut read.present, &rows);
         }
         at(n, msg)
+    }
+
+    /// The shared synthetic run, on this suite's grid: every row held at zero,
+    /// the antennas reading `wobble` radians either side of it.
+    ///
+    /// What the figures in it read as is pinned once, in the reduction's own
+    /// suite; what these cases ask is that this report feeds the section and
+    /// asks it to judge.
+    fn holding(cycles: i64, wobble: f64) -> Vec<Logged<PoseSampleWire>> {
+        fixture::holding(T0, NOMINAL_CYCLE_NS, cycles, wobble)
+            .into_iter()
+            .enumerate()
+            .map(|(n, msg)| at(i64::try_from(n).expect("a cycle count"), msg))
+            .collect()
+    }
+
+    /// Every row reading and holding `antennas`, the rest of the machine at
+    /// `elsewhere`.
+    ///
+    /// The head rows take a number of their own per posture because on the
+    /// machine they do: a raise moves every row, so it is a goal change for
+    /// every row, and a fixture that left them where they were would make one
+    /// hold of two.
+    fn rows_at(antennas: &[f64; 2], elsewhere: f64) -> [f64; ROW_COUNT] {
+        let mut rows = [elsewhere; ROW_COUNT];
+        rows[row(JointRef::AntennaRight).expect("a bus row")] = antennas[0];
+        rows[row(JointRef::AntennaLeft).expect("a bus row")] = antennas[1];
+        rows
+    }
+
+    /// The stream the harness lead leaves behind: `unarmed` cycles read while
+    /// the driver holds nothing, then `stowed` cycles of the stow the
+    /// engagement pinned, then `upright` cycles of the rest posture the raise
+    /// put the machine at.
+    ///
+    /// Every row sits exactly on what it is told, so what a case asks of it is
+    /// which stretches became holds -- which is what the raise's offset is
+    /// sized against: the pre-raise stow is judged like any other hold, and the
+    /// stretch before the machine was armed is not a hold at all.
+    fn harness_lead(unarmed: i64, stowed: i64, upright: i64) -> Vec<Logged<PoseSampleWire>> {
+        let stow = rows_at(&stow_pose_targets().antennas, 0.0);
+        let rest = rows_at(&neutral_targets().antennas, 0.05);
+        let stretches = [
+            (unarmed, &stow, None),
+            (stowed, &stow, Some(&stow)),
+            (upright, &rest, Some(&rest)),
+        ];
+        let mut samples = Vec::new();
+        let mut n = 0;
+        for (cycles, present, commanded) in stretches {
+            for _ in 0..cycles {
+                samples.push(at(
+                    n,
+                    fixture::cycle(T0 + n * NOMINAL_CYCLE_NS, present, commanded),
+                ));
+                n += 1;
+            }
+        }
+        samples
+    }
+
+    /// The harness lead is what makes the pre-raise stow a measurement: the
+    /// goal the engagement pins stands until the raise, so the run carries two
+    /// judged holds a row -- the stow control and the rest hold -- and the
+    /// stretch before the machine was armed carries none.
+    ///
+    /// Over a stream shaped like the run rather than as arithmetic over the
+    /// offsets: a change to when the driver marks the commanded row valid, or
+    /// to the goal being pinned once at engagement, leaves that arithmetic
+    /// green and is read here.
+    #[test]
+    fn the_stow_the_engagement_pinned_is_judged_beside_the_rest_hold() {
+        let report = analyze(&Run {
+            samples: harness_lead(50, 350, 400),
+            ..Run::default()
+        });
+        assert!(
+            measured_about(
+                &report,
+                "stillness: 18 row-hold(s) judged across 9 watched row(s), 0 discarded"
+            ),
+            "two holds a row and nothing lost before the arming: {:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.contains("right antenna over a"))
+                .count(),
+            2,
+            "{:?}",
+            report.measured
+        );
+        let antennas: Vec<&String> = report
+            .measured
+            .iter()
+            .filter(|line| line.contains("antenna over a"))
+            .collect();
+        assert_eq!(antennas.len(), 4, "{:?}", report.measured);
+        assert!(
+            antennas
+                .iter()
+                .all(|line| line.contains("opened 4.00 s after the setpoint last moved")),
+            "each hold opens a settle allowance after its own goal: {antennas:?}"
+        );
+        assert_eq!(
+            findings_about(&report, "antenna moved"),
+            0,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// An arming that overran leaves a pre-raise stow too short to judge, and
+    /// the run says so as a hold discarded rather than as a hold that was never
+    /// there.
+    ///
+    /// Which is how "no control this run" is told from an instrument that has
+    /// stopped seeing holds: the rest hold is still judged, and the count of
+    /// what was dropped is beside it. An arming that overran so far that the
+    /// stow it pins does not outlast the settle allowance at all opens no
+    /// window to discard; what says so then is the goal changes counted beside
+    /// the holds.
+    #[test]
+    fn a_stow_hold_cut_short_by_a_late_arming_is_counted_rather_than_missed() {
+        let report = analyze(&Run {
+            samples: harness_lead(50, 250, 400),
+            ..Run::default()
+        });
+        assert!(
+            measured_about(
+                &report,
+                "stillness: 9 row-hold(s) judged across 9 watched row(s), 9 discarded"
+            ),
+            "the rest hold judged, the short stow counted: {:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.contains("right antenna over a"))
+                .count(),
+            1,
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The bring-up assertion, in the report the harness run is judged by: an
+    /// antenna that wandered over a long hold is a finding, on this report's
+    /// findings list rather than its measurements.
+    #[test]
+    fn a_hunting_antenna_over_a_long_hold_is_a_finding() {
+        let report = analyze(&Run {
+            samples: holding(500, 3.0 * COUNT_RAD),
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "right antenna moved"),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "left antenna moved"),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The same run with the antennas standing still: the section prints its
+    /// figures and finds nothing.
+    #[test]
+    fn a_still_antenna_over_a_long_hold_is_no_finding() {
+        let report = analyze(&Run {
+            samples: holding(500, 0.0),
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "antenna moved"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(&report, "no antenna held one setpoint"),
+            0,
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            measured_about(&report, "right antenna over a"),
+            "the hold went unprinted: {:?}",
+            report.measured
+        );
+    }
+
+    /// A run that never held an antenna long enough to ask fails: the harness
+    /// exists to produce one such hold, and a run without one has not tested
+    /// the thing it was run for.
+    #[test]
+    fn a_run_with_no_long_hold_fails_the_stillness_section() {
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "no antenna held one setpoint"),
+            1,
+            "{:?}",
+            report.findings
+        );
     }
 
     /// A pose that is where it should be and turned away from it has not

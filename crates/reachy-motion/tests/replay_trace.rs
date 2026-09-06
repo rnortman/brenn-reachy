@@ -45,6 +45,14 @@ const TRACE_FIXTURES_ENV: &str = "REACHY_MOTION_TRACE_FIXTURES";
 ///
 /// Panics rather than answers: neither a missing fixture nor a missing
 /// environment is a test case.
+///
+/// TODO(antenna-hold-fixture): the antenna hold has no recording here yet, so
+/// nothing replays the stillness watch over a machine. The fixture must match
+/// this parser: the header is
+/// `run,tick,t_s,phase,<joint>_present_rad…,<joint>_goal_rad…`, the `phase`
+/// cell is exactly `commanding` or `settling` and panics otherwise, present
+/// cells are all nine or all blank, and a joint holding no goal has a blank
+/// goal cell rather than a zero.
 pub fn fixture(name: &str) -> Trace {
     let dir = std::env::var(TRACE_FIXTURES_ENV).unwrap_or_else(|_| {
         panic!(

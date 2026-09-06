@@ -361,6 +361,44 @@ pub fn stow_clocks() -> MoveClocks {
     )
 }
 
+/// Why a step of `step_ns` ending in a hold at `clocks`' destination cannot be
+/// judged for stillness, or `None` when it can. `what` names the step.
+///
+/// Two terms. The move is the first: it streams a new setpoint every cycle
+/// until its longest clock runs out, and the watch's settle allowance only
+/// starts running when the setpoint stops changing -- so the clock the pair is
+/// actually parted onto, not the duration the move was asked for, is what a
+/// step has to carry before the hold begins. The watch's own floor is the
+/// second, and it states that itself.
+///
+/// The figure is a plan's, so it says nothing about a servo still travelling
+/// after the last setpoint was written; that is what the settle allowance is
+/// for.
+#[must_use]
+pub fn unjudgeable_step(
+    what: &str,
+    step_ns: i64,
+    clocks: &MoveClocks,
+    watch: &reachy_motion::stillness::StillnessConfig,
+) -> Option<String> {
+    let move_ns = clocks.cycles() * PERIOD_NS;
+    let hold_ns = i64::try_from(watch.shortest_judgeable_hold().as_nanos())
+        .expect("the watch's allowances are seconds, not centuries");
+    let floor_ns = move_ns + hold_ns;
+    (step_ns < floor_ns).then(|| {
+        format!(
+            "the {what} step runs {} ms and a hold in it can be judged only if it runs {} ms: \
+             {} ms of it is {} still being written new setpoints, and the watch spends its \
+             settle allowance after that before it looks and then wants the shortest stretch \
+             it will call a hold",
+            step_ns / 1_000_000,
+            floor_ns / 1_000_000,
+            move_ns / 1_000_000,
+            clocks.longest_group(),
+        )
+    })
+}
+
 /// One posture move's clocks, floored by the same pass the mover floors its own
 /// base moves with.
 ///
@@ -847,13 +885,18 @@ fn expect(path: &str, wanted: &[(&str, Value)], failures: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    //! What the committed name sidecar has to be, for the reader that resolves a
-    //! `play` step out of it at run time.
+    //! The two facts of this module nothing else reads back: what the committed
+    //! name sidecar has to be for the reader that resolves a `play` step out of
+    //! it at run time, and what a step has to run for a hold in it to be
+    //! judged.
     //!
     //! A generated artifact and the code that parses it drift silently unless
-    //! something reads the committed bytes.
+    //! something reads the committed bytes, and the complaint a guard prints
+    //! when it fires is unread prose unless a case asks what it says.
 
-    use super::{motion_id, motion_table};
+    use reachy_motion::stillness::StillnessConfig;
+
+    use super::{PERIOD_NS, motion_id, motion_table, unjudgeable_step, up_clocks};
 
     /// The sidecar the emitter committed is the sidecar the edge's reader parses,
     /// windows and all.
@@ -871,5 +914,40 @@ mod tests {
         assert_eq!(tour.motion_id, motion_id("bench/tour"));
         assert_eq!(tour.window.duration_ms, 1701);
         assert_eq!(tour.window.blend_out_ms, 200);
+    }
+
+    /// The floor is inclusive: a step exactly as long as the move plus what the
+    /// watch asks carries a judged hold, and the cycle under it does not.
+    #[test]
+    fn a_step_on_the_floor_is_judged_and_one_under_it_complains() {
+        let watch = StillnessConfig::default();
+        let clocks = up_clocks();
+        let floor_ns = clocks.cycles() * PERIOD_NS
+            + i64::try_from(watch.shortest_judgeable_hold().as_nanos()).expect("seconds of it");
+        assert!(unjudgeable_step("upright", floor_ns, &clocks, &watch).is_none());
+        assert!(unjudgeable_step("upright", floor_ns - PERIOD_NS, &clocks, &watch).is_some());
+    }
+
+    /// The complaint names the step, the floor it missed and the move inside
+    /// it, all three in milliseconds.
+    ///
+    /// The message is the whole product of a guard that never fires on a
+    /// healthy tree, so a units slip in it would otherwise surface for the
+    /// first time in front of the operator it is written for.
+    #[test]
+    fn the_complaint_names_the_step_the_floor_and_the_move_in_milliseconds() {
+        let watch = StillnessConfig::default();
+        let clocks = up_clocks();
+        let move_ms = clocks.cycles() * PERIOD_NS / 1_000_000;
+        let floor_ms = move_ms + 6_000;
+        let says = unjudgeable_step("upright", 2 * PERIOD_NS, &clocks, &watch)
+            .expect("40 ms judges nothing");
+        assert!(says.contains("the upright step runs 40 ms"), "{says}");
+        assert!(
+            says.contains(&format!("if it runs {floor_ms} ms")),
+            "{says}"
+        );
+        assert!(says.contains(&format!("{move_ms} ms of it")), "{says}");
+        assert!(says.contains(clocks.longest_group()), "{says}");
     }
 }
