@@ -22,19 +22,19 @@ include("//bazel:clockwork_overrides.MODULE.bazel")
 # other machine.
 bazel_dep(name = "rusty_cogs", version = "")
 
-# git_override(
-#     module_name = "rusty_cogs",
-#     commit = "f21185e98359d31bba13d3199acd9f9a872015aa",
-#     remote = "https://github.com/rnortman/rusty-cogs.git",
-# )
+git_override(
+    module_name = "rusty_cogs",
+    commit = "69b0302fab4661241f4346b592fc1c09edc81711",
+    remote = "https://github.com/rnortman/rusty-cogs.git",
+)
 
 # Active while this tree needs a generator change that is not on the remote yet.
 # Both overrides must not be active at once; the pin above is what CI and every
 # other machine resolve once the revision it names exists.
-local_path_override(
-    module_name = "rusty_cogs",
-    path = "../rusty-cogs",
-)
+# local_path_override(
+#     module_name = "rusty_cogs",
+#     path = "../rusty-cogs",
+# )
 
 # The interpreter the drop pins for its own Python code and both of its pip
 # hubs. Those hubs are version-keyed and the Clockwork compiler's dependency
