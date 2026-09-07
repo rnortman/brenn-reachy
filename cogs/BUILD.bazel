@@ -52,8 +52,10 @@ SIM_LOGGER_CONFIG = ":system_sim.motion_sim.MotionCpu_event_logger_config.tachyo
 # in the executable's own runfiles, and no checker has anything to say about it.
 SIM_CONFIGS = [
     "mover_params.textproto",
+    "servo_profile.textproto",
     "session_params.textproto",
     "sim_params.textproto",
+    "//driver:motord_params.textproto",
 ]
 
 # What each `.clk` module here reaches, transitively, written once per module and
@@ -281,6 +283,10 @@ rust_test(
 rust_binary(
     name = "first_motion_report",
     srcs = ["first_motion_report.rs"],
+    # The deployment's servo profile, read by path: the residual screen is
+    # measured against the trajectory those two registers define, so the
+    # analyzer is handed the same file the cogs read.
+    data = ["servo_profile.textproto"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -323,8 +329,8 @@ rust_binary(
 # available.
 #
 # The harness script's own invocation, not a second one: the analyzer takes a log
-# directory and nothing else, so it fits the checker slot with no extra
-# arguments.
+# directory and the deployment's servo profile, which is the one extra argument
+# the checker slot passes on.
 #
 # This proves the analyzer over one of the two log formats: a deterministic run
 # writes offboard `.slog` files, and the online logger writes onboard `.olog`
@@ -344,9 +350,11 @@ sh_test(
             SIM_PUBLISHER_CONFIG,
             SIM_LOGGER_CONFIG,
             ":first_motion_report",
+            "servo_profile.textproto",
         ]
     ],
     data = [
+        "servo_profile.textproto",
         ":first_motion_report",
         ":s1_author",
         SIM_EXE,
@@ -433,6 +441,7 @@ filegroup(
         "host_logger.textproto",
         "mover_params.textproto",
         "robot_logger_rates.textproto",
+        "servo_profile.textproto",
         "session_params.textproto",
         "sim_params.textproto",
     ],
@@ -470,6 +479,9 @@ merge_simplelaunch_config(
 rust_binary(
     name = "library_tour_report",
     srcs = ["library_tour_report.rs"],
+    # The deployment's servo profile, read by path, for the reason
+    # `first_motion_report`'s `data` gives.
+    data = ["servo_profile.textproto"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -589,16 +601,21 @@ rust_clk_module(
     deps = clk_module_deps(MOTION_MODULES).rs,
 )
 
-# The shipped session configuration rides in as a runfile: the cases here cut
-# their expectations from figures the deployment states, and one case reads the
-# file back to say the two are the same number.
+# The shipped session configuration and the shipped servo profile ride in as
+# runfiles: the cases here cut their expectations from figures the deployment
+# states, and one case reads both files back to say the two are the same
+# numbers.
 rust_test(
     name = "motion_cog_test",
     size = "small",
     srcs = ["motion_cog_test.rs"],
-    data = ["session_params.textproto"],
+    data = [
+        "servo_profile.textproto",
+        "session_params.textproto",
+    ],
     edition = "2024",
     env = {
+        "SERVO_PROFILE": "cogs/servo_profile.textproto",
         "SESSION_PARAMS": "cogs/session_params.textproto",
     },
     deps = [
@@ -964,6 +981,7 @@ filegroup(
         "mover_params.textproto",
         "robot_logger.textproto",
         "robot_logger_rates.textproto",
+        "servo_profile.textproto",
         "session_params.textproto",
     ],
     visibility = ["//visibility:public"],
@@ -1259,9 +1277,40 @@ scenario_suite(
     ],
 )
 
+# S14, the grab that does not let go: S2's run with a hand that never comes off,
+# so the run the raise reopens runs out of window a second time and that raise
+# defeats the stow answering the first -- the machine let go of where it stands
+# rather than driven into the hand for the rest of the maneuver's clock.
+scenario_suite(
+    name = "s14",
+    author_deps = [
+        "//motion:joints_clk_rs",
+    ],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        ":motion_cogs",
+        ":session_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)
+
 # S2, obstruction: the same three cogs S1 runs on, with a hand held against the
-# head cranks part way through the raise, which the disarmed tracking detector
-# leaves as lag in the record.
+# head cranks part way through the raise and taken off inside the window that
+# raise leaves, so the stow answering it runs end to end.
 scenario_suite(
     name = "s2",
     author_deps = [
@@ -1270,13 +1319,17 @@ scenario_suite(
     ],
     channel_publisher_config = SIM_PUBLISHER_CONFIG,
     checker_deps = [
+        ":motion_cogs",
         ":schedule_clk_rs",
         ":session_clk_rs",
         ":session_cmd_clk_rs",
         ":sim_state_clk_rs",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
+        "//motion:faults_clk_rs",
         "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
@@ -1684,6 +1737,7 @@ clk(
     data = [
         "clip_library.textproto",
         "mover_params.textproto",
+        "servo_profile.textproto",
         "session_params.textproto",
         "sim_params.textproto",
     ],
@@ -1750,7 +1804,6 @@ rust_library(
     srcs = [
         "sim_aux.rs",
         "sim_cogs.rs",
-        "sim_lag.rs",
         "sim_regs.rs",
     ],
     edition = "2024",
@@ -1981,5 +2034,42 @@ clk(
         ":sim_clk",
         "@clockwork//clockwork/logging:channel_policy_clk",
         "@clockwork//clockwork/logging:channel_type_clk",
+    ],
+)
+
+# A window of one run's driver samples, written as a replay trace. Run as
+# `bazel run //cogs:trace_export -- <log-dir> <from-ns> <to-ns> <out.csv>`, with
+# the two instants read off whatever the tour or gesture report printed for the
+# stretch worth keeping.
+#
+# The fixture cutter for `//crates/reachy-motion`'s replay suite: that suite
+# reads CSVs of periods and a hardware run arrives as a Clockwork log, so this
+# is what turns a stretch of one into a checked-in regression asset. It judges
+# nothing.
+rust_binary(
+    name = "trace_export",
+    srcs = ["trace_export.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":pose_reading",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:pose_clk_rs",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+    ],
+)
+
+# The cutter's own cases, over crafted sample streams: what the header names,
+# where a window's periods are counted from, and that a period missing its
+# reading or its setpoint writes that half blank rather than as zeros.
+rust_test(
+    name = "trace_export_test",
+    size = "small",
+    crate = ":trace_export",
+    deps = [
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )

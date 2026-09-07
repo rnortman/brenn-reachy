@@ -166,9 +166,9 @@ about anything a control step can see.
 
 | slug | what it detects | response |
 |---|---|---|
-| `antenna_obstructed` | an antenna past the tracking threshold for a whole window without closing: interference, a snag, a hand. Not raised while the detector is disarmed (`TrackingFaultConfig::armed`) | `degrade_antennas` |
+| `antenna_obstructed` | an antenna standing past the tracking threshold from where its own servo's trajectory generator has got to, for a whole window, without closing on it or keeping pace with it: interference, a snag, a hand | `degrade_antennas` |
 | `antenna_servo_fault` | hardware-error bits on an antenna servo, mid-run or at engage | `degrade_antennas` |
-| `head_obstructed` | a leg or the body yaw past the threshold for a whole window without closing: a grab, a snag, a jam. Not a motor failure — the servo still commands. Not raised while the detector is disarmed (`TrackingFaultConfig::armed`) | `slow_stow_to_rest` |
+| `head_obstructed` | a leg or the body yaw standing past the threshold from its generator's trajectory for a whole window, without closing or pacing: a grab, a snag, a jam. Not a motor failure — the servo still commands | `slow_stow_to_rest` |
 | `head_servo_fault` | hardware-error bits on a leg or body-yaw servo mid-run | `masked_slow_stow_to_park` |
 | `position_feedback_lost` | too many consecutive periods with no usable position read; a reading nobody can place counts as one of them | `immediate_all_torque_off_to_park` |
 | `measured_pose_invalid` | the measured cranks yield no believable head pose for a whole run of live reads — a mechanism outside its own model | `immediate_all_torque_off_to_park` |
@@ -185,10 +185,36 @@ a whole window, and that presents as `head_obstructed`. So the two conditions
 answer differently — the seized crank parks and goes limp, the obstruction stows
 under control — and the reason driving five legs against a seized sixth is not
 answered with a stow is the parallel-linkage argument in the escalation ladder
-below. While the detector is disarmed only one of them is answered: a grabbed
-head presents as lag in the record and nothing acts on it, and the seized crank
-still parks through `measured_pose_invalid`. The two conditions still tell apart
-in the record; the difference is which of them the machine does anything about.
+below.
+
+**What answering an obstruction costs.** A hand that stays on the head is
+answered in about a second at the commissioned profile; every figure in this
+paragraph and the next is evaluated at that profile and moves with it. The raise
+comes a window after the residual passes the threshold; the tick abandons its
+move and holds, and the keep-alive goes on writing the last goal that went out —
+at least the threshold past the held joint, and further on a saturated move; the
+session commands the stow, whose lead-in moves the goal by less than the
+progress minimum; and a second raise a window after the first, the hand having
+not relented under the hold, defeats that stow and the machine is released where
+it stands. The servo is commanded past the joint from the grab to the release,
+growing under the content until the first raise and held there for one window
+after it — the hold neither adds travel nor withdraws it. That window is the
+push this buys its question with, and the stow's own travel is never added to
+it.
+
+A hand that lets go: before the residual reaches the threshold — an obstruction
+shorter than about half a second under a goal at the profile — no run opens and
+nothing is raised. After the first raise, the stow completes only if the
+generator had stopped, or all but, by the raise — a hold at the end of a move, a
+static goal, a short move — and the hand comes off within about 140 ms of it, a
+window less the from-rest ramp to the progress minimum. A hand that took the
+head mid-move, with the goal still running at the profile past the prediction,
+has a period or two — tens of milliseconds, no interval a hand acts in: a joint
+released later than that paces under the pace fraction of a generator at the cap
+by the time the window runs out, so the second raise lands and the head is
+dropped where it is rather than folded. That is the trade, and it is a wide one:
+a grab of about 0.7 s on a saturated move ends the session, whether or not the
+hand then lets go.
 
 Classification happens exactly once, at the point the condition becomes one of
 these values, and travels as that value. No layer re-derives a class from a
@@ -222,10 +248,16 @@ the same incident. It does exactly one of two things:
   is the point. The control-not-trusted faults fall through for the reason
   they exist.
 
+The session host runs this clause: a raise whose response is a stow that names
+no motor defeats the running maneuver, which the maneuver's own next step then
+concludes as fallen through.
+
 **One clock.** The stow clock and its budget start once and run through every
 expansion; nothing restarts them. Expiry, budget exhaustion, or a
 fall-through-class failure ends the maneuver at `immediate_all_torque_off`
-regardless. Mask expansion therefore strengthens the termination guarantee
+regardless. A defeated stow therefore ends at the release on the wake that
+steps it, not at the budget: the clock left in hand is what tells the two
+endings apart in the record. Mask expansion therefore strengthens the termination guarantee
 rather than weakening it — nothing in the ladder gates a de-torque.
 
 **Disposition is the sticky maximum.** A fall-through keeps the wind-down's

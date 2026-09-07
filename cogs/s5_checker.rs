@@ -22,18 +22,19 @@ use scenario::check;
 use scenario::check::head_pose_at;
 use scenario::read::Run;
 
-use scenario::{stow_clocks, up_cycles};
+use scenario::stow_clocks;
 
 use s5_scenario::{
-    RETARGET_AFTER, SCRIPT_ID, TURNAROUND_CYCLES, disengage_cycle, end_cycle, retarget_cycle,
-    script_sent_cycle,
+    SCRIPT_ID, disengage_cycle, end_cycle, retarget_after, retarget_cycle, script_sent_cycle,
+    turnaround_cycles,
 };
 
 /// How far the head may drift back from the posture it is closing on between
 /// one cycle and the next, metres.
 ///
-/// Not a tolerance for a machine that changed its mind twice: the plant tracks
-/// a monotone path here, so the only thing this covers is the last bits of the
+/// Not a tolerance for a machine that changed its mind twice: once the fold's
+/// goal has come down past where the lagging head stands, every crank closes on
+/// it monotonically, so the only thing this covers is the last bits of the
 /// solver's arithmetic. A retarget that left the machine oscillating would
 /// exceed it by orders of magnitude.
 const CLOSING_SLACK: f64 = 1e-9;
@@ -107,15 +108,16 @@ fn main() -> ExitCode {
 /// a machine that had arrived early or never set off would satisfy the first
 /// while making every assertion below meaningless.
 fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
-    // The head group's configured clock, deliberately: this guard is about the
-    // head pose being between the two postures, and the shorter figure makes it
-    // stricter. The antennas' own floored clock runs past it and asserting
-    // against that would loosen the window a retarget has to land inside.
-    let move_cycles = up_cycles();
-    if RETARGET_AFTER >= move_cycles {
+    // The head's own travel, deliberately: this guard is about the head pose
+    // being between the two postures, and the head arrives long before the
+    // antennas do. Measuring against the whole machine's travel would loosen the
+    // window a retarget has to land inside to one the head has finished in.
+    let travel = scenario::head_up_travel();
+    let after = retarget_after();
+    if after >= travel {
         failures.push(format!(
-            "the posture changes {RETARGET_AFTER} cycles into a raise given {move_cycles}: the \
-             scenario does not change the posture during a move"
+            "the posture changes {after} cycles into a raise the head takes {travel} cycles to \
+             travel: the scenario does not change the posture during a move"
         ));
     }
     let at = retarget_cycle();
@@ -148,7 +150,7 @@ fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
 /// than about what it was asked for.
 fn check_closing(run: &Run, failures: &mut Vec<String>) {
     let stow = stow_head_pose();
-    let from = retarget_cycle() + TURNAROUND_CYCLES;
+    let from = retarget_cycle() + turnaround_cycles();
     let Some(start) = head_pose_at(run, from) else {
         failures.push(format!(
             "no pose for cycle {from}, where the machine should have turned round"

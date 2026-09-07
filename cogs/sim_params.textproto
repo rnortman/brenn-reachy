@@ -20,13 +20,6 @@ hold_timeout_ns: 200000000
 # injection, which is what an arming sequencer will do on the real machine.
 start_torqued: false
 
-# How far a modelled servo moves in one cycle. These are the motion library's
-# own per-cycle step bounds, so a well-formed goal stream is tracked within one
-# cycle and anything that is not -- a jammed servo, a step nobody should have
-# commanded -- shows up as the growing tracking error the library classifies.
-slew_legs_rad: 0.15
-slew_body_yaw_rad: 0.15
-slew_antennas_rad: 0.65
 
 # One health report every 120 ms: six cycles apart, so a full lap of the nine
 # servos takes 1.08 s and the aux slot is free for a host request on five cycles

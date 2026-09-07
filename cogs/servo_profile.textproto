@@ -1,0 +1,39 @@
+# The servo-side motion profile, loaded once at process setup and read by both
+# control cogs.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.ServoProfile`, which the
+# compiler generates from the `ServoProfile` schema in `config.clk`. Read as it
+# is: the box binds it by path, and the casing converts it to the message the
+# dial hands the cog.
+#
+# One file, two readers. The session writes this pair into all nine servos when
+# it commissions the machine; the decision tick builds its plant model from the
+# same pair, so what it judges a joint against is the trajectory the machine's
+# own generators are running. A second statement of either number is a screen
+# sized for a machine nobody commissioned.
+
+# The servo-side motion profile the commission sequencer writes, in the
+# registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
+# acceleration).
+#
+# This pair is the measured velocity cap of the recorded library tour: every
+# joint class chasing a goal more than 0.1 rad away travels a median of
+# 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the velocity
+# below converts to, and a joint setting off from rest ramps at the
+# acceleration. The whole tour ran velocity-saturated -- the content asks for
+# 3-20 rad/s against a 1.2 rad/s ceiling -- so the pair is what shapes the
+# motion rather than a backstop under it. Whether it is the right pair for this
+# machine is still nobody's measurement, and the mark for that is on the
+# schema's own field in `cogs/config.clk`.
+#
+# The bench's trial-validated figures (400/600, including an 855°/s antenna
+# sweep and the 0.8 s presence gesture) were sized for a host commanding whole
+# moves, where the profile is only the backstop under host-side shaping and a
+# tight one throttles the shaped motion itself. The session streams
+# step-bounded setpoints instead, one per cycle, which is what the low pair is
+# for.
+#
+# Zero in either register is a servo with no generator at all. Both readers
+# refuse it before anything is commanded.
+profile_acceleration: 20
+profile_velocity: 50

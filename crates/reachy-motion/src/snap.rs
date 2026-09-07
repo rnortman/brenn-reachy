@@ -15,9 +15,9 @@
 //! wrote holds is exactly what those checks catch.
 //!
 //! The enumerated kinds need no flat form: [`MotionMode`],
-//! [`TrackingSideKind`], [`WarpKind`](crate::traj::WarpKind) and
-//! [`BusSourceKind`] are the vocabulary's own enums, held in a slot as
-//! themselves and narrowed by the one validation at the boundary. A set of
+//! [`WarpKind`](crate::traj::WarpKind) and [`BusSourceKind`] are the
+//! vocabulary's own enums, held in a slot as themselves and narrowed by the one
+//! validation at the boundary. A set of
 //! servos likewise — it is the vocabulary's `JointFlags` wherever it is held.
 
 use core::time::Duration;
@@ -25,15 +25,6 @@ use core::time::Duration;
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use reachy_kin::FkError;
 use thiserror::Error;
-
-/// Which side of a tracking run's anchor its goal lies on.
-///
-/// The vocabulary's own enum, declared in `motion/tick_state.clk`. Signed,
-/// because the numbers are the direction: the side below the anchor is the
-/// negative one, and [`TrackingSideKind::Unplaced`] is neither side — the goal
-/// sits on the anchor, or is a number nobody can place, so there is no
-/// direction to close in and no side to cross to.
-pub use brenn_reachy__motion__tick_state_clk_rs::TrackingSideKind;
 
 /// Why a code and two numbers name no solve failure.
 ///

@@ -26,8 +26,10 @@ use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use log_read::Logged;
 use reachy_motion::joints::{JointGroup, ROWS, group_of, row, rows_of};
+use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
 use reachy_motion::tick::{
-    RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, TrackingFaultConfig,
+    RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
+    RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, TrackingFaultConfig,
 };
 use run_report::Report;
 
@@ -55,13 +57,14 @@ pub fn commanded_rows(sample: &PoseSampleWire) -> Option<[f64; ROWS.len()]> {
 /// Off the samples alone: each carries the setpoint the driver is holding
 /// beside the position it read, so the lag needs no join against the goal
 /// stream. Two figures, head and antennas, because those are the two the
-/// recorded hardware gestures pinned and the tracking screen is sized against —
-/// and all three of those numbers are printed beside the measurement, so a run
-/// can be read against the only hardware evidence this repo has.
+/// recorded hardware gestures pinned — and both of those numbers are printed
+/// beside the measurement, so a run can be read against the recordings.
 ///
-/// The screen is printed whether or not the run's detector was armed: it is the
-/// figure a plant model has to replace, so what content did against it is the
-/// reading that says how far off it is.
+/// What this is a figure about is how fast the content is against the servos'
+/// own profile, not how healthy the machine is: every joint on this machine
+/// runs a velocity-capped generator, so content asking for more than the cap
+/// leaves a healthy joint far behind its goal and says nothing wrong. Health is
+/// [`residuals`], which is what the detector screens on.
 pub fn lags(samples: &[Logged<PoseSampleWire>], report: &mut Report) {
     let mut head = 0_f64;
     let mut antenna = 0_f64;
@@ -84,7 +87,6 @@ pub fn lags(samples: &[Logged<PoseSampleWire>], report: &mut Report) {
             }
         }
     }
-    let threshold = TrackingFaultConfig::default().threshold_rad;
     // How many samples the two figures came off, because a zero lag and a
     // measurement nothing was compared on print the same otherwise -- and a run
     // in which the driver held nothing is the second one.
@@ -93,12 +95,198 @@ pub fn lags(samples: &[Logged<PoseSampleWire>], report: &mut Report) {
         samples.len()
     ));
     report.note(format!(
-        "worst head lag {head:.4} rad; the recorded healthy gesture ran at \
-         {RECORDED_WORST_HEAD_LAG_RAD:.4} rad and the tracking screen sits at {threshold:.4} rad"
+        "worst head lag {head:.4} rad, distance behind the goal; the recorded healthy gesture \
+         ran at {RECORDED_WORST_HEAD_LAG_RAD:.4} rad"
     ));
     report.note(format!(
         "worst antenna lag {antenna:.4} rad; the recorded fast sweep ran at \
          {RECORDED_WORST_ANTENNA_LAG_RAD:.4} rad"
+    ));
+}
+
+/// The profile a log is to be judged under, read from the deployment's own
+/// configuration file: acceleration first, then velocity, in register units.
+///
+/// A path argument rather than a constant, the way the names sidecar is. A run
+/// recorded on a machine commissioned with one pair has to be judged under that
+/// pair — the residual is the distance from a trajectory those two registers
+/// define, so judging a log under any other pair measures a machine nobody ran.
+///
+/// The parse is a literal `key: value` scan over the lines that are not
+/// comments: two scalars in a file this repo writes are not a reason to
+/// implement protobuf text. Comments are skipped rather than scanned because
+/// the file's own comment block discusses other pairs -- the bench's among them
+/// -- and a scan that took the first match anywhere would read one of those as
+/// the pair the machine was commissioned with.
+///
+/// # Errors
+///
+/// The reason the file could not be read, or the name it does not state.
+pub fn read_profile(path: &str) -> Result<(u32, u32), String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+    let figure = |field: &str| -> Result<u32, String> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim() == field)
+            .ok_or_else(|| format!("{path} states no {field}"))?
+            .1
+            .trim()
+            .parse()
+            .map_err(|error| format!("{path}'s {field} is no register value: {error}"))
+    };
+    Ok((figure("profile_acceleration")?, figure("profile_velocity")?))
+}
+
+/// How far each joint stood from where its servo's own trajectory generator
+/// had got to, sample by sample.
+///
+/// The offline half of the live comparison, stepped the way the tick steps it
+/// so that a run is judged offline by the arithmetic that judged it live:
+/// seeded from the first reading at rest, then one step-then-push per grid
+/// period against the setpoint the driver was holding
+/// [`RESPONSE_DEAD_SAMPLES`] periods earlier. A grid slot no sample attended is
+/// stepped on the setpoint already held, because that is what the servos went
+/// on chasing; a run of them longer than [`MAX_GAP_PERIODS`] re-seeds, and so
+/// does a stretch where the driver held nothing at all, because past either the
+/// generator's position is not something arithmetic knows.
+///
+/// One entry per sample that carried a reading, in nominal order: the instant
+/// and the nine unsigned residuals. A joint *ahead* of its prediction is as far
+/// off it as one behind, which is why they are unsigned — the question is
+/// whether the reading and the model agree.
+#[must_use]
+pub fn residual_stream(
+    samples: &[Logged<PoseSampleWire>],
+    grid: Grid,
+    plant: &PlantModel,
+) -> Vec<(i64, [f64; ROWS.len()])> {
+    // Nominal order is the model's own order, whatever order the log holds:
+    // the prediction is a walk along the grid and a sample read out of turn
+    // would step it backwards.
+    let mut ordered: Vec<&Logged<PoseSampleWire>> = samples.iter().collect();
+    ordered.sort_by_key(|sample| sample.message.nominal_time().as_nanos());
+    let mut predicted = [Predicted::default(); ROWS.len()];
+    let mut seeded = [false; ROWS.len()];
+    let mut ring: Vec<[f64; ROWS.len()]> = Vec::new();
+    let mut previous: Option<i64> = None;
+    let mut out = Vec::new();
+    for sample in ordered {
+        let nominal = sample.message.nominal_time().as_nanos();
+        let (cycle, _) = grid.at(nominal);
+        // How many periods this sample covers: its own, plus any slot no sample
+        // attended. Floored at one, so a repeated or early instant is one
+        // period and never none.
+        let periods = previous.map_or(1, |before| (cycle - before).max(1));
+        previous = Some(cycle);
+        let held = commanded_rows(&sample.message);
+        if periods > MAX_GAP_PERIODS as i64 || ring.len() < RESPONSE_DEAD_SAMPLES {
+            seeded = [false; ROWS.len()];
+            if periods > MAX_GAP_PERIODS as i64 {
+                // The ring goes with the prediction over a gap that long, and
+                // only over one: its setpoints are from before the gap, and a
+                // prediction seeded from this sample has no business being
+                // stepped toward one of them. A ring that is merely filling is
+                // left to fill.
+                ring.clear();
+            }
+        } else {
+            for period in 0..periods {
+                let target = ring.remove(0);
+                for (index, state) in predicted.iter_mut().enumerate() {
+                    if seeded[index] {
+                        plant.step(state, target[index]);
+                    }
+                }
+                if period + 1 < periods {
+                    // The driver wrote nothing in a slot it missed, so the
+                    // newest setpoint is pushed again: the servos chased what
+                    // they were already holding.
+                    let carried = *ring.last().unwrap_or(&target);
+                    ring.push(carried);
+                }
+            }
+        }
+        match held {
+            Some(setpoint) => {
+                ring.push(setpoint);
+                // The ring is exactly a dead time deep. A stretch the loop
+                // above did not step through leaves it full, so the push above
+                // drops the oldest rather than deepening it.
+                while ring.len() > RESPONSE_DEAD_SAMPLES {
+                    ring.remove(0);
+                }
+            }
+            None => {
+                ring.clear();
+                seeded = [false; ROWS.len()];
+            }
+        }
+        let Some(present) = present_rows(&sample.message) else {
+            continue;
+        };
+        let mut residual = [0.0; ROWS.len()];
+        for (index, state) in predicted.iter_mut().enumerate() {
+            if !seeded[index] {
+                state.position = present[index];
+                state.velocity = 0.0;
+                seeded[index] = true;
+            }
+            residual[index] = (present[index] - state.position).abs();
+        }
+        out.push((nominal, residual));
+    }
+    out
+}
+
+/// How far the machine stood from its own modelled trajectory, over a whole
+/// run, printed against the screen the detector runs.
+///
+/// This is the figure a run is judged by. Unlike the lag above it, it does not
+/// grow with the speed of the content: the model is the servo's own generator,
+/// so a velocity-saturated clip and a slow gesture both sit near zero on a
+/// healthy machine, and what puts a joint away from zero is the joint failing
+/// to do what its own profile says it does.
+///
+/// The stream is the caller's, from [`residual_stream`], because the prediction
+/// is a walk along the whole run and a caller that also slices it per window
+/// would otherwise walk it twice -- and the summary and the slices under it must
+/// be the same walk, or they are two answers to one question. `samples` is
+/// carried only for the count of what the walk left out.
+pub fn residuals(
+    stream: &[(i64, [f64; ROWS.len()])],
+    samples: &[Logged<PoseSampleWire>],
+    plant: &PlantModel,
+    report: &mut Report,
+) {
+    let mut head = 0_f64;
+    let mut antenna = 0_f64;
+    for (_, residual) in stream {
+        for joint in ROWS {
+            let Some(index) = row(joint) else { continue };
+            match group_of(joint) {
+                Some(JointGroup::Antennas) => antenna = antenna.max(residual[index]),
+                Some(_) => head = head.max(residual[index]),
+                None => {}
+            }
+        }
+    }
+    let threshold = TrackingFaultConfig::default().threshold_rad;
+    report.note(format!(
+        "{} of {} samples were judged against the modelled trajectory of a servo commissioned \
+         at {:.6} rad/period and {:.6} rad/period²",
+        stream.len(),
+        samples.len(),
+        plant.v_max,
+        plant.a_max,
+    ));
+    report.note(format!(
+        "worst head residual {head:.4} rad and worst antenna residual {antenna:.4} rad, against \
+         a tracking screen at {threshold:.4} rad"
+    ));
+    report.note(format!(
+        "the recorded library ran at {RECORDED_WORST_HEAD_RESIDUAL_RAD:.4} rad and \
+         {RECORDED_WORST_ANTENNA_RESIDUAL_RAD:.4} rad, which is what the screen is sized over"
     ));
 }
 
@@ -237,10 +425,12 @@ mod tests {
 
     use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
     use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, TickFaultWire};
-    use reachy_motion::joints::{JointRef, ROW_COUNT, row, write_rows};
+    use reachy_motion::joints::{JointRef, ROW_COUNT, row, rows_of, write_rows};
     use run_report::Report;
 
-    use super::{Grid, Skips, lags, no_faults};
+    use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
+
+    use super::{Grid, Skips, lags, no_faults, read_profile, residual_stream};
 
     /// A period nothing round, so an arithmetic that assumed one shows.
     const PERIOD_NS: i64 = 20_000_000;
@@ -429,6 +619,315 @@ mod tests {
         assert!(
             !skips.account_for(7..10),
             "where the report sits is a guess, and a guess explains nothing",
+        );
+    }
+
+    /// One sample holding no setpoint at all: the driver before its first goal,
+    /// after a release, or behind a latched torque-off.
+    fn holding_nothing(n: i64, present: &[f64; ROW_COUNT]) -> Logged<PoseSampleWire> {
+        let mut logged = sample(n, present, &[0.0; ROW_COUNT]);
+        logged.message.set_commanded_valid(false);
+        logged
+    }
+
+    /// The row every residual case drives. One row moves and the other eight
+    /// stand on a setpoint of zero, so a residual anywhere else is arithmetic
+    /// leaking between rows.
+    fn driven() -> usize {
+        row(JointRef::BodyYaw).expect("a bus row")
+    }
+
+    /// A stream of samples in which the driven row reads exactly what the plant
+    /// makes of the setpoints the driver held.
+    ///
+    /// The healthy machine, generated rather than recorded: the walk under test
+    /// has to find no residual in it. `shift` offsets which setpoint the
+    /// generated reading answers, which is how a case drives the dead time
+    /// wrong on purpose -- at zero the reading answers the setpoint of
+    /// [`RESPONSE_DEAD_SAMPLES`] samples ago, which is what the walk assumes.
+    fn chase(plant: &PlantModel, commanded: &[f64], shift: usize) -> Vec<Logged<PoseSampleWire>> {
+        let index = driven();
+        let mut predicted = Predicted::default();
+        let mut out = Vec::new();
+        for (n, held) in commanded.iter().enumerate() {
+            if n >= RESPONSE_DEAD_SAMPLES {
+                plant.step(&mut predicted, commanded[n - RESPONSE_DEAD_SAMPLES + shift]);
+            }
+            let mut present = [0.0; ROW_COUNT];
+            present[index] = predicted.position;
+            let mut asked = [0.0; ROW_COUNT];
+            asked[index] = *held;
+            out.push(sample(
+                i64::try_from(n).expect("a few samples"),
+                &present,
+                &asked,
+            ));
+        }
+        out
+    }
+
+    /// A stream whose driven row does not move at all, under a setpoint a long
+    /// way from it: the shape every gap case needs, because a walk that steps
+    /// and a walk that re-seeds answer differently about it.
+    fn frozen(count: i64, target: f64) -> Vec<Logged<PoseSampleWire>> {
+        let index = driven();
+        (0..count)
+            .map(|n| {
+                let mut asked = [0.0; ROW_COUNT];
+                asked[index] = if n < 2 { 0.0 } else { target };
+                sample(n, &[0.0; ROW_COUNT], &asked)
+            })
+            .collect()
+    }
+
+    /// The worst residual the driven row shows, and the worst any other row
+    /// does.
+    fn worsts(stream: &[(i64, [f64; ROW_COUNT])]) -> (f64, f64) {
+        let index = driven();
+        let mut driven_row = 0.0_f64;
+        let mut elsewhere = 0.0_f64;
+        for (_, residual) in stream {
+            for (at, figure) in residual.iter().enumerate() {
+                if at == index {
+                    driven_row = driven_row.max(*figure);
+                } else {
+                    elsewhere = elsewhere.max(*figure);
+                }
+            }
+        }
+        (driven_row, elsewhere)
+    }
+
+    /// The residual a sample carries, found by its instant.
+    fn at_cycle(stream: &[(i64, [f64; ROW_COUNT])], n: i64) -> f64 {
+        let index = driven();
+        stream
+            .iter()
+            .find(|(nominal, _)| *nominal == ORIGIN_NS + n * PERIOD_NS)
+            .map(|(_, residual)| residual[index])
+            .unwrap_or_else(|| panic!("the stream carries no sample for cycle {n}"))
+    }
+
+    /// The setpoints of a saturated move: further per period than the profile
+    /// carries, which is what the recorded library is full of.
+    fn saturated(count: usize) -> Vec<f64> {
+        (0..count).map(|n| 0.1 * n as f64).collect()
+    }
+
+    /// The one assertion that separates this figure from the lag beside it: a
+    /// machine following its own generator exactly reads a residual of zero
+    /// while standing radians away from its goal.
+    ///
+    /// A walk that judged against the goal, or that returned all zeros, or that
+    /// pushed before it read, could not both. And the number this pins is the
+    /// evidence a run is judged by: an analyzer that always printed zero would
+    /// read as a perfectly healthy tour.
+    #[test]
+    fn a_machine_on_its_own_trajectory_has_no_residual_however_far_behind_its_goal_it_is() {
+        let plant = PlantModel::default();
+        let commanded = saturated(60);
+        let samples = chase(&plant, &commanded, 0);
+        let stream = residual_stream(&samples, grid(), &plant);
+
+        assert_eq!(stream.len(), samples.len(), "every sample was judged");
+        let (driven_row, elsewhere) = worsts(&stream);
+        assert!(driven_row < 1e-12, "the driven row's worst is {driven_row}");
+        assert!(
+            elsewhere < 1e-12,
+            "and no other row's is anything: {elsewhere}"
+        );
+
+        // And the same samples are radians from their goal the whole way, which
+        // is the figure `lags` prints and the reason it is not this one.
+        let index = driven();
+        let worst_lag = samples
+            .iter()
+            .map(|logged| {
+                let read = logged.message.validate().expect("a fixture sample");
+                (rows_of(&read.commanded)[index] - rows_of(&read.present)[index]).abs()
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst_lag > 1.0,
+            "the content outran the profile by {worst_lag} rad"
+        );
+    }
+
+    /// The dead time is pinned, not assumed: the same machine answering one
+    /// period sooner than the model expects reads a residual of the order of
+    /// the profile velocity.
+    ///
+    /// Which is what makes the case above an assertion about the dead time the
+    /// model was fitted at rather than about any delay at all.
+    #[test]
+    fn a_reading_that_answers_a_period_early_reads_a_residual() {
+        let plant = PlantModel::default();
+        let commanded = saturated(60);
+        let stream = residual_stream(&chase(&plant, &commanded, 1), grid(), &plant);
+        let (driven_row, _) = worsts(&stream);
+        assert!(
+            driven_row > 0.5 * plant.v_max,
+            "a period of a saturated move is {} rad, and the residual is {driven_row}",
+            plant.v_max
+        );
+    }
+
+    /// A grid slot no sample attended is stepped on the setpoint already held,
+    /// because that is what the servos went on chasing.
+    ///
+    /// The stream is a healthy machine under a setpoint that does not change
+    /// across the hole, so stepping through it is exactly right and not
+    /// stepping through it leaves the prediction three periods behind a moving
+    /// joint -- which is a residual, and would be one on the first live sample
+    /// after every skipped cycle the driver reports.
+    #[test]
+    fn a_hole_in_the_grid_is_stepped_through_on_the_setpoint_the_driver_held() {
+        let plant = PlantModel::default();
+        // A step held from the third sample on, so the joint is still
+        // travelling toward it when the hole falls.
+        let commanded: Vec<f64> = (0..60).map(|n| if n < 2 { 0.0 } else { 2.0 }).collect();
+        let samples = chase(&plant, &commanded, 0);
+        let count = samples.len();
+        let holed: Vec<_> = samples
+            .into_iter()
+            .filter(|logged| !(10..13).contains(&logged.sequence_number))
+            .collect();
+        assert_eq!(holed.len(), count - 3);
+
+        let stream = residual_stream(&holed, grid(), &plant);
+        let (driven_row, _) = worsts(&stream);
+        assert!(
+            driven_row < 1e-12,
+            "the hole cost the prediction {driven_row} rad of the joint's own travel"
+        );
+    }
+
+    /// Past the gap the model is walked through, the prediction is re-seeded
+    /// from the reading rather than guessed at; up to it, it is stepped.
+    ///
+    /// The stream is a joint that never moves under a setpoint radians away, so
+    /// the two answers are as far apart as they can be: a stepped walk measures
+    /// the whole of the prediction's travel, and a re-seeded one measures
+    /// nothing.
+    #[test]
+    fn a_gap_past_the_bound_re_seeds_and_one_inside_it_does_not() {
+        let plant = PlantModel::default();
+        // The gap is how many periods the sample after the hole covers: its
+        // own, plus the slots nobody attended. So a gap of `n` is `n - 1`
+        // samples missing.
+        for gap in [MAX_GAP_PERIODS as i64, MAX_GAP_PERIODS as i64 + 1] {
+            let hole = 20..20 + gap - 1;
+            let holed: Vec<_> = frozen(60, 2.0)
+                .into_iter()
+                .filter(|logged| !hole.contains(&i64::from(logged.sequence_number)))
+                .collect();
+            let stream = residual_stream(&holed, grid(), &plant);
+            let after = at_cycle(&stream, 19 + gap);
+            if gap > MAX_GAP_PERIODS as i64 {
+                assert_eq!(after, 0.0, "a gap of {gap} periods re-seeds");
+            } else {
+                assert!(
+                    after > 0.1,
+                    "a gap of {gap} periods is walked through, and the joint did not move: \
+                     {after}"
+                );
+            }
+        }
+    }
+
+    /// A sample the driver held no setpoint on leaves the model nothing to
+    /// chase: the prediction re-seeds, and the samples until the ring is a dead
+    /// time deep again measure nothing.
+    #[test]
+    fn a_driver_holding_nothing_re_seeds_the_walk() {
+        let plant = PlantModel::default();
+        let mut samples = frozen(60, 2.0);
+        let index = driven();
+        assert!(
+            residual_stream(&samples, grid(), &plant)
+                .iter()
+                .any(|(_, residual)| residual[index] > 0.1),
+            "the stream has to measure something for the re-seed to be visible"
+        );
+
+        samples[30] = holding_nothing(30, &[0.0; ROW_COUNT]);
+        let stream = residual_stream(&samples, grid(), &plant);
+        let dead = i64::try_from(RESPONSE_DEAD_SAMPLES).expect("a few samples");
+        for n in 30..=30 + dead {
+            assert_eq!(
+                at_cycle(&stream, n),
+                0.0,
+                "cycle {n} is the re-seed and the ring filling behind it"
+            );
+        }
+        assert!(
+            at_cycle(&stream, 31 + dead) > 0.0,
+            "and then the comparison is running again"
+        );
+    }
+
+    /// The walk is over the grid and not over the log's order: a prediction is
+    /// a walk along the periods, and a sample read out of turn would step it
+    /// backwards.
+    #[test]
+    fn samples_out_of_order_walk_the_same_stream() {
+        let plant = PlantModel::default();
+        let samples = frozen(40, 2.0);
+        let ordered = residual_stream(&samples, grid(), &plant);
+        let mut shuffled = samples;
+        shuffled.reverse();
+        let reversed = residual_stream(&shuffled, grid(), &plant);
+        assert_eq!(ordered.len(), reversed.len());
+        for ((at, ours), (also, theirs)) in ordered.iter().zip(&reversed) {
+            assert_eq!(at, also);
+            assert_eq!(ours, theirs, "cycle {at}");
+        }
+    }
+
+    /// The profile is read from the fields of the file and never from the prose
+    /// around them, and a file that states no pair is a failure rather than a
+    /// default.
+    ///
+    /// The comment case is the one that would be silent: `servo_profile`'s own
+    /// comment block discusses the bench's pair, so a scan that took the first
+    /// match anywhere would judge a log under a pair nobody commissioned.
+    #[test]
+    fn a_profile_is_read_from_its_fields_and_not_from_the_comments_around_them() {
+        let dir = std::env::temp_dir();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(format!("brenn-reachy-profile-{name}.textproto"));
+            std::fs::write(&path, text).expect("a temporary file");
+            path.to_string_lossy().to_string()
+        };
+
+        let commented = write(
+            "commented",
+            "# the bench ran profile_velocity: 600\n# and profile_acceleration: 400\n\
+             profile_acceleration: 20\nprofile_velocity: 50\n",
+        );
+        assert_eq!(read_profile(&commented), Ok((20, 50)));
+
+        let partial = write("partial", "profile_acceleration: 20\n");
+        assert_eq!(
+            read_profile(&partial),
+            Err(format!("{partial} states no profile_velocity"))
+        );
+
+        let unreadable = write(
+            "unreadable",
+            "profile_acceleration: 20\nprofile_velocity: fast\n",
+        );
+        assert!(
+            read_profile(&unreadable)
+                .is_err_and(|says| says.contains("profile_velocity is no register value")),
+            "{:?}",
+            read_profile(&unreadable)
+        );
+
+        assert!(
+            read_profile(&dir.join("nothing-here.textproto").to_string_lossy())
+                .is_err_and(|says| says.contains("nothing-here")),
+            "a file that is not there is the reason it is not there"
         );
     }
 }

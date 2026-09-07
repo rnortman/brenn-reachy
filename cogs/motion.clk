@@ -380,6 +380,12 @@ cog Mover
         // The grid goals are dated on, and how long a posture change takes.
         params: Tappy<config::MoverParams>;
 
+        // The two profile registers the machine is commissioned with. What the
+        // tick builds its plant model from: the trajectory a healthy servo's
+        // own generator runs is what a joint's reading is judged against, and
+        // the session writes this same pair to the servos.
+        profile: Tappy<config::ServoProfile>;
+
         // Every clip an overlay can name, read-only. A clip's id is its index
         // here, and nothing writes this: clips are chosen before the run
         // starts, so they arrive the way the tick's own numbers do.
@@ -607,6 +613,10 @@ cog Session
         // The aux timeout and its retry budget, the two watchdog windows, and
         // the two budgets a response runs on.
         params: Tappy<config::SessionParams>;
+
+        // The two profile registers the commissioning sweep writes into all
+        // nine servos. The same file the tick models from.
+        profile: Tappy<config::ServoProfile>;
     }
 
     states
@@ -912,6 +922,17 @@ box MotionCore
         representation=Protobuf<config::SessionParams>,
         path="cogs/session_params.textproto");
     connect session_params to session.params;
+
+    // The one profile, bound to both readers. The session writes this pair into
+    // the servos and the tick models the trajectory it produces, so the two
+    // cannot disagree about what the machine's generators are doing: a screen
+    // sized on one pair over a machine commissioned with another would pass a
+    // healthy joint or fault it, and nothing in either cog could tell.
+    new servo_profile: SerializedDataFile(
+        representation=Protobuf<config::ServoProfile>,
+        path="cogs/servo_profile.textproto");
+    connect servo_profile to session.profile;
+    connect servo_profile to mover.profile;
 
     // The clips an overlay can name. Emitted from the documents under
     // `cogs/clips/` rather than authored, and read the same way the two

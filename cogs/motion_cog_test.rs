@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use brenn_reachy__cogs__config_clk_rs::{
-    ClipLibraryConfigWire, MoverParamsWire, SessionParamsWire,
+    ClipLibraryConfigWire, MoverParamsWire, ServoProfileWire, SessionParamsWire,
 };
 use brenn_reachy__cogs__motion_clk_rs_test::{
     MoverTestWrapper, PoseTestWrapper, SessionTestWrapper,
@@ -61,6 +61,7 @@ use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
     self, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
 };
+use reachy_motion::plant::RESPONSE_DEAD_SAMPLES;
 use reachy_motion::record;
 use reachy_motion::snap::PoseSnapshotError;
 use reachy_motion::tick::ResponseKind;
@@ -672,6 +673,16 @@ struct Mover {
     present: [f64; JOINT_COUNT],
     /// Rows that do not follow their goal: an obstruction, to a position loop.
     frozen: JointFlags,
+    /// What the driver reports holding, radians in bus order: the setpoint the
+    /// last goal named, which is what one holds between writes.
+    held: [f64; JOINT_COUNT],
+    /// What it reports holding instead, where a case wants the two to differ.
+    ///
+    /// The setpoint the driver held is what the modelled plant is stepped
+    /// against, and it is not the goal this cog composed: a driver holds
+    /// through a refusal and rewrites on a keep-alive. A case that sets this
+    /// drives the two apart on purpose.
+    holds: Option<[f64; JOINT_COUNT]>,
     /// Whether the samples carry a reading at all.
     blind: bool,
 }
@@ -700,12 +711,15 @@ impl Mover {
         // record is not reachable until the wrapper has stood the cog up.
         cog.initialize(SyncTime::from_nanos(T0));
         cog.set_config_params(params);
+        cog.set_config_profile(&servo_profile());
 
         Self {
             cog,
             now: T0,
             present: stow_rows(),
             frozen: JointFlags::NONE,
+            held: stow_rows(),
+            holds: None,
             blind: false,
         }
     }
@@ -813,7 +827,7 @@ impl Mover {
             torque_off_latched: false,
             missing: if self.blind { u16::MAX >> 7 } else { 0 },
             present: self.present,
-            commanded: [0.0; JOINT_COUNT],
+            commanded: self.holds.unwrap_or(self.held),
         };
         self.cog
             .publish_sample(&sample.message(), SyncTime::from_nanos(at_ns));
@@ -869,6 +883,9 @@ impl Mover {
             let Some(row) = row(joint) else {
                 continue;
             };
+            // The driver holds every row a goal named, frozen or not: a hand on
+            // a joint does not change what the servo was told.
+            self.held[row] = goal.targets[row];
             if !flags::contains(self.frozen, joint) {
                 self.present[row] = goal.targets[row];
             }
@@ -1127,6 +1144,95 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
     );
 }
 
+/// The modelled plant chases the setpoint the *driver* reported holding, and
+/// not the goal this cog composed.
+///
+/// The two are the same on a healthy loop, and every fixture in this file has
+/// them so. They come apart wherever it matters: a driver holds its last
+/// setpoint through a refusal, rewrites it as a keep-alive, and holds nothing at
+/// all before the first goal or after a release. What the tracking comparison is
+/// sized on is the distance from a trajectory the *held* setpoints produce, so a
+/// regression that handed the tick its own goal instead -- or nothing at all --
+/// would make the residual a different quantity from the one the thresholds were
+/// measured against, and would be invisible until the detector is armed.
+#[test]
+fn the_tick_chases_the_setpoint_the_driver_held_and_not_the_goal_it_composed() {
+    let mut mover = standing_up();
+    mover.run(10);
+    let yaw = row(JointRef::BodyYaw).expect("a bus row");
+    let before = state_of(mover.cog.state_ctrl().snap()).tracking[yaw].predicted;
+
+    // A driver holding half a radian of body yaw the cog never asked for.
+    let mut odd = mover.held;
+    odd[yaw] += 0.5;
+    mover.holds = Some(odd);
+    mover.run(4);
+
+    let state = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(
+        rows_of(&state.held[RESPONSE_DEAD_SAMPLES - 1]),
+        odd,
+        "the ring the prediction is stepped from is the driver's own report",
+    );
+    let after = state.tracking[yaw].predicted;
+    assert!(
+        after > before + 1e-9,
+        "the prediction set off toward the setpoint that was held ({before} to {after}), and \
+         the goal this cog emitted for that row never moved",
+    );
+    assert!(
+        after < odd[yaw],
+        "under the profile and not as a step: {after} of the {} it was told",
+        odd[yaw],
+    );
+}
+
+/// The Mover refuses an uncommissionable profile for the reason the session
+/// refuses to commission one: neither pair describes a machine, and a tick
+/// judging every joint against a trajectory nothing runs is worse than a
+/// process that will not start.
+///
+/// Asserted on the decision rather than on the panic. The configuration is
+/// built once per process, so a case that drove the panic would fix a poisoned
+/// cell for every case after it in this binary -- which is why the fallible
+/// half is a function of its own.
+#[test]
+fn a_servo_profile_of_zero_is_no_plant_for_the_mover_to_judge_against() {
+    let shipped = servo_profile();
+    let period = u64::try_from(PERIOD).expect("a period is a length of time");
+    assert!(
+        motion_cogs::commissioned_config(
+            shipped.validate().expect("the shipped pair reads"),
+            period
+        )
+        .is_ok(),
+        "the pair the deployment commissions is a plant",
+    );
+
+    for zeroed in [0, 1] {
+        let mut profile = servo_profile();
+        if zeroed == 0 {
+            profile.set_profile_velocity(0);
+        } else {
+            profile.set_profile_acceleration(0);
+        }
+        assert!(
+            motion_cogs::commissioned_config(
+                profile.validate().expect("a zeroed pair still reads"),
+                period
+            )
+            .is_err(),
+            "a zero in register {zeroed} switches the generator off on the servo",
+        );
+    }
+
+    assert!(
+        motion_cogs::commissioned_config(shipped.validate().expect("the shipped pair reads"), 0)
+            .is_err(),
+        "and a grid of no length is no grid to step a per-period model on",
+    );
+}
+
 /// Arming solves the pose the cranks hold, and a sample that carries no reading
 /// cannot be solved from. That is not a fault: nothing is under command yet, and
 /// a pre-torque problem never faults -- the cog simply tries again on the next
@@ -1334,22 +1440,17 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
     assert!(snap.mode != MotionMode::Faulted);
 }
 
-/// A jammed antenna is answered by nothing: the tracking detector ships
-/// disarmed, so a servo standing still against a goal that has left it is lag in
-/// the record. The pair stays in service, every goal keeps naming it, and the
-/// move runs to its own end.
+/// A jammed antenna is answered by letting the pair go: the detector raises
+/// `antenna_obstructed` about a joint standing still against a goal that has
+/// left it, the tick's own answer takes the pair out of service, and every goal
+/// after it says so in its mask while the head carries the move on.
 ///
-/// The stall's own arithmetic is the motion crate's
-/// (`the_shipped_detector_measures_a_stall_and_raises_nothing`); what this level
-/// says is that the goal stream went on moving through it, which is what
-/// separates a jam nothing answered from a goal stream that froze.
-///
-/// Re-arming the detector makes this a scoped release -- the pair out of service
-/// together, one raise, and every goal after saying so in its mask
-/// (`TODO(tracking-response-model)`). While it is disarmed, that behaviour is
-/// the motion crate's to cover from a config that arms it.
+/// The stall's own arithmetic is the motion crate's; what this level says is
+/// that the answer reaches the goal stream -- the pair leaves the mask, the head
+/// stays in it, and nothing latches, which is what separates a scoped release
+/// from a machine that stopped being commanded.
 #[test]
-fn a_jammed_antenna_leaves_the_pair_in_service_and_the_move_running() {
+fn a_jammed_antenna_is_answered_by_letting_the_pair_go() {
     let mut mover = standing_up();
     mover.frozen = {
         let mut set = JointFlags::NONE;
@@ -1358,28 +1459,49 @@ fn a_jammed_antenna_leaves_the_pair_in_service_and_the_move_running() {
     };
 
     let cycles = mover.run(60);
+    let raised = reports(&cycles);
+    let [report] = raised.as_slice() else {
+        panic!("one hand on one antenna is one raise: {raised:?}");
+    };
+    assert_eq!(report.kind, FaultKindWire::ANTENNA_OBSTRUCTED);
     assert!(
-        reports(&cycles).is_empty(),
-        "a stalled servo is a reading, not a condition",
+        report.detail >= default_motion_config().tracking.threshold_rad,
+        "the magnitude a fault carries is the residual that classified it",
     );
+    assert_eq!(
+        report.count,
+        default_motion_config().tracking.ticks,
+        "the count it carries is the run that ran out",
+    );
+
+    let answered = cycles
+        .iter()
+        .position(|cycle| cycle.report.is_some())
+        .expect("the obstruction was raised");
     let opening = cycles
         .first()
         .expect("the run has cycles")
         .goal
         .expect("the move is commanded from the start");
+    for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
+        assert!(
+            flags::contains(opening.mask, antenna),
+            "the pair was in service before the hand was answered",
+        );
+    }
     let mut moved = false;
-    for cycle in &cycles {
-        let goal = cycle.goal.expect("the move carries on");
-        let mask = goal.mask;
+    for cycle in &cycles[answered + 1..] {
+        let goal = cycle.goal.expect("the head is still under command");
         for antenna in [JointRef::AntennaRight, JointRef::AntennaLeft] {
             assert!(
-                flags::contains(mask, antenna),
-                "nothing took the pair out of service",
+                !flags::contains(goal.mask, antenna),
+                "the answer is the pair: an antenna still named is one nothing let go of",
             );
         }
         assert!(
-            flags::contains(mask, JointRef::BodyYaw) && flags::contains(mask, JointRef::Leg0),
-            "and the head is commanded as it always was",
+            flags::contains(goal.mask, JointRef::BodyYaw)
+                && flags::contains(goal.mask, JointRef::Leg0),
+            "and the head keeps its presence",
         );
         moved |= goal.targets != opening.targets;
     }
@@ -1388,14 +1510,20 @@ fn a_jammed_antenna_leaves_the_pair_in_service_and_the_move_running() {
     assert!(snap.mode != MotionMode::Faulted, "nothing latched");
 }
 
-/// A jammed head joint is answered by nothing either: the move is not abandoned,
-/// the goals keep naming every joint, and the machine runs the move out under
-/// command.
+/// A jammed head joint is answered by abandoning the move and holding: the
+/// detector raises `head_obstructed`, the tick stops planning and the goal
+/// stream carries the last setpoint on, which is what keeps the driver's
+/// dead-man off while the session decides what to do about it.
 ///
-/// The stall is in the samples and nowhere else. Re-arming the detector makes
-/// this an abandoned move and a hold (`TODO(tracking-response-model)`).
+/// The head has nothing to mask -- every one of its joints holds the platform up
+/// -- so what the tick does with the raise is stop asking, which is the hold.
+/// And the hold is not silence: the run reopens against a prediction settling
+/// onto the setpoint the keep-alive goes on writing, so a hand that stays on the
+/// cranks is raised about again every window, for as long as nothing ends the
+/// engagement. Nothing does here -- no session answers this cog -- so the
+/// cadence is what the run shows.
 #[test]
-fn a_jammed_crank_leaves_the_move_running_and_the_machine_under_command() {
+fn a_jammed_crank_abandons_the_move_and_holds() {
     let mut mover = standing_up();
     mover.frozen = {
         let mut set = JointFlags::NONE;
@@ -1408,23 +1536,53 @@ fn a_jammed_crank_leaves_the_move_running_and_the_machine_under_command() {
     };
 
     let cycles = mover.run(60);
-    assert!(
-        reports(&cycles).is_empty(),
-        "a jammed crank is a reading, not a condition",
-    );
-
-    let first = cycles.first().expect("the run has cycles");
-    let opening = first.goal.expect("the move is commanded from the start");
-    let mut moved = false;
-    for cycle in &cycles {
-        let goal = cycle.goal.expect("the keep-alive outlives the jam");
+    let raised = reports(&cycles);
+    let window = default_motion_config().tracking.ticks;
+    assert!(!raised.is_empty(), "a hand on the cranks is answered");
+    for report in &raised {
+        assert_eq!(report.kind, FaultKindWire::HEAD_OBSTRUCTED);
         assert_eq!(
-            goal.mask, opening.mask,
-            "nothing took a joint out of service",
+            report.count, window,
+            "the count a raise carries is the run that ran out",
         );
+    }
+    for pair in raised.windows(2) {
+        assert_eq!(
+            pair[1].time_ns - pair[0].time_ns,
+            i64::from(window) * PERIOD,
+            "a hand that stays on is raised about once a window, out of the hold",
+        );
+    }
+
+    let answered = cycles
+        .iter()
+        .position(|cycle| cycle.report.is_some())
+        .expect("the obstruction was raised");
+    let opening = cycles
+        .first()
+        .expect("the run has cycles")
+        .goal
+        .expect("the move is commanded from the start");
+    let held = cycles[answered]
+        .goal
+        .expect("the raise's own cycle is still commanded");
+    let mut moved = false;
+    for cycle in &cycles[..=answered] {
+        let goal = cycle.goal.expect("the move runs until it is answered");
         moved |= goal.targets != opening.targets;
     }
-    assert!(moved, "and the move was still being carried out");
+    assert!(moved, "the move was being carried out until the raise");
+    for cycle in &cycles[answered + 1..] {
+        let goal = cycle.goal.expect("the keep-alive outlives the raise");
+        assert_eq!(
+            goal.mask, opening.mask,
+            "a head obstruction masks nothing: there is no joint to take out of service",
+        );
+        assert_eq!(
+            goal.targets, held.targets,
+            "and the move is abandoned: what goes out is the setpoint it was holding",
+        );
+    }
     let snap = state_of(mover.cog.state_ctrl().snap());
     assert_eq!(snap.mode, MotionMode::Holding, "it holds, it does not park");
 }
@@ -2964,7 +3122,7 @@ const STARTUP_GRACE_NS: i64 = 2_000_000_000;
 const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 
 /// The servo-side profile the commissioning sweep writes, register units: the
-/// pair `cogs/session_params.textproto` ships.
+/// pair `cogs/servo_profile.textproto` ships.
 ///
 /// Restated here for a different reason from the three above it. Zero in either
 /// register is a servo running unlimited, which is what a configuration missing
@@ -2974,6 +3132,18 @@ const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 /// file.
 const PROFILE_ACCELERATION: u32 = 20;
 const PROFILE_VELOCITY: u32 = 50;
+
+/// The environment variable naming the shipped profile, relative to the
+/// runfiles root.
+const SERVO_PROFILE_ENV: &str = "SERVO_PROFILE";
+
+/// A `ServoProfileWire` carrying the test's profile constants.
+fn servo_profile() -> ServoProfileWire {
+    let mut profile = ServoProfileWire::new();
+    profile.set_profile_acceleration(PROFILE_ACCELERATION);
+    profile.set_profile_velocity(PROFILE_VELOCITY);
+    profile
+}
 
 /// The watchdog timeout the sweep arms, in the register's 20 ms units, and for
 /// the same reason as the pair above: zero is the register disabled, which the
@@ -3000,21 +3170,35 @@ const RAIL_STALE_AFTER_NS: i64 = 2_200_000_000;
 /// to the runfiles root, which is a test's working directory.
 const SESSION_PARAMS_ENV: &str = "SESSION_PARAMS";
 
-/// What the shipped configuration states for `field`.
+/// What the shipped session configuration states for `field`.
+fn shipped_session_figure(field: &str) -> String {
+    shipped_figure(SESSION_PARAMS_ENV, field)
+}
+
+/// What the shipped profile states for `field`.
+fn shipped_profile_figure(field: &str) -> String {
+    shipped_figure(SERVO_PROFILE_ENV, field)
+}
+
+/// What the file `env` names states for `field`.
 ///
 /// Panics on a missing file or a missing field — either is a broken test
 /// target or a name that has moved, not a case.
-fn shipped_session_figure(field: &str) -> String {
-    let path = std::env::var(SESSION_PARAMS_ENV).unwrap_or_else(|_| {
+fn shipped_figure(env: &str, field: &str) -> String {
+    let path = std::env::var(env).unwrap_or_else(|_| {
         panic!(
-            "{SESSION_PARAMS_ENV} is unset: the test target has to name the file beside the data \
-             attribute that supplies it"
+            "{env} is unset: the test target has to name the file beside the data attribute that \
+             supplies it"
         )
     });
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!("{SESSION_PARAMS_ENV} names {path}, which does not read: {error}")
-    });
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{env} names {path}, which does not read: {error}"));
     text.lines()
+        // Comments are not fields. These files carry comment blocks that
+        // discuss other values of the same names -- the bench's servo profile
+        // among them -- so a scan over every line could compare a restated
+        // figure against prose rather than against the deployment.
+        .filter(|line| !line.trim_start().starts_with('#'))
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.trim() == field)
         .map(|(_, value)| value.trim().to_string())
@@ -3035,8 +3219,6 @@ fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() 
         ("startup_grace_ns", STARTUP_GRACE_NS.to_string()),
         ("stow_budget_ns", STOW_BUDGET_NS.to_string()),
         ("torque_off_confirm_budget_ns", 500_000_000_i64.to_string()),
-        ("profile_acceleration", PROFILE_ACCELERATION.to_string()),
-        ("profile_velocity", PROFILE_VELOCITY.to_string()),
         ("bus_watchdog", BUS_WATCHDOG.to_string()),
         ("script_span_cap_ms", SCRIPT_SPAN_CAP_MS.to_string()),
         ("rail_stale_after_ns", RAIL_STALE_AFTER_NS.to_string()),
@@ -3045,6 +3227,16 @@ fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() 
             shipped_session_figure(field),
             restated,
             "cogs/session_params.textproto states another {field} than the cases here run on"
+        );
+    }
+    for (field, restated) in [
+        ("profile_acceleration", PROFILE_ACCELERATION.to_string()),
+        ("profile_velocity", PROFILE_VELOCITY.to_string()),
+    ] {
+        assert_eq!(
+            shipped_profile_figure(field),
+            restated,
+            "cogs/servo_profile.textproto states another {field} than the cases here run on"
         );
     }
 }
@@ -3080,8 +3272,6 @@ fn session_params() -> SessionParamsWire {
     params.set_startup_grace_ns(STARTUP_GRACE_NS);
     params.set_stow_budget_ns(STOW_BUDGET_NS);
     params.set_torque_off_confirm_budget_ns(500_000_000);
-    params.set_profile_acceleration(PROFILE_ACCELERATION);
-    params.set_profile_velocity(PROFILE_VELOCITY);
     params.set_bus_watchdog(u8::try_from(BUS_WATCHDOG).expect("the watchdog count is one byte"));
     params.set_script_span_cap_ms(SCRIPT_SPAN_CAP_MS);
     params.set_rail_stale_after_ns(RAIL_STALE_AFTER_NS);
@@ -3108,6 +3298,7 @@ fn session() -> SessionTestWrapper {
     cog.input_readings_set_num_slots(16);
     cog.initialize(SyncTime::from_nanos(T0));
     cog.set_config_params(&session_params());
+    cog.set_config_profile(&servo_profile());
     cog
 }
 
@@ -4289,8 +4480,8 @@ fn a_timeline_this_build_cannot_read_publishes_nothing() {
 
 /// A servo profile of zero is refused before anything is commissioned.
 ///
-/// The pair lives in two configuration fields whose absence parses to zeros.
-/// Zero in those two
+/// The pair lives in a configuration file of its own whose absence parses to
+/// zeros. Zero in those two
 /// registers is a servo with no rate limit at all -- the opposite of the
 /// backstop the pair is written for -- so the session stops the process at its
 /// first execution, with the machine de-torqued and nothing commanded, rather
@@ -4299,9 +4490,9 @@ fn a_timeline_this_build_cannot_read_publishes_nothing() {
 #[should_panic(expected = "execute() failed")]
 fn a_servo_profile_of_zero_is_not_a_machine_this_session_commissions() {
     let mut cog = session();
-    let mut params = session_params();
-    params.set_profile_velocity(0);
-    cog.set_config_params(&params);
+    let mut profile = servo_profile();
+    profile.set_profile_velocity(0);
+    cog.set_config_profile(&profile);
     drive(&mut cog, FIRST_WAKE);
 }
 
@@ -9155,6 +9346,207 @@ fn a_servo_dropping_out_mid_stow_re_commands_it_on_the_clock_it_had() {
          judged by",
     );
     assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
+}
+
+/// A hand that stays on the head defeats the stow it raised, and the machine is
+/// let go of where it stands.
+///
+/// The armed detector's headline path. The first raise answers with the stow to
+/// rest; the stow drives the goal down through the held cranks, so the joint is
+/// off where the plant says it stands again and the detector raises a second
+/// time inside the maneuver. A head obstruction names no motor to mask, so there
+/// is nothing for the maneuver to expand onto and re-commanding the fold would
+/// grind it into whatever is holding the head. What the second raise gets is the
+/// maneuver's end: one outcome, fallen through, with clock still in hand -- the
+/// clock is not what ended it -- and the release on that same wake. No second
+/// response is selected, because the ladder never begins a second answer.
+#[test]
+fn a_head_obstruction_mid_stow_defeats_it_and_the_machine_is_let_go_at_rest() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    let grabbed = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.7,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    coast(&mut cog, grabbed, 4);
+    let first = stow_held(&cog);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::WINDING_DOWN);
+
+    let again = grabbed + 5 * LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            again,
+            0.9,
+        ),
+        SyncTime::from_nanos(again),
+    );
+    let ran = coast(&mut cog, again, 4);
+
+    assert_eq!(
+        kinds(&ran.told),
+        vec![
+            ReportKindWire::FAULT_RECORDED,
+            ReportKindWire::WINDDOWN_OUTCOME,
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCHEDULE_PUBLISHED,
+        ],
+        "the condition, the maneuver's end, the phase and the schedule nobody is \
+         running -- and no second answer: {:?}",
+        ran.told,
+    );
+    let outcome = ran
+        .told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::WINDDOWN_OUTCOME)
+        .expect("the maneuver ended");
+    assert_eq!(
+        outcome.a,
+        u32::from(WindDownOutcomeWire::FELL_THROUGH.0),
+        "nothing was stowed: the fold was defeated",
+    );
+    assert_eq!(
+        outcome.b, 0,
+        "a grabbed head is rest-class however it ended"
+    );
+    assert!(
+        outcome.detail > 0.0,
+        "and it ended with clock in hand, so the clock is not what ended it: \
+         {outcome:?}",
+    );
+    assert!(
+        ran.asks
+            .iter()
+            .any(|ask| ask.kind == SessionCmdKindWire::TORQUE_OFF_NOW),
+        "the machine is let go of where it stands: {:?}",
+        ran.asks,
+    );
+    assert_eq!(
+        cog.state_sess().phase(),
+        SessionPhaseWire::RESTING,
+        "and the next wake builds a fresh session rather than recovering this one",
+    );
+    assert!(!cog.state_sess().winddown().active());
+    assert_eq!(
+        ran.published,
+        vec![Published {
+            engaged: false,
+            epoch: first.epoch + 1,
+            steps: 1,
+        }],
+        "the fold is not commanded again -- the only schedule published is the \
+         one nobody is running: {:?}",
+        ran.published,
+    );
+}
+
+/// The same defeat inside a park-class stow leaves the machine parked.
+///
+/// The sticky maximum, on the way out: a maneuver opened for a head servo that
+/// dropped out is judged by the ending that asks more of whoever finds the
+/// machine, and a rest-class condition defeating it does not soften that. The
+/// fall-through is the same fall-through; where it leaves the machine is the
+/// park the maneuver already carried.
+#[test]
+fn a_head_obstruction_defeating_a_masked_park_stow_still_parks_the_machine() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    let dropped = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_SERVO_FAULT,
+            JointRefWire::LEG_2,
+            dropped,
+            0.0,
+        ),
+        SyncTime::from_nanos(dropped),
+    );
+    coast(&mut cog, dropped, 4);
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::WINDING_DOWN);
+
+    let grabbed = dropped + 5 * LAPSE_NS;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.9,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    let ran = coast(&mut cog, grabbed, 4);
+
+    let outcome = ran
+        .told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::WINDDOWN_OUTCOME)
+        .expect("the maneuver ended");
+    assert_eq!(outcome.a, u32::from(WindDownOutcomeWire::FELL_THROUGH.0));
+    assert_eq!(
+        outcome.b, 1,
+        "the park the maneuver was already judged by stands",
+    );
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::PARKED);
+    assert!(cog.state_sess().torque_off_pending());
+}
+
+/// A maneuver that comes back from its slot already defeated ends on the next
+/// step.
+///
+/// The defeat is a field of the record rather than anything held across a call,
+/// which is what makes it survive a restart mid-maneuver: a host that persisted
+/// the slot between the raise and the step it acts on resumes a maneuver that
+/// still knows the fold cannot be driven through what was raised. Written into
+/// the slot here, which is what such a slot reads back as.
+#[test]
+fn a_defeated_maneuver_read_back_out_of_the_slot_falls_through() {
+    let mut cog = resting_session();
+    let mut bus = Bus::healthy();
+    engagement(&mut cog, &mut bus);
+    everything(&mut cog, FIRST_WAKE + 300 * 1_000_000);
+
+    let grabbed = FIRST_WAKE + 1_000 * 1_000_000;
+    cog.publish_fault(
+        &raise(
+            FaultKindWire::HEAD_OBSTRUCTED,
+            JointRefWire::LEG_0,
+            grabbed,
+            0.7,
+        ),
+        SyncTime::from_nanos(grabbed),
+    );
+    coast(&mut cog, grabbed, 4);
+    assert!(cog.state_sess().winddown().active());
+    assert!(
+        !cog.state_sess().winddown().defeated(),
+        "a maneuver just opened has nothing standing against it",
+    );
+
+    cog.state_sess_mut().winddown_mut().set_defeated(true);
+
+    let stepped_at = grabbed + 5 * LAPSE_NS;
+    let ran = coast(&mut cog, stepped_at, 3);
+    let outcome = ran
+        .told
+        .iter()
+        .find(|report| report.kind == ReportKindWire::WINDDOWN_OUTCOME)
+        .expect("the maneuver ended on the step after the record said so");
+    assert_eq!(outcome.a, u32::from(WindDownOutcomeWire::FELL_THROUGH.0));
+    assert!(!cog.state_sess().winddown().active());
+    assert_eq!(cog.state_sess().phase(), SessionPhaseWire::RESTING);
 }
 
 /// A condition that stops trusting control ends the maneuver on the wake it

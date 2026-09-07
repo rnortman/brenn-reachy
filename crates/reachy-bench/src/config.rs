@@ -487,6 +487,38 @@ mod tests {
     /// The example shipped beside the crate, which an operator copies.
     const EXAMPLE: &str = include_str!("../reachy-bench.example.toml");
 
+    /// The profile register units, as the two layers that hold them state them.
+    ///
+    /// The wire layer owns the conversion and the motion layer restates the
+    /// scale, because the two share no crate; this crate depends on both and is
+    /// therefore the only place the restatement can be checked. A scale wrong
+    /// on the motion side is a plant model predicting a machine that does not
+    /// exist, which no test on either side alone would notice.
+    #[test]
+    fn the_motion_layers_profile_units_are_the_wire_layers() {
+        assert_eq!(
+            reachy_motion::plant::PROFILE_VELOCITY_UNIT_RAD_PER_S,
+            dxl_proto::conv::PROFILE_VELOCITY_UNIT_RAD_PER_S
+        );
+        assert_eq!(
+            reachy_motion::plant::PROFILE_ACCELERATION_UNIT_RAD_PER_S2,
+            dxl_proto::conv::PROFILE_ACCELERATION_UNIT_RAD_PER_S2
+        );
+        // And the pair the model is built from is the pair the conversion
+        // yields, once the control period is folded in.
+        let plant = reachy_motion::PlantModel::default();
+        let (acceleration, velocity) = reachy_motion::SHIPPED_PROFILE;
+        let period_s = reachy_motion::SHIPPED_PERIOD_NS as f64 * 1e-9;
+        assert_eq!(
+            plant.v_max,
+            dxl_proto::conv::profile_velocity_rad_per_s(velocity) * period_s
+        );
+        assert_eq!(
+            plant.a_max,
+            dxl_proto::conv::profile_acceleration_rad_per_s2(acceleration) * period_s * period_s
+        );
+    }
+
     /// The bounds the motion layer refuses a goal or a stored pin on are count
     /// bounds, and this is the one place the two layers that hold them meet:
     /// the motion layer states them over its own copy of the count frame, and

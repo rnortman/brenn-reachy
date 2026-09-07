@@ -19,13 +19,18 @@
 //!
 //! The limp pair is then commanded to fold with everything else, because the
 //! schedule's last step is the stow the session ends at. They cannot: nothing
-//! holds them any more. The tracking detector ships disarmed, so that is lag in
-//! the record and no second condition -- the head reaches the fold, the antennas
-//! stay where they were when they let go, the goals keep naming them, and the
-//! release the session ends at reports the fold it could not measure. That the
-//! run survives it is the consequence this scenario is here to show. Re-arming
-//! the detector puts a raise inside the fold and a second drain after it
-//! (`TODO(tracking-response-model)`).
+//! holds them any more. That is the run's second condition, and it is the same
+//! one answered twice: the tick's tracking detector sees a pair standing still
+//! against a goal that keeps moving and raises `antenna_obstructed` inside the
+//! fold, the session answers it with the group-scoped de-torque again, and a
+//! second drain writes torque off a pair that is already limp -- which is what
+//! "nothing gates de-torquing" permits.
+//!
+//! And the session still carries on: the head reaches the fold, the antennas
+//! stay where they were when they let go, the goals name the rows still in
+//! service, and the release the session ends at reports the fold it could not
+//! measure. That the run survives all of it is the consequence this scenario is
+//! here to show.
 //!
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. The instants are all cycle counts from the epoch, because the
@@ -36,7 +41,7 @@ use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointGroup, JointRef, flags};
 use scenario::author::Step;
-use scenario::{answered_within, cycle_at, cycles_for, run_end_cycle, up_clocks};
+use scenario::{answered_within, cycle_at, cycles_for, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
 // begins, the cycle a script may first be taken on, and the cycle the machine
@@ -63,20 +68,28 @@ pub use scenario::ACTED_ON_ERROR_BITS as ERROR_BITS;
 /// antennas have arrived, they hold the angle they reached, follow a goal that no
 /// longer moves perfectly, and raise nothing until the fold is commanded.
 ///
-/// The margin is a settle: the move is given its whole budget -- the longest
-/// clock any group of it runs on, which is an antenna's, since the pair is
-/// parted at its crossing and arrives after the head does -- and the cycle it
-/// arrives on is the last of that budget rather than a cycle this file counts.
+/// The margin is a settle past the travel: the move's own clock is not when the
+/// antennas get there, because the pair is parted at its crossing and then
+/// chases a min-jerk goal faster than the servos' profile, so the cycle that
+/// matters is the one the stepped plant stands them on their target.
 pub const SETTLE_CYCLES: i64 = 5;
 
 /// How long the upright step lasts, in cycles.
 ///
-/// Long enough for the machine to arrive, for the rotation to have taken a whole
-/// lap of the bus after the byte was written, and for the pair to have been let
-/// go of well inside it -- and then to hold: a goal stream that stopped when the
-/// machine arrived would trip the driver's dead-man, and this step is long enough
-/// that it would. The checker asserts the fit rather than trusting this number.
-pub const UP_CYCLES: i64 = 200;
+/// Everything answering the byte costs -- the travel, the settle, the lap the
+/// rotation may take to carry the byte, and a wake per verified write -- and
+/// then room to hold: a goal stream that stopped when the machine arrived would
+/// trip the driver's dead-man, and this step outlasts the drain so that the fold
+/// is commanded to a pair that has already let go. An expression rather than a
+/// number, because every term of it is the machine's own arithmetic -- which
+/// also makes the fold coming after the drain structural rather than something
+/// to assert. What the checker measures in the log is the premise arithmetic
+/// cannot give it: that the pair had stopped travelling before the byte, and
+/// that the drain really did land inside the allowance this leaves it.
+#[must_use]
+pub fn up_cycles() -> i64 {
+    released_by_cycle() - up_start_cycle() + SETTLE_CYCLES
+}
 
 /// How long the stow step lasts, in cycles: the move plus room to arrive and
 /// hold. S1's number, because the fold is S1's fold -- what differs is that two
@@ -109,7 +122,7 @@ pub fn degraded_rows() -> JointFlags {
 /// The cycle the servo's error byte is written.
 #[must_use]
 pub fn fault_cycle() -> i64 {
-    up_start_cycle() + up_clocks().cycles() + SETTLE_CYCLES
+    up_start_cycle() + scenario::up_travel() + SETTLE_CYCLES
 }
 
 /// The cycle the session must have answered the condition by.
@@ -146,7 +159,7 @@ const WAKE_ALLOWANCE_NS: i64 = scenario::SESSION_WAKE_FLOOR_NS;
 /// The cycle the stow step begins.
 #[must_use]
 pub fn stow_start_cycle() -> i64 {
-    up_start_cycle() + UP_CYCLES
+    up_start_cycle() + up_cycles()
 }
 
 /// The cycle the schedule runs out on, which is what ends the session.

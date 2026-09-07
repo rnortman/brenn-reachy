@@ -30,22 +30,25 @@ use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use log_read::Logged;
+use motion_cogs::session_bus::disarm_config;
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use reachy_kin::wrap_to_pi;
 use reachy_motion::arm;
+use reachy_motion::disarm::at_stow;
 use reachy_motion::joints::{
-    JointGroup, JointRef, JointTargets, Name, ROW_COUNT, flags, group_of, joint_ref, row, rows_of,
+    JointRef, JointTargets, Name, ROW_COUNT, flags, joint_ref, row, rows_of,
 };
 use reachy_motion::record;
+use reachy_motion::tick::MotionConfig;
 
 use crate::read::Run;
 use crate::{
     BUS_WATCHDOG, COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS,
     FIRST_CYCLE, LAG_K, MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY,
     RAIL_STALE_AFTER_NS, REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS,
-    SLEW_ANTENNAS_RAD, SLEW_BODY_YAW_RAD, SLEW_LEGS_RAD, commission_transactions, cycle_at,
-    cycle_of, cycle_within, cycles_for, drain_cycle, engage_cycles, rail_watch_transactions,
+    commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for, drain_cycle,
+    engage_cycles, rail_watch_transactions,
 };
 
 /// How far the plant may be from the posture it was sent to, in metres and in
@@ -54,9 +57,8 @@ use crate::{
 /// tight enough that a machine which stopped half way fails.
 pub const ARRIVAL_TOLERANCE: f64 = 1e-3;
 
-/// How much room a per-cycle step gets over the configured slew before it counts
-/// as a jump. The motion library's own step bound and the plant's slew are the
-/// same numbers, so a well-formed goal stream sits exactly on this line; the
+/// How much room a per-cycle step gets over the planner's own bound before it
+/// counts as a jump. A well-formed goal stream sits exactly on that line; the
 /// slack is for the last fractional cycle of a move, not for a policy.
 pub const STEP_SLACK: f64 = 1e-9;
 
@@ -362,7 +364,7 @@ fn one_stream(
             }
             for (row, before) in was.iter().enumerate() {
                 let step = (targets[row] - before).abs();
-                let Some(cap) = slew_of(row) else {
+                let Some(cap) = step_bound_of(row) else {
                     travel.push(
                         format!(
                             "the goal decided at {nominal} speaks for row {row}, which sits on no \
@@ -376,7 +378,7 @@ fn one_stream(
                     travel.push(
                         format!(
                             "the goal decided at {nominal} moves row {row} by {step} rad in one \
-                             cycle, past the {cap} rad the plant can travel"
+                             cycle, past the {cap} rad the planner bounds itself to"
                         ),
                         failures,
                     );
@@ -464,20 +466,17 @@ impl PerGoal {
     }
 }
 
-/// How far the modelled servo on `row` travels in one cycle, radians, or `None`
-/// for a row no joint of this machine sits on.
+/// The planner's own per-tick step bound for `row`, radians, or `None` for a row
+/// no joint of this machine sits on.
 ///
-/// Off the joint's own group rather than off the row number, so a machine whose
-/// rows moved keeps its antennas' figure with its antennas. Every group is
-/// named: a row of no group would otherwise be given some group's number, and a
-/// bound taken from the wrong group permits a jump the plant cannot make.
+/// The bound the decision tick refuses its own composed setpoints past, read off
+/// the shipped configuration rather than restated here. What it bounds is the
+/// plan and only the plan: the servos run their own profile, which is slower
+/// than this, and a goal stream stepping further than a servo can travel in a
+/// cycle is content the machine lags rather than a stream that is malformed.
 #[must_use]
-pub fn slew_of(row: usize) -> Option<f64> {
-    Some(match group_of(joint_ref(row)?)? {
-        JointGroup::Antennas => SLEW_ANTENNAS_RAD,
-        JointGroup::BodyYaw => SLEW_BODY_YAW_RAD,
-        JointGroup::Legs => SLEW_LEGS_RAD,
-    })
+pub fn step_bound_of(row: usize) -> Option<f64> {
+    Some(MotionConfig::default().max_step.for_joint(joint_ref(row)?))
 }
 
 /// The goal stream starts with the session: not before the engagement, and
@@ -1075,6 +1074,31 @@ pub fn answered_on_its_wake(what: &str, at: i64, sent_on: i64, failures: &mut Ve
     }
 }
 
+/// The session answered a message on the wake that read it: that cycle or the
+/// next, and never before it.
+///
+/// A message is a wake with no floor under it -- the session wakes on every
+/// fault it is sent -- so what stands between a raise being published and the
+/// session acting on it is the one execution that reads it. An answer dated
+/// earlier than the message is an answer to something else, and one dated later
+/// is a session that slept through a wake it was given. `what` is what is being
+/// dated.
+pub fn answered_on_the_message(what: &str, at: i64, published: i64, failures: &mut Vec<String>) {
+    if at < published {
+        failures.push(format!(
+            "the {what} is dated cycle {at}, before the message it answers was published on \
+             {published}"
+        ));
+    }
+    if at > published + 1 {
+        failures.push(format!(
+            "the {what} is dated cycle {at}, and the message it answers was published on \
+             {published}: a message is a wake with no floor, so it is answered on the wake that \
+             read it"
+        ));
+    }
+}
+
 /// The session let go promptly: within one wake of the instant its schedule ran
 /// out.
 ///
@@ -1404,6 +1428,123 @@ pub fn narration(run: &Run, expected: &[ReportKindWire], failures: &mut Vec<Stri
     }
 }
 
+/// One response the session selected, dated.
+pub struct Answer {
+    /// The cycle the response was decided on.
+    pub at: i64,
+    /// The response kind, as the report numbers it.
+    pub response: u32,
+}
+
+/// One wind-down maneuver's ending, dated.
+pub struct Outcome {
+    /// The cycle the maneuver concluded on.
+    pub at: i64,
+    /// The outcome kind, as the report numbers it.
+    pub outcome: u32,
+    /// The disposition the maneuver concluded with: park or rest.
+    pub disposition: u32,
+    /// Seconds of the maneuver's one clock still unspent when it concluded.
+    pub left_s: f64,
+}
+
+/// One group the session reported letting go of, dated.
+pub struct Release {
+    /// The cycle the drain reported finishing on.
+    pub at: i64,
+    /// The response the drain answered, as the report numbers it.
+    pub response: u32,
+    /// The rows it let go of, as the report numbers the set.
+    pub rows: u32,
+}
+
+/// What the session narrated about its answers, with every other kind of report
+/// allowed by name.
+pub struct Narrated {
+    /// Every response selected, in order.
+    pub answers: Vec<Answer>,
+    /// Every maneuver ending, in order.
+    pub outcomes: Vec<Outcome>,
+    /// Every group release, in order.
+    pub releases: Vec<Release>,
+}
+
+impl Narrated {
+    /// The responses alone, which is what a scenario expecting one answer of
+    /// one kind compares.
+    #[must_use]
+    pub fn responses(&self) -> Vec<u32> {
+        self.answers.iter().map(|answer| answer.response).collect()
+    }
+
+    /// The maneuver endings as the pair a scenario names them by: the outcome
+    /// and the disposition it concluded with.
+    #[must_use]
+    pub fn endings(&self) -> Vec<(u32, u32)> {
+        self.outcomes
+            .iter()
+            .map(|outcome| (outcome.outcome, outcome.disposition))
+            .collect()
+    }
+}
+
+/// The session's answers, collected, and every kind of report it told that this
+/// run has no business producing.
+///
+/// The allow-list is the assertion's teeth: a scenario names every kind its run
+/// can narrate, so a report it never expected fails rather than passing unseen.
+/// One statement of the list rather than one per checker, because the next kind
+/// the session learns to tell has to be admitted deliberately by each run that
+/// can produce it -- and a copy of the loop per scenario is a copy that keeps
+/// passing when the list moves under it.
+///
+/// The three kinds a scenario reasons about are collected *and* have to be
+/// allowed, so a run that admits `response_taken` and not `winddown_outcome` is
+/// a run whose maneuver ending is a failure rather than an empty vector.
+/// `why` says what the run is, for the line a stray kind produces.
+pub fn narrated(
+    run: &Run,
+    allowed: &[ReportKindWire],
+    why: &str,
+    failures: &mut Vec<String>,
+) -> Narrated {
+    let mut told = Narrated {
+        answers: Vec::new(),
+        outcomes: Vec::new(),
+        releases: Vec::new(),
+    };
+    for report in &run.reports {
+        let kind = report.message.kind();
+        if !allowed.contains(&kind) {
+            failures.push(format!(
+                "the session narrated {kind:?} at {}, and this run is {why}",
+                report.message.time().as_nanos()
+            ));
+            continue;
+        }
+        let at = cycle_within(report.message.time().as_nanos());
+        match kind {
+            ReportKindWire::RESPONSE_TAKEN => told.answers.push(Answer {
+                at,
+                response: report.message.a(),
+            }),
+            ReportKindWire::WINDDOWN_OUTCOME => told.outcomes.push(Outcome {
+                at,
+                outcome: report.message.a(),
+                disposition: report.message.b(),
+                left_s: report.message.detail(),
+            }),
+            ReportKindWire::DEGRADE_RELEASED => told.releases.push(Release {
+                at,
+                response: report.message.a(),
+                rows: report.message.b(),
+            }),
+            _ => {}
+        }
+    }
+    told
+}
+
 /// The joint a report names, or `None` where it names none or names a servo this
 /// build's vocabulary has not got.
 #[must_use]
@@ -1614,6 +1755,70 @@ pub fn faults_recorded(
         ));
     }
     found
+}
+
+/// One fault a run carries, as a scenario reads it.
+pub struct Raise {
+    /// The cycle it was raised on.
+    pub at: i64,
+    /// What was raised.
+    pub kind: FaultKindWire,
+    /// The magnitude the fault carries: for a tracking fault, the residual
+    /// that classified it.
+    pub detail: f64,
+    /// The run length the fault carries: for a tracking fault, the window that
+    /// ran out.
+    pub count: u32,
+}
+
+/// Every fault in the run, in the order they were raised.
+///
+/// The stream a scenario about a raise reasons over, read once: which faults,
+/// when, and what each carried. How many there are and how far apart they sit
+/// is each scenario's own claim; [`raise_carries`] is what they all say.
+#[must_use]
+pub fn raises(run: &Run) -> Vec<Raise> {
+    run.faults
+        .iter()
+        .map(|fault| Raise {
+            at: cycle_within(fault.message.time().as_nanos()),
+            kind: fault.message.kind(),
+            detail: fault.message.detail(),
+            count: fault.message.count(),
+        })
+        .collect()
+}
+
+/// What every raise of a tracking obstruction carries, whatever the scenario:
+/// the kind the condition names, the window that ran out, and a residual past
+/// the screen that classified it.
+///
+/// The doctrine rather than any one run: a fault carries the run it ran out on
+/// and the magnitude that decided it, so a scenario asserting only the kind and
+/// the instant would keep passing over a fault that had lost its evidence.
+/// `what` names the condition for the failure lines.
+pub fn raise_carries(raise: &Raise, kind: FaultKindWire, what: &str, failures: &mut Vec<String>) {
+    let cfg = MotionConfig::default();
+    if raise.kind != kind {
+        failures.push(format!(
+            "the tick raised {:?} at cycle {}, and {what} is {kind:?}",
+            raise.kind, raise.at
+        ));
+    }
+    if raise.count != cfg.tracking.ticks {
+        failures.push(format!(
+            "the raise at cycle {} carried a run of {} ticks, and a window is {}: the count a \
+             fault carries is the run it ran out on",
+            raise.at, raise.count, cfg.tracking.ticks
+        ));
+    }
+    if raise.detail < cfg.tracking.threshold_rad {
+        failures.push(format!(
+            "the raise at cycle {} measured {} rad, inside the {} rad it screens on: the \
+             magnitude a fault carries is the residual that classified it",
+            raise.at, raise.detail, cfg.tracking.threshold_rad
+        ));
+    }
 }
 
 /// The decision tick reported nothing.
@@ -1978,6 +2183,46 @@ pub fn outage(run: &Run, blind: Range<i64>, failures: &mut Vec<String>) {
 #[must_use]
 pub fn present_rows(sample: &PoseSampleWire) -> [f64; ROW_COUNT] {
     sample.present().validate().map(rows_of).unwrap_or_default()
+}
+
+/// The nine setpoints a sample says the driver was holding, in bus order, or
+/// `None` where it held none.
+///
+/// [`present_rows`]' sibling, off the same sample: what the machine was being
+/// commanded at, which is the other half of what a joint's behaviour is read
+/// against. `None` rather than zeros, because a driver holding nothing is a
+/// fact about the run and a zero would misreport it as a pose.
+#[must_use]
+pub fn commanded_rows(sample: &PoseSampleWire) -> Option<[f64; ROW_COUNT]> {
+    if !sample.commanded_valid() {
+        return None;
+    }
+    sample.commanded().validate().ok().map(rows_of)
+}
+
+/// Whether the machine was standing at the fold on `cycle`, by the maneuver's
+/// own measure, or `None` where the log has no readable sample for it.
+///
+/// The maneuver's own tolerance and not a posture arrival: what ends a stow is
+/// `at_stow` over the driver's sample, and a tighter number here would be a
+/// checker's opinion of a fold rather than the one the machine was measured
+/// against. The verdict is the caller's, because a completed stow and a
+/// defeated one are the same reading with opposite expectations. `why` says
+/// what the cycle is.
+pub fn folded_at(run: &Run, cycle: i64, why: &str, failures: &mut Vec<String>) -> Option<bool> {
+    let sample = sample_at_or(run, cycle, why, failures)?;
+    match sample.present().validate() {
+        Ok(present) => Some(at_stow(
+            disarm_config(),
+            &reachy_motion::joints::vector_of(present),
+        )),
+        Err(complaint) => {
+            failures.push(format!(
+                "the sample at cycle {cycle} holds no reading: {complaint}"
+            ));
+            None
+        }
+    }
 }
 
 /// The sample the driver published for `cycle`, if the log has one.
@@ -2482,21 +2727,96 @@ pub fn stands_still_rows(
     }
 }
 
+/// `rows` are being held to one setpoint: every sample from `from_cycle`
+/// through `through_cycle` holds each of them within `within_rad` of what the
+/// sample at `from_cycle` held.
+///
+/// [`stands_still_rows`]' opposite side of the bus. That one says the machine
+/// did not move; this one says nothing asked it to. What a scenario wants it
+/// for is a premise about the modelled generator: the prediction chases the
+/// setpoint the driver reported holding, so a setpoint that has not moved for
+/// longer than the ramp and the response delay together is a trajectory that
+/// has come to rest, which is a fact about the run rather than about the walk
+/// the scenario derived its instants over.
+///
+/// `within_rad` is the distance that counts as unchanged -- zero for a setpoint
+/// asserted to be exactly the one that was already out, and the detector's
+/// progress minimum for a lead-in asserted not to have got going. `why` says
+/// what the stretch is.
+///
+/// A sample the driver held nothing on is skipped: a released machine is
+/// commanded nothing, which is a different assertion, and the sample at
+/// `from_cycle` holding nothing is a scenario that named the wrong cycle.
+pub fn commanded_stands_still_rows(
+    run: &Run,
+    rows: JointFlags,
+    from_cycle: i64,
+    through_cycle: i64,
+    within_rad: f64,
+    why: &str,
+    failures: &mut Vec<String>,
+) {
+    let Some(held) = sample_at(run, from_cycle).and_then(commanded_rows) else {
+        failures.push(format!(
+            "no sample for cycle {from_cycle} holds a setpoint, where {why}"
+        ));
+        return;
+    };
+    for sample in &run.samples {
+        let sample = &sample.message;
+        let Ok(cycle) = cycle_of(sample.nominal_time().as_nanos()) else {
+            continue;
+        };
+        if cycle < from_cycle || cycle > through_cycle {
+            continue;
+        }
+        let Some(commanded) = commanded_rows(sample) else {
+            continue;
+        };
+        for joint in flags::iter(rows) {
+            let Some(row) = row(joint) else {
+                failures.push(format!("{} sits on no bus row", Name(joint)));
+                continue;
+            };
+            if (commanded[row] - held[row]).abs() > within_rad {
+                failures.push(format!(
+                    "the setpoint held for {} stands {} rad on cycle {cycle}, past the \
+                     {within_rad} rad this stretch allows it from the {} rad it was on at cycle \
+                     {from_cycle}, where {why}",
+                    Name(joint),
+                    commanded[row],
+                    held[row]
+                ));
+                return;
+            }
+        }
+    }
+}
+
 /// Run one scenario's checker: read the log the harness produced, put the
 /// scenario's assertions to it, and report every way it failed them.
 ///
-/// The three arguments and the one-failure-per-line report are the harness's
+/// The arguments and the one-failure-per-line report are the harness's
 /// protocol rather than any one scenario's, so they are stated here: a checker's
 /// own source is then the list of assertions, which is what a reader of it came
 /// for.
 pub fn main(name: &str, assert: impl FnOnce(&Run, &mut Vec<String>)) -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [log_dir, mover_params, session_params, sim_params] = args.as_slice() else {
-        eprintln!("usage: {name} <output-log-dir> <mover-params> <session-params> <sim-params>");
+    let [log_dir, configs @ ..] = args.as_slice() else {
+        eprintln!("usage: {name} <output-log-dir> <config-textproto>...");
         return ExitCode::FAILURE;
     };
+    let paths = match crate::ConfigPaths::of(configs) {
+        Ok(paths) => paths,
+        Err(missing) => {
+            for line in missing {
+                eprintln!("{name}: {line}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let mut failures = crate::check_params(mover_params, session_params, sim_params);
+    let mut failures = crate::check_params(&paths);
     let run = match Run::read(&PathBuf::from(log_dir)) {
         Ok(run) => run,
         Err(err) => {

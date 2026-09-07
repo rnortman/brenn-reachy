@@ -88,21 +88,32 @@ pub const WINDOW_CYCLES: i64 = TIP_CYCLES + GAP_CYCLES + CLOSE_AFTER_SWAY_CYCLES
 
 /// How long after its step begins the window opens, in cycles.
 ///
-/// Past the move to the upright posture, so the base the motion is composed over
-/// is a machine standing still: what the goal stream then carries over the
-/// window is the layer's contribution and nothing else.
-pub const WINDOW_AFTER_STEP_CYCLES: i64 = 60;
+/// Past the travel the move to the upright posture takes at the servos' own
+/// profile, so the base the motion is composed over is a machine standing still:
+/// what the goal stream then carries over the window is the layer's contribution
+/// and nothing else. The move's clock runs out long before the machine arrives,
+/// so this is a travel expression and not that clock.
+#[must_use]
+pub fn window_after_step_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
 /// How long the upright step lasts, in cycles.
 ///
-/// The move, the window, and then room for the contribution the close hands back
-/// to decay and for the machine to be standing upright again before the step
-/// ends.
-pub const UP_CYCLES: i64 = 200;
+/// The travel, the window, and then room for the contribution the close hands
+/// back to decay and for the machine to be standing upright again before the
+/// step ends.
+#[must_use]
+pub fn up_cycles() -> i64 {
+    window_after_step_cycles() + WINDOW_CYCLES + scenario::posture_step_cycles()
+}
 
-/// How long the stow step lasts, in cycles: the longer move plus room to arrive
-/// and hold.
-pub const STOW_CYCLES: i64 = 150;
+/// How long the stow step lasts, in cycles: the travel the fold takes at the
+/// servos' own profile, plus room to settle onto it.
+#[must_use]
+pub fn stow_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
 /// The delta the hold between the segments stands at, radians.
 ///
@@ -114,7 +125,7 @@ pub const HOLD_RAD: f64 = 0.1;
 /// The cycle the window opens on.
 #[must_use]
 pub fn window_open_cycle() -> i64 {
-    up_start_cycle() + WINDOW_AFTER_STEP_CYCLES
+    up_start_cycle() + window_after_step_cycles()
 }
 
 /// The cycle the window closes on, which is the first cycle it no longer covers.
@@ -164,13 +175,13 @@ pub fn absorbed_cycle() -> i64 {
 /// The cycle the stow step begins.
 #[must_use]
 pub fn stow_start_cycle() -> i64 {
-    up_start_cycle() + UP_CYCLES
+    up_start_cycle() + up_cycles()
 }
 
 /// The cycle the schedule runs out on, which is what ends the session.
 #[must_use]
 pub fn disengage_cycle() -> i64 {
-    stow_start_cycle() + STOW_CYCLES
+    stow_start_cycle() + stow_cycles()
 }
 
 /// The cycle the second script is sent on.

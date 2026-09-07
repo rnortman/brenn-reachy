@@ -29,8 +29,8 @@ fn main() -> ExitCode {
 ///
 /// S1's two messages, with three more after them: the hand that jams the head
 /// cranks, the hand that takes it back off, and the script the machine is asked
-/// to run once the first session's schedule has run out. Everything the scenario
-/// is about follows from those three.
+/// to run once the obstruction has been answered and it is resting. Everything
+/// the scenario is about follows from those three.
 fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     let mut log = InputLog::create(dir)?;
     log.begin(cycle_at(START_CYCLE))?;
@@ -39,15 +39,19 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     // The jam. A jammed servo on this machine holds where it stands, which is
     // what the modelled plant does with an obstructed row: the scenario is not
     // asking what a servo does when something pushes back, it is asking what
-    // the control loop does about a joint that stopped arriving.
+    // the control loop does about a joint that stopped arriving. Both instants
+    // are derived from the stepped walk of the raise -- where the hand has to
+    // land for a run to open on it, and how soon it has to come off for the
+    // stow the raise commands to survive.
     let jammed = JointFlagsWire::from(jammed_rows());
     log.obstruct(cycle_at(obstruct_cycle()), jammed)?;
     log.release(cycle_at(release_cycle()), jammed)?;
 
-    // The second engagement. Nothing latched the machine -- the jam was lag and
-    // not a fault -- so the session ends on its own schedule and a script sent
-    // after it is taken, which is the half of the park/rest split no other run
-    // in the suite says anything about.
+    // The second engagement. Nothing latched the machine -- an obstruction is
+    // answered by carrying it down to the Minimum Risk Condition, which is rest
+    // and not park -- so a script sent after that ending is taken, which is the
+    // half of the park/rest split no other run in the suite says anything
+    // about.
     log.script(
         cycle_at(second_script_cycle()),
         SECOND_SCRIPT_ID,

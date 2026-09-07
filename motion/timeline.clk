@@ -125,6 +125,15 @@ schema WindDownSnap
         // it: what to command is its answer, and whether the command has
         // already gone out is the host's bookkeeping.
         #3 commanded_epoch: UInt32;
+
+        // Whether a condition the running stow cannot be driven through was
+        // raised: the next step concludes the maneuver as fallen through rather
+        // than commanding the fold again. A stow that names no motor to mask
+        // answers a joint that is being held back, and re-commanding the fold
+        // into whatever is holding it grinds where yielding is the point.
+        // Cleared with the rest of the record when a maneuver opens, so it only
+        // ever describes the one that is running.
+        #4 defeated: Bool;
     }
 }
 

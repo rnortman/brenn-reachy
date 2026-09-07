@@ -54,10 +54,14 @@
 //! (`motion/timeline.clk`). An operator line, a status file and an alert are all
 //! renderings of those values; none of them is the record.
 //!
-//! Motion is shaped host-side because the servos have none of their own: a goal
-//! position is applied as an immediate step. Every gentle movement in this system
-//! is an interpolation computed here, checked against the envelope on each tick,
-//! and emitted as a bounded increment.
+//! Motion is shaped host-side. The servos do have a shape of their own — a
+//! velocity-and-acceleration profile the commissioning sweep writes, which
+//! [`plant`] models — but it is a rate backstop and not a shaper: it cannot
+//! interpolate a pose, cannot run an envelope check, and cannot be told what a
+//! move is. Every gentle movement in this system is an interpolation computed
+//! here, checked against the envelope on each tick, and emitted as a bounded
+//! increment; the profile is what a healthy joint's answer to those increments
+//! is predicted from.
 
 #![forbid(unsafe_code)]
 
@@ -85,6 +89,7 @@ pub mod disarm;
 pub mod fault;
 pub mod joints;
 pub mod phase;
+pub mod plant;
 pub mod postures;
 pub mod record;
 pub mod seq;
@@ -112,6 +117,10 @@ pub use phase::{
     ANTENNA_CONTACT_BAND_RAD, ANTENNA_PHASE_SEPARATION_RAD, AntennaPhaseConfig, PhaseSeparation,
     PhaseWatch, mirror_offset,
 };
+pub use plant::{
+    MAX_GAP_PERIODS, PlantError, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS,
+    SHIPPED_PROFILE,
+};
 pub use postures::{NEUTRAL_ANTENNAS, neutral_targets, stow_pose_targets};
 pub use resume::{GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError};
 pub use seq::{
@@ -120,7 +129,7 @@ pub use seq::{
 };
 pub use snap::{
     BusSourceKind, DurationError, FkFailureKind, FkFieldError, MotionMode, PoseSnapshot,
-    PoseSnapshotError, TrackingSideKind, duration_from_nanos, duration_nanos, fk_cause, fk_fields,
+    PoseSnapshotError, duration_from_nanos, duration_nanos, fk_cause, fk_fields,
 };
 pub use stillness::{
     COUNT_RAD, DRIVER_PERIOD, HoldWindow, MAX_EXCURSION_RAD, Sample, StillnessConfig,

@@ -92,18 +92,50 @@ Nothing has been released, and nothing here has driven a motor.
   solution rather than clamping them. Audio sidecars (`.ogg` files shipped
   with the emotions set) are copied alongside their clips.
 
-- **Content plays without a speed ceiling, and the tracking detector ships
-  disarmed.** The per-tick step bound and the clip speed policy derived from it
-  were sized off two hand-recorded gestures and refused seven vendor clips
-  outright. Both are removed: a clip carries no ceiling, a composed setpoint is
-  not step-guarded, and the per-tick step bound guards only the moves this repo
-  plans for itself. The tracking detector (`head_obstructed`,
-  `antenna_obstructed`) judged a joint against its goal using direction
-  heuristics calibrated on the same two gestures; it now ships disarmed and
-  measures every run without raising, until a plant model fitted to the
-  library-run recordings replaces what it judges against.
+- **The tracking detector is armed and judges every joint against a plant model
+  of the servo's own trajectory generator.** The servos run a trapezoidal
+  velocity profile whose two parameters — the velocity cap and the acceleration
+  — are the registers the commissioning sweep already writes. A new plant model
+  (`reachy_motion::plant`) predicts where each joint should be by stepping that
+  profile against the setpoints the driver reported holding, with a three-sample
+  dead time fitted on the recorded library tour. A joint whose reading diverges
+  from its prediction by more than 0.6 rad for 200 ms is obstructed; a joint
+  that is behind but still moving at half the profile velocity or better is slow,
+  not stuck, and keeps its window restarting. The servo profile is a single
+  checked-in file read by both the session (which writes it to the servos) and
+  the motion tick (which models it), and the simulated driver runs the same
+  model from its own register cells, so the deterministic suite pins the
+  response ladder against a plant that matches the real machine. Five trace
+  fixtures cut from the recorded library tour and wake gesture pin the worst
+  residual at each profile and assert that a healthy machine never raises. A
+  hand held on the head that does not let go is answered in about two seconds:
+  the first raise begins a stow, the second raise — when the stow drives into
+  the hand — defeats it, and the machine is released where it stands.
+
+- **Content plays without a speed ceiling.** The per-tick step bound and the
+  clip speed policy derived from it were sized off two hand-recorded gestures
+  and refused seven vendor clips outright. Both are removed: a clip carries no
+  ceiling, a composed setpoint is not step-guarded, and the per-tick step bound
+  guards only the moves this repo plans for itself.
 
 ### Changed
+
+- **A head obstruction during a stow defeats the stow.** Previously a
+  `head_obstructed` raise inside a running stow re-commanded the stow into the
+  obstruction until the four-second budget expired. The session host now
+  recognises that a stow naming no motor to mask cannot be driven through an
+  obstruction: the maneuver is concluded as fallen through and the machine is
+  released on the next wake. A grab that holds the head for longer than the
+  raise latency (~0.7 s) during a wind-down drops it where it is instead of
+  folding it, which is the fault-management doctrine's own trade.
+
+- **The simulated driver runs the servo profile, not a per-class slew rate.**
+  The three configured slew distances and the transport-delay injection are
+  replaced by the plant model stepping each row's profile registers. Every
+  arrival instant in the deterministic suite is now an expression over the
+  travel that profile needs, derived from the planner's own setpoint stream
+  rather than from pre-computed integers. Scenario S14 (new) pins the
+  grab-that-does-not-let-go end to end.
 
 - **The clip library asset carries motions, and sequence documents load
   again.** `ClipConfig` gained a derived `max_speed` — the highest invocation

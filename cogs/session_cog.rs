@@ -38,7 +38,7 @@
 use crate::session_bus::{self, Datagram, Delivery, Entered, Timing};
 use crate::session_ladder::{self, Budgets};
 use crate::session_stow;
-use brenn_reachy__cogs__config_clk_rs::SessionParams;
+use brenn_reachy__cogs__config_clk_rs::{ServoProfile, SessionParams};
 use brenn_reachy__cogs__motion_clk_rs::{SessionDial, SessionSignals};
 use brenn_reachy__cogs__schedule_clk_rs::{
     OverlayWindowWire, PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
@@ -170,6 +170,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     let now = dial.start_time().as_nanos();
 
     let params: &SessionParams = configured(dial.configs.params, "the session's");
+    let profile: &ServoProfile = configured(dial.configs.profile, "the servo profile's");
     let budgets = Budgets::of(params);
     let screens = Screens::of(params);
     let timing = Timing {
@@ -182,9 +183,13 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
     // chooses; everything else in it is a hardware fact the motion library
     // states once. Delivered by initialising the record rather than by carrying
     // it: the machinery that needs it reaches the one copy.
+    //
+    // The two profile registers come off their own file, which the decision
+    // tick reads as well: what this host writes to the servos and what that
+    // tick models their generators with are one pair of numbers.
     session_bus::init_arm_config(ProfileConfig {
-        acceleration: params.profile_acceleration,
-        velocity: params.profile_velocity,
+        acceleration: profile.profile_acceleration,
+        velocity: profile.profile_velocity,
         bus_watchdog: params.bus_watchdog,
     });
 

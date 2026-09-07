@@ -5,8 +5,8 @@
 //! `scenario::check`; what is here is the chain a complaining servo sets off --
 //! the condition read off the driver's rotation and classified as the head's,
 //! the masked stow to park selected once, the jam mid-maneuver that held the
-//! cranks and left them lagging their goal while the disarmed tracking detector
-//! raised nothing about it, the head reaching the fold
+//! cranks for less than the armed tracking detector's own raise latency and so
+//! was answered by nothing, the head reaching the fold
 //! on the maneuver's own clock, the park, the release, and the script that finds
 //! a machine nothing will engage.
 
@@ -18,10 +18,8 @@ use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, ResponseKindWire};
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::WindDownOutcomeWire;
-use motion_cogs::session_bus::disarm_config;
 use reachy_motion::default_motion_config;
-use reachy_motion::disarm::at_stow;
-use reachy_motion::joints::{Name, flags, row, vector_of};
+use reachy_motion::joints::{Name, flags, row};
 use reachy_motion::tick::ResponseKind;
 use scenario::check;
 use scenario::read::Run;
@@ -105,17 +103,33 @@ fn main() -> ExitCode {
         //
         // The masked stow runs on the one clock it was opened with, and the jam
         // that arrives while it is running stalls the head against a fold it is
-        // still being commanded toward. The tracking detector is disarmed, so
-        // that stall is lag in the samples and no raise: the maneuver is never
-        // re-commanded, and the machine reaches the fold on the clock the first
-        // condition bought it. Rearming the detector puts a `HEAD_OBSTRUCTED`
-        // raise back inside this window and the stow back on the re-commanded
-        // path (`TODO(tracking-response-model)`).
+        // still being commanded toward. The hand is on the cranks for the
+        // detector's crossing distance and no longer -- the fewest periods a
+        // generator at the profile could open a run in, and the fold's lead-in
+        // is nowhere near the profile -- so the brush is below the raise
+        // latency and no run opens: the maneuver is never defeated, and the
+        // machine reaches the fold on the clock the first condition bought it.
+        // A hand held past that latency raises inside this window, which is
+        // S14's run.
         check::no_faults(run, failures);
         check_the_answer(run, failures);
         check::stows(run, carried_down, failures);
         check_the_jam_lands_inside_the_maneuver(carried_down, parked, failures);
-        check_jam_held(run, failures);
+        // The scenario's hand really was on the machine: the jammed cranks do
+        // not move at all for as long as the jam lasts. The premise of
+        // everything above -- what this run asserts about the jam is that
+        // nothing was raised about it, which a run where nothing stalled would
+        // satisfy for the wrong reason. The window ends before the release: an
+        // injection takes effect on the cycle it names, so the sample for the
+        // release cycle already shows the rows moving again.
+        check::stands_still_rows(
+            run,
+            jammed_rows(),
+            jam_cycle(),
+            jam_release_cycle() - 1,
+            "held by a hand while the maneuver carried the head down",
+            failures,
+        );
         check_the_jam_was_a_lag(run, failures);
         check_the_fold(run, parked, failures);
         // The script that arrived after all of it, refused as parked: a sender
@@ -183,40 +197,36 @@ fn check_when_it_was_answered(carried_down: Option<i64>, failures: &mut Vec<Stri
 /// for here, so a report this run has no business producing fails rather than
 /// passing unseen.
 fn check_the_answer(run: &Run, failures: &mut Vec<String>) {
-    let mut answers = Vec::new();
-    let mut outcomes = Vec::new();
-    for report in &run.reports {
-        match report.message.kind() {
-            ReportKindWire::PHASE_CHANGED
-            | ReportKindWire::SCRIPT_ACCEPTED
-            | ReportKindWire::SCRIPT_REFUSED
-            | ReportKindWire::SCHEDULE_PUBLISHED
-            | ReportKindWire::FAULT_RECORDED
-            | ReportKindWire::TORQUE_OFF_CONFIRMED => {}
-            ReportKindWire::RESPONSE_TAKEN => answers.push(report.message.a()),
-            ReportKindWire::WINDDOWN_OUTCOME => {
-                outcomes.push((report.message.a(), report.message.b()));
-            }
-            other => failures.push(format!(
-                "the session narrated {other:?} at {}, and this run is a complaining servo \
-                 answered under control",
-                report.message.time().as_nanos()
-            )),
-        }
-    }
+    let told = check::narrated(
+        run,
+        &[
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCRIPT_ACCEPTED,
+            ReportKindWire::SCRIPT_REFUSED,
+            ReportKindWire::SCHEDULE_PUBLISHED,
+            ReportKindWire::FAULT_RECORDED,
+            ReportKindWire::TORQUE_OFF_CONFIRMED,
+            ReportKindWire::RESPONSE_TAKEN,
+            ReportKindWire::WINDDOWN_OUTCOME,
+        ],
+        "a complaining servo answered under control",
+        failures,
+    );
     let masked = u32::from(ResponseKindWire::from(ResponseKind::MaskedSlowStowToPark).0);
-    if answers != vec![masked] {
+    if told.responses() != vec![masked] {
         failures.push(format!(
-            "the session selected {answers:?}, and a head servo in trouble is answered once with \
-             the masked stow to park ({masked}): a second answer would be a second clock over one \
-             machine"
+            "the session selected {:?}, and a head servo in trouble is answered once with the \
+             masked stow to park ({masked}): a second answer would be a second clock over one \
+             machine",
+            told.responses()
         ));
     }
     let completed = u32::from(WindDownOutcomeWire::COMPLETED.0);
-    if outcomes != vec![(completed, 1)] {
+    if told.endings() != vec![(completed, 1)] {
         failures.push(format!(
-            "the maneuver ended as {outcomes:?}, and this run's hand comes off in time for the \
-             head to be measured at the fold, with the park the first condition decided"
+            "the maneuver ended as {:?}, and this run's hand comes off in time for the head to \
+             be measured at the fold, with the park the first condition decided",
+            told.endings()
         ));
     }
 }
@@ -232,18 +242,11 @@ fn check_the_fold(run: &Run, parked: Option<i64>, failures: &mut Vec<String>) {
     let Some(parked) = parked else {
         return;
     };
-    let Some(sample) = check::sample_at_or(run, parked, "measured at the fold", failures) else {
-        return;
-    };
-    match sample.present().validate() {
-        Ok(present) if at_stow(disarm_config(), &vector_of(present)) => {}
-        Ok(_) => failures.push(format!(
+    if check::folded_at(run, parked, "measured at the fold", failures) == Some(false) {
+        failures.push(format!(
             "the machine the session let go of on cycle {parked} is not at the fold, and the \
              maneuver it ended reported the head measured there"
-        )),
-        Err(complaint) => failures.push(format!(
-            "the sample at cycle {parked} holds no reading: {complaint}"
-        )),
+        ));
     }
     // And it is left there. Nothing is streamed to a parked machine and its
     // torque is off, so a machine that moved after this moved with nobody
@@ -289,57 +292,18 @@ fn check_the_jam_lands_inside_the_maneuver(
     }
 }
 
-/// The scenario's hand really was on the machine: the jammed cranks do not move
-/// at all for as long as the jam lasts.
-///
-/// The premise of everything above. With the tracking detector disarmed, what
-/// this run asserts about the jam is that nothing was raised about it -- which a
-/// run where nothing stalled would satisfy for the wrong reason. S2 states the
-/// same thing about its own jam and this is that assertion.
-///
-/// The window ends at the release rather than including it: an injection takes
-/// effect on the cycle it names, so the sample for the release cycle already
-/// shows the rows moving again.
-fn check_jam_held(run: &Run, failures: &mut Vec<String>) {
-    let from = jam_cycle();
-    let Some(held) = check::sample_at(run, from).map(check::present_rows) else {
-        failures.push(format!(
-            "no sample for cycle {from}, where the cranks are jammed"
-        ));
-        return;
-    };
-    for cycle in from..jam_release_cycle() {
-        let Some(sample) = check::sample_at(run, cycle).map(check::present_rows) else {
-            failures.push(format!("no sample for cycle {cycle}, inside the jam"));
-            return;
-        };
-        for joint in flags::iter(jammed_rows()) {
-            let Some(row) = row(joint) else {
-                failures.push(format!("{} sits on no bus row", Name(joint)));
-                continue;
-            };
-            if sample[row] != held[row] {
-                failures.push(format!(
-                    "at cycle {cycle} the jammed {} reads {}, having stood at {} when the jam \
-                     settled: the plant let a jammed row move",
-                    Name(joint),
-                    sample[row],
-                    held[row]
-                ));
-                return;
-            }
-        }
-    }
-}
-
 /// The jam is a lag in the record: some jammed crank ends it sitting further
-/// from its goal than the disarmed detector's own threshold.
+/// from its goal than the detector's own threshold.
 ///
-/// This is what makes the absent raise a statement. The maneuver goes on
-/// commanding the head toward the fold while the hand holds the cranks, so the
-/// distance between the goal and the position is what an armed detector would
-/// have screened on -- the same run re-read with the detector armed is the one
-/// that raises.
+/// This is what makes the absent raise a statement: the hand really did stop
+/// the machine closing on the fold it was being commanded to, so the run is
+/// about a stall and not about a machine nothing happened to.
+///
+/// A lag against the goal, which is not the figure the detector screens on --
+/// what it measures is the distance to the joint's own generator, and under the
+/// fold's lead-in that generator had not travelled the screen's distance in the
+/// periods the hand was on. So the two figures are the point: radians behind
+/// the goal, and nothing raised.
 fn check_the_jam_was_a_lag(run: &Run, failures: &mut Vec<String>) {
     let threshold = default_motion_config().tracking.threshold_rad;
     let at = jam_release_cycle() - 1;

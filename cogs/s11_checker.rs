@@ -7,12 +7,15 @@
 //! out and let go of the machine at rest, with the same five phase changes and
 //! the same two schedules S1 has.
 //!
-//! What is here is the group-scoped answer. The condition read off the driver's
-//! rotation and classified as the antennas'; the two verified torque-off writes
-//! the session issues itself; the report that says the pair let go; the tick
-//! taking the limp pair out of service when the fold is commanded and carrying
-//! the move on with what remains; the head reaching that fold; and the release
-//! reporting the antennas it could not find there.
+//! What is here is the group-scoped answer, twice. The condition read off the
+//! driver's rotation and classified as the antennas'; the two verified
+//! torque-off writes the session issues itself; the report that says the pair
+//! let go; the tick taking the limp pair out of service when the fold is
+//! commanded and carrying the move on with what remains; the
+//! `antenna_obstructed` the detector raises about a pair that cannot follow that
+//! fold, and the second drain that answers it over rows already limp; the head
+//! reaching that fold; and the release reporting the antennas it could not find
+//! there.
 //!
 //! Every failure is collected rather than thrown, so one run reports everything
 //! that was wrong with it.
@@ -28,7 +31,7 @@ use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use motion_cogs::session_bus::disarm_config;
 use reachy_kin::wrap_to_pi;
 use reachy_motion::arm::row_of_id;
-use reachy_motion::joints::{Name, ROWS, flags, row};
+use reachy_motion::joints::{Name, ROW_COUNT, ROWS, flags, row};
 use reachy_motion::tick::ResponseKind;
 use scenario::check;
 use scenario::check::present_rows;
@@ -37,8 +40,8 @@ use scenario::read::Run;
 use scenario::{stow_clocks, up_clocks};
 
 use s11_scenario::{
-    SCRIPT_ID, STOW_CYCLES, UP_CYCLES, answered_by_cycle, degraded_rows, disengage_cycle,
-    end_cycle, fault_cycle, faulted_joint, released_by_cycle, script_sent_cycle, stow_start_cycle,
+    SCRIPT_ID, STOW_CYCLES, answered_by_cycle, degraded_rows, disengage_cycle, end_cycle,
+    fault_cycle, faulted_joint, released_by_cycle, script_sent_cycle, stow_start_cycle, up_cycles,
     up_start_cycle,
 };
 
@@ -68,37 +71,42 @@ fn main() -> ExitCode {
         }
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
-        check::room("upright", UP_CYCLES, &up_clocks(), failures);
+        check::room("upright", up_cycles(), &up_clocks(), failures);
         check::room("stow", STOW_CYCLES, &stow_clocks(), failures);
-        check_the_answer_fits_the_posture(failures);
+        check_the_answer_fits_the_posture(run, failures);
 
-        // The one condition of this run, and nothing else: the servo's own
+        // The two conditions of this run, and nothing else. The servo's own
         // account of itself, once -- the byte latches in the servo and the
         // rotation carries it on every lap, so a session that recorded what it
         // read would fill the timeline with one standing condition at the poll
-        // rate. The pair that stops closing on the fold once nothing holds it is
-        // no second condition: the tracking detector ships disarmed, so a limp
-        // antenna commanded to move is lag in the record and is answered by
-        // nothing. Re-arming it puts an `antenna_obstructed` raise inside the
-        // fold and a second drain after it
-        // (`TODO(tracking-response-model)`).
+        // rate. And the pair that cannot follow the fold once nothing holds it,
+        // which the tick raises about while the fold is being commanded: also
+        // once, because the answer takes the pair out of the tick's own service
+        // and a masked row is stepped and never judged.
         check::faults_recorded(
             run,
-            &[check::Expected {
-                kind: FaultKindWire::ANTENNA_SERVO_FAULT,
-                rows: flags::bit(faulted_joint()),
-                from: fault_cycle(),
-                through: answered_by_cycle(),
-                how_many: check::Recorded::Times(1),
-                raised_by_tick: false,
-                why: "the antenna complaining about itself",
-            }],
+            &[
+                check::Expected {
+                    kind: FaultKindWire::ANTENNA_SERVO_FAULT,
+                    rows: flags::bit(faulted_joint()),
+                    from: fault_cycle(),
+                    through: answered_by_cycle(),
+                    how_many: check::Recorded::Times(1),
+                    raised_by_tick: false,
+                    why: "the antenna complaining about itself",
+                },
+                check::Expected {
+                    kind: FaultKindWire::ANTENNA_OBSTRUCTED,
+                    rows: degraded_rows(),
+                    from: stow_start_cycle(),
+                    through: disengage_cycle(),
+                    how_many: check::Recorded::Times(1),
+                    raised_by_tick: true,
+                    why: "the limp pair not following the fold",
+                },
+            ],
             failures,
         );
-        // And the tick's own channel is empty, which is this run's subject: the
-        // limp pair is commanded to fold and answers with nothing, so a raise
-        // here of any kind would be a detector that came back armed.
-        check::no_faults(run, failures);
         check_the_answer(run, failures);
         check_the_writes(run, engaged.map(|engaged| engaged.released), failures);
         // The pair really did let go: from the cycle the drain must have
@@ -130,92 +138,95 @@ fn main() -> ExitCode {
 }
 
 /// The answer: every response this run selected is the group-scoped de-torque,
-/// and the pair it released is the pair.
+/// and the pair it released is the pair, twice.
 ///
-/// The doctrine's one response scoped to a group. Nothing is stowed and nothing
-/// is parked: an antenna pair going limp while the head keeps its presence is a
-/// fault answered, so a `winddown_outcome` or a response of any other kind here
-/// would be a session that ended over a condition it was supposed to survive.
+/// The doctrine's one response scoped to a group, and the one rung a machine can
+/// be answered with twice: nothing is stowed and nothing is parked, so a
+/// `winddown_outcome` or a response of any other kind here would be a session
+/// that ended over a condition it was supposed to survive.
 ///
 /// And nothing else is narrated. Every kind the session can tell is accounted
 /// for here, so a report this run has no business producing fails rather than
 /// passing unseen.
 fn check_the_answer(run: &Run, failures: &mut Vec<String>) {
-    let mut answers = Vec::new();
-    let mut releases = Vec::new();
-    for report in &run.reports {
-        match report.message.kind() {
-            ReportKindWire::PHASE_CHANGED
-            | ReportKindWire::SCRIPT_ACCEPTED
-            | ReportKindWire::SCHEDULE_PUBLISHED
-            | ReportKindWire::FAULT_RECORDED
-            | ReportKindWire::SESSION_ENDED
-            | ReportKindWire::TORQUE_OFF_CONFIRMED => {}
-            ReportKindWire::RESPONSE_TAKEN => {
-                answers.push((
-                    cycle_within(report.message.time().as_nanos()),
-                    report.message.a(),
-                ));
-            }
-            ReportKindWire::DEGRADE_RELEASED => releases.push((
-                cycle_within(report.message.time().as_nanos()),
-                report.message.a(),
-                report.message.b(),
-            )),
-            other => failures.push(format!(
-                "the session narrated {other:?} at {}, and this run is a pair let go of by a \
-                 session that carried on",
-                report.message.time().as_nanos()
-            )),
-        }
-    }
+    let told = check::narrated(
+        run,
+        &[
+            ReportKindWire::PHASE_CHANGED,
+            ReportKindWire::SCRIPT_ACCEPTED,
+            ReportKindWire::SCHEDULE_PUBLISHED,
+            ReportKindWire::FAULT_RECORDED,
+            ReportKindWire::SESSION_ENDED,
+            ReportKindWire::TORQUE_OFF_CONFIRMED,
+            ReportKindWire::RESPONSE_TAKEN,
+            ReportKindWire::DEGRADE_RELEASED,
+        ],
+        "a pair let go of by a session that carried on",
+        failures,
+    );
     let degrade = u32::from(ResponseKindWire::from(ResponseKind::DegradeAntennas).0);
-    if answers.is_empty() {
+    if told.answers.is_empty() {
         failures.push(
             "the session selected no response: a servo's own error byte is evidence of a \
              condition, and the condition has an answer"
                 .to_string(),
         );
     }
-    for (at, response) in &answers {
-        if *response != degrade {
+    for answer in &told.answers {
+        if answer.response != degrade {
             failures.push(format!(
-                "the session selected response {response} at cycle {at}, and an antenna in \
-                 trouble is answered by letting the pair go ({degrade}): every other rung ends \
-                 the session"
+                "the session selected response {} at cycle {}, and an antenna in trouble is \
+                 answered by letting the pair go ({degrade}): every other rung ends the session",
+                answer.response, answer.at
             ));
         }
     }
     let pair = u32::from(JointFlagsWire::from(degraded_rows()).0);
-    for (at, response, rows) in &releases {
-        if *response != degrade || *rows != pair {
+    for release in &told.releases {
+        if release.response != degrade || release.rows != pair {
             failures.push(format!(
-                "the session released rows {rows} for response {response} at cycle {at}, and this \
-                 maneuver is the antenna pair ({pair}) let go of by the group-scoped de-torque \
-                 ({degrade})"
+                "the session released rows {} for response {} at cycle {}, and this maneuver is \
+                 the antenna pair ({pair}) let go of by the group-scoped de-torque ({degrade})",
+                release.rows, release.response, release.at
             ));
         }
     }
-    // One condition, so one drain: the servo's own byte, answered while the
+    // Two conditions, so two drains: the servo's own byte, answered while the
     // machine held its working posture and inside the wakes one verified write
-    // apiece takes. The fold the limp pair cannot join raises nothing while the
-    // tracking detector is disarmed, so nothing asks for the group again.
-    match (releases.first(), releases.len()) {
-        (Some((first, ..)), 1) => {
-            if *first < fault_cycle() || *first > released_by_cycle() {
+    // apiece takes; and the pair failing to follow the fold, answered inside the
+    // step that commands it. The second drain writes torque off rows that are
+    // already limp, which is the doctrine's rule that nothing gates
+    // de-torquing -- an answer scoped to a group is issued whether or not the
+    // group is still holding.
+    match told.releases.as_slice() {
+        [first, second] => {
+            if first.at < fault_cycle() || first.at > released_by_cycle() {
                 failures.push(format!(
-                    "the pair was released at cycle {first}, outside the {}..{} one verified write \
-                     per wake takes",
+                    "the pair was released at cycle {}, outside the {}..{} one verified write per \
+                     wake takes",
+                    first.at,
                     fault_cycle(),
                     released_by_cycle()
                 ));
             }
+            if second.at < stow_start_cycle() || second.at > disengage_cycle() {
+                failures.push(format!(
+                    "the pair was released a second time at cycle {}, outside the {}..{} the fold \
+                     the limp pair cannot follow is commanded in",
+                    second.at,
+                    stow_start_cycle(),
+                    disengage_cycle()
+                ));
+            }
         }
         _ => failures.push(format!(
-            "the session released the pair on cycles {:?}: this run has one condition in it -- \
-             the byte the servo holds -- answered by draining the group once, and the fold the \
-             limp pair cannot join is answered by nothing",
-            releases.iter().map(|(at, ..)| *at).collect::<Vec<_>>()
+            "the session released the pair on cycles {:?}: this run has two conditions in it -- \
+             the byte the servo holds, and the fold the limp pair cannot follow -- each answered \
+             by draining the group",
+            told.releases
+                .iter()
+                .map(|release| release.at)
+                .collect::<Vec<_>>()
         )),
     }
 }
@@ -367,38 +378,57 @@ fn check_the_release_says_what_it_could_not_find(run: &Run, failures: &mut Vec<S
     }
 }
 
-/// The scenario still describes the run it claims to: the byte is written after
-/// the antennas have arrived, and the whole answer to it fits inside the step
-/// they are holding.
+/// The scenario still describes the run it claims to: the pair had finished
+/// travelling before the byte was written.
 ///
-/// Both are arithmetic over numbers this file does not own -- how long the
-/// upright move is given, how long a lap of the driver's rotation takes, how long
-/// the session's wake floor is -- and a move in any of them hollows the run out in
-/// a way every assertion below would report as something else. A pair let go of
-/// while it was still travelling would stall away from goals that keep moving,
-/// and the tick would raise about the antennas inside the upright step: the
-/// obstruction this run places after the fold would then be a different one, on a
-/// cycle decided by where the rotation happened to be. So the ordering is
-/// asserted rather than described.
-fn check_the_answer_fits_the_posture(failures: &mut Vec<String>) {
-    // The whole move rather than the configured duration: the antennas are the
-    // group whose clock the floor lengthens, and they are the pair this guard is
-    // about.
-    let arrived = up_start_cycle() + up_clocks().cycles();
-    if fault_cycle() < arrived {
-        failures.push(format!(
-            "the servo's byte is written on cycle {} and the antennas are still travelling until \
-             {arrived}: a pair let go of mid-move stops closing on goals that keep moving, which \
-             is a raise this run does not place",
-            fault_cycle()
-        ));
+/// Measured in the samples rather than derived from the scenario's own
+/// arithmetic. A pair let go of while it was still travelling would stall away
+/// from goals that keep moving, and the tick would raise about the antennas
+/// inside the upright step: the obstruction this run places after the fold
+/// would then be a different one, on a cycle decided by where the rotation
+/// happened to be. What that failure looks like in the log is a pair whose last
+/// moving reading is *after* the byte -- they stopped because they were let go
+/// of, not because they arrived -- so that is the reading this asserts, and it
+/// holds however the travel, the rotation's lap or the wake floor move.
+///
+/// The other half of the ordering -- the answer finished before the fold is
+/// commanded -- is structural rather than asserted: the upright step is defined
+/// as the drain plus a settle (`s11_scenario::up_cycles`), so the fold cannot
+/// be commanded before the drain's own allowance. What makes it observable is
+/// the release window in [`check_the_answer`], which dates the first drain
+/// inside that allowance from the log.
+fn check_the_answer_fits_the_posture(run: &Run, failures: &mut Vec<String>) {
+    let mut moved: Option<i64> = None;
+    let mut stood: Option<[f64; ROW_COUNT]> = None;
+    for cycle in up_start_cycle()..stow_start_cycle() {
+        let Some(reads) = check::sample_at(run, cycle).map(present_rows) else {
+            continue;
+        };
+        if let Some(before) = stood {
+            for joint in flags::iter(degraded_rows()) {
+                if let Some(row) = row(joint)
+                    && reads[row] != before[row]
+                {
+                    moved = Some(cycle);
+                }
+            }
+        }
+        stood = Some(reads);
     }
-    if released_by_cycle() >= stow_start_cycle() {
-        failures.push(format!(
-            "the pair is allowed until cycle {} to let go and the fold is commanded on {}: the \
-             answer to the byte has to be finished before the run asks the limp pair to move",
-            released_by_cycle(),
+    match moved {
+        None => failures.push(format!(
+            "neither antenna moved at all between cycles {} and {}, where this run has them \
+             travelling to the working posture before anything is wrong with them",
+            up_start_cycle(),
             stow_start_cycle()
-        ));
+        )),
+        Some(moved) if moved > fault_cycle() => failures.push(format!(
+            "an antenna was still moving on cycle {moved} and the servo's byte is written on {}: \
+             a pair whose last movement is after the byte was let go of mid-move, which stalls it \
+             away from goals that keep moving -- a raise inside the upright step, and a different \
+             run from the one this scenario places",
+            fault_cycle()
+        )),
+        Some(_) => {}
     }
 }

@@ -48,21 +48,10 @@ pub const STOW_DURATION_NS: i64 = 2_000_000_000;
 /// How long the goal stream may be silent before the gate de-torques.
 pub const HOLD_TIMEOUT_NS: i64 = 200_000_000;
 
-/// How far a crank moves in one cycle, radians.
-pub const SLEW_LEGS_RAD: f64 = 0.15;
-
-/// How far the body yaw moves in one cycle, radians. Its own number rather than
-/// the cranks': the plant configures the three groups separately, and a scenario
-/// that could not say they differ could not run one where they do.
-pub const SLEW_BODY_YAW_RAD: f64 = 0.15;
-
 /// Whether the modelled machine starts energised. Every scenario starts it cold:
 /// the session's own engagement is what energises it, over the bus, which is the
 /// arming path a real machine has.
 pub const START_TORQUED: bool = false;
-
-/// How far an antenna moves in one cycle, radians.
-pub const SLEW_ANTENNAS_RAD: f64 = 0.65;
 
 /// The minimum spacing between the simulated driver's health reports.
 ///
@@ -141,11 +130,13 @@ pub const SESSION_CONFIRM_BUDGET_NS: i64 = 500_000_000;
 /// The servo-side profile acceleration the commissioning sweep writes, in the
 /// register's own units.
 ///
-/// Mirrors the deployed `SessionParams.profile_acceleration`; a scenario
+/// Mirrors the deployed `ServoProfile.profile_acceleration`; a scenario
 /// asserting this pair is asserting about the file the process read. What makes
 /// the claim reach the wire is
 /// [`check::commissioned_profile`](crate::check::commissioned_profile), which
-/// finds the two writes in the run's own datagrams.
+/// finds the two writes in the run's own datagrams. What makes it the pair the
+/// decision tick judges joints against is [`check_params`], which compares the
+/// file with the motion library's own `plant::SHIPPED_PROFILE`.
 pub const PROFILE_ACCELERATION: i64 = 20;
 
 /// The servo-side profile velocity the sweep writes, register units.
@@ -244,6 +235,498 @@ pub const FIRST_CYCLE: i64 = 1;
 #[must_use]
 pub fn cycles_for(duration_ns: i64) -> i64 {
     (duration_ns + PERIOD_NS - 1) / PERIOD_NS
+}
+
+/// How many cycles the modelled machine takes to travel `distance_rad` from
+/// rest to rest, including the servos' response delay.
+///
+/// The plant's own duration, not the planner's clock: the servos run the
+/// profile the commissioning sweep wrote into them, and on content faster than
+/// that profile a joint is still travelling long after the setpoint stream has
+/// stopped moving. A scenario states every instant it derives from arrival as an
+/// expression over this rather than as an integer somebody nudged until the run
+/// went green -- the arithmetic is then the reason the number is what it is.
+///
+/// The figure is an upper bound on the stepped plant by a cycle or three (the
+/// closed form is continuous-time), which is the direction an arrival assertion
+/// needs: an instant taken from here is never before the joint got there.
+#[must_use]
+pub fn travel_cycles(distance_rad: f64) -> i64 {
+    let plant = reachy_motion::plant::PlantModel::default();
+    i64::try_from(plant.travel_cycles(distance_rad)).unwrap_or(i64::MAX)
+}
+
+/// The joint angles a posture's Cartesian targets put the machine at.
+///
+/// The tick's own composition -- its configured geometry, and the crank angles
+/// the envelope check itself selects -- so the travel a scenario derives is the
+/// travel the machine is actually asked for. Anything the tick changes about how
+/// a posture becomes nine angles moves these instants with it, which is what
+/// keeps the suite's timing premises the machine's rather than a second opinion
+/// about it.
+fn posture_joints(
+    targets: &reachy_motion::joints::JointTargets,
+) -> reachy_motion::joints::JointVector {
+    reachy_motion::tick::joints_of(reachy_motion::tick::default_motion_config(), targets)
+        .expect("a canonical posture is reachable")
+}
+
+/// Where every bus row stands on each cycle of a posture move, and the angles
+/// the move ends on.
+///
+/// The walk itself, for a scenario that has something to say about the middle
+/// of a move rather than about its end -- where a joint stands when a hand is
+/// laid on it, and how far it still had to travel from there.
+pub struct PostureWalk {
+    /// The modelled position of every row, indexed by cycles since the move was
+    /// commanded. The first [`LAG_K`] entries are the posture the machine set
+    /// off from, because a goal is dated that far ahead of the sample that
+    /// decided it.
+    pub positions: Vec<[f64; reachy_motion::joints::ROW_COUNT]>,
+    /// The angles the move puts each row on, which is what an arrival is
+    /// measured against.
+    pub targets: [f64; reachy_motion::joints::ROW_COUNT],
+}
+
+impl PostureWalk {
+    /// The cycle every bus row is standing on its target by, in one pass over
+    /// the walk.
+    ///
+    /// One pass rather than nine: this is what a scenario places its instants
+    /// against, and the walk is the suite's own startup cost.
+    ///
+    /// # Panics
+    ///
+    /// If the plant never finishes the move, which is a bug in the walk rather
+    /// than a slow machine.
+    #[must_use]
+    pub fn arrivals(&self) -> [i64; reachy_motion::joints::ROW_COUNT] {
+        let mut arrived = [None; reachy_motion::joints::ROW_COUNT];
+        for (cycle, positions) in self.positions.iter().enumerate().skip(LAG_K as usize) {
+            for (row, arrived) in arrived.iter_mut().enumerate() {
+                if arrived.is_none() && positions[row] == self.targets[row] {
+                    *arrived = Some(
+                        i64::try_from(cycle).expect("a posture move is not a century of cycles"),
+                    );
+                }
+            }
+            if arrived.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        arrived.map(|cycle| {
+            cycle.unwrap_or_else(|| panic!("the plant does not finish a posture move at all"))
+        })
+    }
+
+    /// The cycle the whole machine is standing on the posture by: the last row
+    /// to arrive, which on every posture move is an antenna.
+    ///
+    /// # Panics
+    ///
+    /// As [`PostureWalk::arrivals`] does.
+    #[must_use]
+    pub fn travel(&self) -> i64 {
+        self.arrivals()
+            .into_iter()
+            .max()
+            .expect("the machine has rows")
+    }
+
+    /// The same for the head alone -- the cranks and the body yaw.
+    ///
+    /// Its own figure because the head arrives long before the antennas do: a
+    /// scenario about where the *head* stands part way through a move measures
+    /// its instants against this, and one measured against the antennas'
+    /// arrival would place them on a head that had finished.
+    ///
+    /// # Panics
+    ///
+    /// As [`PostureWalk::arrivals`] does.
+    #[must_use]
+    pub fn head_travel(&self) -> i64 {
+        let arrivals = self.arrivals();
+        reachy_motion::joints::ROWS
+            .into_iter()
+            .enumerate()
+            .filter(|(_, joint)| {
+                reachy_motion::joints::group_of(*joint)
+                    != Some(reachy_motion::joints::JointGroup::Antennas)
+            })
+            .map(|(row, _)| arrivals[row])
+            .max()
+            .expect("the head has rows")
+    }
+}
+
+/// The whole stepped walk of a posture move.
+///
+/// Stepped rather than solved: the plant is handed the move's own setpoint
+/// stream, period by period, exactly as the driver hands it to the modelled
+/// servos, and each row's answer is where it stands on that period. That is what
+/// makes these the machine's own numbers -- a joint chasing a min-jerk goal
+/// spends its first cycles slower than the profile allows, because the goal is,
+/// so it saturates late and arrives later than a straight-line travel of the
+/// same distance would. Two things the postures alone do not say are in it: an
+/// antenna routed the long way round travels further than the difference
+/// between the angles the postures name, and the clock the planner floors the
+/// move onto is not the clock it was asked for.
+///
+/// The commanded lag every goal carries is the padding at the head of the walk;
+/// the response delay the servos answer a setpoint at is in the walk itself.
+///
+/// # Panics
+///
+/// If the move is one this machine will not run, which for the canonical
+/// postures would be a geometry change rather than a scenario's mistake, or if
+/// the plant does not finish it at all.
+#[must_use]
+pub fn posture_walk(
+    from: &reachy_motion::joints::JointTargets,
+    to: &reachy_motion::joints::JointTargets,
+    duration_ns: i64,
+) -> PostureWalk {
+    let path = motion_cogs::planned_path(
+        reachy_motion::tick::default_motion_config(),
+        from,
+        motion_cogs::Goal {
+            target: *to,
+            durations: reachy_motion::traj::MoveDurations::uniform(
+                core::time::Duration::from_nanos(
+                    u64::try_from(duration_ns).expect("a configured duration is a duration"),
+                ),
+            ),
+        },
+        1e9 / PERIOD_NS as f64,
+    )
+    .unwrap_or_else(|refusal| {
+        panic!("a canonical posture move is one this machine runs: {refusal}")
+    });
+
+    let plant = reachy_motion::plant::PlantModel::default();
+    let standing = posture_joints(from).joints().map(|(_, angle)| angle);
+    let ends = posture_joints(path.target())
+        .joints()
+        .map(|(_, angle)| angle);
+    let mut state = standing.map(|angle| reachy_motion::plant::Predicted {
+        position: angle,
+        velocity: 0.0,
+    });
+    // The setpoints the servos have been handed and not yet answered, oldest
+    // first: the response delay, stepped the way the plant and the decision
+    // tick's model of it both step it -- read, then push.
+    let mut held = [standing; reachy_motion::plant::RESPONSE_DEAD_SAMPLES];
+    let mut positions = vec![standing; LAG_K as usize];
+    let mut sampled = *from;
+    for cycle in 0..MAX_TRAVEL_CYCLES {
+        for (row, predicted) in state.iter_mut().enumerate() {
+            plant.step(predicted, held[0][row]);
+        }
+        positions.push(state.map(|predicted| predicted.position));
+        if state
+            .iter()
+            .zip(ends)
+            .all(|(predicted, end)| predicted.position == end)
+        {
+            break;
+        }
+        assert!(
+            cycle + 1 < MAX_TRAVEL_CYCLES,
+            "the plant does not finish a posture move in {MAX_TRAVEL_CYCLES} cycles",
+        );
+        path.sample(
+            core::time::Duration::from_nanos(
+                u64::try_from(cycle * PERIOD_NS).expect("a cycle count is not a century"),
+            ),
+            &mut sampled,
+        );
+        let commanded = posture_joints(&sampled).joints().map(|(_, angle)| angle);
+        held.rotate_left(1);
+        held[reachy_motion::plant::RESPONSE_DEAD_SAMPLES - 1] = commanded;
+    }
+    PostureWalk {
+        positions,
+        targets: ends,
+    }
+}
+
+/// The stepped walk of the raise, walked once per process.
+///
+/// Every instant the suite derives from the way up reads this one walk. The
+/// walk itself is a full plan -- trajectory, envelope check and inverse
+/// kinematics -- and then a per-cycle step of the plant, and the accessors over
+/// it are called from authors, checkers and their own guards several times
+/// each; without this the suite's startup cost would grow with the number of
+/// derived instants rather than with the number of distinct walks, of which
+/// there are two.
+///
+/// # Panics
+///
+/// As [`posture_walk`] does.
+#[must_use]
+pub fn up_walk() -> &'static PostureWalk {
+    static WALK: std::sync::OnceLock<PostureWalk> = std::sync::OnceLock::new();
+    WALK.get_or_init(|| {
+        posture_walk(
+            &reachy_motion::postures::stow_pose_targets(),
+            &reachy_motion::postures::neutral_targets(),
+            UP_DURATION_NS,
+        )
+    })
+}
+
+/// The stepped walk of the fold, walked once per process: the same distance on
+/// a longer clock.
+///
+/// # Panics
+///
+/// As [`posture_walk`] does.
+#[must_use]
+pub fn stow_walk() -> &'static PostureWalk {
+    static WALK: std::sync::OnceLock<PostureWalk> = std::sync::OnceLock::new();
+    WALK.get_or_init(|| {
+        posture_walk(
+            &reachy_motion::postures::neutral_targets(),
+            &reachy_motion::postures::stow_pose_targets(),
+            STOW_DURATION_NS,
+        )
+    })
+}
+
+/// How long the walk above may run before it is a bug rather than a slow
+/// machine: two minutes of cycles, against the longest posture move's three
+/// seconds.
+const MAX_TRAVEL_CYCLES: i64 = 6_000;
+
+/// How many cycles after it is commanded the machine is standing upright.
+#[must_use]
+pub fn up_travel() -> i64 {
+    up_walk().travel()
+}
+
+/// The same for the head alone, on the way up.
+#[must_use]
+pub fn head_up_travel() -> i64 {
+    up_walk().head_travel()
+}
+
+/// The same for the fold, which travels the same distance on a longer clock.
+#[must_use]
+pub fn stow_travel() -> i64 {
+    stow_walk().travel()
+}
+
+/// The longer of the two, which is what a step carrying either has to allow.
+#[must_use]
+pub fn posture_travel() -> i64 {
+    up_travel().max(stow_travel())
+}
+
+/// How many cycles pass between the driver holding a setpoint and the first
+/// reading that shows a servo answering it: the response delay the plant and the
+/// decision tick's model of it are both stepped at.
+#[must_use]
+pub fn response_delay_cycles() -> i64 {
+    i64::try_from(reachy_motion::plant::RESPONSE_DEAD_SAMPLES)
+        .expect("the response delay is a couple of cycles")
+}
+
+/// How many cycles a modelled servo takes to reach its profile velocity from
+/// rest, and to come back to rest from it.
+///
+/// The ramp the configured acceleration gives, rounded up. What a scenario
+/// wants it for is a goal that turns round under a moving joint: the joint keeps
+/// going the way it was for this many cycles after the setpoint reverses,
+/// whatever the setpoint says, because that is how long its own generator takes
+/// to bring the speed through zero.
+#[must_use]
+pub fn ramp_cycles() -> i64 {
+    let plant = reachy_motion::plant::PlantModel::default();
+    (plant.v_max / plant.a_max).ceil() as i64
+}
+
+/// How many cycles a modelled servo setting off from rest takes to stand at or
+/// past `distance_rad`.
+///
+/// The ramp alone, and no response delay: what a scenario wants it for is a
+/// joint a hand has just come off, and a release changes no setpoint, so there
+/// is nothing for a dead time to delay. [`travel_cycles`] is the other
+/// question -- a commanded arrival, rest to rest, whose setpoint really does
+/// take a dead time to be answered.
+#[must_use]
+pub fn pass_cycles(distance_rad: f64) -> i64 {
+    let plant = reachy_motion::plant::PlantModel::default();
+    i64::try_from(plant.pass_cycles(distance_rad)).unwrap_or(i64::MAX)
+}
+
+/// How many cycles a generator running at its profile velocity takes to open
+/// the tracking screen's own distance between itself and a joint that stopped.
+///
+/// The raise latency's first term: a run opens on the tick the residual passes
+/// `threshold_rad` and the fault comes `ticks` ticks later, so a jam shorter
+/// than this raises nothing at all whatever the goal was doing, and one longer
+/// than this plus the window raises. A scenario placing a hand on the machine
+/// says which of the two it is by this figure rather than by an integer.
+#[must_use]
+pub fn crossing_cycles() -> i64 {
+    let cfg = reachy_motion::tick::default_motion_config();
+    (cfg.tracking.threshold_rad / cfg.plant.v_max).ceil() as i64
+}
+
+/// The three instants a hand laid on the rows of a moving posture move decides.
+///
+/// Derived together because each is the next one's premise: where the hand lands
+/// decides when the residual passes the screen, which decides when the fault
+/// comes.
+#[derive(Clone, Copy, Debug)]
+pub struct Jam {
+    /// The cycle of the move the rows are held from.
+    pub jam: i64,
+    /// The cycle the residual first stands past the detector's threshold, which
+    /// is the cycle the run opens on.
+    pub crossing: i64,
+    /// The cycle the window runs out on, which is the cycle the fault is raised
+    /// on.
+    pub raise: i64,
+}
+
+/// The rows a hand laid on the head holds: the six cranks that carry it.
+///
+/// The whole group rather than one of them. A single frozen crank leaves the
+/// platform in a shape the linkage cannot take, which the estimator reports as
+/// a pose it cannot solve -- a real presentation, and a different scenario's
+/// subject. Freezing all six holds the head exactly where it stood, so what a
+/// run placing this hand is about is the tracking evidence and nothing else.
+///
+/// Shared rather than restated by each run that places such a hand, because the
+/// two that do have to place the *same* hand: one recovers inside the window its
+/// first raise opens and the other never lets go, and what makes them the same
+/// run up to that instant is this set and the placement
+/// [`jam_on_the_raise`] derives from it.
+#[must_use]
+pub fn head_jam_rows() -> brenn_reachy__motion__joints_clk_rs::JointFlags {
+    reachy_motion::joints::JointGroup::Legs.joints()
+}
+
+/// Where a hand has to go on the raise for the detector to answer it, and what
+/// the detector makes of it, read off the stepped walk of that move.
+///
+/// Two conditions decide it, and both are conditions on the plant rather than
+/// preferences of any one scenario.
+///
+/// The held rows have to be far enough short of their target at the jam for
+/// their generator to travel the screen's own distance after it: a hand laid on
+/// a joint that had nearly arrived opens no run at all.
+///
+/// And their generator has to have *stopped* by the time the fault lands, a
+/// response delay before it, so the reading the run reopens against is a joint
+/// standing beside a trajectory that has come to rest. That is what makes a
+/// release recoverable, for the run that lets go: the reopened window is
+/// restarted by a released joint regaining the progress minimum, which takes
+/// three steps of its ramp, while a generator still running at the profile is
+/// one a joint setting off from rest cannot pace before the window runs out.
+///
+/// The earliest jam satisfying the second condition is the one taken, which is
+/// the one that leaves the most distance for the first: it puts the residual
+/// well past the screen rather than a hundredth of a radian past it.
+///
+/// # Panics
+///
+/// If no cycle of the raise satisfies both, which would be a move, a screen or a
+/// profile a run can no longer be stated over rather than a number to nudge.
+#[must_use]
+pub fn jam_on_the_raise(rows: brenn_reachy__motion__joints_clk_rs::JointFlags) -> Jam {
+    // Derived once per row-set. Both scenarios that place a hand read every
+    // instant of it several times, and the derivation is a search over the
+    // walk; the answer is a function of the row-set, the walk, the screen and
+    // the profile, all of which are fixed within a process.
+    static DERIVED: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::BTreeMap<brenn_reachy__motion__joints_clk_rs::JointFlags, Jam>,
+        >,
+    > = std::sync::OnceLock::new();
+    let derived = DERIVED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    if let Some(jam) = derived
+        .lock()
+        .expect("the suite is not holding a poisoned derivation")
+        .get(&rows)
+    {
+        return *jam;
+    }
+    let jam = derive_jam_on_the_raise(rows);
+    derived
+        .lock()
+        .expect("the suite is not holding a poisoned derivation")
+        .insert(rows, jam);
+    jam
+}
+
+/// [`jam_on_the_raise`]'s search, run once per row-set.
+///
+/// # Panics
+///
+/// As [`jam_on_the_raise`] does.
+fn derive_jam_on_the_raise(rows: brenn_reachy__motion__joints_clk_rs::JointFlags) -> Jam {
+    let cfg = reachy_motion::tick::default_motion_config();
+    let walk = up_walk();
+    let held: Vec<usize> = reachy_motion::joints::flags::iter(rows)
+        .map(|joint| reachy_motion::joints::row(joint).expect("a jammed joint sits on a bus row"))
+        .collect();
+    let cycles = i64::try_from(walk.positions.len()).expect("a move is not a century of cycles");
+    let arrivals = walk.arrivals();
+    let arrival = held
+        .iter()
+        .map(|&row| arrivals[row])
+        .max()
+        .expect("a hand is laid on at least one row");
+    // How far the worst-placed row's generator has moved on since the hand
+    // landed, which is the residual the detector screens on: a held joint's
+    // reading does not move, so the whole of the distance is the trajectory's.
+    //
+    // Measured from the cycle *before* the jam: the driver drains what arrived
+    // and then advances the plant, so the reading the sample for the jam's own
+    // cycle carries is where the row stood on the cycle before it.
+    let residual = |from: i64, at: i64| {
+        held.iter()
+            .map(|&row| {
+                (walk.positions[at as usize][row] - walk.positions[from as usize][row]).abs()
+            })
+            .fold(0.0f64, f64::max)
+    };
+    for jam in 1..cycles {
+        let Some(crossing) =
+            (jam..cycles).find(|&at| residual(jam - 1, at) > cfg.tracking.threshold_rad)
+        else {
+            break;
+        };
+        let raise = crossing + i64::from(cfg.tracking.ticks) - 1;
+        if arrival + response_delay_cycles() <= raise {
+            return Jam {
+                jam,
+                crossing,
+                raise,
+            };
+        }
+    }
+    panic!("no cycle of the raise both opens a run on the held rows and settles their generator")
+}
+
+/// How much room an arrival assertion gets past the travel the plant needs.
+///
+/// The travel figure is the cycle the last joint reached its target on; this is
+/// the room a scenario leaves past it, so an arrival assertion is made on a
+/// machine that has been standing still for a moment rather than on one that
+/// arrived on the very cycle it is read.
+pub const ARRIVAL_SETTLE_CYCLES: i64 = 5;
+
+/// How long a step carrying a posture move has to run for the machine to be
+/// asserted arrived on its last cycle.
+///
+/// The plant's travel and nothing else's: a step sized on the move's clock
+/// would assert an arrival on a machine still climbing toward it.
+#[must_use]
+pub fn posture_step_cycles() -> i64 {
+    posture_travel() + ARRIVAL_SETTLE_CYCLES
 }
 
 /// How many cycles a move to the upright posture is given, rounded up.
@@ -707,6 +1190,63 @@ pub fn cycle_at(n: i64) -> i64 {
     T0_NS + n * PERIOD_NS
 }
 
+/// The configuration files a checker screens, bound by the name each file
+/// carries.
+///
+/// The harness hands them over as a list of runfiles paths, and the list's order
+/// is nobody's meaning: a file added to it, or two of them swapped for
+/// tidiness, would otherwise re-bind every scenario's screen and read as a file
+/// stating the wrong number rather than as a list in the wrong order. So the
+/// binding is by file name, once, here.
+pub struct ConfigPaths<'a> {
+    /// `mover_params.textproto`.
+    pub mover: &'a str,
+    /// `servo_profile.textproto`.
+    pub profile: &'a str,
+    /// `session_params.textproto`.
+    pub session: &'a str,
+    /// `sim_params.textproto`.
+    pub sim: &'a str,
+    /// `driver/motord_params.textproto`.
+    pub motord: &'a str,
+}
+
+impl<'a> ConfigPaths<'a> {
+    /// Pick each file out of the paths the harness handed over, by its name.
+    ///
+    /// # Errors
+    ///
+    /// One line per file the list does not carry.
+    pub fn of(paths: &'a [String]) -> Result<Self, Vec<String>> {
+        let mut missing = Vec::new();
+        let mut named = |name: &str| -> &'a str {
+            let found = paths
+                .iter()
+                .map(String::as_str)
+                .find(|path| path.rsplit('/').next() == Some(name));
+            match found {
+                Some(path) => path,
+                None => {
+                    missing.push(format!("the checker was handed no {name}"));
+                    ""
+                }
+            }
+        };
+        let paths = Self {
+            mover: named("mover_params.textproto"),
+            profile: named("servo_profile.textproto"),
+            session: named("session_params.textproto"),
+            sim: named("sim_params.textproto"),
+            motord: named("motord_params.textproto"),
+        };
+        if missing.is_empty() {
+            Ok(paths)
+        } else {
+            Err(missing)
+        }
+    }
+}
+
 /// The configured numbers above, as they are written in the textprotos the box
 /// binds.
 ///
@@ -725,15 +1265,23 @@ pub fn cycle_at(n: i64) -> i64 {
 /// and a check that failed over the spelling would send its next reader to edit
 /// the constant.
 ///
+/// The driver's own configuration is among the files even though no scenario
+/// runs that driver: its period is the third statement of the one grid every
+/// process on the machine is built for, and the plant model both the tick and
+/// the simulated driver step is a distance per period of it.
+///
 /// # Errors
 ///
 /// One line per number the file states differently, or per number it does not
 /// state at all, or the reason the file could not be read.
-pub fn check_params(
-    mover_textproto: &str,
-    session_textproto: &str,
-    sim_textproto: &str,
-) -> Vec<String> {
+pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
+    let &ConfigPaths {
+        mover: mover_textproto,
+        profile: profile_textproto,
+        session: session_textproto,
+        sim: sim_textproto,
+        motord: motord_textproto,
+    } = paths;
     let mut failures = Vec::new();
     expect(
         mover_textproto,
@@ -757,8 +1305,6 @@ pub fn check_params(
                 "torque_off_confirm_budget_ns",
                 Value::Int(SESSION_CONFIRM_BUDGET_NS),
             ),
-            ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
-            ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
             ("bus_watchdog", Value::Int(BUS_WATCHDOG)),
             ("script_span_cap_ms", Value::Int(SCRIPT_SPAN_CAP_MS)),
             ("rail_stale_after_ns", Value::Int(RAIL_STALE_AFTER_NS)),
@@ -766,14 +1312,50 @@ pub fn check_params(
         &mut failures,
     );
     expect(
+        profile_textproto,
+        &[
+            ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
+            ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
+        ],
+        &mut failures,
+    );
+    // Every process on the machine is built for the one grid, and the plant
+    // model's two limits are distances per period of it: a tick modelling a
+    // 20 ms generator over a stream of some other spacing would judge every
+    // joint against a trajectory nothing runs. The driver's own file is checked
+    // here rather than by the driver because it is the third statement of the
+    // same number and nothing else reads all three.
+    expect(
+        motord_textproto,
+        &[("period_ns", Value::Int(PERIOD_NS))],
+        &mut failures,
+    );
+    // The pair the tests of the motion library are written against, and the
+    // grid they assume, against the files the processes read. `PlantModel`'s
+    // own default is built from these two constants, so a file that moved away
+    // from them would leave every scenario and every unit test screening a
+    // machine no deployment runs.
+    let (shipped_acceleration, shipped_velocity) = reachy_motion::plant::SHIPPED_PROFILE;
+    if i64::from(shipped_acceleration) != PROFILE_ACCELERATION
+        || i64::from(shipped_velocity) != PROFILE_VELOCITY
+    {
+        failures.push(format!(
+            "the motion library ships profile {shipped_acceleration}/{shipped_velocity} and the \
+             scenarios expect {PROFILE_ACCELERATION}/{PROFILE_VELOCITY}",
+        ));
+    }
+    if reachy_motion::plant::SHIPPED_PERIOD_NS != PERIOD_NS {
+        failures.push(format!(
+            "the motion library models a {}ns period and the processes run on {PERIOD_NS}ns",
+            reachy_motion::plant::SHIPPED_PERIOD_NS,
+        ));
+    }
+    expect(
         sim_textproto,
         &[
             ("period_ns", Value::Int(PERIOD_NS)),
             ("hold_timeout_ns", Value::Int(HOLD_TIMEOUT_NS)),
             ("start_torqued", Value::Bool(START_TORQUED)),
-            ("slew_legs_rad", Value::Float(SLEW_LEGS_RAD)),
-            ("slew_body_yaw_rad", Value::Float(SLEW_BODY_YAW_RAD)),
-            ("slew_antennas_rad", Value::Float(SLEW_ANTENNAS_RAD)),
             ("health_poll_period_ns", Value::Int(HEALTH_POLL_PERIOD_NS)),
         ],
         &mut failures,
@@ -896,7 +1478,11 @@ mod tests {
 
     use reachy_motion::stillness::StillnessConfig;
 
-    use super::{PERIOD_NS, motion_id, motion_table, unjudgeable_step, up_clocks};
+    use super::{
+        LAG_K, PERIOD_NS, crossing_cycles, head_jam_rows, head_up_travel, jam_on_the_raise,
+        motion_id, motion_table, posture_joints, response_delay_cycles, travel_cycles,
+        unjudgeable_step, up_clocks, up_travel, up_walk,
+    };
 
     /// The sidecar the emitter committed is the sidecar the edge's reader parses,
     /// windows and all.
@@ -914,6 +1500,131 @@ mod tests {
         assert_eq!(tour.motion_id, motion_id("bench/tour"));
         assert_eq!(tour.window.duration_ms, 1701);
         assert_eq!(tour.window.blend_out_ms, 200);
+    }
+
+    /// The stepped walk every re-derived instant in the suite is an expression
+    /// over lands where the plant's own closed form says it must: at or after
+    /// it, and within a few cycles of it.
+    ///
+    /// The failure direction is the silent one. A walk that over-estimates --
+    /// sampling the planned path at the wrong instant, pushing a setpoint
+    /// before it read one, or a row that never registers its arrival and rides
+    /// the walk's own ceiling -- makes every step longer and every arrival
+    /// window wider, so the suite stays green while the assertions it is built
+    /// from have lost their edges. Nothing else in the tree reads this
+    /// arithmetic back.
+    ///
+    /// The distance is the long way round: the planner routes each antenna away
+    /// from its outboard direction, so the fold-to-upright arc is a whole turn
+    /// less the difference between the two postures' angles rather than that
+    /// difference. Arrival is at or after the closed form because the closed
+    /// form is a straight-line travel from rest to rest, and a joint chasing a
+    /// min-jerk goal is slower than its profile for the first cycles because
+    /// the goal is -- so it saturates late and arrives later. Two small terms
+    /// pull the other way and nearly cancel it: the closed form is
+    /// continuous-time and over-estimates the stepped plant by a cycle or
+    /// three, and the walk counts from the cycle the move is commanded on
+    /// rather than from the one the first setpoint is dated at. So the band is
+    /// stated wide at the top and tight at the bottom.
+    #[test]
+    fn the_stepped_arrival_walk_agrees_with_the_plant_it_walks() {
+        let stow = reachy_motion::postures::stow_pose_targets();
+        let neutral = reachy_motion::postures::neutral_targets();
+        let folded = posture_joints(&stow);
+        let upright = posture_joints(&neutral);
+        let arc = core::f64::consts::TAU - (upright.antennas[0] - folded.antennas[0]).abs();
+        let closed_form = travel_cycles(arc);
+
+        let arrived = up_travel();
+        assert!(
+            arrived >= closed_form,
+            "the walk has the machine upright at cycle {arrived}, before the {closed_form} \
+             cycles the plant needs for {arc:.4} rad"
+        );
+        assert!(
+            arrived <= closed_form + LAG_K + 12,
+            "the walk has the machine upright at cycle {arrived}, well past the {closed_form} \
+             cycles the plant needs for {arc:.4} rad: a row that never registered its arrival \
+             would widen every arrival window in the suite"
+        );
+
+        // The row that arrives last is an antenna, which is the premise
+        // `PostureWalk::travel` rests on.
+        let arrivals = up_walk().arrivals();
+        let last = reachy_motion::joints::ROWS
+            .into_iter()
+            .enumerate()
+            .max_by_key(|(row, _)| arrivals[*row])
+            .map(|(_, joint)| joint)
+            .expect("the machine has rows");
+        assert_eq!(
+            reachy_motion::joints::group_of(last),
+            Some(reachy_motion::joints::JointGroup::Antennas),
+            "the last row up is {last:?}, not an antenna"
+        );
+    }
+
+    /// The head is upright long before the antennas are, which is what makes
+    /// the head's own travel figure a separate one.
+    ///
+    /// The premise a scenario about a schedule changing under a *moving head*
+    /// rests on: measured against the whole machine's travel, such a retarget
+    /// would land on a head that had finished the move.
+    #[test]
+    fn the_head_arrives_before_the_antennas_do() {
+        let head = head_up_travel();
+        let machine = up_travel();
+        assert!(
+            head < machine,
+            "the head is up at cycle {head} and the machine at {machine}"
+        );
+    }
+
+    /// The three instants a hand on the raise decides hold together, and the
+    /// crossing is not sooner than a generator at the profile could reach.
+    ///
+    /// The derivation searches the walk for a jam that both opens a run and
+    /// leaves the generator stopped by the fault, and two scenarios place their
+    /// whole run against what it answers. Each instant is checked here against
+    /// arithmetic the search does not do: the crossing cannot come sooner than
+    /// the screen's distance at the cap, because nothing in the walk moves
+    /// faster than that; the raise is a window after the crossing; and the
+    /// jammed rows' unjammed arrival is a response delay or more before the
+    /// raise, which is the premise a released joint's recovery rests on.
+    #[test]
+    fn the_hand_on_the_raise_opens_a_run_and_leaves_the_generator_stopped() {
+        let cfg = reachy_motion::tick::default_motion_config();
+        let hand = jam_on_the_raise(head_jam_rows());
+        // Counted from the cycle before the jam, which is where the search
+        // measures the residual from: the driver drains what arrived and then
+        // advances the plant, so the sample published for a cycle carries the
+        // position of the one before it.
+        assert!(
+            hand.crossing - (hand.jam - 1) >= crossing_cycles(),
+            "the residual passes the {} rad screen {} periods after the reading the jam froze, \
+             and the fastest a generator can open that distance is {} periods at the profile \
+             velocity",
+            cfg.tracking.threshold_rad,
+            hand.crossing - (hand.jam - 1),
+            crossing_cycles()
+        );
+        assert_eq!(
+            hand.raise,
+            hand.crossing + i64::from(cfg.tracking.ticks) - 1,
+            "the fault comes a window after the run opens"
+        );
+        let arrival = reachy_motion::joints::flags::iter(head_jam_rows())
+            .filter_map(reachy_motion::joints::row)
+            .map(|row| up_walk().arrivals()[row])
+            .max()
+            .expect("a hand is laid on at least one row");
+        assert!(
+            arrival + response_delay_cycles() <= hand.raise,
+            "the jammed rows' unjammed arrival is cycle {arrival} and the fault lands on \
+             {}: the reading the reopened run anchors against has to show a generator that has \
+             stopped, or no release recovers the stow",
+            hand.raise
+        );
     }
 
     /// The floor is inclusive: a step exactly as long as the move plus what the

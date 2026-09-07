@@ -44,26 +44,41 @@ pub const SCRIPT_ID: u32 = 5;
 
 /// How many cycles into the raise the posture changes.
 ///
-/// Half way through it. Early enough that the machine is still moving -- which
-/// the checker asserts rather than assumes, because a step boundary after the
-/// move had finished is S1's second step under another name.
-pub const RETARGET_AFTER: i64 = 20;
+/// Half way through the head's own travel at the servos' profile, which is what
+/// this run needs and not half way through the clock the raise was given: the
+/// clock runs out with the head barely off the fold, so a fraction of it would
+/// put the retarget on a machine that had hardly set off -- which the checker
+/// asserts rather than assumes, because a step boundary after the move had
+/// finished is S1's second step under another name.
+#[must_use]
+pub fn retarget_after() -> i64 {
+    scenario::head_up_travel() / 2
+}
 
-/// How long the stow step lasts from the retarget, in cycles: the longer move
-/// from wherever the raise had got to, plus room to arrive and hold.
-pub const STOW_CYCLES: i64 = 150;
+/// How long the stow step lasts from the retarget, in cycles: the travel the
+/// fold takes at the servos' own profile from wherever the raise had got to,
+/// plus room to settle onto it.
+///
+/// A whole posture move's travel and then the raise's own half, because the
+/// antennas were part way up when the goal turned round and the arc that takes
+/// them back down is the planner's to resolve: the bound is the furthest either
+/// of them could have to travel.
+#[must_use]
+pub fn stow_cycles() -> i64 {
+    scenario::posture_step_cycles() + retarget_after()
+}
 
 /// The cycle the posture changes on: the instant the upright step gives up its
 /// hold on the timeline and the stow step takes over.
 #[must_use]
 pub fn retarget_cycle() -> i64 {
-    up_start_cycle() + RETARGET_AFTER
+    up_start_cycle() + retarget_after()
 }
 
 /// The cycle the schedule runs out on, which is what ends the session.
 #[must_use]
 pub fn disengage_cycle() -> i64 {
-    retarget_cycle() + STOW_CYCLES
+    retarget_cycle() + stow_cycles()
 }
 
 /// The last cycle of the run.
@@ -73,14 +88,27 @@ pub fn end_cycle() -> i64 {
 }
 
 /// How many cycles the machine keeps travelling the way it was after the
-/// retarget, before the new setpoint can have reached the plant at all.
+/// retarget, before an assertion that it is closing on the fold can be made.
 ///
-/// The goal decided on the retarget cycle names an instant `lag_k` cycles out,
-/// and the driver executes it there. So the turnaround is not observable in the
-/// measured pose until the cycle after that, and an assertion that the machine
-/// is closing on its new posture has to start from then rather than from the
-/// cycle the step changed on.
-pub const TURNAROUND_CYCLES: i64 = LAG_K + 1;
+/// Four terms, and every one of them is the plant's or the goal stream's:
+///
+/// - the commanded lag a goal carries, and the response delay the servos answer
+///   a setpoint at, before the retarget's first setpoint can show in a reading
+///   at all;
+/// - the cycles the raise had been running, because the fold is planned from the
+///   last commanded setpoint and the head is lagging that setpoint by up to
+///   everything it has not yet travelled -- so the fold's own goal begins
+///   *above* where the head stands and the head goes on climbing toward it,
+///   following the new goal rather than the old one;
+/// - the generator's own ramp, which is how long a crank at its profile velocity
+///   takes to bring that speed through zero once the goal is finally below it.
+///
+/// An upper bound rather than the instant: the head turns round earlier than
+/// this, and what the assertion needs is a cycle by which it certainly has.
+#[must_use]
+pub fn turnaround_cycles() -> i64 {
+    LAG_K + scenario::response_delay_cycles() + retarget_after() + scenario::ramp_cycles()
+}
 
 /// The two steps of the script: upright, and then stow from part way there.
 ///

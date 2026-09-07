@@ -10,16 +10,24 @@
 //! control by the servos that still work, and then a park nothing clears but an
 //! operator.
 //!
-//! It is also the run where the head stalls *during* the maneuver. The cranks
-//! are jammed while the fold is under way, so the machine stops closing on the
-//! stow it was commanded to -- and the tracking detector ships disarmed, so
-//! nothing is raised about it. The maneuver runs on the one clock the first
-//! condition opened it with, the hand comes off in time for the machine to reach
-//! the fold, and the park is what that first condition decided. What pins the
-//! stall as a mid-maneuver one is the checker's pair of assertions: the jam
-//! lands strictly inside the maneuver's span, and no obstruction is raised
-//! anywhere in the run. Re-arming the detector puts a raise inside that span and
-//! a re-commanded stow after it (`TODO(tracking-response-model)`).
+//! It is also the run where the head stalls *during* the maneuver, and where a
+//! stall shorter than the armed detector can see is answered by nothing. The
+//! cranks are jammed while the fold is under way, so the machine stops closing
+//! on the stow it was commanded to; the hand is on them for the detector's own
+//! crossing distance and no longer, which is the fewest periods a generator
+//! running flat out at the profile could open a run in -- and this generator is
+//! not running flat out, because the fold's min-jerk lead-in is where the jam
+//! lands. So the brush is below the raise latency and no run opens at all: the
+//! maneuver runs on the one clock the first condition opened it with, the
+//! machine reaches the fold, and the park is what that first condition decided.
+//! What pins the stall as a mid-maneuver one is the checker's pair of
+//! assertions: the jam lands strictly inside the maneuver's span, and no
+//! obstruction is raised anywhere in the run.
+//!
+//! A hand that stays on the cranks past that latency is a different run, and it
+//! is S14's: the raise lands inside the maneuver and defeats it, and the machine
+//! is let go of where it stands rather than at the fold. This one is kept as the
+//! suite's only fold measured under a masked stow.
 //!
 //! A condition read *off the bus* -- a servo's error byte -- arriving
 //! mid-maneuver is covered by no scenario in this suite, for the reason the
@@ -91,11 +99,22 @@ pub const JAM_AFTER: i64 = 10;
 
 /// How long the jam lasts, in cycles.
 ///
-/// Long enough for the tracking detector's window to run out more than once, so
-/// what says nothing was raised is a stall a detector would have judged; and
-/// short enough that the fold still fits in what is left of the maneuver's one
-/// clock.
-pub const JAM_CYCLES: i64 = 40;
+/// The detector's own crossing distance: the fewest periods in which a held
+/// joint's residual can reach the screen, which needs the generator at the
+/// profile velocity for every one of them. A hand on for that long and no
+/// longer cannot open a run under a generator moving slower -- and this jam
+/// lands in the fold's min-jerk lead-in, where it is far slower -- so nothing
+/// is raised, and even at the cap the fault would come a whole window after the
+/// crossing. Stated as that expression rather than as a number, so a screen or
+/// a profile that moved moves the jam with it.
+///
+/// What it buys is a brush below the raise latency, answered with nothing:
+/// short enough that the detector never has evidence to act on, long enough
+/// that the machine visibly stops closing on the fold it was commanded to.
+#[must_use]
+pub fn jam_cycles() -> i64 {
+    scenario::crossing_cycles()
+}
 
 /// The rows the scenario jams: the six cranks that carry the head.
 ///
@@ -151,7 +170,7 @@ pub fn jam_cycle() -> i64 {
 /// The cycle the jam is released on.
 #[must_use]
 pub fn jam_release_cycle() -> i64 {
-    jam_cycle() + JAM_CYCLES
+    jam_cycle() + jam_cycles()
 }
 
 /// The cycle the maneuver's one clock runs out on at the latest.

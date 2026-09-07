@@ -29,7 +29,7 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use scenario::author::Step;
-use scenario::{BLIND_CYCLES_BEFORE_BUS_FAILURE, cycle_at, up_cycles};
+use scenario::{BLIND_CYCLES_BEFORE_BUS_FAILURE, cycle_at};
 
 use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use reachy_motion::default_motion_config;
@@ -43,8 +43,13 @@ pub use scenario::{START_CYCLE, armed_cycle as up_start_cycle, script_cycle as s
 /// The script's number.
 pub const SCRIPT_ID: u32 = 4;
 
-/// How long the machine holds upright before the bus goes away, in cycles: the
-/// move plus room to arrive and settle into its hold.
+/// How long the machine holds upright after it has arrived and before the bus
+/// goes away, in cycles.
+///
+/// Past the travel the raise takes at the servos' own profile, not past the
+/// clock the move was given: the clock runs out with an antenna still a couple
+/// of radians from upright, and a run whose outage landed there would be about a
+/// move interrupted rather than about a loop that lost its measurements.
 pub const SETTLE_CYCLES: i64 = 20;
 
 /// The cycle the bus stops answering on.
@@ -60,7 +65,7 @@ pub const SETTLE_CYCLES: i64 = 20;
 /// with two possible causes.
 #[must_use]
 pub fn outage_cycle() -> i64 {
-    up_start_cycle() + up_cycles() + SETTLE_CYCLES
+    up_start_cycle() + scenario::up_travel() + SETTLE_CYCLES
 }
 
 /// How many cycles of replies are lost.

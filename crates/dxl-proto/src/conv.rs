@@ -17,6 +17,19 @@ pub const CENTRE_COUNTS: i32 = COUNTS_PER_REV / 2;
 /// Volts per least-significant bit of the voltage registers.
 pub const VOLTS_PER_LSB: f64 = 0.1;
 
+/// Radians per second per least-significant bit of Profile Velocity.
+///
+/// The register's own unit is 0.229 rev/min, the same figure the velocity
+/// registers on these parts are scaled in.
+pub const PROFILE_VELOCITY_UNIT_RAD_PER_S: f64 = 0.229 * 2.0 * PI / 60.0;
+
+/// Radians per second squared per least-significant bit of Profile
+/// Acceleration.
+///
+/// The register's own unit is 214.577 rev/min², which is per minute *squared*:
+/// hence 3600 and not 60 below.
+pub const PROFILE_ACCELERATION_UNIT_RAD_PER_S2: f64 = 214.577 * 2.0 * PI / 3600.0;
+
 /// Why a value could not be converted.
 #[derive(Debug, Clone, Copy, PartialEq, Error)]
 pub enum ConvError {
@@ -79,6 +92,26 @@ pub fn raw_from_volts(volts: f64) -> Result<u16, ConvError> {
         return Err(ConvError::VoltsOutOfRange { volts, units });
     }
     Ok(units as u16)
+}
+
+/// Profile Velocity register to radians per second: the cap the servo's own
+/// trajectory generator ramps up to.
+///
+/// Zero is not a speed of zero. It disables the generator, which makes a goal
+/// write an immediate step; callers that model or bound the generator have to
+/// refuse it, and this function has nothing to say about that — it converts.
+#[must_use]
+pub fn profile_velocity_rad_per_s(units: u32) -> f64 {
+    f64::from(units) * PROFILE_VELOCITY_UNIT_RAD_PER_S
+}
+
+/// Profile Acceleration register to radians per second squared: the rate the
+/// generator changes its own velocity at.
+///
+/// Zero disables the generator, as above.
+#[must_use]
+pub fn profile_acceleration_rad_per_s2(units: u32) -> f64 {
+    f64::from(units) * PROFILE_ACCELERATION_UNIT_RAD_PER_S2
 }
 
 /// Current register to milliamps at the *nominal* scale of 1 mA per unit.
@@ -220,6 +253,33 @@ mod tests {
             let err = raw_from_volts(value).unwrap_err();
             assert!(matches!(err, ConvError::VoltsOutOfRange { .. }), "{value}");
         }
+    }
+
+    /// The pair the session's commissioning sweep writes, in engineering units.
+    ///
+    /// Four figures, because that is what the vendor states the register units
+    /// to. These two numbers are what the plant model above this layer is
+    /// built from, so a scale wrong here is a prediction wrong everywhere.
+    #[test]
+    fn the_shipped_profile_pair_converts_to_the_stated_rates() {
+        assert!((profile_velocity_rad_per_s(50) - 1.1990).abs() < 5e-4);
+        assert!((profile_acceleration_rad_per_s2(20) - 7.4901).abs() < 5e-4);
+    }
+
+    /// The bench's pair, an order of magnitude up: the scale is linear, so a
+    /// unit constant off by a factor shows here as well as at 50/20.
+    #[test]
+    fn the_bench_profile_pair_converts_to_the_stated_rates() {
+        assert!((profile_velocity_rad_per_s(600) - 14.388).abs() < 5e-3);
+        assert!((profile_acceleration_rad_per_s2(400) - 149.80).abs() < 5e-2);
+    }
+
+    /// Zero converts to zero. It *means* the generator is off, which is a
+    /// caller's business; the arithmetic here is not where that is decided.
+    #[test]
+    fn a_disabled_generator_converts_to_zero_rather_than_being_refused() {
+        assert!(profile_velocity_rad_per_s(0).abs() < 1e-12);
+        assert!(profile_acceleration_rad_per_s2(0).abs() < 1e-12);
     }
 
     #[test]

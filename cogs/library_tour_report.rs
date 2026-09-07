@@ -8,16 +8,25 @@
 //! goal moved in a period, whether the driver missed a slot, and how near the
 //! antenna tips came to meeting.
 //!
-//! The measurements are the point. This machine has no plant model, so there
-//! is no speed policy on content and no import-time crossing check on a clip's
-//! antenna track; what stands in for both is a record of what the servos
-//! actually did when the whole library was played at them. A run that is clean
-//! here is a run whose numbers can be read.
+//! The measurements are the point. There is no speed policy on content and no
+//! import-time crossing check on a clip's antenna track; what stands in for
+//! both is a record of what the servos actually did when the whole library was
+//! played at them. A run that is clean here is a run whose numbers can be read.
 //!
-//! It reads the log and the names sidecar, and nothing else. The sidecar is
-//! what says which motions the library holds and what they are called, which is
-//! the list the tour is judged against -- the log carries indices and an index
-//! is not a name.
+//! Two distances per window, and they answer different questions. The lag is
+//! how far a joint stood behind its goal, which on velocity-capped servos is a
+//! figure about how fast the content is. The residual is how far it stood from
+//! where its own trajectory generator had got to, stepped by the same model the
+//! decision tick screens on -- so a run is judged offline by the arithmetic
+//! that judged it live.
+//!
+//! It reads the log, the names sidecar and the deployment's servo profile, and
+//! nothing else. The sidecar is what says which motions the library holds and
+//! what they are called, which is the list the tour is judged against -- the
+//! log carries indices and an index is not a name. The profile is the two
+//! registers the machine was commissioned with, which is what the residual is
+//! measured against: a log recorded under one pair cannot be judged under
+//! another.
 //!
 //! Findings split the way the bring-up rule splits them. A motion never asked
 //! for, or a gap in the sample stream, is a defect in the harness. A window
@@ -39,11 +48,15 @@ use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, t
 use motion_channels::{
     EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL,
 };
-use pose_reading::{Grid, Skips, commanded_rows, lags, no_faults, present_rows};
+use pose_reading::{
+    Grid, Skips, commanded_rows, lags, no_faults, present_rows, read_profile, residual_stream,
+    residuals,
+};
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_edge::names::MotionTable;
 use reachy_motion::joints::{JointRef, Name, ROWS, row};
 use reachy_motion::phase::{ANTENNA_CONTACT_BAND_RAD, inside_band, mirror_offset};
+use reachy_motion::plant::PlantModel;
 use run_report::{Report, verdict};
 
 /// How far a goal has to move for the window it moved in to count as having
@@ -598,11 +611,13 @@ fn measurements(
     events: &[&Logged<DriverEventWire>],
     planned: &[Window],
     by_id: &BTreeMap<u16, String>,
+    stream: &[(i64, [f64; ROWS.len()])],
     report: &mut Report,
 ) {
     for window in planned {
         let mut samples = 0_usize;
         let mut lag = Worst::default();
+        let mut residual = Worst::default();
         let mut step = Worst::default();
         let mut commanded_tips = Nearest::default();
         let mut present_tips = Nearest::default();
@@ -630,21 +645,36 @@ fn measurements(
                 }
             }
         }
+        // The residuals are the whole run's, stepped once in nominal order --
+        // a prediction is history and cannot be restarted at a window's edge --
+        // so a window reads the slice of them its own instants cover.
+        let lo = stream.partition_point(|(nominal, _)| *nominal < window.start_ns);
+        let hi = stream.partition_point(|(nominal, _)| *nominal < window.end_ns);
+        for (_, figures) in &stream[lo..hi] {
+            for joint in ROWS {
+                let Some(index) = row(joint) else { continue };
+                residual.offer(joint, figures[index]);
+            }
+        }
         let skipped = events_inside(events, window)
             .iter()
             .filter(|event| event.message.kind() == EventKindWire::CYCLE_SKIPPED)
             .count();
+        // The window's own two instants, printed so an operator can hand them
+        // to `//cogs:trace_export` to cut a replay fixture.
         report.note(format!(
-            "{}: {samples} sample(s), worst lag {lag}, peak step {step} per period, \
-             {skipped} skipped cycle(s), commanded tips {commanded_tips}, present tips \
-             {present_tips}",
-            named_motion(by_id, window.motion_id)
+            "{} [{} .. {}]: {samples} sample(s), worst residual {residual}, worst lag {lag}, \
+             peak step {step} per period, {skipped} skipped cycle(s), commanded tips \
+             {commanded_tips}, present tips {present_tips}",
+            named_motion(by_id, window.motion_id),
+            window.start_ns,
+            window.end_ns
         ));
     }
 }
 
 /// Everything this tool has to say about one tour.
-fn analyze(run: &Run, table: &MotionTable) -> Report {
+fn analyze(run: &Run, table: &MotionTable, profile: (u32, u32)) -> Report {
     let mut report = Report::default();
     for complaint in &run.complaints {
         report.fail(complaint.clone());
@@ -675,22 +705,46 @@ fn analyze(run: &Run, table: &MotionTable) -> Report {
         period_ns: NOMINAL_CYCLE_NS,
     };
     let skips = Skips::of(&run.events, grid, 0);
+    // The plant the run's own machine was commissioned with, on the run's own
+    // grid. A log recorded under another pair is judged under that pair, which
+    // is why the profile is an argument and not a constant.
+    let (acceleration, velocity) = profile;
+    let plant = match PlantModel::from_registers(velocity, acceleration, grid.period_ns) {
+        Ok(plant) => plant,
+        Err(error) => {
+            report.fail(format!(
+                "the profile {acceleration}/{velocity} on a {}ns grid is no plant to judge this \
+                 run against: {error}",
+                grid.period_ns
+            ));
+            return report;
+        }
+    };
+    let stream = residual_stream(&run.samples, grid, &plant);
     let asked = asked_for(run, &by_id, &mut report);
     no_faults(&run.faults, &mut report);
     every_asked_motion_was_scheduled(&asked, &planned, &by_id, &mut report);
     every_window_moved(&ordered, &planned, &by_id, &mut report);
     the_stream_held(&ordered, &planned, grid, &skips, &mut report);
-    measurements(&ordered, &events, &planned, &by_id, &mut report);
+    measurements(&ordered, &events, &planned, &by_id, &stream, &mut report);
+    residuals(&stream, &run.samples, &plant, &mut report);
     lags(&run.samples, &mut report);
     report
 }
 
 fn main() -> ExitCode {
-    const USAGE: &str = "usage: library_tour_report <log-dir> <names.json>";
+    const USAGE: &str = "usage: library_tour_report <log-dir> <names.json> <servo_profile>";
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [log_dir, sidecar] = args.as_slice() else {
+    let [log_dir, sidecar, profile_path] = args.as_slice() else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
+    };
+    let profile = match read_profile(profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("reading the servo profile: {err}");
+            return ExitCode::FAILURE;
+        }
     };
     let text = match std::fs::read_to_string(sidecar) {
         Ok(text) => text,
@@ -713,7 +767,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = analyze(&run, &table);
+    let report = analyze(&run, &table, profile);
     verdict(
         "library_tour_report",
         log_dir,
@@ -735,6 +789,7 @@ mod tests {
         POSE_CHANNEL, PoseSampleWire, Report, Run, ScriptWire, SessionScheduleWire, TickFaultWire,
         Window, analyze, windows,
     };
+    use reachy_motion::plant::SHIPPED_PROFILE;
 
     use brenn_reachy__cogs__schedule_clk_rs::OverlayWindowWire;
     use brenn_reachy__cogs__script_clk_rs::ScriptOverlayWire;
@@ -892,10 +947,24 @@ mod tests {
     /// sample has nothing to report and still prints its numbers.
     #[test]
     fn a_tour_that_played_every_motion_has_no_findings() {
-        let report = analyze(&clean(), &table());
+        let report = analyze(&clean(), &table(), SHIPPED_PROFILE);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
-            measured(&report, "pollen/dances/simple_nod: 20 sample(s)"),
+            measured(&report, "pollen/dances/simple_nod [") && measured(&report, "20 sample(s)"),
+            "{:?}",
+            report.measured
+        );
+        // The window's own instants, which are what `//cogs:trace_export`
+        // needs to cut a replay fixture from the log.
+        assert!(
+            measured(
+                &report,
+                &format!(
+                    "[{} .. {}]",
+                    when(1).as_nanos(),
+                    when(1 + WINDOW_CYCLES).as_nanos()
+                )
+            ),
             "{:?}",
             report.measured
         );
@@ -913,7 +982,7 @@ mod tests {
     /// sweep of checks none of which had anything to read.
     #[test]
     fn a_log_with_no_samples_is_refused_at_once() {
-        let report = analyze(&Run::default(), &table());
+        let report = analyze(&Run::default(), &table(), SHIPPED_PROFILE);
         assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert!(found(&report, "no driver samples"), "{:?}", report.findings);
     }
@@ -926,7 +995,7 @@ mod tests {
             scripts: vec![script(0, 0)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "pollen/emotions/curious1 was never asked for"),
             "{:?}",
@@ -942,7 +1011,7 @@ mod tests {
             scripts: vec![script(0, 0), script(WINDOW_CYCLES, 1), script(41, 1)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "curious1 was asked for 2 times"),
             "{:?}",
@@ -958,7 +1027,7 @@ mod tests {
             scripts: vec![script(0, 1), script(WINDOW_CYCLES, 0)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "not in the order the library numbers them"),
             "{:?}",
@@ -976,7 +1045,7 @@ mod tests {
             scripts: vec![at(0, empty), script(WINDOW_CYCLES, 1)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "carries 0 overlay window(s)"),
             "{:?}",
@@ -1003,7 +1072,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(
                 &report,
@@ -1035,7 +1104,7 @@ mod tests {
             schedules: planned(),
             ..Run::default()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert_eq!(
             report
                 .findings
@@ -1077,7 +1146,7 @@ mod tests {
             schedules: planned(),
             ..Run::default()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             !found(&report, "gap(s) over the tour"),
             "{:?}",
@@ -1102,7 +1171,7 @@ mod tests {
             faults: vec![at(3, fault)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "the decision tick raised"),
             "{:?}",
@@ -1136,7 +1205,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             measured(&report, "simple_nod")
                 && report
@@ -1213,7 +1282,7 @@ mod tests {
             schedules: vec![schedule(0, 0, 1, 1 + WINDOW_CYCLES)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(
                 &report,
@@ -1233,7 +1302,7 @@ mod tests {
             schedules: planned(),
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(
                 &report,
@@ -1254,7 +1323,7 @@ mod tests {
             scripts: vec![script(0, 0), script(WINDOW_CYCLES, 7)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(
                 &report,
@@ -1292,11 +1361,11 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         let line = report
             .measured
             .iter()
-            .find(|line| line.contains("pollen/dances/simple_nod:"))
+            .find(|line| line.contains("pollen/dances/simple_nod ["))
             .expect("the first window's measurements")
             .clone();
         assert!(line.contains("worst lag 0.0500 rad at leg 3"), "{line}");
@@ -1326,12 +1395,12 @@ mod tests {
             events: vec![at(3, event)],
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             report
                 .measured
                 .iter()
-                .any(|line| line.contains("pollen/dances/simple_nod:")
+                .any(|line| line.contains("pollen/dances/simple_nod [")
                     && line.contains("1 skipped cycle(s)")),
             "{:?}",
             report.measured
@@ -1340,7 +1409,7 @@ mod tests {
             report
                 .measured
                 .iter()
-                .any(|line| line.contains("pollen/emotions/curious1:")
+                .any(|line| line.contains("pollen/emotions/curious1 [")
                     && line.contains("0 skipped cycle(s)")),
             "{:?}",
             report.measured
@@ -1355,7 +1424,7 @@ mod tests {
             samples: heartbeat(1 + WINDOW_CYCLES),
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "carries no sample at all"),
             "{:?}",
@@ -1382,7 +1451,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "carried a setpoint"),
             "{:?}",
@@ -1398,7 +1467,7 @@ mod tests {
             schedules: Vec::new(),
             ..clean()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "planned no overlay window at all"),
             "{:?}",
@@ -1420,7 +1489,10 @@ mod tests {
             ..clean()
         };
         assert!(
-            found(&analyze(&late, &table()), "gap(s) over the tour"),
+            found(
+                &analyze(&late, &table(), SHIPPED_PROFILE),
+                "gap(s) over the tour"
+            ),
             "a logger that came up after the tour started is a hole in the record",
         );
         let early = Run {
@@ -1431,7 +1503,10 @@ mod tests {
             ..clean()
         };
         assert!(
-            found(&analyze(&early, &table()), "gap(s) over the tour"),
+            found(
+                &analyze(&early, &table(), SHIPPED_PROFILE),
+                "gap(s) over the tour"
+            ),
             "a logger that stopped before the last window closed is the same hole",
         );
     }
@@ -1446,7 +1521,7 @@ mod tests {
             scripts: vec![script(0, 0)],
             ..Run::default()
         };
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             found(&report, "holds no sample between the first window opening"),
             "{:?}",
@@ -1481,7 +1556,7 @@ mod tests {
             count: 42,
             first_seq: Some(0),
         });
-        let report = analyze(&run, &table());
+        let report = analyze(&run, &table(), SHIPPED_PROFILE);
         assert!(
             measured(&report, &format!("{POSE_CHANNEL} x42")),
             "{:?}",

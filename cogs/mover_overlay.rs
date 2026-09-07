@@ -35,9 +35,10 @@ use reachy_clips::compose::{compose, uncompose};
 use reachy_clips::config::ValidatedLibrary;
 use reachy_motion::joints::JointTargets;
 use reachy_motion::tick::{
-    ClockStretch, MotionCommand, MotionConfig, floor_move_clock, last_targets, plan_move,
+    ClockStretch, CommandRejection, MotionCommand, MotionConfig, floor_move_clock, last_targets,
+    plan_move,
 };
-use reachy_motion::traj::{MoveDurations, WarpKind};
+use reachy_motion::traj::{MoveDurations, Trajectory, WarpKind};
 
 use crate::MoverCounters;
 
@@ -411,6 +412,41 @@ fn asked_move(goal: Goal) -> MotionCommand {
         durations: goal.durations,
         warp: WARP,
     }
+}
+
+/// The path the move to `goal` from `start` actually runs, or the reason this
+/// machine will not run it.
+///
+/// The planner's own construction: the antenna directions resolved away from
+/// their outboard directions, the clock floored, the path shaped to the resolved
+/// target. Answered here rather than assembled by a caller, because the warp and
+/// the rate the clock is floored against are this cog's.
+///
+/// What a caller outside the control loop wants it for is the two things the
+/// postures alone do not say: where the move really ends -- an antenna routed
+/// the long way round travels further than the difference between the angles the
+/// postures name -- and where it stands at each period on the way.
+///
+/// The refusal is carried rather than dropped: a caller outside the loop is
+/// asking about a move it believes in, so which envelope or clock the planner
+/// declined it on is the whole of what it needs to say when it turns out not to
+/// be so.
+pub fn planned_path(
+    cfg: &MotionConfig,
+    start: &JointTargets,
+    goal: Goal,
+    tick_hz: f64,
+) -> Result<Trajectory, CommandRejection> {
+    plan_move(
+        cfg,
+        start,
+        &goal.target,
+        goal.durations,
+        WARP,
+        tick_hz,
+        None,
+    )
+    .map(|(path, _)| path)
 }
 
 /// The clocks the move to `goal` from `start` actually runs on.

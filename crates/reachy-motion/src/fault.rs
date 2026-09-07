@@ -145,9 +145,8 @@ pub fn detail(fault: &Fault) -> f64 {
 /// run.
 ///
 /// For the two obstructions this is the count the tracking run reached on the
-/// tick it ran out, which is the window it was judged by — the ordinary `ticks`
-/// or the longer `reversal_ticks` — so a reading tells a window that was too
-/// short from a reversal the detector did not recognise.
+/// tick it ran out, which is how long the joint stood off its predicted
+/// position without closing on it or keeping pace with it.
 #[must_use]
 pub fn count(fault: &Fault) -> u32 {
     match *fault {

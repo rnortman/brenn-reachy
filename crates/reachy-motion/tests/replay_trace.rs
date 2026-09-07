@@ -47,8 +47,9 @@ const TRACE_FIXTURES_ENV: &str = "REACHY_MOTION_TRACE_FIXTURES";
 /// environment is a test case.
 ///
 /// TODO(antenna-hold-fixture): the antenna hold has no recording here yet, so
-/// nothing replays the stillness watch over a machine. The fixture must match
-/// this parser: the header is
+/// nothing replays the stillness watch over a machine. `//cogs:trace_export`
+/// cuts a window of a log into a file this reads; what such a file must carry
+/// is what the parser here refuses to guess at: the header is
 /// `run,tick,t_s,phase,<joint>_present_rad…,<joint>_goal_rad…`, the `phase`
 /// cell is exactly `commanding` or `settling` and panics otherwise, present
 /// cells are all nine or all blank, and a joint holding no goal has a blank
@@ -206,6 +207,37 @@ impl Run {
             }
         }
         watch.separation()
+    }
+
+    /// The grid this run was driven on: the median time one period took,
+    /// nanoseconds.
+    ///
+    /// A recording's own grid and not the deployment's. The bench loops that
+    /// wrote the older fixtures here ran at 32 ms and 24 ms a period against
+    /// the 20 ms the machine ships, and the servo's trajectory generator is
+    /// stepped in periods: a model built at one period and driven over a
+    /// recording made at another is slow or fast by the ratio, and on fast
+    /// content that shows up as radians of residual that were never on the
+    /// machine. The median rather than the mean, because a period the loop
+    /// overslept and the period after it are both in the series.
+    ///
+    /// Panics on a run of one period, which carries no grid at all.
+    pub fn period_ns(&self) -> i64 {
+        let mut periods: Vec<i64> = self
+            .samples
+            .windows(2)
+            .filter_map(|pair| {
+                let slots = pair[1].tick.checked_sub(pair[0].tick)?;
+                let elapsed = pair[1].at.checked_sub(pair[0].at)?;
+                i64::try_from(elapsed.as_nanos() / u128::from(slots.max(1))).ok()
+            })
+            .collect();
+        assert!(
+            !periods.is_empty(),
+            "a run of one period says nothing about the grid it was driven on"
+        );
+        periods.sort_unstable();
+        periods[periods.len() / 2]
     }
 
     /// The last period's timestamp.
@@ -458,18 +490,10 @@ impl Columns {
     }
 }
 
-/// The prefix a joint's two columns are written under.
-fn column(joint: JointRef) -> String {
-    match joint {
-        JointRef::BodyYaw => "body_yaw".to_string(),
-        JointRef::AntennaRight => "antenna_right".to_string(),
-        JointRef::AntennaLeft => "antenna_left".to_string(),
-        // The legs are written 1-based, as the servos on the bus are numbered.
-        leg => format!(
-            "leg{}",
-            1 + reachy_motion::joints::leg_index(leg).expect("the ninth column is an antenna")
-        ),
-    }
+/// The prefix a joint's two columns are written under: the library's own, so
+/// the fixtures and whatever writes them name a crank the same way.
+fn column(joint: JointRef) -> &'static str {
+    reachy_motion::joints::column_name(joint).expect("the nine bus rows each name a column")
 }
 
 /// A cell holding an angle in radians.
@@ -534,4 +558,132 @@ fn arrival(series: &[(Duration, f64)], goal: f64) -> Option<Duration> {
         }
     }
     arrived
+}
+
+#[cfg(test)]
+mod tests {
+    //! What a recorded run's grid reads as.
+    //!
+    //! [`Run::period_ns`] is the one measurement in this module that every
+    //! residual pin in the replay suite flows through: the plant a recording is
+    //! judged against is built at the period this answers, so an error here
+    //! moves all four bench figures at once and in one direction — the shape a
+    //! reader is most likely to accept and re-bake under the bring-up rule.
+    //! Hence cases of its own, over traces small enough to read, rather than
+    //! only the implicit exercise the checked-in 20 ms fixtures give it.
+
+    use core::time::Duration;
+
+    use reachy_motion::joints::ROWS;
+
+    use super::{Run, Sample, Trace, column};
+
+    /// A trace holding one run of `periods`, each named by its grid slot and
+    /// the instant it began.
+    ///
+    /// Every angle cell is zero: what these cases measure is the grid, and the
+    /// two columns a period's timing lives in are `tick` and `t_s`.
+    fn trace(periods: &[(u64, f64)]) -> Trace {
+        let mut text = String::from("run,tick,t_s,phase");
+        for joint in ROWS {
+            text.push_str(&format!(",{}_present_rad", column(joint)));
+        }
+        for joint in ROWS {
+            text.push_str(&format!(",{}_goal_rad", column(joint)));
+        }
+        text.push('\n');
+        for (tick, secs) in periods {
+            text.push_str(&format!("0,{tick},{secs:.6},commanding"));
+            for _ in 0..2 * ROWS.len() {
+                text.push_str(",0.000000");
+            }
+            text.push('\n');
+        }
+        Trace::parse(&text)
+    }
+
+    /// The grid is the median period and not the mean: one period the loop
+    /// overslept does not move it.
+    ///
+    /// The median is chosen for exactly this, and the choice is what the case
+    /// is about. An overslept period lands in the series twice over — long
+    /// once, and the period after it is measured from the late instant — so a
+    /// mean drags toward the outlier while every other period says 20 ms.
+    #[test]
+    fn the_grid_is_the_median_period_and_not_the_mean() {
+        // Six periods on a 20 ms grid, with the fourth two hundred
+        // milliseconds late: the loop lost the CPU and caught up.
+        let trace = trace(&[
+            (0, 0.00),
+            (1, 0.02),
+            (2, 0.04),
+            (3, 0.24),
+            (4, 0.26),
+            (5, 0.28),
+        ]);
+        let run = trace.run(0);
+        assert_eq!(run.period_ns(), 20_000_000);
+        let mean: i64 = 280_000_000 / 5;
+        assert!(
+            mean > 20_000_000,
+            "the mean of this series is {mean} ns, so a mean would have read the outlier"
+        );
+    }
+
+    /// A slot the driver dropped is divided over the slots it covers, so a hole
+    /// in the grid reads as the grid it is a hole in.
+    ///
+    /// What the elapsed time between two samples measures is the periods
+    /// between their slots, not one period: a fixture cut across a dropped read
+    /// carries a forty-millisecond step over two slots, and a series that took
+    /// that for a period would read the grid at twice its rate and build a
+    /// plant that moves twice as far per period as the servo did.
+    #[test]
+    fn a_dropped_period_is_divided_over_the_slots_it_covers() {
+        let trace = trace(&[(0, 0.00), (1, 0.02), (3, 0.06), (4, 0.08)]);
+        assert_eq!(trace.run(0).period_ns(), 20_000_000);
+    }
+
+    /// Two readings on one slot are one period, not a period of no length.
+    ///
+    /// Not a shape any fixture in the tree carries — the parser reads a period
+    /// that fails to advance as a fresh run — so the run is built here
+    /// directly. What it guards is the division: a slot difference of zero
+    /// divided into an elapsed time is what would make a grid of nanoseconds
+    /// out of one duplicated sample.
+    #[test]
+    fn two_readings_on_one_slot_are_one_period() {
+        let run = Run {
+            samples: vec![
+                Sample {
+                    tick: 0,
+                    at: Duration::ZERO,
+                    settling: false,
+                    present: None,
+                    goal: [None; ROWS.len()],
+                },
+                Sample {
+                    tick: 0,
+                    at: Duration::from_millis(20),
+                    settling: false,
+                    present: None,
+                    goal: [None; ROWS.len()],
+                },
+            ],
+        };
+        assert_eq!(run.period_ns(), 20_000_000);
+    }
+
+    /// A run of one period carries no grid at all, and says so rather than
+    /// answering.
+    ///
+    /// The alternative is a plant built at a period nobody measured, which is
+    /// the one failure this figure must not have: it would be wrong by a ratio
+    /// and read as residual.
+    #[test]
+    #[should_panic(expected = "says nothing about the grid")]
+    fn a_run_of_one_period_has_no_grid() {
+        let trace = trace(&[(0, 0.00)]);
+        let _ = trace.run(0).period_ns();
+    }
 }

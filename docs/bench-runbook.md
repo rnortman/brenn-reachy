@@ -85,8 +85,8 @@ minutes of unattended motion. **Keep the space around the machine clear until
 it returns.** The tour quits the launcher itself; the `timeout` is
 a backstop the sender sizes, and reaching it fails the run.
 `library_tour_report` judges the records: every motion asked once in order, no
-fault, every window moving the machine, no gap in the samples. It prints lag,
-peak step and antenna separation for **Open observations**.
+fault, every window moving the machine, no gap in the samples. It prints
+residual, lag, peak step and antenna separation for **Open observations**.
 
 ## The hold test
 

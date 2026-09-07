@@ -66,9 +66,12 @@ use motion_channels::{
 use motion_evidence::{ARRIVAL_TURN_RAD, closest, solved_pose};
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
-use pose_reading::{Grid, Skips, lags, no_faults, present_rows};
+use pose_reading::{
+    Grid, Skips, lags, no_faults, present_rows, read_profile, residual_stream, residuals,
+};
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, row, rows_of};
+use reachy_motion::plant::{PlantModel, SHIPPED_PROFILE};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::seq::failure::Name as FailureName;
 use reachy_motion::value;
@@ -135,6 +138,14 @@ struct Run {
     /// with no Rust type bound to it still says whether anything travelled on
     /// it.
     census: Census,
+    /// The two profile registers the run's machine was commissioned with, as
+    /// the deployment's own configuration states them: acceleration first.
+    ///
+    /// What the residual is measured against, so a log recorded under one pair
+    /// is judged under that pair. `None` is a run nobody named a profile for,
+    /// which is a crafted run in the cases below rather than anything read off
+    /// a log: the tool's own invocation always names the file.
+    profile: Option<(u32, u32)>,
     /// Anything that went wrong reading the log itself. Every one of these is a
     /// failure of the run.
     complaints: Complaints,
@@ -2292,6 +2303,7 @@ fn analyze(run: &Run) -> Report {
     the_release(run, &traffic, &mut report);
     jitter(run, &mut report);
     reads(run, &mut report);
+    residual_screen(run, grid, &mut report);
     lags(&run.samples, &mut report);
     stillness(run, &mut report);
     health(run, &mut report);
@@ -2302,16 +2314,38 @@ fn analyze(run: &Run) -> Report {
     report
 }
 
+/// How far every joint stood from its own modelled trajectory over the run.
+///
+/// The profile is the run's own, and a pair that models nothing is a finding
+/// rather than a silent omission: without it there is no screen, and a report
+/// that printed nothing where the screen belongs would read as a clean run.
+fn residual_screen(run: &Run, grid: Grid, report: &mut Report) {
+    let (acceleration, velocity) = run.profile.unwrap_or(SHIPPED_PROFILE);
+    match PlantModel::from_registers(velocity, acceleration, grid.period_ns) {
+        Ok(plant) => {
+            let stream = residual_stream(&run.samples, grid, &plant);
+            residuals(&stream, &run.samples, &plant, report);
+        }
+        Err(error) => report.fail(format!(
+            "the profile {acceleration}/{velocity} on a {}ns grid is no plant to judge this run \
+             against: {error}",
+            grid.period_ns
+        )),
+    }
+}
+
 /// Read the log named on the command line, judge it, and print both halves.
 ///
 /// The measurements go to stdout and the findings to stderr, so a run's numbers
 /// can be filed with the run record while the findings are what an operator sees
 /// on the terminal. The exit status is the verdict.
 fn main() -> ExitCode {
-    const USAGE: &str = "usage: first_motion_report [--grid-jitter-ns <n>] <log-dir>";
+    const USAGE: &str =
+        "usage: first_motion_report [--grid-jitter-ns <n>] <log-dir> <servo_profile>";
     let mut args = std::env::args().skip(1);
     let mut jitter_ns = 0_i64;
     let mut log_dir: Option<String> = None;
+    let mut profile_path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--grid-jitter-ns" => {
@@ -2327,17 +2361,25 @@ fn main() -> ExitCode {
                 }
             }
             _ if log_dir.is_none() && !arg.starts_with("--") => log_dir = Some(arg),
+            _ if profile_path.is_none() && !arg.starts_with("--") => profile_path = Some(arg),
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::FAILURE;
             }
         }
     }
-    let Some(log_dir) = log_dir else {
+    let (Some(log_dir), Some(profile_path)) = (log_dir, profile_path) else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
     let log_dir = &log_dir;
+    let profile = match read_profile(&profile_path) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("reading the servo profile: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let run = match Run::read(&PathBuf::from(log_dir)) {
         Ok(run) => run,
         Err(err) => {
@@ -2347,6 +2389,7 @@ fn main() -> ExitCode {
     };
     let run = Run {
         grid_jitter_ns: jitter_ns,
+        profile: Some(profile),
         ..run
     };
     let report = analyze(&run);

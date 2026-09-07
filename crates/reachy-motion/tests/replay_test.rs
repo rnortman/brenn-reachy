@@ -20,12 +20,16 @@ mod replay_trace;
 use core::time::Duration;
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
-use reachy_motion::joints::{ROWS, flags, group_of};
-use reachy_motion::tick::{RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_HEAD_LAG_RAD, tracking};
+use reachy_motion::joints::{ROW_COUNT, ROWS, flags, group_of, row};
+use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS};
+use reachy_motion::tick::{
+    RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
+    RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, tracking,
+};
 use reachy_motion::{
-    ANTENNA_PHASE_SEPARATION_RAD, JointGroup, JointRef, JointTargets, MotionCommand, MotionConfig,
-    MotionSnapWire, MoveDurations, WarpKind, dry_pass_peaks, floor_move_clock, stow_pose_targets,
-    stow_targets,
+    ANTENNA_PHASE_SEPARATION_RAD, JointGroup, JointRef, JointTargets, JointVector, MotionCommand,
+    MotionConfig, MotionSnapWire, MoveDurations, WarpKind, dry_pass_peaks, floor_move_clock,
+    stow_pose_targets, stow_targets,
 };
 
 use replay_trace::{ARRIVED_TOLERANCE_RAD, Run, Sample, Trace, fixture};
@@ -79,41 +83,222 @@ fn gesture(durations: MoveDurations) -> MotionCommand {
     }
 }
 
+/// The profile the recordings in `fixtures/traces` were made under, in register
+/// units: acceleration then velocity, as the commissioning sweep writes them.
+///
+/// The bench nights ran a faster pair than the deployment ships, so every
+/// fixture here is judged against the plant it was actually recorded on. A log
+/// recorded under one pair and replayed under another is a different machine.
+const BENCH_PROFILE: (u32, u32) = (400, 600);
+
+/// The plant a recording is judged against: its own profile, on the grid that
+/// recording was actually driven at.
+///
+/// Both halves come off the run rather than off the deployment. The bench
+/// nights ran a faster profile than the machine ships and slower loops than the
+/// grid it ships — 32 ms and 24 ms a period — and the generator this models
+/// moves per period, so a
+/// model handed the shipped period covers a fraction of what the servo covered
+/// in the same sample and reads the difference as residual.
+fn bench_plant(run: &Run) -> PlantModel {
+    let (acceleration, velocity) = BENCH_PROFILE;
+    PlantModel::from_registers(velocity, acceleration, run.period_ns())
+        .expect("the bench profile pair is a model")
+}
+
+/// One period of a recording on which some joint's window ran out.
+///
+/// The residuals of that period travel with it: what the comparison decided is
+/// only half of what a guard needs, since a window run out at the threshold's
+/// own edge and one run out a radian past it are the same boolean and very
+/// different evidence.
+struct Trip {
+    /// The grid slot, counted from the run's first period.
+    at: u64,
+    /// The joints whose window ran out on it.
+    exhausted: JointFlags,
+    /// How far every row stood from its own prediction, radians.
+    residuals: [f64; ROW_COUNT],
+}
+
+/// One period the comparison judged, and what it measured.
+///
+/// No grid slot: the judged periods of a run are not necessarily adjacent
+/// slots — a period whose grouped read fell short is stepped and never judged —
+/// and the detector's own window is a count of judged periods rather than a
+/// stretch of the grid, so nothing here needs to know which slot a reading came
+/// from.
+struct Judged {
+    /// How far every row stood from its own prediction, radians.
+    residuals: [f64; ROW_COUNT],
+}
+
+/// What one recorded run reads as, judged.
+struct Replay {
+    /// The periods on which some joint's window ran out, in grid order.
+    trips: Vec<Trip>,
+    /// How far every row stood from its own prediction on each period that
+    /// carried a reading, in grid order.
+    ///
+    /// Every judged period and not only the ones that decided something: the
+    /// threshold is sized on the worst of these and on the worst a run holds
+    /// for a whole window, and neither figure is visible in a verdict.
+    judged: Vec<Judged>,
+}
+
 /// The shipped tracking comparison driven over a recorded run, period by
 /// period, answering the joints whose window ran out and when.
 ///
-/// A period whose grouped read fell short is skipped: a stale measurement
-/// would freeze the run where it stands. A released joint is handed over
-/// masked — it holds no goal to lag behind.
-fn trips(cfg: &MotionConfig, run: &Run) -> Vec<(u64, JointFlags)> {
+/// The prediction is stepped exactly as the live tick steps it: seeded from the
+/// first reading, then one step-then-push per period against the setpoint the
+/// driver was holding `RESPONSE_DEAD_SAMPLES` periods earlier. A period whose
+/// grouped read fell short is stepped but not judged — a stale measurement
+/// would freeze the run where it stands, while the servo went on moving, and
+/// the servo did not stop moving because the read failed. A grid slot the
+/// recording holds no period for is stepped on the setpoint already held; a gap
+/// of more than `MAX_GAP_PERIODS` of them re-seeds, because past that the
+/// prediction is not something arithmetic knows. A released joint is handed
+/// over masked: it holds no setpoint to be judged against.
+///
+/// The walk is the tick's `advance_prediction` restated, and it has to stay so:
+/// a fixture judged by any other order or any other gap rule is not the run the
+/// machine was judged by. `plant::RESPONSE_DEAD_SAMPLES`' own
+/// TODO(plant-chase-sequencer) is the one statement of this walk that would
+/// make the restatement unnecessary.
+fn replay(cfg: &MotionConfig, plant: &PlantModel, run: &Run) -> Replay {
     let mut state = MotionSnapWire::new();
     let state = state.clear_valid();
-    let mut out = Vec::new();
+    let mut out = Replay {
+        trips: Vec::new(),
+        judged: Vec::new(),
+    };
+    let mut held: Vec<JointVector> = Vec::new();
+    let mut previous: Option<u64> = None;
     for sample in &run.samples {
+        // A released joint is commanded nothing, so the ring carries its own
+        // angle rather than a setpoint it never had.
+        let mut setpoint = sample.present.unwrap_or_default();
+        for joint in ROWS {
+            if let Some(angle) = sample.goal_of(joint) {
+                setpoint.set(joint, angle);
+            }
+        }
+        // How many periods this one covers: its own, plus every grid slot the
+        // recording holds nothing for. Floored at one.
+        let periods = previous.map_or(1, |before| sample.tick.saturating_sub(before).max(1));
+        previous = Some(sample.tick);
+        if periods > MAX_GAP_PERIODS as u64 || held.len() < RESPONSE_DEAD_SAMPLES {
+            tracking::reseed(&mut state.tracking);
+            if periods > MAX_GAP_PERIODS as u64 {
+                // The ring goes with the prediction over a gap that long, and
+                // only over one: a prediction seeded from this period's reading
+                // has no business being stepped toward a setpoint from before
+                // the gap. A ring that is merely filling is left to fill.
+                held.clear();
+            }
+        } else {
+            for period in 0..periods {
+                let target = held.remove(0);
+                tracking::predict(plant, &target, &mut state.tracking);
+                if period + 1 < periods {
+                    // Nothing was written in a slot the loop missed, so the
+                    // newest setpoint is pushed again: the servos chased what
+                    // they were already holding.
+                    let carried = *held.last().unwrap_or(&target);
+                    held.push(carried);
+                }
+            }
+        }
+        held.push(setpoint);
+        while held.len() > RESPONSE_DEAD_SAMPLES {
+            held.remove(0);
+        }
         let Some(present) = sample.present else {
             continue;
         };
-        // A released joint is commanded nothing, so it stands at its own angle
-        // rather than at a goal it never had.
-        let mut goal = present;
-        for joint in ROWS {
-            if let Some(angle) = sample.goal_of(joint) {
-                goal.set(joint, angle);
-            }
-        }
+        tracking::seed(&mut state.tracking, &present);
         let look = tracking::look(
             &cfg.tracking,
             sample.released(),
             &present,
-            &goal,
             &mut state.tracking,
         );
+        out.judged.push(Judged {
+            residuals: look.residuals,
+        });
         if !flags::is_empty(look.exhausted) {
-            out.push((sample.tick, look.exhausted));
+            out.trips.push(Trip {
+                at: sample.tick,
+                exhausted: look.exhausted,
+                residuals: look.residuals,
+            });
         }
     }
     out
 }
+
+fn is_head(joint: JointRef) -> bool {
+    group_of(joint) != Some(JointGroup::Antennas)
+}
+
+fn is_antenna(joint: JointRef) -> bool {
+    !is_head(joint)
+}
+
+fn worst_residual(judged: &[Judged], admit: fn(JointRef) -> bool) -> f64 {
+    ROWS.into_iter()
+        .filter(|joint| admit(*joint))
+        .filter_map(row)
+        .flat_map(|row| judged.iter().map(move |judged| judged.residuals[row]))
+        .fold(0.0_f64, f64::max)
+}
+
+/// The worst residual any row held for a whole window of `periods` judged
+/// periods of one recording.
+///
+/// The minimum within a window, maximised over the rows and the windows: a
+/// residual a run never came back under for that long is the shape the detector
+/// answers, and an excursion that closes inside the window is the shape it must
+/// not.
+///
+/// A window is `periods` *judged* periods and not `periods` grid slots, because
+/// that is the window the detector counts: a period whose grouped read fell
+/// short is stepped and never judged, and a stale tick leaves every run exactly
+/// where it stood rather than growing or clearing it. So a run spans a hole and
+/// runs out on its tenth live reading whatever grid distance the ten covered,
+/// and a window formed only from adjacent slots would drop the stretches that
+/// straddle a dropped read — the direction that hides margin the machine has
+/// already lost.
+///
+/// Only within one recording, though: the caller passes one run's judged
+/// periods, since a window straddling two of them would be a figure about two
+/// machines.
+///
+/// Every row rather than a group at a time: the figure is the worst any joint
+/// held, and the head and the antennas are all nine of them.
+fn sustained_residual(judged: &[Judged], periods: usize) -> f64 {
+    let mut worst = 0.0_f64;
+    for window in judged.windows(periods) {
+        for row in ROWS.into_iter().filter_map(row) {
+            let held = window
+                .iter()
+                .map(|judged| judged.residuals[row])
+                .fold(f64::INFINITY, f64::min);
+            worst = worst.max(held);
+        }
+    }
+    worst
+}
+
+/// The recordings cut from the 2026-09-06 clip-library tour and the wake
+/// gesture beside it, which are the runs the shipped screen is sized on.
+const TOUR_FIXTURES: [&str; 5] = [
+    "trace-tour-toc-toc-toc",
+    "trace-tour-side-peekaboo",
+    "trace-tour-proud1",
+    "trace-tour-no-sad1",
+    "trace-wake-20260906",
+];
 
 /// Guard 1. Neither run that went well raises anything in the shipped tracking
 /// comparison, and the lags they ran at are the headroom record.
@@ -130,13 +315,13 @@ fn the_runs_that_went_well_raise_nothing() {
     let cfg = MotionConfig::default();
     for name in ["trace-verify2", "trace-fast4"] {
         let trace = fixture(name);
-        let trips = trips(&cfg, trace.run(0));
+        let trips = replay(&cfg, &bench_plant(trace.run(0)), trace.run(0)).trips;
         assert!(
             trips.is_empty(),
             "{name}: {:?}",
             trips
                 .iter()
-                .map(|(at, out)| (*at, flags::Names(*out).to_string()))
+                .map(|trip| (trip.at, flags::Names(trip.exhausted).to_string()))
                 .collect::<Vec<_>>()
         );
     }
@@ -167,6 +352,307 @@ fn the_runs_that_went_well_raise_nothing() {
     assert!(
         head_lag < cfg.tracking.threshold_rad,
         "the healthy head lag {head_lag:.4} rad now reaches the {:.4} rad threshold",
+        cfg.tracking.threshold_rad
+    );
+}
+
+/// The worst residual any head joint ran at on the bench recordings, radians.
+///
+/// Local to this suite rather than a library constant, because no live run is
+/// reported against the bench profile: these recordings were made under a pair
+/// three times faster than the deployment commissions, so the figure screens
+/// nothing a report prints. What it is for is the model itself — the same
+/// arithmetic over the same machine at a second setting, which is the only
+/// in-tree check that the model is the servo's generator rather than a fit to
+/// one profile.
+const BENCH_WORST_HEAD_RESIDUAL_RAD: f64 = 0.094;
+
+/// The worst residual an antenna ran at on the fastest bench sweep, radians.
+///
+/// Read the same way as [`BENCH_WORST_HEAD_RESIDUAL_RAD`], over the sweep whose
+/// goal ran at four times the profile it was commissioned at: the joint was a
+/// radian and a third behind that goal and this far from its own trajectory.
+const BENCH_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.792;
+
+/// Guard 1. The clip library played on the unit raises nothing, and its worst
+/// residuals are the figures the shipped threshold is sized over.
+///
+/// The five recordings cut from the 2026-09-06 tour and the wake gesture, under
+/// the profile the deployment commissions — the whole library's worst residual
+/// on record, its worst leg and antenna reversal excursions, its longest travel
+/// and the shipped gesture. A healthy machine on the content it ships with, so
+/// a raise here is the screen sized wrong; the pins are the library's own
+/// constants, so the figure a report prints beside a live run and the figure
+/// the recordings hold are one statement.
+#[test]
+fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_sized_on() {
+    let cfg = MotionConfig::default();
+    let window = cfg.tracking.ticks as usize;
+    let mut judged = Vec::new();
+    let mut sustained = 0.0_f64;
+    for name in TOUR_FIXTURES {
+        let trace = fixture(name);
+        assert_eq!(trace.runs(), 1, "{name} holds more than the window cut");
+        // A fixture cut from a run at another period would be a different
+        // machine, so the grid is asserted rather than assumed.
+        assert_eq!(
+            trace.run(0).period_ns(),
+            SHIPPED_PERIOD_NS,
+            "{name} was recorded on another grid"
+        );
+        let outcome = replay(&cfg, &cfg.plant, trace.run(0));
+        assert!(
+            outcome.trips.is_empty(),
+            "{name}: {:?}",
+            outcome
+                .trips
+                .iter()
+                .map(|trip| (trip.at, flags::Names(trip.exhausted).to_string()))
+                .collect::<Vec<_>>()
+        );
+        // The sustained figure is taken per recording, because a window is a
+        // stretch of one run's own judged periods; the worst period is a
+        // maximum and takes the whole library at once.
+        sustained = sustained.max(sustained_residual(&outcome.judged, window));
+        judged.extend(outcome.judged);
+    }
+
+    let head = worst_residual(&judged, is_head);
+    let antennas = worst_residual(&judged, is_antenna);
+    assert!(
+        (head - RECORDED_WORST_HEAD_RESIDUAL_RAD).abs() < 5e-3,
+        "the recorded library's worst head residual is {head:.4} rad"
+    );
+    assert!(
+        (antennas - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "the recorded library's worst antenna residual is {antennas:.4} rad"
+    );
+
+    // And the margin, which is what the screen is: no excursion on record was
+    // held for a whole window, so the figure a run is judged by is well under
+    // the threshold even at the run's worst sustained stretch. The ratio is
+    // printed because it is the headroom claim itself, and a change that eats
+    // it should be readable here rather than inferred from a pass.
+    println!(
+        "worst residual {head:.4} rad (head) / {antennas:.4} rad (antennas), worst held for a \
+         {window}-period window {sustained:.4} rad, against a {:.4} rad screen: {:.2}x headroom \
+         on the worst period and {:.2}x on the worst window",
+        cfg.tracking.threshold_rad,
+        cfg.tracking.threshold_rad / head.max(antennas),
+        cfg.tracking.threshold_rad / sustained,
+    );
+    assert!(
+        sustained < cfg.tracking.threshold_rad,
+        "the library held {sustained:.4} rad for a whole {window}-period window, which the \
+         {:.4} rad screen no longer clears",
+        cfg.tracking.threshold_rad
+    );
+    // The sizing rule itself, asserted rather than described: the shipped
+    // screen stands half again over the worst residual these recordings hold.
+    // The threshold's own derivation is that ratio, so a re-cut fixture or a
+    // change to the model that eats the margin fails here instead of leaving
+    // the derivation stated against a figure the recordings no longer show.
+    assert!(
+        cfg.tracking.threshold_rad >= 1.5 * head.max(antennas),
+        "the screen is {:.4} rad and the recordings' worst residual is {:.4} rad: the threshold \
+         is sized at half again over what a healthy machine shows",
+        cfg.tracking.threshold_rad,
+        head.max(antennas)
+    );
+}
+
+/// The worst residual a leg ran at on the library's worst leg reversal,
+/// radians.
+///
+/// Local to this suite: the two library constants are the figures a report
+/// prints a live run against, and those are the head's and the antennas'. This
+/// one is what one fixture is kept for — the excursion a crank makes when the
+/// goal turns round through it, which the aggregate head maximum (a body yaw
+/// reversal, half again this figure) hides.
+const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.274;
+
+/// The worst residual the shipped wake gesture and the hold after it ran at,
+/// radians: head then antennas.
+///
+/// Local for the same reason, and kept because this recording is the evidence
+/// for a direction no other fixture holds. The dead time is three samples and
+/// not four because the tour's saturated moves improve with a deeper ring while
+/// this gesture's antennas get steadily worse — about a quarter per sample — so
+/// a ring deepened to chase the tour would mis-time every unsaturated move. The
+/// tour pins move under a dead-time change too, but they move in the direction
+/// that reads as an improvement; this pair is what says the trade was a trade.
+const WAKE_WORST_RESIDUAL_RAD: (f64, f64) = (0.1106, 0.0988);
+
+/// The worst a joint ran behind its *goal* on the library's longest travel,
+/// radians.
+///
+/// Kept beside that fixture's residual because the pair is the whole claim: an
+/// antenna three radians behind the goal a clip asked for, standing a tenth of
+/// a radian from where its own servo's generator had got to. The first figure
+/// is what the content asked of the machine and says nothing about health; the
+/// second is what the detector screens on.
+const CLIP_WORST_ANTENNA_LAG_RAD: f64 = 2.9622;
+
+/// The most any joint on that recording stood from its own prediction, radians:
+/// the bound the lag figure beside it is contrasted with.
+const CLIP_LONGEST_TRAVEL_RESIDUAL_BOUND_RAD: f64 = 0.1;
+
+fn is_leg(joint: JointRef) -> bool {
+    group_of(joint) == Some(JointGroup::Legs)
+}
+
+/// Guard 1. Each recording cut from the library holds the figure it is kept
+/// for.
+///
+/// The test beside the aggregate one, per fixture rather than over the five at
+/// once. The library's two worst residuals are a maximum and the aggregate
+/// pins are where they belong; the rest of what these files are kept for is
+/// per file, and a maximum over the five says nothing about any of them. Cut a
+/// window differently, truncate one, swap two, and the aggregate is unmoved —
+/// which is the rot the README's own contract says one test per file prevents.
+///
+/// Every figure here is the one the README row states, so a re-cut fixture
+/// fails naming its own file and the README and the suite cannot drift.
+#[test]
+fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
+    let cfg = MotionConfig::default();
+    let judged = |name: &str| {
+        let trace = fixture(name);
+        let run = trace.run(0);
+        replay(&cfg, &cfg.plant, run).judged
+    };
+
+    // The worst residual on record is a body yaw reversal on `no_sad1`, and it
+    // is the figure the threshold carries its margin over.
+    let no_sad1 = worst_residual(&judged("trace-tour-no-sad1"), is_head);
+    assert!(
+        (no_sad1 - RECORDED_WORST_HEAD_RESIDUAL_RAD).abs() < 5e-3,
+        "no_sad1's worst head residual is {no_sad1:.4} rad"
+    );
+
+    // The worst antenna reversal is `proud1`'s, which is the antenna pin.
+    let proud1 = worst_residual(&judged("trace-tour-proud1"), is_antenna);
+    assert!(
+        (proud1 - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "proud1's worst antenna residual is {proud1:.4} rad"
+    );
+
+    // The worst *leg* reversal is `side_peekaboo`'s, and a crank's excursion is
+    // its own figure: the head maximum is a yaw and reads half again this.
+    let peekaboo = worst_residual(&judged("trace-tour-side-peekaboo"), is_leg);
+    assert!(
+        (peekaboo - CLIP_WORST_LEG_RESIDUAL_RAD).abs() < 5e-3,
+        "side_peekaboo's worst leg residual is {peekaboo:.4} rad"
+    );
+
+    // The longest travel on record, and the standing case that a lag says
+    // nothing about health: three radians behind the goal, a tenth of a radian
+    // from its own trajectory. Both halves read off the one recording, because
+    // the contrast is the claim.
+    let toc_toc_toc = fixture("trace-tour-toc-toc-toc");
+    let lag = [JointRef::AntennaRight, JointRef::AntennaLeft]
+        .into_iter()
+        .map(|joint| toc_toc_toc.run(0).joint(joint).worst_lag)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        (lag - CLIP_WORST_ANTENNA_LAG_RAD).abs() < 5e-3,
+        "toc_toc_toc's worst antenna lag is {lag:.4} rad"
+    );
+    let toc_residual = worst_residual(&judged("trace-tour-toc-toc-toc"), is_head).max(
+        worst_residual(&judged("trace-tour-toc-toc-toc"), is_antenna),
+    );
+    assert!(
+        toc_residual < CLIP_LONGEST_TRAVEL_RESIDUAL_BOUND_RAD,
+        "toc_toc_toc's worst residual is {toc_residual:.4} rad, and what this recording is kept \
+         for is a joint radians behind its goal and a tenth of a radian from its own generator"
+    );
+    assert!(
+        lag > 10.0 * toc_residual,
+        "the lag is {lag:.4} rad and the residual {toc_residual:.4} rad: this recording is kept \
+         for the distance between the two figures"
+    );
+
+    // The shipped gesture, at the profile the deployment commissions. The
+    // unsaturated run in the library, which is why the dead time is pinned
+    // against it as well as against the tour.
+    let wake = judged("trace-wake-20260906");
+    let (wake_head, wake_antennas) = (
+        worst_residual(&wake, is_head),
+        worst_residual(&wake, is_antenna),
+    );
+    assert!(
+        (wake_head - WAKE_WORST_RESIDUAL_RAD.0).abs() < 5e-3,
+        "the wake gesture's worst head residual is {wake_head:.4} rad"
+    );
+    assert!(
+        (wake_antennas - WAKE_WORST_RESIDUAL_RAD.1).abs() < 5e-3,
+        "the wake gesture's worst antenna residual is {wake_antennas:.4} rad"
+    );
+}
+
+/// Guard 1. The bench recordings raise nothing under their own profile either,
+/// and their residuals are pinned at that profile.
+///
+/// The same model at a second setting: these runs were driven by servos
+/// commissioned three times faster, and the arithmetic that judges them is the
+/// deployment's with two registers changed. A model carrying a constant read
+/// off one profile would show up here rather than on the machine.
+#[test]
+fn the_bench_runs_that_went_well_pin_their_residuals_at_their_own_profile() {
+    let cfg = MotionConfig::default();
+    let verify2_trace = fixture("trace-verify2");
+    let fast4_trace = fixture("trace-fast4");
+    let verify2 = {
+        let run = verify2_trace.run(0);
+        replay(&cfg, &bench_plant(run), run)
+    };
+    let fast4 = {
+        let run = fast4_trace.run(0);
+        replay(&cfg, &bench_plant(run), run)
+    };
+    for (name, outcome) in [("trace-verify2", &verify2), ("trace-fast4", &fast4)] {
+        assert!(
+            outcome.trips.is_empty(),
+            "{name}: {:?}",
+            outcome
+                .trips
+                .iter()
+                .map(|trip| (trip.at, flags::Names(trip.exhausted).to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let head = worst_residual(&verify2.judged, is_head);
+    assert!(
+        (head - BENCH_WORST_HEAD_RESIDUAL_RAD).abs() < 5e-3,
+        "the validated gesture's worst head residual is {head:.4} rad"
+    );
+    let antennas = worst_residual(&fast4.judged, is_antenna);
+    assert!(
+        (antennas - BENCH_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "the fast sweep's worst antenna residual is {antennas:.4} rad"
+    );
+    // And what the two figures are of, which is the point of keeping them.
+    // The head, on a gesture the whole machine made well, reads a tenth of a
+    // radian: the model is the generator at either setting. The antenna on the
+    // speed record reads better than the screen, on a run nothing was wrong
+    // with — its goal outran the profile, the servo outran the profile's own
+    // stated cap by a few percent, and three samples of dead time on a 32 ms
+    // loop is half again the delay the same constant means on the 20 ms grid
+    // the machine ships. What keeps that joint in service is the pace rule and
+    // not the screen: it was moving with its generator the whole way. So this
+    // pair of pins is also the standing statement that the screen's margin is
+    // a figure about one profile on one grid, and the two rules behind it are
+    // what carry a machine on another.
+    assert!(
+        head < cfg.tracking.threshold_rad,
+        "the validated gesture's head now reaches the {:.4} rad screen",
+        cfg.tracking.threshold_rad
+    );
+    assert!(
+        antennas > cfg.tracking.threshold_rad,
+        "the fast sweep's antenna no longer passes the {:.4} rad screen, so this pin no longer \
+         says that the pace rule is what carried it",
         cfg.tracking.threshold_rad
     );
 }
@@ -245,19 +731,36 @@ fn the_lag_and_speed_figures_the_tracking_comment_quotes_are_what_the_recordings
 fn the_collision_trips_it_on_the_antennas_and_nothing_else() {
     let cfg = MotionConfig::default();
     let trace = fixture("trace-stagger");
-    let trips = trips(&cfg, trace.run(2));
+    let trips = replay(&cfg, &bench_plant(trace.run(2)), trace.run(2)).trips;
 
     assert!(
         !trips.is_empty(),
         "the stalled pair never ran its window out"
     );
-    for (at, exhausted) in &trips {
-        for joint in flags::iter(*exhausted) {
+    for trip in &trips {
+        for joint in flags::iter(trip.exhausted) {
             assert_eq!(
                 group_of(joint),
                 Some(JointGroup::Antennas),
-                "a head joint ran its window out at period {at}: {}",
-                flags::Names(*exhausted)
+                "a head joint ran its window out at period {}: {}",
+                trip.at,
+                flags::Names(trip.exhausted)
+            );
+            // The window ran out on a joint that was genuinely far from where
+            // its own generator had got to, and not on one sitting a hair past
+            // the screen: the pair stood still with the goal radians away, so
+            // the residual that carried this is most of a radian and clears the
+            // threshold several times over. A model with the dead time or the
+            // acceleration wrong could still run a window out here; one that
+            // did so at the threshold's own edge would not.
+            let residual = trip.residuals[row(joint).expect("a bus row")];
+            assert!(
+                residual > 2.0 * cfg.tracking.threshold_rad,
+                "the {joint:?} window ran out at period {} on a residual of {residual:.4} rad, \
+                 which is inside twice the {:.4} rad threshold: the collision on record stood \
+                 the pair much further off its trajectory than that",
+                trip.at,
+                cfg.tracking.threshold_rad,
             );
         }
     }
@@ -268,8 +771,8 @@ fn the_collision_trips_it_on_the_antennas_and_nothing_else() {
     let ran_out = |side| {
         trips
             .iter()
-            .find(|(_, out)| flags::contains(*out, side))
-            .map(|(at, _)| *at)
+            .find(|trip| flags::contains(trip.exhausted, side))
+            .map(|trip| trip.at)
     };
     let right = ran_out(JointRef::AntennaRight).expect("the right antenna stalled");
     let left = ran_out(JointRef::AntennaLeft).expect("the left antenna stalled");
@@ -625,4 +1128,103 @@ fn the_collision_stalls_both_antennas_at_mirrored_angles() {
         let residual = antenna.residual.expect("it was holding a goal");
         assert!(residual > stall.worst_lag, "{joint:?}: {residual}");
     }
+}
+
+/// Guard 5. What the model reads over the gain change, which is the only run on
+/// record of a servo that did not keep up with its own generator.
+///
+/// Both runs command the whole span in a single period, so the modelled
+/// generator ramps to its cap while the servo answers with its position loop
+/// alone — the model is describing a move nobody planned, and the residual it
+/// reads is most of the span. What the two runs differ in is the speed the
+/// servo answered at: under the P-only gains of that night the antennas covered
+/// about half the profile velocity per period and under the tuned gains most of
+/// it. Half is where `pace_min` sits, so the first run is the one recording of
+/// a joint the pace rule does not carry and the second is a joint it does. Read
+/// as a hardware reading and not as a screen: no shipped command steps a goal
+/// like this, and what the pair says is which side of the pace floor a badly
+/// tuned servo lands on.
+#[test]
+fn the_gain_change_is_a_servo_under_the_pace_floor_and_the_same_servo_over_it() {
+    let cfg = MotionConfig::default();
+    let trace = fixture("trace-newgains");
+    let outcomes = [0, 1].map(|index| {
+        let run = trace.run(index);
+        replay(&cfg, &bench_plant(run), run)
+    });
+    for (index, outcome) in [(0, &outcomes[0]), (1, &outcomes[1])] {
+        let worst = worst_residual(&outcome.judged, is_head)
+            .max(worst_residual(&outcome.judged, is_antenna));
+        let settled = outcome
+            .judged
+            .last()
+            .map(|residuals| {
+                worst_residual(std::slice::from_ref(residuals), is_head)
+                    .max(worst_residual(std::slice::from_ref(residuals), is_antenna))
+            })
+            .expect("the run was judged");
+        println!(
+            "run {index} reads {worst:.4} rad off the model at its worst and {settled:.4} rad on \
+             the last period it was held on, and ran its window out on {} period(s)",
+            outcome.trips.len()
+        );
+        assert!(
+            worst > cfg.tracking.threshold_rad,
+            "run {index} reads {worst:.4} rad off the model at its worst, which no longer says \
+             what a step command does to a generator"
+        );
+    }
+
+    // The pre-change run: both antennas, and only the antennas, run their
+    // windows out. They are the rows whose span is radians rather than
+    // fractions of one, so they are the rows a speed shortfall accumulates on.
+    assert!(
+        !outcomes[0].trips.is_empty(),
+        "the servos that could not keep up now keep up"
+    );
+    for trip in &outcomes[0].trips {
+        for joint in flags::iter(trip.exhausted) {
+            assert!(
+                is_antenna(joint),
+                "{joint:?} ran its window out at period {}: {}",
+                trip.at,
+                flags::Names(trip.exhausted)
+            );
+        }
+    }
+
+    // And after the change, the same command on the same machine is carried by
+    // the pace rule from end to end.
+    assert!(
+        outcomes[1].trips.is_empty(),
+        "the tuned run: {:?}",
+        outcomes[1]
+            .trips
+            .iter()
+            .map(|trip| (trip.at, flags::Names(trip.exhausted).to_string()))
+            .collect::<Vec<_>>()
+    );
+
+    // Where each run ended, which is the measurement the fixture is kept for:
+    // the P-only gains leave the loaded legs standing off their goal for good
+    // and the tuned gains bring them home. Once the generator has stopped the
+    // model stands on the goal, so the distance from the model is the droop.
+    let settled = |outcome: &Replay| {
+        worst_residual(
+            std::slice::from_ref(outcome.judged.last().expect("the run was judged")),
+            is_head,
+        )
+    };
+    let droop = settled(&outcomes[0]);
+    assert!(
+        (droop - deg(4.0)).abs() < deg(0.6),
+        "the droop the shipped gains left reads {:.2}deg off the model",
+        droop.to_degrees()
+    );
+    let tuned = settled(&outcomes[1]);
+    assert!(
+        tuned < deg(1.3),
+        "the tuned gains leave {:.2}deg off the model",
+        tuned.to_degrees()
+    );
 }

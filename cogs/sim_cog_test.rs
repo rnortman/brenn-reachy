@@ -34,8 +34,9 @@ use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
     self, JointRef, ServoHealth, flags, rows_of, write_rows, write_vector,
 };
+use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
 use reachy_motion::value;
-use sim_cogs::{sim_aux, sim_lag, sim_regs};
+use sim_cogs::{sim_aux, sim_regs};
 
 /// The instant every case starts from. Round rather than zero, so a time that
 /// travelled through the wrong field is a number nothing else in the case is.
@@ -47,8 +48,13 @@ const PERIOD: i64 = 20_000_000;
 /// How long the goal stream may be silent before the gate de-torques.
 const HOLD_TIMEOUT: i64 = 200_000_000;
 
-/// Per-cycle slew of the cranks and the body yaw, radians.
-const SLEW_LEGS: f64 = 0.15;
+/// The profile velocity the commissioning sweep writes into every servo, in the
+/// register's own units -- the deployed pair, which is what the modelled servos
+/// run their trajectories at once a case has commissioned them.
+const PROFILE_VELOCITY: u32 = 50;
+
+/// The profile acceleration written beside it, same terms.
+const PROFILE_ACCELERATION: u32 = 20;
 
 /// How long the driver waits between health reports.
 const HEALTH_PERIOD: i64 = 120_000_000;
@@ -61,17 +67,38 @@ const TORQUE_OFF_CONFIRM_BUDGET: i64 = 300_000_000;
 
 const _: () = assert!(TORQUE_OFF_CONFIRM_BUDGET == reachy_driver::TORQUE_OFF_CONFIRM_BUDGET_NS);
 
-/// Per-cycle slew of the antennas, radians.
-const SLEW_ANTENNAS: f64 = 0.65;
-
 /// The lag a well-formed goal stream commands at: a goal names the grid instant
 /// two cycles ahead of the sample that produced it.
 const LAG: i64 = 2;
 
 /// The most cycles of motion one execution may make up, which is the cog's own
-/// `MAX_CATCHUP_CYCLES` -- a private constant of a crate this test drives
-/// through its wrapper, so it is restated here and asserted against.
-const MAX_CATCHUP_CYCLES: f64 = 8.0;
+/// `MAX_CATCHUP_CYCLES`: the same gap the decision tick's model of this plant
+/// steps through, so it is that constant and not a second number.
+const MAX_CATCHUP_CYCLES: i64 = MAX_GAP_PERIODS as i64;
+
+/// The trajectory generator the pair above describes on this grid: what every
+/// commissioned row's motion is asserted against.
+fn plant() -> PlantModel {
+    PlantModel::from_registers(PROFILE_VELOCITY, PROFILE_ACCELERATION, PERIOD)
+        .expect("the deployed profile describes a generator")
+}
+
+/// Where one row's modelled trajectory stands after `cycles` cycles of chasing
+/// `target` from `position`, at the plant's own profile.
+///
+/// The same function the plant steps, stepped here: a case that restated the
+/// arithmetic would be asserting the plant against a second model of it.
+fn travelled(position: f64, target: f64, cycles: i64) -> f64 {
+    let plant = plant();
+    let mut predicted = Predicted {
+        position,
+        velocity: 0.0,
+    };
+    for _ in 0..cycles {
+        plant.step(&mut predicted, target);
+    }
+    predicted.position
+}
 
 /// The nine angles the machine rests at, which is where every case finds it.
 fn stow_rows() -> [f64; JOINT_COUNT] {
@@ -311,6 +338,27 @@ impl Sim {
         sim
     }
 
+    /// The same, with the deployed profile written into every servo before
+    /// anything is commanded: what the session's commissioning sweep does on the
+    /// real machine, which is what gives the modelled servos a trajectory
+    /// generator at all. A row whose profile registers are zero has none -- the
+    /// servo's own semantics -- and reaches its target in one cycle.
+    fn commissioned() -> Self {
+        let mut sim = Self::armed();
+        for (reg, units) in [
+            (RegIdWire::PROFILE_VELOCITY, PROFILE_VELOCITY),
+            (RegIdWire::PROFILE_ACCELERATION, PROFILE_ACCELERATION),
+        ] {
+            let mut cmd = SimCmdWire::new();
+            cmd.set_op(SimOpWire::SET_REGISTER);
+            cmd.set_mask(JointFlagsWire::from(flags::all()));
+            cmd.set_reg(reg);
+            cmd.set_value(u64::from(units));
+            sim.inject_full(&cmd);
+        }
+        sim
+    }
+
     /// The same, meeting a machine a predecessor left energised. What a case
     /// built this way asserts is the release, not the arming.
     fn met_torqued() -> Self {
@@ -335,9 +383,6 @@ impl Sim {
         let params = message.clear_valid();
         params.period_ns = PERIOD;
         params.hold_timeout_ns = HOLD_TIMEOUT;
-        params.slew_legs_rad = SLEW_LEGS;
-        params.slew_body_yaw_rad = SLEW_LEGS;
-        params.slew_antennas_rad = SLEW_ANTENNAS;
         params.health_poll_period_ns = HEALTH_PERIOD;
         edit(params);
         cog.set_config_params(&message);
@@ -962,8 +1007,20 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
     assert_eq!(sim.slot().goals_executed, 1);
     assert_eq!(
         due.sample.present[0],
+        stow_rows()[0],
+        "the setpoint has been written and the servo has not answered it yet"
+    );
+    // The response delay, on an uncommissioned row: no generator, so the
+    // position loop closes on the goal whole, a dead time after the setpoint
+    // was held -- one cycle of it the driver's own read-before-write ordering
+    // and the rest a fit against the real servos.
+    for _ in 0..RESPONSE_DEAD_SAMPLES {
+        sim.step();
+    }
+    assert_eq!(
+        rows_of(&sim.slot().positions)[0],
         stow_rows()[0] + 0.05,
-        "a step inside one cycle's slew arrives whole"
+        "and a row with no profile arrives in the cycle it answers"
     );
 
     // Every quiet cycle after it rewrites the same setpoint, which is what
@@ -981,40 +1038,220 @@ fn a_goal_is_written_at_its_instant_and_not_before() {
     }
 }
 
+/// A commissioned servo runs the trajectory its own profile registers describe:
+/// it accelerates onto the profile velocity and travels no further than that in
+/// a cycle, whatever it is asked for.
+///
+/// The plant is the servo's own generator, and this is the assertion that says
+/// so. Every group runs the one pair -- the sweep writes the same two numbers to
+/// all nine servos -- so what is asserted per row is that the row moved at all
+/// and that none of them outran the profile.
 #[test]
-fn a_servo_moves_no_further_than_its_slew_in_one_cycle() {
-    let mut sim = Sim::armed();
-    // Further than any servo can travel in a cycle, so every cycle is a
-    // full-rate one and the rate is what is asserted.
+fn a_commissioned_servo_runs_the_profile_its_registers_describe() {
+    let mut sim = Sim::commissioned();
+    // Further than the profile carries in the cycles below, so every one of
+    // them is a full-rate cycle once the ramp is over.
     let mut targets = stow_rows();
-    targets[0] += 10.0;
-    targets[1] += 10.0;
-    targets[7] += 10.0;
+    for row in [0, 1, 7] {
+        targets[row] += 10.0;
+    }
 
-    let mut previous = stow_rows();
-    for step in 0..8 {
+    let start = stow_rows();
+    let mut previous = start;
+    let plant = plant();
+    // The other rows are asked for a step the first cycle of the ramp already
+    // covers, which the plant's own landing arm puts them on in the cycle they
+    // answer rather than creeping up on. Half the profile acceleration: from
+    // rest that is the whole of the first cycle's travel, so the step is
+    // reached and not overshot.
+    let short = 0.5 * plant.a_max;
+    let landing_rows = [2, 3, 4, 5, 6, 8];
+    for row in landing_rows {
+        targets[row] += short;
+    }
+    let mut landed = [None; JOINT_COUNT];
+    for step in 0..20 {
         let cycle = sim.commanded_step(&targets, JOINT_MASK_ALL);
-        if step < LAG {
-            assert_eq!(cycle.sample.present, previous, "cycle {step}");
-            continue;
+        for row in [0, 1, 7] {
+            let moved = cycle.sample.present[row] - previous[row];
+            assert!(
+                moved <= plant.v_max + 1e-12,
+                "cycle {step}, row {row}: moved {moved} rad, past the {} rad the profile carries",
+                plant.v_max,
+            );
         }
-        assert_close(
-            cycle.sample.present[0] - previous[0],
-            SLEW_LEGS,
-            "the body yaw moves at its own rate",
-        );
-        assert_close(
-            cycle.sample.present[1] - previous[1],
-            SLEW_LEGS,
-            "a crank moves at the legs' rate",
-        );
-        assert_close(
-            cycle.sample.present[7] - previous[7],
-            SLEW_ANTENNAS,
-            "an antenna moves at the antennas' rate",
-        );
+        for row in landing_rows {
+            if landed[row].is_none() && (cycle.sample.present[row] - targets[row]).abs() < 1e-12 {
+                landed[row] = Some(step);
+            }
+        }
         previous = cycle.sample.present;
     }
+    for row in [0, 1, 7] {
+        assert_close(
+            previous[row],
+            travelled(
+                start[row],
+                targets[row],
+                20 - LAG - RESPONSE_DEAD_SAMPLES as i64,
+            ),
+            "the row travelled exactly the profile's own trajectory",
+        );
+    }
+    for row in landing_rows {
+        assert_eq!(
+            landed[row],
+            Some(LAG + RESPONSE_DEAD_SAMPLES as i64),
+            "row {row} was asked for a step inside one cycle of the ramp: it arrives on the \
+             first cycle it answers the setpoint at, which is the commanded lag and the \
+             response delay and nothing else",
+        );
+        assert_eq!(
+            previous[row], targets[row],
+            "row {row} stayed on the target it landed on",
+        );
+    }
+}
+
+/// A servo whose profile registers are zero has no generator: the goal is a
+/// step and the position loop closes on it in one cycle.
+///
+/// The servo's own semantics, and the state of a machine nothing has
+/// commissioned -- which every scenario's plant is until the session's sweep
+/// has run.
+#[test]
+fn an_uncommissioned_servo_reaches_its_target_in_one_cycle() {
+    let mut sim = Sim::armed();
+    let mut targets = stow_rows();
+    targets[1] += 1.0;
+
+    for _ in 0..(LAG + RESPONSE_DEAD_SAMPLES as i64 + 1) {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+    }
+    assert_close(
+        rows_of(&sim.slot().positions)[1],
+        targets[1],
+        "a row with no profile is where it was asked for",
+    );
+}
+
+/// A jammed row holds, and the row is let go of at rest: the generator that was
+/// driving into the jam is not carrying speed when the hand comes off, so the
+/// row sets off up its ramp again.
+#[test]
+fn a_released_row_sets_off_from_rest() {
+    let mut sim = Sim::commissioned();
+    let mut targets = stow_rows();
+    targets[1] += 10.0;
+    let start = stow_rows();
+
+    // Up to the profile velocity, then jammed.
+    for _ in 0..20 {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+    }
+    sim.inject(SimOpWire::OBSTRUCT, one(JointRef::Leg0));
+    // The injection is read on a later cycle than the one it was published
+    // from, and the row stops on the cycle that reads it.
+    for _ in 0..3 {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+    }
+    let jammed_at = sim.commanded_step(&targets, JOINT_MASK_ALL).sample.present[1];
+    for _ in 0..10 {
+        let held = sim.commanded_step(&targets, JOINT_MASK_ALL);
+        assert_eq!(held.sample.present[1], jammed_at, "a jammed row holds");
+    }
+
+    sim.inject(SimOpWire::RELEASE_OBSTRUCTION, one(JointRef::Leg0));
+    let plant = plant();
+    let mut previous = jammed_at;
+    let mut moves = Vec::new();
+    for _ in 0..4 {
+        let cycle = sim.commanded_step(&targets, JOINT_MASK_ALL);
+        moves.push(cycle.sample.present[1] - previous);
+        previous = cycle.sample.present[1];
+    }
+    let first = moves
+        .iter()
+        .position(|moved| *moved != 0.0)
+        .expect("the released row sets off");
+    // One cycle of acceleration, then two, then three: the generator starts
+    // from rest rather than carrying the speed it had when the hand went on.
+    for (step, moved) in moves[first..].iter().enumerate() {
+        assert_close(
+            *moved,
+            (step + 1) as f64 * plant.a_max,
+            "the released row climbs its ramp from rest",
+        );
+        assert!(
+            *moved < plant.v_max,
+            "which is not the speed it was travelling at when it was jammed",
+        );
+    }
+
+    assert!(
+        jammed_at > start[1],
+        "and the jam happened mid-move, not before it began",
+    );
+}
+
+/// The simulated driver's setpoint ring is exactly as deep as the dead time it
+/// is the storage for.
+///
+/// The depth is a schema fact and the walk over it is written against the
+/// constant, so the two can disagree. A ring deeper than the constant is the
+/// silent direction: the shift and the read both stay inside the first
+/// `RESPONSE_DEAD_SAMPLES` slots, so the plant would answer setpoints at a
+/// delay nobody stated while the wire format claimed another. The decision
+/// tick's own ring is pinned the same way, beside the constant.
+#[test]
+fn the_simulated_drivers_ring_is_as_deep_as_the_dead_time() {
+    let mut state = SimStateWire::new();
+    assert_eq!(state.clear_valid().held.len(), RESPONSE_DEAD_SAMPLES);
+}
+
+/// The modelled plant and the decision tick's model of it agree cycle for
+/// cycle, including across an execution that lost the CPU: the tick steps the
+/// gap it missed on the setpoint the driver was holding, and so does the plant.
+///
+/// This is what the whole detector rests on. A plant and a prediction that
+/// disagreed by a hair on every cycle of a two-radian move would put the
+/// residual the detector screens on wherever the disagreement accumulated to.
+#[test]
+fn the_plant_and_the_model_of_it_agree_across_a_lost_cycle() {
+    let mut sim = Sim::commissioned();
+    let mut targets = stow_rows();
+    targets[1] += 10.0;
+    let start = stow_rows();
+
+    let mut cycles = 0;
+    for _ in 0..10 {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+        cycles += 1;
+    }
+    // The process away for the whole gap the plant makes up, with the goal
+    // stream carrying on: what the servo chased through it is the setpoint the
+    // driver already held.
+    let late = sim.commanded_step_by(&targets, JOINT_MASK_ALL, MAX_CATCHUP_CYCLES);
+    cycles += MAX_CATCHUP_CYCLES;
+    for _ in 0..5 {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+        cycles += 1;
+    }
+
+    assert!(
+        late.sample.present[1] > start[1],
+        "the machine moved through the gap",
+    );
+    let wanted = travelled(
+        start[1],
+        targets[1],
+        cycles - LAG - RESPONSE_DEAD_SAMPLES as i64,
+    );
+    let found = rows_of(&sim.slot().positions)[1];
+    assert!(
+        (found - wanted).abs() < 1e-12,
+        "the plant stands at {found} and the model of it at {wanted}",
+    );
 }
 
 #[test]
@@ -1029,7 +1266,7 @@ fn a_partial_mask_moves_only_its_own_rows() {
     let rows = set_of(&[JointRef::BodyYaw, JointRef::AntennaLeft]);
     let mask = JointFlagsWire::from(rows).0;
 
-    for _ in 0..(LAG + 2) {
+    for _ in 0..(LAG + RESPONSE_DEAD_SAMPLES as i64) {
         sim.commanded_step(&targets, mask);
     }
     let settled = sim.step();
@@ -1046,287 +1283,6 @@ fn a_partial_mask_moves_only_its_own_rows() {
     assert_eq!(slot.has_target, rows, "only those rows are commanded");
 }
 
-/// How many cycles of response delay the lag cases give a row.
-///
-/// Long enough that the delay is unmistakable against the antennas' own slew,
-/// and well inside the rings.
-const LAGGED_CYCLES: u32 = 4;
-
-const _: () = assert!((LAGGED_CYCLES as usize) < sim_lag::LAG_DEPTH);
-
-/// One injection giving `rows` a response delay of `cycles` cycles.
-fn lag_of(rows: JointFlags, cycles: u32) -> SimCmdWire {
-    let mut cmd = SimCmdWire::new();
-    cmd.set_op(SimOpWire::SET_LAG);
-    cmd.set_mask(JointFlagsWire::from(rows));
-    cmd.set_count(cycles);
-    cmd
-}
-
-/// The first cycle each row's angle differs from where the machine rested.
-fn first_moves(cycles: &[Cycle], start: &[f64; JOINT_COUNT]) -> [Option<usize>; JOINT_COUNT] {
-    let mut out = [None; JOINT_COUNT];
-    for (n, cycle) in cycles.iter().enumerate() {
-        for (row, moved) in out.iter_mut().enumerate() {
-            if moved.is_none() && cycle.sample.present[row] != start[row] {
-                *moved = Some(n);
-            }
-        }
-    }
-    out
-}
-
-/// A lagged servo chases the target it was given `LAGGED_CYCLES` cycles ago:
-/// it sets off that many cycles after the row beside it and stays that far
-/// behind.
-///
-/// The plant's one way to make a row lag a goal it is following, and the reason
-/// it exists: the distance a joint stands behind a moving goal is what the
-/// motion tick's tracking window is judged over, and an unlagged row is never
-/// behind one at all.
-#[test]
-fn a_lagged_servo_chases_the_target_it_was_given_cycles_ago() {
-    let mut sim = Sim::armed();
-    let start = stow_rows();
-    // Laid on a machine standing at rest, so the ring the injection fills
-    // carries the resting angle the arming pinned: the first cycles of the move
-    // below chase that, which is what the delay means.
-    sim.inject_full(&lag_of(one(JointRef::AntennaRight), LAGGED_CYCLES));
-
-    // Further than either antenna covers in the run, so both are at full rate
-    // throughout and neither arrives.
-    let mut targets = start;
-    targets[7] += 10.0;
-    targets[8] += 10.0;
-    let cycles: Vec<Cycle> = (0..(LAG as usize + LAGGED_CYCLES as usize + 4))
-        .map(|_| sim.commanded_step(&targets, JOINT_MASK_ALL))
-        .collect();
-
-    let moved = first_moves(&cycles, &start);
-    let (Some(lagged), Some(following)) = (moved[7], moved[8]) else {
-        panic!("both antennas were asked for ten radians: {moved:?}");
-    };
-    assert_eq!(
-        lagged - following,
-        LAGGED_CYCLES as usize,
-        "the lagged antenna sets off {LAGGED_CYCLES} cycles late: {moved:?}",
-    );
-    // Measured as travel from where each antenna rested rather than as the gap
-    // between them: the two rest mirrored, and that offset is the posture
-    // rather than anything about the delay.
-    let last = cycles.last().expect("the run ran");
-    let travelled = |row: usize| (last.sample.present[row] - start[row]).abs();
-    assert_close(
-        travelled(8) - travelled(7),
-        LAGGED_CYCLES as f64 * SLEW_ANTENNAS,
-        "and stays that many cycles of travel behind",
-    );
-}
-
-/// A response delay longer than the rings hold is refused whole and counted.
-///
-/// Never shortened: a run whose premise is a servo a given number of cycles
-/// behind says nothing about anything if the plant quietly gave it fewer.
-#[test]
-fn a_lag_longer_than_the_plant_holds_is_refused() {
-    let mut sim = Sim::armed();
-    let before = sim.slot().refused_injections;
-    sim.inject_full(&lag_of(
-        one(JointRef::AntennaRight),
-        sim_lag::LAG_DEPTH as u32,
-    ));
-    sim.step();
-
-    let slot = sim.slot();
-    assert_eq!(
-        slot.refused_injections,
-        before + 1,
-        "an injection the plant cannot carry out is counted"
-    );
-    assert_eq!(
-        slot.lagged,
-        JointFlags::NONE,
-        "and no row was given a delay"
-    );
-}
-
-/// How many cycles of response delay the catch-up case gives a row, and how
-/// many cycles of motion each of its executions covers.
-///
-/// The delay is a whole number of steps so the case can name the execution the
-/// row sets off on, and the step is inside the cog's own catch-up clamp.
-const CATCHUP_LAGGED_CYCLES: u32 = 8;
-const CATCHUP_STEP: i64 = 4;
-
-const _: () = assert!((CATCHUP_LAGGED_CYCLES as usize) < sim_lag::LAG_DEPTH);
-const _: () = assert!(CATCHUP_STEP <= MAX_CATCHUP_CYCLES as i64);
-
-/// A delay is a number of cycles, not a number of executions: a process that
-/// lost the CPU and made up four cycles of motion in one execution has spent
-/// four cycles of its rows' delays.
-///
-/// What this pins is the plant's ring walking one cell per cycle of motion
-/// rather than one per execution. Told in executions, this row's eight-cycle
-/// delay would be eight executions long — thirty-two cycles — and every
-/// scenario that skipped a grid point would silently run on a weaker lag than
-/// its premise.
-#[test]
-fn a_late_cycle_spends_its_whole_lag_of_cycles() {
-    let mut sim = Sim::armed();
-    let start = stow_rows();
-    sim.inject_full(&lag_of(one(JointRef::AntennaRight), CATCHUP_LAGGED_CYCLES));
-
-    // Further than the run covers, so neither row arrives and every cycle of
-    // their motion is a full-rate one. The row beside the lagged one is the
-    // reference: it follows at once, so the executions between them are the
-    // delay.
-    let mut targets = start;
-    targets[7] += 10.0;
-    targets[8] += 10.0;
-
-    // Read off the samples rather than counted from the constants: when a goal
-    // becomes due is the goal stream's own business, and what this case is
-    // about is how many executions apart the two rows set off.
-    let steps = 2 + (CATCHUP_LAGGED_CYCLES as i64 / CATCHUP_STEP) as usize;
-    let cycles: Vec<Cycle> = (0..steps)
-        .map(|_| sim.commanded_step_by(&targets, JOINT_MASK_ALL, CATCHUP_STEP))
-        .collect();
-
-    let moved = first_moves(&cycles, &start);
-    let (Some(lagged), Some(following)) = (moved[7], moved[8]) else {
-        panic!("both rows were asked for ten radians: {moved:?}");
-    };
-    assert_eq!(
-        (lagged - following) as i64 * CATCHUP_STEP,
-        CATCHUP_LAGGED_CYCLES as i64,
-        "the delay is spent in cycles of motion, not in executions: {moved:?}",
-    );
-}
-
-/// A delay laid on a row nothing has commanded leaves it standing where it is.
-///
-/// The seed is the angle the row is holding, and for a row with no target that
-/// is where it stands: filled from the schema's zero instead, the ring would
-/// hand the row a goal nobody gave — a real angle on this machine — and the
-/// plant would set off toward it on nobody's command, in a scenario built to
-/// watch what the machine does with the commands it was given.
-#[test]
-fn a_lag_laid_before_any_goal_leaves_the_row_standing() {
-    let mut sim = Sim::armed();
-    let start = stow_rows();
-    assert!(
-        start[7].abs() > SLEW_ANTENNAS,
-        "the resting angle is far enough from zero that a ring filled from the \
-         schema's zero would show as motion: {}",
-        start[7],
-    );
-    sim.inject_full(&lag_of(one(JointRef::AntennaRight), LAGGED_CYCLES));
-
-    // Away from zero, so a row chasing a zero-filled ring would move the other
-    // way from the one it was asked to.
-    let mut targets = start;
-    targets[7] += 10.0;
-
-    // The goal is due `LAG` executions after it is sent, and the row then waits
-    // out its delay: until both have passed it is holding the angle its ring was
-    // seeded with, which is this one.
-    for cycle in 0..(LAG as usize + LAGGED_CYCLES as usize) {
-        let step = sim.commanded_step(&targets, JOINT_MASK_ALL);
-        assert_close(
-            step.sample.present[7],
-            start[7],
-            &format!("the row nothing had commanded stands still on cycle {cycle}"),
-        );
-    }
-
-    let setting_off = sim.commanded_step(&targets, JOINT_MASK_ALL);
-    assert_close(
-        setting_off.sample.present[7] - start[7],
-        SLEW_ANTENNAS,
-        "and then sets off the way it was asked",
-    );
-}
-
-/// An injection naming no rows ends every delay, and a delay of no cycles is a
-/// row following at once.
-///
-/// The two ways a scenario puts a lagged plant back the way it was without
-/// standing the run up again.
-#[test]
-fn a_lag_is_ended_by_naming_no_rows_or_no_cycles() {
-    for (what, ending) in [
-        ("no rows", lag_of(JointFlags::NONE, LAGGED_CYCLES)),
-        ("no cycles", lag_of(one(JointRef::AntennaRight), 0)),
-    ] {
-        let mut sim = Sim::armed();
-        let start = stow_rows();
-        sim.inject_full(&lag_of(one(JointRef::AntennaRight), LAGGED_CYCLES));
-        sim.inject_full(&ending);
-
-        let mut targets = start;
-        targets[7] += 10.0;
-        targets[8] += 10.0;
-        let cycles: Vec<Cycle> = (0..(LAG as usize + LAGGED_CYCLES as usize + 2))
-            .map(|_| sim.commanded_step(&targets, JOINT_MASK_ALL))
-            .collect();
-
-        let moved = first_moves(&cycles, &start);
-        assert_eq!(
-            moved[7], moved[8],
-            "a delay ended by naming {what} is a row following at once: {moved:?}",
-        );
-    }
-}
-
-/// How far each execution of the restatement case moves the commanded angle.
-///
-/// Well inside one cycle's slew, so a following row arrives at the angle it is
-/// chasing every cycle and the distance a lagged row stands behind is exactly
-/// the ramp it has not been handed yet.
-const RAMP_PER_CYCLE: f64 = 0.05;
-
-const _: () = assert!(RAMP_PER_CYCLE < SLEW_ANTENNAS);
-
-/// A delay restated over a row already lagged keeps the history the row has.
-///
-/// Refilling the ring would hand the row the angle it is being asked for now at
-/// every depth, so the row would cover its whole lag's distance in one cycle
-/// and then lag again — a step no scenario asked for, in the one place a
-/// scenario is watching how far a row stands behind its goal.
-#[test]
-fn a_lag_restated_over_a_moving_row_keeps_its_history() {
-    let mut sim = Sim::armed();
-    let start = stow_rows();
-    sim.inject_full(&lag_of(one(JointRef::AntennaRight), LAGGED_CYCLES));
-
-    let ramp = LAG as usize + LAGGED_CYCLES as usize + 12;
-    let restate_on = ramp / 2;
-    let mut targets = start;
-    let mut previous = start;
-    for cycle in 0..ramp {
-        targets[7] += RAMP_PER_CYCLE;
-        targets[8] += RAMP_PER_CYCLE;
-        if cycle == restate_on {
-            sim.inject_full(&lag_of(one(JointRef::AntennaRight), LAGGED_CYCLES));
-        }
-        let step = sim.commanded_step(&targets, JOINT_MASK_ALL);
-        let moved = step.sample.present[7] - previous[7];
-        assert!(
-            moved.abs() < RAMP_PER_CYCLE + 1e-9,
-            "the lagged row never covers more than one cycle of the ramp, \
-             cycle {cycle}: {moved}",
-        );
-        previous = step.sample.present;
-    }
-
-    let travelled = |row: usize| (previous[row] - start[row]).abs();
-    assert_close(
-        travelled(8) - travelled(7),
-        LAGGED_CYCLES as f64 * RAMP_PER_CYCLE,
-        "and stands exactly its delay's worth of ramp behind the row beside it",
-    );
-}
-
 #[test]
 fn a_jammed_servo_holds_while_the_rest_of_the_machine_tracks() {
     let mut sim = Sim::armed();
@@ -1339,7 +1295,7 @@ fn a_jammed_servo_holds_while_the_rest_of_the_machine_tracks() {
     // One crank jammed where it stands. Everything else is asked for the same
     // move, so what separates them is the obstruction and nothing else.
     sim.inject(SimOpWire::OBSTRUCT, one(JointRef::Leg2));
-    for _ in 0..(LAG + 2) {
+    for _ in 0..(LAG + RESPONSE_DEAD_SAMPLES as i64) {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
     let jammed = sim.step();
@@ -1402,6 +1358,59 @@ fn a_teleport_puts_the_servos_where_the_scenario_says() {
         cycle.sample.present, wanted,
         "the named rows, and only them"
     );
+}
+
+/// A row a scenario teleports sets off from rest afterwards, like one let go
+/// of: a hand that put a joint somewhere did not leave its generator running.
+///
+/// Carrying the speed of the move it was making into a position it never
+/// travelled to would have the plant set off from an instant nothing produced,
+/// and the first cycles after a teleport are exactly what a scenario placing a
+/// machine and then commanding it is measuring.
+#[test]
+fn a_teleported_row_sets_off_from_rest() {
+    let mut sim = Sim::commissioned();
+    let mut targets = stow_rows();
+    targets[1] += 10.0;
+
+    // Up to the profile velocity, so a generator that carried its speed would
+    // be unmistakable.
+    for _ in 0..20 {
+        sim.commanded_step(&targets, JOINT_MASK_ALL);
+    }
+
+    let mut positions = JointsWire::new();
+    let mut wanted = stow_rows();
+    wanted[1] = stow_rows()[1] + 3.0;
+    write_rows(positions.clear_valid(), &wanted);
+    let mut cmd = SimCmdWire::new();
+    cmd.set_op(SimOpWire::SET_POSITIONS);
+    cmd.set_mask(JointFlagsWire::from(set_of(&[JointRef::Leg0])));
+    *cmd.positions_mut() = positions;
+    sim.inject_full(&cmd);
+
+    // The cycle the teleport lands on is a jump of most of three radians; from
+    // there the row's readings are the plant's own trajectory from rest,
+    // stepped once for the landing cycle itself.
+    let mut readings = Vec::new();
+    let mut previous = rows_of(&sim.slot().positions)[1];
+    let mut landed = None;
+    for cycle in 0..8 {
+        let at = sim.commanded_step(&targets, JOINT_MASK_ALL).sample.present[1];
+        if landed.is_none() && (at - previous).abs() > 0.5 {
+            landed = Some(cycle);
+        }
+        previous = at;
+        readings.push(at);
+    }
+    let landed = landed.expect("the teleport moved the row");
+    for (step, at) in readings[landed..].iter().enumerate() {
+        assert_close(
+            *at,
+            travelled(wanted[1], targets[1], step as i64 + 1),
+            "the teleported row runs the plant's own ramp from rest",
+        );
+    }
 }
 
 #[test]
@@ -1589,7 +1598,9 @@ fn a_machine_re_armed_after_a_stall_moves_nothing_until_it_is_told_to() {
 
     let mut fresh = stalled_at;
     fresh[1] += 0.05;
-    for _ in 0..(LAG + 1) {
+    // The commanded lag, and then the servos' own response delay before the
+    // setpoint shows in a reading.
+    for _ in 0..(LAG + 1 + RESPONSE_DEAD_SAMPLES as i64) {
         sim.commanded_step(&fresh, JOINT_MASK_ALL);
     }
     let moving = sim.step();
@@ -2095,27 +2106,30 @@ fn two_events_separated_by_quiet_cycles_each_name_their_own_cycle() {
 
 #[test]
 fn a_late_cycle_makes_up_whole_cycles_of_motion_and_no_more() {
-    let mut sim = Sim::armed();
+    let mut sim = Sim::commissioned();
     // Further than any catch-up covers, so every cycle asserted here is a
     // full-rate one and the rate is what is being counted.
     let mut targets = stow_rows();
     targets[1] += 100.0;
-    for _ in 0..(LAG + 2) {
+    // Up to the profile velocity first, so what the gaps below cover is whole
+    // cycles at the cap rather than part of the ramp.
+    for _ in 0..20 {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
 
+    let v_max = plant().v_max;
     let on_time = sim.commanded_step(&targets, JOINT_MASK_ALL);
     let late = sim.commanded_step_by(&targets, JOINT_MASK_ALL, 5);
     assert_close(
         late.sample.present[1] - on_time.sample.present[1],
-        5.0 * SLEW_LEGS,
+        5.0 * v_max,
         "five cycles' worth of motion for five cycles of lost time",
     );
 
     let very_late = sim.commanded_step_by(&targets, JOINT_MASK_ALL, 20);
     assert_close(
         very_late.sample.present[1] - late.sample.present[1],
-        MAX_CATCHUP_CYCLES * SLEW_LEGS,
+        MAX_CATCHUP_CYCLES as f64 * v_max,
         "and no further than the clamp, whatever the gap was",
     );
 }
@@ -2168,15 +2182,6 @@ fn an_injection_this_build_cannot_carry_out_is_counted_and_does_nothing() {
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
     let mut sim = Sim::with_params(|params| params.period_ns = PERIOD / 2);
-    sim.step();
-}
-
-/// The same for a slew that is not a distance: an unset rate leaves a machine
-/// that never moves, and a negative one is nobody's intent.
-#[test]
-#[should_panic(expected = "MotorSim test wrapper: execute() failed")]
-fn a_scenario_whose_servos_have_no_rate_is_refused() {
-    let mut sim = Sim::with_params(|params| params.slew_antennas_rad = 0.0);
     sim.step();
 }
 

@@ -148,10 +148,12 @@ pub struct Answered {
 ///
 /// A machine already being carried down is answering every further condition
 /// with the maneuver it is running: the ladder never begins a second answer, so
-/// the condition re-ranks that maneuver and the wake carries on. The one
-/// exception is the group-scoped de-torque, which is why it is asked about
-/// first: an antenna pair going limp is scoped to the pair and is a fault
-/// answered whatever else the machine is doing.
+/// the condition re-ranks that maneuver and the wake carries on -- and where the
+/// condition is one the maneuver cannot be driven through, it also defeats it,
+/// and the maneuver's own next step ends it. The one exception is the
+/// group-scoped de-torque, which is why it is asked about first: an antenna pair
+/// going limp is scoped to the pair and is a fault answered whatever else the
+/// machine is doing.
 pub fn answer(
     slot: &mut SessionStateWire,
     kind: FaultKind,
@@ -170,11 +172,29 @@ pub fn answer(
     // the one maneuver a response names and an ending does not.
     let maneuver = maneuver_of(response);
     if !matches!(maneuver, Some(Maneuver::AntennaTorqueOff)) && session_stow::running(slot) {
-        // Re-ranked and nothing else: the maneuver's own next step is what acts
-        // on a condition that has stopped trusting control, and it runs in this
-        // same execution. A second answer would be a second clock over one
-        // machine.
+        // Which conditions the running maneuver can be driven through, and which
+        // one defeats it. A response that expands the maneuver -- a stow over a
+        // grown mask, the release control is not trusted through -- is answered
+        // by re-ranking alone: the maneuver's own next step acts on it, and it
+        // runs in this same execution. A stow that names no motor to mask is the
+        // one that cannot be: what it answers is a joint being held back, so the
+        // fold re-commanded into it grinds where yielding is the point, and the
+        // maneuver falls through instead. Wildcard-free, so a maneuver added to
+        // the doctrine is decided here or does not compile.
+        let defeats = match maneuver {
+            Some(Maneuver::SlowStow) => true,
+            Some(Maneuver::MaskedSlowStow | Maneuver::ImmediateAllTorqueOff) => false,
+            // Excluded before this arm, and no maneuver at all: neither reaches
+            // here.
+            Some(Maneuver::AntennaTorqueOff) | None => false,
+        };
+        // Re-ranked, and defeated where the condition asks for it. A second
+        // answer would be a second clock over one machine, so nothing else is
+        // begun either way and nothing is narrated a second time.
         if session_stow::re_rank(slot, kind) {
+            if defeats {
+                session_stow::defeat(slot);
+            }
             return None;
         }
         // Except where the record standing as a maneuver does not read back as

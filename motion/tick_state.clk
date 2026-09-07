@@ -74,29 +74,6 @@ enum WarpKind
     }
 }
 
-// Which side of a tracking run's anchor its goal lies on.
-//
-// The value is the direction, so the side below the anchor is the negative one,
-// and the zero is neither side rather than an absence.
-enum TrackingSideKind
-{
-    uuid: ecbd7614-630e-402f-9e79-3b24ec0d4852;
-    options
-    {
-        underlying_type: Int8;
-    }
-    values
-    {
-        // Neither side: the goal sits on the anchor, or is a number nobody can
-        // place.
-        #0 unplaced default { underlying_value: 0; }
-        // Above the anchor -- closing means rising.
-        #1 above { underlying_value: 1; }
-        // Below it -- closing means falling.
-        #2 below { underlying_value: -1; }
-    }
-}
-
 // Which layer judged the servo bus not to be carrying, or that none did.
 //
 // Keys the failure-kind number beside it: a wire failure when a transaction
@@ -120,43 +97,57 @@ enum BusSourceKind
     }
 }
 
-// One joint's open run of live ticks past the tracking threshold.
+// One joint's modelled trajectory, and its open run of live ticks past the
+// tracking threshold.
 //
-// The evidence an obstruction is classified from: how far the joint has failed
-// to close on its goal, and for how long.
-schema TrackingStreakSnap
+// Two things per row, because the second is only ever judged against the first:
+// where the servo's own trajectory generator stands, stepped every period from
+// the setpoints the driver held, and how long the joint has stood away from
+// that without closing on it or keeping pace with it. The prediction is plant
+// state and outlives every run: a raise, a degrade or an abort forgets the run
+// and leaves the model where the plant is, because a hold does not stop the
+// servo being a servo.
+//
+// Fields 1, 2 and 4 are retired: the goal-crossing detector they carried was
+// replaced by the trajectory model above.
+schema TrackingRowSnap
 {
     uuid: f2d6d29a-87a7-44bf-933a-af86736b3f80;
     fields
     {
-        // Whether a run is open at all. `count` and `crossed` mean nothing when
-        // this is false; `anchor` and `side` keep meaning, because a closed run
-        // is what the next one is judged against.
+        // Whether a run is open at all. `count` and both anchors mean nothing
+        // when this is false.
         #0 active: Bool;
 
-        // Where the joint was when this run last restarted, radians. On a
-        // closed run, where it stood on the last tick its error was inside the
-        // tracking threshold -- its last healthy sample.
-        #1 anchor: Float64;
-
-        // Which side of `anchor` the goal lay on when a run last restarted.
-        // Written only while a run is open, and a close leaves it alone, so a
-        // closed run still says which way the joint was being asked to go --
-        // but a move the joint followed inside the threshold opens no run and
-        // writes nothing here, leaving the side of the move before it.
-        #2 side: TrackingSideKind;
-
-        // Live ticks since, this one included. Zero on a closed run.
+        // Live ticks since the run opened or last restarted, this one included.
+        // Zero on a closed run.
         #3 count: UInt32;
 
-        // Whether the goal turned round under this run rather than the joint
-        // having gone quiet: the goal stepped over an open run's anchor in one
-        // period, or this run opened on the far side of the side a closed run
-        // retained, under a joint that had carried the old direction. A joint
-        // whose goal turned round under it is still carrying that direction, so
-        // a crossed run measures progress from the far end of the coast and
-        // counts against the longer of the two windows.
-        #4 crossed: Bool;
+        // Where the modelled generator's trajectory stands for this joint,
+        // radians. Meaningless until `seeded`.
+        #5 predicted: Float64;
+
+        // That trajectory's velocity, radians per control period, signed.
+        #6 velocity: Float64;
+
+        // The joint's reading when the run opened or last restarted, radians.
+        #7 anchor_present: Float64;
+
+        // `predicted` at that same instant, radians. The pair is what says
+        // whether the joint is closing the gap it opened, and how far the
+        // generator has moved on since.
+        #8 anchor_predicted: Float64;
+
+        // Whether `predicted` has been seeded from a reading. False before the
+        // first live read, and after any stretch the model had no setpoint to
+        // chase: a prediction is only ever seeded from where the joint is, and
+        // never from where a goal says it should be.
+        #9 seeded: Bool;
+    }
+    history
+    {
+        version: 9;
+        removed: [1, 2, 4];
     }
 }
 
@@ -336,12 +327,43 @@ schema MotionSnap
         // Consecutive live reads whose pose would not solve.
         #16 pose_failures: UInt32;
 
-        // Each joint's open tracking run, in bus order. An entry whose `active`
-        // is false is a joint with no run open.
-        #17 tracking: FixedArray<TrackingStreakSnap, 9>;
+        // Each joint's modelled trajectory and open tracking run, in bus order.
+        // An entry whose `active` is false is a joint with no run open.
+        #17 tracking: FixedArray<TrackingRowSnap, 9>;
 
         // The joints out of service. Nothing is commanded for these and nothing
         // is judged about them.
         #18 masked: joints::JointFlags;
+
+        // The setpoints the driver reported holding over the last
+        // `reachy_motion::plant::RESPONSE_DEAD_SAMPLES` periods, oldest first.
+        // What the modelled generator chases is the oldest entry, because a
+        // setpoint takes that many periods to show in a reading: one is the
+        // driver's own read-before-write ordering within a cycle, which is
+        // certain, and the rest are fitted and attributed to the servo.
+        //
+        // Read before it is pushed, once per period, which is what keeps the
+        // oldest entry a whole dead time old. The depth is that constant.
+        #21 held: FixedArray<joints::Joints, 3>;
+
+        // How many of `held`'s entries are setpoints the driver really held.
+        // Below the full depth there is nothing to chase yet, so the model
+        // idles and the next live read re-seeds it; a driver holding nothing --
+        // pre-engage, released, torqued off -- puts it back to zero.
+        //
+        // This count and the ring above it are one invariant -- the count says
+        // how many of the ring's entries are real -- so the two carry
+        // neighbouring field numbers and are renumbered together. A reader that
+        // cannot see the ring reads no count either, which is the zero the
+        // filling case above already handles: the next live reads refill both.
+        // Nothing can then present a count over a ring it did not write.
+        //
+        // TODO(held-ring-pairing-pin)
+        #22 held_count: UInt8;
+    }
+    history
+    {
+        version: 22;
+        removed: [19, 20];
     }
 }

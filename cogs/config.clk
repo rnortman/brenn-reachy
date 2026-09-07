@@ -5,10 +5,11 @@
 // that is forced rather than stylistic. A config is bound to a file of
 // protobuf text, so its schema has to cross the Protobuf backend as well as the
 // C++ one -- and generation is declared per module, not per schema. Most of the
-// vocabulary cannot cross that backend: the tick's state module declares an
-// enum with a negative member (`TrackingSideKind::below` -- a side is a
-// direction, so one of the two is below), and the Protobuf emitter refuses a
-// negative enumerator outright. So the schemas that must be authored as text
+// vocabulary is not emitted for that backend at all: the motion and driver
+// modules declare `generate(cpp)` and nothing else, and a config field reaching
+// into one of them would have to drag the whole module across. What the backend
+// itself refuses is narrower but real -- a negative enumerator, for one, which
+// a direction enum naturally wants. So the schemas that must be authored as text
 // live here, and they are held to what that backend will carry: scalars and
 // `VarString`, never the motion vocabulary. Not because a config field has to be
 // a bare number -- `driver/motord_config.clk` names a device path -- but because
@@ -105,23 +106,6 @@ schema SessionParams
         // problem, not a reason to stop asking.
         #5 torque_off_confirm_budget_ns: Int64;
 
-        // The servo-side profile acceleration the commissioning sweep writes,
-        // in the register's own units. A backstop under host-side shaping and
-        // not the thing that shapes a move: the session streams one
-        // step-bounded setpoint per cycle, so a machine reaching this limiter
-        // is a stream that asked for more than a step. Zero is refused by the
-        // host before it commissions anything -- a servo reads it as no limit
-        // at all, which is what a file that lost this line would ask for. The
-        // shipped pair has run on hardware but nobody has measured whether it is
-        // the right pair for this machine:
-        // TODO(session-servo-profile)
-        #6 profile_acceleration: UInt32;
-
-        // The servo-side profile velocity the sweep writes, register units.
-        // Sized with the acceleration above, refused at zero for the same
-        // reason, and for the same purpose.
-        #7 profile_velocity: UInt32;
-
         // The servos' Bus Watchdog timeout the sweep writes, in the register's
         // own 20 ms units. What stops a servo -- without releasing its torque,
         // observed on this hardware -- when the host has gone quiet: the
@@ -155,14 +139,54 @@ schema SessionParams
         // is how old a reading the machine will torque on.
         #10 rail_stale_after_ns: Int64;
     }
+    history
+    {
+        version: 11;
+        removed: [6, 7];
+    }
 }
 
-// What the simulated driver is built with: the cycle it runs on, the dead-man
-// it enforces, and how fast the modelled servos move.
+// The servo-side motion profile: the two registers the commissioning sweep
+// writes into all nine servos.
+//
+// Its own schema, and its own file, because two cogs read it and they read it
+// for different reasons. The session writes the pair to the machine; the
+// decision tick models the trajectory the pair produces, so that a joint can be
+// judged against where a healthy servo's own generator stands rather than
+// against a goal no servo could have reached yet. One file bound to both config
+// inputs is what makes those two the same pair by construction: a model built
+// from one number and a machine commissioned with another would be a detector
+// screening a machine that does not exist.
+//
+// Zero in either register disables the generator on the servo -- a goal becomes
+// an immediate step at whatever the position loop manages. Both readers refuse
+// it before anything is commanded: it is the opposite of the backstop the pair
+// exists to be, and it is what a file that lost a line parses to.
+schema ServoProfile
+{
+    uuid: 6b91f622-922f-45a0-bc65-03c5f6c3ed6a;
+    fields
+    {
+        // The profile acceleration, in the register's own units of
+        // 214.577 rev/min². The shipped pair is the cap the machine measurably
+        // runs at, but which pair it should run is still nobody's measurement:
+        // TODO(session-servo-profile)
+        #0 profile_acceleration: UInt32;
+
+        // The profile velocity, in the register's own units of 0.229 rev/min.
+        // Sized with the acceleration above.
+        #1 profile_velocity: UInt32;
+    }
+}
+
+// What the simulated driver is built with: the cycle it runs on and the dead-man
+// it enforces.
 //
 // A config for the same reason: a dead-man scenario wants the timeout it
-// asserts against to be a number it stated, and a plant that slews at a rate
-// nobody wrote down is a plant whose settling time is an accident.
+// asserts against to be a number it stated. How fast the modelled servos move
+// is not here -- it is the profile registers the commissioning sweep wrote into
+// them, so the simulated machine runs at the speed the real one was configured
+// for rather than at a speed a scenario chose.
 schema SimParams
 {
     uuid: a20e4386-2277-419a-bf82-77fe0f2572fe;
@@ -183,18 +207,6 @@ schema SimParams
         // release had to answer.
         #2 start_torqued: Bool;
 
-        // How far a crank servo moves in one cycle, radians. The plant is
-        // first-order: it closes this much of the gap to its target per cycle
-        // and no more, so a goal stream that steps further than this shows up
-        // as a tracking error rather than as a teleport.
-        #3 slew_legs_rad: Float64;
-
-        // How far the body yaw servo moves in one cycle, radians.
-        #4 slew_body_yaw_rad: Float64;
-
-        // How far an antenna servo moves in one cycle, radians.
-        #5 slew_antennas_rad: Float64;
-
         // The minimum spacing between successive health reports, nanoseconds.
         //
         // Per report, not per lap: the rotation reads one servo each time it
@@ -203,6 +215,11 @@ schema SimParams
         // transaction a cycle has with the host's own requests, and a rotation
         // that took every cycle it could would leave none.
         #6 health_poll_period_ns: Int64;
+    }
+    history
+    {
+        version: 7;
+        removed: [3, 4, 5];
     }
 }
 

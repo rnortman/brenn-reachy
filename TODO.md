@@ -401,34 +401,42 @@ Give the servo-side velocity/acceleration profile the commissioning sweep writes
 a measured value.
 
 Deferral context: the configuration half is done — `profile_acceleration` and
-`profile_velocity` are `SessionParams` fields, shipped as 20 / 50 register units
-in `cogs/session_params.textproto`, and `check::commissioned_profile` pins the
-file's values to the writes that reach all nine servos. What remains is the
-measurement. The shipped pair is a modest backstop chosen for a host that streams
-one step-bounded setpoint per period; the commissioning sweep has since written
-it on a unit and the machine moved under it, but nobody has measured whether it
-is the right pair. It is an
+`profile_velocity` are the two fields of `ServoProfile`, shipped as 20 / 50
+register units in `cogs/servo_profile.textproto`, which the session and the
+decision tick both read; `check::commissioned_profile` pins the file's values to
+the writes that reach all nine servos. What remains is the measurement. The
+shipped pair was chosen as a modest backstop for a host that streams one
+step-bounded setpoint per period. It is an
 order of magnitude below the figures the bench ran (400 / 600, trial-validated,
 including an 855°/s antenna sweep), which were sized for a host commanding whole
 moves outright, so the two cannot both be right for the same machine. What
-decides it is a hardware session — too tight and the servos rate-limit a
-correctly shaped stream, which surfaces as growing tracking error rather than as
-a refusal — which is outside what the deterministic runner can answer. Marked at
-the profile fields in `cogs/config.clk`.
+decides it is a hardware session, which is outside what the deterministic runner
+can answer. Marked at the profile fields in `cogs/config.clk`.
 
-That symptom is now observed. The 2026-08-28 hardware runs of the wake gesture
-report a worst head lag of 0.95–1.02 rad and a worst antenna lag of
-2.47–2.52 rad, against fixture pins of 0.245 rad and 1.38 rad recorded under the
-bench's 400 / 600 profile. Both of the gesture's commanded peaks (about
-3.34 rad/s of leg crank, 7.57 rad/s of antenna) sit above the shipped 50's
-1.20 rad/s cap and under the bench pair's 9.59 rad/s, and a cap-limited joint
-chasing the min-jerk goal predicts roughly the lag that was measured. Consistent
-with the rate limit, not measured as its cause: the session is what decides it,
-and these are the before-numbers its after-numbers are read against — the lag
-collapsing toward the pins under the trial-validated profile is the confirmation.
-Nothing is failing on it: the tracking screen faults on lack of progress rather
-than on distance, no fault fired in any of those runs, and the run report prints
-the lag as a note it derives no verdict from.
+The pair is no longer a backstop under host-side shaping: it is the cap the
+machine actually runs at, measured. Over the 2026-09-06 library tour every joint
+class chasing a goal more than 0.1 rad away travels a median of 0.0230–0.0245 rad
+per 20 ms period, independent of the size of the gap, against the 0.023981 rad
+the configured 50 converts to — the measured cap is the configured cap to within
+2 %, and a joint setting off from rest ramps at the configured acceleration. The
+tour ran velocity-saturated throughout: the clip library asks for peaks of
+3–20 rad/s against a 1.20 rad/s ceiling, which is where its worst head lag of
+1.54 rad and worst antenna lag of 2.96 rad come from. So the symptom this entry
+suspected is confirmed and explained, and what is left is only the decision:
+which pair this machine should run, taken on a hardware session. Nothing is
+failing on it — the tracking detector judges a joint against the trajectory the
+configured profile produces rather than against its goal, so a saturated stream
+is not a fault, and the run reports print both figures as notes.
+
+Whoever takes that decision also re-derives the prose figures in the
+obstruction-cost paragraphs of `docs/fault-management.md` and the
+tracking-detector sentence in `CLAUDE.md`, because all of them are evaluated at
+this pair: the first raise's latency (`crossing_cycles() + ticks`), the
+settled-move grace (`ticks − pass_cycles(progress_min_rad)`), and the
+saturated-move grace, which rests on `4·a_max ≈ pace_min·v_max` at the shipped
+pair and may take a different count at another. The scenario suite is written
+over those expressions and moves by itself; the documents do not, and no test
+reads a document.
 
 ## `aux-pending-carries-bustxn`
 
@@ -940,53 +948,85 @@ between them is a decision about the sender's contract.
 Done = one datagram gets one answer, whichever answer is chosen, and the rule is
 written where the screen is. Marked at `hold` in `cogs/session_cog.rs`.
 
-## `tracking-response-model`
+## `plant-chase-sequencer`
 
-Replace the tracking detector's direction inference with a model of the servo's
-response. Out go `side`, `crossed`, both of the arms that open a crossed run,
-the extremum anchor and `reversal_ticks`; in comes a per-joint-class prediction
-of where a healthy joint stands, computed from the goal history, and the run is
-judged the way it is judged now — `threshold_rad`, `progress_min_rad`, `ticks` —
-against that prediction rather than against the goal. A first-order lag with a
-rate limit is the shape the replay traces suggest: 0.245 rad at 3.34 rad/s and
-about 0.82 rad at 7.55 rad/s are both near a 70 ms time constant, and 1.38 rad
-at roughly 19.5 rad/s is nearer 110 ms. A prediction turns round when a servo
-would, so a joint that is following is always closing on it and there is no
-reversal left to detect; a fault then means "not closing on where a healthy
-servo would be".
+State the plant model's stepping sequence once. `PlantModel::step` is one
+function every reader shares, but the loop around it — seed a row from a
+reading, step against the setpoint of `RESPONSE_DEAD_SAMPLES` periods ago and
+then push this period's, walk the periods no sample attended on the setpoint
+already held, re-seed past `MAX_GAP_PERIODS` or when the driver holds nothing —
+is written out five times: the decision tick (`advance_prediction`), the
+simulated plant (`sim_cogs::advance`), the offline residual walk
+(`pose_reading::residual_stream`), the scenario suite's travel walk
+(`scenario::posture_walk`) and the replay suite (`replay_test::replay`).
+Their agreement is what makes a run judged offline the run judged live, and
+nothing but their comments asserts it.
 
-Deferral context: what the detector has today is three separate rules for
-inferring, from one period of position, whether a joint is carrying a direction
-its goal has left, and each is correct where it fires with a shape it cannot
-see. The one the code records is that `side` is written only while a run is
-open, so a reversal of a move the joint followed inside the threshold is judged
-against the move before it and gets the ordinary window while the joint may
-still be coasting. Library content moves faster than the two gestures those
-rules were read off, so the detector ships **disarmed**
-(`TrackingFaultConfig::armed`, `false`): it measures every run and raises
-nothing, and an obstruction is accepted as a servo warming against a hand
-rather than answered. `make library-run` is what records the reversals the model
-needs — goals and positions through every motion in the library at recorded
-pace — so the recording this entry used to say does not exist is now the run's
-output. Fitting still needs a plant the simulator can drive: the simulated plant
-is a transport delay (`cogs/sim_lag.rs`) that a lag model does not describe, so
-a proportional-lag plant mode has to come first for S12 and the `Follower` tests
-to drive it. It also deletes the machinery two design cycles have built, which
-is a cycle of its own rather than a rider on one.
+Deferral context: the sequencer's state is slot-resident in two of the five —
+the tick keeps it in `MotionSnap` and the simulated driver in `SimState`,
+because it has to survive a restart — so one shared sequencer means each caller
+marshalling nine predictions and a setpoint ring in and out of a schema every
+period, on the control path. Whether that copy belongs on the tick's hot loop,
+and whether the two schemas keep their present shape under it, is a design
+question rather than a refactor. Until then each copy carries a comment saying
+which walk it restates.
 
-Re-arming restores coverage three scenarios gave up while it is off: S2's fault
-half — the report spacing, the tick abandoning the move, the rest-class stow to
-rest end to end — S8's `HEAD_OBSTRUCTED` raise inside the masked stow, with the
-re-commanded fold that follows it, and S11's second condition, the
-`ANTENNA_OBSTRUCTED` raise about the limp pair once the fold is commanded, with
-the second `DEGRADE_RELEASED` drain that answers it. All three scenarios are
-rewritten again then rather than forked now; while the detector is disarmed that
-coverage is the motion crate's, in the `motion_tick` cases that arm it.
+Done = one sequencer beside the model, and every reader of the plant calls it.
+Marked at `RESPONSE_DEAD_SAMPLES` in `crates/reachy-motion/src/plant.rs`.
 
-Done = the detector judges a run against a predicted position, the crossed-run
-machinery is gone, the model is fitted against a recorded reversal, and `armed`
-ships `true`. Marked at the fresh-open arm of `tracking::look` in
-`crates/reachy-motion/src/tick.rs`.
+## `held-ring-pairing-pin`
+
+Hold the setpoint ring and its count together by construction rather than by a
+comment. `MotionSnap` carries the driver's last setpoints as `held` and how many
+of them are real as `held_count`, and the two are one invariant: a reader that
+cannot see the ring must not see its count either, or a count reads as a full
+ring the record never wrote. The two field numbers were paired by hand, and the
+rule that they move together lives in the `//` documentation element beside them
+and nowhere else. Nothing structural or mechanical states it, so the next change
+to the ring's layout can separate them again and only review would notice. The
+argument is schema hygiene rather than an observed symptom: nothing in this tree
+persists a `MotionSnap` across builds — the Mover's slot carries no
+`TakeSnapshots` policy and a restarted process arms from a fresh slot — so the
+separated pair has no reachable runtime symptom today, and `resume` refuses a
+count past the ring's depth in any case.
+
+Deferral context: the shape that removes the rule is one field — a nested record
+holding the entries and the count, the way `tracking` already groups a
+prediction with its run — which retires the count with the ring by construction;
+it is also a second renumbering of two fields that have just been renumbered
+once, and it changes what every Rust reader of the pair writes. The alternative
+is a mechanical pin instead of a schema change, and the field numbers are not
+visible from the generated Rust, so it would mean a check that reads schema
+source — a kind of gate this tree does not have yet. Which of the two the schema
+wants is a design call, and the invariant holds as written today.
+
+Done = renumbering the ring without its count fails a build or a test rather
+than passing review. Marked at `held_count` in `motion/tick_state.clk`.
+
+## `refused-state-names-its-reason`
+
+Let a refused control slot say which invariant it broke. `resume` answers a
+`StateError` per way a slot describes no state a tick could be in — a mode
+without its path, a clock that is not a length of time, a non-finite number in
+a modelled trajectory, a held count past the ring's depth — and the Mover's
+only reader is `if armed && resume(state).is_err()`, which drops the variant,
+adds one to `refused_state` and re-arms from the next reading. Every kind reads
+the same from outside the process: a counter that rose by one and a move
+abandoned for a sample. The variants exist to tell a truncated or foreign slot
+from a live defect, and that is the distinction an operator reading a run needs
+most.
+
+Deferral context: the Mover reports through numeric signals and a state field
+per counter (`cogs/mover.clk`), so naming the reason is either a signal per
+variant — a vocabulary that grows with the error enum and has to be versioned
+with it — or a narration channel this cog does not have. Which of the two the
+Mover should carry, and whether the same answer belongs on the session's
+identical call site, is report surface and a design call rather than a
+refactor. The refusal itself is safe as written: nothing is commanded and the
+goal stream stopping is what takes the machine down.
+
+Done = a run's record names which `StateError` refused a slot. Marked at the
+`resume` call in `cogs/motion_cogs.rs`.
 
 ## `beam-gappy-segment-extent`
 
@@ -1098,18 +1138,17 @@ against the run that moved them. Marked at `DEFAULT_GAINS.antennas` in
 
 ## `antenna-hold-fixture`
 
-Turn a recorded antenna hold into a replay fixture: a per-tick exporter from a
-recording to the trace CSV the replay suite reads, a
+Cut two replay fixtures out of a recorded antenna hold: a
 `fixtures/traces/trace-antenna-hunt.csv` with a case asserting the stillness
 watch fails it, and a post-fix `trace-antenna-still.csv` asserting it passes at
 the bound baked from that run.
 
-Deferral context: the exporter's riskiest part is the column mapping onto a
-strict parser, and landing it with no fixture to exercise it would ship exactly
-that part unproven. The recording it needs does not exist until the hardware
-hold test has been run. The parser's constraints are recorded beside `fixture`
-in `crates/reachy-motion/tests/replay_trace.rs`, where the work happens.
+Deferral context: the exporter this needed is `//cogs:trace_export`, which
+takes a log directory and a pair of nominal instants and writes the trace CSV
+the replay suite reads. What is left is the recording, which does not exist
+until the hardware hold test has been run, and the two windows cut out of it.
+The parser's constraints are recorded beside `fixture` in
+`crates/reachy-motion/tests/replay_trace.rs`, where the cases go.
 
-Done = both fixtures are checked in, the replay suite fails on the hunting one
-and passes the still one, and the exporter is a target somebody can run against
-a fetched recording.
+Done = both fixtures are checked in and the replay suite fails on the hunting
+one and passes the still one.

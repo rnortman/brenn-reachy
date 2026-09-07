@@ -54,12 +54,22 @@ pub const CLOSING_SCRIPT_ID: u32 = 32;
 /// well-formed and would have held the machine had nothing superseded it.
 pub const OPENING_CYCLES: i64 = 100;
 
-/// How long the held script's own upright step lasts, in cycles.
-pub const UP_CYCLES: i64 = 60;
+/// How long the held script's own upright step lasts, in cycles: the travel the
+/// raise takes at the servos' own profile, plus room to settle onto it.
+///
+/// Not the move's clock. The raise is clocked at 40 cycles and an antenna has
+/// 3.4 rad to swing at 0.024 rad a cycle, so a step sized on the clock would
+/// have every arrival below asserted on a machine still coming up.
+#[must_use]
+pub fn up_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
-/// How long its fold lasts, in cycles: the longer move plus room to arrive and
-/// hold.
-pub const STOW_CYCLES: i64 = 150;
+/// How long its fold lasts, in cycles: the same travel back, on the same terms.
+#[must_use]
+pub fn stow_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
 /// How many cycles into the release the closing script arrives.
 ///
@@ -76,20 +86,24 @@ pub const CLOSING_AFTER_RELEASE: i64 = 20;
 /// screen a hold applies to the script already waiting.
 pub const DUPLICATE_AFTER_CLOSING: i64 = 20;
 
-/// How long the second session holds the machine up, in cycles.
-pub const SECOND_UP_CYCLES: i64 = 60;
+/// How long the second session holds the machine up, in cycles: the same travel
+/// as the first session's raise.
+#[must_use]
+pub fn second_up_cycles() -> i64 {
+    up_cycles()
+}
 
 /// The cycle the held script's fold begins on.
 #[must_use]
 pub fn stow_start_cycle() -> i64 {
-    up_start_cycle() + UP_CYCLES
+    up_start_cycle() + up_cycles()
 }
 
 /// The cycle the first schedule runs out on, which is what ends the first
 /// session.
 #[must_use]
 pub fn disengage_cycle() -> i64 {
-    stow_start_cycle() + STOW_CYCLES
+    stow_start_cycle() + stow_cycles()
 }
 
 /// The cycle the closing script is sent on: inside the release the first
@@ -121,14 +135,14 @@ pub fn second_up_start_cycle() -> i64 {
 /// The cycle the second session's fold begins on.
 #[must_use]
 pub fn second_stow_start_cycle() -> i64 {
-    second_up_start_cycle() + SECOND_UP_CYCLES
+    second_up_start_cycle() + second_up_cycles()
 }
 
 /// The cycle the second schedule runs out on, which is what ends the second
 /// session.
 #[must_use]
 pub fn second_disengage_cycle() -> i64 {
-    second_stow_start_cycle() + STOW_CYCLES
+    second_stow_start_cycle() + stow_cycles()
 }
 
 /// The last cycle of the run.

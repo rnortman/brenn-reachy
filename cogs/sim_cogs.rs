@@ -42,6 +42,7 @@ use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSign
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
 use brenn_reachy__driver__health_clk_rs::{DriverStatus, DriverStatusWire, EventKind};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
+use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegId;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use clockwork_rs::SyncTime;
 use motion_slots::{configured, counters};
@@ -54,12 +55,12 @@ use reachy_driver::{
 use reachy_kin::default_geometry;
 use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
-    JointGroup, JointRef, ROW_COUNT, angle_of, flags, group_of, row, rows_of, set_angle,
-    write_rows, write_vector,
+    ROW_COUNT, angle_of, flags, row, rows_of, set_angle, write_rows, write_vector,
 };
+use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
+use reachy_motion::value::Value;
 
 pub mod sim_aux;
-pub mod sim_lag;
 pub mod sim_regs;
 
 use sim_aux::{Answer, Request};
@@ -73,7 +74,12 @@ use sim_regs::Regs;
 /// that teleports hides exactly the tracking error the control loop is being
 /// tested on. Falling behind shows up as a machine that did not get where it
 /// was asked, which is the truthful reading of a driver that missed its cycles.
-const MAX_CATCHUP_CYCLES: i64 = 8;
+///
+/// The decision tick's model of this plant steps through a gap of the same
+/// length and re-seeds past it, so the two are one number: a plant and a
+/// prediction that disagreed about how much of a gap they had covered would
+/// disagree about where the machine is for the rest of the run.
+const MAX_CATCHUP_CYCLES: i64 = MAX_GAP_PERIODS as i64;
 
 /// The cycle this cog's execution condition waits for, nanoseconds.
 ///
@@ -171,6 +177,7 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             state.torqued = flags::all();
             believe(state, flags::all(), true);
         }
+        seed_held(state);
         release(state, nominal);
     }
 
@@ -253,6 +260,7 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
                 EngageRequest::over(&mut state.engage).abandon();
                 state.torqued = JointFlags::NONE;
                 state.has_target = JointFlags::NONE;
+                stop(state, flags::all());
                 TorqueOffConfirm::over(&mut state.confirm).begin(nominal);
             }
             SessionCmdKind::EngageNow => {
@@ -328,6 +336,10 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
         }
     }
 
+    // What the rows were holding before this cycle's write, for the cycles an
+    // execution that lost the CPU stepped over: the driver wrote nothing in
+    // them, so the servos were chasing what they already had.
+    let held_before = holding(state);
     let silence = nominal - state.gate.last_accept.as_nanos();
     // What the driver believes, not what the plant is: the real driver has no
     // window onto the plant, and a dead-man measured against one would be a
@@ -343,6 +355,7 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
             // asking for any more.
             state.torqued = JointFlags::NONE;
             state.has_target = JointFlags::NONE;
+            stop(state, flags::all());
             // The sweep is being written, so what it took is a question worth
             // reading back. Idempotent: the pass keeps the instant it opened
             // at, because the budget is measured from when the de-torquing was
@@ -388,8 +401,8 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     // points behind it are points no cycle attended -- which is the same
     // reading the real driver's loop makes of a slot it missed.
     state.skipped_cycles += u64::try_from(cycles - 1).unwrap_or(0);
-    keep_history(state, cycles);
-    advance(params, state, cycles);
+    let held_now = holding(state);
+    advance(state, cycles, period_ns, &held_before, &held_now);
 
     // A cycle in which the bus answers nothing at all. Decided before anything
     // is read, because it decides whether anything is: the outage is the wire's
@@ -504,6 +517,7 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
         SimOp::TorqueOff => {
             state.torqued = flags::without(state.torqued, mask);
             believe(state, mask, false);
+            stop(state, mask);
             if flags::is_empty(state.torqued) {
                 // A sweep that reached everything is a confirmed disarm, not a
                 // fault: nothing latches, and nothing is being held any more.
@@ -511,15 +525,26 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
                 state.has_target = JointFlags::NONE;
             }
         }
+        // A row put where a scenario wants it is a hand on the machine, so its
+        // generator is at rest afterwards: carrying the speed of the move it
+        // was making into a position it did not travel to would set the plant
+        // off from an instant nothing produced.
         SimOp::SetPositions => {
             for joint in flags::iter(mask) {
                 if let Some(angle) = angle_of(&cmd.positions, joint) {
                     set_angle(&mut state.positions, joint, angle);
                 }
             }
+            stop(state, mask);
         }
         SimOp::Obstruct => state.obstructed |= mask,
-        SimOp::ReleaseObstruction => state.obstructed = flags::without(state.obstructed, mask),
+        // A row let go of sets off again from rest: a real generator that has
+        // been driving into a jam is not carrying speed when the hand comes
+        // off, and the position loop starts the move it was denied.
+        SimOp::ReleaseObstruction => {
+            state.obstructed = flags::without(state.obstructed, mask);
+            stop(state, mask);
+        }
         SimOp::DropReplies => state.drop_replies_left = cmd.count,
         SimOp::RefuseAux => state.aux_unanswered_left = cmd.count,
         // The set replaces whatever was off the bus, so a scenario puts servos
@@ -527,43 +552,6 @@ fn inject(state: &mut SimState, cmd: &SimCmd, nominal: i64) {
         // none: an outage a scenario cannot end is one it cannot show a machine
         // surviving.
         SimOp::AbsentServo => state.absent = mask,
-        // A response delay the rings can hold, or an injection refused whole:
-        // a run whose premise is a servo nineteen cycles behind says nothing
-        // about anything if the plant quietly gave it eight.
-        SimOp::SetLag => {
-            if sim_lag::representable(cmd.count) {
-                // Each row *entering* the set has its whole ring filled with the
-                // angle it is holding now, so a delay reaching back further than
-                // the lag has existed chases that rather than the angle an
-                // unwritten cell holds -- which on this machine is a real angle,
-                // and a plant that slewed to it would be moving on nobody's
-                // command. The target for a row that has one, and where the row
-                // stands for a row that does not: a row nothing has commanded is
-                // holding its position, and that is the only angle it can be
-                // said to have been given.
-                //
-                // A row already lagged keeps its ring. Refilling it would hand a
-                // row mid-move the target it holds now at every depth, so the
-                // delayed target it is chasing would jump a whole lag's distance
-                // forward for one cycle -- a step no scenario asked for, in the
-                // one place a scenario is watching how far a row stands behind
-                // its goal. The ring is what survives, not the depth: the depth
-                // below is one number for the whole set, so naming a moving row
-                // at a different one reads its kept history at the new offset
-                // and steps that row's target by the difference on the next
-                // cycle.
-                let held = holding(state);
-                for joint in flags::iter(flags::without(mask, state.lagged)) {
-                    if let Some(index) = row(joint) {
-                        sim_lag::seed(&mut state.target_history, index, held[index]);
-                    }
-                }
-                state.lagged = mask;
-                state.lag_cycles = cmd.count;
-            } else {
-                state.refused_injections += 1;
-            }
-        }
         SimOp::SetRegister => {
             for joint in flags::iter(mask) {
                 let Some(index) = row(joint) else {
@@ -915,9 +903,23 @@ fn run_aux(
 fn release(state: &mut SimState, nominal: i64) {
     state.torqued = JointFlags::NONE;
     state.has_target = JointFlags::NONE;
+    stop(state, flags::all());
     believe(state, flags::all(), false);
     GoalGate::over(&mut state.gate).clear_commanded();
     state.swept_at = SyncTime::from_nanos(nominal);
+}
+
+/// Stop the modelled generators on these rows.
+///
+/// A servo whose torque comes off, or that is let go of after a jam, has a
+/// trajectory generator at rest: it is not carrying speed into the next move it
+/// is asked for. Position is untouched -- these gearboxes do not back-drive.
+fn stop(state: &mut SimState, rows: JointFlags) {
+    for joint in flags::iter(rows) {
+        if let Some(index) = row(joint) {
+            state.velocities[index] = 0.0;
+        }
+    }
 }
 
 /// Record what a verified torque-enable write would have said about these rows.
@@ -958,16 +960,6 @@ fn check_params(params: &SimParams) {
         "the dead-man must allow at least one cycle of silence, not {}ns",
         params.hold_timeout_ns,
     );
-    for (rate, group) in [
-        (params.slew_body_yaw_rad, "body yaw"),
-        (params.slew_legs_rad, "legs"),
-        (params.slew_antennas_rad, "antennas"),
-    ] {
-        assert!(
-            rate.is_finite() && rate > 0.0,
-            "the {group} slew must be a distance a servo covers in a cycle, not {rate}",
-        );
-    }
 }
 
 /// How many cycles of motion an execution covers.
@@ -980,38 +972,14 @@ fn elapsed_cycles(elapsed_ns: i64, period_ns: i64) -> i64 {
     (elapsed_ns / period_ns).clamp(1, MAX_CATCHUP_CYCLES)
 }
 
-/// Write this execution's targets into the rings, one cell per cycle of plant
-/// motion.
-///
-/// Every cycle, whether or not a goal arrived: a row asked for nothing new is a
-/// row still being asked for the same thing, and a ring that only moved when a
-/// setpoint did would measure a delay in goals rather than in cycles. An
-/// execution that covered several cycles writes the same target into each of
-/// them, which is a plant that was asked for nothing while the process was away.
-///
-/// Only while some row is lagged: a ring nothing reads back through is 288 cells
-/// written per cycle for nobody. The lag's own injection fills the rings it is
-/// about, so the history a delay reads begins where the delay does.
-fn keep_history(state: &mut SimState, cycles: i64) {
-    if flags::is_empty(state.lagged) {
-        return;
-    }
-    let targets = holding(state);
-    let mut cursor = state.history_cursor;
-    for _ in 0..cycles.min(sim_lag::LAG_DEPTH as i64) {
-        cursor = sim_lag::push(&mut state.target_history, cursor, &targets);
-    }
-    state.history_cursor = cursor;
-}
-
 /// What each row is holding, radians: the target it has been given, or -- for a
 /// row nothing has commanded yet -- where it stands.
 ///
-/// The distinction matters only to the rings. A row with no target carries the
+/// The distinction matters to the ring. A row with no target carries the
 /// schema's zero in `targets`, which on this machine is a real angle, so a ring
-/// filled from it would hand a lagged row a goal nobody ever gave: a row nothing
-/// has asked anything of is holding its position, and that is the only angle it
-/// can be said to be chasing.
+/// filled from it would hand a row a goal nobody ever gave: a row nothing has
+/// asked anything of is holding its position, and that is the only angle it can
+/// be said to be chasing.
 fn holding(state: &SimState) -> [f64; ROW_COUNT] {
     let mut held = rows_of(&state.targets);
     let standing = rows_of(&state.positions);
@@ -1023,69 +991,132 @@ fn holding(state: &SimState) -> [f64; ROW_COUNT] {
     held
 }
 
-/// What `joint` is closing on this cycle, radians.
+/// Fill the whole ring with what each row holds now, and stop every modelled
+/// generator.
 ///
-/// The target it holds now, or -- for a row the scenario gave a response delay
-/// -- the one it was given that many cycles ago. A delay the rings cannot reach
-/// back to is a delay nothing set: `set_lag` refused it, so there is no case in
-/// which this silently shortens one.
-fn chasing(state: &SimState, joint: JointRef) -> Option<f64> {
-    if flags::contains(state.lagged, joint)
-        && let Some(row) = row(joint)
-        && let Some(angle) = sim_lag::delayed(
-            &state.target_history,
-            state.history_cursor,
-            row,
-            state.lag_cycles,
-        )
-    {
-        return Some(angle);
+/// Run once, when the process meets the machine: a cell nothing has written
+/// holds the schema's zero, which on this machine is a real angle, and a plant
+/// that set off toward it would be moving on nobody's command.
+fn seed_held(state: &mut SimState) {
+    let standing = holding(state);
+    for age in 0..RESPONSE_DEAD_SAMPLES {
+        write_rows(&mut state.held[age], &standing);
     }
-    angle_of(&state.targets, joint)
+    state.velocities = [0.0; ROW_COUNT];
 }
 
-/// Move the modelled servos toward what they are being asked for.
+/// Put the newest setpoint into the ring, dropping the oldest.
+///
+/// One push per cycle of plant motion, always after that cycle's step: reading
+/// before pushing is what makes the setpoint a row chases the one held
+/// [`RESPONSE_DEAD_SAMPLES`] cycles ago, and it is the order the decision tick's
+/// own model steps in.
+fn push_held(state: &mut SimState, targets: &[f64; ROW_COUNT]) {
+    for age in 1..RESPONSE_DEAD_SAMPLES {
+        state.held.swap(age - 1, age);
+    }
+    write_rows(&mut state.held[RESPONSE_DEAD_SAMPLES - 1], targets);
+}
+
+/// The trajectory generator a row's own registers describe, or `None` for a row
+/// whose profile registers are zero.
+///
+/// Zero in either register switches the generator off on a real XL330: the servo
+/// takes the goal as a step and its position loop closes on it as fast as it
+/// can. That is the state of an uncommissioned machine, and it is modelled as
+/// arriving in one cycle rather than refused -- the sweep that writes the pair
+/// is the same sweep that torques the machine on, so a row moving under no
+/// profile is a row a scenario never commissioned.
+///
+/// # Panics
+///
+/// If either register is not in this build's control table for this row, or
+/// does not carry a register-sized value. Both are facts about the table in
+/// `sim_regs` rather than anything a scenario writes, and a build whose table
+/// stopped naming them would otherwise turn the whole plant instant again --
+/// which every arrival assertion in the suite would pass, early, about a
+/// machine that does not exist.
+fn generator(state: &SimState, index: usize, period_ns: i64) -> Option<PlantModel> {
+    let register = |reg| {
+        let carried = sim_regs::read(&state.regs, index, reg).unwrap_or_else(|refusal| {
+            panic!("row {index} carries no {reg:?} to run a profile from: {refusal:?}")
+        });
+        Value::as_u32(carried)
+            .unwrap_or_else(|| panic!("row {index}'s {reg:?} is no register value: {carried:?}"))
+    };
+    PlantModel::from_registers(
+        register(RegId::ProfileVelocity),
+        register(RegId::ProfileAcceleration),
+        period_ns,
+    )
+    .ok()
+}
+
+/// Move the modelled servos along the trajectories their own profile registers
+/// describe, one cycle at a time.
+///
+/// The plant is the servo's own generator: it accelerates at the configured
+/// profile acceleration, runs no faster than the configured profile velocity,
+/// and decelerates onto its target, carrying its speed from one cycle to the
+/// next. What it chases is the setpoint the driver held
+/// [`RESPONSE_DEAD_SAMPLES`] cycles ago, which is the response delay the real
+/// servos answer at: one cycle of it is the driver's own read-before-write
+/// ordering and the rest is a fit against the recorded runs. The decision tick
+/// models the same trajectory from the same pair, so
+/// an unobstructed row and the tick's prediction of it agree cycle for cycle.
 ///
 /// A jammed servo holds where it stands whatever it is asked for -- that is
 /// what an obstruction is to a position loop, and the growing error is what the
 /// motion tick's obstruction detector reads. A de-torqued one holds too: these
 /// gearboxes do not back-drive, which is why a de-torqued machine at stow is
 /// the safe state and a de-torqued machine anywhere else is not.
-fn advance(params: &SimParams, state: &mut SimState, cycles: i64) {
+///
+/// `pre` is what the rows held before this execution's own write and `post` is
+/// what they hold after it: an execution covering several cycles is a process
+/// that lost the CPU, and the cycles it was away were cycles the driver wrote
+/// nothing in, so the setpoint it already held is what the servos were chasing
+/// through them.
+fn advance(
+    state: &mut SimState,
+    cycles: i64,
+    period_ns: i64,
+    pre: &[f64; ROW_COUNT],
+    post: &[f64; ROW_COUNT],
+) {
+    for cycle in 0..cycles {
+        step_cycle(state, period_ns);
+        let last = cycle == cycles - 1;
+        push_held(state, if last { post } else { pre });
+    }
+}
+
+/// One cycle of plant motion.
+fn step_cycle(state: &mut SimState, period_ns: i64) {
+    // The setpoint of a dead time ago, which is what every row is chasing this
+    // cycle.
+    let oldest = rows_of(&state.held[0]);
     for joint in flags::iter(state.torqued) {
         if flags::contains(state.obstructed, joint) || !flags::contains(state.has_target, joint) {
             continue;
         }
-        let Some(group) = group_of(joint) else {
+        let (Some(index), Some(position)) = (row(joint), angle_of(&state.positions, joint)) else {
             continue;
         };
-        let (Some(target), Some(position)) =
-            (chasing(state, joint), angle_of(&state.positions, joint))
-        else {
+        let target = oldest[index];
+        let Some(model) = generator(state, index, period_ns) else {
+            // No generator on the servo: the goal is a step and the position
+            // loop closes on it.
+            set_angle(&mut state.positions, joint, target);
+            state.velocities[index] = 0.0;
             continue;
         };
-        let step = slew(params, group) * cycles as f64;
-        let gap = target - position;
-        let moved = if gap.abs() <= step {
-            target
-        } else {
-            position + step.copysign(gap)
+        let mut predicted = Predicted {
+            position,
+            velocity: state.velocities[index],
         };
-        set_angle(&mut state.positions, joint, moved);
-    }
-}
-
-/// How far a servo of `group` moves in one cycle, radians.
-///
-/// Per group rather than per servo: the six cranks carry the head between them
-/// and are the same part, the antennas are a different and much faster one, and
-/// the body yaw is its own. Each rate is a distance rather than a number that
-/// might be one, because [`check_params`] refused the scenario otherwise.
-fn slew(params: &SimParams, group: JointGroup) -> f64 {
-    match group {
-        JointGroup::BodyYaw => params.slew_body_yaw_rad,
-        JointGroup::Legs => params.slew_legs_rad,
-        JointGroup::Antennas => params.slew_antennas_rad,
+        model.step(&mut predicted, target);
+        set_angle(&mut state.positions, joint, predicted.position);
+        state.velocities[index] = predicted.velocity;
     }
 }
 

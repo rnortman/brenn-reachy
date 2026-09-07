@@ -26,11 +26,16 @@ binding on every change in this repo.
   is load-bearing: a response may be scoped to one group, and an antenna pair
   going limp while the head keeps its presence is a fault answered, not an
   exception to this rule. The tracking detector (`head_obstructed`,
-  `antenna_obstructed`) is the one condition currently answered by nothing: it
-  judges a joint against its goal, which it cannot do on content faster than the
-  gestures its thresholds were read off, so it ships disarmed until a plant
-  model replaces what it judges against. An obstruction is accepted as a motor
-  warming against a hand.
+  `antenna_obstructed`) is armed: it judges a joint against the trajectory its
+  own servo's generator is running, built from the profile the commissioning
+  sweep writes, so content faster than the servos is lag rather than evidence
+  and what reaches the screen is a joint neither closing on that trajectory nor
+  keeping pace with it. A hand that stays on the head is answered in about a
+  second — a raise, a stow commanded into it for one window, a second raise that
+  defeats the stow, and the machine released where it stands. A hand that took
+  the head mid-move gets a period or two to let go before that second raise, so
+  a grab on a saturated move ends the session whether or not it then lets go;
+  that is the ladder's own trade, and yielding is the point.
 - **No automatic fault recovery.** Nothing clears a fault, and nothing retries
   a failed operation with perturbed inputs. The park-class responses wait for
   an operator to restart the process. The rest-class ones end the session

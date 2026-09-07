@@ -146,9 +146,13 @@ pub const CLOSING_AFTER_REFRESH: i64 = 260;
 /// cycles: the sender's own last beat.
 pub const CLOSING_UP_CYCLES: i64 = 20;
 
-/// How long the closing script's fold lasts, in cycles: the longer move plus
-/// room to arrive and hold.
-pub const CLOSING_STOW_CYCLES: i64 = 150;
+/// How long the closing script's fold lasts, in cycles: the travel the fold
+/// takes at the servos' own profile, plus room to settle onto it. Not the move's
+/// clock, which runs out with the antennas still coming down.
+#[must_use]
+pub fn closing_stow_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
 /// The cycle the refresh is sent on.
 #[must_use]
@@ -213,7 +217,7 @@ pub fn stow_start_cycle() -> i64 {
 /// The cycle the schedule runs out on, which is what ends the session.
 #[must_use]
 pub fn disengage_cycle() -> i64 {
-    stow_start_cycle() + CLOSING_STOW_CYCLES
+    stow_start_cycle() + closing_stow_cycles()
 }
 
 /// The last cycle of the run.

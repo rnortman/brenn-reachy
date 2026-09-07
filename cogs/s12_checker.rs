@@ -29,8 +29,8 @@ use scenario::check;
 use scenario::read::Run;
 
 use s12_scenario::{
-    OPENING_SCRIPT_ID, REVERSAL_AFTER_STOW, REVERSAL_SCRIPT_ID, disengage_cycle, end_cycle,
-    lagged_rows, raised_cycle, reversal_cycle, script_sent_cycle, second_stow_start_cycle,
+    OPENING_SCRIPT_ID, REVERSAL_SCRIPT_ID, antenna_rows, disengage_cycle, end_cycle, raised_cycle,
+    reversal_after_stow, reversal_cycle, script_sent_cycle, second_stow_start_cycle,
     stow_move_cycles, stow_start_cycle,
 };
 
@@ -115,9 +115,10 @@ fn main() -> ExitCode {
 /// with reverses instantly however lagged its loop is.
 fn check_reversal_landed_mid_move(failures: &mut Vec<String>) {
     let moving = stow_move_cycles();
-    if REVERSAL_AFTER_STOW >= moving {
+    let after = reversal_after_stow();
+    if after >= moving {
         failures.push(format!(
-            "the replacement arrives {REVERSAL_AFTER_STOW} cycles into a fold whose move takes \
+            "the replacement arrives {after} cycles into a fold whose move takes \
              {moving}: what this run is about is a goal turning round under a joint that is still \
              following it"
         ));
@@ -142,7 +143,7 @@ fn check_the_antennas_were_lagging(run: &Run, failures: &mut Vec<String>) {
         return;
     };
     let present = check::present_rows(sample);
-    for joint in flags::iter(lagged_rows()) {
+    for joint in flags::iter(antenna_rows()) {
         let Some(index) = row(joint) else {
             failures.push(format!("{} sits on no bus row", Name(joint)));
             continue;

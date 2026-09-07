@@ -106,6 +106,19 @@ pub fn re_rank(slot: &mut SessionStateWire, kind: FaultKind) -> bool {
     ranked
 }
 
+/// Record that the running maneuver cannot be driven through what was just
+/// raised.
+///
+/// The stow keeps standing until the next step, which concludes it as fallen
+/// through: nothing here commands anything and nothing here reads a clock. What
+/// makes this the answer rather than another stow is the doctrine's -- a
+/// condition answered by a stow that names no motor to mask is a joint being
+/// held back, and the fold re-commanded into it grinds where yielding is the
+/// point.
+pub fn defeat(slot: &mut SessionStateWire) {
+    slot.winddown_mut().set_defeated(true);
+}
+
 /// Take the maneuver out of the record.
 ///
 /// What is left of a maneuver whose record could not be read: the bit that says
@@ -171,6 +184,10 @@ pub fn step(slot: &mut SessionStateWire, now_ns: i64, stowed: bool) -> Step {
     // would be held toward the fold with no clock to end it. Answered by letting
     // go, which is what every other unreadable record of a machine that may be
     // holding is answered with.
+    // Read before the record is held open: the view below borrows the whole of
+    // it, and this is the host's own bookkeeping rather than anything the core
+    // decides.
+    let defeated = slot.winddown().defeated();
     let stepped = {
         let Ok(state) = slot.winddown_mut().validate_mut() else {
             return Step::Ungoverned;
@@ -187,11 +204,16 @@ pub fn step(slot: &mut SessionStateWire, now_ns: i64, stowed: bool) -> Step {
             // down.
             // TODO(session-mask-view)
             head_released: false,
-            // A stow ends when the machine is measured at the pose. A stow the
-            // machine defeated is not evidence this host has: what stops a move
-            // is a condition, and a condition arrives as a raise and re-ranks
-            // the maneuver.
-            stow: stowed.then_some(StowEnding::Stowed),
+            // A stow ends when the machine is measured at the pose, or when a
+            // condition it cannot be driven through defeated it. Defeated wins
+            // over a fold reading in the same wake: the reading is a dead time
+            // stale, and the record must not claim a controlled descent the
+            // detector has just said stopped.
+            stow: if defeated {
+                Some(StowEnding::Defeated)
+            } else {
+                stowed.then_some(StowEnding::Stowed)
+            },
         };
         let deadline = maneuver.deadline();
         (maneuver.next(now, evidence), deadline)

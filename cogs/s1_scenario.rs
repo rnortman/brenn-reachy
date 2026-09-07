@@ -47,8 +47,16 @@ pub const SCRIPT_ID: u32 = 1;
 /// long enough to ask.
 pub const UP_CYCLES: i64 = 400;
 
-/// How long the stow step lasts, in cycles: the longer move plus the same room.
-pub const STOW_CYCLES: i64 = 150;
+/// How long the stow step lasts, in cycles: the travel the fold takes at the
+/// servos' own profile, plus room to settle onto it.
+///
+/// Not the move's clock. The fold's clock is 100 cycles and an antenna's 3.4 rad
+/// of travel takes half again as many, so a step sized on the clock would put
+/// the arrival assertion on a machine still coming down.
+#[must_use]
+pub fn stow_cycles() -> i64 {
+    scenario::posture_step_cycles()
+}
 
 /// The cycle the stow step begins.
 #[must_use]
@@ -59,7 +67,7 @@ pub fn stow_start_cycle() -> i64 {
 /// The cycle the schedule runs out on, which is what ends the session.
 #[must_use]
 pub fn disengage_cycle() -> i64 {
-    stow_start_cycle() + STOW_CYCLES
+    stow_start_cycle() + stow_cycles()
 }
 
 /// The last cycle of the run.

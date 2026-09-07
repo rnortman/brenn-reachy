@@ -27,7 +27,7 @@ mod session_cog;
 // Public for the one figure the scenario harness cannot derive for itself: the
 // clocks a base move runs on once this cog has floored them, which is what says
 // whether a scripted step leaves the antennas time to arrive.
-pub use mover_overlay::{Goal, floored_clocks};
+pub use mover_overlay::{Goal, floored_clocks, planned_path};
 // Public for one figure each, both read by the scenario harness: the
 // provisioning grid, whose readable cells are most of what the start-up survey
 // costs in transactions, and the bus cycle the session's staleness window counts
@@ -39,7 +39,7 @@ mod session_stow;
 
 pub use session_cog::execute_session;
 
-use brenn_reachy__cogs__config_clk_rs::MoverParams;
+use brenn_reachy__cogs__config_clk_rs::{MoverParams, ServoProfile};
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
 use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
@@ -58,11 +58,12 @@ use reachy_kin::{
 use reachy_motion::arm::{ArmRecord, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
+use reachy_motion::plant::PlantModel;
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
-    CommandDisposition, CommandRejection, Fault, MotionMode, MoveAbort, TickInputs, TickOutputs,
-    arm, default_motion_config, last_goal, motion_tick, resume, standing_fault,
+    CommandDisposition, CommandRejection, Fault, MotionConfig, MotionMode, MoveAbort, TickInputs,
+    TickOutputs, arm, last_goal, motion_tick, resume, standing_fault,
 };
 use reachy_motion::traj::MoveDurations;
 
@@ -287,8 +288,11 @@ fn store_seed(state: &mut PoseStateWire, seed: &Isometry3<f64>, solved_any: bool
 /// latches on stops the stream, which is how the machine reaches the minimum
 /// risk condition when the loop can no longer command it.
 pub fn execute_mover(dial: &mut MoverDial<'_>) {
-    let cfg = default_motion_config();
     let settings = Settings::of(dial);
+    let cfg = motion_config(
+        configured(dial.configs.profile, "the servo profile's"),
+        settings.period_ns,
+    );
     let clips = dial.configs.clips;
     let before = MoverCounters::read(dial.states.ctrl);
     let mut counters = before;
@@ -370,6 +374,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         if armed && resume(state).is_err() {
             // Readable bytes that describe no state a tick could be in -- the
             // same answer as a slot that did not validate, for the same reason.
+            // TODO(refused-state-names-its-reason)
             counters.refused_state += 1;
             armed = false;
         }
@@ -403,6 +408,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         }
 
         let present = reading(sample);
+        let held = holding(sample);
 
         if !armed {
             // Arming, level-triggered: engaged and not armed is the whole
@@ -490,6 +496,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 now: Duration::from_nanos(u64::try_from(nominal).unwrap_or(0)),
                 period: Duration::from_nanos(settings.period_ns),
                 present: present.as_ref(),
+                commanded: held.as_ref(),
                 command: command.as_ref(),
                 // No health poll: this cog holds no bus and reads no error
                 // bits.
@@ -606,6 +613,17 @@ fn snap_of(state: &mut MoverStateWire) -> &mut MotionSnap {
         .expect("a state this execution has already validated")
 }
 
+/// The setpoint the driver reported holding, or `None` where it held none.
+///
+/// What the modelled plant is stepped against: the setpoint that actually
+/// reached the servos, keep-alive rewrites and refusals included, rather than
+/// the goal this cog composed. A cycle the driver held nothing on -- before the
+/// first goal, after a release, behind a latched torque-off -- leaves the model
+/// nothing to chase and re-seeds it from the next reading.
+fn holding(sample: &PoseSample) -> Option<JointVector> {
+    bool::from(sample.commanded_valid).then(|| vector_of(&sample.commanded))
+}
+
 /// The measured positions, or `None` where the sample carries no reading.
 ///
 /// A sample the driver marked stale, or one with a row that did not answer, is
@@ -614,6 +632,66 @@ fn snap_of(state: &mut MoverStateWire) -> &mut MotionSnap {
 fn reading(sample: &PoseSample) -> Option<JointVector> {
     (bool::from(sample.present_valid) && flags::is_empty(sample.missing))
         .then(|| vector_of(&sample.present))
+}
+
+/// The tick's configuration, built once from the profile this deployment
+/// commissions and shared from then on.
+///
+/// Built once: everything in it is either a hardware fact the motion library
+/// states or a number a config file states before the first execution, so a cog
+/// that rebuilt it every sample would pay for it at control rate. A profile handed
+/// in after the first call is ignored rather than refused — in a deployment
+/// there is only ever one, since a cog's config is read from a file before the
+/// first execution and nothing writes it afterwards, and in a test binary the
+/// first case to run fixes it for the rest.
+///
+/// The period is the Mover's own configured grid and never a constant: the
+/// plant model's two limits are per-period distances, so a model built for one
+/// grid and stepped on another is wrong in proportion to the ratio.
+///
+/// # Panics
+///
+/// For a profile register of zero, which disables the generator on the servo,
+/// and for a period that is no grid. The tick would then be judging every joint
+/// against a trajectory nothing runs, which is worse than a process that
+/// refuses to start: the session refuses the same pair before it commissions
+/// anything, so the two readers of the one file stop for the same reason.
+fn motion_config(profile: &ServoProfile, period_ns: u64) -> &'static MotionConfig {
+    static COMMISSIONED: std::sync::OnceLock<MotionConfig> = std::sync::OnceLock::new();
+    COMMISSIONED.get_or_init(|| {
+        commissioned_config(profile, period_ns).unwrap_or_else(|error| {
+            panic!(
+                "the servo profile is acceleration {}, velocity {} on a {period_ns} ns grid, \
+                 which is no plant to judge a joint against: {error}",
+                profile.profile_acceleration, profile.profile_velocity,
+            )
+        })
+    })
+}
+
+/// The configuration this pair and this grid describe, or why they describe no
+/// machine.
+///
+/// Fallible entry point: `motion_config` panics on refusal, and the
+/// configuration is built once per process, so a test that drove the panic
+/// would poison a `OnceLock` for every case after it.
+///
+/// # Errors
+///
+/// The reason the pair and the period are no plant.
+pub fn commissioned_config(
+    profile: &ServoProfile,
+    period_ns: u64,
+) -> Result<MotionConfig, reachy_motion::plant::PlantError> {
+    let plant = PlantModel::from_registers(
+        profile.profile_velocity,
+        profile.profile_acceleration,
+        i64::try_from(period_ns).unwrap_or(i64::MAX),
+    )?;
+    Ok(MotionConfig {
+        plant,
+        ..MotionConfig::default()
+    })
 }
 
 /// The grid this cog commands on, and how long a posture change takes.

@@ -32,8 +32,8 @@ use scenario::read::Run;
 use scenario::{cycle_at, cycle_within, drain_cycle, stow_clocks};
 
 use s7_scenario::{
-    CLOSING_SCRIPT_ID, CLOSING_STOW_CYCLES, HOLD_RAD, HOLD_SCRIPT_ID, REFRESH_SCRIPT_ID,
-    closing_cycle, disengage_cycle, duplicate_cycle, end_cycle, motion_hold_from_cycle,
+    CLOSING_SCRIPT_ID, HOLD_RAD, HOLD_SCRIPT_ID, REFRESH_SCRIPT_ID, closing_cycle,
+    closing_stow_cycles, disengage_cycle, duplicate_cycle, end_cycle, motion_hold_from_cycle,
     motion_hold_through_cycle, refresh_cycle, script_sent_cycle, standing_cycle, stow_start_cycle,
 };
 
@@ -391,5 +391,5 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         &stow_pose_targets(),
         failures,
     );
-    check::room("stow", CLOSING_STOW_CYCLES, &stow_clocks(), failures);
+    check::room("stow", closing_stow_cycles(), &stow_clocks(), failures);
 }

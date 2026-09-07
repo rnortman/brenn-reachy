@@ -29,9 +29,9 @@ use scenario::read::Run;
 use scenario::{stow_clocks, up_clocks};
 
 use s6_scenario::{
-    HOLD_RAD, SCRIPT_ID, SECOND_SCRIPT_ID, STOW_CYCLES, UP_CYCLES, absorbed_cycle, disengage_cycle,
-    end_cycle, hold_from_cycle, hold_through_cycle, script_sent_cycle, second_script_cycle,
-    standing_cycle, stow_start_cycle, sway_peak_cycle, window_close_cycle,
+    HOLD_RAD, SCRIPT_ID, SECOND_SCRIPT_ID, absorbed_cycle, disengage_cycle, end_cycle,
+    hold_from_cycle, hold_through_cycle, script_sent_cycle, second_script_cycle, standing_cycle,
+    stow_cycles, stow_start_cycle, sway_peak_cycle, up_cycles, window_close_cycle,
 };
 
 /// How far a goal may be from the number this scenario derives for it, radians.
@@ -166,8 +166,8 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         &stow_pose_targets(),
         failures,
     );
-    check::room("upright", UP_CYCLES, &up_clocks(), failures);
-    check::room("stow", STOW_CYCLES, &stow_clocks(), failures);
+    check::room("upright", up_cycles(), &up_clocks(), failures);
+    check::room("stow", stow_cycles(), &stow_clocks(), failures);
     // The scenario's own arithmetic: the window and the room the hand-back needs
     // after it both sit inside the step the motion is played over.
     if absorbed_cycle() >= stow_start_cycle() {

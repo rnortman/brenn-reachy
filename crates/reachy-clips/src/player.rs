@@ -1371,6 +1371,9 @@ mod tests {
                     now: TICK * ticks,
                     period: TICK,
                     present: Some(&present),
+                    // The driver holding what the last period put on the wire,
+                    // which is what the machine is chasing.
+                    commanded: Some(&present),
                     command: Some(&MotionCommand::Track(composed)),
                     health: None,
                 },

@@ -332,6 +332,37 @@ pub fn joint_ref(row: usize) -> Option<JointRef> {
     ROWS.get(row).copied()
 }
 
+/// What a recorded run's CSV calls each bus row, in bus order.
+///
+/// The fixture format's own vocabulary: a trace names two columns per servo,
+/// `<prefix>_present_rad` and `<prefix>_goal_rad`, and this is the prefix. It
+/// lives here beside [`Name`] because it is a naming of the same nine servos,
+/// and because two statements of it — one in the tool that writes a fixture and
+/// one in the suite that reads it — can disagree about which crank a column is
+/// without either failing: a renamed column fails loudly, a re-numbered leg
+/// does not.
+///
+/// The legs are 1-based, as the servos on the bus are numbered, which is the
+/// same numbering [`Name`] renders.
+const ROW_COLUMNS: [&str; ROW_COUNT] = [
+    "body_yaw",
+    "leg1",
+    "leg2",
+    "leg3",
+    "leg4",
+    "leg5",
+    "leg6",
+    "antenna_right",
+    "antenna_left",
+];
+
+/// The prefix a recorded run's CSV names `joint`'s pair of columns under, or
+/// `None` for [`JointRef::None`], which no trace carries a column for.
+#[must_use]
+pub fn column_name(joint: JointRef) -> Option<&'static str> {
+    ROW_COLUMNS.get(row(joint)?).copied()
+}
+
 /// The crank at `leg`, 0-based in servo order, or [`JointRef::None`] past the
 /// sixth.
 ///
@@ -948,6 +979,29 @@ mod tests {
                 "the envelope says {envelope_says:?}, the tick says {motion_says:?}"
             );
         }
+    }
+
+    /// A trace column is named for exactly one servo, and a leg's column
+    /// carries the same number its name does.
+    ///
+    /// The fixture format's authority: a tool writing a trace and a suite
+    /// reading one both take the prefix from here, so what this pins is that
+    /// the nine are distinct — a shared name would attribute one crank's
+    /// readings to another — and that the numbering matches the one an operator
+    /// reads in a message.
+    #[test]
+    fn every_bus_row_has_its_own_trace_column() {
+        let mut seen = std::collections::BTreeSet::new();
+        for joint in ROWS {
+            let column = column_name(joint).expect("a bus row has a column");
+            assert!(seen.insert(column), "{joint:?} shares the {column} column");
+            if let Some(leg) = leg_index(joint) {
+                assert_eq!(column, format!("leg{}", leg + 1));
+                assert!(Name(joint).to_string().ends_with(&format!("{}", leg + 1)));
+            }
+        }
+        assert_eq!(seen.len(), ROW_COUNT);
+        assert_eq!(column_name(JointRef::None), None);
     }
 
     /// Every one of the nine slots is covered by the finiteness check, and the
