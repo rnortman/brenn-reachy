@@ -148,6 +148,8 @@ schema ProvisionRow
         #13 profile_acceleration: ProvisionCell;
         // The motion profile's velocity, its own units.
         #14 profile_velocity: ProvisionCell;
+        // The acceleration ceiling, its own units.
+        #15 acceleration_limit: ProvisionCell;
     }
 }
 

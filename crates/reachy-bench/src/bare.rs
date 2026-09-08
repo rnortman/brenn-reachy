@@ -3,16 +3,22 @@
 //!
 //! Each one opens with a bus and a roster and nothing else. `provision` writes
 //! the antennas' operating mode, `reboot` restarts the servos, `off` sweeps
-//! torque off, and `watchdog` establishes what an armed Bus Watchdog does to one
-//! servo. None of them commands an angle — the goal `watchdog` writes is the
-//! count the servo reports for itself — so none of them needs an envelope, a
-//! pose or a control loop; what they share is the register-level plumbing at the
-//! bottom of this file.
+//! torque off, `watchdog` establishes what an armed Bus Watchdog does to one
+//! servo, and `hold-probe` watches one held servo far faster than a driver
+//! cycle can. None of them commands an angle — the goal `watchdog` and
+//! `hold-probe` write is the count the servo reports for itself — so none of
+//! them needs an envelope, a pose or a control loop; what they share is the
+//! register-level plumbing at the bottom of this file.
 //!
-//! `watchdog` is the one that torques a servo, and it is the odd one here for
-//! that reason: it is a supervised bring-up assertion about a register the
-//! session path arms on every engagement, and its whole observation is a servo
-//! letting go on its own.
+//! `watchdog` and `hold-probe` are the two that torque a servo, and they are the
+//! odd ones here for that reason: each is a supervised bring-up assertion, one
+//! about a register the session path arms on every engagement and one about
+//! whether a joint commanded to stand still does. `hold-probe` samples a single
+//! servo's Present Position in a tight loop — around a kilohertz on this wire,
+//! against the driver's fifty — which is what separates a slow limit cycle from
+//! a buzz the driver's own rate can only alias, and it runs the same window
+//! twice: once with the goal rewritten as the driver rewrites it, once with
+//! reads alone, so a wobble that needs the host's writes to exist says so.
 //!
 //! Ports are the caller's: every command here takes one already open, so the
 //! whole surface is exercisable against a scripted machine with no device in
@@ -26,7 +32,9 @@
 //! front is a host-side failure to encode the byte all nine are written, which
 //! leaves no write to attempt.
 
+use core::fmt;
 use core::time::Duration;
+use std::cell::OnceCell;
 use std::time::Instant;
 
 use dxl_proto::{HardwareError, StatusCode, StatusError, counts_to_rad};
@@ -36,9 +44,10 @@ use reachy_bus::{
 };
 use reachy_motion::joints::{Name, ROW_COUNT, row};
 use reachy_motion::reg::Name as RegName;
+use reachy_motion::stillness;
 use reachy_motion::value;
 use reachy_motion::{
-    EXPECTED_MODELS, EXPECTED_OPERATING_MODES, JointRef, RegId, Value, ValueShape,
+    EXPECTED_MODELS, EXPECTED_OPERATING_MODES, Gains, JointRef, RegId, Value, ValueShape,
 };
 use thiserror::Error;
 
@@ -92,9 +101,61 @@ const WATCHDOG_BUSY_TIMEOUTS: u32 = 5;
 /// does not happen had a whole timeout of slack beyond its own.
 const WATCHDOG_SILENT_TIMEOUTS: u32 = 2;
 
-/// The cadence traffic goes out at while a no-trip phase runs: the driver's own
-/// command period, which is also one register count.
-const WATCHDOG_TRAFFIC_PERIOD: Duration = Duration::from_millis(WATCHDOG_UNIT_MS);
+/// The cadence a command that keeps the bus busy writes goals at: the driver's
+/// own command period, which is also one Bus Watchdog register count.
+///
+/// Two commands write at it, for two reasons. The watchdog's no-trip phases
+/// keep the bus busy the way a session does; the hold probe rewrites the goal
+/// at it because a wobble driven by the host's writes is driven by writes at
+/// this spacing and no other.
+const COMMAND_PERIOD: Duration = Duration::from_millis(WATCHDOG_UNIT_MS);
+
+/// The joint the hold probe addresses unless the operator names another: an
+/// antenna, which is the joint reported to hunt and the one whose torque costs
+/// the least to hold.
+const HOLD_PROBE_JOINT: JointRef = JointRef::AntennaRight;
+
+/// How long each of the probe's two phases runs unless the operator says
+/// otherwise. Seconds, so a hold of a few hundred cycles of anything slower
+/// than the sample rate is inside one phase.
+///
+/// Public because the binary's own usage text quotes it: the default a command
+/// runs at is stated once, where the command is.
+pub const HOLD_PROBE_SECONDS: u64 = 3;
+
+/// The longest phase an operator may ask for. A phase is a servo held under
+/// torque with nobody but the operator watching, and the command is attended by
+/// construction; a mistyped figure that held it for an hour would be a hold
+/// nobody meant to command.
+const HOLD_PROBE_MAX_SECONDS: u64 = 60;
+
+/// The excursion a held joint is asserted to stay inside, in encoder counts.
+///
+/// The stillness watch's own bound, read back out of the radians it is stated
+/// in rather than restated here: what the session judges a hold against and
+/// what this judges one against are one figure, and a probe that passed a hold
+/// the session would fail would be an instrument disagreeing with the machine.
+const HOLD_PROBE_BOUND_COUNTS: f64 = stillness::MAX_EXCURSION_RAD / stillness::COUNT_RAD;
+
+/// What a probe's series file is named for: the prefix, and everything after it
+/// is the moment it was taken and the servo it came from.
+///
+/// Stated here, where the command is, because two other places have to know it
+/// — the binary that writes the file, and the fetch that globs for it on the
+/// device. The fetch is shell and cannot read this constant, so its test
+/// compares the two texts; what the test compares against is this one.
+pub const HOLD_PROBE_SERIES_PREFIX: &str = "hold-probe-";
+
+/// The most readings a second of one phase can hold, for the series to be
+/// sized before the loop runs. A read of one register is hundreds of
+/// microseconds of wire at this baud plus the host's turnaround, so a couple of
+/// thousand a second is a ceiling nothing on this bus reaches.
+const HOLD_PROBE_RATE_CEILING_HZ: usize = 2000;
+
+/// The shortest differenced series a dominant period is read off. Below it the
+/// lag range is a handful of lags over a handful of products, and the largest
+/// of those is noise wearing a number.
+const HOLD_PROBE_MIN_SERIES: usize = 16;
 
 /// A host's clock: elapsed time on an epoch it owns, and the sleep.
 ///
@@ -434,6 +495,68 @@ pub enum BareError {
         id: u8,
         /// The error field, whole.
         error: StatusError,
+    },
+
+    /// The servo the hold probe addresses was already holding torque, so it is
+    /// standing somewhere this command did not put it — a session's pose, or a
+    /// hold left behind. The probe torques the servo itself at the count it
+    /// reports, and what it measures is that hold; a servo that arrived holding
+    /// would be measured in somebody else's.
+    #[error("servo {id} is holding torque; release it with `off` before the hold probe")]
+    HoldProbeTorqueHeld {
+        /// The servo addressed.
+        id: u8,
+    },
+
+    /// The servo the hold probe addresses has its Bus Watchdog armed or
+    /// latched, so the second phase — seconds of reads with no goal write —
+    /// would be watched by a timer that stops the servo partway through. The
+    /// quiet second phase that came back would then be a servo the watchdog
+    /// halted rather than one the host stopped disturbing, which is the exact
+    /// difference the two phases exist to tell apart.
+    #[error(
+        "servo {id} has its bus watchdog at {read}, not 0; a session or a watchdog run left it \
+         armed. Reboot the servo, or run `off`, before the hold probe"
+    )]
+    HoldProbeWatchdogArmed {
+        /// The servo addressed.
+        id: u8,
+        /// What the register answered.
+        read: u8,
+    },
+
+    /// A phase was asked for that is longer than an attended hold is meant to
+    /// be. Refused before the port is touched.
+    #[error(
+        "a hold probe phase of {asked} s is longer than the {most} s this command holds a servo for"
+    )]
+    HoldProbeTooLong {
+        /// The figure asked for, in seconds.
+        asked: u64,
+        /// The longest one accepted, in seconds.
+        most: u64,
+    },
+
+    /// A servo commanded to stand still did not. The bring-up assertion of this
+    /// command: the figures beside it are the discovery, and the phase says
+    /// whether the host's own goal rewrites were running while it happened.
+    #[error(
+        "servo {id} moved {excursion:.0} counts while held during {phase}, past the {bound:.1} count \
+         bound, {}", Shown(*.period)
+    )]
+    HoldProbeExcursion {
+        /// The servo addressed.
+        id: u8,
+        /// The traffic that was running.
+        phase: Busy,
+        /// How far it moved, peak to peak, in counts.
+        excursion: f64,
+        /// The bound it passed, in counts.
+        bound: f64,
+        /// What the series' own period read as — the half of the discovery
+        /// that says which mechanism this is. Carried as the figures, and
+        /// worded by the one place that words them.
+        period: Option<ProbePeriod>,
     },
 }
 
@@ -899,7 +1022,7 @@ pub fn watchdog<P: BusPort>(
     clock: &mut dyn Clock,
     line: &mut dyn FnMut(&str),
 ) -> Result<(), BareError> {
-    let (row, id) = watchdog_target(map, target)?;
+    let (row, id) = bare_target(map, target, WATCHDOG_JOINT)?;
     let mut bus = Bus::new(port, timing);
 
     line(&format!(
@@ -1006,11 +1129,16 @@ fn watchdog_exercise<P: BusPort>(
     watchdog_rearms(bus, map, row, line)
 }
 
-/// The servo a watchdog self-test addresses: the one asked for, or an antenna.
-fn watchdog_target(map: &ServoMap, target: Option<u8>) -> Result<(usize, u8), BareError> {
+/// The servo a bare-bus command addresses: the one asked for, or the joint the
+/// command defaults to.
+fn bare_target(
+    map: &ServoMap,
+    target: Option<u8>,
+    default: JointRef,
+) -> Result<(usize, u8), BareError> {
     let roster = map.ids();
     let Some(id) = target else {
-        let row = row(WATCHDOG_JOINT).expect("a named joint has a bus row");
+        let row = row(default).expect("a named joint has a bus row");
         return Ok((row, roster[row]));
     };
     match roster.iter().position(|held| *held == id) {
@@ -1019,9 +1147,13 @@ fn watchdog_target(map: &ServoMap, target: Option<u8>) -> Result<(usize, u8), Ba
     }
 }
 
-/// The traffic one no-trip phase keeps on the bus.
-#[derive(Clone, Copy)]
-enum Busy {
+/// The traffic one phase keeps on the bus.
+///
+/// Public because it is what a probe's readings are labelled with: which of the
+/// two a wobble appears in is the reading the tuning branches on, and a caller
+/// that has to compare English to find out is a caller that cannot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Busy {
     /// What the driver does while it holds a pose: read where the servo is,
     /// write the goal again.
     ReadsAndGoals,
@@ -1032,11 +1164,18 @@ enum Busy {
 
 impl Busy {
     /// What an operator reads this phase as.
-    fn name(self) -> &'static str {
+    #[must_use]
+    pub fn name(self) -> &'static str {
         match self {
             Self::ReadsAndGoals => "reads and goal rewrites",
             Self::ReadsOnly => "reads alone",
         }
+    }
+}
+
+impl fmt::Display for Busy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -1067,7 +1206,7 @@ fn watchdog_busy<P: BusPort>(
             // A verified write is two exchanges: the write and the read-back.
             exchanges += 2;
         }
-        clock.sleep_until(clock.now() + WATCHDOG_TRAFFIC_PERIOD);
+        clock.sleep_until(clock.now() + COMMAND_PERIOD);
     }
 
     let read = read_byte(bus, map, row, RegId::BusWatchdog)?;
@@ -1078,14 +1217,14 @@ fn watchdog_busy<P: BusPort>(
             read,
             armed: WATCHDOG_COUNTS,
             busy,
-            period: WATCHDOG_TRAFFIC_PERIOD,
+            period: COMMAND_PERIOD,
         });
     }
     if read_byte(bus, map, row, RegId::TorqueEnable)? == 0 {
         return Err(BareError::WatchdogReleasedEarly { id, phase });
     }
     line(&format!(
-        "  {phase}: {exchanges} exchanges over {busy:?} at one every {WATCHDOG_TRAFFIC_PERIOD:?}, \
+        "  {phase}: {exchanges} exchanges over {busy:?} at one every {COMMAND_PERIOD:?}, \
          watchdog still armed at {read} and the servo still holding"
     ));
     Ok(())
@@ -1287,20 +1426,623 @@ fn watchdog_tracks_its_goal<P: BusPort>(
     Ok(())
 }
 
-/// Write where the servo stands as its goal, then enable torque.
+/// One reading the probe took: when, and the count that came back.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeSample {
+    /// Elapsed since the phase began.
+    pub at: Duration,
+    /// The Present Position register, as the count it is.
+    pub counts: i32,
+}
+
+/// One phase of a probe: the traffic that was running, every reading taken
+/// while it was, and what those readings say.
+pub struct ProbePhase {
+    /// The traffic that was running.
+    pub kind: Busy,
+    /// The readings, in the order they were taken.
+    pub samples: Vec<ProbeSample>,
+    /// What the readings say, read at the first ask and kept.
+    ///
+    /// Kept because the reading walks the series once per lag: a phase of a
+    /// minute is a second's arithmetic, and a caller that asked twice would
+    /// spend it twice. Not read as the phase closes, because that is a second
+    /// of arithmetic between the two phases and again before the release, with
+    /// the servo holding torque throughout and the bus idle — so the ask comes
+    /// from a caller that has already put the torque off.
+    stats: OnceCell<ProbeStats>,
+}
+
+/// The regular component of a series, if it has one.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbePeriod {
+    /// The lag it repeats at, in samples.
+    pub lag: usize,
+    /// The autocorrelation at that lag: one is a series that repeats exactly,
+    /// and a figure near zero is a lag that won only because something had to.
+    pub regularity: f64,
+    /// The same lag against the phase's own measured rate, in milliseconds.
+    pub millis: f64,
+    /// Its reciprocal, in hertz.
+    pub hz: f64,
+}
+
+/// What one phase says once its readings are read.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeStats {
+    /// Readings taken.
+    pub samples: usize,
+    /// The rate they were taken at, measured from their own stamps rather than
+    /// assumed: what the loop achieved is what bounds the frequencies it can
+    /// separate, and a run that ran slower than it meant to must not be read as
+    /// though it had not.
+    pub rate_hz: f64,
+    /// Peak to peak, in counts.
+    pub excursion: f64,
+    /// Direction changes per second, under the stillness watch's rule that a
+    /// plateau is not a reversal.
+    pub reversals_per_s: f64,
+    /// Mean sample count between consecutive reversals, or `None` for a series
+    /// with fewer than two.
+    ///
+    /// Printed beside [`Self::period`] because the two answer the same
+    /// question differently, and their disagreement is itself a finding: a
+    /// limit cycle turns round on a near-constant interval and correlates
+    /// strongly at one lag, while encoder dither turns round as often at
+    /// intervals scattered from one sample to several and correlates at none.
+    pub reversal_interval_mean_samples: Option<f64>,
+    /// Population standard deviation of those intervals, on the same series.
+    pub reversal_interval_spread_samples: Option<f64>,
+    /// The dominant period of the differenced series, if it has one.
+    pub period: Option<ProbePeriod>,
+}
+
+/// One probe run: what it saw, and how it ended.
+///
+/// The readings and the verdict are separate because the readings outlive the
+/// verdict — a phase that ended in a refusal is the reading a bring-up most
+/// wants kept, and a caller writes the series down before it acts on the
+/// outcome, the way the self-test saves its record before it refuses.
+pub struct ProbeRun {
+    /// The servo probed.
+    pub id: u8,
+    /// The phases, in the order they ran. A phase cut short by a bus failure is
+    /// here with the readings it got.
+    pub phases: Vec<ProbePhase>,
+    /// The bring-up assertion, and any failure the phases or the make-safe met.
+    pub outcome: Result<(), BareError>,
+}
+
+impl ProbeRun {
+    /// Both phases' readings as one comma-separated table: the phase, the
+    /// elapsed milliseconds within it, and the count.
+    ///
+    /// The whole series rather than the figures, because the figures are a
+    /// reading of it and a run that earns a fixture earns it as data. Rendered
+    /// here and written by the caller, so what a file holds is exercisable
+    /// without one.
+    #[must_use]
+    pub fn csv(&self) -> String {
+        let mut out = String::from("phase,elapsed_ms,counts\n");
+        for phase in &self.phases {
+            for sample in &phase.samples {
+                out.push_str(&format!(
+                    "{phase},{at:.3},{counts}\n",
+                    phase = phase.kind,
+                    at = sample.at.as_secs_f64() * 1000.0,
+                    counts = sample.counts,
+                ));
+            }
+        }
+        out
+    }
+}
+
+impl ProbePhase {
+    /// One phase and its readings, unread.
+    #[must_use]
+    pub fn new(kind: Busy, samples: Vec<ProbeSample>) -> Self {
+        Self {
+            kind,
+            samples,
+            stats: OnceCell::new(),
+        }
+    }
+
+    /// What the readings say. Read at the first ask, kept for the rest.
+    #[must_use]
+    pub fn stats(&self) -> &ProbeStats {
+        self.stats.get_or_init(|| read_series(&self.samples))
+    }
+}
+
+/// How long a run of readings spans, in seconds.
+fn span_of(samples: &[ProbeSample]) -> f64 {
+    match (samples.first(), samples.last()) {
+        (Some(first), Some(last)) => (last.at - first.at).as_secs_f64(),
+        _ => 0.0,
+    }
+}
+
+/// What one phase's readings say.
+///
+/// The excursion, the reversals and their intervals are read by the stillness
+/// watch's own reader, so the figures this instrument judges a hold by and the
+/// figures a session judges one by are one definition. The rate is measured
+/// against the phase's own stamps: what the loop achieved is what bounds the
+/// frequencies it can separate, and a run that ran slower than it meant to must
+/// not be read as though it had not.
+///
+/// The dominant period is this command's own addition, and the series is
+/// differenced for it: a hold's position series is a constant with a wobble on
+/// it, and the constant carries no information about the wobble's shape while
+/// dominating any correlation taken over it.
+fn read_series(samples: &[ProbeSample]) -> ProbeStats {
+    let span = span_of(samples);
+    let wobble = stillness::Wobble::over(samples.iter().map(|sample| f64::from(sample.counts)));
+    let (interval_mean, interval_spread) = wobble.interval_stats();
+    let rate_hz = wobble.rate_hz(span).unwrap_or(0.0);
+    let steps: Vec<f64> = samples
+        .windows(2)
+        .map(|pair| f64::from(pair[1].counts - pair[0].counts))
+        .collect();
+    ProbeStats {
+        samples: samples.len(),
+        rate_hz,
+        excursion: wobble.excursion(),
+        reversals_per_s: wobble.reversals_per_s(span),
+        reversal_interval_mean_samples: interval_mean,
+        reversal_interval_spread_samples: interval_spread,
+        period: dominant_period(&steps).map(|(lag, regularity)| {
+            let millis = if rate_hz > 0.0 {
+                lag as f64 * 1000.0 / rate_hz
+            } else {
+                f64::NAN
+            };
+            ProbePeriod {
+                lag,
+                regularity,
+                millis,
+                hz: if millis > 0.0 {
+                    1000.0 / millis
+                } else {
+                    f64::NAN
+                },
+            }
+        }),
+    }
+}
+
+impl fmt::Display for ProbeStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{samples} readings at {rate:.0} Hz, peak to peak {excursion:.0} counts, \
+             {reversals:.1} reversals/s, {intervals}, {period}",
+            samples = self.samples,
+            rate = self.rate_hz,
+            excursion = self.excursion,
+            reversals = self.reversals_per_s,
+            intervals = Intervals(
+                self.reversal_interval_mean_samples,
+                self.reversal_interval_spread_samples
+            ),
+            period = Shown(self.period),
+        )
+    }
+}
+
+/// The reversal intervals as an operator reads them, and the words for a series
+/// with fewer than two reversals.
+struct Intervals(Option<f64>, Option<f64>);
+
+impl fmt::Display for Intervals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.0, self.1) {
+            (Some(mean), Some(spread)) => write!(
+                f,
+                "reversal intervals {mean:.2} samples (spread {spread:.2})"
+            ),
+            _ => write!(f, "no reversal interval"),
+        }
+    }
+}
+
+/// A period as an operator reads it, and the words for a series that has none.
+struct Shown(Option<ProbePeriod>);
+
+impl fmt::Display for Shown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(period) => write!(
+                f,
+                "period {lag} samples ({millis:.2} ms, {hz:.0} Hz, regularity {regularity:.2})",
+                lag = period.lag,
+                millis = period.millis,
+                hz = period.hz,
+                regularity = period.regularity,
+            ),
+            None => write!(f, "no period"),
+        }
+    }
+}
+
+/// The lag a differenced series repeats at, and how strongly, or nothing.
+///
+/// The autocorrelation of the mean-removed series at every lag from two up to
+/// half its length, and the largest positive one wins. Lag one is excluded: a
+/// series that alternates every sample correlates positively with itself at
+/// two, and a positive correlation at one is a drift rather than a cycle.
+/// Nothing is answered for a series too short to have a lag range worth
+/// searching, and none for one that never moved — a flat hold has no period,
+/// which is the answer, not a division by zero.
+fn dominant_period(steps: &[f64]) -> Option<(usize, f64)> {
+    if steps.len() < HOLD_PROBE_MIN_SERIES {
+        return None;
+    }
+    let mean = steps.iter().sum::<f64>() / steps.len() as f64;
+    let centred: Vec<f64> = steps.iter().map(|step| step - mean).collect();
+    let energy: f64 = centred.iter().map(|step| step * step).sum();
+    if energy <= 0.0 {
+        return None;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for lag in 2..=centred.len() / 2 {
+        let sum: f64 = centred[..centred.len() - lag]
+            .iter()
+            .zip(&centred[lag..])
+            .map(|(here, there)| here * there)
+            .sum();
+        let correlation = sum / energy;
+        if correlation > 0.0 && best.is_none_or(|(_, held)| correlation > held) {
+            best = Some((lag, correlation));
+        }
+    }
+    best
+}
+
+/// What one probe run was asked for.
+///
+/// One struct rather than three arguments because they arrive together from one
+/// invocation and travel together through it: the servo, the gains to run at,
+/// and how long each phase is.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeRequest {
+    /// The servo to probe, or nothing for the command's default antenna.
+    pub target: Option<u8>,
+    /// The position gains to swap in for the run, or nothing to leave the
+    /// servo's own alone.
+    pub gains: Option<Gains>,
+    /// How long each of the two phases runs.
+    pub seconds: Duration,
+}
+
+/// Hold one servo where it stands and watch it far faster than a driver does.
+///
+/// The instrument for a joint reported to wobble while it is holding still. A
+/// driver cycle samples at 50 Hz, which aliases anything above 25 Hz onto some
+/// other frequency and cannot say which; this loop reads one servo's Present
+/// Position as fast as the wire answers — around a kilohertz at this baud — so
+/// the frequency it reports is the one the joint has. What that frequency is
+/// decides the lever: a slow limit cycle is the position loop working across
+/// backlash, and a fast buzz is the derivative term amplifying the encoder's
+/// own quantisation.
+///
+/// Two phases, each `seconds` long: the goal rewritten every command period as
+/// the driver rewrites it, then reads alone. A wobble present in the first and
+/// absent from the second is driven by the host's writes and is answered by the
+/// driver rather than by a gain.
+///
+/// It commands no angle. The only goal ever written is the count the servo
+/// reported for itself before torque went on, rewritten unchanged — the same
+/// claim `watchdog` makes and for the same reason. Torque it does take, on one
+/// servo, for a few seconds; the make-safe releases it and restores the gains
+/// whichever way the run ends, and the command refuses to start on a servo that
+/// is already holding something.
+///
+/// The requested gains are swapped in verified, and the kept triple is written
+/// back on the way out. RAM registers: nothing here is non-volatile, and a
+/// power cycle undoes the swap whatever this command managed.
+///
+/// The readings come back whatever the outcome, so a caller can write them down
+/// before it acts on the verdict.
+pub fn hold_probe<P: BusPort>(
+    map: &ServoMap,
+    timing: BusTiming,
+    port: P,
+    request: ProbeRequest,
+    clock: &mut dyn Clock,
+    line: &mut dyn FnMut(&str),
+) -> Result<ProbeRun, BareError> {
+    let asked = request.seconds.as_secs();
+    if asked > HOLD_PROBE_MAX_SECONDS {
+        return Err(BareError::HoldProbeTooLong {
+            asked,
+            most: HOLD_PROBE_MAX_SECONDS,
+        });
+    }
+    let (row, id) = bare_target(map, request.target, HOLD_PROBE_JOINT)?;
+    let mut bus = Bus::new(port, timing);
+
+    line(&format!(
+        "hold-probe: servo {id} is torqued at the position it already holds and read as fast as \
+         the bus answers, for {seconds:?} with the goal rewritten every {COMMAND_PERIOD:?} and \
+         {seconds:?} with reads alone. It is commanded nowhere — the only goal written is the \
+         count it reports for itself — but it does hold torque for the whole of both phases. \
+         Stay clear of it, and do not run this with the head up.",
+        seconds = request.seconds,
+    ));
+
+    let info =
+        with_retry(&mut bus, |bus| bus.ping(id)).map_err(|source| BareError::Bus { id, source })?;
+    if read_byte(&mut bus, map, row, RegId::TorqueEnable)? != 0 {
+        return Err(BareError::HoldProbeTorqueHeld { id });
+    }
+    // The second phase writes no goal for seconds, which is what the Bus
+    // Watchdog stops a servo for. A servo that arrived with it armed would be
+    // measured while a timer was halting it, and the quiet phase that came back
+    // would read as the answer this probe exists to find.
+    let watchdog = read_byte(&mut bus, map, row, RegId::BusWatchdog)?;
+    if watchdog != 0 {
+        return Err(BareError::HoldProbeWatchdogArmed { id, read: watchdog });
+    }
+    line(&format!(
+        "  servo {id}: model {model}, torque off, bus watchdog disarmed",
+        model = info.model
+    ));
+
+    // Read before anything is written, so a probe that cannot read the gains
+    // has written none and has nothing to put back.
+    let kept = match request.gains {
+        Some(_) => Some(read_gains(&mut bus, map, row)?),
+        None => None,
+    };
+
+    let mut probe = HeldServo {
+        bus: &mut bus,
+        map,
+        row,
+        request,
+    };
+    let mut phases = Vec::new();
+    let exercised = probe.exercise(clock, line, &mut phases);
+    let restored = probe.make_safe(kept, line);
+    // Read, printed and judged after the release: which of the two phases a
+    // joint wobbles in is the reading, so a refusal taken at the first would
+    // leave the question that separates them unasked — and the arithmetic that
+    // reads a series walks it once per lag, which is not something to spend
+    // with a servo still holding torque.
+    for phase in &phases {
+        line(&format!("  {}: {}", phase.kind, phase.stats()));
+    }
+    let judged = judge_phases(id, &phases);
+    let outcome = match (exercised, restored) {
+        (Err(failed), Err(release)) => {
+            // The failure is the discovery and is what the caller acts on; a
+            // make-safe that did not finish may be a servo still holding
+            // torque, which an operator has to act on before reading anything,
+            // so it is said out loud first.
+            line(&format!(
+                "  cleanup did not finish, so the state of this servo is unknown: {release}"
+            ));
+            Err(failed)
+        }
+        (Err(failed), Ok(())) => Err(failed),
+        (Ok(()), Err(release)) => Err(release),
+        (Ok(()), Ok(())) => judged,
+    };
+    Ok(ProbeRun {
+        id,
+        phases,
+        outcome,
+    })
+}
+
+/// The probe's bring-up assertion: a held servo stays inside the stillness
+/// watch's bound, in both phases.
+///
+/// Read off the figures each phase carries, so nothing here touches the bus.
+/// The figures are the ones the per-phase lines printed, read once and kept.
+fn judge_phases(id: u8, phases: &[ProbePhase]) -> Result<(), BareError> {
+    for phase in phases {
+        if phase.stats().excursion > HOLD_PROBE_BOUND_COUNTS {
+            return Err(BareError::HoldProbeExcursion {
+                id,
+                phase: phase.kind,
+                excursion: phase.stats().excursion,
+                bound: HOLD_PROBE_BOUND_COUNTS,
+                period: phase.stats().period,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One probe's wiring: the bus, the servo it is addressing, and what was asked
+/// for. Held together so the phases are methods over one held servo rather than
+/// five arguments repeated at every step.
+struct HeldServo<'a, P: BusPort> {
+    bus: &'a mut Bus<P>,
+    map: &'a ServoMap,
+    row: usize,
+    request: ProbeRequest,
+}
+
+impl<P: BusPort> HeldServo<'_, P> {
+    /// Every write the probe makes and every assertion it draws, inside the
+    /// boundary the make-safe covers.
+    ///
+    /// The phases are pushed as they finish — a phase cut short by a bus
+    /// failure is pushed with what it got — so the caller's record is whatever
+    /// the run reached.
+    fn exercise(
+        &mut self,
+        clock: &mut dyn Clock,
+        line: &mut dyn FnMut(&str),
+        phases: &mut Vec<ProbePhase>,
+    ) -> Result<(), BareError> {
+        if let Some(asked) = self.request.gains {
+            write_value(
+                self.bus,
+                self.map,
+                self.row,
+                RegId::PositionGains,
+                asked.value(),
+            )?;
+            line(&format!("  gains: {asked}, written and read back"));
+        }
+
+        let held = hold_where_it_stands(self.bus, self.map, self.row)?;
+        line("  holding: torque on at the position it was resting at");
+
+        for kind in [Busy::ReadsAndGoals, Busy::ReadsOnly] {
+            self.phase(kind, &held, clock, phases)?;
+        }
+        Ok(())
+    }
+
+    /// One phase: read the servo's position as fast as the bus answers for the
+    /// requested length, rewriting the held goal every command period if this
+    /// phase is the one that does.
+    fn phase(
+        &mut self,
+        kind: Busy,
+        held: &RawValue,
+        clock: &mut dyn Clock,
+        phases: &mut Vec<ProbePhase>,
+    ) -> Result<(), BareError> {
+        let started = clock.now();
+        let until = started + self.request.seconds;
+        let mut next_goal = started;
+        // Sized before the loop starts: a vector growing from nothing
+        // reallocates and copies inside the tightest timing loop in this crate,
+        // and this loop's whole purpose is that its stamps mean something. The
+        // bound is the wire's ceiling, not its expected rate — a read costs
+        // hundreds of microseconds at this baud, so nothing can beat it.
+        let mut samples: Vec<ProbeSample> = Vec::with_capacity(
+            HOLD_PROBE_RATE_CEILING_HZ * self.request.seconds.as_secs() as usize,
+        );
+
+        while clock.now() < until {
+            if matches!(kind, Busy::ReadsAndGoals) && clock.now() >= next_goal {
+                // The goal that was held, not the count just read: a rewrite of
+                // wherever the servo has got to is a setpoint following the
+                // joint around, which would hide the very wobble this is
+                // looking for.
+                if let Err(failed) =
+                    write_verified(self.bus, self.map, self.row, RegId::GoalPosition, held)
+                {
+                    phases.push(ProbePhase::new(kind, samples));
+                    return Err(failed);
+                }
+                next_goal = clock.now() + COMMAND_PERIOD;
+            }
+            match read_raw(self.bus, self.map, self.row, RegId::PresentPosition) {
+                Ok(raw) => samples.push(ProbeSample {
+                    at: clock.now() - started,
+                    counts: raw.i32().expect("a position register is four bytes wide"),
+                }),
+                Err(failed) => {
+                    phases.push(ProbePhase::new(kind, samples));
+                    return Err(failed);
+                }
+            }
+        }
+
+        // Read and printed by the caller after the release: reading a series
+        // costs a walk of it per lag, and spending that here would be seconds
+        // of arithmetic between the two phases and again before the torque
+        // comes off.
+        phases.push(ProbePhase::new(kind, samples));
+        Ok(())
+    }
+
+    /// Put the gains back and take the torque off, whatever the phases said.
+    ///
+    /// Both are attempted whichever fails: the gains are RAM a power cycle
+    /// clears, and the torque is the one thing an operator would otherwise have
+    /// to walk up to the machine for. When both fail the returned error is the
+    /// torque one, for that reason, and the gains' failure is printed beside it.
+    fn make_safe(
+        &mut self,
+        kept: Option<Gains>,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<(), BareError> {
+        let restored = match kept {
+            Some(gains) => write_value(
+                self.bus,
+                self.map,
+                self.row,
+                RegId::PositionGains,
+                gains.value(),
+            ),
+            None => Ok(()),
+        };
+        let released = write_byte(self.bus, self.map, self.row, RegId::TorqueEnable, 0);
+        match (restored, released) {
+            (Ok(()), Ok(())) => {
+                match kept {
+                    Some(gains) => line(&format!("  released, and the gains are back at {gains}")),
+                    None => line("  released, and the gains were never touched"),
+                }
+                Ok(())
+            }
+            (Err(gains), Ok(())) => {
+                line(
+                    "  released, but the gains would not go back; they are RAM and a power cycle \
+                     clears them",
+                );
+                Err(gains)
+            }
+            (Ok(()), Err(release)) => Err(release),
+            (Err(gains), Err(release)) => {
+                line(&format!("  the gains would not go back either: {gains}"));
+                Err(release)
+            }
+        }
+    }
+}
+
+/// One servo's three position gains.
+fn read_gains<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+) -> Result<Gains, BareError> {
+    let value = read_value(bus, map, row, RegId::PositionGains)?;
+    let (p, i, d) = value.as_gains().ok_or(BareError::Map {
+        id: map.ids()[row],
+        reg: RegId::PositionGains,
+        source: MapError::WrongShape {
+            reg: RegId::PositionGains,
+            expected: ValueShape::Gains,
+            observed: value.shape(),
+        },
+    })?;
+    Ok(Gains { p, i, d })
+}
+
+/// Write where the servo stands as its goal, then enable torque, and answer
+/// with the goal that was written.
 ///
 /// Both halves together, because either alone is the hazard: a goal written to a
 /// servo that is about to hold it is only safe if it is where the servo already
 /// is, and torque enabled without it is a servo commanded to whatever its goal
 /// register happens to hold.
+///
+/// The count comes back because a caller that goes on rewriting the goal has to
+/// rewrite *this* one: a rewrite of whatever the servo reports at that instant
+/// is a goal that follows the servo around, which is a moving setpoint dressed
+/// as a hold.
 fn hold_where_it_stands<P: BusPort>(
     bus: &mut Bus<P>,
     map: &ServoMap,
     row: usize,
-) -> Result<(), BareError> {
+) -> Result<RawValue, BareError> {
     let at = read_raw(bus, map, row, RegId::PresentPosition)?;
     write_verified(bus, map, row, RegId::GoalPosition, &at)?;
-    write_byte(bus, map, row, RegId::TorqueEnable, 1)
+    write_byte(bus, map, row, RegId::TorqueEnable, 1)?;
+    Ok(at)
 }
 
 /// Write one of a servo's one-byte registers, with the read-back the write path
@@ -1312,9 +2054,24 @@ fn write_byte<P: BusPort>(
     reg: RegId,
     byte: u8,
 ) -> Result<(), BareError> {
+    write_value(bus, map, row, reg, value::u8(byte))
+}
+
+/// Write one register as the value it carries, with the read-back the write
+/// path does itself.
+///
+/// The encoding is the map's, so a value of the wrong shape for the register is
+/// refused here rather than put on the wire.
+fn write_value<P: BusPort>(
+    bus: &mut Bus<P>,
+    map: &ServoMap,
+    row: usize,
+    reg: RegId,
+    value: Value,
+) -> Result<(), BareError> {
     let id = map.ids()[row];
     let raw = map
-        .encode_value(row, reg, value::u8(byte))
+        .encode_value(row, reg, value)
         .map_err(|source| BareError::Map { id, reg, source })?;
     write_verified(bus, map, row, reg, &raw)
 }
@@ -3223,6 +3980,819 @@ mod tests {
             ),
             (Some(0), Some(0)),
             "a failed observation still left the servo disarmed and limp",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The hold probe
+    // -----------------------------------------------------------------------
+
+    /// What one frame costs the scripted machine's clock. A millisecond, so a
+    /// phase's readings land at a rate of the order the real loop achieves and
+    /// the figures a case asserts are figures of the same shape.
+    const FRAME: Duration = Duration::from_millis(1);
+
+    /// A phase long enough for a series worth reading — sixty frames or so at
+    /// the cost above — and short enough that a case is instant.
+    const PHASE: Duration = Duration::from_millis(60);
+
+    /// A probe run: the transcript, and the readings the command handed back.
+    struct Probed {
+        run: Run,
+        probe: Option<ProbeRun>,
+    }
+
+    impl Probed {
+        /// The readings, or a panic naming what was expected instead.
+        fn probe(&self) -> &ProbeRun {
+            self.probe
+                .as_ref()
+                .expect("the probe reached its phases and handed them back")
+        }
+
+        /// The phase that ran under `kind`.
+        fn phase(&self, kind: Busy) -> &ProbePhase {
+            self.probe()
+                .phases
+                .iter()
+                .find(|phase| phase.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} phase"))
+        }
+    }
+
+    /// Run `hold-probe` against `machine`, on a clock the machine spends.
+    ///
+    /// The run's outcome is the probe's own, so every assertion the other
+    /// commands' cases make about a transcript works here unchanged; the
+    /// readings come back beside it because they outlive the verdict.
+    fn probed(
+        mut machine: FakeMachine,
+        cfg: &Configured,
+        target: Option<u8>,
+        gains: Option<Gains>,
+    ) -> Probed {
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        machine.spends_time(&now, FRAME);
+        let captured: Rc<RefCell<Option<ProbeRun>>> = Rc::new(RefCell::new(None));
+        let held = Rc::clone(&captured);
+        let run = run_at(machine, &now, |port, clock, line| {
+            let request = ProbeRequest {
+                target,
+                gains,
+                seconds: PHASE,
+            };
+            match hold_probe(&cfg.map, cfg.timing, port, request, clock, line) {
+                Ok(mut probe) => {
+                    let outcome = core::mem::replace(&mut probe.outcome, Ok(()));
+                    *held.borrow_mut() = Some(probe);
+                    outcome
+                }
+                Err(refused) => Err(refused),
+            }
+        });
+        let probe = captured.borrow_mut().take();
+        Probed { run, probe }
+    }
+
+    /// Run `hold-probe` against `machine`, with `id` acknowledging writes to
+    /// `regs` and storing none of them from the moment the transcript reaches a
+    /// line starting with `after`.
+    ///
+    /// The probe's own [`run_deaf_from`], with a register that takes a write
+    /// and drops it rather than one that stops answering: the failure a
+    /// verified write then meets names the register it was for, so a case about
+    /// two cleanup writes can say which of them the run reported. A case names
+    /// the moment in the command's own transcript rather than counting the
+    /// transactions the phases before it happened to take.
+    fn probed_dropping_from(
+        mut machine: FakeMachine,
+        cfg: &Configured,
+        id: u8,
+        after: &str,
+        regs: &[RegId],
+        gains: Option<Gains>,
+    ) -> Probed {
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        machine.spends_time(&now, FRAME);
+        let addrs: Vec<u16> = regs.iter().map(|reg| named_reg(*reg).addr).collect();
+        let after = after.to_string();
+        let captured: Rc<RefCell<Option<ProbeRun>>> = Rc::new(RefCell::new(None));
+        let held = Rc::clone(&captured);
+        let run = run_at(machine, &now, |port, clock, line| {
+            let machine = port.machine();
+            let mut watched = |text: &str| {
+                if text.trim_start().starts_with(&after) {
+                    let mut machine = machine.borrow_mut();
+                    for addr in &addrs {
+                        machine.ignored.push((id, *addr));
+                    }
+                }
+                line(text);
+            };
+            let request = ProbeRequest {
+                target: None,
+                gains,
+                seconds: PHASE,
+            };
+            match hold_probe(&cfg.map, cfg.timing, port, request, clock, &mut watched) {
+                Ok(mut probe) => {
+                    let outcome = core::mem::replace(&mut probe.outcome, Ok(()));
+                    *held.borrow_mut() = Some(probe);
+                    outcome
+                }
+                Err(refused) => Err(refused),
+            }
+        });
+        let probe = captured.borrow_mut().take();
+        Probed { run, probe }
+    }
+
+    /// The servo a probe addresses when the operator names none.
+    fn probe_id(cfg: &Configured) -> u8 {
+        cfg.map.ids()[row(HOLD_PROBE_JOINT).expect("a named joint has a bus row")]
+    }
+
+    /// A servo that stands exactly still passes both phases, is left limp, and
+    /// was never commanded anywhere but the count it was already at.
+    #[test]
+    fn a_servo_that_holds_still_passes_both_phases() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let machine = machine_at(&example_config(), &stow_legs());
+        let stood = i32::from_le_bytes(
+            machine
+                .get(id, named_reg(RegId::PresentPosition))
+                .expect("the fixture stands somewhere")
+                .try_into()
+                .expect("a position register is four bytes wide"),
+        );
+
+        let probed = probed(machine, &cfg, None, None);
+        probed.run.ok("a still servo passes");
+
+        assert_eq!(probed.probe().id, id);
+        assert_eq!(probed.probe().phases.len(), 2);
+        for kind in [Busy::ReadsAndGoals, Busy::ReadsOnly] {
+            let stats = *probed.phase(kind).stats();
+            assert!(stats.excursion.abs() < 1e-9, "{kind} moved a still servo");
+            assert!(stats.samples > HOLD_PROBE_MIN_SERIES, "{kind}: {stats}");
+            // The rate is the loop's own, measured off the readings: one frame
+            // per read at the cost this fixture charges.
+            assert!(
+                (stats.rate_hz - 1000.0 / FRAME.as_secs_f64() / 1000.0).abs() < 200.0,
+                "{kind}: {stats}"
+            );
+            assert!(
+                stats.period.is_none(),
+                "a flat series has no period: {stats}"
+            );
+        }
+
+        let machine = probed.run.registers.borrow();
+        assert_eq!(
+            machine.get(id, named_reg(RegId::TorqueEnable)),
+            Some(&[0][..])
+        );
+        assert_eq!(
+            machine.get(id, named_reg(RegId::GoalPosition)),
+            Some(&stood.to_le_bytes()[..])
+        );
+        drop(machine);
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("no period") && line.contains("peak to peak 0 counts")),
+            "{:?}",
+            probed.run.printed
+        );
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("the gains were never touched")),
+            "{:?}",
+            probed.run.printed
+        );
+    }
+
+    /// A servo wobbling on a four-sample cycle fails the bound, and the figures
+    /// beside the refusal are the discovery: the period is the cycle's, read at
+    /// the loop's own rate rather than at an assumed one.
+    #[test]
+    fn a_four_sample_wobble_fails_with_its_own_period() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        let stood = i32::from_le_bytes(
+            machine
+                .get(id, named_reg(RegId::PresentPosition))
+                .expect("the fixture stands somewhere")
+                .try_into()
+                .expect("a position register is four bytes wide"),
+        );
+        machine.wobbles(id, &[stood, stood + 3, stood + 6, stood + 3]);
+
+        let probed = probed(machine, &cfg, None, None);
+        let error = probed.run.err("a servo that moved 6 counts is not still");
+        let BareError::HoldProbeExcursion {
+            id: named,
+            phase,
+            excursion,
+            bound,
+            period,
+        } = error
+        else {
+            panic!("expected an excursion, got {error}");
+        };
+        assert_eq!(*named, id);
+        // The first phase is the one judged: which phase a wobble is in is the
+        // reading, and this one is in both.
+        assert_eq!(*phase, Busy::ReadsAndGoals);
+        assert!((*excursion - 6.0).abs() < 1e-9, "{excursion}");
+        assert!((*bound - 2.0).abs() < 1e-9, "{bound}");
+        assert_eq!(
+            period.expect("a four-sample cycle has a period").lag,
+            4,
+            "{}",
+            Shown(*period)
+        );
+        // The operator reads the rendered line, not the fields.
+        let shown = error.to_string();
+        assert!(
+            shown.starts_with(&format!(
+                "servo {id} moved 6 counts while held during reads and goal rewrites, past the 2.0 count bound"
+            )),
+            "{shown}"
+        );
+        assert!(!shown.contains("  "), "{shown}");
+
+        let stats = *probed.phase(Busy::ReadsOnly).stats();
+        let read = stats.period.expect("a four-sample cycle has a period");
+        assert_eq!(read.lag, 4);
+        assert!(read.regularity > 0.5, "{stats}");
+        // Four samples at a millisecond each: 4 ms, 250 Hz — figures the loop's
+        // measured rate produces, not the driver's 50 Hz grid.
+        assert!((read.millis - 4.0).abs() < 1.0, "{stats}");
+        assert!((read.hz - 250.0).abs() < 60.0, "{stats}");
+        // Two reversals per cycle, at a quarter of a millisecond-per-sample
+        // loop: around 500 a second.
+        assert!(stats.reversals_per_s > 300.0, "{stats}");
+
+        // Both phases' readings survive the refusal, as the table a fixture is
+        // cut from.
+        let csv = probed.probe().csv();
+        assert!(csv.starts_with("phase,elapsed_ms,counts\n"), "{csv}");
+        assert_eq!(
+            csv.lines().count() - 1,
+            probed
+                .probe()
+                .phases
+                .iter()
+                .map(|phase| phase.samples.len())
+                .sum::<usize>()
+        );
+        assert!(csv.contains("reads alone,"), "{csv}");
+
+        // Every goal the rewriting phase wrote is the one count the servo
+        // stood at before torque went on — the invariant the instrument rests
+        // on, asserted here rather than on a still servo, because a goal
+        // following the joint around is only visible on one that moves. The
+        // whole run of writes, not the register's last value: a rewrite loop
+        // is judged on all of them.
+        let machine = probed.run.registers.borrow();
+        let goals: Vec<i32> = machine
+            .written
+            .iter()
+            .filter(|(who, addr, _)| *who == id && *addr == named_reg(RegId::GoalPosition).addr)
+            .map(|(_, _, bytes)| {
+                i32::from_le_bytes(bytes.as_slice().try_into().expect("four bytes of goal"))
+            })
+            .collect();
+        assert!(goals.len() > 1, "the phase rewrote nothing: {goals:?}");
+        assert!(
+            goals.iter().all(|goal| *goal == stood),
+            "a goal followed the joint: {goals:?}, standing at {stood}"
+        );
+        for moved in [stood + 3, stood + 6] {
+            assert!(
+                !goals.contains(&moved),
+                "a wobble sample was written back as a goal: {goals:?}"
+            );
+        }
+        // The refusal is still a released servo.
+        assert_eq!(
+            machine.get(id, named_reg(RegId::TorqueEnable)),
+            Some(&[0][..])
+        );
+    }
+
+    /// A servo that stops answering part way through a phase takes its gains
+    /// back and its torque off anyway, and the readings it did give come back.
+    #[test]
+    fn a_read_failure_mid_phase_still_restores_the_gains_and_releases() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let kept = Gains {
+            p: 500,
+            i: 0,
+            d: 100,
+        };
+        let asked = Gains { p: 200, i: 0, d: 0 };
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        let row = row(HOLD_PROBE_JOINT).expect("a named joint has a bus row");
+        let raw = cfg
+            .map
+            .encode_value(row, RegId::PositionGains, kept.value())
+            .expect("the gains encode");
+        machine.set(id, named_reg(RegId::PositionGains), raw.as_slice());
+        // Answers the hold's own read and twenty of the phase's, then goes.
+        machine
+            .deafens_after
+            .insert((id, named_reg(RegId::PresentPosition).addr), 21);
+
+        let probed = probed(machine, &cfg, None, Some(asked));
+        let error = probed
+            .run
+            .err("a servo that stopped answering is not a reading");
+        let BareError::BusRead { id: named, reg, .. } = error else {
+            panic!("expected a read failure, got {error}");
+        };
+        assert_eq!((*named, *reg), (id, RegId::PresentPosition));
+
+        // The phase it died in is here with what it got, and the second never
+        // ran.
+        assert_eq!(probed.probe().phases.len(), 1);
+        assert_eq!(probed.phase(Busy::ReadsAndGoals).samples.len(), 20);
+
+        let machine = probed.run.registers.borrow();
+        assert_eq!(
+            machine.get(id, named_reg(RegId::TorqueEnable)),
+            Some(&[0][..])
+        );
+        assert_eq!(
+            machine.get(id, named_reg(RegId::PositionGains)),
+            Some(raw.as_slice())
+        );
+        drop(machine);
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("the gains are back at P 500 I 0 D 100")),
+            "{:?}",
+            probed.run.printed
+        );
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("gains: P 200 I 0 D 0")),
+            "{:?}",
+            probed.run.printed
+        );
+    }
+
+    /// A servo already holding torque is refused before anything is written:
+    /// what it is standing in is somebody else's hold, and the probe would be
+    /// measuring that.
+    #[test]
+    fn a_probe_refuses_a_servo_that_is_already_holding() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        machine.set(id, named_reg(RegId::TorqueEnable), &[1]);
+
+        let probed = probed(machine, &cfg, None, None);
+        let error = probed.run.err("a servo holding torque is refused");
+        let BareError::HoldProbeTorqueHeld { id: named } = error else {
+            panic!("expected a held servo, got {error}");
+        };
+        assert_eq!(*named, id);
+        assert!(probed.probe.is_none(), "a refused probe has no readings");
+        probed.run.commanded_nothing(&cfg);
+    }
+
+    /// A servo whose Bus Watchdog is armed is refused before anything is
+    /// written. The reads-only phase is seconds of exactly the silence that
+    /// register stops a servo for, so a probe run in that state would report a
+    /// watchdog's halt as the answer the two phases exist to separate.
+    #[test]
+    fn a_probe_refuses_a_servo_whose_bus_watchdog_is_armed() {
+        for armed in [WATCHDOG_COUNTS, WATCHDOG_LATCHED] {
+            let cfg = resolved();
+            let id = probe_id(&cfg);
+            let mut machine = machine_at(&example_config(), &stow_legs());
+            machine.set(id, named_reg(RegId::BusWatchdog), &[armed]);
+
+            let probed = probed(machine, &cfg, None, None);
+            let error = probed.run.err("an armed watchdog is refused");
+            let BareError::HoldProbeWatchdogArmed { id: named, read } = error else {
+                panic!("expected an armed watchdog, got {error}");
+            };
+            assert_eq!((*named, *read), (id, armed));
+            assert!(probed.probe.is_none(), "a refused probe has no readings");
+            probed.run.commanded_nothing(&cfg);
+            let shown = error.to_string();
+            assert!(
+                shown.contains(&format!("bus watchdog at {armed}")),
+                "{shown}"
+            );
+        }
+    }
+
+    /// A phase longer than an attended hold is refused before the bus is
+    /// touched, and a servo off the roster is refused by ID as everywhere else.
+    #[test]
+    fn a_probe_refuses_an_unattendable_phase_and_a_servo_off_the_roster() {
+        let cfg = resolved();
+        let machine = machine_at(&example_config(), &stow_legs());
+        let too_long = Duration::from_secs(HOLD_PROBE_MAX_SECONDS + 1);
+        let outcome = hold_probe(
+            &cfg.map,
+            cfg.timing,
+            Spy::new(machine),
+            ProbeRequest {
+                target: None,
+                gains: None,
+                seconds: too_long,
+            },
+            &mut TestClock::sharing(&Rc::new(Cell::new(Duration::ZERO))),
+            &mut |_| {},
+        );
+        let Err(BareError::HoldProbeTooLong { asked, most }) = outcome else {
+            panic!("a phase of a minute and one second is not attended");
+        };
+        assert_eq!(
+            (asked, most),
+            (HOLD_PROBE_MAX_SECONDS + 1, HOLD_PROBE_MAX_SECONDS)
+        );
+        // The operator reads the rendered line, not the fields.
+        let shown = BareError::HoldProbeTooLong { asked, most }.to_string();
+        assert_eq!(
+            shown,
+            format!(
+                "a hold probe phase of {asked} s is longer than the {most} s this command holds a servo for"
+            )
+        );
+
+        let probed = probed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            Some(99),
+            None,
+        );
+        let error = probed.run.err("a servo nobody configured is refused");
+        let BareError::OffRoster { id, .. } = error else {
+            panic!("expected an off-roster refusal, got {error}");
+        };
+        assert_eq!(*id, 99);
+    }
+
+    /// The dominant period is read off the shape of the series and not off the
+    /// count of its reversals: a drift, an alternation and a longer cycle read
+    /// as three different things at the same reversal rate.
+    #[test]
+    fn a_period_is_the_series_shape_rather_than_its_reversal_count() {
+        let at = |k: usize| Duration::from_millis(k as u64);
+        let phase = |counts: &[i32]| {
+            ProbePhase::new(
+                Busy::ReadsOnly,
+                counts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, counts)| ProbeSample {
+                        at: at(k),
+                        counts: *counts,
+                    })
+                    .collect(),
+            )
+        };
+
+        // A joint alternating every sample: period two, and the reversal rate
+        // says so too.
+        let flicker: Vec<i32> = (0..64).map(|k| i32::from(k % 2 == 0)).collect();
+        let stats = *phase(&flicker).stats();
+        assert_eq!(stats.period.expect("an alternation has a period").lag, 2);
+        assert!((stats.excursion - 1.0).abs() < 1e-9, "{stats}");
+        // The intervals say the same thing the correlation does, which is what
+        // an alternation looks like: every reversal one sample after the last.
+        assert_eq!(stats.reversal_interval_mean_samples, Some(1.0));
+        assert_eq!(stats.reversal_interval_spread_samples, Some(0.0));
+
+        // A joint drifting one way: the same series length, no cycle at all.
+        let drift: Vec<i32> = (0..64).collect();
+        let stats = *phase(&drift).stats();
+        assert!(stats.period.is_none(), "a ramp is not a cycle: {stats}");
+        assert!(stats.reversals_per_s < f64::EPSILON, "{stats}");
+
+        // A joint that never moved: no period, no reversals, no division by a
+        // series with no energy in it.
+        let stats = *phase(&[7; 64]).stats();
+        assert!(stats.period.is_none(), "{stats}");
+        assert!(stats.excursion.abs() < 1e-9, "{stats}");
+        assert_eq!(stats.reversal_interval_mean_samples, None);
+
+        // A series too short to search is not a series with a period.
+        let stats = *phase(&flicker[..HOLD_PROBE_MIN_SERIES]).stats();
+        assert!(stats.period.is_none(), "{stats}");
+    }
+
+    /// A phase built out of a series, for the cases that judge the figures
+    /// rather than a run: one reading a millisecond, which is the order the
+    /// loop achieves on the wire.
+    fn phase_of(kind: Busy, counts: &[i32]) -> ProbePhase {
+        ProbePhase::new(
+            kind,
+            counts
+                .iter()
+                .enumerate()
+                .map(|(k, counts)| ProbeSample {
+                    at: Duration::from_millis(k as u64),
+                    counts: *counts,
+                })
+                .collect(),
+        )
+    }
+
+    /// The regularity tells a limit cycle from encoder dither, which is the
+    /// whole reading the gains ladder branches on.
+    ///
+    /// A clean cycle correlates strongly at its own lag; a series that turns
+    /// round as often but at scattered intervals correlates at none of them and
+    /// says so twice — a low regularity, and an interval spread of the order of
+    /// its own mean.
+    #[test]
+    fn a_scattered_series_reads_as_dither_and_a_clean_one_as_a_cycle() {
+        let cycle: Vec<i32> = (0..256).map(|k| [0, 3, 6, 3][k % 4]).collect();
+        let cycle = *phase_of(Busy::ReadsOnly, &cycle).stats();
+        let clean = cycle.period.expect("a four-sample cycle has a period");
+
+        // The right antenna's own shape from the run this instrument was built
+        // for: one count, turning round as often as the cycle does, at
+        // intervals of one sample to several and repeating nothing. A fixed
+        // sequence, so what this asserts is the same figure every run.
+        let mut state: u32 = 0x2545_f491;
+        let dither: Vec<i32> = (0..256)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                -i32::try_from((state >> 30) & 1).expect("one bit is a count")
+            })
+            .collect();
+        let dither = *phase_of(Busy::ReadsOnly, &dither).stats();
+
+        let scattered = dither
+            .period
+            .map_or(0.0, |period: ProbePeriod| period.regularity);
+        assert!(
+            scattered < clean.regularity / 2.0,
+            "dither read as regular as a cycle: {dither} against {cycle}"
+        );
+        let (mean, spread) = (
+            dither
+                .reversal_interval_mean_samples
+                .expect("dither turns round"),
+            dither
+                .reversal_interval_spread_samples
+                .expect("dither turns round"),
+        );
+        assert!(spread > mean / 2.0, "{dither}");
+        assert_eq!(cycle.reversal_interval_spread_samples, Some(0.0), "{cycle}");
+    }
+
+    /// Lag one is not a period.
+    ///
+    /// A series whose differenced form correlates most strongly at one sample
+    /// is a joint travelling, not one turning round: the reported lag is the
+    /// shortest cycle a series can carry, which is two.
+    #[test]
+    fn a_series_correlated_at_one_sample_is_not_reported_at_lag_one() {
+        // Eight counts up, eight down: every step but two is the step before
+        // it, so lag one is the strongest correlation in the differenced
+        // series and the cycle is sixteen.
+        let triangle: Vec<i32> = (0..128)
+            .map(|k| {
+                let phase = k % 16;
+                if phase < 8 { phase } else { 16 - phase }
+            })
+            .collect();
+        let stats = *phase_of(Busy::ReadsOnly, &triangle).stats();
+        let period = stats.period.expect("a triangle wave has a period");
+        assert!(period.lag >= 2, "lag one was reported: {stats}");
+        assert_eq!(period.lag % 16, 0, "{stats}");
+    }
+
+    /// The phase a wobble is in is the phase the refusal names.
+    ///
+    /// Which of the two a joint moves in is the reading the whole two-phase
+    /// design exists to take: a rewrite-driven wobble is answered by the
+    /// driver and a wobble under reads alone is answered by a gain, so a
+    /// refusal that named the wrong phase would send the campaign down the
+    /// wrong branch.
+    #[test]
+    fn a_wobble_in_the_reads_only_phase_is_refused_as_that_phase() {
+        let flat = phase_of(Busy::ReadsAndGoals, &[7; 64]);
+        let wobbling: Vec<i32> = (0..64).map(|k| [0, 3, 6, 3][k % 4]).collect();
+        let phases = vec![flat, phase_of(Busy::ReadsOnly, &wobbling)];
+
+        let Err(BareError::HoldProbeExcursion {
+            id,
+            phase,
+            excursion,
+            ..
+        }) = judge_phases(18, &phases)
+        else {
+            panic!("six counts under reads alone is not a still servo");
+        };
+        assert_eq!((id, phase), (18, Busy::ReadsOnly));
+        assert!((excursion - 6.0).abs() < 1e-9, "{excursion}");
+
+        // And a quiet pair is a quiet pair, whichever way round it is read.
+        judge_phases(18, &[phase_of(Busy::ReadsOnly, &[7; 64])]).expect("a flat hold passes");
+    }
+
+    /// The bound is the stillness watch's, and the comparison is at it: a hold
+    /// at exactly two counts passes, and one at three does not.
+    ///
+    /// The instrument and the session judge a hold by one figure, so the place
+    /// the two could disagree is the place the bound is crossed.
+    #[test]
+    fn the_bound_is_crossed_at_the_count_past_it() {
+        for (counts, still) in [(2, true), (3, false)] {
+            let cfg = resolved();
+            let id = probe_id(&cfg);
+            let mut machine = machine_at(&example_config(), &stow_legs());
+            let stood = i32::from_le_bytes(
+                machine
+                    .get(id, named_reg(RegId::PresentPosition))
+                    .expect("the fixture stands somewhere")
+                    .try_into()
+                    .expect("a position register is four bytes wide"),
+            );
+            machine.wobbles(id, &[stood, stood + counts]);
+
+            let probed = probed(machine, &cfg, None, None);
+            let read = *probed.phase(Busy::ReadsAndGoals).stats();
+            assert!((read.excursion - f64::from(counts)).abs() < 1e-9, "{read}");
+            if still {
+                probed
+                    .run
+                    .ok("a hold at exactly the bound is a hold inside it");
+            } else {
+                let error = probed.run.err("a count past the bound is not still");
+                assert!(
+                    matches!(error, BareError::HoldProbeExcursion { .. }),
+                    "expected an excursion, got {error}"
+                );
+            }
+        }
+    }
+
+    /// The gains not going back is reported and returned, and the torque still
+    /// comes off.
+    #[test]
+    fn gains_that_will_not_go_back_are_reported_and_the_servo_is_still_released() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let machine = machine_at(&example_config(), &stow_legs());
+        let asked = Gains { p: 200, i: 0, d: 0 };
+        // The gains register takes writes and stores none from the moment the
+        // servo is holding, so the swap landed and the write-back reads the
+        // triple that was already there.
+        let probed = probed_dropping_from(
+            machine,
+            &cfg,
+            id,
+            "holding:",
+            &[RegId::PositionGains],
+            Some(asked),
+        );
+
+        let error = probed.run.err("the gains could not be put back");
+        let BareError::Bus {
+            source: XactError::VerifyMismatch { addr, .. },
+            ..
+        } = error
+        else {
+            panic!("expected the write-back to read back the wrong triple, got {error}");
+        };
+        assert_eq!(*addr, named_reg(RegId::PositionGains).addr);
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("the gains would not go back")),
+            "{:?}",
+            probed.run.printed
+        );
+        assert_eq!(
+            probed
+                .run
+                .registers
+                .borrow()
+                .get(id, named_reg(RegId::TorqueEnable)),
+            Some(&[0][..]),
+            "the torque came off anyway",
+        );
+    }
+
+    /// A release that could not be read back is what the run returns, whatever
+    /// else went right.
+    ///
+    /// Nothing gates de-torquing and nothing outranks its failure: a servo that
+    /// may still be holding is the one state an operator has to act on.
+    #[test]
+    fn a_release_that_did_not_read_back_is_the_run_s_answer() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let machine = machine_at(&example_config(), &stow_legs());
+        let probed =
+            probed_dropping_from(machine, &cfg, id, "holding:", &[RegId::TorqueEnable], None);
+
+        let error = probed.run.err("the release could not be read back");
+        let BareError::Bus {
+            source: XactError::VerifyMismatch { addr, .. },
+            ..
+        } = error
+        else {
+            panic!("expected the release to read back as still holding, got {error}");
+        };
+        assert_eq!(*addr, named_reg(RegId::TorqueEnable).addr);
+        assert_eq!(probed.probe().phases.len(), 2, "both phases still ran");
+    }
+
+    /// Both cleanup writes failing returns the release's failure and prints the
+    /// gains' beside it; a phase that also failed adds the line that says the
+    /// servo's state is unknown.
+    #[test]
+    fn a_cleanup_that_failed_twice_returns_the_release_and_says_both() {
+        let cfg = resolved();
+        let id = probe_id(&cfg);
+        let machine = machine_at(&example_config(), &stow_legs());
+        let asked = Gains { p: 200, i: 0, d: 0 };
+        let probed = probed_dropping_from(
+            machine,
+            &cfg,
+            id,
+            "holding:",
+            &[RegId::PositionGains, RegId::TorqueEnable],
+            Some(asked),
+        );
+        let error = probed.run.err("neither cleanup write read back");
+        let BareError::Bus {
+            source: XactError::VerifyMismatch { addr, .. },
+            ..
+        } = error
+        else {
+            panic!("expected a write that did not read back, got {error}");
+        };
+        assert_eq!(
+            *addr,
+            named_reg(RegId::TorqueEnable).addr,
+            "the release's failure is the one that comes out, not the gains'",
+        );
+        assert!(
+            probed
+                .run
+                .printed
+                .iter()
+                .any(|line| line.contains("the gains would not go back either")),
+            "{:?}",
+            probed.run.printed
+        );
+
+        // And with a phase failing too: the failure the run returns is the
+        // phase's, and the cleanup that did not finish is said out loud first.
+        let cfg = resolved();
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        machine
+            .deafens_after
+            .insert((id, named_reg(RegId::PresentPosition).addr), 21);
+        let probed =
+            probed_dropping_from(machine, &cfg, id, "holding:", &[RegId::TorqueEnable], None);
+        let error = probed
+            .run
+            .err("a servo that stopped answering is not a reading");
+        assert!(
+            matches!(
+                error,
+                BareError::BusRead {
+                    reg: RegId::PresentPosition,
+                    ..
+                }
+            ),
+            "the phase's failure is the discovery, got {error}"
+        );
+        assert!(
+            probed.run.printed.iter().any(|line| line
+                .contains("cleanup did not finish, so the state of this servo is unknown")),
+            "{:?}",
+            probed.run.printed
         );
     }
 }

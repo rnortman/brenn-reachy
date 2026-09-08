@@ -19,24 +19,38 @@
 //! window against a bound the caller supplies, and what a report does with that
 //! is the report's opinion.
 //!
-//! What a window carries is three numbers, and only the first is judged:
+//! What a window carries is four numbers, and only the first is judged:
 //!
 //! - the **excursion**, the peak-to-peak spread of the present position, which
 //!   bounds how far the joint moved while it was meant to be still;
 //! - the **reversal rate**, how often the direction of travel changed;
+//! - the **reversal intervals**, the mean and spread of how many samples ran
+//!   between one reversal and the next;
 //! - the **mean error**, how far from the setpoint the joint sat on average.
 //!
-//! The last two are printed rather than judged: together they separate a joint
-//! hunting about its setpoint (many reversals, error averaging near zero) from
-//! one sitting still at an offset (few reversals, a standing error), which are
-//! different findings about the mechanism even when the excursion is the same.
+//! The last three are printed rather than judged. The reversal rate and the
+//! mean error separate a joint hunting about its setpoint (many reversals,
+//! error averaging near zero) from one sitting still at an offset (few
+//! reversals, a standing error), which are different findings about the
+//! mechanism even when the excursion is the same. The interval statistics
+//! separate the two again along another axis: a regular oscillation turns round
+//! on a near-constant interval and reads a spread small against its mean, while
+//! encoder dither turns round as often but at intervals scattered from one
+//! sample to several, and reads a spread comparable to its mean. The same
+//! reversal rate is two mechanisms, and only the intervals tell them apart.
 //!
 //! **Nyquist caveat.** The series is the driver's 50 Hz read of the encoder, so
 //! a limit cycle above 25 Hz arrives aliased: it appears at some lower
 //! frequency, and the reversal rate is therefore a floor on how often the joint
 //! turned round, not a measurement of it. The peak-to-peak excursion survives
 //! aliasing — a sampled extreme is a real extreme — which is why the bound is
-//! on amplitude and the reversal rate is not bounded at all.
+//! on amplitude and the reversal rate is not bounded at all. An apparent
+//! frequency read off the intervals carries the same caveat and carries it
+//! sharply: a series sampled at `r` Hz shows a component at `f` Hz as any of
+//! `|r·k ± f|` for whole `k`, so a period of four samples at 50 Hz says 12.5 Hz
+//! or 37.5 or 62.5 or 87.5, and this series cannot say which. What it does say
+//! is that the turning is regular, and how regular; separating the candidates
+//! takes a faster sampler than the driver's grid.
 
 use core::time::Duration;
 
@@ -175,6 +189,18 @@ pub struct HoldWindow {
     pub excursion_rad: f64,
     /// Sign changes of the first difference, per second.
     pub reversals_per_s: f64,
+    /// Mean number of samples between consecutive reversals, or `None` when
+    /// the window held fewer than two of them and there is no interval to
+    /// measure.
+    ///
+    /// Half a period: a joint oscillating turns round twice a cycle. Counted
+    /// in samples rather than seconds because the sampling grid is what the
+    /// aliasing is against, and converted with the window's own measured rate
+    /// by [`Self::apparent_frequency_hz`].
+    pub reversal_interval_mean_samples: Option<f64>,
+    /// Population standard deviation of those intervals, in samples, or `None`
+    /// on the same window. Zero for a perfectly regular turning.
+    pub reversal_interval_spread_samples: Option<f64>,
     /// Mean of present minus commanded, radians. Signed: which side of the
     /// setpoint the joint sat on is part of the finding.
     pub mean_error_rad: f64,
@@ -204,6 +230,41 @@ impl HoldWindow {
     #[must_use]
     pub fn excursion_counts(&self) -> f64 {
         self.excursion_rad / COUNT_RAD
+    }
+
+    /// How fast this window's own readings arrived, Hz, or `None` for a window
+    /// of one sample or one that spans no time.
+    ///
+    /// Measured off the window rather than assumed: the recordings this watch
+    /// is replayed over were driven at 20, 24 and 32 ms grids, and a frequency
+    /// computed against an assumed grid is wrong by that ratio without saying
+    /// so.
+    #[must_use]
+    pub fn sample_rate_hz(&self) -> Option<f64> {
+        let span = self.end_ns.checked_sub(self.start_ns)?;
+        if span <= 0 || self.samples < 2 {
+            return None;
+        }
+        Some((self.samples - 1) as f64 * 1e9 / span as f64)
+    }
+
+    /// The apparent period of the turning, in samples: two reversal intervals.
+    #[must_use]
+    pub fn apparent_period_samples(&self) -> Option<f64> {
+        self.reversal_interval_mean_samples
+            .filter(|mean| *mean > 0.0)
+            .map(|mean| 2.0 * mean)
+    }
+
+    /// The apparent frequency of the turning, Hz, at the window's own sample
+    /// rate.
+    ///
+    /// *Apparent* is the whole of the claim: see the aliasing caveat in the
+    /// module header. A component this reads at `f` is at any of `|r·k ± f|`
+    /// for the window's rate `r`.
+    #[must_use]
+    pub fn apparent_frequency_hz(&self) -> Option<f64> {
+        Some(self.sample_rate_hz()? / self.apparent_period_samples()?)
     }
 }
 
@@ -281,6 +342,153 @@ pub struct StillnessCounts {
     pub non_finite: usize,
 }
 
+/// A held joint's series, read the way this module reads one.
+///
+/// The three figures a hold is described by that are properties of the values
+/// alone — how far they spread, how often they turned round, and how evenly
+/// spaced those turns were — with the rule that a plateau is not a reversal: a
+/// zero step neither breaks a run of one direction nor makes a change of one.
+///
+/// Public and separate from the watch because the same reading is taken by
+/// instruments outside the driver's grid: a bench probe sampling one servo as
+/// fast as the wire answers judges its hold against this module's bound, and a
+/// second definition of "reversal" beside the bound would be an instrument and
+/// a session disagreeing about the same joint.
+///
+/// Streaming and fixed-size, so the watch can hold one per joint: values go in
+/// one at a time and nothing keeps the series.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Wobble {
+    samples: usize,
+    lowest: f64,
+    highest: f64,
+    previous: f64,
+    /// Sign of the last non-zero first difference; zero before there was one.
+    direction: i8,
+    reversals: usize,
+    /// Which reading the last reversal fell on, counting from one; zero before
+    /// there was one.
+    last_reversal_sample: usize,
+    /// Welford over the sample counts between consecutive reversals: how many
+    /// intervals, their running mean, and the sum of squared deviations from
+    /// it. Three words rather than the series, which is the crate's rule.
+    intervals: usize,
+    interval_mean: f64,
+    interval_m2: f64,
+}
+
+impl Wobble {
+    /// Take in one reading.
+    pub fn take(&mut self, value: f64) {
+        self.samples += 1;
+        if self.samples == 1 {
+            self.lowest = value;
+            self.highest = value;
+            self.previous = value;
+            return;
+        }
+        self.lowest = self.lowest.min(value);
+        self.highest = self.highest.max(value);
+        let step = value - self.previous;
+        let direction = if step > 0.0 {
+            1
+        } else if step < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if direction != 0 {
+            if self.direction != 0 && direction != self.direction {
+                self.reverse();
+            }
+            self.direction = direction;
+        }
+        self.previous = value;
+    }
+
+    /// Take in every reading of a series that is already in hand.
+    ///
+    /// For a caller that sampled first and reads afterwards; the watch feeds
+    /// [`Self::take`] instead.
+    pub fn over(values: impl IntoIterator<Item = f64>) -> Self {
+        let mut wobble = Self::default();
+        for value in values {
+            wobble.take(value);
+        }
+        wobble
+    }
+
+    /// How many readings went in.
+    #[must_use]
+    pub fn samples(&self) -> usize {
+        self.samples
+    }
+
+    /// Peak-to-peak spread of the readings, in whatever unit they carried.
+    #[must_use]
+    pub fn excursion(&self) -> f64 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        self.highest - self.lowest
+    }
+
+    /// How many times the direction of travel changed.
+    #[must_use]
+    pub fn reversals(&self) -> usize {
+        self.reversals
+    }
+
+    /// Direction changes per second, at a span measured by the caller.
+    #[must_use]
+    pub fn reversals_per_s(&self, span_s: f64) -> f64 {
+        if span_s > 0.0 {
+            self.reversals as f64 / span_s
+        } else {
+            0.0
+        }
+    }
+
+    /// Mean and population standard deviation of the sample counts between
+    /// consecutive reversals, or `None` when fewer than two reversals left
+    /// nothing to measure.
+    #[must_use]
+    pub fn interval_stats(&self) -> (Option<f64>, Option<f64>) {
+        if self.intervals == 0 {
+            return (None, None);
+        }
+        let variance = self.interval_m2 / self.intervals as f64;
+        (Some(self.interval_mean), Some(variance.max(0.0).sqrt()))
+    }
+
+    /// The rate the readings arrived at, Hz, over a span the caller measured,
+    /// or `None` for one reading or no span.
+    ///
+    /// Measured rather than assumed, which is the whole reason a span is asked
+    /// for: a series read at whatever rate it achieved must not be reported as
+    /// though it ran at the rate it meant to.
+    #[must_use]
+    pub fn rate_hz(&self, span_s: f64) -> Option<f64> {
+        if self.samples < 2 || span_s <= 0.0 {
+            return None;
+        }
+        Some((self.samples - 1) as f64 / span_s)
+    }
+
+    /// Take in a reversal seen on the reading just accepted.
+    fn reverse(&mut self) {
+        self.reversals += 1;
+        if self.last_reversal_sample != 0 {
+            let interval = (self.samples - self.last_reversal_sample) as f64;
+            self.intervals += 1;
+            let delta = interval - self.interval_mean;
+            self.interval_mean += delta / self.intervals as f64;
+            self.interval_m2 += delta * (interval - self.interval_mean);
+        }
+        self.last_reversal_sample = self.samples;
+    }
+}
+
 /// The nanoseconds in `duration`, saturating at the longest a signed count of
 /// them can express.
 ///
@@ -297,13 +505,8 @@ struct Open {
     opened_after_ns: i64,
     error_at_open: f64,
     last_ns: i64,
-    samples: usize,
-    lowest: f64,
-    highest: f64,
-    previous: f64,
-    /// Sign of the last non-zero first difference; zero before there was one.
-    direction: i8,
-    reversals: usize,
+    /// The present position series, read by the shared reader.
+    wobble: Wobble,
     error_sum: f64,
 }
 
@@ -450,41 +653,21 @@ impl StillnessWatch {
         let changed_ns = self.watched[index].changed_ns.unwrap_or(sample.t_ns);
         match &mut self.watched[index].open {
             None => {
+                let mut wobble = Wobble::default();
+                wobble.take(present);
                 self.watched[index].open = Some(Open {
                     start_ns: sample.t_ns,
                     opened_after_ns: sample.t_ns.saturating_sub(changed_ns),
                     error_at_open: error,
                     last_ns: sample.t_ns,
-                    samples: 1,
-                    lowest: present,
-                    highest: present,
-                    previous: present,
-                    direction: 0,
-                    reversals: 0,
+                    wobble,
                     error_sum: error,
                 });
             }
             Some(open) => {
                 open.last_ns = sample.t_ns;
-                open.samples += 1;
-                open.lowest = open.lowest.min(present);
-                open.highest = open.highest.max(present);
                 open.error_sum += error;
-                let step = present - open.previous;
-                let direction = if step > 0.0 {
-                    1
-                } else if step < 0.0 {
-                    -1
-                } else {
-                    0
-                };
-                if direction != 0 {
-                    if open.direction != 0 && direction != open.direction {
-                        open.reversals += 1;
-                    }
-                    open.direction = direction;
-                }
-                open.previous = present;
+                open.wobble.take(present);
             }
         }
     }
@@ -496,25 +679,23 @@ impl StillnessWatch {
             return;
         };
         let span_ns = open.last_ns.saturating_sub(open.start_ns);
-        if span_ns < self.min_hold_ns || open.samples < self.min_samples {
+        if span_ns < self.min_hold_ns || open.wobble.samples() < self.min_samples {
             self.counts.discarded_short += 1;
             return;
         }
         let seconds = Duration::from_nanos(span_ns.unsigned_abs()).as_secs_f64();
-        let reversals_per_s = if seconds > 0.0 {
-            open.reversals as f64 / seconds
-        } else {
-            0.0
-        };
+        let (interval_mean, interval_spread) = open.wobble.interval_stats();
         self.counts.judged += 1;
         out.push(HoldWindow {
             joint,
             start_ns: open.start_ns,
             end_ns: open.last_ns,
-            samples: open.samples,
-            excursion_rad: open.highest - open.lowest,
-            reversals_per_s,
-            mean_error_rad: open.error_sum / open.samples as f64,
+            samples: open.wobble.samples(),
+            excursion_rad: open.wobble.excursion(),
+            reversals_per_s: open.wobble.reversals_per_s(seconds),
+            reversal_interval_mean_samples: interval_mean,
+            reversal_interval_spread_samples: interval_spread,
+            mean_error_rad: open.error_sum / open.wobble.samples() as f64,
             opened_after_ns: open.opened_after_ns,
             error_at_open_rad: open.error_at_open,
         });
@@ -585,7 +766,7 @@ mod tests {
 
     /// `seconds` of holding `goal` with the joint reading whatever `present`
     /// says of the cycle index.
-    fn holding(seconds: f64, goal: f64, present: impl Fn(usize) -> f64) -> Vec<Tick> {
+    fn holding(seconds: f64, goal: f64, mut present: impl FnMut(usize) -> f64) -> Vec<Tick> {
         (0..cycles(seconds))
             .map(|index| Tick::held(present(index), goal))
             .collect()
@@ -596,8 +777,23 @@ mod tests {
         holding(seconds, goal, |_| goal)
     }
 
-    /// Feed a series to a watch on `joints` and close it out.
+    /// Feed a series to a watch on `joints` and close it out, the series laid
+    /// out on the driver's grid.
     fn watch(
+        cfg: StillnessConfig,
+        joints: &[JointRef],
+        ticks: &[Tick],
+    ) -> (Vec<HoldWindow>, StillnessCounts) {
+        watch_on(PERIOD_NS, cfg, joints, ticks)
+    }
+
+    /// The same, with the series laid out on a grid of `period_ns`.
+    ///
+    /// The recordings this watch is replayed over were driven at three
+    /// different grids, so what a window says about frequency has to come off
+    /// its own spacing.
+    fn watch_on(
+        period_ns: i64,
         cfg: StillnessConfig,
         joints: &[JointRef],
         ticks: &[Tick],
@@ -622,7 +818,7 @@ mod tests {
             };
             watch.look(
                 &Sample {
-                    t_ns: index as i64 * PERIOD_NS,
+                    t_ns: index as i64 * period_ns,
                     present_valid: tick.present_valid,
                     commanded_valid: tick.commanded.is_some(),
                     missing,
@@ -931,6 +1127,8 @@ mod tests {
             samples: 100,
             excursion_rad,
             reversals_per_s: 0.0,
+            reversal_interval_mean_samples: None,
+            reversal_interval_spread_samples: None,
             mean_error_rad: 0.0,
             opened_after_ns: nanos(cfg.settle),
             error_at_open_rad: 0.0,
@@ -1013,5 +1211,152 @@ mod tests {
         assert!(window.mean_error_rad.is_finite(), "{window:?}");
         assert_eq!(window.excursion_rad, 0.0);
         assert_eq!(counts.goal_changes, 1);
+    }
+
+    /// A regular oscillation reads its own period back, in samples and as a
+    /// frequency against the grid the series was laid out on — never against
+    /// an assumed one.
+    ///
+    /// The series turns round every second sample, which is a four-sample
+    /// period whatever the spacing; the frequency that comes out is therefore
+    /// a quarter of the series' own rate, and the two spacings here are the
+    /// check that it is the series' rate and not the driver's.
+    #[test]
+    fn a_regular_oscillation_reads_its_period_off_its_own_sample_rate() {
+        // 0, 1, 2, 1 counts: two reversals per four samples.
+        let ticks = holding(20.0, 0.0, |index| {
+            f64::from(2 - (2 - i32::try_from(index % 4).unwrap_or(0)).abs()) * COUNT_RAD
+        });
+        for period_ns in [PERIOD_NS, 32_000_000] {
+            let (windows, _) = watch_on(period_ns, StillnessConfig::default(), &[RIGHT], &ticks);
+            let window = only(&windows);
+            let mean = window
+                .reversal_interval_mean_samples
+                .expect("a window that turned round many times has intervals");
+            let spread = window
+                .reversal_interval_spread_samples
+                .expect("and a spread of them");
+            assert!((mean - 2.0).abs() < 1e-9, "{window:?}");
+            assert!(spread < 1e-9, "{window:?}");
+            assert!(
+                (window.apparent_period_samples().expect("a period") - 4.0).abs() < 1e-9,
+                "{window:?}"
+            );
+            let rate = window.sample_rate_hz().expect("a measured rate");
+            assert!((rate - 1e9 / period_ns as f64).abs() < 1e-6, "{window:?}");
+            let hz = window.apparent_frequency_hz().expect("a frequency");
+            assert!((hz - rate / 4.0).abs() < 1e-9, "{window:?} read {hz} Hz");
+        }
+    }
+
+    /// Encoder dither turns round as often as a fast oscillation does and is
+    /// not one: it turns round at scattered intervals, and the spread beside
+    /// the mean is what says so.
+    #[test]
+    fn lsb_dither_reads_a_spread_comparable_to_its_mean() {
+        // A fixed sequence, so the figures this asserts are the same every
+        // run: a joint flickering between one count and its neighbour.
+        let mut state: u32 = 0x2545_f491;
+        let ticks = holding(20.0, 0.0, |_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from((state >> 30) & 1) * COUNT_RAD
+        });
+        let (windows, _) = seen(&ticks);
+        let window = only(&windows);
+        let mean = window.reversal_interval_mean_samples.expect("intervals");
+        let spread = window.reversal_interval_spread_samples.expect("a spread");
+        assert!(window.excursion_counts() <= 1.0 + 1e-9, "{window:?}");
+        assert!(
+            spread > 0.5 * mean,
+            "{window:?}: dither read a spread of {spread} against a mean of {mean}"
+        );
+    }
+
+    /// One turn is not a period. A joint that drifts out and comes back has a
+    /// reversal and no interval, and the window says so rather than inventing
+    /// a figure out of one turn.
+    #[test]
+    fn a_single_reversal_leaves_no_interval_to_measure() {
+        let turn = cycles(16.0);
+        let ticks = holding(20.0, 0.0, |index| {
+            let from_turn = index.abs_diff(turn) as f64;
+            (10.0 - from_turn * 0.01) * COUNT_RAD
+        });
+        let (windows, _) = seen(&ticks);
+        let window = only(&windows);
+        let reversals = window.reversals_per_s * window.length().as_secs_f64();
+        assert!((reversals - 1.0).abs() < 1e-6, "{window:?}");
+        assert_eq!(window.reversal_interval_mean_samples, None, "{window:?}");
+        assert_eq!(window.reversal_interval_spread_samples, None, "{window:?}");
+        assert_eq!(window.apparent_period_samples(), None, "{window:?}");
+        assert_eq!(window.apparent_frequency_hz(), None, "{window:?}");
+    }
+
+    /// The reader the watch is built out of says the same things standing on
+    /// its own, which is how an instrument off the driver's grid takes this
+    /// module's reading rather than a second one of its own.
+    #[test]
+    fn the_series_reader_reads_a_series_the_way_the_watch_does() {
+        // A four-sample cycle with a plateau in it: the plateau neither breaks
+        // a run of one direction nor makes a reversal, which is the rule the
+        // whole module is written around.
+        let wobble = Wobble::over([0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0]);
+        assert_eq!(wobble.samples(), 8);
+        assert!((wobble.excursion() - 2.0).abs() < 1e-12);
+        assert_eq!(wobble.reversals(), 2);
+        assert_eq!(wobble.interval_stats(), (Some(2.0), Some(0.0)));
+        // The rate is the caller's span over the caller's readings; a span of
+        // none is no rate rather than an infinity.
+        assert!(
+            wobble
+                .rate_hz(0.14)
+                .is_some_and(|rate| (rate - 50.0).abs() < 1e-9)
+        );
+        assert_eq!(wobble.rate_hz(0.0), None);
+        assert!((wobble.reversals_per_s(0.14) - 2.0 / 0.14).abs() < 1e-9);
+
+        // Nothing read: no spread, no excursion, no division by an empty
+        // series.
+        let empty = Wobble::default();
+        assert_eq!(empty.samples(), 0);
+        assert!(empty.excursion().abs() < 1e-12);
+        assert_eq!(empty.interval_stats(), (None, None));
+        assert_eq!(empty.rate_hz(1.0), None);
+
+        // And the watch's own window is that reader's answer over the same
+        // series, not a second reading of it.
+        let (windows, _) = seen(&holding(20.0, 0.0, |index| {
+            if index % 2 == 0 { COUNT_RAD } else { 0.0 }
+        }));
+        let window = only(&windows);
+        let alternating = Wobble::over(
+            (0..window.samples).map(|index| if index % 2 == 0 { COUNT_RAD } else { 0.0 }),
+        );
+        // Every figure the window sources from the reader, not two of them: a
+        // field mis-wired during the extraction would leave the watch's own
+        // cases green while the session and the bench probe reported different
+        // numbers for the same hold.
+        let span = (window.end_ns - window.start_ns) as f64 / 1e9;
+        assert_eq!(window.samples, alternating.samples(), "{window:?}");
+        assert!(
+            (window.excursion_rad - alternating.excursion()).abs() < 1e-12,
+            "{window:?}"
+        );
+        assert!(
+            (window.reversals_per_s - alternating.reversals_per_s(span)).abs() < 1e-12,
+            "{window:?}"
+        );
+        let (mean, spread) = alternating.interval_stats();
+        assert_eq!(window.reversal_interval_mean_samples, mean, "{window:?}");
+        assert_eq!(
+            window.reversal_interval_spread_samples, spread,
+            "{window:?}"
+        );
+        // And the figures are figures, not two `None`s agreeing.
+        assert!(window.reversals_per_s > 0.0, "{window:?}");
+        assert!(
+            spread.is_some_and(|spread| spread.abs() < 1e-12),
+            "{spread:?}"
+        );
     }
 }

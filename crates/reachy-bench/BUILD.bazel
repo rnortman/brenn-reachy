@@ -53,6 +53,7 @@ rust_binary(
     deps = [
         ":reachy_bench_lib",
         "//crates/reachy-bus:reachy_bus",
+        "//crates/reachy-motion:reachy_motion",
         "@brenn_reachy_crates//:anyhow",
     ],
 )

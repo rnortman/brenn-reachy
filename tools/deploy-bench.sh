@@ -18,7 +18,10 @@
 #             belongs to the bench.
 #   --fetch   copy the state file the bench writes back to a local directory,
 #             named for the moment it was fetched so a session's runs
-#             accumulate rather than overwrite.
+#             accumulate rather than overwrite. Any hold-probe series sitting
+#             beside it comes too, under the names the bench gave them. Either
+#             half may be absent — only a selftest writes the state file, and
+#             only a probe writes a series — and finding neither is the failure.
 #
 # Two device paths, for two different reasons:
 #
@@ -41,6 +44,13 @@ set -euo pipefail
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 binary="${repo_root}/target/bench-arm64/release/reachy-bench"
+
+# What the bench names a hold-probe series. The binary states it as
+# HOLD_PROBE_SERIES_PREFIX and this is the only other statement of it; the
+# script's test compares the two, because nothing else joins a Rust format
+# string to a shell glob and a rename on one side would leave this fetching
+# nothing — which is the fetch's ordinary, silent case.
+probe_prefix="hold-probe-"
 
 # One directory, reused. Nothing on this path activates a release, so nothing
 # prunes the store either; rsync --delete is what makes reuse idempotent.
@@ -94,12 +104,97 @@ case "$mode" in
 		# behind — and since every fetch is timestamped, nothing ever
 		# overwrites it.
 		part="${out}.part"
-		ssh_root "cat ${app_home}/selftest-state.toml" >"$part" || {
+		# A missing state file is not the end of a fetch. Only `selftest`
+		# writes one, ${app_home} is RAM, and the probe's own procedure is
+		# runs of `hold-probe` and then a fetch — so dying here would
+		# strand every series the session took behind an unrelated sweep.
+		# Whether the fetch found anything at all is judged at the end.
+		state_missing=""
+		if ssh_root "cat ${app_home}/selftest-state.toml" >"$part"; then
+			mv -- "$part" "$out"
+			echo "${prog}: ${out}"
+		else
 			rm -f -- "$part"
-			die "no state file on ${host}; the bench has not written one yet."
-		}
-		mv -- "$part" "$out"
-		echo "${prog}: ${out}"
+			state_missing=1
+			echo "${prog}: no state file on ${host}; only a selftest writes one." >&2
+		fi
+
+		# The probe's series, if any run wrote one. Each already carries
+		# the moment it was taken and the servo it was taken from, so
+		# they are fetched under their own names and a second fetch of
+		# the same file is the same file. Absent is the ordinary case:
+		# nothing has run the probe, and that is not a failed fetch.
+		#
+		# A tuning session is many runs and every one of them leaves a
+		# series on the device, so the fetch is two connections whatever
+		# the count: one listing, and one stream carrying every series
+		# the device holds. Every one of them, not only the names that
+		# are not here yet: the name carries a moment off a clock that
+		# is RAM on a board with no battery, so two runs either side of
+		# a boot without a network can wear the same name. What decides
+		# "already here" is therefore the bytes, and a name here holding
+		# different bytes is a collision an operator has to settle, not
+		# something to overwrite or to skip.
+		# TODO(bench-probe-series-retention): nothing removes a series
+		# from the device, and ${app_home} is RAM.
+		probes=$(ssh_root "ls -1 ${app_home}/${probe_prefix}*.csv 2>/dev/null" || true)
+		wanted=()
+		quoted=()
+		for probe in $probes; do
+			name=$(basename -- "$probe")
+			# The bench's own shape, checked before the name goes
+			# anywhere near a command line: the listing comes from a
+			# directory the unprivileged account owns and this fetch
+			# runs as root, so a name is untrusted input until it
+			# has been read.
+			[[ $name =~ ^${probe_prefix}[0-9]+-[0-9]+\.csv$ ]] || die \
+				"unexpected file ${name} in ${app_home} on ${host}; the bench writes ${probe_prefix}<unix>-<id>.csv."
+			wanted+=("$name")
+			quoted+=("$(printf '%q' "$name")")
+		done
+		if [ ${#wanted[@]} -gt 0 ]; then
+			# Into a staging directory first, for the reason the state
+			# file uses a .part: a stream that fails partway must not
+			# leave a truncated series under a name a later fetch then
+			# takes for the whole one.
+			part="${dest}/.probe-part"
+			rm -rf -- "$part"
+			mkdir -p -- "$part"
+			ssh_root "tar -cf - -C ${app_home} -- ${quoted[*]}" | tar -xf - -C "$part" || {
+				rm -rf -- "$part"
+				die "could not fetch the probe series from ${host}."
+			}
+			# Every name checked before any of them is moved: a
+			# stream that came back short must land nothing, or
+			# the series that did arrive sit in the records
+			# directory as though the fetch had finished.
+			for name in "${wanted[@]}"; do
+				[ -f "${part}/${name}" ] || {
+					rm -rf -- "$part"
+					die "${host} sent no ${name}."
+				}
+			done
+			for name in "${wanted[@]}"; do
+				if [ -f "${dest}/${name}" ]; then
+					cmp -s -- "${part}/${name}" "${dest}/${name}" || {
+						rm -rf -- "$part"
+						die "${dest}/${name} is here already holding different readings; the device's clock reused a name. Move the local copy aside and fetch again."
+					}
+					echo "${prog}: ${dest}/${name} (already here)"
+					continue
+				fi
+				mv -- "${part}/${name}" "${dest}/${name}"
+				echo "${prog}: ${dest}/${name}"
+			done
+			rm -rf -- "$part"
+		fi
+
+		# Neither half was there: the fetch found nothing, which is a
+		# failed fetch even though each half alone is allowed to be
+		# absent.
+		if [ -n "$state_missing" ] && [ ${#wanted[@]} -eq 0 ]; then
+			die "nothing to fetch from ${host}: no state file and no probe series."
+		fi
 		;;
 
 	--run)

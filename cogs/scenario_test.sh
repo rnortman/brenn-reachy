@@ -78,6 +78,35 @@ if [[ $status -ne 0 ]]; then
     fail "the deterministic run exited $status"
 fi
 
+# The configuration this run was performed under, beside its records, the way a
+# device run carries it home: an analyzer reads a log's own `config/` and
+# refuses a log with none, so the one path that produces a log without a deploy
+# has to stage it too. From the tree's own copies, which is honest -- a
+# deterministic run reads exactly those files.
+#
+# Copied only when the runfiles carry them: a scenario whose checker reads a
+# run's configuration lists the three in its `data` and every other one carries
+# none, and staging a directory out of files that are not there would be a
+# `config/` holding nothing. All three or none, and a runfiles set carrying some
+# of them is this harness misconfigured -- a partial `config/` would reach the
+# analyzer as a run missing a file, which reads as a defect of the run.
+run_config_files=(
+    cogs/servo_profile.textproto
+    cogs/servo_gains.textproto
+    cogs/mover_params.textproto
+)
+staged_configs=0
+for config in "${run_config_files[@]}"; do
+    [ -f "$PWD/$config" ] && staged_configs=$((staged_configs + 1))
+done
+if [[ $staged_configs -gt 0 ]]; then
+    [[ $staged_configs -eq ${#run_config_files[@]} ]] ||
+        fail "the runfiles carry $staged_configs of the ${#run_config_files[@]} configuration files a run records: ${run_config_files[*]}"
+    for config in "${run_config_files[@]}"; do
+        install -m 0644 -D -- "$PWD/$config" "$output_log/config/$config"
+    done
+fi
+
 # Expanded through the set-if-set form: under `set -u` an empty array is an
 # unbound variable on bash before 4.4, and a scenario whose checker takes no
 # extra arguments has exactly that. The failure would read as a harness bug on

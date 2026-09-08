@@ -113,7 +113,7 @@ pub const JAM_AFTER: i64 = 10;
 /// that the machine visibly stops closing on the fold it was commanded to.
 #[must_use]
 pub fn jam_cycles() -> i64 {
-    scenario::crossing_cycles()
+    scenario::crossing_cycles(JointGroup::Legs)
 }
 
 /// The rows the scenario jams: the six cranks that carry the head.

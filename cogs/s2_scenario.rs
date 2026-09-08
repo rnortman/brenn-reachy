@@ -33,6 +33,7 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
+use reachy_motion::joints::JointGroup;
 use scenario::author::Step;
 use scenario::{
     STOW_BUDGET_NS, TAIL_CYCLES, cycle_at, cycles_for, engage_allowance_cycles,
@@ -100,7 +101,7 @@ pub fn raise_cycle() -> i64 {
 pub fn recovery_bound_cycle() -> i64 {
     let cfg = reachy_motion::tick::default_motion_config();
     raise_cycle() + i64::from(cfg.tracking.ticks)
-        - scenario::pass_cycles(cfg.tracking.progress_min_rad)
+        - scenario::pass_cycles(JointGroup::Legs, cfg.tracking.progress_min_rad)
         - 1
 }
 
@@ -127,7 +128,7 @@ pub fn release_cycle() -> i64 {
 pub fn caught_up_cycle() -> i64 {
     let cfg = reachy_motion::tick::default_motion_config();
     release_cycle()
-        + scenario::pass_cycles(cfg.tracking.threshold_rad)
+        + scenario::pass_cycles(JointGroup::Legs, cfg.tracking.threshold_rad)
         + scenario::ARRIVAL_SETTLE_CYCLES
 }
 

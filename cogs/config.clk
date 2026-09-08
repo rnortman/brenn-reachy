@@ -53,6 +53,17 @@ schema MoverParams
         // stowing is the posture the machine ends every session in, and it is
         // done gently.
         #3 stow_duration_ns: Int64;
+
+        // Whether the plant-model tracking detector judges joints at all.
+        //
+        // True on every shipped configuration, and pinned true by the scenario
+        // suite's own check of this file. The one use for false is a capability
+        // run: a measurement deliberately commissioned at a profile the motors
+        // cannot follow, where the model is known not to describe them and the
+        // residual would be motor lag rather than obstruction. Nothing else.
+        // An attended run is what that state is for, and every analyzer reads
+        // a run recorded with it as a failed run.
+        #4 tracking_armed: Bool;
     }
 }
 
@@ -147,7 +158,15 @@ schema SessionParams
 }
 
 // The servo-side motion profile: the two registers the commissioning sweep
-// writes into all nine servos.
+// writes into all nine servos, stated once per servo class.
+//
+// Three pairs and not one because the classes are three different loads on two
+// different XL330 variants: the antennas' Velocity Limit register reads 1620
+// against the head servos' 445, so a pair the antennas can hold is a pair the
+// head refuses. Six flat scalars and not a nested pair message: every reader of
+// this file is a first-match `key: value` line scan, and a nested message would
+// state `profile_velocity` three times and hand every scanner the legs' value
+// for the antennas -- silently, and invisibly while the pairs are equal.
 //
 // Its own schema, and its own file, because two cogs read it and they read it
 // for different reasons. The session writes the pair to the machine; the
@@ -167,15 +186,85 @@ schema ServoProfile
     uuid: 6b91f622-922f-45a0-bc65-03c5f6c3ed6a;
     fields
     {
-        // The profile acceleration, in the register's own units of
-        // 214.577 rev/min². The shipped pair is the cap the machine measurably
-        // runs at, but which pair it should run is still nobody's measurement:
-        // TODO(session-servo-profile)
-        #0 profile_acceleration: UInt32;
+        // The six platform servos' profile acceleration, in the register's own
+        // units of 214.577 rev/min². The shipped pair is the cap the machine
+        // measurably runs at, but which pair each class should run is still
+        // nobody's measurement: TODO(session-servo-profile)
+        #2 legs_profile_acceleration: UInt32;
 
-        // The profile velocity, in the register's own units of 0.229 rev/min.
-        // Sized with the acceleration above.
-        #1 profile_velocity: UInt32;
+        // The six platform servos' profile velocity, in the register's own
+        // units of 0.229 rev/min. Sized with the acceleration above.
+        #3 legs_profile_velocity: UInt32;
+
+        // The body yaw servo's profile acceleration, same units.
+        #4 body_yaw_profile_acceleration: UInt32;
+
+        // The body yaw servo's profile velocity, same units.
+        #5 body_yaw_profile_velocity: UInt32;
+
+        // The two antenna servos' profile acceleration, same units.
+        #6 antennas_profile_acceleration: UInt32;
+
+        // The two antenna servos' profile velocity, same units.
+        #7 antennas_profile_velocity: UInt32;
+    }
+    history
+    {
+        version: 1;
+        removed: [0, 1];
+    }
+}
+
+// The servo-side position gains: the three PID terms the commissioning sweep
+// writes into each servo, stated once per servo class.
+//
+// Data rather than constants because they are tuned. Every rung of a gains
+// ladder is otherwise a code edit and a commit, and what a class of motor needs
+// to hold its load without hunting is a measurement of this machine rather than
+// a property of the motion arithmetic.
+//
+// Nine flat scalars for the reason `ServoProfile` gives: every reader of a file
+// like this is a first-match `key: value` line scan, and a nested per-class
+// message would state `p` three times and hand each scanner the first class's
+// value.
+//
+// The library keeps the same triple as its own default, and the scenario suite
+// pins this file to it, so a file and a library that disagreed about what a
+// machine is commissioned with is a failed run rather than a machine nobody
+// characterised.
+schema ServoGains
+{
+    uuid: 0e4b1d38-6c4a-4c5b-9c1a-2f0d51d4b0a7;
+    fields
+    {
+        // The six platform servos' proportional term, in the register's own
+        // units. The legs carry the head's weight through the linkage and are
+        // the only class tuned with an integral term.
+        #0 legs_p: UInt16;
+
+        // The six platform servos' integral term.
+        #1 legs_i: UInt16;
+
+        // The six platform servos' derivative term.
+        #2 legs_d: UInt16;
+
+        // The body yaw servo's proportional term.
+        #3 body_yaw_p: UInt16;
+
+        // The body yaw servo's integral term.
+        #4 body_yaw_i: UInt16;
+
+        // The body yaw servo's derivative term.
+        #5 body_yaw_d: UInt16;
+
+        // The two antenna servos' proportional term.
+        #6 antennas_p: UInt16;
+
+        // The two antenna servos' integral term.
+        #7 antennas_i: UInt16;
+
+        // The two antenna servos' derivative term.
+        #8 antennas_d: UInt16;
     }
 }
 

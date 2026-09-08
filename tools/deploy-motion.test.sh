@@ -106,6 +106,13 @@ stage_payload() {
 	: >"${payload}/robotcpu.textproto"
 	: >"${payload}/robotcpu_harness.textproto"
 	: >"${payload}/cogs/session_params.textproto"
+	# The three files a run carries home beside its records and the only
+	# three an experiment overlay may write. Distinguishable contents,
+	# because a case below asserts that an overlaid copy replaced the
+	# build's and that the stamp's digest is the overlaid one's.
+	for name in servo_profile servo_gains mover_params; do
+		echo "${name}: from the build" >"${payload}/cogs/${name}.textproto"
+	done
 	for name in models/oww/melspectrogram.onnx models/oww/embedding_model.onnx \
 		models/oww/hey_jarvis_v0.1.onnx models/silero/silero_vad.onnx; do
 		mkdir -p -- "$(dirname -- "${payload}/${name}")"
@@ -803,6 +810,130 @@ assert_lacks "and nothing is pushed" "$(calls)" "rsync"
 assert_lacks "and the device is not touched" "$(calls)" "ssh"
 GIT_HEAD=0123456789abcdef0123456789abcdef01234567
 
+# ---------------------------------------------------------------------------
+# The experiment overlay, and the configuration a run carries home
+# ---------------------------------------------------------------------------
+#
+# A tuning campaign varies three files per run. They are payload members, so an
+# overlay writes them into the staged payload before the stamp and before the
+# rsync; the stamp records a digest per file, and the run copies them into the
+# log root, which is what lets a fetched log say what it ran on.
+
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a push with no overlay pushes the build's own configuration" 0 \
+	"$(status_of "$result")"
+stamp=$(cat -- "$PUSHED_PROVENANCE")
+assert_contains "and the stamp says no overlay was in force" "$stamp" "overlay=none"
+for name in servo_profile servo_gains mover_params; do
+	assert_contains "the stamp digests cogs/${name}.textproto" "$stamp" \
+		"config_sha256=cogs/${name}.textproto $(sha256sum -- "${payload}/cogs/${name}.textproto" | cut -d' ' -f1)"
+done
+assert_lacks "and nothing was named as overlaid" "$(output_of "$result")" "overlay:"
+
+# A payload missing one of the three is a build that staged nothing to overlay,
+# and a push of it would put a unit's analyzer in front of a log with no
+# configuration beside it.
+mv -- "${payload}/cogs/servo_gains.textproto" "${payload}/cogs/servo_gains.keep"
+result=$(deploy unit --push)
+assert_status "a payload with no servo gains refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names the member" "$(output_of "$result")" \
+	"no run configuration cogs/servo_gains.textproto"
+mv -- "${payload}/cogs/servo_gains.keep" "${payload}/cogs/servo_gains.textproto"
+
+experiment="${work}/experiment"
+mkdir -p -- "${experiment}/cogs"
+cat >"${experiment}/cogs/servo_profile.textproto" <<'OVERLAY'
+legs_profile_acceleration: 32767
+OVERLAY
+export REACHY_EXPERIMENT_DIR="$experiment"
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a push with an overlay succeeds" 0 "$(status_of "$result")"
+assert_eq "the overlaid file replaced the build's copy in the payload" \
+	"legs_profile_acceleration: 32767" \
+	"$(cat -- "${payload}/cogs/servo_profile.textproto")"
+assert_contains "the console names the overlaid file with its digest" \
+	"$(output_of "$result")" \
+	"overlay: cogs/servo_profile.textproto $(sha256sum -- "${experiment}/cogs/servo_profile.textproto" | cut -d' ' -f1)"
+stamp=$(cat -- "$PUSHED_PROVENANCE")
+assert_contains "the stamp names the overlay directory" "$stamp" "overlay=${experiment}"
+assert_contains "and its digest is the overlaid file's, not the build's" "$stamp" \
+	"config_sha256=cogs/servo_profile.textproto $(sha256sum -- "${experiment}/cogs/servo_profile.textproto" | cut -d' ' -f1)"
+assert_contains "and the file that was not overlaid keeps the build's digest" "$stamp" \
+	"config_sha256=cogs/mover_params.textproto $(sha256sum -- "${payload}/cogs/mover_params.textproto" | cut -d' ' -f1)"
+
+# The overlay is a tuning knob, not a way to push arbitrary payload members: a
+# path outside the three is refused before anything is written or pushed.
+cat >"${experiment}/reachy_motord" <<'OVERLAY'
+not a servo profile
+OVERLAY
+result=$(deploy unit --push)
+assert_status "an overlay naming a path outside the allowlist refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and the refusal names the path" "$(output_of "$result")" \
+	"the experiment overlay states reachy_motord"
+assert_contains "and says which files a run may vary" "$(output_of "$result")" \
+	"cogs/servo_profile.textproto cogs/servo_gains.textproto cogs/mover_params.textproto"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
+rm -f -- "${experiment}/reachy_motord"
+
+# A ladder is kept as one file per rung with the current one linked into place,
+# so a symlink is an overlay file. Skipping it would push the tree's own
+# configuration under the overlay's name, which no signal downstream would
+# contradict: the run really did run the tree's files.
+mkdir -p -- "${work}/rungs"
+cat >"${work}/rungs/r2.textproto" <<'RUNG'
+antennas_p: 150
+RUNG
+ln -sf -- "${work}/rungs/r2.textproto" "${experiment}/cogs/servo_gains.textproto"
+export REACHY_EXPERIMENT_DIR="$experiment"
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a push whose overlay is a symlink to a rung succeeds" 0 "$(status_of "$result")"
+assert_eq "the link's target replaced the build's copy" "antennas_p: 150" \
+	"$(cat -- "${payload}/cogs/servo_gains.textproto")"
+assert_contains "and the stamp digests the rung, not the build's copy" \
+	"$(cat -- "$PUSHED_PROVENANCE")" \
+	"config_sha256=cogs/servo_gains.textproto $(sha256sum -- "${work}/rungs/r2.textproto" | cut -d' ' -f1)"
+
+# The trailing slash shell completion writes is not a different directory.
+REACHY_EXPERIMENT_DIR="${experiment}/"
+result=$(deploy unit --push)
+assert_status "a push whose overlay directory carries a trailing slash succeeds" 0 \
+	"$(status_of "$result")"
+assert_contains "and the overlaid paths are payload-relative" "$(output_of "$result")" \
+	"overlay: cogs/servo_gains.textproto"
+
+# A link with nothing behind it is a rung that was moved, not an overlay.
+ln -sf -- "${work}/rungs/gone.textproto" "${experiment}/cogs/servo_gains.textproto"
+REACHY_EXPERIMENT_DIR="$experiment"
+result=$(deploy unit --push)
+assert_status "an overlay link with nothing behind it refuses" 1 "$(status_of "$result")"
+assert_contains "and names the file" "$(output_of "$result")" \
+	"the experiment overlay's cogs/servo_gains.textproto is no readable file"
+rm -f -- "${experiment}/cogs/servo_gains.textproto"
+
+# An overlay directory that holds nothing is a variable somebody left set: every
+# signal that says a run was an experiment would be absent, and the run would be
+# recorded against a configuration that was never in force.
+REACHY_EXPERIMENT_DIR="${work}/empty-experiment"
+mkdir -p -- "$REACHY_EXPERIMENT_DIR"
+result=$(deploy unit --push)
+assert_status "an overlay directory that overlays nothing refuses" 1 "$(status_of "$result")"
+assert_contains "and says so" "$(output_of "$result")" \
+	"which holds none of the files a run may vary"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
+
+REACHY_EXPERIMENT_DIR="${work}/no-such-experiment"
+result=$(deploy unit --push)
+assert_status "an overlay directory that is not there refuses" 1 "$(status_of "$result")"
+assert_contains "and says what to do about it" "$(output_of "$result")" \
+	"Unset it to push the tree's own configuration"
+
+unset REACHY_EXPERIMENT_DIR
+stage_payload "$after"
+
 # The stamp travels inside the payload, so a payload that landed without one is a
 # payload that did not land: the transfer's own failure is the whole story, and
 # there is no second one that can go missing on its own.
@@ -820,7 +951,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 36 --run-window 36 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 36 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 36 --run-window 36 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 36 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -1247,7 +1378,7 @@ assert_status "a tour that ended itself and passed the analyzer succeeds" 0 \
 assert_contains "the budget is asked of the sender, over the committed table" "$toured" \
 	"bazel run -- //crates/reachy-ask:reachy_ask --tour-budget ${names_table}"
 assert_contains "the bus question, the log root's clear and the tour are one invocation" "$toured" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/clip_library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/clip_library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
 # The sender knows its own end, so it is given neither of the gesture's clocks:
 # a run window would be a second opinion about when the tour is over, and the
 # commissioning timeout it ships with is the one that says a unit never came up.
@@ -1690,7 +1821,7 @@ assert_contains "the configuration is checked before any device is touched" "$ra
 assert_contains "the checker is built in the default configuration" "$ran" \
 	"bazel build -- //crates/reachy-host:reachy_host"
 assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # The voice host's console reaches the operator while the run is happening, not
@@ -2197,6 +2328,35 @@ assert_contains "and the constants say who else reads them" \
 # ---------------------------------------------------------------------------
 
 assert_run_budget_covers_lead "${script_dir}/deploy-motion.sh"
+
+# ---------------------------------------------------------------------------
+# The one set of configuration files, stated in four places
+# ---------------------------------------------------------------------------
+#
+# `cogs/pose_reading.rs` reads a run's `config/` and refuses a log that is
+# missing any of these files; three producers stage them — this script for a
+# device push, `host-motion-run.sh` for a host run, `cogs/scenario_test.sh` for
+# a deterministic one. A producer that fell behind the reader writes an
+# incomplete `config/` and every log it makes is refused after the run, on
+# hardware, which is the expensive way to find out. So the four lists are
+# compared here, where the checkout is at hand and nothing has to be built.
+root=$(checkout_root)
+
+# The array literal of a shell list, one entry per line, indentation stripped.
+shell_config_list() {
+	sed -n '/^run_config_files=(/,/^)/p' -- "$1" | sed '1d;$d' | tr -d '\t ' | sed '/^$/d'
+}
+
+reader=$(sed -n '/^pub const CONFIG_FILES/,/^];/p' -- "${root}/cogs/pose_reading.rs" |
+	grep -o '"[^"]*"' | tr -d '"')
+assert_eq "the analyzer's list is the three files a run records" \
+	"cogs/servo_profile.textproto
+cogs/servo_gains.textproto
+cogs/mover_params.textproto" "$reader"
+for producer in tools/deploy-motion.sh tools/host-motion-run.sh cogs/scenario_test.sh; do
+	assert_eq "${producer} stages exactly what the analyzer reads" \
+		"$reader" "$(shell_config_list "${root}/${producer}")"
+done
 
 # ---------------------------------------------------------------------------
 

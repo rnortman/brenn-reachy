@@ -25,7 +25,10 @@ use std::path::PathBuf;
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{ROWS, flags};
-use reachy_motion::{JointRef, JointVector, PhaseSeparation, PhaseWatch};
+use reachy_motion::stillness::Sample as StillnessSample;
+use reachy_motion::{
+    HoldWindow, JointRef, JointVector, PhaseSeparation, PhaseWatch, StillnessConfig, StillnessWatch,
+};
 
 /// How near its final goal a joint must be to count as having arrived, radians.
 ///
@@ -46,14 +49,16 @@ const TRACE_FIXTURES_ENV: &str = "REACHY_MOTION_TRACE_FIXTURES";
 /// Panics rather than answers: neither a missing fixture nor a missing
 /// environment is a test case.
 ///
-/// TODO(antenna-hold-fixture): the antenna hold has no recording here yet, so
-/// nothing replays the stillness watch over a machine. `//cogs:trace_export`
-/// cuts a window of a log into a file this reads; what such a file must carry
-/// is what the parser here refuses to guess at: the header is
+/// TODO(antenna-hold-fixture): there is a recording of the hunt
+/// (`trace-antenna-hunt.csv`) and none of an antenna pair holding still, so
+/// nothing here says what a quiet hold reads. `//cogs:trace_export` cuts a
+/// window of a log into a file this reads; what such a file must carry is what
+/// the parser here refuses to guess at: the header is
 /// `run,tick,t_s,phase,<joint>_present_rad…,<joint>_goal_rad…`, the `phase`
 /// cell is exactly `commanding` or `settling` and panics otherwise, present
 /// cells are all nine or all blank, and a joint holding no goal has a blank
-/// goal cell rather than a zero.
+/// goal cell rather than a zero. The cut runs from before the raise's last
+/// goal write, so the shipped settle allowance opens the window inside it.
 pub fn fixture(name: &str) -> Trace {
     let dir = std::env::var(TRACE_FIXTURES_ENV).unwrap_or_else(|_| {
         panic!(
@@ -207,6 +212,47 @@ impl Run {
             }
         }
         watch.separation()
+    }
+
+    /// The holds `joints` showed over this run, as the live stillness watch
+    /// would have cut them.
+    ///
+    /// The shipped watch, driven period by period out of the file exactly as
+    /// the report drives it off the pose stream, so a window measured here is
+    /// the window the machine reported. A period whose grouped read fell short
+    /// is fed as an invalid reading rather than skipped — a gap is not a goal
+    /// change and the watch is the one that decides that — and a period
+    /// holding no goal for one of the watched joints is fed as a driver
+    /// holding nothing, which closes the window as it did on the machine.
+    pub fn holds(&self, cfg: StillnessConfig, joints: &[JointRef]) -> Vec<HoldWindow> {
+        let mut watch = StillnessWatch::new(cfg, joints);
+        let mut windows = Vec::new();
+        for sample in &self.samples {
+            let mut commanded = JointVector::default();
+            let mut commanded_valid = true;
+            for joint in joints {
+                match sample.goal_of(*joint) {
+                    Some(goal) => {
+                        commanded.set(*joint, goal);
+                    }
+                    None => commanded_valid = false,
+                }
+            }
+            let present = sample.present.unwrap_or_default();
+            watch.look(
+                &StillnessSample {
+                    t_ns: i64::try_from(sample.at.as_nanos()).expect("a trace within an epoch"),
+                    present_valid: sample.present.is_some(),
+                    commanded_valid,
+                    missing: JointFlags::NONE,
+                    present: &present,
+                    commanded: &commanded,
+                },
+                &mut windows,
+            );
+        }
+        watch.finish(&mut windows);
+        windows
     }
 
     /// The grid this run was driven on: the median time one period took,

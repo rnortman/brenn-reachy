@@ -22,7 +22,7 @@ use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, ResponseKindWire};
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use brenn_reachy__motion__timeline_clk_rs::WindDownOutcomeWire;
-use reachy_motion::joints::{Name, flags, row};
+use reachy_motion::joints::{JointGroup, Name, flags, row};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::tick::default_motion_config;
 use scenario::check;
@@ -321,7 +321,8 @@ fn check_second_engagement(run: &Run, failures: &mut Vec<String>) {
 /// scenario places the jam so that this holds, off the walk of the raise; this
 /// is that placement read back out of the run.
 fn check_the_generator_had_stopped(run: &Run, failures: &mut Vec<String>) {
-    let settled_from = raise_cycle() - scenario::ramp_cycles() - scenario::response_delay_cycles();
+    let settled_from =
+        raise_cycle() - scenario::ramp_cycles(JointGroup::Legs) - scenario::response_delay_cycles();
     check::commanded_stands_still_rows(
         run,
         jammed_rows(),

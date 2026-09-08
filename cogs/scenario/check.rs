@@ -37,18 +37,20 @@ use reachy_kin::wrap_to_pi;
 use reachy_motion::arm;
 use reachy_motion::disarm::at_stow;
 use reachy_motion::joints::{
-    JointRef, JointTargets, Name, ROW_COUNT, flags, joint_ref, row, rows_of,
+    JointGroup, JointRef, JointTargets, Name, ROW_COUNT, flags, group_of_row, joint_ref, row,
+    rows_of,
 };
 use reachy_motion::record;
 use reachy_motion::tick::MotionConfig;
 
 use crate::read::Run;
 use crate::{
-    BUS_WATCHDOG, COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS, EXECUTION_DURATION_NS,
-    FIRST_CYCLE, LAG_K, MoveClocks, PERIOD_NS, PROFILE_ACCELERATION, PROFILE_VELOCITY,
-    RAIL_STALE_AFTER_NS, REPORT_GROUP, REPORT_GROUP_PREFIX, SESSION_WAKE_FLOOR_NS,
-    commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for, drain_cycle,
-    engage_cycles, rail_watch_transactions,
+    ANTENNAS_PROFILE_ACCELERATION, ANTENNAS_PROFILE_VELOCITY, BODY_YAW_PROFILE_ACCELERATION,
+    BODY_YAW_PROFILE_VELOCITY, BUS_WATCHDOG, COGS, CONTROL_DELAY_NS, DRIVER_CONFIRM_BUDGET_NS,
+    EXECUTION_DURATION_NS, FIRST_CYCLE, LAG_K, LEGS_PROFILE_ACCELERATION, LEGS_PROFILE_VELOCITY,
+    MoveClocks, PERIOD_NS, RAIL_STALE_AFTER_NS, REPORT_GROUP, REPORT_GROUP_PREFIX,
+    SESSION_WAKE_FLOOR_NS, commission_transactions, cycle_at, cycle_of, cycle_within, cycles_for,
+    drain_cycle, engage_cycles, rail_watch_transactions,
 };
 
 /// How far the plant may be from the posture it was sent to, in metres and in
@@ -2023,10 +2025,29 @@ pub fn commissioned_profile(run: &Run, failures: &mut Vec<String>) {
             continue;
         }
         let value = i64::try_from(txn.value()).unwrap_or(i64::MAX);
-        let expected = match txn.reg() {
-            RegIdWire::PROFILE_ACCELERATION => PROFILE_ACCELERATION,
-            RegIdWire::PROFILE_VELOCITY => PROFILE_VELOCITY,
-            RegIdWire::BUS_WATCHDOG => {
+        // The pair the row's own class is commissioned with: a sweep that wrote
+        // the legs' numbers into an antenna would be a machine the tick's
+        // antenna model does not describe.
+        let group = arm::row_of_id(txn.id()).and_then(group_of_row);
+        let expected = match (txn.reg(), group) {
+            (RegIdWire::PROFILE_ACCELERATION, Some(JointGroup::Legs)) => LEGS_PROFILE_ACCELERATION,
+            (RegIdWire::PROFILE_VELOCITY, Some(JointGroup::Legs)) => LEGS_PROFILE_VELOCITY,
+            (RegIdWire::PROFILE_ACCELERATION, Some(JointGroup::BodyYaw)) => {
+                BODY_YAW_PROFILE_ACCELERATION
+            }
+            (RegIdWire::PROFILE_VELOCITY, Some(JointGroup::BodyYaw)) => BODY_YAW_PROFILE_VELOCITY,
+            (RegIdWire::PROFILE_ACCELERATION, Some(JointGroup::Antennas)) => {
+                ANTENNAS_PROFILE_ACCELERATION
+            }
+            (RegIdWire::PROFILE_VELOCITY, Some(JointGroup::Antennas)) => ANTENNAS_PROFILE_VELOCITY,
+            (RegIdWire::PROFILE_ACCELERATION | RegIdWire::PROFILE_VELOCITY, None) => {
+                failures.push(format!(
+                    "the session wrote a profile register to servo {}, which is no bus row",
+                    txn.id()
+                ));
+                continue;
+            }
+            (RegIdWire::BUS_WATCHDOG, _) => {
                 watchdog.entry(txn.id()).or_default().push(value);
                 continue;
             }

@@ -60,8 +60,9 @@ use clockwork_rs::SyncTime;
 use reachy_kin::EnvelopeConfig;
 use reachy_motion::arm;
 use reachy_motion::arm::{
-    ArmConfig, CommissionSequencer, EXPECTED_OPERATING_MODES, PollSequencer, ProfileConfig,
-    ProvisionExpect, ProvisionTable, Rail, SERVO_IDS, VENDOR_HOMING_OFFSETS, engage_gates,
+    ArmConfig, CommissionSequencer, EXPECTED_OPERATING_MODES, GroupGains, PollSequencer,
+    ProfileConfig, ProvisionExpect, ProvisionTable, Rail, SERVO_IDS, VENDOR_HOMING_OFFSETS,
+    engage_gates,
 };
 use reachy_motion::cells::{self, RailRecord};
 use reachy_motion::disarm::{
@@ -89,14 +90,16 @@ use reachy_motion::{txn, value};
 /// [`arm::arm_config`], and what this host supplies is the two things that are
 /// not hardware facts: the provisioning grid below, and `profile`.
 ///
-/// The profile is the caller's because it is the one part of this record a
-/// deployment chooses: the library states plainly that it has no default for
-/// it, since what it should be is a property of the machine a host drives
-/// rather than of the motion arithmetic. It arrives from the session's own
-/// configuration and is taken on the first call, which is the wake that first
-/// needs the record -- built once for the same reason the rest of it is, and
-/// therefore fixed for the life of the process at the value the process started
-/// with.
+/// The profile and the gains are the caller's because they are the parts of
+/// this record a deployment chooses: the library states plainly that it has no
+/// default for the profile, since what it should be is a property of the
+/// machine a host drives rather than of the motion arithmetic, and the gains
+/// are tuned against a machine the same way -- the library's own triple is what
+/// the file is held to rather than what the session commissions with. Both
+/// arrive from the session's own configuration and are taken on the first call,
+/// which is the wake that first needs the record -- built once for the same
+/// reason the rest of it is, and therefore fixed for the life of the process at
+/// the values the process started with.
 ///
 /// A profile handed in after the first call is ignored rather than refused. The
 /// record is process-wide for the life of the binary, tests included: the first
@@ -112,29 +115,39 @@ use reachy_motion::{txn, value};
 ///
 /// # Panics
 ///
-/// For a profile whose acceleration or velocity is zero. Zero in those two
+/// For any class whose acceleration or velocity is zero, named. Zero in those
 /// registers is what a servo reads as *no limit*, which is the opposite of the
-/// backstop the pair exists to be, and it is what a configuration that lost the
-/// two lines parses to. Refusing here stops the process at start-up with the
-/// machine de-torqued and nothing commanded, rather than commissioning a
-/// machine whose servo-side rate limit is off with nothing said about it.
+/// backstop the pair exists to be, and it is what a configuration that lost a
+/// line parses to. Refusing here stops the process at start-up with the machine
+/// de-torqued and nothing commanded, rather than commissioning a machine whose
+/// servo-side rate limit is off with nothing said about it.
 ///
 /// And for a zero bus watchdog, which is the register disabled: armed is the
 /// policy, so a file that says nothing about it is a session that would command
 /// servos with nothing at all watching for a dead driver.
-pub fn init_arm_config(profile: ProfileConfig) {
-    assert!(
-        profile.acceleration > 0 && profile.velocity > 0,
-        "the servo profile is {profile:?}, and zero in either register is a servo running \
-         unlimited rather than the backstop the pair is for",
-    );
+pub fn init_arm_config(gains: GroupGains, profile: ProfileConfig) {
+    for group in JointGroup::ALL {
+        let (acceleration, velocity) = profile.profiles.of(group);
+        assert!(
+            acceleration > 0 && velocity > 0,
+            "the servo profile for the {} is {acceleration}/{velocity}, and zero in either \
+             register is a servo running unlimited rather than the backstop the pair is for",
+            group.name(),
+        );
+    }
     assert!(
         profile.bus_watchdog > 0,
         "the servo profile is {profile:?}, and zero in the watchdog register is a machine that \
          keeps chasing a stale goal after the driver commanding it has died",
     );
-    let _ = CONFIGURED
-        .get_or_init(|| arm::arm_config(&EnvelopeConfig::default(), provision_table(), profile));
+    let _ = CONFIGURED.get_or_init(|| {
+        arm::arm_config(
+            &EnvelopeConfig::default(),
+            provision_table(),
+            gains,
+            profile,
+        )
+    });
 }
 
 /// The record, for the machinery below.
@@ -1467,6 +1480,7 @@ mod tests {
     use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
+    use reachy_motion::plant::GroupProfiles;
 
     /// The survey's own readings seed the picture the torque-on gate judges, row
     /// for row and stamped with the instant they were merged at.
@@ -1637,8 +1651,7 @@ mod tests {
     /// is under test is which values are refused, and the refusal is about zero.
     fn profile() -> ProfileConfig {
         ProfileConfig {
-            acceleration: 20,
-            velocity: 50,
+            profiles: reachy_motion::plant::SHIPPED_PROFILES,
             bus_watchdog: 10,
         }
     }
@@ -1653,31 +1666,48 @@ mod tests {
     #[test]
     #[should_panic(expected = "zero in the watchdog register")]
     fn a_session_with_the_watchdog_disabled_is_refused_before_anything_is_armed() {
-        init_arm_config(ProfileConfig {
-            bus_watchdog: 0,
-            ..profile()
-        });
+        init_arm_config(
+            reachy_motion::arm::DEFAULT_GAINS,
+            ProfileConfig {
+                bus_watchdog: 0,
+                ..profile()
+            },
+        );
     }
 
     /// And its older sibling: zero acceleration is a servo running unlimited
-    /// rather than the backstop the pair exists to be.
+    /// rather than the backstop the pair exists to be. The refusal names the
+    /// class, because a file may lose one class's line and keep the others.
     #[test]
-    #[should_panic(expected = "zero in either register")]
+    #[should_panic(expected = "the servo profile for the legs is 0/50")]
     fn a_session_whose_servo_profile_is_unlimited_is_refused_the_same_way() {
-        init_arm_config(ProfileConfig {
-            acceleration: 0,
-            ..profile()
-        });
+        init_arm_config(
+            reachy_motion::arm::DEFAULT_GAINS,
+            ProfileConfig {
+                profiles: GroupProfiles {
+                    legs: (0, 50),
+                    ..reachy_motion::plant::SHIPPED_PROFILES
+                },
+                ..profile()
+            },
+        );
     }
 
     /// The same for velocity, which the assert covers with one condition and so
-    /// could lose without a case to say so.
+    /// could lose without a case to say so -- on the antennas, the class whose
+    /// own pair a capability run is most likely to move.
     #[test]
-    #[should_panic(expected = "zero in either register")]
+    #[should_panic(expected = "the servo profile for the antennas is 20/0")]
     fn a_session_whose_servo_velocity_is_unlimited_is_refused_the_same_way() {
-        init_arm_config(ProfileConfig {
-            velocity: 0,
-            ..profile()
-        });
+        init_arm_config(
+            reachy_motion::arm::DEFAULT_GAINS,
+            ProfileConfig {
+                profiles: GroupProfiles {
+                    antennas: (20, 0),
+                    ..reachy_motion::plant::SHIPPED_PROFILES
+                },
+                ..profile()
+            },
+        );
     }
 }

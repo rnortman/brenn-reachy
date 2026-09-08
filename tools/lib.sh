@@ -1089,11 +1089,6 @@ analyzer_verdict() {
 # log and a rename has to reach both.
 report_target=//cogs:first_motion_report
 
-# The deployed servo profile, as both analyzers reach it: a runfile of each
-# analyzer target, so the path is relative to the runfiles root that `bazel run`
-# leaves as the working directory.
-servo_profile_runfile=cogs/servo_profile.textproto
-
 # Judge a run's records.
 #
 #   report_verdict <run directory> [extra analyzer arguments...]
@@ -1102,15 +1097,14 @@ servo_profile_runfile=cogs/servo_profile.textproto
 # jitter band, a device run reads hardware timestamps strictly — and they go
 # ahead of the run directory, which is this analyzer's grammar.
 #
-# The servo profile follows the run directory and is this wrapper's rather than
-# the caller's: the analyzer measures every joint against the trajectory those
-# two registers define, and there is one deployed pair. Named
-# runfiles-relative, which under `bazel run` is what the analyzer's working
-# directory is rooted at.
+# The configuration the run was performed under is no argument: the analyzer
+# reads it out of the run directory's own `config/`, which is where every path
+# that produces a log puts it. A profile named here instead would be the
+# analyzing host's answer to a question only the machine that ran can answer.
 report_verdict() {
 	local run_dir=$1
 	shift
-	analyzer_verdict "$report_target" "$@" "$run_dir" "$servo_profile_runfile"
+	analyzer_verdict "$report_target" "$@" "$run_dir"
 }
 
 # The analyzer of a speech run, which reads both sides of a fetch: what a
@@ -1143,8 +1137,8 @@ tour_report_target=//cogs:library_tour_report
 #
 # The run directory is the one `run_directory` found, and the sidecar is the
 # committed name table the tour was built from -- both absolute, because this
-# runs under `bazel run` from its own runfiles tree. The servo profile is this
-# wrapper's, for the reason `report_verdict` gives.
+# runs under `bazel run` from its own runfiles tree. The configuration is read
+# out of the run directory, for the reason `report_verdict` gives.
 tour_verdict() {
-	analyzer_verdict "$tour_report_target" "$1" "$2" "$servo_profile_runfile"
+	analyzer_verdict "$tour_report_target" "$1" "$2"
 }

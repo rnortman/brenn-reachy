@@ -260,7 +260,7 @@ impl Stillness {
 fn line(held: &Stillness, window: &HoldWindow) -> String {
     format!(
         "  {} over a {:.2} s hold from {}: {:.1} counts ({:.4} rad) peak to peak, {:.1} \
-         reversals/s, mean error {:+.4} rad, over {} reading(s), opened {:.2} s after the \
+         reversals/s, {}, mean error {:+.4} rad, over {} reading(s), opened {:.2} s after the \
          setpoint last moved at {:+.4} rad of error",
         Name(window.joint),
         window.length().as_secs_f64(),
@@ -268,11 +268,37 @@ fn line(held: &Stillness, window: &HoldWindow) -> String {
         window.excursion_counts(),
         window.excursion_rad,
         window.reversals_per_s,
+        period(window),
         window.mean_error_rad,
         window.samples,
         window.opened_after_ns as f64 / 1e9,
         window.error_at_open_rad
     )
+}
+
+/// How regular the turning was, for the middle of that line.
+///
+/// The frequency is *apparent* and says so: it is computed against the
+/// window's own measured sample rate, and anything above half that rate
+/// arrives folded down onto it. What the spread beside it says is whether the
+/// turning was a regular oscillation (small against the mean) or scattered
+/// encoder dither (comparable to it). A hold with fewer than two reversals has
+/// no interval to measure and says so rather than printing a figure made of
+/// one turn.
+fn period(window: &HoldWindow) -> String {
+    match (
+        window.apparent_period_samples(),
+        window.reversal_interval_spread_samples,
+        window.apparent_frequency_hz(),
+    ) {
+        (Some(samples), Some(spread), Some(hz)) => {
+            format!("period ≈ {samples:.1} samples ({hz:.1} Hz apparent, spread {spread:.1})")
+        }
+        (Some(samples), Some(spread), None) => {
+            format!("period ≈ {samples:.1} samples (spread {spread:.1})")
+        }
+        _ => "no period".to_string(),
+    }
 }
 
 /// Say what the run held still for, and — under [`Standard::Judged`] — what it
@@ -540,6 +566,37 @@ mod tests {
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
             says(&report.measured, "6.0 counts"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// How regular the turning was, printed beside the rate: a joint reversing
+    /// every cycle is a two-sample period, which at the driver's grid is the
+    /// fastest thing this series can show and reads as half the sample rate.
+    #[test]
+    fn a_regular_wobble_prints_its_apparent_period() {
+        let held = wobbling(JointRef::AntennaRight, 500, 3.0 * COUNT_RAD);
+        let report = said(&held, Standard::Printed);
+        assert!(
+            says(
+                &report.measured,
+                "period ≈ 2.0 samples (25.0 Hz apparent, spread 0.0)"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A hold with no turning in it has no period, and says so rather than
+    /// printing a figure divided by nothing.
+    #[test]
+    fn a_hold_that_never_turns_round_has_no_period() {
+        let held = wobbling(JointRef::AntennaRight, 500, 0.0);
+        let report = said(&held, Standard::Printed);
+        assert!(says(&report.measured, "no period"), "{:?}", report.measured);
+        assert!(
+            !says(&report.measured, "Hz apparent"),
             "{:?}",
             report.measured
         );

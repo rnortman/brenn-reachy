@@ -617,6 +617,13 @@ cog Session
         // The two profile registers the commissioning sweep writes into all
         // nine servos. The same file the tick models from.
         profile: Tappy<config::ServoProfile>;
+
+        // The three position-gain registers the same sweep writes, per servo
+        // class. Read only by this cog: gains shape how closely a motor follows
+        // its own generator, and nothing models that -- the tick judges a joint
+        // against the generator's trajectory, not against the loop that chases
+        // it.
+        gains: Tappy<config::ServoGains>;
     }
 
     states
@@ -933,6 +940,14 @@ box MotionCore
         path="cogs/servo_profile.textproto");
     connect servo_profile to session.profile;
     connect servo_profile to mover.profile;
+
+    // The gains, read by the session alone: they are what the sweep writes into
+    // the servos, and nothing else in this composition has an opinion about how
+    // a motor chases its generator.
+    new servo_gains: SerializedDataFile(
+        representation=Protobuf<config::ServoGains>,
+        path="cogs/servo_gains.textproto");
+    connect servo_gains to session.gains;
 
     // The clips an overlay can name. Emitted from the documents under
     // `cogs/clips/` rather than authored, and read the same way the two

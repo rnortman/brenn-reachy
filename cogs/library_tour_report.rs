@@ -20,13 +20,13 @@
 //! decision tick screens on -- so a run is judged offline by the arithmetic
 //! that judged it live.
 //!
-//! It reads the log, the names sidecar and the deployment's servo profile, and
-//! nothing else. The sidecar is what says which motions the library holds and
-//! what they are called, which is the list the tour is judged against -- the
-//! log carries indices and an index is not a name. The profile is the two
-//! registers the machine was commissioned with, which is what the residual is
-//! measured against: a log recorded under one pair cannot be judged under
-//! another.
+//! It reads the log and the names sidecar, and nothing else. The sidecar is what
+//! says which motions the library holds and what they are called, which is the
+//! list the tour is judged against -- the log carries indices and an index is
+//! not a name. The profile the residual is measured against comes out of the
+//! run's own records, beside them in `config/`: a log recorded under one set of
+//! pairs cannot be judged under another, and a tuning campaign varies them per
+//! run.
 //!
 //! Findings split the way the bring-up rule splits them. A motion never asked
 //! for, or a gap in the sample stream, is a defect in the harness. A window
@@ -41,22 +41,22 @@ use std::process::ExitCode;
 
 use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
 use brenn_reachy__cogs__script_clk_rs::ScriptWire;
-use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKindWire};
+use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKindWire, HealthReportWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
 use motion_channels::{
-    EVENT_CHANNEL, FAULT_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL,
+    EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL,
 };
 use pose_reading::{
-    Grid, Skips, commanded_rows, lags, no_faults, present_rows, read_profile, residual_stream,
-    residuals,
+    Grid, RunConfig, Skips, capabilities, capability, commanded_rows, health_summary, lags,
+    no_faults, present_rows, residual_stream, residuals,
 };
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_edge::names::MotionTable;
 use reachy_motion::joints::{JointRef, Name, ROWS, row};
 use reachy_motion::phase::{ANTENNA_CONTACT_BAND_RAD, inside_band, mirror_offset};
-use reachy_motion::plant::PlantModel;
+use reachy_motion::plant::GroupPlants;
 use run_report::{Report, verdict};
 
 /// How far a goal has to move for the window it moved in to count as having
@@ -78,9 +78,11 @@ const SAMPLE_GAP_NS: i64 = NOMINAL_CYCLE_NS + NOMINAL_CYCLE_NS / 2;
 
 /// Everything one tour put in the log.
 ///
-/// Five streams, which is the whole of what a tour is judged on: what was
+/// Six streams, which is the whole of what a tour is judged on: what was
 /// asked, what the session planned, what the driver read and held, what it
-/// could not do, and what the decision tick raised.
+/// could not do, what the decision tick raised, and what the health rotation
+/// saw. The last is what says whether a tour the machine played whole was one
+/// its motors were comfortable playing.
 #[derive(Default)]
 struct Run {
     /// What the sender asked for.
@@ -93,6 +95,8 @@ struct Run {
     events: Vec<Logged<DriverEventWire>>,
     /// What the decision tick raised.
     faults: Vec<Logged<TickFaultWire>>,
+    /// What the health rotation read, one report per servo visit.
+    readings: Vec<Logged<HealthReportWire>>,
     /// Every channel the log carries and how many messages each held.
     census: Census,
     /// Anything that went wrong reading the log itself.
@@ -113,7 +117,7 @@ impl Streams for Run {
 ///
 /// Only channels a tour has something to say about: a channel bound here that
 /// the tour has no use for would report as missing on a log that is fine.
-const CHANNELS: [Bound<Run>; 5] = [
+const CHANNELS: [Bound<Run>; 6] = [
     Bound {
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
@@ -138,6 +142,11 @@ const CHANNELS: [Bound<Run>; 5] = [
         name: FAULT_CHANNEL,
         check: binding::<TickFaultWire>,
         route: |run, message| typed(message, &mut run.faults, &mut run.complaints),
+    },
+    Bound {
+        name: HEALTH_CHANNEL,
+        check: binding::<HealthReportWire>,
+        route: |run, message| typed(message, &mut run.readings, &mut run.complaints),
     },
 ];
 
@@ -674,11 +683,12 @@ fn measurements(
 }
 
 /// Everything this tool has to say about one tour.
-fn analyze(run: &Run, table: &MotionTable, profile: (u32, u32)) -> Report {
+fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
     let mut report = Report::default();
     for complaint in &run.complaints {
         report.fail(complaint.clone());
     }
+    config.configuration(&mut report);
     for channel in &run.census {
         report.note(format!("  {} x{}", channel.name, channel.count));
     }
@@ -708,14 +718,12 @@ fn analyze(run: &Run, table: &MotionTable, profile: (u32, u32)) -> Report {
     // The plant the run's own machine was commissioned with, on the run's own
     // grid. A log recorded under another pair is judged under that pair, which
     // is why the profile is an argument and not a constant.
-    let (acceleration, velocity) = profile;
-    let plant = match PlantModel::from_registers(velocity, acceleration, grid.period_ns) {
+    let plant = match GroupPlants::from_profiles(&config.profiles, grid.period_ns) {
         Ok(plant) => plant,
         Err(error) => {
             report.fail(format!(
-                "the profile {acceleration}/{velocity} on a {}ns grid is no plant to judge this \
-                 run against: {error}",
-                grid.period_ns
+                "the profile {:?} on a {}ns grid is no plant to judge this run against: {error}",
+                config.profiles, grid.period_ns
             ));
             return report;
         }
@@ -729,20 +737,28 @@ fn analyze(run: &Run, table: &MotionTable, profile: (u32, u32)) -> Report {
     measurements(&ordered, &events, &planned, &by_id, &stream, &mut report);
     residuals(&stream, &run.samples, &plant, &mut report);
     lags(&run.samples, &mut report);
+    // The tour is the run the library's whole load is applied in, so it is
+    // the run these two are worth taking off: a capability figure is only as
+    // good as the content that demanded it, and a temperature only means
+    // something over a long play.
+    capabilities(&capability(&run.samples, grid), &mut report);
+    health_summary(&run.readings, &mut report);
     report
 }
 
 fn main() -> ExitCode {
-    const USAGE: &str = "usage: library_tour_report <log-dir> <names.json> <servo_profile>";
+    const USAGE: &str = "usage: library_tour_report <log-dir> <names.json>";
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [log_dir, sidecar, profile_path] = args.as_slice() else {
+    let [log_dir, sidecar] = args.as_slice() else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    let profile = match read_profile(profile_path) {
-        Ok(profile) => profile,
+    // The tour's own configuration, out of the records: a log is judged under
+    // the pairs the machine that wrote it was commissioned with.
+    let config = match RunConfig::read(&PathBuf::from(log_dir)) {
+        Ok(config) => config,
         Err(err) => {
-            eprintln!("reading the servo profile: {err}");
+            eprintln!("reading the configuration this run was performed under: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -767,7 +783,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = analyze(&run, &table, profile);
+    let report = analyze(&run, &table, &config);
     verdict(
         "library_tour_report",
         log_dir,
@@ -785,11 +801,13 @@ mod tests {
     //! is enough for order, repetition and omission to be different things.
 
     use super::{
-        ANTENNA_CONTACT_BAND_RAD, CHANNELS, DriverEventWire, EventKindWire, Logged, MotionTable,
-        POSE_CHANNEL, PoseSampleWire, Report, Run, ScriptWire, SessionScheduleWire, TickFaultWire,
-        Window, analyze, windows,
+        ANTENNA_CONTACT_BAND_RAD, CHANNELS, DriverEventWire, EventKindWire, HealthReportWire,
+        Logged, MotionTable, POSE_CHANNEL, PoseSampleWire, Report, Run, RunConfig, ScriptWire,
+        SessionScheduleWire, TickFaultWire, Window, analyze, windows,
     };
-    use reachy_motion::plant::SHIPPED_PROFILE;
+    use pose_reading::TEMPERATURE_STOP_C;
+    use reachy_motion::arm::DEFAULT_GAINS;
+    use reachy_motion::plant::SHIPPED_PROFILES;
 
     use brenn_reachy__cogs__schedule_clk_rs::OverlayWindowWire;
     use brenn_reachy__cogs__script_clk_rs::ScriptOverlayWire;
@@ -798,7 +816,7 @@ mod tests {
     use motion_proto::PlayWindow;
     use reachy_driver::NOMINAL_CYCLE_NS;
     use reachy_edge::names::MotionEntry;
-    use reachy_motion::joints::{JointRef, ROW_COUNT, row, write_rows};
+    use reachy_motion::joints::{JointGroup, JointRef, ROW_COUNT, row, write_rows};
 
     /// An arbitrary instant a synthetic run starts at, chosen for being nothing
     /// round.
@@ -932,6 +950,13 @@ mod tests {
         }
     }
 
+    /// The configuration a crafted run is judged under: what this tree ships,
+    /// with the detector armed, which is what every case here is about the
+    /// machine and not about the configuration.
+    fn shipped() -> RunConfig {
+        RunConfig::stated(SHIPPED_PROFILES, DEFAULT_GAINS, true)
+    }
+
     /// Whether any finding says `what`.
     fn found(report: &Report, what: &str) -> bool {
         report.findings.iter().any(|line| line.contains(what))
@@ -947,7 +972,7 @@ mod tests {
     /// sample has nothing to report and still prints its numbers.
     #[test]
     fn a_tour_that_played_every_motion_has_no_findings() {
-        let report = analyze(&clean(), &table(), SHIPPED_PROFILE);
+        let report = analyze(&clean(), &table(), &shipped());
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
             measured(&report, "pollen/dances/simple_nod [") && measured(&report, "20 sample(s)"),
@@ -978,11 +1003,110 @@ mod tests {
         );
     }
 
+    /// What the health rotation saw over the tour reaches the report, and a
+    /// servo that latched something beyond the voltage bit is a finding.
+    #[test]
+    fn the_health_rotation_reaches_the_tour_report() {
+        let mut warm = HealthReportWire::new();
+        warm.set_id(10);
+        warm.set_volts(7.4);
+        warm.set_temp_c(48);
+        warm.set_sample_time(when(3));
+        let mut hurt = HealthReportWire::new();
+        hurt.set_id(11);
+        hurt.set_volts(7.4);
+        hurt.set_bits(0x20);
+        hurt.set_sample_time(when(3));
+        let mut run = clean();
+        run.readings = vec![
+            Logged {
+                at_ns: when(3).as_nanos(),
+                sequence_number: 0,
+                message: warm,
+            },
+            Logged {
+                at_ns: when(3).as_nanos(),
+                sequence_number: 1,
+                message: hurt,
+            },
+        ];
+        let report = analyze(&run, &table(), &shipped());
+        assert!(
+            measured(&report, "servo 10: 7.40 V"),
+            "{:?}",
+            report.measured
+        );
+        assert!(measured(&report, "peak 48 C"), "{:?}", report.measured);
+        assert!(found(&report, "servo 11 (0x20)"), "{:?}", report.findings);
+        // The warm servo sits under the temperature ceiling, so the error-bit
+        // rule is the only verdict this fixture carries.
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    }
+
+    /// A servo that reached the temperature ceiling fails the tour report,
+    /// through the same pass the per-servo lines come from.
+    ///
+    /// The reading is a verdict in both analyzers, and only this case says so
+    /// of the tour: the unit case one module over would keep passing if the
+    /// tour report stopped calling the health pass at all.
+    #[test]
+    fn a_servo_at_the_temperature_ceiling_fails_the_tour_report() {
+        let mut hot = HealthReportWire::new();
+        hot.set_id(18);
+        hot.set_volts(7.4);
+        hot.set_temp_c(TEMPERATURE_STOP_C);
+        hot.set_sample_time(when(3));
+        let mut run = clean();
+        run.readings = vec![Logged {
+            at_ns: when(3).as_nanos(),
+            sequence_number: 0,
+            message: hot,
+        }];
+        let report = analyze(&run, &table(), &shipped());
+        // The rule's own wording and figure, not the servo id alone: any
+        // per-servo verdict names an id, so an id is not evidence that this is
+        // the temperature one.
+        assert!(
+            found(
+                &report,
+                &format!("reached {TEMPERATURE_STOP_C} C, which no healthy tour")
+            ),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            found(
+                &report,
+                &format!("servo 18 ({TEMPERATURE_STOP_C} C at 0.0 s)")
+            ),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    }
+
+    /// A tour whose joints never fell behind a setpoint measures no capability
+    /// and says so, rather than printing the content's own pace as the motors'.
+    #[test]
+    fn a_tour_that_never_saturated_a_motor_says_it_measured_nothing() {
+        let report = analyze(&clean(), &table(), &shipped());
+        for class in JointGroup::ALL.map(JointGroup::name) {
+            assert!(
+                measured(
+                    &report,
+                    &format!("capability {class}: no sample found this class chasing")
+                ),
+                "{:?}",
+                report.measured
+            );
+        }
+    }
+
     /// A log with no samples says exactly that rather than reporting a clean
     /// sweep of checks none of which had anything to read.
     #[test]
     fn a_log_with_no_samples_is_refused_at_once() {
-        let report = analyze(&Run::default(), &table(), SHIPPED_PROFILE);
+        let report = analyze(&Run::default(), &table(), &shipped());
         assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert!(found(&report, "no driver samples"), "{:?}", report.findings);
     }
@@ -995,7 +1119,7 @@ mod tests {
             scripts: vec![script(0, 0)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "pollen/emotions/curious1 was never asked for"),
             "{:?}",
@@ -1011,7 +1135,7 @@ mod tests {
             scripts: vec![script(0, 0), script(WINDOW_CYCLES, 1), script(41, 1)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "curious1 was asked for 2 times"),
             "{:?}",
@@ -1027,7 +1151,7 @@ mod tests {
             scripts: vec![script(0, 1), script(WINDOW_CYCLES, 0)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "not in the order the library numbers them"),
             "{:?}",
@@ -1045,7 +1169,7 @@ mod tests {
             scripts: vec![at(0, empty), script(WINDOW_CYCLES, 1)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "carries 0 overlay window(s)"),
             "{:?}",
@@ -1072,7 +1196,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(
                 &report,
@@ -1104,7 +1228,7 @@ mod tests {
             schedules: planned(),
             ..Run::default()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert_eq!(
             report
                 .findings
@@ -1146,7 +1270,7 @@ mod tests {
             schedules: planned(),
             ..Run::default()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             !found(&report, "gap(s) over the tour"),
             "{:?}",
@@ -1171,7 +1295,7 @@ mod tests {
             faults: vec![at(3, fault)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "the decision tick raised"),
             "{:?}",
@@ -1205,7 +1329,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             measured(&report, "simple_nod")
                 && report
@@ -1282,7 +1406,7 @@ mod tests {
             schedules: vec![schedule(0, 0, 1, 1 + WINDOW_CYCLES)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(
                 &report,
@@ -1302,7 +1426,7 @@ mod tests {
             schedules: planned(),
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(
                 &report,
@@ -1323,7 +1447,7 @@ mod tests {
             scripts: vec![script(0, 0), script(WINDOW_CYCLES, 7)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(
                 &report,
@@ -1361,7 +1485,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         let line = report
             .measured
             .iter()
@@ -1395,7 +1519,7 @@ mod tests {
             events: vec![at(3, event)],
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             report
                 .measured
@@ -1424,7 +1548,7 @@ mod tests {
             samples: heartbeat(1 + WINDOW_CYCLES),
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "carries no sample at all"),
             "{:?}",
@@ -1451,7 +1575,7 @@ mod tests {
             })
             .collect();
         let run = Run { samples, ..clean() };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "carried a setpoint"),
             "{:?}",
@@ -1467,7 +1591,7 @@ mod tests {
             schedules: Vec::new(),
             ..clean()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "planned no overlay window at all"),
             "{:?}",
@@ -1490,7 +1614,7 @@ mod tests {
         };
         assert!(
             found(
-                &analyze(&late, &table(), SHIPPED_PROFILE),
+                &analyze(&late, &table(), &shipped()),
                 "gap(s) over the tour"
             ),
             "a logger that came up after the tour started is a hole in the record",
@@ -1504,7 +1628,7 @@ mod tests {
         };
         assert!(
             found(
-                &analyze(&early, &table(), SHIPPED_PROFILE),
+                &analyze(&early, &table(), &shipped()),
                 "gap(s) over the tour"
             ),
             "a logger that stopped before the last window closed is the same hole",
@@ -1521,7 +1645,7 @@ mod tests {
             scripts: vec![script(0, 0)],
             ..Run::default()
         };
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             found(&report, "holds no sample between the first window opening"),
             "{:?}",
@@ -1543,7 +1667,7 @@ mod tests {
             names, unique,
             "a channel bound twice routes one of them nowhere"
         );
-        assert_eq!(names.len(), 5, "five streams is what a tour is judged on");
+        assert_eq!(names.len(), 6, "six streams is what a tour is judged on");
     }
 
     /// What the log itself said about the channels it carried reaches the
@@ -1556,7 +1680,7 @@ mod tests {
             count: 42,
             first_seq: Some(0),
         });
-        let report = analyze(&run, &table(), SHIPPED_PROFILE);
+        let report = analyze(&run, &table(), &shipped());
         assert!(
             measured(&report, &format!("{POSE_CHANNEL} x42")),
             "{:?}",

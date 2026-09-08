@@ -88,6 +88,9 @@ enum RegId
         #22 model_number { underlying_value: 22; }
         // The measured temperature at the servo, degrees Celsius.
         #23 present_temperature { underlying_value: 23; }
+        // The acceleration ceiling the profile's own acceleration is bounded
+        // by. A profile written past it is refused by the servo.
+        #24 acceleration_limit { underlying_value: 24; }
     }
 }
 

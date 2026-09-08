@@ -192,6 +192,30 @@ pub(crate) struct FakeMachine {
     pub(crate) keeps_latch: Vec<u8>,
     /// One servo's Bus Watchdog, if a case scripted one.
     pub(crate) watchdog: Option<BusWatchdogModel>,
+    /// Reads of a register a servo answers before it stops answering for good,
+    /// counted down as they arrive: a servo that goes away part way through a
+    /// phase, said as "after this many readings" rather than as a count of the
+    /// transactions the phases before it happened to take.
+    pub(crate) deafens_after: HashMap<(u8, u16), u32>,
+    /// The host's clock and what one frame costs on it, for a command whose
+    /// loop is bounded by time rather than by a count of exchanges.
+    ///
+    /// Without it a command that reads as fast as the bus answers never
+    /// advances a test clock at all, because nothing in such a loop sleeps: the
+    /// wire is what passes the time on a real bus, and this is the wire saying
+    /// so. Shared with the clock the command reads.
+    pub(crate) wire_time: Option<(Rc<Cell<Duration>>, Duration)>,
+    /// Every unicast write that crossed the wire, as (servo, address, bytes),
+    /// in the order they arrived — including the ones this machine then
+    /// refused or dropped, because what a case asks about is what the host
+    /// sent. The register file holds only the last of a repeated write, and a
+    /// command that rewrites one register in a loop is judged on the whole run
+    /// of them.
+    pub(crate) written: Vec<(u8, u16, Vec<u8>)>,
+    /// Per servo, the counts its Present Position reads back as, one per read
+    /// and cycling: a joint that is not standing still, scripted as the series
+    /// a reader would see rather than as a mechanism.
+    pub(crate) wobble: HashMap<u8, VecDeque<i32>>,
     out: VecDeque<u8>,
 }
 
@@ -216,8 +240,38 @@ impl FakeMachine {
             deaf_to_reboot: Vec::new(),
             keeps_latch: Vec::new(),
             watchdog: None,
+            deafens_after: HashMap::new(),
+            wire_time: None,
+            written: Vec::new(),
+            wobble: HashMap::new(),
             out: VecDeque::new(),
         }
+    }
+
+    /// Let this machine spend `per_frame` of `now` on every frame it is sent.
+    pub(crate) fn spends_time(&mut self, now: &Rc<Cell<Duration>>, per_frame: Duration) {
+        self.wire_time = Some((Rc::clone(now), per_frame));
+    }
+
+    /// Script `id`'s position readings as a cycle of counts, one per read.
+    pub(crate) fn wobbles(&mut self, id: u8, counts: &[i32]) {
+        self.wobble.insert(id, counts.iter().copied().collect());
+    }
+
+    /// Take the next scripted reading for `id`, if it has a script.
+    ///
+    /// Rotating rather than draining, so a phase longer than the script is a
+    /// series that repeats rather than one that stops: the shape of a wobble is
+    /// what a case is written about, and its length is not.
+    fn wobbled(&mut self, id: u8) {
+        let Some(series) = self.wobble.get_mut(&id) else {
+            return;
+        };
+        let Some(next) = series.pop_front() else {
+            return;
+        };
+        series.push_back(next);
+        self.set(id, named_reg(RegId::PresentPosition), &next.to_le_bytes());
     }
 
     pub(crate) fn set(&mut self, id: u8, reg: Reg, bytes: &[u8]) {
@@ -343,6 +397,16 @@ impl FakeMachine {
     /// Whether this servo answers a read of `addr` at all, spending one count
     /// of a dropout if it is in the middle of one.
     fn hushed(&mut self, id: u8, addr: u16) -> bool {
+        // Counted before anything else answers: a servo with a countdown on it
+        // goes away on the reading after the last one it was given.
+        if let Some(left) = self.deafens_after.get_mut(&(id, addr)) {
+            match *left {
+                0 => {
+                    self.deaf.insert((id, addr));
+                }
+                _ => *left -= 1,
+            }
+        }
         if self.silent.contains(&id) {
             return true;
         }
@@ -469,6 +533,12 @@ impl BusPort for FakeMachine {
         let len = usize::from(u16::from_le_bytes([buf[5], buf[6]]));
         let instruction = buf[7];
         let params = &buf[8..8 + len - 3];
+        // Before the silence check: a frame sent to a servo that answers
+        // nothing still spent its time on the wire, and a command waiting for
+        // that answer waits the same as for any other.
+        if let Some((now, per_frame)) = &self.wire_time {
+            now.set(now.get() + *per_frame);
+        }
         if self.silent.contains(&id) {
             return Ok(());
         }
@@ -496,6 +566,7 @@ impl BusPort for FakeMachine {
                 }
                 if addr == named_reg(RegId::PresentPosition).addr {
                     self.crept(id);
+                    self.wobbled(id);
                 }
                 let error = self.errors.get(&(id, addr)).copied().unwrap_or(0);
                 let source = self.source(id, addr);
@@ -505,6 +576,7 @@ impl BusPort for FakeMachine {
             }
             INST_WRITE => {
                 let addr = u16::from_le_bytes([params[0], params[1]]);
+                self.written.push((id, addr, params[2..].to_vec()));
                 // A tripped watchdog refuses the write instead of taking it,
                 // which is the signature a host sees rather than a value that
                 // went in.

@@ -42,12 +42,55 @@ export PATH
 export CALLS="${work}/calls"
 export GIT_COMMIT_TIME=""
 export SSH_RUN_STATUS=0
+export SSH_CAT_STATUS=0
+export SSH_TAR_STATUS=0
+export TAR_OMITS=""
+export PROBE_FILES=""
 
 # Every stub records its whole invocation on one line, so a case can assert
 # both that a command ran and that it did not.
 cat >"${stubs}/ssh" <<'STUB'
 #!/usr/bin/env bash
 printf 'ssh %s\n' "$*" >>"$CALLS"
+# The state file, which only a selftest writes: a device that has run one
+# answers, and one that has not is the case's to say.
+for arg in "$@"; do
+	case "$arg" in
+		"cat "*selftest-state.toml)
+			[ "${SSH_CAT_STATUS:-0}" = 0 ] || exit "$SSH_CAT_STATUS"
+			printf 'state of the bench\n'
+			exit 0
+			;;
+	esac
+done
+# The listing of the probe's series: what a device holds is the case's to say,
+# and an empty answer is a device where the probe never ran.
+for arg in "$@"; do
+	case "$arg" in
+		*"ls -1"*hold-probe*) printf '%s\n' ${PROBE_FILES:-} ; exit 0 ;;
+	esac
+done
+# The stream carrying the series: a tar of the names asked for, each holding a
+# line that says which file it is, so a case can tell the fetched files apart.
+# A case can make the stream fail outright, or leave one name out of it.
+for arg in "$@"; do
+	case "$arg" in
+		"tar -cf -"*hold-probe*)
+			[ "${SSH_TAR_STATUS:-0}" = 0 ] || exit "$SSH_TAR_STATUS"
+			names=${arg##*-- }
+			staging=$(mktemp -d)
+			sent=()
+			for name in $names; do
+				[ "$name" = "${TAR_OMITS:-}" ] && continue
+				printf 'series of %s\n' "$name" >"${staging}/${name}"
+				sent+=("$name")
+			done
+			[ ${#sent[@]} -gt 0 ] && tar -cf - -C "$staging" -- "${sent[@]}"
+			rm -rf -- "$staging"
+			exit 0
+			;;
+	esac
+done
 # Only the run itself carries a status worth faking; the mkdir before it, and
 # the fetch's cat, succeed.
 for arg in "$@"; do
@@ -186,6 +229,172 @@ assert_status "ssh failing is not a hardware reading" 1 "$(status_of "$result")"
 assert_contains "ssh failing says so" "$(output_of "$result")" "did not run"
 
 SSH_RUN_STATUS=0
+
+# ---------------------------------------------------------------------------
+# What a fetch brings back
+# ---------------------------------------------------------------------------
+
+# Each case runs with its own device listing and its own destination, set here
+# rather than left as file-scope state a later case would inherit: a stub that
+# answers with the previous case's series is a test-harness bug that reads as a
+# product one.
+# Not a subshell: the assertions inside a case count towards this file's tally
+# and a failure inside one has to fail the run.
+with_probes() {
+	local name=$1 files=$2 case=$3
+	PROBE_FILES="$files"
+	records="${work}/records-${name}"
+	rm -rf -- "$records"
+	"$case"
+	PROBE_FILES=""
+	records=""
+}
+
+fetch_case_with_no_series() {
+result=$(deploy unit --fetch "$records")
+assert_status "a fetch with no probe series is a fetch" 0 "$(status_of "$result")"
+assert_eq "the state file lands under a timestamped name" 1 \
+	"$(find "$records" -name 'selftest-state-*.toml' | wc -l)"
+assert_eq "a device that never probed brings back no series" 0 \
+	"$(find "$records" -name 'hold-probe-*.csv' | wc -l)"
+}
+with_probes none "" fetch_case_with_no_series
+
+fetch_case_with_two_series() {
+result=$(deploy unit --fetch "$records")
+assert_status "a fetch with two series is a fetch" 0 "$(status_of "$result")"
+assert_eq "each series lands under the name the bench gave it" 2 \
+	"$(find "$records" -name 'hold-probe-*.csv' | wc -l)"
+assert_contains "the series is the device's file, not an empty one" \
+	"$(cat "${records}/hold-probe-1750000000-17.csv")" \
+	"hold-probe-1750000000-17.csv"
+assert_contains "each fetched path is printed" "$(output_of "$result")" \
+	"hold-probe-1750000001-18.csv"
+assert_eq "no part file is left behind" 0 "$(find "$records" -name '*.part' | wc -l)"
+assert_eq "no staging directory is left behind" 0 \
+	"$(find "$records" -name '.probe-part' | wc -l)"
+
+# One connection carries every series, whatever the count: a session of many
+# runs must not cost a handshake each.
+assert_eq "the series come back in one stream" 1 \
+	"$(grep -c 'tar -cf -' "$CALLS")"
+
+# A second fetch into the same directory lands nothing new: the bytes that
+# come back are the bytes already here, so the local copy stands and the fetch
+# says so. The stream still runs — the device's clock is what a name rests on,
+# and only the content can say whether two names are the same reading.
+: >"$CALLS"
+result=$(deploy unit --fetch "$records")
+assert_status "a second fetch is a fetch" 0 "$(status_of "$result")"
+assert_contains "a series already here says so" "$(output_of "$result")" "already here"
+assert_eq "and it is still the device's file" "series of hold-probe-1750000000-17.csv" \
+	"$(cat "${records}/hold-probe-1750000000-17.csv")"
+assert_eq "no staging directory survives it" 0 \
+	"$(find "$records" -name '.probe-part' | wc -l)"
+
+# A local copy of the same name holding different readings is a collision the
+# operator settles: the device's clock can repeat a stamp across a boot, and
+# neither copy is thrown away for the other.
+printf 'a different reading\n' >"${records}/hold-probe-1750000000-17.csv"
+result=$(deploy unit --fetch "$records")
+assert_status "a name reused for different readings refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the file and the cause" "$(output_of "$result")" \
+	"holding different readings"
+assert_eq "and it leaves the local copy alone" "a different reading" \
+	"$(cat "${records}/hold-probe-1750000000-17.csv")"
+assert_eq "and no staging directory behind it" 0 \
+	"$(find "$records" -name '.probe-part' | wc -l)"
+}
+with_probes two \
+	"/var/lib/brenn-app/hold-probe-1750000000-17.csv /var/lib/brenn-app/hold-probe-1750000001-18.csv" \
+	fetch_case_with_two_series
+
+# A stream that fails partway leaves nothing behind under a name a later fetch
+# would take for a whole series -- which is what the staging directory is for.
+fetch_case_with_a_stream_that_fails() {
+SSH_TAR_STATUS=1
+result=$(deploy unit --fetch "$records")
+SSH_TAR_STATUS=0
+assert_status "a stream that failed is a failed fetch" 1 "$(status_of "$result")"
+assert_contains "and it says which host" "$(output_of "$result")" \
+	"could not fetch the probe series"
+assert_eq "no series is left behind" 0 "$(find "$records" -name 'hold-probe-*.csv' | wc -l)"
+assert_eq "and no staging directory is" 0 "$(find "$records" -name '.probe-part' | wc -l)"
+}
+with_probes stream-fails \
+	"/var/lib/brenn-app/hold-probe-1750000000-17.csv /var/lib/brenn-app/hold-probe-1750000001-18.csv" \
+	fetch_case_with_a_stream_that_fails
+
+# A stream that came back short is the same answer: the series that did arrive
+# are not moved into place under a partial fetch.
+fetch_case_with_a_short_stream() {
+TAR_OMITS="hold-probe-1750000001-18.csv"
+result=$(deploy unit --fetch "$records")
+TAR_OMITS=""
+assert_status "a short stream is a failed fetch" 1 "$(status_of "$result")"
+assert_contains "the missing series is named" "$(output_of "$result")" \
+	"sent no hold-probe-1750000001-18.csv"
+assert_eq "nothing lands from a partial stream" 0 \
+	"$(find "$records" -name 'hold-probe-*.csv' | wc -l)"
+assert_eq "and no staging directory is left" 0 "$(find "$records" -name '.probe-part' | wc -l)"
+}
+with_probes short-stream \
+	"/var/lib/brenn-app/hold-probe-1750000000-17.csv /var/lib/brenn-app/hold-probe-1750000001-18.csv" \
+	fetch_case_with_a_short_stream
+
+# The listing comes out of a directory the unprivileged account owns and this
+# fetch runs as root: a name that is not the shape the bench writes never
+# reaches a command line.
+fetch_case_with_an_unexpected_name() {
+result=$(deploy unit --fetch "$records")
+assert_status "a name the bench would not have written refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the file" "$(output_of "$result")" "unexpected file"
+assert_eq "and nothing was streamed" 0 "$(grep -c 'tar -cf -' "$CALLS")"
+}
+with_probes odd-name \
+	'/var/lib/brenn-app/hold-probe-1;touch\ /tmp/pwned.csv' \
+	fetch_case_with_an_unexpected_name
+
+# Only a selftest writes the state file, and the probe's own procedure is runs
+# of hold-probe and then a fetch: a missing state file must not strand the
+# series the session took.
+fetch_case_with_no_state_file() {
+SSH_CAT_STATUS=1
+result=$(deploy unit --fetch "$records")
+SSH_CAT_STATUS=0
+assert_status "a fetch with no state file is still a fetch" 0 "$(status_of "$result")"
+assert_contains "and it says the state file is not there" "$(output_of "$result")" \
+	"no state file"
+assert_eq "the series still come back" 2 "$(find "$records" -name 'hold-probe-*.csv' | wc -l)"
+assert_eq "and no empty record is left behind" 0 \
+	"$(find "$records" -name 'selftest-state-*.toml' | wc -l)"
+}
+with_probes no-state \
+	"/var/lib/brenn-app/hold-probe-1750000000-17.csv /var/lib/brenn-app/hold-probe-1750000001-18.csv" \
+	fetch_case_with_no_state_file
+
+# Neither half there is a fetch that found nothing, which is a failure.
+fetch_case_with_nothing_at_all() {
+SSH_CAT_STATUS=1
+result=$(deploy unit --fetch "$records")
+SSH_CAT_STATUS=0
+assert_status "a device holding neither refuses" 1 "$(status_of "$result")"
+assert_contains "and says so" "$(output_of "$result")" "nothing to fetch"
+}
+with_probes nothing "" fetch_case_with_nothing_at_all
+
+# ---------------------------------------------------------------------------
+# The name the bench writes a series under is the name this script globs for
+# ---------------------------------------------------------------------------
+
+# Nothing joins a Rust format string to a shell glob but the text itself. The
+# binary asserts it writes this prefix; this asserts the script looks for the
+# same one, so a rename on either side fails here rather than fetching nothing.
+declared=$(sed -n 's/^pub const HOLD_PROBE_SERIES_PREFIX: &str = "\(.*\)";$/\1/p' \
+	"${script_dir}/../crates/reachy-bench/src/bare.rs")
+globbed=$(sed -n 's/^probe_prefix="\(.*\)"$/\1/p' "$subject")
+assert_eq "the bench states a series prefix" "hold-probe-" "$declared"
+assert_eq "the fetch globs for the prefix the bench writes" "$declared" "$globbed"
 
 # ---------------------------------------------------------------------------
 

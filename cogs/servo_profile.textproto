@@ -6,11 +6,18 @@
 # is: the box binds it by path, and the casing converts it to the message the
 # dial hands the cog.
 #
-# One file, two readers. The session writes this pair into all nine servos when
-# it commissions the machine; the decision tick builds its plant model from the
-# same pair, so what it judges a joint against is the trajectory the machine's
-# own generators are running. A second statement of either number is a screen
-# sized for a machine nobody commissioned.
+# One file, two readers. The session writes these pairs into the nine servos
+# when it commissions the machine; the decision tick builds its plant models
+# from the same pairs, so what it judges a joint against is the trajectory the
+# machine's own generators are running. A second statement of any of these
+# numbers is a screen sized for a machine nobody commissioned.
+#
+# One pair per servo class, stated as six flat keys. The classes are separate
+# because their motors and their Velocity Limits are: the antennas' Velocity
+# Limit register reads 1620 and the seven head servos' reads 445, so what the
+# antennas can be commissioned with is not what the head can. Flat keys rather
+# than a nested pair message because every reader here is a first-match
+# `key: value` line scan.
 
 # The servo-side motion profile the commission sequencer writes, in the
 # registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
@@ -33,7 +40,14 @@
 # step-bounded setpoints instead, one per cycle, which is what the low pair is
 # for.
 #
+# All three classes carry the one measured pair: no per-class capability has
+# been measured yet, so a class running a different pair would be a guess.
+#
 # Zero in either register is a servo with no generator at all. Both readers
-# refuse it before anything is commanded.
-profile_acceleration: 20
-profile_velocity: 50
+# refuse it, per class, before anything is commanded.
+legs_profile_acceleration: 20
+legs_profile_velocity: 50
+body_yaw_profile_acceleration: 20
+body_yaw_profile_velocity: 50
+antennas_profile_acceleration: 20
+antennas_profile_velocity: 50

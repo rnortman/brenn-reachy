@@ -29,6 +29,7 @@
 //! deterministic runner puts every sample on the grid exactly and a scenario
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
+use reachy_motion::joints::JointGroup;
 use scenario::author::Step;
 use scenario::{LAG_K, cycle_at, run_end_cycle};
 
@@ -107,7 +108,10 @@ pub fn end_cycle() -> i64 {
 /// this, and what the assertion needs is a cycle by which it certainly has.
 #[must_use]
 pub fn turnaround_cycles() -> i64 {
-    LAG_K + scenario::response_delay_cycles() + retarget_after() + scenario::ramp_cycles()
+    LAG_K
+        + scenario::response_delay_cycles()
+        + retarget_after()
+        + scenario::ramp_cycles(JointGroup::Legs)
 }
 
 /// The two steps of the script: upright, and then stow from part way there.

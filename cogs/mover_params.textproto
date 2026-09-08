@@ -21,3 +21,10 @@ up_duration_ns: 800000000
 # 2.0 s to stow. Longer than the way up: stowing is how every session ends and
 # it is done gently.
 stow_duration_ns: 2000000000
+
+# The tracking detector judges every joint. False is for a capability run alone
+# -- a measurement commissioned at a profile the motors cannot follow, where
+# the model is known wrong -- and no shipped configuration carries it. The
+# scenario suite pins this true, and both analyzers fail any run whose recorded
+# configuration says otherwise.
+tracking_armed: true

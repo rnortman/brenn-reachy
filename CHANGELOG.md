@@ -11,6 +11,51 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Added
 
+- **Servo profiles and gains are per-class and tunable without a code change.**
+  The nine servos fall into three classes — the six Stewart-platform legs, the
+  body yaw, and the two antennas — each with its own load and its own Velocity
+  Limit register. The commissioning sweep now writes each class its own
+  acceleration/velocity profile pair and its own PID gains triple, read from two
+  checked-in configuration files (`servo_profile.textproto`,
+  `servo_gains.textproto`). The plant model and tracking detector follow: one
+  trapezoid per class, so a profile tuned to the antennas does not predict the
+  legs. All three classes ship at the same conservative pair today; the split is
+  the infrastructure the tuning procedure below needs to move them apart.
+
+- **A servo tuning guide and experiment overlay.** `docs/servo-tuning.md` is the
+  procedure for measuring what the motors achieve under the library's load,
+  choosing a profile pair per class, and confirming the tracking detector still
+  works under the new numbers. A new experiment overlay
+  (`REACHY_EXPERIMENT_DIR`) lets a push replace the profile, gains, or mover
+  parameters without editing the tree: the overlay is named on the console with
+  its digest, copied into the run's log alongside the rest of the
+  configuration, and both analyzers read the run's own files rather than the
+  tree's — so a fetched run carries the numbers that produced it. A disarmed
+  detector is always a failed run.
+
+- **Both analyzers measure servo capability.** A new section in each report
+  counts the samples each joint spent chasing a moving setpoint, prints the
+  per-period travel distribution against the servo's recorded Velocity Limit,
+  and reports the ramp — the acceleration the motor managed when it set off from
+  rest. The health section now reads the whole series per servo rather than just
+  the last sample: voltage range, temperature rise, peak and when, and the worst
+  error byte the run latched. A peak reaching 50 °C fails the run; the figure
+  is 13 °C over the hottest a healthy library tour has produced and 20 °C under
+  the servo's own shutdown. The per-class residual lines print the shipped
+  profile's p99.9 from three baseline tours as a range, which is the noise floor
+  a candidate's figure is read against.
+
+- **A bench hold probe for single-servo tuning.** `make bench-run
+  ARGS="hold-probe <id>"` torques one servo where it stands, writes goals at
+  the control rate, records the position series through two phases (with and
+  without goal writes), judges the excursion against the stillness watch's
+  bound, and writes the series as a CSV the fetch brings home. An operator can
+  swap in trial gains before the hold, and the probe restores the originals and
+  releases torque on every exit path. The stillness watch's hold-window line
+  now carries interval statistics — mean and spread of the time between
+  reversals, and the apparent oscillation frequency — so a regular limit cycle
+  reads differently from encoder dither.
+
 - **The antennas rest off vertical, and a stillness watch measures whether they
   stay still.** At exactly vertical the gearbox backlash leaves the antenna rod
   balanced on the play with nothing biasing it to one side, and the servo's

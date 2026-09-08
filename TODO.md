@@ -400,11 +400,11 @@ wants an answer of its own with it. Marked at `Answer` in `cogs/sim_aux.rs`.
 Give the servo-side velocity/acceleration profile the commissioning sweep writes
 a measured value.
 
-Deferral context: the configuration half is done — `profile_acceleration` and
-`profile_velocity` are the two fields of `ServoProfile`, shipped as 20 / 50
-register units in `cogs/servo_profile.textproto`, which the session and the
-decision tick both read; `check::commissioned_profile` pins the file's values to
-the writes that reach all nine servos. What remains is the measurement. The
+Deferral context: the configuration half is done — `ServoProfile` states one
+acceleration/velocity pair per servo class, six flat fields shipped as 20 / 50
+register units each in `cogs/servo_profile.textproto`, which the session and the
+decision tick both read; `check::commissioned_profile` pins each class's values
+to the writes that reach that class's servos. What remains is the measurement. The
 shipped pair was chosen as a modest backstop for a host that streams one
 step-bounded setpoint per period. It is an
 order of magnitude below the figures the bench ran (400 / 600, trial-validated,
@@ -1133,22 +1133,47 @@ measurement, and `TODO(session-servo-profile)` is the one that takes it.
 
 Done = either the stillness section passes on hardware with the gains untouched
 and the stale sweep rationale rewritten, or the gains carry a figure measured
-against the run that moved them. Marked at `DEFAULT_GAINS.antennas` in
-`crates/reachy-motion/src/arm.rs`.
+against the run that moved them. A rung is now a number in
+`cogs/servo_gains.textproto` rather than a code edit, and the library's own
+`DEFAULT_GAINS` is what that file is pinned to, so a trial that lands is two
+statements moved together. Marked at both: the antennas' triple in that file
+and `DEFAULT_GAINS.antennas` in `crates/reachy-motion/src/arm.rs`.
 
 ## `antenna-hold-fixture`
 
-Cut two replay fixtures out of a recorded antenna hold: a
-`fixtures/traces/trace-antenna-hunt.csv` with a case asserting the stillness
-watch fails it, and a post-fix `trace-antenna-still.csv` asserting it passes at
-the bound baked from that run.
+Cut a `fixtures/traces/trace-antenna-still.csv` out of a recorded antenna hold
+that was quiet, with a case asserting the stillness watch passes it at the
+bound baked from that run.
 
-Deferral context: the exporter this needed is `//cogs:trace_export`, which
-takes a log directory and a pair of nominal instants and writes the trace CSV
-the replay suite reads. What is left is the recording, which does not exist
-until the hardware hold test has been run, and the two windows cut out of it.
-The parser's constraints are recorded beside `fixture` in
-`crates/reachy-motion/tests/replay_trace.rs`, where the cases go.
+Deferral context: the hunting half is done —
+`fixtures/traces/trace-antenna-hunt.csv` carries the 2026-09-07 raise and the
+replay suite fails the left antenna over it and passes the right. The still
+half waits on a run whose antennas hold inside the bound, which is what the
+gains ladder is for; there is no such recording yet. The cutter is
+`//cogs:trace_export`, which takes a log directory and a pair of nominal
+instants; cut from before the raise's last goal write, so the shipped settle
+allowance is spent inside the file and the watch opens the window the live one
+opened. The parser's constraints are recorded beside `fixture` in
+`crates/reachy-motion/tests/replay_trace.rs`, where the case goes.
 
-Done = both fixtures are checked in and the replay suite fails on the hunting
-one and passes the still one.
+Done = the still fixture is checked in and the replay suite passes it.
+
+## `bench-probe-series-retention`
+
+Decide what the device keeps of the hold probe's series, and make the fetch or
+the bench enforce it: today every probe run writes a CSV into the account's
+home and nothing ever removes one.
+
+Deferral context: that home is a tmpfs, so the series are RAM the device gives
+up nothing else for, and a tuning session is many runs by design — a minute-long
+run is a few megabytes. The fetch no longer re-copies what it already has and
+takes two connections whatever the count, so the cost that remains is device
+memory alone. The two answers are not equivalent and neither is the tooling's to
+pick: removing a series once it has been fetched makes the fetch the only copy,
+and bounding what the device keeps drops the oldest evidence of a session while
+it is still running. Both are decisions about how long a hardware reading
+survives, which is the operator's call. The mark is at the listing in
+`tools/deploy-bench.sh`.
+
+Done = the device's retention is bounded by something, and the rule is written
+down where an operator reads it.

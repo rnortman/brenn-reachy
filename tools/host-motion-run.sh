@@ -86,6 +86,18 @@ launch_config_target=//cogs:hostcpu.textproto
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 config_target=//cogs:host_config_files
 
+# The configuration files a run carries home beside its records, at their
+# staging-relative paths. Out of the staging and not out of the tree: what the
+# system read is what was staged, which is the same rule the logger
+# configuration below is read under. The three a deploy overlay can vary and the three an
+# analyzer reads: the profile it judges the residual against, the gains, and
+# whether the tracking detector was armed.
+run_config_files=(
+	cogs/servo_profile.textproto
+	cogs/servo_gains.textproto
+	cogs/mover_params.textproto
+)
+
 # The generated files a process reads, by basename: three process descriptions
 # and the writer's channel set. Flattened into `cogs/`, which is where the
 # launcher config's args say they are.
@@ -296,4 +308,12 @@ run_dir=$(run_directory "$logs" \
 	"Either it never started or it could not open a file there; its output is under ${launch_logs}." \
 	"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare ${logger_config} against the flagless defaults every process here runs on.")
 echo "${prog}: log  ${run_dir}"
+# The configuration this run was performed under, beside its records, the way a
+# device run carries it home: the analyzer reads a log's own `config/` and
+# refuses a log with none. From the tree's copies, which is what this run ran on
+# -- `stage` installed those same files into the staging the system read.
+for file in "${run_config_files[@]}"; do
+	install -m 0644 -D -- "${staging}/${file}" "${run_dir}/config/${file}"
+done
+
 report_verdict "$run_dir" --grid-jitter-ns "$grid_jitter_ns"

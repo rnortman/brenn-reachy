@@ -88,14 +88,12 @@ a backstop the sender sizes, and reaching it fails the run.
 fault, every window moving the machine, no gap in the samples. It prints
 residual, lag, peak step and antenna separation for **Open observations**.
 
-## The hold test
+## The hold test, and tuning
 
-`make motion-run`, then read `stillness`: antennas judged, head printed.
-T0: a kept, committed branch off the fix, `NEUTRAL_ANTENNAS` `[0.0, 0.0]`, sign
-test flipped. Expect failure; record figures and directory under **Open
-observations**. T1 is `main`; never widen the bound. A pre-raise hold is
-arm-time stow, not rest. Trials, fixture: `TODO.md`'s `antenna-hold-gains`,
-`antenna-hold-fixture`.
+`make motion-run`, then read `stillness`: antennas judged, head printed; never
+widen the bound. The gains and profile ladders, the `hold-probe` command, the
+`REACHY_EXPERIMENT_DIR` overlay and the record of every run read so far are
+`docs/servo-tuning.md`.
 
 ## The speech run
 

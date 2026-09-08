@@ -37,6 +37,8 @@ use core::f64::consts::TAU;
 
 use thiserror::Error;
 
+use crate::joints::{JointGroup, PerGroup};
+
 /// Radians per second per least-significant bit of the Profile Velocity
 /// register, whose own unit is 0.229 rev/min.
 ///
@@ -56,14 +58,34 @@ pub const PROFILE_VELOCITY_UNIT_RAD_PER_S: f64 = 0.229 * TAU / 60.0;
 /// Restated here for the reason the velocity unit above it is.
 pub const PROFILE_ACCELERATION_UNIT_RAD_PER_S2: f64 = 214.577 * TAU / 3600.0;
 
-/// The profile pair this deployment ships, in register units: acceleration
-/// first, then velocity, the order the configuration file writes them in.
+/// One servo class's two profile registers: acceleration first, then velocity,
+/// the order the configuration file writes them in.
+pub type ProfilePair = (u32, u32);
+
+/// The profile registers per class of servo.
 ///
-/// Here rather than only in that file because the tests are written against
-/// these two numbers, and a suite pinning a machine no deployment runs is a
-/// suite about nothing. What keeps the two statements together is the scenario
-/// harness's parameter check, which reads the file and compares it with this.
-pub const SHIPPED_PROFILE: (u32, u32) = (20, 50);
+/// Three pairs and not one because the classes are three different loads on
+/// two different XL330 variants: the antennas' Velocity Limit is 1620 register
+/// units against the head's 445, so a pair the antennas can hold is a pair the
+/// head's servos refuse.
+pub type GroupProfiles = PerGroup<ProfilePair>;
+
+/// The profile pairs this deployment ships, in register units.
+///
+/// Here rather than only in the configuration file because the tests are
+/// written against these numbers, and a suite pinning a machine no deployment
+/// runs is a suite about nothing. What keeps the two statements together is the
+/// scenario harness's parameter check, which reads the file and compares it
+/// with this.
+///
+/// All three classes carry one pair today: it is the measured velocity cap of
+/// the recorded library tour, and no per-class capability has been measured
+/// yet. TODO(session-servo-profile)
+pub const SHIPPED_PROFILES: GroupProfiles = GroupProfiles {
+    legs: (20, 50),
+    yaw: (20, 50),
+    antennas: (20, 50),
+};
 
 /// The control period this deployment ships, nanoseconds.
 ///
@@ -169,16 +191,53 @@ pub enum PlantError {
     },
 }
 
-impl Default for PlantModel {
-    /// The shipped profile at the shipped period.
+/// The three classes' generators, as commissioned.
+///
+/// What a joint is judged against is its own class's model: one model for nine
+/// servos would predict the antennas' trajectory from the legs' registers, and
+/// a residual measured that way is the difference between two configurations
+/// rather than between a machine and its own generator.
+pub type GroupPlants = PerGroup<PlantModel>;
+
+/// Why a class's profile could not be modelled: which class, and what about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the {}'s profile is no generator: {source}", .group.name())]
+pub struct GroupPlantError {
+    /// The class whose pair was refused.
+    pub group: JointGroup,
+    /// What was wrong with it.
+    pub source: PlantError,
+}
+
+impl GroupPlants {
+    /// The three models these three pairs describe, stepped on a grid of
+    /// `period_ns`.
+    ///
+    /// # Errors
+    ///
+    /// The first class whose pair is not a generator, named. A refusal here is
+    /// a process that does not start: a tick judging joints against a
+    /// trajectory nothing runs is worse than one that never ticks.
+    pub fn from_profiles(
+        profiles: &GroupProfiles,
+        period_ns: i64,
+    ) -> Result<Self, GroupPlantError> {
+        profiles.try_map(|group, (acceleration, velocity)| {
+            PlantModel::from_registers(velocity, acceleration, period_ns)
+                .map_err(|source| GroupPlantError { group, source })
+        })
+    }
+}
+
+impl Default for GroupPlants {
+    /// The shipped profiles at the shipped period.
     ///
     /// For the tests and for the default configuration a test host builds. A
-    /// process reads its own two registers and its own period instead: this is
+    /// process reads its own registers and its own period instead: this is
     /// what the deployment ships, not what any given machine is running.
     fn default() -> Self {
-        let (acceleration, velocity) = SHIPPED_PROFILE;
-        Self::from_registers(velocity, acceleration, SHIPPED_PERIOD_NS)
-            .expect("the shipped profile pair and period are a model")
+        Self::from_profiles(&SHIPPED_PROFILES, SHIPPED_PERIOD_NS)
+            .expect("the shipped profile pairs and period are three models")
     }
 }
 
@@ -327,6 +386,14 @@ impl PlantModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joints::{ROWS, group_of};
+
+    /// The model a class of the shipped machine runs, which all three classes
+    /// share today. The cases below are about the arithmetic of one generator,
+    /// so they take one.
+    fn shipped() -> PlantModel {
+        GroupPlants::default().legs
+    }
 
     /// The state schema's setpoint ring is exactly as deep as the dead time it
     /// is the storage for.
@@ -347,7 +414,7 @@ mod tests {
     /// stated to.
     #[test]
     fn the_shipped_model_is_the_configured_pair_per_period() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         assert!(
             (plant.v_max - 0.023981).abs() < 5e-6,
             "v_max is {}",
@@ -369,7 +436,7 @@ mod tests {
     /// eight, and the eighth period ends a thousandth of the cap short of it.
     #[test]
     fn a_move_from_rest_reaches_the_cap_in_the_ramp_and_never_exceeds_it() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         let ramp = (plant.v_max / plant.a_max).ceil() as usize;
         assert_eq!(ramp, 9, "the shipped pair's ramp");
         let mut state = Predicted::default();
@@ -396,7 +463,7 @@ mod tests {
     /// [`CLOSED_FORM_SLACK`] the two arithmetics differ by.
     #[test]
     fn a_long_move_takes_the_time_the_closed_form_states() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         for distance in [1.0, 2.875, 2.0 * TAU] {
             let stepped = periods_to_arrive(&plant, distance);
             let closed = plant.travel_cycles(distance) - RESPONSE_DEAD_SAMPLES;
@@ -411,7 +478,7 @@ mod tests {
     /// past it.
     #[test]
     fn a_short_move_is_a_triangle_that_does_not_overshoot() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         let target = 0.05;
         assert!(
             target < plant.v_max * plant.v_max / plant.a_max,
@@ -441,7 +508,7 @@ mod tests {
     /// acceleration and never jumps.
     #[test]
     fn a_target_reversal_decelerates_rather_than_stepping() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         let mut state = Predicted::default();
         for _ in 0..40 {
             plant.step(&mut state, 10.0);
@@ -479,7 +546,7 @@ mod tests {
     /// here, which is a fifth of the travel this asserts.
     #[test]
     fn a_target_update_mid_move_keeps_the_velocity_it_had() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         let mut running = Predicted::default();
         for _ in 0..4 {
             plant.step(&mut running, 10.0);
@@ -521,6 +588,99 @@ mod tests {
         }
     }
 
+    /// Every bus row reads its own class's pair, and the three classes are
+    /// three separate models.
+    ///
+    /// Table-driven over all nine rows, because the mapping is what a differing
+    /// antenna pair would otherwise get silently wrong: a row read as the legs'
+    /// would be judged against a generator its servo is not running.
+    #[test]
+    fn every_row_reads_its_own_classs_profile_and_model() {
+        let profiles = GroupProfiles {
+            legs: (20, 50),
+            yaw: (30, 60),
+            antennas: (40, 70),
+        };
+        let plants = GroupPlants::from_profiles(&profiles, SHIPPED_PERIOD_NS)
+            .expect("three pairs and a grid are three models");
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            let expected = match group_of(joint) {
+                Some(JointGroup::BodyYaw) => profiles.yaw,
+                Some(JointGroup::Antennas) => profiles.antennas,
+                _ => profiles.legs,
+            };
+            assert_eq!(profiles.for_row(row), expected, "row {row}");
+            assert_eq!(profiles.for_joint(joint), expected, "{joint:?}");
+            let (acceleration, velocity) = expected;
+            assert_eq!(
+                plants.for_row(row),
+                PlantModel::from_registers(velocity, acceleration, SHIPPED_PERIOD_NS)
+                    .expect("the case's pairs are models"),
+                "row {row}"
+            );
+            assert_eq!(plants.for_joint(joint), plants.for_row(row), "{joint:?}");
+        }
+        assert_eq!(plants.of(JointGroup::Legs), plants.legs);
+        assert_eq!(plants.of(JointGroup::BodyYaw), plants.yaw);
+        assert_eq!(plants.of(JointGroup::Antennas), plants.antennas);
+    }
+
+    /// The shipped triple is three copies of one model, which is what makes the
+    /// per-class plumbing a no-op on today's configuration.
+    #[test]
+    fn the_shipped_triple_is_three_models_of_the_one_shipped_pair() {
+        let plants = GroupPlants::default();
+        let one = PlantModel::from_registers(50, 20, SHIPPED_PERIOD_NS)
+            .expect("the shipped pair is a model");
+        assert_eq!(plants.legs, one);
+        assert_eq!(plants.yaw, one);
+        assert_eq!(plants.antennas, one);
+    }
+
+    /// A zero in any one class is refused, and the refusal names the class.
+    #[test]
+    fn a_class_whose_generator_is_disabled_is_refused_by_name() {
+        for (group, profiles) in [
+            (
+                JointGroup::Legs,
+                GroupProfiles {
+                    legs: (20, 0),
+                    ..SHIPPED_PROFILES
+                },
+            ),
+            (
+                JointGroup::BodyYaw,
+                GroupProfiles {
+                    yaw: (0, 50),
+                    ..SHIPPED_PROFILES
+                },
+            ),
+            (
+                JointGroup::Antennas,
+                GroupProfiles {
+                    antennas: (0, 0),
+                    ..SHIPPED_PROFILES
+                },
+            ),
+        ] {
+            let refusal = GroupPlants::from_profiles(&profiles, SHIPPED_PERIOD_NS)
+                .expect_err("a zero register is no generator");
+            assert_eq!(refusal.group, group);
+            assert!(
+                matches!(refusal.source, PlantError::GeneratorDisabled { .. }),
+                "{refusal}"
+            );
+            assert!(refusal.to_string().contains(group.name()), "{refusal}");
+        }
+        assert!(matches!(
+            GroupPlants::from_profiles(&SHIPPED_PROFILES, 0),
+            Err(GroupPlantError {
+                source: PlantError::NoPeriod { .. },
+                ..
+            })
+        ));
+    }
+
     /// The bench's pair is the same model at a different setting, which is what
     /// lets one model explain recordings made under either.
     #[test]
@@ -536,7 +696,7 @@ mod tests {
     /// scenarios wait out.
     #[test]
     fn travel_cycles_matches_the_stepped_plant_and_clocks_the_antenna_raise() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         for distance in [0.01, 0.1, 1.0, 2.875, 12.56] {
             let stepped = periods_to_arrive(&plant, distance) + RESPONSE_DEAD_SAMPLES;
             let stated = plant.travel_cycles(distance);
@@ -588,7 +748,7 @@ mod tests {
     /// plus the dead time a commanded arrival takes to be read.
     #[test]
     fn pass_cycles_is_the_stepped_ramp_and_not_the_travel() {
-        let plant = PlantModel::default();
+        let plant = shipped();
         for distance in [0.001, 0.01, 0.05, 0.1, 0.192, 0.6, 1.0, 2.875, 12.56] {
             let stepped = periods_to_pass(&plant, distance);
             assert_eq!(

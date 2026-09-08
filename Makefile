@@ -21,6 +21,7 @@ SHELL := /bin/bash
 #     REACHY_HOST ?= reachy00
 #     REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
 #     REACHY_HOST_PARAMS ?= /elsewhere/reachy00/host_params.textproto
+#     REACHY_EXPERIMENT_DIR ?= /elsewhere/reachy00/experiment
 #
 # Read unconditionally, because it carries more than one variable and a guard on
 # any single one would silently drop the rest. The precedence the file wants is
@@ -47,6 +48,15 @@ endif
 # `.local/host_params.textproto`, which `tools/lib.sh` names.
 ifdef REACHY_HOST_PARAMS
 export REACHY_HOST_PARAMS
+endif
+
+# The directory of experiment configuration a push lays over the payload, for a
+# tuning run: a servo profile, servo gains or mover parameters that are not the
+# tree's. Read by the deploy script, so a value the conf file supplies has to be
+# exported to reach it; unset is the tree's own configuration and is what every
+# ordinary run wants.
+ifdef REACHY_EXPERIMENT_DIR
+export REACHY_EXPERIMENT_DIR
 endif
 
 # The brenn-pod checkout, read for two things a speech run needs: the prebuilt
@@ -77,7 +87,7 @@ help:
 	@echo "  make bench-config    push the bench's configuration into the unit's RAM"
 	@echo "  make bench-run       build, push, run the bench on the unit (ARGS=...)"
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
-	@echo "  make bench-fetch     bring a run's state file back, timestamped"
+	@echo "  make bench-fetch     bring a run's state file and probe series back"
 	@echo "  make motion-build    the aarch64 motion payload: launcher, binaries, configs"
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
 	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
@@ -451,9 +461,11 @@ bench-run: device-host bench-config bench-build
 bench-selftest: device-host bench-config bench-build
 	tools/deploy-bench.sh $(REACHY_HOST) --run selftest $(ARGS)
 
-# Bring a run's state file back. Each fetch lands under its own timestamped
-# name, so the several runs a session calls for accumulate rather than
-# overwrite each other.
+# Bring a run's state file back, and any hold-probe series beside it. The state
+# file lands under its own timestamped name, so the several runs a session calls
+# for accumulate rather than overwrite each other; a probe series already
+# carries the moment it was taken and the servo it came from, so it keeps the
+# name the bench gave it.
 .PHONY: bench-fetch
 bench-fetch: device-host
 	tools/deploy-bench.sh $(REACHY_HOST) --fetch $(BENCH_RECORDS)

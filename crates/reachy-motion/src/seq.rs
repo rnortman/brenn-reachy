@@ -74,6 +74,7 @@ pub mod reg {
             RegId::MinVoltageLimit => "minimum voltage limit",
             RegId::CurrentLimit => "current limit",
             RegId::VelocityLimit => "velocity limit",
+            RegId::AccelerationLimit => "acceleration limit",
             RegId::TemperatureLimit => "temperature limit",
             RegId::BusWatchdog => "bus watchdog",
             RegId::ProfileAcceleration => "profile acceleration",
@@ -1180,7 +1181,7 @@ mod tests {
         /// register inserted among these turns a goal write into a shutdown
         /// write in a peer built at the other revision.
         the_register_numbering_is_the_one_written_down:
-            RegId as RegIdWire, past the end 24 {
+            RegId as RegIdWire, past the end 25 {
             RegId::None => 0,
             RegId::TorqueEnable => 1,
             RegId::GoalPosition => 2,
@@ -1205,6 +1206,7 @@ mod tests {
             RegId::PresentInputVoltage => 21,
             RegId::ModelNumber => 22,
             RegId::PresentTemperature => 23,
+            RegId::AccelerationLimit => 24,
         }
     }
 }

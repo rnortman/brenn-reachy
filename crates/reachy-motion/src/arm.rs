@@ -66,9 +66,10 @@ use reachy_kin::{
 };
 
 use crate::joints::{
-    JointGroup, JointRef, JointVector, ROW_COUNT, ROWS, ServoHealth, flags, group_of, joint_ref,
-    leg_index, leg_ref, row,
+    JointGroup, JointRef, JointVector, PerGroup, ROW_COUNT, ROWS, ServoHealth, flags, group_of,
+    joint_ref, leg_index, leg_ref, row,
 };
+use crate::plant::GroupProfiles;
 use crate::resume::{
     GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError, checked_cursor, no_phase, no_stray_failure,
     no_stray_field,
@@ -192,29 +193,7 @@ impl fmt::Display for Gains {
 ///
 /// The legs carry the head's weight through a six-bar linkage and the other
 /// three carry almost nothing, so they are not tuned alike.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroupGains {
-    /// The six crank servos.
-    pub legs: Gains,
-    /// The body yaw servo.
-    pub yaw: Gains,
-    /// The two antenna servos.
-    pub antennas: Gains,
-}
-
-impl GroupGains {
-    /// The gains for one joint's group.
-    #[must_use]
-    pub fn for_joint(&self, joint: JointRef) -> Gains {
-        match group_of(joint) {
-            Some(JointGroup::BodyYaw) => self.yaw,
-            Some(JointGroup::Antennas) => self.antennas,
-            // Every other ref is a crank. A ref naming no servo reaches no
-            // servo, so the gains read for it are never written anywhere.
-            _ => self.legs,
-        }
-    }
-}
+pub type GroupGains = PerGroup<Gains>;
 
 /// The gains this platform is armed with.
 ///
@@ -256,10 +235,9 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
 /// there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileConfig {
-    /// Profile acceleration, register units.
-    pub acceleration: u32,
-    /// Profile velocity, register units.
-    pub velocity: u32,
+    /// The acceleration/velocity pair per servo class, register units. The
+    /// classes are separate because their motors and their Velocity Limits are.
+    pub profiles: GroupProfiles,
     /// Bus Watchdog timeout, in the register's 20 ms units. Armed, because a
     /// servo that has stopped beats one chasing a stale goal once its host has
     /// gone quiet; the trip does not release torque on this hardware, which is
@@ -275,7 +253,7 @@ pub struct ProfileConfig {
 /// whatever shape the wire layer decodes it to, not engineering units — these
 /// are integers a person compares against a data sheet, and an angle converted
 /// from them would be the wrong thing to compare.
-pub const PROVISION_REGS: [RegId; 15] = [
+pub const PROVISION_REGS: [RegId; 16] = [
     RegId::ReturnDelayTime,
     RegId::OperatingMode,
     RegId::DriveMode,
@@ -288,6 +266,7 @@ pub const PROVISION_REGS: [RegId; 15] = [
     RegId::TemperatureLimit,
     RegId::CurrentLimit,
     RegId::VelocityLimit,
+    RegId::AccelerationLimit,
     RegId::BusWatchdog,
     RegId::ProfileAcceleration,
     RegId::ProfileVelocity,
@@ -298,7 +277,13 @@ pub const PROVISION_REGS: [RegId; 15] = [
 ///
 /// A function rather than a value so one register can appear twice with
 /// different contents, which is what the watchdog's clear-then-arm pair needs.
-pub type ProfileWrite = (RegId, fn(&ProfileConfig) -> Value);
+///
+/// The row is the one being written. The sweep walks servo-major and so knows
+/// it, and a per-class register projects the configuration by it here rather
+/// than being handed a projection the sequencer made: which pair a row is
+/// written is the writer's own business, and a caller passing both the
+/// configuration and its projection is two things that have to agree.
+pub type ProfileWrite = (RegId, fn(&ProfileConfig, usize) -> Value);
 
 /// The registers the gains-and-profiles sweep writes per servo, in write order,
 /// each paired with where its value comes from.
@@ -315,12 +300,14 @@ pub type ProfileWrite = (RegId, fn(&ProfileConfig) -> Value);
 /// from this list, so an entry added here widens both rather than leaving a
 /// snapshot refused at cursors the sweep legitimately reaches.
 pub const PROFILE_REGS: [ProfileWrite; 4] = [
-    (RegId::BusWatchdog, |_| value::u8(0)),
-    (RegId::BusWatchdog, |cfg| value::u8(cfg.bus_watchdog)),
-    (RegId::ProfileAcceleration, |cfg| {
-        value::u32(cfg.acceleration)
+    (RegId::BusWatchdog, |_, _| value::u8(0)),
+    (RegId::BusWatchdog, |cfg, _| value::u8(cfg.bus_watchdog)),
+    (RegId::ProfileAcceleration, |cfg, row| {
+        value::u32(cfg.profiles.for_row(row).0)
     }),
-    (RegId::ProfileVelocity, |cfg| value::u32(cfg.velocity)),
+    (RegId::ProfileVelocity, |cfg, row| {
+        value::u32(cfg.profiles.for_row(row).1)
+    }),
 ];
 
 /// What arming does about one servo's one provisioned register.
@@ -509,16 +496,21 @@ pub fn leg_windows(env: &EnvelopeConfig) -> [(f64, f64); 6] {
 /// are facts this crate states once, and two copies of any of them would let one
 /// host commission a machine against fences another host's tests never see.
 ///
-/// The two arguments are the two things that are not hardware facts. `expected`
-/// is the provisioning grid — what this deployment bakes an expectation for, and
-/// empty where a caller checks nothing. `profile` is the servo-side
-/// velocity/acceleration backstop, which this crate deliberately has no default
-/// for: what it should be is a property of the machine a host drives and of the
-/// shaping that host does, not of the motion arithmetic here.
+/// The three arguments are the three things that are not hardware facts.
+/// `expected` is the provisioning grid — what this deployment bakes an
+/// expectation for, and empty where a caller checks nothing. `profile` is the
+/// servo-side velocity/acceleration backstop, which this crate deliberately has
+/// no default for: what it should be is a property of the machine a host drives
+/// and of the shaping that host does, not of the motion arithmetic here.
+/// `gains` is the position loop each class of servo runs, which this crate does
+/// state a default for ([`DEFAULT_GAINS`]) but does not impose: they are tuned
+/// against a machine, so a host reads them from its own configuration and the
+/// default is what that configuration is held to.
 #[must_use]
 pub fn arm_config(
     env: &EnvelopeConfig,
     expected: ProvisionTable,
+    gains: GroupGains,
     profile: ProfileConfig,
 ) -> ArmConfig {
     ArmConfig {
@@ -527,7 +519,7 @@ pub fn arm_config(
         min_arm_voltage: DEFAULT_MIN_ARM_VOLTAGE,
         voltage_poll_period: DEFAULT_VOLTAGE_POLL_PERIOD,
         voltage_budget: DEFAULT_VOLTAGE_BUDGET,
-        gains: DEFAULT_GAINS,
+        gains,
         profile,
         leg_windows: leg_windows(env),
     }
@@ -1075,9 +1067,10 @@ impl<'a> CommissionSequencer<'a> {
                     // table's order — which is what makes the watchdog's clear
                     // land before its arm.
                     let index = cursor - ROW_COUNT;
+                    let row = index / PROFILE_REGS.len();
                     let (reg, value_of) = PROFILE_REGS[index % PROFILE_REGS.len()];
-                    let value = value_of(&self.cfg.profile);
-                    self.write(index / PROFILE_REGS.len(), reg, value);
+                    let value = value_of(&self.cfg.profile, row);
+                    self.write(row, reg, value);
                 }
             }
             CommissionPhaseKind::Complete => return SeqAction::Done(self.summary()),
@@ -1647,6 +1640,7 @@ mod tests {
     use core::f64::consts::PI;
 
     use super::*;
+    use crate::joints::group_of_row;
     use crate::testutil::{Asked, ScriptedBus, asked};
     use crate::txn::AuxOpKind;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -2546,6 +2540,63 @@ mod tests {
         log.iter()
             .filter(|(_, request)| wrote(request.op) && request.context.reg == Some(reg))
             .count()
+    }
+
+    /// Every servo is written the profile pair its own class was configured
+    /// with, and no other.
+    ///
+    /// Driven at three pairs that differ, which is the only arrangement that
+    /// can tell a correct row-to-class projection from a wrong one: with the
+    /// three equal — which is what the deployment ships today — a swapped
+    /// divisor, a `%` for a `/` or a `for_joint` where a `for_row` belongs
+    /// writes exactly the same nine values. What a wrong projection costs is
+    /// stated by the tracking detector: the tick models an antenna on the
+    /// antennas' generator while the servo runs the legs', so the residual is
+    /// the mismatch and the screen faults a healthy machine on the first move.
+    #[test]
+    fn the_sweep_writes_each_servo_its_own_class_pair() {
+        let profiles = GroupProfiles {
+            legs: (20, 50),
+            yaw: (30, 60),
+            antennas: (40, 70),
+        };
+        let cfg = ArmConfig {
+            profile: ProfileConfig {
+                profiles,
+                bus_watchdog: 10,
+            },
+            ..provisioned_config()
+        };
+        let mut machine = bus();
+        commission(&cfg, &mut machine).expect("commissioning passes");
+
+        for (row, id) in SERVO_IDS.iter().enumerate() {
+            let (acceleration, velocity) = profiles.for_row(row);
+            let written = |reg: RegId| {
+                machine
+                    .log
+                    .iter()
+                    .filter(|(_, request)| {
+                        wrote(request.op)
+                            && request.context.id == *id
+                            && request.context.reg == Some(reg)
+                    })
+                    .map(|(_, request)| request.value)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                written(RegId::ProfileAcceleration),
+                vec![value::u32(acceleration)],
+                "servo {id} is a {} servo",
+                group_of_row(row).expect("a bus row is a class").name(),
+            );
+            assert_eq!(
+                written(RegId::ProfileVelocity),
+                vec![value::u32(velocity)],
+                "servo {id} is a {} servo",
+                group_of_row(row).expect("a bus row is a class").name(),
+            );
+        }
     }
 
     /// The two torque-on gates are the whole enumeration, and they refuse

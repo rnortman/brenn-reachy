@@ -391,6 +391,17 @@ pub fn leg_index(joint: JointRef) -> Option<u8> {
     }
 }
 
+/// Which group the servo at `row` in bus order belongs to, or `None` past the
+/// ninth.
+///
+/// The row-keyed half of [`group_of`], here rather than at the two call sites
+/// that want it — a checker reading a write by servo ID, a report keyed by bus
+/// row — so the row-to-group chain is stated where the row-to-joint map is.
+#[must_use]
+pub fn group_of_row(row: usize) -> Option<JointGroup> {
+    joint_ref(row).and_then(group_of)
+}
+
 /// Which group `joint` belongs to, or `None` for [`JointRef::None`].
 #[must_use]
 pub fn group_of(joint: JointRef) -> Option<JointGroup> {
@@ -592,6 +603,119 @@ impl JointGroup {
             }
         }
         set
+    }
+
+    /// What the group is called in a message an operator reads.
+    ///
+    /// The plural the rest of this repo uses for the class, so a refusal that
+    /// names a group reads the way the configuration file's own keys do. Prose
+    /// and not a key: [`Self::config_prefix`] is what a configuration file's
+    /// field names are built from, and the two differ on the body yaw.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BodyYaw => "body yaw",
+            Self::Legs => "legs",
+            Self::Antennas => "antennas",
+        }
+    }
+
+    /// What the configuration files this repo writes prefix a per-class field
+    /// name with.
+    ///
+    /// Beside [`Self::name`] because they are two spellings of one class and a
+    /// reader that reached for the display name to build a key would ask a
+    /// file for `body yaw_p`. A file states `<prefix>_profile_velocity`,
+    /// `<prefix>_p` and so on, so a class added here is a class whose keys the
+    /// scanners build without being edited.
+    #[must_use]
+    pub fn config_prefix(self) -> &'static str {
+        match self {
+            Self::BodyYaw => "body_yaw",
+            Self::Legs => "legs",
+            Self::Antennas => "antennas",
+        }
+    }
+}
+
+/// One value per servo class, and the three ways anything asks for one.
+///
+/// The classes are the organising idea of every per-class record this crate
+/// holds — the profile pairs, the plant models, the position gains — and they
+/// are all the same three fields dispatched the same three ways. One carrier
+/// rather than one hand-written triple of accessors per record: a fourth
+/// per-class figure is then a type alias, and the rule for a row that names no
+/// servo cannot be fixed in one copy and left wrong in another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerGroup<T> {
+    /// The six crank servos.
+    pub legs: T,
+    /// The body yaw servo.
+    pub yaw: T,
+    /// The two antenna servos.
+    pub antennas: T,
+}
+
+impl<T: Copy> PerGroup<T> {
+    /// The value for one class by name.
+    #[must_use]
+    pub fn of(&self, group: JointGroup) -> T {
+        match group {
+            JointGroup::BodyYaw => self.yaw,
+            JointGroup::Legs => self.legs,
+            JointGroup::Antennas => self.antennas,
+        }
+    }
+
+    /// The value for one joint's class.
+    ///
+    /// A ref naming no servo reads as the legs': it reaches no servo, so the
+    /// value read for it is never written anywhere and never judges anything.
+    #[must_use]
+    pub fn for_joint(&self, joint: JointRef) -> T {
+        match group_of(joint) {
+            Some(group) => self.of(group),
+            None => self.legs,
+        }
+    }
+
+    /// The value for the servo at `row` in bus order.
+    ///
+    /// A row past the ninth reads as the legs', for [`Self::for_joint`]'s
+    /// reason: nothing is commanded through it.
+    #[must_use]
+    pub fn for_row(&self, row: usize) -> T {
+        match group_of_row(row) {
+            Some(group) => self.of(group),
+            None => self.legs,
+        }
+    }
+
+    /// The same three classes carrying what `f` makes of each value.
+    ///
+    /// # Errors
+    ///
+    /// The first class `f` refuses, with whatever it refused it for.
+    pub fn try_map<U, E>(
+        &self,
+        mut f: impl FnMut(JointGroup, T) -> Result<U, E>,
+    ) -> Result<PerGroup<U>, E> {
+        PerGroup::try_of_each(|group| f(group, self.of(group)))
+    }
+}
+
+impl<T> PerGroup<T> {
+    /// One value per class, each made from the class it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// The first class `f` refuses, with whatever it refused it for.
+    pub fn try_of_each<E>(mut f: impl FnMut(JointGroup) -> Result<T, E>) -> Result<PerGroup<T>, E> {
+        Ok(PerGroup {
+            legs: f(JointGroup::Legs)?,
+            yaw: f(JointGroup::BodyYaw)?,
+            antennas: f(JointGroup::Antennas)?,
+        })
     }
 }
 
@@ -1069,6 +1193,51 @@ mod tests {
                 "bits {bits:#04x}"
             );
         }
+    }
+
+    /// One carrier answers by class, by joint and by bus row, and the three
+    /// answers agree on every one of the nine rows.
+    ///
+    /// Table-driven over the whole bus because this dispatch is what every
+    /// per-class record in the crate is read through: a row read as another
+    /// class's would write one class's registers into another's servo, or judge
+    /// an antenna against the legs' generator.
+    #[test]
+    fn a_per_group_record_answers_by_class_joint_and_row() {
+        let carrier = PerGroup {
+            legs: 1,
+            yaw: 2,
+            antennas: 3,
+        };
+        for (row, joint) in ROWS.into_iter().enumerate() {
+            let group = group_of(joint).expect("every bus row names a servo");
+            assert_eq!(group_of_row(row), Some(group), "row {row}");
+            assert_eq!(carrier.of(group), carrier.for_joint(joint), "{joint:?}");
+            assert_eq!(carrier.for_row(row), carrier.for_joint(joint), "row {row}");
+        }
+        // Nothing is commanded through a row past the ninth or through a ref
+        // that names no servo, and both read as the legs' rather than as a
+        // panic.
+        assert_eq!(group_of_row(ROWS.len()), None);
+        assert_eq!(carrier.for_row(ROWS.len()), carrier.legs);
+        assert_eq!(carrier.for_joint(JointRef::None), carrier.legs);
+    }
+
+    /// The three classes' configuration prefixes are three distinct keys, and
+    /// the body yaw's is not its display name.
+    ///
+    /// The trap this pins: a scanner building `<prefix>_profile_velocity` off
+    /// the prose name would ask a file for `body yaw_profile_velocity` and be
+    /// told the file states no such field, at analysis time, over a log that
+    /// cost a hardware run.
+    #[test]
+    fn every_class_has_its_own_configuration_key_prefix() {
+        let prefixes = JointGroup::ALL.map(JointGroup::config_prefix);
+        assert_eq!(prefixes, ["body_yaw", "legs", "antennas"]);
+        assert_ne!(
+            JointGroup::BodyYaw.config_prefix(),
+            JointGroup::BodyYaw.name()
+        );
     }
 
     #[test]

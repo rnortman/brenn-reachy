@@ -38,7 +38,7 @@
 use crate::session_bus::{self, Datagram, Delivery, Entered, Timing};
 use crate::session_ladder::{self, Budgets};
 use crate::session_stow;
-use brenn_reachy__cogs__config_clk_rs::{ServoProfile, SessionParams};
+use brenn_reachy__cogs__config_clk_rs::{ServoGains, ServoProfile, SessionParams};
 use brenn_reachy__cogs__motion_clk_rs::{SessionDial, SessionSignals};
 use brenn_reachy__cogs__schedule_clk_rs::{
     OverlayWindowWire, PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
@@ -171,6 +171,7 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
 
     let params: &SessionParams = configured(dial.configs.params, "the session's");
     let profile: &ServoProfile = configured(dial.configs.profile, "the servo profile's");
+    let gains: &ServoGains = configured(dial.configs.gains, "the servo gains'");
     let budgets = Budgets::of(params);
     let screens = Screens::of(params);
     let timing = Timing {
@@ -179,19 +180,23 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
         rail_stale_after_ns: params.rail_stale_after_ns,
     };
     // The commissioned record, taken from configuration on the first wake and
-    // shared from then on. The profile is the one part of it this deployment
-    // chooses; everything else in it is a hardware fact the motion library
-    // states once. Delivered by initialising the record rather than by carrying
-    // it: the machinery that needs it reaches the one copy.
+    // shared from then on. The profile and the gains are the parts of it this
+    // deployment chooses; everything else in it is a hardware fact the motion
+    // library states once. Delivered by initialising the record rather than by
+    // carrying it: the machinery that needs it reaches the one copy.
     //
-    // The two profile registers come off their own file, which the decision
-    // tick reads as well: what this host writes to the servos and what that
-    // tick models their generators with are one pair of numbers.
-    session_bus::init_arm_config(ProfileConfig {
-        acceleration: profile.profile_acceleration,
-        velocity: profile.profile_velocity,
-        bus_watchdog: params.bus_watchdog,
-    });
+    // The profile registers come off their own file, which the decision tick
+    // reads as well: what this host writes to each class of servo and what that
+    // tick models its generators with are one set of numbers. The gains come
+    // off a file of their own, read here and nowhere else: they shape how
+    // closely a motor follows the generator, which nothing models.
+    session_bus::init_arm_config(
+        crate::group_gains(gains),
+        ProfileConfig {
+            profiles: crate::group_profiles(profile),
+            bus_watchdog: params.bus_watchdog,
+        },
+    );
 
     // The slot is this cog's own memory and nothing else writes it, so bytes it
     // cannot read are memory gone wrong rather than another writer's opinion.

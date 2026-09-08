@@ -163,8 +163,7 @@ pub(crate) fn every_fault() -> Vec<Fault> {
 /// A fixture's number: this crate has no default for the profile, so a test that
 /// needs one states it, and what a host writes to a real machine is the host's.
 const TEST_PROFILE: ProfileConfig = ProfileConfig {
-    acceleration: 20,
-    velocity: 50,
+    profiles: crate::plant::SHIPPED_PROFILES,
     bus_watchdog: 10,
 };
 
@@ -174,7 +173,12 @@ const TEST_PROFILE: ProfileConfig = ProfileConfig {
 /// tests exercise is arming, and the grid's contents are a property of a
 /// deployment rather than of the sequencers.
 pub(crate) fn arm_config(env: &EnvelopeConfig) -> ArmConfig {
-    crate::arm::arm_config(env, ProvisionTable::new(), TEST_PROFILE)
+    crate::arm::arm_config(
+        env,
+        ProvisionTable::new(),
+        crate::arm::DEFAULT_GAINS,
+        TEST_PROFILE,
+    )
 }
 
 /// Transactions and waits one scripted sequence may take before the driver

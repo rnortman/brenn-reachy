@@ -1,0 +1,45 @@
+# The servo-side position gains, loaded once at process setup and written into
+# the nine servos when the session commissions the machine.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.ServoGains`, which the
+# compiler generates from the `ServoGains` schema in `config.clk`. Read as it
+# is: the box binds it by path, and the casing converts it to the message the
+# dial hands the cog.
+#
+# One class per triple, stated as nine flat keys. The classes are three
+# different loads: the legs carry the head's weight through a six-bar linkage
+# and the other three carry almost nothing, so they are not tuned alike. Flat
+# keys rather than a nested per-class message because every reader here is a
+# first-match `key: value` line scan.
+#
+# The motion library states the same triples as its own default, which is what
+# the simulated register file answers a gains read with and what the unit tests
+# are written against; the scenario suite pins this file to that default, so a
+# rung tuned here and not there is a failed run rather than a machine
+# commissioned with numbers nobody wrote down.
+
+# A proportional term alone cannot hold the head's weight up this linkage: at
+# the vendor's P-only 300 the two most loaded cranks park 3.9-4.3 degrees short
+# of their goal and stay there. The integral term is what closes that, and the
+# derivative term is what stops it hunting; measured, the pair settles inside
+# 1.3 degrees with no oscillation.
+legs_p: 800
+legs_i: 100
+legs_d: 300
+
+# The value the vendor's own stack writes at startup. Nothing has ever
+# implicated the yaw, so nothing has moved it.
+body_yaw_p: 200
+body_yaw_i: 0
+body_yaw_d: 0
+
+# Stiff enough to carry a 0.3 s sweep, which the vendor's 200 lags badly enough
+# to overshoot the crossing. No integral term: an antenna holds nothing up, so
+# there is no standing error to integrate away.
+#
+# TODO(antenna-hold-gains): the sweep this was measured against is not the one
+# a session plays, and these are the next thing to move if resting the antennas
+# off vertical does not quiet them.
+antennas_p: 500
+antennas_i: 0
+antennas_d: 100

@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use brenn_reachy__cogs__config_clk_rs::{
-    ClipLibraryConfigWire, MoverParamsWire, ServoProfileWire, SessionParamsWire,
+    ClipLibraryConfigWire, MoverParamsWire, ServoGainsWire, ServoProfileWire, SessionParamsWire,
 };
 use brenn_reachy__cogs__motion_clk_rs_test::{
     MoverTestWrapper, PoseTestWrapper, SessionTestWrapper,
@@ -51,7 +51,7 @@ use reachy_kin::{
     rest_head_pose, stow_head_pose, wrap_to_pi,
 };
 use reachy_motion::NEUTRAL_ANTENNAS;
-use reachy_motion::arm::{SERVO_IDS, row_of_id};
+use reachy_motion::arm::{Gains, SERVO_IDS, row_of_id};
 use reachy_motion::default_motion_config;
 use reachy_motion::disarm::{
     DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE, STOW_ANTENNAS, stow_targets,
@@ -59,7 +59,7 @@ use reachy_motion::disarm::{
 use reachy_motion::fault;
 use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
-    self, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
+    self, JointGroup, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
 };
 use reachy_motion::plant::RESPONSE_DEAD_SAMPLES;
 use reachy_motion::record;
@@ -653,6 +653,12 @@ struct Cycle {
     report: Option<Report>,
 }
 
+/// The Mover's configuration for a case, at the deployment's own arming.
+///
+/// The detector is armed here because it is armed on every configuration this
+/// tree ships: the cases about a jam are cases about what an armed tick does,
+/// and a fixture that left the field at its zero would be testing the one
+/// state a capability run puts the machine in.
 fn params(period_ns: i64, up_ns: i64, stow_ns: i64) -> MoverParamsWire {
     let mut message = MoverParamsWire::new();
     let params = message.clear_valid();
@@ -660,6 +666,7 @@ fn params(period_ns: i64, up_ns: i64, stow_ns: i64) -> MoverParamsWire {
     params.period_ns = period_ns;
     params.up_duration_ns = up_ns;
     params.stow_duration_ns = stow_ns;
+    params.tracking_armed = true.into();
     message
 }
 
@@ -1199,37 +1206,156 @@ fn the_tick_chases_the_setpoint_the_driver_held_and_not_the_goal_it_composed() {
 #[test]
 fn a_servo_profile_of_zero_is_no_plant_for_the_mover_to_judge_against() {
     let shipped = servo_profile();
-    let period = u64::try_from(PERIOD).expect("a period is a length of time");
+    let armed = params(PERIOD, UP_NS, STOW_NS);
+    let armed = armed.validate().expect("the fixture's parameters read");
     assert!(
         motion_cogs::commissioned_config(
             shipped.validate().expect("the shipped pair reads"),
-            period
+            armed,
         )
         .is_ok(),
         "the pair the deployment commissions is a plant",
     );
 
-    for zeroed in [0, 1] {
+    // One case per register per class: a zero anywhere in the six is a class of
+    // servo with no generator, and a check that only covered the legs would
+    // pass a file that had lost the antennas' line.
+    //
+    // Each with the class it belongs to, because that is the half a refusal
+    // that only asserted `is_err` cannot see: a reader that put the antennas'
+    // velocity in the yaw's slot refuses all six of these just as loudly, and
+    // the machine it built would model two classes on each other's generators.
+    type Zeroing = (JointGroup, &'static str, fn(&mut ServoProfileWire));
+    let zeroings: [Zeroing; 6] = [
+        (JointGroup::Legs, "legs velocity", |p| {
+            p.set_legs_profile_velocity(0);
+        }),
+        (JointGroup::Legs, "legs acceleration", |p| {
+            p.set_legs_profile_acceleration(0);
+        }),
+        (JointGroup::BodyYaw, "body yaw velocity", |p| {
+            p.set_body_yaw_profile_velocity(0);
+        }),
+        (JointGroup::BodyYaw, "body yaw acceleration", |p| {
+            p.set_body_yaw_profile_acceleration(0);
+        }),
+        (JointGroup::Antennas, "antennas velocity", |p| {
+            p.set_antennas_profile_velocity(0);
+        }),
+        (JointGroup::Antennas, "antennas acceleration", |p| {
+            p.set_antennas_profile_acceleration(0);
+        }),
+    ];
+    for (group, named, zero) in zeroings {
         let mut profile = servo_profile();
-        if zeroed == 0 {
-            profile.set_profile_velocity(0);
-        } else {
-            profile.set_profile_acceleration(0);
-        }
+        zero(&mut profile);
+        let error = motion_cogs::commissioned_config(
+            profile.validate().expect("a zeroed pair still reads"),
+            armed,
+        )
+        .expect_err("a zeroed register switches that class's generator off");
+        assert_eq!(
+            error.group,
+            group,
+            "the {named} register belongs to the {} and the refusal says so",
+            group.name(),
+        );
         assert!(
-            motion_cogs::commissioned_config(
-                profile.validate().expect("a zeroed pair still reads"),
-                period
-            )
-            .is_err(),
-            "a zero in register {zeroed} switches the generator off on the servo",
+            error.to_string().contains(group.name()),
+            "the {named} refusal reads without naming its class: {error}",
         );
     }
 
+    let gridless = params(0, UP_NS, STOW_NS);
     assert!(
-        motion_cogs::commissioned_config(shipped.validate().expect("the shipped pair reads"), 0)
-            .is_err(),
+        motion_cogs::commissioned_config(
+            shipped.validate().expect("the shipped pair reads"),
+            gridless.validate().expect("a gridless period still reads"),
+        )
+        .is_err(),
         "and a grid of no length is no grid to step a per-period model on",
+    );
+}
+
+/// Each of the gains file's nine scalars reaches the class its name states.
+///
+/// Nine distinct numbers, because the file this tree ships gives the yaw and
+/// the legs different triples but nothing else distinguishes a reader that
+/// crossed two classes: the sweep would then commission the antennas -- the
+/// joints this campaign is measuring for hunting -- on the yaw's soft
+/// `200/0/0`, with every other test still green.
+#[test]
+fn every_gain_field_reaches_the_class_it_names() {
+    let mut message = ServoGainsWire::new();
+    let gains = message.clear_valid();
+    gains.legs_p = 1;
+    gains.legs_i = 2;
+    gains.legs_d = 3;
+    gains.body_yaw_p = 4;
+    gains.body_yaw_i = 5;
+    gains.body_yaw_d = 6;
+    gains.antennas_p = 7;
+    gains.antennas_i = 8;
+    gains.antennas_d = 9;
+    let mapped = motion_cogs::group_gains(message.validate().expect("nine gains read"));
+    assert_eq!(mapped.legs, Gains { p: 1, i: 2, d: 3 });
+    assert_eq!(mapped.yaw, Gains { p: 4, i: 5, d: 6 });
+    assert_eq!(mapped.antennas, Gains { p: 7, i: 8, d: 9 });
+}
+
+/// The same for the profile file's six, for the same reason: three pairs that
+/// differ are the only arrangement in which a crossed reader shows, and the
+/// deployment ships three that are equal.
+#[test]
+fn every_profile_field_reaches_the_class_it_names() {
+    let mut message = ServoProfileWire::new();
+    message.set_legs_profile_acceleration(1);
+    message.set_legs_profile_velocity(2);
+    message.set_body_yaw_profile_acceleration(3);
+    message.set_body_yaw_profile_velocity(4);
+    message.set_antennas_profile_acceleration(5);
+    message.set_antennas_profile_velocity(6);
+    let mapped = motion_cogs::group_profiles(message.validate().expect("six registers read"));
+    assert_eq!(mapped.legs, (1, 2));
+    assert_eq!(mapped.yaw, (3, 4));
+    assert_eq!(mapped.antennas, (5, 6));
+}
+
+/// The detector's arming is the parameter file's field, in both directions.
+///
+/// The knob the capability run turns: a run staged disarmed that armed anyway
+/// faults mid-sweep at a profile the motors were never meant to follow, and a
+/// wiring that read it the other way round would leave a shipped machine with
+/// nothing judging any joint against its own servo's trajectory.
+#[test]
+fn the_detector_is_armed_by_the_parameter_file_and_by_nothing_else() {
+    let shipped = servo_profile();
+    let shipped = shipped.validate().expect("the shipped pair reads");
+
+    let armed = params(PERIOD, UP_NS, STOW_NS);
+    let cfg = motion_cogs::commissioned_config(
+        shipped,
+        armed.validate().expect("the fixture's parameters read"),
+    )
+    .expect("a plant");
+    assert!(
+        cfg.tracking.armed,
+        "the shipped parameters arm the detector"
+    );
+
+    let mut disarmed = params(PERIOD, UP_NS, STOW_NS);
+    disarmed
+        .validate_mut()
+        .expect("the fixture's parameters read")
+        .tracking_armed = false.into();
+    let cfg = motion_cogs::commissioned_config(
+        shipped,
+        disarmed.validate().expect("a disarmed parameter set reads"),
+    )
+    .expect("a plant");
+    assert!(
+        !cfg.tracking.armed,
+        "a capability run's parameters disarm it, which is what that run is for",
     );
 }
 
@@ -3130,8 +3256,12 @@ const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 /// running on any other pair would be a case running a machine no deployment
 /// ships. The scenario harness is what checks these two numbers against the
 /// file.
-const PROFILE_ACCELERATION: u32 = 20;
-const PROFILE_VELOCITY: u32 = 50;
+const LEGS_PROFILE_ACCELERATION: u32 = 20;
+const LEGS_PROFILE_VELOCITY: u32 = 50;
+const BODY_YAW_PROFILE_ACCELERATION: u32 = 20;
+const BODY_YAW_PROFILE_VELOCITY: u32 = 50;
+const ANTENNAS_PROFILE_ACCELERATION: u32 = 20;
+const ANTENNAS_PROFILE_VELOCITY: u32 = 50;
 
 /// The environment variable naming the shipped profile, relative to the
 /// runfiles root.
@@ -3140,8 +3270,12 @@ const SERVO_PROFILE_ENV: &str = "SERVO_PROFILE";
 /// A `ServoProfileWire` carrying the test's profile constants.
 fn servo_profile() -> ServoProfileWire {
     let mut profile = ServoProfileWire::new();
-    profile.set_profile_acceleration(PROFILE_ACCELERATION);
-    profile.set_profile_velocity(PROFILE_VELOCITY);
+    profile.set_legs_profile_acceleration(LEGS_PROFILE_ACCELERATION);
+    profile.set_legs_profile_velocity(LEGS_PROFILE_VELOCITY);
+    profile.set_body_yaw_profile_acceleration(BODY_YAW_PROFILE_ACCELERATION);
+    profile.set_body_yaw_profile_velocity(BODY_YAW_PROFILE_VELOCITY);
+    profile.set_antennas_profile_acceleration(ANTENNAS_PROFILE_ACCELERATION);
+    profile.set_antennas_profile_velocity(ANTENNAS_PROFILE_VELOCITY);
     profile
 }
 
@@ -3230,8 +3364,27 @@ fn the_restated_session_figures_are_the_ones_the_shipped_configuration_states() 
         );
     }
     for (field, restated) in [
-        ("profile_acceleration", PROFILE_ACCELERATION.to_string()),
-        ("profile_velocity", PROFILE_VELOCITY.to_string()),
+        (
+            "legs_profile_acceleration",
+            LEGS_PROFILE_ACCELERATION.to_string(),
+        ),
+        ("legs_profile_velocity", LEGS_PROFILE_VELOCITY.to_string()),
+        (
+            "body_yaw_profile_acceleration",
+            BODY_YAW_PROFILE_ACCELERATION.to_string(),
+        ),
+        (
+            "body_yaw_profile_velocity",
+            BODY_YAW_PROFILE_VELOCITY.to_string(),
+        ),
+        (
+            "antennas_profile_acceleration",
+            ANTENNAS_PROFILE_ACCELERATION.to_string(),
+        ),
+        (
+            "antennas_profile_velocity",
+            ANTENNAS_PROFILE_VELOCITY.to_string(),
+        ),
     ] {
         assert_eq!(
             shipped_profile_figure(field),
@@ -4491,7 +4644,7 @@ fn a_timeline_this_build_cannot_read_publishes_nothing() {
 fn a_servo_profile_of_zero_is_not_a_machine_this_session_commissions() {
     let mut cog = session();
     let mut profile = servo_profile();
-    profile.set_profile_velocity(0);
+    profile.set_antennas_profile_velocity(0);
     cog.set_config_profile(&profile);
     drive(&mut cog, FIRST_WAKE);
 }

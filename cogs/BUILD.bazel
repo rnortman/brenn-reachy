@@ -52,6 +52,7 @@ SIM_LOGGER_CONFIG = ":system_sim.motion_sim.MotionCpu_event_logger_config.tachyo
 # in the executable's own runfiles, and no checker has anything to say about it.
 SIM_CONFIGS = [
     "mover_params.textproto",
+    "servo_gains.textproto",
     "servo_profile.textproto",
     "session_params.textproto",
     "sim_params.textproto",
@@ -283,10 +284,15 @@ rust_test(
 rust_binary(
     name = "first_motion_report",
     srcs = ["first_motion_report.rs"],
-    # The deployment's servo profile, read by path: the residual screen is
-    # measured against the trajectory those two registers define, so the
-    # analyzer is handed the same file the cogs read.
-    data = ["servo_profile.textproto"],
+    # This tree's own copies of the three configuration files a run carries
+    # home beside its records. The run is judged under the copies in its own
+    # log; these are what the report compares them against, so a run performed
+    # under an experiment overlay says so at the top of its report.
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -301,7 +307,6 @@ rust_binary(
         ":session_clk_rs",
         ":session_cmd_clk_rs",
         ":stillness_report",
-        "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
@@ -329,8 +334,9 @@ rust_binary(
 # available.
 #
 # The harness script's own invocation, not a second one: the analyzer takes a log
-# directory and the deployment's servo profile, which is the one extra argument
-# the checker slot passes on.
+# directory and reads the configuration the run was performed under out of a
+# `config/` directory beside the records, which the harness stages from the
+# three files below -- this run does run on the tree's copies.
 #
 # This proves the analyzer over one of the two log formats: a deterministic run
 # writes offboard `.slog` files, and the online logger writes onboard `.olog`
@@ -350,10 +356,11 @@ sh_test(
             SIM_PUBLISHER_CONFIG,
             SIM_LOGGER_CONFIG,
             ":first_motion_report",
-            "servo_profile.textproto",
         ]
     ],
     data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
         "servo_profile.textproto",
         ":first_motion_report",
         ":s1_author",
@@ -441,6 +448,7 @@ filegroup(
         "host_logger.textproto",
         "mover_params.textproto",
         "robot_logger_rates.textproto",
+        "servo_gains.textproto",
         "servo_profile.textproto",
         "session_params.textproto",
         "sim_params.textproto",
@@ -479,9 +487,13 @@ merge_simplelaunch_config(
 rust_binary(
     name = "library_tour_report",
     srcs = ["library_tour_report.rs"],
-    # The deployment's servo profile, read by path, for the reason
+    # This tree's own copies of the three configuration files, for the reason
     # `first_motion_report`'s `data` gives.
-    data = ["servo_profile.textproto"],
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -860,6 +872,7 @@ rust_library(
     deps = [
         ":log_read",
         ":run_report",
+        "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -875,6 +888,15 @@ rust_test(
     name = "pose_reading_test",
     size = "small",
     crate = ":pose_reading",
+    # The tree's own three configuration files, which the configuration reading
+    # compares a run's copies against: the "this run is not the tree's" note is
+    # the one that says an experiment overlay was in force, and a case that
+    # could not read the tree would prove nothing about it.
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
 )
 
 # What the pose estimator keeps between samples, in a module of its own: the
@@ -981,6 +1003,7 @@ filegroup(
         "mover_params.textproto",
         "robot_logger.textproto",
         "robot_logger_rates.textproto",
+        "servo_gains.textproto",
         "servo_profile.textproto",
         "session_params.textproto",
     ],
@@ -1402,6 +1425,7 @@ scenario_suite(
     process_description = SIM_PROCESS,
     scenario_deps = [
         ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
         "//motion:joints_clk_rs",
     ],
 )
@@ -1737,6 +1761,7 @@ clk(
     data = [
         "clip_library.textproto",
         "mover_params.textproto",
+        "servo_gains.textproto",
         "servo_profile.textproto",
         "session_params.textproto",
         "sim_params.textproto",

@@ -21,15 +21,17 @@ use core::time::Duration;
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, group_of, row};
-use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS};
+use reachy_motion::plant::{
+    GroupPlants, GroupProfiles, MAX_GAP_PERIODS, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS,
+};
 use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
     RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, tracking,
 };
 use reachy_motion::{
     ANTENNA_PHASE_SEPARATION_RAD, JointGroup, JointRef, JointTargets, JointVector, MotionCommand,
-    MotionConfig, MotionSnapWire, MoveDurations, WarpKind, dry_pass_peaks, floor_move_clock,
-    stow_pose_targets, stow_targets,
+    MotionConfig, MotionSnapWire, MoveDurations, StillnessConfig, WarpKind, dry_pass_peaks,
+    floor_move_clock, judge, stow_pose_targets, stow_targets,
 };
 
 use replay_trace::{ARRIVED_TOLERANCE_RAD, Run, Sample, Trace, fixture};
@@ -89,7 +91,14 @@ fn gesture(durations: MoveDurations) -> MotionCommand {
 /// The bench nights ran a faster pair than the deployment ships, so every
 /// fixture here is judged against the plant it was actually recorded on. A log
 /// recorded under one pair and replayed under another is a different machine.
-const BENCH_PROFILE: (u32, u32) = (400, 600);
+///
+/// One pair for all three classes: the bench nights wrote one pair into all
+/// nine servos, which is what the recordings were made on.
+const BENCH_PROFILE: GroupProfiles = GroupProfiles {
+    legs: (400, 600),
+    yaw: (400, 600),
+    antennas: (400, 600),
+};
 
 /// The plant a recording is judged against: its own profile, on the grid that
 /// recording was actually driven at.
@@ -100,10 +109,9 @@ const BENCH_PROFILE: (u32, u32) = (400, 600);
 /// moves per period, so a
 /// model handed the shipped period covers a fraction of what the servo covered
 /// in the same sample and reads the difference as residual.
-fn bench_plant(run: &Run) -> PlantModel {
-    let (acceleration, velocity) = BENCH_PROFILE;
-    PlantModel::from_registers(velocity, acceleration, run.period_ns())
-        .expect("the bench profile pair is a model")
+fn bench_plant(run: &Run) -> GroupPlants {
+    GroupPlants::from_profiles(&BENCH_PROFILE, run.period_ns())
+        .expect("the bench profile pairs are three models")
 }
 
 /// One period of a recording on which some joint's window ran out.
@@ -165,7 +173,7 @@ struct Replay {
 /// machine was judged by. `plant::RESPONSE_DEAD_SAMPLES`' own
 /// TODO(plant-chase-sequencer) is the one statement of this walk that would
 /// make the restatement unnecessary.
-fn replay(cfg: &MotionConfig, plant: &PlantModel, run: &Run) -> Replay {
+fn replay(cfg: &MotionConfig, plant: &GroupPlants, run: &Run) -> Replay {
     let mut state = MotionSnapWire::new();
     let state = state.clear_valid();
     let mut out = Replay {
@@ -1227,4 +1235,82 @@ fn the_gain_change_is_a_servo_under_the_pace_floor_and_the_same_servo_over_it() 
         "the tuned gains leave {:.2}deg off the model",
         tuned.to_degrees()
     );
+}
+
+/// Guard 6. The watch replayed over a recording says what the watch that ran
+/// on the machine said, and the two antennas of one hold are two different
+/// mechanisms.
+///
+/// The 2026-09-07 raise, cut from before its last goal write so the shipped
+/// settle allowance is spent inside the file: the left antenna hunts and the
+/// right does not, under the same 50 Hz goal rewrite reaching both. What the
+/// interval statistics add to the reversal rate is the separation — both rows
+/// turn round about 25 times a second, and only one of them does it on a
+/// regular period. This is the first fixture the stillness watch is replayed
+/// over at all, so it is also the check that a live window and a replayed one
+/// are the same window.
+#[test]
+fn the_recorded_antenna_hold_reads_one_hunt_and_one_dither() {
+    let cfg = StillnessConfig::default();
+    let trace = fixture("trace-antenna-hunt");
+    let windows = trace
+        .run(0)
+        .holds(cfg, &[JointRef::AntennaLeft, JointRef::AntennaRight]);
+    let of = |joint: JointRef| {
+        let mut held = windows.iter().filter(|window| window.joint == joint);
+        let window = *held.next().unwrap_or_else(|| panic!("{joint:?} held once"));
+        assert!(held.next().is_none(), "{joint:?} held once: {windows:?}");
+        window
+    };
+
+    // The left antenna: the hunt. Every figure here was read off the live
+    // run's own report, so a watch that has stopped agreeing with it fails.
+    let left = of(JointRef::AntennaLeft);
+    assert!(
+        (left.opened_after_ns as f64 / 1e9 - 4.00).abs() < 0.03,
+        "the left window opened {:.2} s after the setpoint last moved",
+        left.opened_after_ns as f64 / 1e9
+    );
+    assert!(
+        left.samples.abs_diff(161) <= 1,
+        "the left window judged {} readings",
+        left.samples
+    );
+    let left_reversals = left.reversals_per_s * left.length().as_secs_f64();
+    assert!(
+        (left_reversals - 81.0).abs() <= 1.0,
+        "the left antenna turned round {left_reversals:.1} times"
+    );
+    let mean = left
+        .reversal_interval_mean_samples
+        .expect("a hunting antenna has intervals");
+    let spread = left
+        .reversal_interval_spread_samples
+        .expect("and a spread of them");
+    assert!((mean - 1.96).abs() < 0.02, "{left:?}");
+    assert!((spread - 0.29).abs() < 0.02, "{left:?}");
+    // Near an alias of a quarter of the sample rate, and only near: the phase
+    // and amplitude drift across the hold, so the turning is not locked to the
+    // grid the goal is rewritten on.
+    let hz = left.apparent_frequency_hz().expect("a frequency");
+    assert!((hz - 12.7).abs() < 0.3, "{left:?} read {hz:.2} Hz apparent");
+    let Err(complaint) = judge(&left, &cfg) else {
+        panic!("the recorded hunt judged still: {left:?}");
+    };
+    assert!((left.excursion_counts() - 9.0).abs() < 1.0, "{complaint}");
+
+    // The right antenna: one count of encoder dither at the same reversal
+    // rate, turning round at scattered intervals rather than on a period.
+    let right = of(JointRef::AntennaRight);
+    assert!(
+        right.samples.abs_diff(153) <= 1,
+        "the right window judged {} readings",
+        right.samples
+    );
+    assert_eq!(judge(&right, &cfg), Ok(()), "{right:?}");
+    assert!((right.excursion_counts() - 1.0).abs() < 0.01, "{right:?}");
+    let right_spread = right
+        .reversal_interval_spread_samples
+        .expect("a dithering antenna has intervals too");
+    assert!(right_spread > 1.0, "{right:?}");
 }

@@ -31,7 +31,7 @@ use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use motion_cogs::session_bus::disarm_config;
 use reachy_kin::wrap_to_pi;
 use reachy_motion::arm::row_of_id;
-use reachy_motion::joints::{Name, ROW_COUNT, ROWS, flags, row};
+use reachy_motion::joints::{Name, ROW_COUNT, ROWS, flags, joint_ref, row};
 use reachy_motion::tick::ResponseKind;
 use scenario::check;
 use scenario::check::present_rows;
@@ -263,7 +263,7 @@ fn check_the_writes(run: &Run, released: Option<i64>, failures: &mut Vec<String>
         {
             continue;
         }
-        let joint = row_of_id(txn.id()).and_then(|row| ROWS.get(row).copied());
+        let joint = row_of_id(txn.id()).and_then(joint_ref);
         match joint {
             Some(joint) if flags::contains(degraded_rows(), joint) => written.push(joint),
             other => failures.push(format!(

@@ -175,6 +175,14 @@ about anything a control step can see.
 | `bus_failure` | transactions failing under torque; a write nothing acknowledges after every attempt | `immediate_all_torque_off_to_park` |
 | `torque_off_unconfirmed` | a torque-off write unacknowledged after all nine attempts and their retries | `immediate_all_torque_off_to_park`, degenerate: the torque-off already ran, so what remains is the park and the alert. An unconfirmed MRC is never reported as Resting |
 
+**The detector is armed on every shipped configuration.** `MoverParams.tracking_armed`
+is a configuration field so that one kind of measurement can run without it: a
+capability run commissioned at a servo profile the motors cannot follow, where
+the model deliberately does not describe them and a residual would be motor lag
+rather than obstruction. No configuration this tree ships carries `false` — the
+scenario suite pins the file `true` — such a run is attended, and every analyzer
+reads a run whose recorded configuration says otherwise as a failed run.
+
 **One crank seized is not a grabbed head.** A single leg servo that stops while
 the other five keep tracking presents as `measured_pose_invalid`: five cranks on
 the plan and one off it is a pose no rigid head can hold, so the forward

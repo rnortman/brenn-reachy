@@ -48,6 +48,8 @@ config_files=(
 	cogs/clip_library.textproto
 	cogs/host_logger.textproto
 	cogs/mover_params.textproto
+	cogs/servo_gains.textproto
+	cogs/servo_profile.textproto
 	cogs/session_params.textproto
 )
 for file in "${config_files[@]}"; do
@@ -357,6 +359,16 @@ assert_contains "one cquery names the configuration" "$(calls)" \
 	"-- //cogs:host_config_files"
 assert_eq "and there are two cqueries, not one per target" 2 \
 	"$(calls | grep -c 'bazel cquery')"
+
+# The analyzer reads the configuration a run was performed under out of the run's
+# own records and refuses a log without it, the way it does on a device. This run
+# reads the tree's copies out of the staging, so the staging's copies are what go
+# beside the records.
+for file in cogs/servo_profile.textproto cogs/servo_gains.textproto cogs/mover_params.textproto; do
+	assert_eq "${file} is staged beside the records the analyzer reads" \
+		"$(cat -- "${staging}/${file}")" \
+		"$(cat -- "${logs}/run_000001/config/${file}")"
+done
 
 assert_contains "the analyzer is run over the log the writer wrote" "$(calls)" \
 	"run -- //cogs:first_motion_report --grid-jitter-ns"

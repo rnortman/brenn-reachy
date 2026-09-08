@@ -130,17 +130,42 @@ pub const SESSION_CONFIRM_BUDGET_NS: i64 = 500_000_000;
 /// The servo-side profile acceleration the commissioning sweep writes, in the
 /// register's own units.
 ///
-/// Mirrors the deployed `ServoProfile.profile_acceleration`; a scenario
+/// Mirrors the deployed `ServoProfile.legs_profile_acceleration`; a scenario
 /// asserting this pair is asserting about the file the process read. What makes
 /// the claim reach the wire is
 /// [`check::commissioned_profile`](crate::check::commissioned_profile), which
-/// finds the two writes in the run's own datagrams. What makes it the pair the
-/// decision tick judges joints against is [`check_params`], which compares the
-/// file with the motion library's own `plant::SHIPPED_PROFILE`.
-pub const PROFILE_ACCELERATION: i64 = 20;
+/// finds the two writes on each of the six crank rows in the run's own
+/// datagrams. What makes it the pair the decision tick judges those joints
+/// against is [`check_params`], which compares the file with the motion
+/// library's own `plant::SHIPPED_PROFILES`.
+pub const LEGS_PROFILE_ACCELERATION: i64 = 20;
 
-/// The servo-side profile velocity the sweep writes, register units.
-pub const PROFILE_VELOCITY: i64 = 50;
+/// The six cranks' profile velocity the sweep writes, register units.
+pub const LEGS_PROFILE_VELOCITY: i64 = 50;
+
+/// The body yaw servo's profile acceleration, register units. Its own pair
+/// because its motor and its load are its own.
+pub const BODY_YAW_PROFILE_ACCELERATION: i64 = 20;
+
+/// The body yaw servo's profile velocity, register units.
+pub const BODY_YAW_PROFILE_VELOCITY: i64 = 50;
+
+/// The two antennas' profile acceleration, register units. Their own pair: the
+/// antenna servos are a different XL330 variant with a Velocity Limit 3.6x the
+/// head's.
+pub const ANTENNAS_PROFILE_ACCELERATION: i64 = 20;
+
+/// The two antennas' profile velocity, register units.
+pub const ANTENNAS_PROFILE_VELOCITY: i64 = 50;
+
+/// Whether the deployed `MoverParams` arms the plant-model tracking detector.
+///
+/// Pinned true, and there is no scenario for false: the field exists for an
+/// attended capability run commissioned at a profile the motors cannot follow,
+/// where the model is known not to describe them. Every shipped configuration
+/// carries it armed, and `check_params` is what says so about the file the
+/// processes read.
+pub const TRACKING_ARMED: bool = true;
 
 /// The servos' Bus Watchdog timeout the commissioning sweep arms, in the
 /// register's 20 ms units.
@@ -250,9 +275,13 @@ pub fn cycles_for(duration_ns: i64) -> i64 {
 /// The figure is an upper bound on the stepped plant by a cycle or three (the
 /// closed form is continuous-time), which is the direction an arrival assertion
 /// needs: an instant taken from here is never before the joint got there.
+///
+/// The class is named because the profile is per class: a travel worked out on
+/// the legs' generator and asserted about an antenna is an instant off a
+/// machine nobody commissioned.
 #[must_use]
-pub fn travel_cycles(distance_rad: f64) -> i64 {
-    let plant = reachy_motion::plant::PlantModel::default();
+pub fn travel_cycles(group: reachy_motion::joints::JointGroup, distance_rad: f64) -> i64 {
+    let plant = reachy_motion::plant::GroupPlants::default().of(group);
     i64::try_from(plant.travel_cycles(distance_rad)).unwrap_or(i64::MAX)
 }
 
@@ -403,7 +432,7 @@ pub fn posture_walk(
         panic!("a canonical posture move is one this machine runs: {refusal}")
     });
 
-    let plant = reachy_motion::plant::PlantModel::default();
+    let plants = reachy_motion::plant::GroupPlants::default();
     let standing = posture_joints(from).joints().map(|(_, angle)| angle);
     let ends = posture_joints(path.target())
         .joints()
@@ -420,7 +449,7 @@ pub fn posture_walk(
     let mut sampled = *from;
     for cycle in 0..MAX_TRAVEL_CYCLES {
         for (row, predicted) in state.iter_mut().enumerate() {
-            plant.step(predicted, held[0][row]);
+            plants.for_row(row).step(predicted, held[0][row]);
         }
         positions.push(state.map(|predicted| predicted.position));
         if state
@@ -538,10 +567,10 @@ pub fn response_delay_cycles() -> i64 {
 /// wants it for is a goal that turns round under a moving joint: the joint keeps
 /// going the way it was for this many cycles after the setpoint reverses,
 /// whatever the setpoint says, because that is how long its own generator takes
-/// to bring the speed through zero.
+/// to bring the speed through zero. Per class, as the profile is.
 #[must_use]
-pub fn ramp_cycles() -> i64 {
-    let plant = reachy_motion::plant::PlantModel::default();
+pub fn ramp_cycles(group: reachy_motion::joints::JointGroup) -> i64 {
+    let plant = reachy_motion::plant::GroupPlants::default().of(group);
     (plant.v_max / plant.a_max).ceil() as i64
 }
 
@@ -552,10 +581,10 @@ pub fn ramp_cycles() -> i64 {
 /// joint a hand has just come off, and a release changes no setpoint, so there
 /// is nothing for a dead time to delay. [`travel_cycles`] is the other
 /// question -- a commanded arrival, rest to rest, whose setpoint really does
-/// take a dead time to be answered.
+/// take a dead time to be answered. Per class, as the profile is.
 #[must_use]
-pub fn pass_cycles(distance_rad: f64) -> i64 {
-    let plant = reachy_motion::plant::PlantModel::default();
+pub fn pass_cycles(group: reachy_motion::joints::JointGroup, distance_rad: f64) -> i64 {
+    let plant = reachy_motion::plant::GroupPlants::default().of(group);
     i64::try_from(plant.pass_cycles(distance_rad)).unwrap_or(i64::MAX)
 }
 
@@ -566,11 +595,12 @@ pub fn pass_cycles(distance_rad: f64) -> i64 {
 /// `threshold_rad` and the fault comes `ticks` ticks later, so a jam shorter
 /// than this raises nothing at all whatever the goal was doing, and one longer
 /// than this plus the window raises. A scenario placing a hand on the machine
-/// says which of the two it is by this figure rather than by an integer.
+/// says which of the two it is by this figure rather than by an integer. Per
+/// class, as the profile is.
 #[must_use]
-pub fn crossing_cycles() -> i64 {
+pub fn crossing_cycles(group: reachy_motion::joints::JointGroup) -> i64 {
     let cfg = reachy_motion::tick::default_motion_config();
-    (cfg.tracking.threshold_rad / cfg.plant.v_max).ceil() as i64
+    (cfg.tracking.threshold_rad / cfg.plant.of(group).v_max).ceil() as i64
 }
 
 /// The three instants a hand laid on the rows of a moving posture move decides.
@@ -1203,6 +1233,8 @@ pub struct ConfigPaths<'a> {
     pub mover: &'a str,
     /// `servo_profile.textproto`.
     pub profile: &'a str,
+    /// `servo_gains.textproto`.
+    pub gains: &'a str,
     /// `session_params.textproto`.
     pub session: &'a str,
     /// `sim_params.textproto`.
@@ -1235,6 +1267,7 @@ impl<'a> ConfigPaths<'a> {
         let paths = Self {
             mover: named("mover_params.textproto"),
             profile: named("servo_profile.textproto"),
+            gains: named("servo_gains.textproto"),
             session: named("session_params.textproto"),
             sim: named("sim_params.textproto"),
             motord: named("motord_params.textproto"),
@@ -1278,6 +1311,7 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
     let &ConfigPaths {
         mover: mover_textproto,
         profile: profile_textproto,
+        gains: gains_textproto,
         session: session_textproto,
         sim: sim_textproto,
         motord: motord_textproto,
@@ -1290,6 +1324,7 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
             ("period_ns", Value::Int(PERIOD_NS)),
             ("up_duration_ns", Value::Int(UP_DURATION_NS)),
             ("stow_duration_ns", Value::Int(STOW_DURATION_NS)),
+            ("tracking_armed", Value::Bool(TRACKING_ARMED)),
         ],
         &mut failures,
     );
@@ -1314,8 +1349,48 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
     expect(
         profile_textproto,
         &[
-            ("profile_acceleration", Value::Int(PROFILE_ACCELERATION)),
-            ("profile_velocity", Value::Int(PROFILE_VELOCITY)),
+            (
+                "legs_profile_acceleration",
+                Value::Int(LEGS_PROFILE_ACCELERATION),
+            ),
+            ("legs_profile_velocity", Value::Int(LEGS_PROFILE_VELOCITY)),
+            (
+                "body_yaw_profile_acceleration",
+                Value::Int(BODY_YAW_PROFILE_ACCELERATION),
+            ),
+            (
+                "body_yaw_profile_velocity",
+                Value::Int(BODY_YAW_PROFILE_VELOCITY),
+            ),
+            (
+                "antennas_profile_acceleration",
+                Value::Int(ANTENNAS_PROFILE_ACCELERATION),
+            ),
+            (
+                "antennas_profile_velocity",
+                Value::Int(ANTENNAS_PROFILE_VELOCITY),
+            ),
+        ],
+        &mut failures,
+    );
+    // The gains the session commissions each class of servo with, against the
+    // motion library's own default. Not a second set of constants here: the
+    // library states the triples, this file is what a deployment edits when a
+    // rung is tuned, and the two disagreeing is a machine commissioned with
+    // numbers no test was written against.
+    let gains = reachy_motion::arm::DEFAULT_GAINS;
+    expect(
+        gains_textproto,
+        &[
+            ("legs_p", Value::Int(i64::from(gains.legs.p))),
+            ("legs_i", Value::Int(i64::from(gains.legs.i))),
+            ("legs_d", Value::Int(i64::from(gains.legs.d))),
+            ("body_yaw_p", Value::Int(i64::from(gains.yaw.p))),
+            ("body_yaw_i", Value::Int(i64::from(gains.yaw.i))),
+            ("body_yaw_d", Value::Int(i64::from(gains.yaw.d))),
+            ("antennas_p", Value::Int(i64::from(gains.antennas.p))),
+            ("antennas_i", Value::Int(i64::from(gains.antennas.i))),
+            ("antennas_d", Value::Int(i64::from(gains.antennas.d))),
         ],
         &mut failures,
     );
@@ -1330,19 +1405,36 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
         &[("period_ns", Value::Int(PERIOD_NS))],
         &mut failures,
     );
-    // The pair the tests of the motion library are written against, and the
-    // grid they assume, against the files the processes read. `PlantModel`'s
-    // own default is built from these two constants, so a file that moved away
-    // from them would leave every scenario and every unit test screening a
-    // machine no deployment runs.
-    let (shipped_acceleration, shipped_velocity) = reachy_motion::plant::SHIPPED_PROFILE;
-    if i64::from(shipped_acceleration) != PROFILE_ACCELERATION
-        || i64::from(shipped_velocity) != PROFILE_VELOCITY
-    {
-        failures.push(format!(
-            "the motion library ships profile {shipped_acceleration}/{shipped_velocity} and the \
-             scenarios expect {PROFILE_ACCELERATION}/{PROFILE_VELOCITY}",
-        ));
+    // The pairs the tests of the motion library are written against, and the
+    // grid they assume, against the files the processes read. `GroupPlants`'
+    // own default is built from these constants, so a file that moved away from
+    // them would leave every scenario and every unit test screening a machine
+    // no deployment runs. Per class, because a check that compared one pair
+    // would pass a file that gave the antennas the legs' numbers.
+    let shipped = reachy_motion::plant::SHIPPED_PROFILES;
+    for (class, (acceleration, velocity), (expected_a, expected_v)) in [
+        (
+            "legs",
+            shipped.legs,
+            (LEGS_PROFILE_ACCELERATION, LEGS_PROFILE_VELOCITY),
+        ),
+        (
+            "body yaw",
+            shipped.yaw,
+            (BODY_YAW_PROFILE_ACCELERATION, BODY_YAW_PROFILE_VELOCITY),
+        ),
+        (
+            "antennas",
+            shipped.antennas,
+            (ANTENNAS_PROFILE_ACCELERATION, ANTENNAS_PROFILE_VELOCITY),
+        ),
+    ] {
+        if i64::from(acceleration) != expected_a || i64::from(velocity) != expected_v {
+            failures.push(format!(
+                "the motion library ships the {class} at profile {acceleration}/{velocity} and \
+                 the scenarios expect {expected_a}/{expected_v}",
+            ));
+        }
     }
     if reachy_motion::plant::SHIPPED_PERIOD_NS != PERIOD_NS {
         failures.push(format!(
@@ -1479,9 +1571,13 @@ mod tests {
     use reachy_motion::stillness::StillnessConfig;
 
     use super::{
-        LAG_K, PERIOD_NS, crossing_cycles, head_jam_rows, head_up_travel, jam_on_the_raise,
-        motion_id, motion_table, posture_joints, response_delay_cycles, travel_cycles,
-        unjudgeable_step, up_clocks, up_travel, up_walk,
+        AUX_RETRIES, AUX_TIMEOUT_NS, BUS_WATCHDOG, ConfigPaths, HEALTH_POLL_PERIOD_NS,
+        HOLD_TIMEOUT_NS, LAG_K, PERIOD_NS, RAIL_STALE_AFTER_NS, SAMPLE_STALE_AFTER,
+        SCRIPT_SPAN_CAP_MS, SESSION_CONFIRM_BUDGET_NS, START_TORQUED, STARTUP_GRACE_NS,
+        STOW_BUDGET_NS, STOW_DURATION_NS, TRACKING_ARMED, UP_DURATION_NS, check_params,
+        crossing_cycles, head_jam_rows, head_up_travel, jam_on_the_raise, motion_id, motion_table,
+        posture_joints, response_delay_cycles, travel_cycles, unjudgeable_step, up_clocks,
+        up_travel, up_walk,
     };
 
     /// The sidecar the emitter committed is the sidecar the edge's reader parses,
@@ -1533,7 +1629,7 @@ mod tests {
         let folded = posture_joints(&stow);
         let upright = posture_joints(&neutral);
         let arc = core::f64::consts::TAU - (upright.antennas[0] - folded.antennas[0]).abs();
-        let closed_form = travel_cycles(arc);
+        let closed_form = travel_cycles(reachy_motion::joints::JointGroup::Antennas, arc);
 
         let arrived = up_travel();
         assert!(
@@ -1600,13 +1696,14 @@ mod tests {
         // advances the plant, so the sample published for a cycle carries the
         // position of the one before it.
         assert!(
-            hand.crossing - (hand.jam - 1) >= crossing_cycles(),
+            hand.crossing - (hand.jam - 1)
+                >= crossing_cycles(reachy_motion::joints::JointGroup::Legs),
             "the residual passes the {} rad screen {} periods after the reading the jam froze, \
              and the fastest a generator can open that distance is {} periods at the profile \
              velocity",
             cfg.tracking.threshold_rad,
             hand.crossing - (hand.jam - 1),
-            crossing_cycles()
+            crossing_cycles(reachy_motion::joints::JointGroup::Legs)
         );
         assert_eq!(
             hand.raise,
@@ -1660,5 +1757,179 @@ mod tests {
         );
         assert!(says.contains(&format!("{move_ms} ms of it")), "{says}");
         assert!(says.contains(clocks.longest_group()), "{says}");
+    }
+
+    /// The parameter check reads every key it claims to read, and fails a file
+    /// that states any of them differently.
+    ///
+    /// Three files carry pinned keys: the profile's six, the gains' nine, and
+    /// the detector's arming. A key the check silently skipped -- misspelled
+    /// here, or dropped when the list was edited -- would pass a deployment
+    /// nobody screened. So each is perturbed in turn and the failure is
+    /// required to name it.
+    #[test]
+    fn the_parameter_check_reads_every_key_it_pins() {
+        // The harness's own scratch directory, private to this test target and
+        // emptied by it: a fixed name under the system temporary directory
+        // collides between concurrent runs, and the cleanup below is skipped on
+        // exactly the path -- a failing assertion -- where the leftovers would
+        // be read by the next one.
+        let dir = std::env::var_os("TEST_TMPDIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join("check-params");
+        let write = |dir: &std::path::Path, name: &str, body: &str| -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("the fixture directory is writable");
+            path.to_string_lossy().into_owned()
+        };
+        let gains = reachy_motion::arm::DEFAULT_GAINS;
+        let shipped = reachy_motion::plant::SHIPPED_PROFILES;
+        // Every file the check reads, as the deployment states it. Built from
+        // the constants rather than copied so this case is about which keys are
+        // read, never about what the numbers are -- the files themselves are
+        // what the live scenarios check.
+        let files = |mutate: Option<(&str, &str, &str)>| -> Vec<String> {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a fixture directory");
+            let mut sources = [
+                (
+                    "mover_params.textproto",
+                    vec![
+                        ("lag_k", LAG_K.to_string()),
+                        ("period_ns", PERIOD_NS.to_string()),
+                        ("up_duration_ns", UP_DURATION_NS.to_string()),
+                        ("stow_duration_ns", STOW_DURATION_NS.to_string()),
+                        ("tracking_armed", TRACKING_ARMED.to_string()),
+                    ],
+                ),
+                (
+                    "servo_profile.textproto",
+                    vec![
+                        ("legs_profile_acceleration", shipped.legs.0.to_string()),
+                        ("legs_profile_velocity", shipped.legs.1.to_string()),
+                        ("body_yaw_profile_acceleration", shipped.yaw.0.to_string()),
+                        ("body_yaw_profile_velocity", shipped.yaw.1.to_string()),
+                        (
+                            "antennas_profile_acceleration",
+                            shipped.antennas.0.to_string(),
+                        ),
+                        ("antennas_profile_velocity", shipped.antennas.1.to_string()),
+                    ],
+                ),
+                (
+                    "servo_gains.textproto",
+                    vec![
+                        ("legs_p", gains.legs.p.to_string()),
+                        ("legs_i", gains.legs.i.to_string()),
+                        ("legs_d", gains.legs.d.to_string()),
+                        ("body_yaw_p", gains.yaw.p.to_string()),
+                        ("body_yaw_i", gains.yaw.i.to_string()),
+                        ("body_yaw_d", gains.yaw.d.to_string()),
+                        ("antennas_p", gains.antennas.p.to_string()),
+                        ("antennas_i", gains.antennas.i.to_string()),
+                        ("antennas_d", gains.antennas.d.to_string()),
+                    ],
+                ),
+                (
+                    "session_params.textproto",
+                    vec![
+                        ("aux_timeout_ns", AUX_TIMEOUT_NS.to_string()),
+                        ("aux_retries", AUX_RETRIES.to_string()),
+                        ("sample_stale_after", SAMPLE_STALE_AFTER.to_string()),
+                        ("startup_grace_ns", STARTUP_GRACE_NS.to_string()),
+                        ("stow_budget_ns", STOW_BUDGET_NS.to_string()),
+                        (
+                            "torque_off_confirm_budget_ns",
+                            SESSION_CONFIRM_BUDGET_NS.to_string(),
+                        ),
+                        ("bus_watchdog", BUS_WATCHDOG.to_string()),
+                        ("script_span_cap_ms", SCRIPT_SPAN_CAP_MS.to_string()),
+                        ("rail_stale_after_ns", RAIL_STALE_AFTER_NS.to_string()),
+                    ],
+                ),
+                (
+                    "sim_params.textproto",
+                    vec![
+                        ("period_ns", PERIOD_NS.to_string()),
+                        ("hold_timeout_ns", HOLD_TIMEOUT_NS.to_string()),
+                        ("start_torqued", START_TORQUED.to_string()),
+                        ("health_poll_period_ns", HEALTH_POLL_PERIOD_NS.to_string()),
+                    ],
+                ),
+                (
+                    "motord_params.textproto",
+                    vec![("period_ns", PERIOD_NS.to_string())],
+                ),
+            ];
+            if let Some((file, key, value)) = mutate {
+                let target = sources
+                    .iter_mut()
+                    .find(|(name, _)| *name == file)
+                    .expect("the fixture set carries the file");
+                let cell = target
+                    .1
+                    .iter_mut()
+                    .find(|(name, _)| *name == key)
+                    .expect("the file carries the key");
+                cell.1 = value.to_owned();
+            }
+            sources
+                .iter()
+                .map(|(name, keys)| {
+                    let body: String = keys
+                        .iter()
+                        .map(|(key, value)| format!("{key}: {value}\n"))
+                        .collect();
+                    write(&dir, name, &body)
+                })
+                .collect()
+        };
+
+        let paths = files(None);
+        let bound = ConfigPaths::of(&paths).expect("the fixture set carries every file");
+        assert_eq!(
+            check_params(&bound),
+            Vec::<String>::new(),
+            "the constants and a file written from them are one statement",
+        );
+
+        // One perturbation per pinned key, each a value the field could
+        // plausibly drift to.
+        let perturbations: [(&str, &str, &str); 16] = [
+            ("mover_params.textproto", "tracking_armed", "false"),
+            ("servo_profile.textproto", "legs_profile_acceleration", "21"),
+            ("servo_profile.textproto", "legs_profile_velocity", "51"),
+            (
+                "servo_profile.textproto",
+                "body_yaw_profile_acceleration",
+                "21",
+            ),
+            ("servo_profile.textproto", "body_yaw_profile_velocity", "51"),
+            (
+                "servo_profile.textproto",
+                "antennas_profile_acceleration",
+                "21",
+            ),
+            ("servo_profile.textproto", "antennas_profile_velocity", "51"),
+            ("servo_gains.textproto", "legs_p", "801"),
+            ("servo_gains.textproto", "legs_i", "101"),
+            ("servo_gains.textproto", "legs_d", "301"),
+            ("servo_gains.textproto", "body_yaw_p", "201"),
+            ("servo_gains.textproto", "body_yaw_i", "1"),
+            ("servo_gains.textproto", "body_yaw_d", "1"),
+            ("servo_gains.textproto", "antennas_p", "501"),
+            ("servo_gains.textproto", "antennas_i", "1"),
+            ("servo_gains.textproto", "antennas_d", "101"),
+        ];
+        for (file, key, value) in perturbations {
+            let paths = files(Some((file, key, value)));
+            let bound = ConfigPaths::of(&paths).expect("the fixture set carries every file");
+            let failures = check_params(&bound);
+            assert!(
+                failures.iter().any(|line| line.contains(key)),
+                "a {file} stating {key}: {value} is a file the check has to name: {failures:?}",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

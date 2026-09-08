@@ -5,40 +5,70 @@
 //! tests that need no port and no machine. This file owns only the argument
 //! shape, the port, the printing and the exit code.
 //!
-//! `selftest` is read-only. The other four write to a servo, and none of them
+//! `selftest` is read-only. The other five write to a servo, and none of them
 //! commands an angle: `provision` writes one non-volatile register on a limp
-//! machine, `reboot` and `off` are de-torques, which nothing gates, and
-//! `watchdog` torques one servo at the position it is already standing at and
-//! watches what its bus watchdog does to it — a stop, with torque held.
+//! machine, `reboot` and `off` are de-torques, which nothing gates, `watchdog`
+//! torques one servo at the position it is already standing at and watches what
+//! its bus watchdog does to it — a stop, with torque held — and `hold-probe`
+//! torques one servo at that same position and reads it as fast as the bus
+//! answers, to see whether a joint told to stand still does.
 
 #![forbid(unsafe_code)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use reachy_bench::bare::{self, BareError, MonotonicClock};
+use reachy_bench::bare::{
+    self, BareError, HOLD_PROBE_SECONDS, HOLD_PROBE_SERIES_PREFIX, MonotonicClock, ProbeRequest,
+    ProbeRun,
+};
 use reachy_bench::config::{self, RECORD_NAME};
 use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
+use reachy_motion::Gains;
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
+
+/// The flags, named once so the parser, the per-command contract and the
+/// refusals all say the same word.
+const CONFIG_FLAG: &str = "--config";
+/// See [`CONFIG_FLAG`].
+const RECORD_FLAG: &str = "--record";
+/// See [`CONFIG_FLAG`].
+const GAINS_FLAG: &str = "--gains";
+/// See [`CONFIG_FLAG`].
+const SECONDS_FLAG: &str = "--seconds";
 
 /// What the operator asked for.
 #[derive(Debug)]
 struct Args {
     config: PathBuf,
     record: Option<PathBuf>,
+    /// The position gains a hold probe swaps in for its run, if the operator
+    /// named a triple.
+    gains: Option<Gains>,
+    /// How long each of a hold probe's phases runs, if the operator named a
+    /// figure.
+    seconds: Option<u64>,
     /// The words that were not flags: the one servo a reboot or a watchdog
     /// self-test addresses.
     operands: Vec<String>,
+    /// The flags that were given, by name and in the order they were typed.
+    ///
+    /// Kept because a flag only some commands read is a flag the rest have to
+    /// refuse: a run that silently ignored `--gains` is an operator who
+    /// believes gains were swapped when nothing was written.
+    given: Vec<&'static str>,
 }
 
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH]\n\
+        "usage: reachy-bench <command> [operands] [--config PATH] [--record PATH] \
+         [--gains P,I,D] [--seconds N]\n\
          \n\
          commands:\n\
          \x20 selftest              read-only: pings and register reads, no torque, no motion\n\
@@ -48,6 +78,8 @@ fn usage() -> String {
          \x20 off                   write torque off on every servo\n\
          \x20 watchdog [id]         torque one servo and watch what its bus watchdog does to \
          it\n\
+         \x20 hold-probe [id]       torque one servo and read it at bus speed to see whether \
+         it holds still\n\
          \n\
          Nothing here commands an angle: this tool reads the machine, provisions it and \
          releases it.\n\
@@ -78,6 +110,15 @@ fn usage() -> String {
          servo left armed among eight at zero splits the roster across the two and the\n\
          sweep fails on the mix, naming the servo.\n\
          \n\
+         `hold-probe` is the other supervised assertion: it holds one servo — an antenna\n\
+         unless you name another — at the count it reports for itself and reads that count as\n\
+         fast as the bus answers, for {HOLD_PROBE_SECONDS} s with the goal rewritten at the\n\
+         driver's cadence and {HOLD_PROBE_SECONDS} s with reads alone. `--gains P,I,D` swaps\n\
+         the position loop's terms for the run and puts the kept ones back on the way out;\n\
+         `--seconds N` sets each phase's length. It commands no angle and holds torque for both\n\
+         phases: run it at rest, never with the head up. The two series are written beside the\n\
+         record as hold-probe-<stamp>-<id>.csv, whether the run passed or not.\n\
+         \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
          {RECORD_NAME} beside it."
     )
@@ -100,17 +141,19 @@ enum Command {
     Reboot,
     Off,
     Watchdog,
+    HoldProbe,
 }
 
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 5] = [
+    const ALL: [Command; 6] = [
         Self::Selftest,
         Self::Provision,
         Self::Reboot,
         Self::Off,
         Self::Watchdog,
+        Self::HoldProbe,
     ];
 
     /// The command `word` names, or nothing.
@@ -121,6 +164,7 @@ impl Command {
             "reboot" => Self::Reboot,
             "off" => Self::Off,
             "watchdog" => Self::Watchdog,
+            "hold-probe" => Self::HoldProbe,
             _ => return None,
         })
     }
@@ -133,6 +177,7 @@ impl Command {
             Self::Reboot => "reboot",
             Self::Off => "off",
             Self::Watchdog => "watchdog",
+            Self::HoldProbe => "hold-probe",
         }
     }
 
@@ -144,7 +189,21 @@ impl Command {
     fn operands(self) -> usize {
         match self {
             Self::Selftest | Self::Provision | Self::Off => 0,
-            Self::Reboot | Self::Watchdog => 1,
+            Self::Reboot | Self::Watchdog | Self::HoldProbe => 1,
+        }
+    }
+
+    /// The flags this command reads, beyond the one every command reads.
+    ///
+    /// The other half of the invocation contract `operands` is: a flag a
+    /// command does not read is refused rather than dropped, because a dropped
+    /// one is an operator told nothing while the machine did something else.
+    /// `--config` is every command's: all six load the bus out of it.
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Selftest => &[RECORD_FLAG],
+            Self::Provision | Self::Reboot | Self::Off | Self::Watchdog => &[],
+            Self::HoldProbe => &[RECORD_FLAG, GAINS_FLAG, SECONDS_FLAG],
         }
     }
 }
@@ -166,6 +225,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Command::Reboot => reboot(&args, optional_id(&args)?),
         Command::Off => off(&args),
         Command::Watchdog => watchdog(&args, optional_id(&args)?),
+        Command::HoldProbe => hold_probe(&args, optional_id(&args)?),
     }
 }
 
@@ -174,7 +234,10 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args {
         config: PathBuf::from(DEFAULT_CONFIG),
         record: None,
+        gains: None,
+        seconds: None,
         operands: Vec::new(),
+        given: Vec::new(),
     };
     let mut argv = argv;
     while let Some(word) = argv.next() {
@@ -189,12 +252,67 @@ fn parse_args(argv: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         // the flag. Every flag this program does define takes a value, so a
         // missing one is an operator typo rather than shorthand for anything.
         match word.as_str() {
-            "--config" => args.config = PathBuf::from(value_for(&word, &mut argv)?),
-            "--record" => args.record = Some(PathBuf::from(value_for(&word, &mut argv)?)),
+            "--config" => {
+                args.config = PathBuf::from(value_for(&word, &mut argv)?);
+                args.given.push(CONFIG_FLAG);
+            }
+            "--record" => {
+                args.record = Some(PathBuf::from(value_for(&word, &mut argv)?));
+                args.given.push(RECORD_FLAG);
+            }
+            "--gains" => {
+                args.gains = Some(parse_gains(&value_for(&word, &mut argv)?)?);
+                args.given.push(GAINS_FLAG);
+            }
+            "--seconds" => {
+                args.seconds = Some(parse_seconds(&value_for(&word, &mut argv)?)?);
+                args.given.push(SECONDS_FLAG);
+            }
             other => bail!("reachy-bench: unknown option `{other}`\n\n{}", usage()),
         }
     }
     Ok(args)
+}
+
+/// The three position gains a `--gains` flag carries, as `P,I,D`.
+///
+/// All three or none: the register is one six-byte span written in one
+/// transaction, and a flag that set the proportional term alone would be
+/// writing the other two anyway — from whatever the operator did not say.
+fn parse_gains(word: &str) -> anyhow::Result<Gains> {
+    let terms: Vec<&str> = word.split(',').collect();
+    let [p, i, d] = terms.as_slice() else {
+        bail!(
+            "`--gains` takes three terms, `P,I,D`; got `{word}`\n\n{}",
+            usage()
+        );
+    };
+    let term = |text: &str, which: &str| -> anyhow::Result<u16> {
+        text.trim()
+            .parse()
+            .with_context(|| format!("`--gains`: `{text}` is not a {which} gain\n\n{}", usage()))
+    };
+    Ok(Gains {
+        p: term(p, "proportional")?,
+        i: term(i, "integral")?,
+        d: term(d, "derivative")?,
+    })
+}
+
+/// The seconds a `--seconds` flag carries. Zero is refused here: a phase of no
+/// length is a phase that measures nothing, and the command would print a rate
+/// over no readings rather than say so.
+fn parse_seconds(word: &str) -> anyhow::Result<u64> {
+    let seconds: u64 = word.parse().with_context(|| {
+        format!(
+            "`--seconds`: `{word}` is not a number of seconds\n\n{}",
+            usage()
+        )
+    })?;
+    if seconds == 0 {
+        bail!("`--seconds` must be at least one second\n\n{}", usage());
+    }
+    Ok(seconds)
 }
 
 /// The word after a flag, or a refusal naming the flag that wanted it.
@@ -218,6 +336,15 @@ fn check_invocation(args: &Args, command: Command) -> anyhow::Result<()> {
             usage(),
             given = args.operands.len(),
         );
+    }
+    let taken = command.flags();
+    for flag in &args.given {
+        if *flag != CONFIG_FLAG && !taken.contains(flag) {
+            bail!(
+                "reachy-bench: `{name}` does not take `{flag}`\n\n{}",
+                usage()
+            );
+        }
     }
     Ok(())
 }
@@ -397,6 +524,88 @@ fn watchdog(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
         println!("{line}")
     })
     .map_err(|error| refused("watchdog", error))
+}
+
+/// Hold one servo where it stands and read it at bus speed.
+///
+/// Not gated on anything the machine says, and it needs no envelope: the only
+/// goal it writes is the count the servo just reported for itself. What it does
+/// need is an operator standing there — it holds torque on one servo for both
+/// phases — so the warning is the command's own, printed before the port is
+/// opened.
+///
+/// The series is written before the verdict is acted on, for the reason the
+/// self-test's record is: a refused run is the reading a bring-up most wants
+/// kept, and an early return between the run and the save would throw away a
+/// hardware round trip.
+fn hold_probe(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
+    let (map, timing, device) = bare_config(args)?;
+    let seconds = std::time::Duration::from_secs(args.seconds.unwrap_or(HOLD_PROBE_SECONDS));
+
+    println!("hold-probe over {device} at {} baud.", timing.baud);
+
+    let port = bare_port(&device, timing.baud)?;
+    let mut clock = MonotonicClock::new();
+
+    let request = ProbeRequest {
+        target,
+        gains: args.gains,
+        seconds,
+    };
+    let run = bare::hold_probe(&map, timing, port, request, &mut clock, &mut |line| {
+        println!("{line}")
+    })
+    .map_err(|error| refused("hold-probe", error))?;
+
+    // The verdict outlives a failed write. A series that could not be written
+    // down is a host problem — a full tmpfs, most likely, which is where these
+    // land — and reporting it in place of the finding the run made would throw
+    // away the hardware round trip that found it. So the write's failure is
+    // said out loud and kept, and it becomes the exit status only when the
+    // probe itself had nothing to report.
+    let saved = save_probe(&run, &record_path(args), now_unix());
+    if let Err(failed) = &saved {
+        eprintln!("hold-probe: the series could not be written: {failed:#}");
+    }
+    verdict_before_write(run.outcome, saved)
+}
+
+/// What a probe run exits with: its own verdict, or the series write's failure
+/// when the probe had nothing to report.
+///
+/// A separate step because the order is the whole point and an inversion of it
+/// is invisible at the call site: a hardware finding reported as "the series
+/// could not be written" throws away the round trip that found it.
+fn verdict_before_write(
+    outcome: Result<(), BareError>,
+    saved: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    outcome.map_err(|error| refused("hold-probe", error))?;
+    saved
+}
+
+/// Write a probe's two series beside the record, and say where they went.
+///
+/// Created, never overwritten. The name carries the moment the run was taken,
+/// off a device whose clock is RAM and whose home is a tmpfs: a boot without a
+/// network, or a step once one arrives, gives a stamp that repeats. A second
+/// run landing on an already-used name is refused loudly rather than writing
+/// over a hardware reading that cost a round trip.
+fn save_probe(run: &ProbeRun, record: &Path, taken_at_unix: u64) -> anyhow::Result<()> {
+    let beside = record.parent().unwrap_or(Path::new(""));
+    let path = beside.join(format!(
+        "{HOLD_PROBE_SERIES_PREFIX}{taken_at_unix}-{id}.csv",
+        id = run.id
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(run.csv().as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("series written to {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -652,6 +861,221 @@ mod tests {
         }
     }
 
+    /// A flag a command does not read is refused rather than dropped.
+    ///
+    /// `off --gains 300,0,50` parses, and every word of it is a flag this
+    /// program defines; run, it would write no gain and say nothing. An
+    /// operator who believes a triple was swapped reads the next run as the
+    /// machine's answer to it.
+    #[test]
+    fn a_flag_a_command_does_not_read_is_refused() {
+        for words in [
+            vec!["off", "--gains", "300,0,50"],
+            vec!["provision", "--seconds", "30"],
+            vec!["reboot", "--record", "/tmp/r"],
+            vec!["watchdog", "--gains", "200,0,0"],
+            vec!["selftest", "--seconds", "5"],
+        ] {
+            let refused = dispatch(argv(&words)).expect_err("that command does not read it");
+            let printed = refused.to_string();
+            assert!(printed.contains(words[0]), "{words:?}: {printed}");
+            assert!(printed.contains(words[1]), "{words:?}: {printed}");
+            assert!(printed.contains("usage:"), "{words:?}: {printed}");
+        }
+    }
+
+    /// Every command reads `--config`, and the ones that take the rest say so
+    /// in the same place the parser reads them.
+    #[test]
+    fn the_flags_a_command_takes_are_the_flags_it_reads() {
+        assert_eq!(
+            Command::HoldProbe.flags(),
+            &[RECORD_FLAG, GAINS_FLAG, SECONDS_FLAG]
+        );
+        assert_eq!(Command::Selftest.flags(), &[RECORD_FLAG]);
+        for command in Command::ALL {
+            assert!(
+                !command.flags().contains(&CONFIG_FLAG),
+                "{}: every command reads the configuration, so it is not listed",
+                command.name()
+            );
+            let args = parse_args(argv(&["--config", "/tmp/c.toml"]))
+                .expect("the configuration is every command's");
+            assert!(
+                check_invocation(&args, command).is_ok(),
+                "{}",
+                command.name()
+            );
+        }
+    }
+
+    /// The name the probe writes its series under is the name the fetch globs
+    /// for.
+    ///
+    /// Nothing joins a Rust `format!` to a shell glob but the text itself, so
+    /// the prefix is one constant and this is the half of the join the binary
+    /// can assert; `tools/deploy-bench.test.sh` compares that constant against
+    /// the script.
+    #[test]
+    fn a_series_is_written_under_the_name_the_fetch_looks_for() {
+        // `TEST_TMPDIR` under bazel: private per test target and per run, so
+        // nothing here writes into the source tree or races another case.
+        let dir = std::env::var_os("TEST_TMPDIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from)
+            .join("probe-series");
+        std::fs::create_dir_all(&dir).expect("a writable temporary directory");
+        let run = ProbeRun {
+            id: 18,
+            phases: Vec::new(),
+            outcome: Ok(()),
+        };
+        save_probe(&run, &dir.join(RECORD_NAME), 1_750_000_000).expect("the directory is writable");
+        let written: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the directory is there")
+            .map(|entry| {
+                entry
+                    .expect("a readable entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(written, vec!["hold-probe-1750000000-18.csv".to_string()]);
+        assert!(
+            written[0].starts_with(HOLD_PROBE_SERIES_PREFIX),
+            "{written:?}"
+        );
+        assert!(written[0].ends_with(".csv"), "{written:?}");
+    }
+
+    /// The gains a `--gains` flag carries reach the register in the order they
+    /// were typed, and every malformed one is refused by name.
+    ///
+    /// A transposed term here writes an operator's derivative gain into the
+    /// proportional slot on a servo about to hold torque for six seconds, which
+    /// is a reading of a machine nobody configured.
+    #[test]
+    fn the_gains_flag_parses_p_i_d_in_that_order() {
+        let args = parse_args(argv(&["hold-probe", "--gains", "1,2,3"]))
+            .expect("three terms are a triple");
+        assert_eq!(args.gains, Some(Gains { p: 1, i: 2, d: 3 }));
+        // Spaces around a term are an operator's, not a typo.
+        let args = parse_args(argv(&["hold-probe", "--gains", "500, 0, 100"]))
+            .expect("three terms are a triple");
+        assert_eq!(
+            args.gains,
+            Some(Gains {
+                p: 500,
+                i: 0,
+                d: 100
+            })
+        );
+
+        for (word, says) in [
+            ("200,0", "three terms"),
+            ("200,0,0,0", "three terms"),
+            ("", "three terms"),
+            ("x,0,0", "proportional"),
+            ("200,x,0", "integral"),
+            ("200,0,x", "derivative"),
+            ("200,0,70000", "derivative"),
+        ] {
+            let refused = parse_args(argv(&["hold-probe", "--gains", word]))
+                .expect_err("that is not a triple");
+            let printed = format!("{refused:#}");
+            assert!(printed.contains("--gains"), "`{word}`: {printed}");
+            assert!(printed.contains(says), "`{word}`: {printed}");
+            assert!(printed.contains("usage:"), "`{word}`: {printed}");
+        }
+    }
+
+    /// A phase of no length is refused rather than run: it would measure
+    /// nothing and print a rate over no readings.
+    #[test]
+    fn the_seconds_flag_takes_a_length_and_refuses_no_length() {
+        let args =
+            parse_args(argv(&["hold-probe", "--seconds", "12"])).expect("twelve is a length");
+        assert_eq!(args.seconds, Some(12));
+
+        for (word, says) in [
+            ("0", "at least one second"),
+            ("x", "not a number of seconds"),
+            ("-3", "not a number of seconds"),
+            ("2.5", "not a number of seconds"),
+        ] {
+            let refused = parse_args(argv(&["hold-probe", "--seconds", word]))
+                .expect_err("that is not a phase length");
+            let printed = format!("{refused:#}");
+            assert!(printed.contains("--seconds"), "`{word}`: {printed}");
+            assert!(printed.contains(says), "`{word}`: {printed}");
+            assert!(printed.contains("usage:"), "`{word}`: {printed}");
+        }
+    }
+
+    /// The probe's own verdict is what a run exits with; the series write's
+    /// failure is what it exits with only when the probe had nothing to say.
+    #[test]
+    fn a_hardware_finding_outranks_a_series_that_could_not_be_written() {
+        let finding = || Err(BareError::HoldProbeTorqueHeld { id: 18 });
+        let unwritable = || Err(anyhow::anyhow!("writing /nowhere/series.csv"));
+
+        verdict_before_write(Ok(()), Ok(())).expect("a quiet hold that was written down");
+
+        let refused = verdict_before_write(finding(), Ok(())).expect_err("the probe refused");
+        assert!(format!("{refused:#}").contains("holding"), "{refused:#}");
+
+        let refused =
+            verdict_before_write(finding(), unwritable()).expect_err("the probe still refused");
+        assert!(
+            format!("{refused:#}").contains("holding"),
+            "the write's failure displaced the finding: {refused:#}"
+        );
+
+        let refused =
+            verdict_before_write(Ok(()), unwritable()).expect_err("the series went nowhere");
+        assert!(format!("{refused:#}").contains("series.csv"), "{refused:#}");
+    }
+
+    /// A series is created, never written over, and a directory that will not
+    /// take it says which path it was.
+    ///
+    /// The device's clock is RAM: a boot without a network repeats a stamp, and
+    /// a second run under a name already taken would otherwise truncate the
+    /// first run's readings.
+    #[test]
+    fn a_series_never_writes_over_one_already_there() {
+        let dir = std::env::var_os("TEST_TMPDIR")
+            .map_or_else(std::env::temp_dir, PathBuf::from)
+            .join("probe-series-twice");
+        std::fs::create_dir_all(&dir).expect("a writable temporary directory");
+        let run = ProbeRun {
+            id: 17,
+            phases: Vec::new(),
+            outcome: Ok(()),
+        };
+        let record = dir.join(RECORD_NAME);
+        save_probe(&run, &record, 1_750_000_000).expect("the name is free");
+        let refused = save_probe(&run, &record, 1_750_000_000)
+            .expect_err("that name is a series already taken");
+        let printed = format!("{refused:#}");
+        assert!(
+            printed.contains("hold-probe-1750000000-17.csv"),
+            "{printed}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hold-probe-1750000000-17.csv"))
+                .expect("the first series is still there"),
+            run.csv(),
+        );
+
+        let refused = save_probe(&run, &dir.join("nowhere").join(RECORD_NAME), 1_750_000_001)
+            .expect_err("there is no such directory");
+        assert!(
+            format!("{refused:#}").contains("hold-probe-1750000001-17.csv"),
+            "{refused:#}"
+        );
+    }
+
     /// There is no flag to authorise a release: `off` releases wherever the
     /// machine is, so an operator typing one gets it refused by name rather
     /// than silently accepted.
@@ -724,13 +1148,25 @@ mod tests {
     #[test]
     fn the_operator_text_offers_no_coordinated_motion() {
         let text = usage();
-        // The command's own listing shape, not the bare word: `antennas`
-        // still appears in what `provision` writes.
+        // The listed word itself, at the boundary the listing gives it: a
+        // command's entry is its name, indented, and whatever follows on that
+        // line. Matching the whole word rather than a prefix is what keeps
+        // `hold-probe` — a read of one servo standing where it already is —
+        // from reading as an offer to command a hold, while a bare `stow`
+        // with nothing after it on the line is still caught.
+        let listed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert!(
+            listed.contains(&"hold-probe"),
+            "the listing this reads is not the listing: {text}"
+        );
         for gone in [
             "arm", "up", "hold", "stow", "yaw", "antennas", "demo", "play",
         ] {
-            let listed = format!("\x20 {gone}");
-            assert!(!text.contains(&listed), "`{gone}` is still offered: {text}");
+            assert!(!listed.contains(&gone), "`{gone}` is still offered: {text}");
         }
         assert!(text.contains("Nothing here commands an angle"), "{text}");
     }
@@ -747,6 +1183,8 @@ mod tests {
             vec!["off"],
             vec!["watchdog"],
             vec!["watchdog", "11"],
+            vec!["hold-probe"],
+            vec!["hold-probe", "11"],
         ] {
             let refused = dispatch(argv(
                 &[&words[..], &["--config", "/nonexistent/reachy-bench.toml"]].concat(),

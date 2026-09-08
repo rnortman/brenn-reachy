@@ -198,6 +198,100 @@ require_members() {
 	done
 }
 
+# The configuration files a run carries home beside its records, at their
+# payload-relative paths.
+#
+# Three, and they are also the only paths an experiment overlay may write: they
+# are the files a run can be varied by -- the profile the residual is judged
+# against, the servo gains, and whether the tracking detector was armed -- and
+# the files an analyzer reads. `session_params.textproto` and
+# `motord_params.textproto` are pinned by the scenario suite's parameter check
+# and read by no analyzer, so they join this list when something reads them.
+#
+# The overlay is a tuning knob and not a way to push arbitrary payload members,
+# which is what makes the list an allowlist rather than a hint: a path outside
+# it is refused.
+run_config_files=(
+	cogs/servo_profile.textproto
+	cogs/servo_gains.textproto
+	cogs/mover_params.textproto
+)
+
+# The directory of experiment configuration to lay over the staged payload, or
+# empty for none. The operator's, out of `.local/reachy.conf` by way of the
+# Makefile, because which experiment is being run is a property of the session
+# and not of the tree.
+#
+# Trailing slashes are stripped, keeping a bare `/` as itself: the paths below
+# are made by cutting this prefix off `find`'s output, which prints one slash
+# between the directory and the rest, and shell completion writes the trailing
+# one.
+experiment_dir=${REACHY_EXPERIMENT_DIR:-}
+while [ "${#experiment_dir}" -gt 1 ] && [ "${experiment_dir%/}" != "$experiment_dir" ]; do
+	experiment_dir=${experiment_dir%/}
+done
+
+# Lay the experiment overlay over the staged payload.
+#
+#   overlay_experiment
+#
+# Every file under `${experiment_dir}` at its payload-relative path, refusing
+# any path this payload does not accept an overlay for. Into the staged payload
+# before the stamp is written and before the rsync, so the digests the stamp
+# records are the digests of what lands on the unit, and so `--delete` cannot
+# take the overlaid copy back off.
+#
+# The staged payload is a build output and this overwrites members of it, which
+# is deliberate and is why every overlaid file is named on the console with its
+# digest: the next build restores the tree's copy, and until then the operator
+# has been told which files on this unit are not the tree's.
+#
+# The contents are not checked here. A malformed file is refused by the cog that
+# binds it, at start, on the unit, by the real loader and before anything is
+# commanded -- and a host-side key scan would be a hand-maintained third
+# statement of a schema in the language least able to express it, whose false
+# refusals would block pushes the payload would have accepted. The path check is
+# the half shell states correctly, so the path check is what is here.
+#
+# Symlinks are followed and count as files: a rung kept as its own file and
+# pointed at by `cogs/servo_profile.textproto -> ../rungs/r2.textproto` is how a
+# gains or profile ladder is run, and a walk that skipped it would push the
+# tree's configuration under an overlay's name -- silently, since a run that
+# really did run the tree's files prints no difference note. A link with no
+# readable file behind it is refused rather than skipped, and an overlay that
+# contributed nothing at all is a mistake and not a configuration.
+overlay_experiment() {
+	local file relative allowed name overlaid=0
+	[ -n "$experiment_dir" ] || return 0
+	[ -d "$experiment_dir" ] ||
+		die "REACHY_EXPERIMENT_DIR names ${experiment_dir}, which is no directory." \
+			"Unset it to push the tree's own configuration."
+	while IFS= read -r file; do
+		relative=${file#"${experiment_dir}"/}
+		allowed=no
+		for name in "${run_config_files[@]}"; do
+			[ "$relative" = "$name" ] && allowed=yes
+		done
+		[ "$allowed" = yes ] ||
+			die "the experiment overlay states ${relative}, which is not one of the files a run may vary." \
+				"Those are: ${run_config_files[*]}"
+		[ -f "$file" ] ||
+			die "the experiment overlay's ${relative} is no readable file, so there is nothing to overlay." \
+				"A link with nothing behind it is the usual cause."
+		install -m 0644 -D -- "$file" "${payload}/${relative}"
+		echo "${prog}: overlay: ${relative} $(sha256_of "${payload}/${relative}")" >&2
+		overlaid=$((overlaid + 1))
+	done < <(find -L "$experiment_dir" \( -type f -o -type l \) | sort)
+	[ "$overlaid" -gt 0 ] ||
+		die "REACHY_EXPERIMENT_DIR names ${experiment_dir}, which holds none of the files a run may vary." \
+			"Those are: ${run_config_files[*]}"
+}
+
+# The sha256 of one file, the digest alone.
+sha256_of() {
+	sha256sum -- "$1" | cut -d' ' -f1
+}
+
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
 # edit to the checked-in file after the last build is not among them: the
@@ -762,9 +856,16 @@ fetch_records() {
 #
 # A tree that cannot state its commit is a push refusal, not a stamp saying
 # nothing: the whole point of the file is that a fetched log names its build.
+#
+# Beside the build it names the configuration: a `config_sha256=` line per file a
+# run can be varied by, and the overlay directory that produced them, if any. The
+# files themselves travel home in the log root's `config/` and are what the
+# analyzers read; these lines are the push's own record of what it staged, so a
+# fetched log says both what its configuration is and that nothing rewrote it
+# between the push and the run.
 stamp_provenance() {
 	local into=$1 age_unchecked=$2
-	local pushed_from dirty built commit commit_source brenn_pod
+	local pushed_from dirty built commit commit_source brenn_pod name
 	pushed_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || pushed_from=
 	[ -n "$pushed_from" ] ||
 		die "this tree cannot state its own commit, so a push from it could not say which build ran." \
@@ -823,6 +924,11 @@ stamp_provenance() {
 # the payload's age against the newest commit, so the payload may predate that
 # commit.
 #
+# overlay names the directory of experiment configuration the push laid over the
+# payload, or none. A config_sha256 line per file a run can be varied by, over
+# the copy that was pushed: the same files are in config/ beside these records,
+# so a digest that disagrees with one of them is a payload edited on the unit.
+#
 # brenn_pod is the other half of what built the voice host: the brenn-pod
 # revision the payload's build resolved its speech crates from. A value starting
 # overlay: means they came out of a working tree beside the building checkout
@@ -835,7 +941,11 @@ pushed_from=${pushed_from}
 dirty=${dirty}
 age_unchecked=${age_unchecked}
 pushed=$(date -u +%Y%m%dT%H%M%SZ)
+overlay=${experiment_dir:-none}
 STAMP
+	for name in "${run_config_files[@]}"; do
+		echo "config_sha256=${name} $(sha256_of "${payload}/${name}")" >>"$into"
+	done
 	echo "${prog}: provenance: commit ${commit} (${commit_source}), pushed from ${pushed_from}," \
 		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
 }
@@ -1157,13 +1267,52 @@ ask_last_line() {
 	fi
 }
 
+# The chain fragment that puts this run's configuration beside its records.
+#
+#   config_into_log_root <log root>
+#
+# The three files a run can be varied by, copied out of the payload into the log
+# root the fetch brings home, so a fetched records directory carries the files
+# that produced it. Both motion analyzers read them and refuse a log with none:
+# what a machine was commissioned with is a fact about the run, and an analyzing
+# host's own copy of the tree is an answer to a different question. A speech run
+# carries them for the same reason -- it is the same payload under the same
+# overlay, and what it records is judged later by whoever asks.
+#
+# Straight out of the release rather than staged aside the way the stamp is: the
+# release is not what the wipe empties, so these copies are made after it with
+# nothing at risk. The payload-relative path is kept whole, so
+# `config/cogs/servo_profile.textproto` says where on the unit the file was read
+# from.
+config_into_log_root() {
+	local log_root=$1 name dir fragment="" dirs=()
+	# One `mkdir` per directory the set lands in, not one per file: the
+	# payload-relative paths are known here, so the remote shell is not asked
+	# to run `dirname` three times to rediscover the one directory they share.
+	for name in "${run_config_files[@]}"; do
+		dir=${name%/*}
+		case " ${dirs[*]-} " in
+		*" ${dir} "*) ;;
+		*) dirs+=("$dir") ;;
+		esac
+	done
+	for dir in "${dirs[@]}"; do
+		fragment="${fragment}; mkdir -p -- ${log_root}/config/${dir} || exit ${rc_post_wipe}"
+	done
+	for name in "${run_config_files[@]}"; do
+		fragment="${fragment}; cp -- ${release}/${name} ${log_root}/config/${name} || exit ${rc_post_wipe}"
+	done
+	printf '%s' "$fragment"
+}
+
 # The remote chain both run modes start with, up to the sentinel, as one string.
 #
 #   launch_chain <log root>
 #
 # Everything before the launcher: the bus question, the checks that can still
 # refuse, the wipe of the log root and the launcher's console directory, the
-# stamp into the log root, the `cd` into the release and the sentinel. One copy
+# stamp and this run's configuration into the log root, the `cd` into the
+# release and the sentinel. One copy
 # because both modes make exactly these preparations and the reasoning behind
 # their order — what is asked before the wipe and what is answered after it — is
 # what a second copy would drift on. What differs is what is started at the end
@@ -1237,6 +1386,7 @@ launch_chain() {
 	# fetch having to know anything. A rename within the store's own
 	# tmpfs, so full-tmpfs and permission failures cannot reach it.
 	remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
+	remote="${remote}$(config_into_log_root "$log_root")"
 	# The payload's first publishes are started here, and the front
 	# of each stream is whatever the logger was late for: it opens
 	# its subscriptions on a poll after it opens the log and attaches
@@ -1336,6 +1486,7 @@ case "$mode" in
 		require_members "shared object" "${shared_objects[@]}"
 		require_members "launcher config" "${launch_configs[@]}"
 		require_members model "${models[@]}"
+		require_members "run configuration" "${run_config_files[@]}"
 
 		age_unchecked=no
 		if [ "${1:-}" = "--stale-ok" ]; then
@@ -1383,6 +1534,11 @@ case "$mode" in
 		fi
 
 		log_root=$(config_string log_root_dir)
+
+		# Before the stamp, so the digests it records are the digests of
+		# the files that land, and before the rsync, so the unit gets
+		# the overlaid copies rather than the build's.
+		overlay_experiment
 
 		# Into the staged payload, so the one rsync below carries it and
 		# the stamp on the unit can only describe the payload it landed
@@ -1719,6 +1875,7 @@ case "$mode" in
 		remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
 		remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
 		remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
+		remote="${remote}$(config_into_log_root "$log_root")"
 		remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
 		remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
 		# Past the last step that can refuse: what a supervised session

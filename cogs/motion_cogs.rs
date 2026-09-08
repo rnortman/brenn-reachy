@@ -39,7 +39,7 @@ mod session_stow;
 
 pub use session_cog::execute_session;
 
-use brenn_reachy__cogs__config_clk_rs::{MoverParams, ServoProfile};
+use brenn_reachy__cogs__config_clk_rs::{MoverParams, ServoGains, ServoProfile};
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
 use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
@@ -55,10 +55,10 @@ use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeViolations, FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics,
 };
-use reachy_motion::arm::{ArmRecord, rest_pose_seeds};
+use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
-use reachy_motion::plant::PlantModel;
+use reachy_motion::plant::{GroupPlants, GroupProfiles};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
@@ -288,10 +288,11 @@ fn store_seed(state: &mut PoseStateWire, seed: &Isometry3<f64>, solved_any: bool
 /// latches on stops the stream, which is how the machine reaches the minimum
 /// risk condition when the loop can no longer command it.
 pub fn execute_mover(dial: &mut MoverDial<'_>) {
-    let settings = Settings::of(dial);
+    let params: &MoverParams = configured(dial.configs.params, "the mover's");
+    let settings = Settings::of(params);
     let cfg = motion_config(
         configured(dial.configs.profile, "the servo profile's"),
-        settings.period_ns,
+        params,
     );
     let clips = dial.configs.clips;
     let before = MoverCounters::read(dial.states.ctrl);
@@ -645,6 +646,11 @@ fn reading(sample: &PoseSample) -> Option<JointVector> {
 /// first execution and nothing writes it afterwards, and in a test binary the
 /// first case to run fixes it for the rest.
 ///
+/// The Mover's own parameters and not a scattering of scalars off them: the
+/// grid and the detector's arming are both fields of the one file, and a new
+/// knob is then a field read here rather than another positional argument on
+/// two functions and every call site of both.
+///
 /// The period is the Mover's own configured grid and never a constant: the
 /// plant model's two limits are per-period distances, so a model built for one
 /// grid and stepped on another is wrong in proportion to the ratio.
@@ -656,21 +662,22 @@ fn reading(sample: &PoseSample) -> Option<JointVector> {
 /// against a trajectory nothing runs, which is worse than a process that
 /// refuses to start: the session refuses the same pair before it commissions
 /// anything, so the two readers of the one file stop for the same reason.
-fn motion_config(profile: &ServoProfile, period_ns: u64) -> &'static MotionConfig {
+fn motion_config(profile: &ServoProfile, params: &MoverParams) -> &'static MotionConfig {
     static COMMISSIONED: std::sync::OnceLock<MotionConfig> = std::sync::OnceLock::new();
     COMMISSIONED.get_or_init(|| {
-        commissioned_config(profile, period_ns).unwrap_or_else(|error| {
+        commissioned_config(profile, params).unwrap_or_else(|error| {
             panic!(
-                "the servo profile is acceleration {}, velocity {} on a {period_ns} ns grid, \
-                 which is no plant to judge a joint against: {error}",
-                profile.profile_acceleration, profile.profile_velocity,
+                "the servo profile is {:?} on a {} ns grid, which is no plant to judge \
+                 a joint against: {error}",
+                group_profiles(profile),
+                params.period_ns,
             )
         })
     })
 }
 
-/// The configuration this pair and this grid describe, or why they describe no
-/// machine.
+/// The configuration this profile and these mover parameters describe, or why
+/// they describe no machine.
 ///
 /// Fallible entry point: `motion_config` panics on refusal, and the
 /// configuration is built once per process, so a test that drove the panic
@@ -678,20 +685,66 @@ fn motion_config(profile: &ServoProfile, period_ns: u64) -> &'static MotionConfi
 ///
 /// # Errors
 ///
-/// The reason the pair and the period are no plant.
+/// The reason the profile's pairs and the parameters' period are no plant.
 pub fn commissioned_config(
     profile: &ServoProfile,
-    period_ns: u64,
-) -> Result<MotionConfig, reachy_motion::plant::PlantError> {
-    let plant = PlantModel::from_registers(
-        profile.profile_velocity,
-        profile.profile_acceleration,
-        i64::try_from(period_ns).unwrap_or(i64::MAX),
-    )?;
-    Ok(MotionConfig {
+    params: &MoverParams,
+) -> Result<MotionConfig, reachy_motion::plant::GroupPlantError> {
+    let plant = GroupPlants::from_profiles(&group_profiles(profile), params.period_ns)?;
+    let mut cfg = MotionConfig {
         plant,
         ..MotionConfig::default()
-    })
+    };
+    cfg.tracking.armed = params.tracking_armed.into();
+    Ok(cfg)
+}
+
+/// The gains file's nine scalars as the motion library's three triples.
+///
+/// The one place those field names and the classes are joined, for
+/// [`group_profiles`]'s reason.
+#[must_use]
+pub fn group_gains(gains: &ServoGains) -> GroupGains {
+    GroupGains {
+        legs: Gains {
+            p: gains.legs_p,
+            i: gains.legs_i,
+            d: gains.legs_d,
+        },
+        yaw: Gains {
+            p: gains.body_yaw_p,
+            i: gains.body_yaw_i,
+            d: gains.body_yaw_d,
+        },
+        antennas: Gains {
+            p: gains.antennas_p,
+            i: gains.antennas_i,
+            d: gains.antennas_d,
+        },
+    }
+}
+
+/// The configuration file's six scalars as the motion library's three pairs.
+///
+/// The one place the field names and the classes are joined, so the session
+/// that writes the registers and the tick that models them read the file the
+/// same way.
+#[must_use]
+pub fn group_profiles(profile: &ServoProfile) -> GroupProfiles {
+    GroupProfiles {
+        legs: (
+            profile.legs_profile_acceleration,
+            profile.legs_profile_velocity,
+        ),
+        yaw: (
+            profile.body_yaw_profile_acceleration,
+            profile.body_yaw_profile_velocity,
+        ),
+        antennas: (
+            profile.antennas_profile_acceleration,
+            profile.antennas_profile_velocity,
+        ),
+    }
 }
 
 /// The grid this cog commands on, and how long a posture change takes.
@@ -712,8 +765,7 @@ struct Settings {
 
 impl Settings {
     /// Read and check this cog's configuration.
-    fn of(dial: &MoverDial<'_>) -> Self {
-        let params: &MoverParams = configured(dial.configs.params, "the mover's");
+    fn of(params: &MoverParams) -> Self {
         Self {
             lag_k: i64::from(params.lag_k),
             period_ns: length_of(params.period_ns, "the control period"),

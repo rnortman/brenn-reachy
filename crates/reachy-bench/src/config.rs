@@ -42,6 +42,15 @@ use reachy_motion::{
 /// broadcast address.
 const MAX_SERVO_ID: u8 = dxl_proto::BROADCAST_ID - 1;
 
+/// The Acceleration Limit the XL330 data sheet gives as the factory value, in
+/// register units.
+///
+/// Checked rather than recorded: the data sheet states one number for every
+/// variant on this bus, and the sweep is here to find out whether this hardware
+/// carries it. A different reading is a finding for a person, not a figure to
+/// absorb — it is the ceiling a capability profile is written under.
+pub const DATASHEET_ACCELERATION_LIMIT: u32 = 32767;
+
 /// Why a configuration cannot be used.
 ///
 /// Every arm is a refusal, never a substitution: a configuration that says
@@ -412,6 +421,13 @@ impl BenchConfig {
         // single-turn joints' position limits are here for the same reason —
         // their provisioned range is the whole turn and no window is claimed.
         table.set_all(RegId::VelocityLimit, ProvisionExpect::Record);
+        // Checked against the data sheet, and allowed to fail: nothing has read
+        // this register off this hardware, and what it holds bounds every
+        // Profile Acceleration the machine can be written.
+        table.set_all(
+            RegId::AccelerationLimit,
+            ProvisionExpect::Check(value::u32(DATASHEET_ACCELERATION_LIMIT)),
+        );
         table.set_all(RegId::Shutdown, ProvisionExpect::Record);
         table.set_all(RegId::MinPositionLimit, ProvisionExpect::Record);
         table.set_all(RegId::MaxPositionLimit, ProvisionExpect::Record);
@@ -504,19 +520,37 @@ mod tests {
             reachy_motion::plant::PROFILE_ACCELERATION_UNIT_RAD_PER_S2,
             dxl_proto::conv::PROFILE_ACCELERATION_UNIT_RAD_PER_S2
         );
-        // And the pair the model is built from is the pair the conversion
-        // yields, once the control period is folded in.
-        let plant = reachy_motion::PlantModel::default();
-        let (acceleration, velocity) = reachy_motion::SHIPPED_PROFILE;
+        // And the pairs the models are built from are the pairs the conversion
+        // yields, once the control period is folded in. Per class, because each
+        // class carries its own pair and a check over one of them would leave
+        // the other two unpinned.
+        let plants = reachy_motion::GroupPlants::default();
+        let profiles = reachy_motion::SHIPPED_PROFILES;
         let period_s = reachy_motion::SHIPPED_PERIOD_NS as f64 * 1e-9;
-        assert_eq!(
-            plant.v_max,
-            dxl_proto::conv::profile_velocity_rad_per_s(velocity) * period_s
-        );
-        assert_eq!(
-            plant.a_max,
-            dxl_proto::conv::profile_acceleration_rad_per_s2(acceleration) * period_s * period_s
-        );
+        for (group, plant, (acceleration, velocity)) in [
+            (reachy_motion::JointGroup::Legs, plants.legs, profiles.legs),
+            (reachy_motion::JointGroup::BodyYaw, plants.yaw, profiles.yaw),
+            (
+                reachy_motion::JointGroup::Antennas,
+                plants.antennas,
+                profiles.antennas,
+            ),
+        ] {
+            assert_eq!(
+                plant.v_max,
+                dxl_proto::conv::profile_velocity_rad_per_s(velocity) * period_s,
+                "{}",
+                group.name()
+            );
+            assert_eq!(
+                plant.a_max,
+                dxl_proto::conv::profile_acceleration_rad_per_s2(acceleration)
+                    * period_s
+                    * period_s,
+                "{}",
+                group.name()
+            );
+        }
     }
 
     /// The bounds the motion layer refuses a goal or a stored pin on are count
@@ -695,10 +729,10 @@ mod tests {
     fn the_provisioning_table_checks_the_setup_and_records_the_rest() {
         let cfg = minimal();
         let table = cfg.provision_table();
-        // Eight registers on all nine servos — the homing offset among them —
-        // the current limit on all nine, and two more per-leg registers on six
-        // legs.
-        assert_eq!(table.checks(), 8 * 9 + 9 + 2 * 6);
+        // Nine registers on all nine servos — the homing offset and the
+        // acceleration limit among them — the current limit on all nine, and
+        // two more per-leg registers on six legs.
+        assert_eq!(table.checks(), 9 * 9 + 9 + 2 * 6);
         // Everything checked, plus six recorded families on all nine, less the
         // two per-leg position limits that are checked rather than recorded.
         assert_eq!(table.reads(), table.checks() + 6 * 9 - 2 * 6);
@@ -714,6 +748,19 @@ mod tests {
             );
         }
         assert_eq!(EXPECTED_OPERATING_MODES, [3, 3, 3, 3, 3, 3, 3, 4, 4]);
+
+        // Never read off this hardware; the sweep establishes whether the
+        // factory value holds.
+        let column = ProvisionTable::column(RegId::AccelerationLimit).expect("provisioned");
+        for row in 0..ROW_COUNT {
+            assert_eq!(
+                table.at(row, column),
+                Some(ProvisionExpect::Check(value::u32(
+                    DATASHEET_ACCELERATION_LIMIT
+                ))),
+                "row {row}"
+            );
+        }
 
         // The offset register is signed, so a negative quarter turn is checked
         // and reported as one rather than as a span near four billion.

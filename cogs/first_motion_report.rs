@@ -56,7 +56,6 @@ use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use brenn_reachy__motion__reports_clk_rs::{RefusalReason, RefusalReasonWire, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
-use dxl_proto::HardwareError;
 use log_read::{Bound, Census, Complaints, Logged, Streams, binding, cumulative, read_with, typed};
 use motion_channels::{
     AUX_OUT_CHANNEL, CMD_CHANNEL, ESTIMATE_CHANNEL, EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL,
@@ -67,11 +66,12 @@ use motion_evidence::{ARRIVAL_TURN_RAD, closest, solved_pose};
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use pose_reading::{
-    Grid, Skips, lags, no_faults, present_rows, read_profile, residual_stream, residuals,
+    Grid, RunConfig, Skips, capabilities, capability, health_summary, lags, no_faults,
+    present_rows, residual_stream, residuals,
 };
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, row, rows_of};
-use reachy_motion::plant::{PlantModel, SHIPPED_PROFILE};
+use reachy_motion::plant::{GroupPlants, SHIPPED_PROFILES};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::seq::failure::Name as FailureName;
 use reachy_motion::value;
@@ -138,14 +138,16 @@ struct Run {
     /// with no Rust type bound to it still says whether anything travelled on
     /// it.
     census: Census,
-    /// The two profile registers the run's machine was commissioned with, as
-    /// the deployment's own configuration states them: acceleration first.
+    /// The configuration the run was performed under, as the copy beside its
+    /// records states it: the profile registers per class, the position gains,
+    /// and whether the tracking detector was judging.
     ///
-    /// What the residual is measured against, so a log recorded under one pair
-    /// is judged under that pair. `None` is a run nobody named a profile for,
-    /// which is a crafted run in the cases below rather than anything read off
-    /// a log: the tool's own invocation always names the file.
-    profile: Option<(u32, u32)>,
+    /// The profile is what the residual is measured against, so a log recorded
+    /// under one set of pairs is judged under those pairs. `None` is a run
+    /// nobody carried a configuration for, which is a crafted run in the cases
+    /// below rather than anything read off a log: the tool refuses a log whose
+    /// records have none beside them.
+    config: Option<RunConfig>,
     /// Anything that went wrong reading the log itself. Every one of these is a
     /// failure of the run.
     complaints: Complaints,
@@ -1736,70 +1738,6 @@ fn the_release(run: &Run, traffic: &AuxTraffic<'_>, report: &mut Report) {
     }
 }
 
-/// What the health rotation saw, per servo.
-///
-/// The last reading each servo gave, which is the picture of the machine at the
-/// end of the run. A latched error byte is a finding: the rotation is how this
-/// stack learns a servo is complaining, and a run that ended with one complaining
-/// is a run somebody should look at before the next.
-///
-/// One finding for the whole set rather than one per servo. A bus-wide condition
-/// is one fact about the machine, and nine copies of it bury the rest of the
-/// report. Which servos, and what each of them latched, is in the line.
-///
-/// The input-voltage bit on its own is the exception, and it is not a finding
-/// on this machine: the servo bus rail is specified above the highest Max
-/// Voltage Limit the register accepts, so a healthy unit sets that bit by
-/// arithmetic. `dxl_proto::HardwareError` is the one predicate that says so and
-/// this pass judges through it. The bit is never filtered away -- every servo's
-/// byte is printed, and the set that latched it is named in a note of its own.
-/// Any bit beyond input-voltage, on any servo, is a finding, and the byte is
-/// named whole, so a voltage bit riding alongside an overload
-/// launders nothing.
-fn health(run: &Run, report: &mut Report) {
-    let mut latest: BTreeMap<u8, &HealthReportWire> = BTreeMap::new();
-    for reading in &run.readings {
-        latest.insert(reading.message.id(), &reading.message);
-    }
-    if latest.is_empty() {
-        report.note("the health rotation reported nothing".to_string());
-        return;
-    }
-    let mut complaining: Vec<String> = Vec::new();
-    let mut voltage_only: Vec<String> = Vec::new();
-    for (id, reading) in latest {
-        report.note(format!(
-            "servo {id}: {:.2} V, {} C, error byte 0x{:02x}",
-            reading.volts(),
-            reading.temp_c(),
-            reading.bits()
-        ));
-        let latched = HardwareError(reading.bits());
-        if latched.bits_other_than_voltage() != 0 {
-            complaining.push(format!("servo {id} (0x{:02x})", reading.bits()));
-        } else if reading.bits() != 0 {
-            voltage_only.push(format!("servo {id}"));
-        }
-    }
-    if !voltage_only.is_empty() {
-        report.note(format!(
-            "the input-voltage bit is latched on {} of the servos the health rotation read: {} -- \
-             expected on this machine, where the rail is specified above the register's Max \
-             Voltage Limit, so a healthy unit sets that bit by arithmetic",
-            voltage_only.len(),
-            voltage_only.join(", ")
-        ));
-    }
-    if !complaining.is_empty() {
-        report.fail(format!(
-            "the run ended with an error byte latched on {} of the servos the health rotation \
-             read: {}",
-            complaining.len(),
-            complaining.join(", ")
-        ));
-    }
-}
-
 /// Why a busy answer is a finding, in the terms the trail can support.
 ///
 /// `line` is the identity line the answer is printed under, and `reissue` what
@@ -2274,6 +2212,9 @@ fn analyze(run: &Run) -> Report {
     for complaint in &run.complaints {
         report.fail(complaint.clone());
     }
+    if let Some(config) = &run.config {
+        config.configuration(&mut report);
+    }
     if run.samples.is_empty() {
         report.fail(
             "the log carries no samples: the driver's heartbeat is the clock every other stream \
@@ -2306,7 +2247,8 @@ fn analyze(run: &Run) -> Report {
     residual_screen(run, grid, &mut report);
     lags(&run.samples, &mut report);
     stillness(run, &mut report);
-    health(run, &mut report);
+    health_summary(&run.readings, &mut report);
+    capabilities(&capability(&run.samples, grid), &mut report);
     transactions(run, &traffic, &mut report);
     head_of_the_log(run, &mut report);
     counter_cross_check(run, &traffic, &mut report);
@@ -2320,15 +2262,18 @@ fn analyze(run: &Run) -> Report {
 /// rather than a silent omission: without it there is no screen, and a report
 /// that printed nothing where the screen belongs would read as a clean run.
 fn residual_screen(run: &Run, grid: Grid, report: &mut Report) {
-    let (acceleration, velocity) = run.profile.unwrap_or(SHIPPED_PROFILE);
-    match PlantModel::from_registers(velocity, acceleration, grid.period_ns) {
+    let profile = run
+        .config
+        .as_ref()
+        .map_or(SHIPPED_PROFILES, |config| config.profiles);
+    match GroupPlants::from_profiles(&profile, grid.period_ns) {
         Ok(plant) => {
             let stream = residual_stream(&run.samples, grid, &plant);
             residuals(&stream, &run.samples, &plant, report);
         }
         Err(error) => report.fail(format!(
-            "the profile {acceleration}/{velocity} on a {}ns grid is no plant to judge this run \
-             against: {error}",
+            "the profile {profile:?} on a {}ns grid is no plant to judge this run against: \
+             {error}",
             grid.period_ns
         )),
     }
@@ -2340,12 +2285,10 @@ fn residual_screen(run: &Run, grid: Grid, report: &mut Report) {
 /// can be filed with the run record while the findings are what an operator sees
 /// on the terminal. The exit status is the verdict.
 fn main() -> ExitCode {
-    const USAGE: &str =
-        "usage: first_motion_report [--grid-jitter-ns <n>] <log-dir> <servo_profile>";
+    const USAGE: &str = "usage: first_motion_report [--grid-jitter-ns <n>] <log-dir>";
     let mut args = std::env::args().skip(1);
     let mut jitter_ns = 0_i64;
     let mut log_dir: Option<String> = None;
-    let mut profile_path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--grid-jitter-ns" => {
@@ -2361,22 +2304,24 @@ fn main() -> ExitCode {
                 }
             }
             _ if log_dir.is_none() && !arg.starts_with("--") => log_dir = Some(arg),
-            _ if profile_path.is_none() && !arg.starts_with("--") => profile_path = Some(arg),
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::FAILURE;
             }
         }
     }
-    let (Some(log_dir), Some(profile_path)) = (log_dir, profile_path) else {
+    let Some(log_dir) = log_dir else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
     let log_dir = &log_dir;
-    let profile = match read_profile(&profile_path) {
-        Ok(profile) => profile,
+    // The run's own configuration, out of the records rather than off the
+    // command line: a log is judged under the pairs the machine that wrote it
+    // was commissioned with, and those travel home with the records.
+    let config = match RunConfig::read(&PathBuf::from(log_dir)) {
+        Ok(config) => config,
         Err(err) => {
-            eprintln!("reading the servo profile: {err}");
+            eprintln!("reading the configuration this run was performed under: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -2389,7 +2334,7 @@ fn main() -> ExitCode {
     };
     let run = Run {
         grid_jitter_ns: jitter_ns,
-        profile: Some(profile),
+        config: Some(config),
         ..run
     };
     let report = analyze(&run);
@@ -2412,6 +2357,7 @@ mod tests {
         TickFaultWire, TimelineEntryWire, ValueShapeWire, analyze, joint_set_of, judge_antennas,
         named_rows, neutral_targets, row, stow_pose_targets,
     };
+    use pose_reading::TEMPERATURE_STOP_C;
     use reachy_motion::record;
     use std::collections::BTreeSet;
 
@@ -3567,7 +3513,8 @@ mod tests {
         assert_eq!(
             findings_about(
                 &report,
-                "latched on 1 of the servos the health rotation read: servo 11 (0x20)"
+                "latched an error byte on 1 of the servos the health rotation read: servo 11 \
+                 (0x20)"
             ),
             1,
             "{:?}",
@@ -3575,6 +3522,43 @@ mod tests {
         );
         assert_eq!(findings_about(&report, "servo 10 ("), 0);
         assert!(measured_about(&report, "servo 10: 7.40 V"));
+    }
+
+    /// A servo that reached the temperature ceiling fails this report too.
+    ///
+    /// The bit cases above guard the health pass being called at all; this one
+    /// guards the temperature verdict specifically reaching a motion run's
+    /// findings, which is what the ceiling claims of both analyzers.
+    #[test]
+    fn a_servo_at_the_temperature_ceiling_fails_the_motion_run() {
+        let mut hot = HealthReportWire::new();
+        hot.set_id(18);
+        hot.set_volts(7.4);
+        hot.set_temp_c(TEMPERATURE_STOP_C);
+        hot.set_sample_time(when(1));
+        let report = analyze(&Run {
+            samples: heartbeat(10),
+            readings: vec![at(1, hot)],
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(
+                &report,
+                &format!("1 of the servos the health rotation read reached {TEMPERATURE_STOP_C} C")
+            ),
+            1,
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            findings_about(
+                &report,
+                &format!("servo 18 ({TEMPERATURE_STOP_C} C at 0.0 s)")
+            ),
+            1,
+            "{:?}",
+            report.findings
+        );
     }
 
     /// The input-voltage bit latched on every row is this machine's expected
@@ -3656,7 +3640,8 @@ mod tests {
         assert_eq!(
             findings_about(
                 &report,
-                "latched on 1 of the servos the health rotation read: servo 12 (0x21)"
+                "latched an error byte on 1 of the servos the health rotation read: servo 12 \
+                 (0x21)"
             ),
             1,
             "{:?}",

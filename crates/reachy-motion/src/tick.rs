@@ -137,7 +137,7 @@ use crate::joints::{
     flags, group_of, row, worst_joint, worst_row,
 };
 use crate::phase::{AntennaPhaseConfig, PhaseSeparation, PhaseWatch};
-use crate::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
+use crate::plant::{GroupPlants, MAX_GAP_PERIODS, Predicted, RESPONSE_DEAD_SAMPLES};
 use crate::record;
 use crate::seq::{SeqError, SeqFailureKind, failure};
 use crate::snap::{DurationError, PoseSnapshotError, duration_from_nanos, duration_nanos};
@@ -179,6 +179,18 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// What it is made of is what the model leaves out — the stiction and backlash
 /// a crank shows when the goal reverses through it, and a load-dependent steady
 /// offset — so it is the measurement `threshold_rad` carries its margin over.
+///
+/// One of the three recorded tours of that library ran the body yaw to 0.3825
+/// rad, so this figure sits 0.0145 rad under the worst the shipped pair has
+/// been seen to produce. The screen clears both: half again over this figure is
+/// 0.552 rad and half again over the larger reading is 0.574 rad, each under
+/// the 0.6 rad threshold.
+///
+/// The same tours are also recorded per joint group as p99.9 residuals, in the
+/// offline analyzer (`RECORDED_P999_*_RESIDUAL_RAD`, `cogs/pose_reading.rs`),
+/// which is the noise floor a candidate profile's p99.9 is read against. A
+/// confirmation tour that re-bakes this figure and its antenna twin re-bakes
+/// those three arrays from the same tour.
 pub const RECORDED_WORST_HEAD_RESIDUAL_RAD: f64 = 0.368;
 
 /// The worst residual an antenna ran at on the same recordings, radians — a
@@ -187,6 +199,20 @@ pub const RECORDED_WORST_HEAD_RESIDUAL_RAD: f64 = 0.368;
 /// The antennas run the library's fastest content and its longest travel, and their
 /// residual is nonetheless the head's to within a fiftieth of a radian: what
 /// this figure is about is the reversal, not the speed.
+///
+/// One of the three recorded tours of the same library ran an antenna to
+/// 0.4018 rad, so this figure sits 0.0478 rad under the worst the shipped pair
+/// has been seen to produce, and that reading is the one the sizing rule does
+/// not clear: half again over it is 0.6027 rad, past the 0.6 rad threshold,
+/// which is a headroom of 1.49 rather than 1.5. Nothing here moves on that
+/// reading — the threshold is not widened and the recorded worsts are re-baked
+/// only from a confirmation tour — but a re-bake that carries an antenna worst
+/// above 0.4 rad puts the replay suite's margin assertion past the shipped
+/// threshold, and which of the two gives way is a decision for whoever reads
+/// that tour, not an edit made to get the suite green.
+///
+/// Re-baked with [`RECORDED_WORST_HEAD_RESIDUAL_RAD`], and beside the same
+/// per-group p99.9 arrays that comment names.
 pub const RECORDED_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.354;
 
 /// When a joint stands far enough from where its servo's own trajectory
@@ -206,7 +232,8 @@ pub const RECORDED_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.354;
 /// 1.5-3 rad behind, and [`RECORDED_WORST_ANTENNA_LAG_RAD`] is a joint
 /// following perfectly at a radian and a third out. What this judges instead is
 /// the residual against the generator's own trajectory, which over those same
-/// recordings stays under 0.4 rad. Two ways past the residual threshold are
+/// recordings stays around 0.4 rad, the worst reading of the shipped pair on
+/// record being an antenna at 0.4018. Two ways past the residual threshold are
 /// still healthy and both are checked before anything is raised: a joint
 /// closing on the prediction, and a joint behind it but still moving with it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -274,13 +301,16 @@ impl Default for TrackingFaultConfig {
     fn default() -> Self {
         Self {
             armed: true,
-            // Half again over the worst residual on record, which is
-            // [`RECORDED_WORST_HEAD_RESIDUAL_RAD`] — a body-yaw reversal on the
-            // recorded clip library, where no sample of any joint reaches
-            // 0.4 rad. The replay suite asserts the margin against the
-            // recordings themselves, so the two move together. A displacement
-            // of a third of a radian from where the generator has got to is
-            // what a hand does to a crank, not what a servo does to itself.
+            // Half again over the pinned worst residual and a little more:
+            // [`RECORDED_WORST_HEAD_RESIDUAL_RAD`], a body-yaw reversal on the
+            // recorded clip library, gives 0.552 rad. The pinned worsts are not
+            // the largest samples those recordings hold — the largest is an
+            // antenna at 0.4018 rad, and the screen stands 1.49 times that
+            // reading rather than the 1.5 times the pinned worsts give. The
+            // replay suite asserts the margin against the recordings
+            // themselves, so the two move together. A displacement of a third
+            // of a radian from where the generator has got to is what a hand
+            // does to a crank, not what a servo does to itself.
             threshold_rad: 0.6,
             // About 6.5 of the servos' 0.088° counts, comfortably above the
             // half-count quantisation floor of 7.7e-4 rad, and under a third
@@ -316,13 +346,13 @@ pub struct MotionConfig {
     pub max_step: JointStep,
     /// When to call tracking lost.
     pub tracking: TrackingFaultConfig,
-    /// The servos' own trajectory generator, as commissioned: what the tracking
-    /// comparison predicts a healthy joint against.
+    /// The servos' own trajectory generators, as commissioned, per class: what
+    /// the tracking comparison predicts a healthy joint against.
     ///
-    /// A model of the machine and not a choice about it — a host reads the two
-    /// registers it wrote and the control period it runs on, and builds this
-    /// from them.
-    pub plant: PlantModel,
+    /// A model of the machine and not a choice about it — a host reads the
+    /// registers it wrote per class and the control period it runs on, and
+    /// builds these from them.
+    pub plant: GroupPlants,
     /// Where the antennas' tips can meet, and how far apart in phase a
     /// commanded pair has to cross there.
     pub phase: AntennaPhaseConfig,
@@ -360,10 +390,10 @@ impl Default for MotionConfig {
                 antennas: 0.65,
             },
             tracking: TrackingFaultConfig::default(),
-            // The profile this deployment commissions, at the period it ticks
+            // The profiles this deployment commissions, at the period it ticks
             // on. A host on another period, or a machine commissioned with
-            // another pair, builds its own.
-            plant: PlantModel::default(),
+            // other pairs, builds its own.
+            plant: GroupPlants::default(),
             phase: AntennaPhaseConfig::default(),
             // One second of silence at 50 Hz.
             read_loss_ticks: 50,
@@ -1469,7 +1499,7 @@ pub struct TrackingLook {
 /// count per tick still shows its motion over the window.
 pub mod tracking {
     use super::{
-        JointFlags, JointRef, JointVector, PlantModel, Predicted, ROW_COUNT, TrackingFaultConfig,
+        GroupPlants, JointFlags, JointRef, JointVector, Predicted, ROW_COUNT, TrackingFaultConfig,
         TrackingLook, TrackingRowSnap, flags, outside_limit, row,
     };
 
@@ -1528,8 +1558,8 @@ pub mod tracking {
     /// An unseeded row is not stepped. There is nothing to step: a prediction
     /// starts from where the joint was measured, never from where a goal says
     /// it should be.
-    pub fn predict(plant: &PlantModel, held: &JointVector, runs: &mut Runs) {
-        for (run, (_, target)) in runs.iter_mut().zip(held.joints()) {
+    pub fn predict(plant: &GroupPlants, held: &JointVector, runs: &mut Runs) {
+        for (run, (joint, target)) in runs.iter_mut().zip(held.joints()) {
             if !bool::from(run.seeded) {
                 continue;
             }
@@ -1537,7 +1567,11 @@ pub mod tracking {
                 position: run.predicted,
                 velocity: run.velocity,
             };
-            plant.step(&mut state, target);
+            // Keyed by the joint the iterator is already yielding rather than
+            // by its position: the class a joint is judged against is a fact
+            // about the joint, and a positional index would rest on an
+            // unstated agreement about the order they come in.
+            plant.for_joint(joint).step(&mut state, target);
             run.predicted = state.position;
             run.velocity = state.velocity;
         }
@@ -3293,6 +3327,7 @@ fn resolve_antenna(last: f64, target: f64, outboard: f64) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::arm::{ArmConfig, pin_goals};
+    use crate::plant::PlantModel;
     use crate::seq::{RegId, SeqStepKind, StepContext};
     use reachy_kin::rest_head_pose;
 
@@ -6703,8 +6738,8 @@ mod tests {
         /// Where the machine reads, per row.
         position: JointVector,
         /// The plant this machine is: the tick's own, with both limits taken
-        /// down to the fraction of the profile this servo manages.
-        plant: PlantModel,
+        /// down to the fraction of the profile these servos manage.
+        plant: GroupPlants,
         /// The worst residual any tick measured.
         worst: f64,
         /// The longest run any tick reported.
@@ -6727,6 +6762,21 @@ mod tests {
         tick: u32,
     }
 
+    /// The three configured generators with both limits taken down to `pace` of
+    /// what the registers say, which is how a scripted machine is made slower
+    /// than its own profile.
+    fn paced(plant: &GroupPlants, pace: f64) -> GroupPlants {
+        let slow = |model: PlantModel| PlantModel {
+            v_max: pace * model.v_max,
+            a_max: pace * model.a_max,
+        };
+        GroupPlants {
+            legs: slow(plant.legs),
+            yaw: slow(plant.yaw),
+            antennas: slow(plant.antennas),
+        }
+    }
+
     impl Plant {
         fn new(cfg: &MotionConfig, start: &JointVector, pace: f64) -> Self {
             let mut modelled = [Predicted::default(); ROW_COUNT];
@@ -6737,10 +6787,7 @@ mod tests {
                 goals: vec![*start],
                 modelled,
                 position: *start,
-                plant: PlantModel {
-                    v_max: pace * cfg.plant.v_max,
-                    a_max: pace * cfg.plant.a_max,
-                },
+                plant: paced(&cfg.plant, pace),
                 worst: 0.0,
                 longest: 0,
                 degraded: None,
@@ -6800,7 +6847,7 @@ mod tests {
                 if flags::contains(self.jammed, id) {
                     continue;
                 }
-                self.plant.step(modelled, target);
+                self.plant.for_joint(id).step(modelled, target);
                 self.position.set(id, modelled.position);
             }
             self.position
@@ -7095,7 +7142,7 @@ mod tests {
     /// against nothing, so no cadence could be measured on one.
     fn yaw_move(cfg: &MotionConfig, distance_rad: f64, fraction: f64) -> MotionCommand {
         // A min-jerk path peaks at fifteen eighths of its average rate.
-        let periods = MIN_JERK_PEAK_RATE * distance_rad / (fraction * cfg.plant.v_max);
+        let periods = MIN_JERK_PEAK_RATE * distance_rad / (fraction * cfg.plant.yaw.v_max);
         move_to(
             JointTargets {
                 body_yaw: distance_rad,
@@ -7251,7 +7298,7 @@ mod tests {
         let cfg = armed_shipped();
         let ticks = cfg.tracking.ticks;
         let command = yaw_move(&cfg, 1.5, 0.5);
-        let recovery = cfg.plant.pass_cycles(cfg.tracking.progress_min_rad) as u32;
+        let recovery = cfg.plant.yaw.pass_cycles(cfg.tracking.progress_min_rad) as u32;
         let bound = ticks - recovery;
 
         let inside = re_raises(&cfg, &command, 20, Some(bound - 1), 260);
@@ -7276,7 +7323,7 @@ mod tests {
         let remaining =
             (inside.trajectory[(first + ticks) as usize].position - anchor.position).abs();
         assert!(
-            cfg.plant.pass_cycles(cfg.tracking.pace_min * remaining) <= recovery as usize + 2,
+            cfg.plant.yaw.pass_cycles(cfg.tracking.pace_min * remaining) <= recovery as usize + 2,
             "and pacing {} rad of it takes the ramp no longer than the two periods of slack the \
              release offset leaves",
             cfg.tracking.pace_min * remaining
@@ -7321,7 +7368,7 @@ mod tests {
         // Three times the profile velocity at its peak: the goal is far past
         // the prediction and staying there.
         let command = yaw_move(&cfg, 2.0, 3.0);
-        let recovery = cfg.plant.pass_cycles(cfg.tracking.progress_min_rad) as u32;
+        let recovery = cfg.plant.yaw.pass_cycles(cfg.tracking.progress_min_rad) as u32;
         let run = re_raises(&cfg, &command, 5, Some(ticks - recovery - 1), 300);
         let raises = &run.raises;
 
@@ -7337,9 +7384,9 @@ mod tests {
         );
         let first = raises[0].0 as usize;
         let at_first = run.trajectory[first];
-        let braking = cfg.plant.v_max * cfg.plant.v_max / (2.0 * cfg.plant.a_max);
+        let braking = cfg.plant.yaw.v_max * cfg.plant.yaw.v_max / (2.0 * cfg.plant.yaw.a_max);
         assert!(
-            at_first.velocity >= cfg.plant.v_max - 1e-12,
+            at_first.velocity >= cfg.plant.yaw.v_max - 1e-12,
             "the premise: the generator is still running at the cap when the hand comes off, at \
              {} rad per period",
             at_first.velocity
@@ -7357,7 +7404,7 @@ mod tests {
         let generator = run.trajectory[out].position - run.trajectory[anchor].position;
         let joint = run.reading[out] - run.reading[anchor];
         assert!(
-            run.trajectory[out].velocity >= cfg.plant.v_max - 1e-12,
+            run.trajectory[out].velocity >= cfg.plant.yaw.v_max - 1e-12,
             "the generator has not stopped by the end of the third window"
         );
         assert!(
@@ -7770,7 +7817,7 @@ mod tests {
             }
 
             let expected = walked(
-                &cfg.plant,
+                &cfg.plant.yaw,
                 pinned.body_yaw,
                 pinned.body_yaw,
                 &setpoints[..usize::try_from(stale).expect("a few periods")],
@@ -7794,7 +7841,7 @@ mod tests {
             // period included.
             let mut walk = setpoints.clone();
             walk.push(held.body_yaw);
-            let after = walked(&cfg.plant, pinned.body_yaw, pinned.body_yaw, &walk);
+            let after = walked(&cfg.plant.yaw, pinned.body_yaw, pinned.body_yaw, &walk);
             let mut present = pinned;
             if follows {
                 present.body_yaw = after.position;
@@ -7875,7 +7922,7 @@ mod tests {
                 );
             } else {
                 let expected = walked(
-                    &cfg.plant,
+                    &cfg.plant.yaw,
                     before.position,
                     far.body_yaw,
                     &vec![far.body_yaw; gap],
