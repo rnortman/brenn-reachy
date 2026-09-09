@@ -274,7 +274,8 @@ fn check_the_answer(run: &Run, failures: &mut Vec<String>) {
 /// the second raise lands on its own count.
 ///
 /// The cranks and not every row, because this is a statement about the hand: the
-/// antenna swept the long way round travels five times the cranks' arc and its
+/// antenna swept inboard over the head travels more than four times the
+/// cranks' arc and its
 /// lead-in reaches about a hundredth of a radian by the release, which is
 /// nothing anything is holding and nowhere near the fold. That the machine is
 /// nowhere near the fold when it is let go is asserted on the pose itself.

@@ -13,7 +13,8 @@
 //! profile leaves every healthy joint far behind its goal; on the recorded clip
 //! library the healthy machine runs 1.5-3 rad behind. A comparison against
 //! where the generator's own trajectory stands answers the question the goal
-//! cannot, and the same residual over the same recordings is under 0.4 rad.
+//! cannot, and the same residual over the same recordings is about 0.4 rad,
+//! 0.4024 rad at the worst.
 //!
 //! The model has no fitted constants. Its two parameters are the two registers
 //! the sweep writes, converted into the caller's control period. The one
@@ -58,9 +59,28 @@ pub const PROFILE_VELOCITY_UNIT_RAD_PER_S: f64 = 0.229 * TAU / 60.0;
 /// Restated here for the reason the velocity unit above it is.
 pub const PROFILE_ACCELERATION_UNIT_RAD_PER_S2: f64 = 214.577 * TAU / 3600.0;
 
-/// One servo class's two profile registers: acceleration first, then velocity,
-/// the order the configuration file writes them in.
-pub type ProfilePair = (u32, u32);
+/// One servo class's two profile registers, in register units.
+///
+/// Named fields rather than a pair of numbers, because the two orders in this
+/// tree disagree: the configuration file writes acceleration first and
+/// [`PlantModel::from_registers`] takes the velocity first, so a positional
+/// pair is a swap that type-checks. A swapped pair commissions a class at a
+/// hundredth of its speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfilePair {
+    /// Profile Acceleration, the ramp the servo's generator runs.
+    pub acceleration: u32,
+    /// Profile Velocity, the cruise it ramps to.
+    pub velocity: u32,
+}
+
+/// The ceiling a Profile Acceleration may be written at.
+///
+/// The register's own range and nothing else: the XL330 has no separate
+/// acceleration-limit register, so the field's top value is the whole of the
+/// bound, and zero at the other end disables the generator's acceleration
+/// stage rather than lifting it.
+pub const PROFILE_ACCELERATION_MAX: u32 = 32767;
 
 /// The profile registers per class of servo.
 ///
@@ -78,13 +98,27 @@ pub type GroupProfiles = PerGroup<ProfilePair>;
 /// scenario harness's parameter check, which reads the file and compares it
 /// with this.
 ///
-/// All three classes carry one pair today: it is the measured velocity cap of
-/// the recorded library tour, and no per-class capability has been measured
-/// yet. TODO(session-servo-profile)
+/// Two pairs across the three classes. The legs run their own measured
+/// capability, confirmed on a tour of the whole clip library at it; the body
+/// yaw and the antennas run the measured velocity cap of the recorded library
+/// tour, which is the pair every class started at. The per-class capability the
+/// machine has been measured at is `cogs/pose_reading.rs`'s
+/// `RECORDED_CAPABILITY_*`; the body yaw's reading is that pair to within the
+/// instrument's own ratio, and the antennas' is a faster pair that is on record
+/// and not commissioned, which is what TODO(session-servo-profile) now carries.
 pub const SHIPPED_PROFILES: GroupProfiles = GroupProfiles {
-    legs: (20, 50),
-    yaw: (20, 50),
-    antennas: (20, 50),
+    legs: ProfilePair {
+        acceleration: 287,
+        velocity: 326,
+    },
+    yaw: ProfilePair {
+        acceleration: 20,
+        velocity: 50,
+    },
+    antennas: ProfilePair {
+        acceleration: 20,
+        velocity: 50,
+    },
 };
 
 /// The control period this deployment ships, nanoseconds.
@@ -99,22 +133,18 @@ pub const SHIPPED_PERIOD_NS: i64 = 20_000_000;
 /// How many samples elapse between a setpoint being held by the driver and the
 /// first reading that shows the servo answering it.
 ///
-/// Three. One of them is certain and is the driver's: its cycle reads the nine present
+/// Two, both measured. One is the driver's: its cycle reads the nine present
 /// positions before it writes the cycle's goal, so a reading can answer at best
-/// the previous cycle's setpoint. The other two are fitted, over the 2026-09-06
-/// clip-library tour and the wake-gesture log together, and attributed to the
-/// servo -- an attribution, not a measurement of the servo alone.
+/// the previous cycle's setpoint. The second is the servo's own start, late in
+/// the period after the write -- read off every goal step of more than a chase
+/// gap written while a joint stood still, over two capability tours at the
+/// servos' own limits (75 steps total). Every one of them moves 1-5 counts in
+/// the very next period and ramps in the one after, and 38 of 38 second periods
+/// on the repeat tour exceed their first.
 ///
-/// The fit does not turn at three, and the two logs pull opposite ways. Over
-/// the tour, whose content all outruns the profile, the worst residual keeps
-/// falling slowly with every extra sample of depth through at least five: that
-/// is a prediction running ahead of a servo the registers say is faster than it
-/// delivers under load, not a later answer, and it belongs in the detector's
-/// margin rather than in the model. Over the wake gesture, whose content the
-/// profile carries, the antennas' residual rises about a quarter with every
-/// sample past one. Three is where the residual figures the detector's
-/// threshold is derived from were computed, and it is the depth the tick judges
-/// by so that the two are one walk.
+/// A trapezoid stepped two periods after the write fits that travel to within a
+/// period's travel; stepped three periods after, it trails the joint by a whole
+/// period.
 ///
 /// A crate constant and not a configuration field: it is a property of this
 /// hardware and this driver's cycle, measured once, and a deployment that could
@@ -130,7 +160,7 @@ pub const SHIPPED_PERIOD_NS: i64 = 20_000_000;
 /// with each caller marshalling its own storage in and out, is the statement
 /// that would. What the depth of the two rings that hold it is checked against
 /// is this constant, in the tests below and in the simulated driver's own.
-pub const RESPONSE_DEAD_SAMPLES: usize = 3;
+pub const RESPONSE_DEAD_SAMPLES: usize = 2;
 
 /// The most periods one step of a caller's loop may advance the model through
 /// when samples went missing.
@@ -222,8 +252,8 @@ impl GroupPlants {
         profiles: &GroupProfiles,
         period_ns: i64,
     ) -> Result<Self, GroupPlantError> {
-        profiles.try_map(|group, (acceleration, velocity)| {
-            PlantModel::from_registers(velocity, acceleration, period_ns)
+        profiles.try_map(|group, pair| {
+            PlantModel::from_registers(pair.velocity, pair.acceleration, period_ns)
                 .map_err(|source| GroupPlantError { group, source })
         })
     }
@@ -388,11 +418,26 @@ mod tests {
     use super::*;
     use crate::joints::{ROWS, group_of};
 
-    /// The model a class of the shipped machine runs, which all three classes
-    /// share today. The cases below are about the arithmetic of one generator,
-    /// so they take one.
+    /// A profile pair, in the order the configuration file writes one.
+    ///
+    /// The cases below distinguish the three classes by giving each a pair of
+    /// its own, and the field names spelled out per pair would bury the numbers
+    /// the case is about.
+    fn pair(acceleration: u32, velocity: u32) -> ProfilePair {
+        ProfilePair {
+            acceleration,
+            velocity,
+        }
+    }
+
+    /// The model the body yaw and the antennas run on the shipped machine, and
+    /// the pair every figure the cases below pin was read at. The cases are
+    /// about the arithmetic of one generator, so they take one; the legs run
+    /// their own faster pair, and the class-by-class plumbing is what
+    /// `the_shipped_triple_is_the_legs_capability_and_the_tour_cap_on_the_rest`
+    /// is for.
     fn shipped() -> PlantModel {
-        GroupPlants::default().legs
+        GroupPlants::default().yaw
     }
 
     /// The state schema's setpoint ring is exactly as deep as the dead time it
@@ -430,7 +475,8 @@ mod tests {
     /// A step from rest reaches the cap in `⌈v_max / a_max⌉` periods and goes
     /// no faster, however far the target is.
     ///
-    /// Nine periods and not eight at the shipped pair. The two registers are
+    /// Nine periods and not eight at the yaw's and antennas' `20 / 50`, which
+    /// is the pair this case's model carries. The two registers are
     /// scaled in units that are not commensurate — 0.229 rev/min against
     /// 214.577 rev/min² — so the ratio is 8.004 periods rather than a round
     /// eight, and the eighth period ends a thousandth of the cap short of it.
@@ -438,7 +484,7 @@ mod tests {
     fn a_move_from_rest_reaches_the_cap_in_the_ramp_and_never_exceeds_it() {
         let plant = shipped();
         let ramp = (plant.v_max / plant.a_max).ceil() as usize;
-        assert_eq!(ramp, 9, "the shipped pair's ramp");
+        assert_eq!(ramp, 9, "the ramp at the yaw's and antennas' 20 / 50");
         let mut state = Predicted::default();
         for period in 1..=ramp {
             plant.step(&mut state, 10.0);
@@ -597,9 +643,9 @@ mod tests {
     #[test]
     fn every_row_reads_its_own_classs_profile_and_model() {
         let profiles = GroupProfiles {
-            legs: (20, 50),
-            yaw: (30, 60),
-            antennas: (40, 70),
+            legs: pair(20, 50),
+            yaw: pair(30, 60),
+            antennas: pair(40, 70),
         };
         let plants = GroupPlants::from_profiles(&profiles, SHIPPED_PERIOD_NS)
             .expect("three pairs and a grid are three models");
@@ -611,11 +657,14 @@ mod tests {
             };
             assert_eq!(profiles.for_row(row), expected, "row {row}");
             assert_eq!(profiles.for_joint(joint), expected, "{joint:?}");
-            let (acceleration, velocity) = expected;
             assert_eq!(
                 plants.for_row(row),
-                PlantModel::from_registers(velocity, acceleration, SHIPPED_PERIOD_NS)
-                    .expect("the case's pairs are models"),
+                PlantModel::from_registers(
+                    expected.velocity,
+                    expected.acceleration,
+                    SHIPPED_PERIOD_NS
+                )
+                .expect("the case's pairs are models"),
                 "row {row}"
             );
             assert_eq!(plants.for_joint(joint), plants.for_row(row), "{joint:?}");
@@ -625,16 +674,24 @@ mod tests {
         assert_eq!(plants.of(JointGroup::Antennas), plants.antennas);
     }
 
-    /// The shipped triple is three copies of one model, which is what makes the
-    /// per-class plumbing a no-op on today's configuration.
+    /// The shipped triple is two models: the legs' commissioned capability and
+    /// the pair the other two classes still run. Per class, because the whole
+    /// point of the plumbing is that a class judged against another class's
+    /// generator is judged against a trajectory nothing runs.
     #[test]
-    fn the_shipped_triple_is_three_models_of_the_one_shipped_pair() {
+    fn the_shipped_triple_is_the_legs_capability_and_the_tour_cap_on_the_rest() {
         let plants = GroupPlants::default();
-        let one = PlantModel::from_registers(50, 20, SHIPPED_PERIOD_NS)
-            .expect("the shipped pair is a model");
-        assert_eq!(plants.legs, one);
-        assert_eq!(plants.yaw, one);
-        assert_eq!(plants.antennas, one);
+        let legs = PlantModel::from_registers(326, 287, SHIPPED_PERIOD_NS)
+            .expect("the legs' pair is a model");
+        let rest = PlantModel::from_registers(50, 20, SHIPPED_PERIOD_NS)
+            .expect("the tour's cap is a model");
+        assert_eq!(plants.legs, legs);
+        assert_eq!(plants.yaw, rest);
+        assert_eq!(plants.antennas, rest);
+        assert!(
+            legs.v_max > rest.v_max && legs.a_max > rest.a_max,
+            "the legs' generator is the faster of the two"
+        );
     }
 
     /// A zero in any one class is refused, and the refusal names the class.
@@ -644,21 +701,21 @@ mod tests {
             (
                 JointGroup::Legs,
                 GroupProfiles {
-                    legs: (20, 0),
+                    legs: pair(20, 0),
                     ..SHIPPED_PROFILES
                 },
             ),
             (
                 JointGroup::BodyYaw,
                 GroupProfiles {
-                    yaw: (0, 50),
+                    yaw: pair(0, 50),
                     ..SHIPPED_PROFILES
                 },
             ),
             (
                 JointGroup::Antennas,
                 GroupProfiles {
-                    antennas: (0, 0),
+                    antennas: pair(0, 0),
                     ..SHIPPED_PROFILES
                 },
             ),
@@ -707,9 +764,9 @@ mod tests {
         }
         // The stow-to-neutral travel of one antenna, which is the longest thing
         // any posture change asks of this machine.
-        assert_eq!(plant.travel_cycles(2.875), 131);
+        assert_eq!(plant.travel_cycles(2.875), 130);
         // Sign is not a distance.
-        assert_eq!(plant.travel_cycles(-2.875), 131);
+        assert_eq!(plant.travel_cycles(-2.875), 130);
     }
 
     /// How far above the stepped model's own arrival the closed form may sit.
@@ -767,7 +824,7 @@ mod tests {
         // ramp and nothing else. Being commanded to stop there instead costs a
         // fourth period of braking and the dead time on top.
         assert_eq!(plant.pass_cycles(0.01), 3);
-        assert_eq!(plant.travel_cycles(0.01), 7);
+        assert_eq!(plant.travel_cycles(0.01), 6);
     }
 
     /// How many periods the model takes to stand at or past `distance`,

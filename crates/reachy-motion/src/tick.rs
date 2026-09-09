@@ -170,7 +170,7 @@ pub const RECORDED_WORST_HEAD_LAG_RAD: f64 = 0.245;
 pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 
 /// The worst residual any head joint ran at on the recorded clip library,
-/// radians — a body yaw crank 0.368 rad off its modelled trajectory as a goal
+/// radians — a body yaw crank 0.3884 rad off its modelled trajectory as a goal
 /// turned round through it.
 ///
 /// The figure the tracking screen is sized on, which
@@ -180,40 +180,55 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// a crank shows when the goal reverses through it, and a load-dependent steady
 /// offset — so it is the measurement `threshold_rad` carries its margin over.
 ///
-/// One of the three recorded tours of that library ran the body yaw to 0.3825
-/// rad, so this figure sits 0.0145 rad under the worst the shipped pair has
-/// been seen to produce. The screen clears both: half again over this figure is
-/// 0.552 rad and half again over the larger reading is 0.574 rad, each under
-/// the 0.6 rad threshold.
+/// One of the three recorded tours of that library ran the body yaw to 0.4024
+/// rad, so this figure sits 0.014 rad under the worst the shipped pair has been
+/// seen to produce, and that reading is the one the sizing rule does not clear:
+/// half again over it is 0.6036 rad, past the 0.6 rad threshold, a headroom of
+/// 1.491 rather than 1.5. Nothing here moves on that reading — the threshold is
+/// not widened and the recorded worsts are re-baked only from a confirmation
+/// tour — but a re-bake that carries a body-yaw worst above 0.4 rad puts the
+/// replay suite's margin assertion past the shipped threshold, and which of the
+/// two gives way is a decision for whoever reads that tour, not an edit made to
+/// get the suite green.
+///
+/// The figure is a body yaw's, at the pair the class still runs and the gains
+/// it still runs — neither moved when the legs were commissioned — so the
+/// confirmation tour cut no head window and this figure is the recorded tours'
+/// as it was. What would move it is a tour that commissions the yaw.
 ///
 /// The same tours are also recorded per joint group as p99.9 residuals, in the
 /// offline analyzer (`RECORDED_P999_*_RESIDUAL_RAD`, `cogs/pose_reading.rs`),
-/// which is the noise floor a candidate profile's p99.9 is read against. A
-/// confirmation tour that re-bakes this figure and its antenna twin re-bakes
-/// those three arrays from the same tour.
-pub const RECORDED_WORST_HEAD_RESIDUAL_RAD: f64 = 0.368;
+/// which is the noise floor a candidate profile's p99.9 is read against, and as
+/// the capability pairs beside them (`RECORDED_CAPABILITY_*`). Each class's
+/// figures are one configuration's reading, at the pair and the gains the tree
+/// ships that class at, and are re-baked together for that class or not at all:
+/// a fresh worst printed against a noise floor measured under some other
+/// configuration is a comparison of two machines. Where a figure is not its
+/// class's shipping configuration, its own comment says so — the antennas'
+/// p99.9 array. TODO(session-servo-profile) is the re-bake, and lists the set.
+pub const RECORDED_WORST_HEAD_RESIDUAL_RAD: f64 = 0.3884;
 
-/// The worst residual an antenna ran at on the same recordings, radians — a
-/// right antenna 0.354 rad off its trajectory through a goal reversal.
+/// The worst residual an antenna ran at on the recorded clip library, radians —
+/// an antenna 0.3913 rad off its modelled trajectory through a goal reversal.
 ///
 /// The antennas run the library's fastest content and its longest travel, and their
-/// residual is nonetheless the head's to within a fiftieth of a radian: what
+/// residual is nonetheless the head's to within a fortieth of a radian: what
 /// this figure is about is the reversal, not the speed.
 ///
-/// One of the three recorded tours of the same library ran an antenna to
-/// 0.4018 rad, so this figure sits 0.0478 rad under the worst the shipped pair
-/// has been seen to produce, and that reading is the one the sizing rule does
-/// not clear: half again over it is 0.6027 rad, past the 0.6 rad threshold,
-/// which is a headroom of 1.49 rather than 1.5. Nothing here moves on that
-/// reading — the threshold is not widened and the recorded worsts are re-baked
-/// only from a confirmation tour — but a re-bake that carries an antenna worst
-/// above 0.4 rad puts the replay suite's margin assertion past the shipped
-/// threshold, and which of the two gives way is a decision for whoever reads
-/// that tour, not an edit made to get the suite green.
+/// Read at the gains the class ships, `200 / 0 / 0`, on the `20 / 50` pair it
+/// also ships. Which matters here and not on the head's figure: the antennas'
+/// earlier recordings were made on `500 / 0 / 100`, a proportional term two and
+/// a half times this one, and the proportional term is what sets how far a
+/// joint follows behind its own generator. Those recordings read 0.3795, 0.3782
+/// and 0.3855 rad, so the softer loop costs about two hundredths of a radian
+/// and the figure is still under 0.4 rad; half again over it is 0.587 rad and
+/// the 0.6 rad screen clears it. The class that stands past 0.4 rad on these
+/// recordings is the body yaw, whose comment above says what that costs the
+/// sizing rule.
 ///
 /// Re-baked with [`RECORDED_WORST_HEAD_RESIDUAL_RAD`], and beside the same
 /// per-group p99.9 arrays that comment names.
-pub const RECORDED_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.354;
+pub const RECORDED_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.3913;
 
 /// When a joint stands far enough from where its servo's own trajectory
 /// generator has got to, for long enough, without closing on it or keeping pace
@@ -233,7 +248,7 @@ pub const RECORDED_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.354;
 /// following perfectly at a radian and a third out. What this judges instead is
 /// the residual against the generator's own trajectory, which over those same
 /// recordings stays around 0.4 rad, the worst reading of the shipped pair on
-/// record being an antenna at 0.4018. Two ways past the residual threshold are
+/// record being a body yaw at 0.4024. Two ways past the residual threshold are
 /// still healthy and both are checked before anything is raised: a joint
 /// closing on the prediction, and a joint behind it but still moving with it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -301,16 +316,17 @@ impl Default for TrackingFaultConfig {
     fn default() -> Self {
         Self {
             armed: true,
-            // Half again over the pinned worst residual and a little more:
-            // [`RECORDED_WORST_HEAD_RESIDUAL_RAD`], a body-yaw reversal on the
-            // recorded clip library, gives 0.552 rad. The pinned worsts are not
-            // the largest samples those recordings hold — the largest is an
-            // antenna at 0.4018 rad, and the screen stands 1.49 times that
-            // reading rather than the 1.5 times the pinned worsts give. The
-            // replay suite asserts the margin against the recordings
-            // themselves, so the two move together. A displacement of a third
-            // of a radian from where the generator has got to is what a hand
-            // does to a crank, not what a servo does to itself.
+            // Half again over the larger pinned worst residual and a little
+            // more: [`RECORDED_WORST_ANTENNA_RESIDUAL_RAD`], an antenna
+            // reversal on the recorded clip library, gives 0.5870 rad, and the
+            // head's 0.5826 rad. The pinned worsts are not the largest samples
+            // those recordings hold — the largest is a body yaw at 0.4024 rad,
+            // and the screen stands 1.49 times that reading rather than the
+            // 1.53 times the larger pinned worst gives. The replay suite
+            // asserts the margin against the recordings themselves, so the two
+            // move together. A displacement of a third of a radian from where
+            // the generator has got to is what a hand does to a crank, not
+            // what a servo does to itself.
             threshold_rad: 0.6,
             // About 6.5 of the servos' 0.088° counts, comfortably above the
             // half-count quantisation floor of 7.7e-4 rad, and under a third
@@ -838,9 +854,9 @@ pub fn yaw_goal_counts(radians: f64) -> f64 {
 /// while the inboard arc crosses the antennas harmlessly over the head at their
 /// different heights and disturbs almost nothing outside the head's footprint.
 ///
-/// Deliberately not derived from the stow angles. The midpoint of the
-/// stow-to-neutral arc is ±1.525 rad, about 2.6° off horizontal; these are the
-/// physical direction and stay put if the stow angles ever move.
+/// Deliberately not derived from the stow angles. Halfway between straight up
+/// and the fold is ±1.66 rad, about 5.1° off horizontal; these are the physical
+/// direction and stay put if the stow angles ever move.
 pub const ANTENNA_OUTBOARD: [f64; 2] =
     [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
 
@@ -1743,7 +1759,7 @@ fn push_held(state: &mut MotionSnap, setpoint: &JointVector) {
 ///
 /// One period is one step-then-push: the step reads the setpoint of
 /// `RESPONSE_DEAD_SAMPLES` periods ago and the push takes up this period's,
-/// which is the dead time the model was fitted at. A period no sample attended
+/// which is the dead time the model is measured at. A period no sample attended
 /// is stepped on the setpoint the driver was already holding, because that is
 /// what the servos went on chasing.
 ///
@@ -3296,15 +3312,25 @@ fn short_arc(last: f64, target: f64) -> f64 {
 /// sideways takes the shortest path away from it, and one commanded exactly
 /// there arrives the short way.
 fn resolve_antenna(last: f64, target: f64, outboard: f64) -> Option<f64> {
-    let short = short_arc(last, target);
-    let sweep = short - last;
-    // Ground from `last` to `outboard` in the direction of travel, in
-    // `[0, 2π)`. Strictly inside the sweep is a crossing; zero is the antenna
-    // standing on the point, and `sweep` itself is it arriving there.
+    // The sweep is the wrapped difference itself, not `short - last`: adding it
+    // to `last` and taking it back off loses a bit at some angles, and the
+    // endpoint case below compares it against a distance measured from `last`
+    // for equality.
+    let sweep = wrap_to_pi(target - last);
+    let short = last + sweep;
+    // Ground from `last` to `outboard` in the direction of travel, up to a
+    // turn. Strictly inside the sweep is a crossing; nothing else is — an
+    // antenna standing on the point measures no ground or a whole turn of it,
+    // and one arriving there measures the sweep itself.
+    //
+    // Measured through the same wrap the sweep is, and turned round the same
+    // way, so that an antenna commanded exactly to the point reaches the
+    // comparison with the two figures bit-equal rather than a rounding apart.
+    let forward = (outboard - last).rem_euclid(core::f64::consts::TAU);
     let to_outboard = if sweep >= 0.0 {
-        (outboard - last).rem_euclid(core::f64::consts::TAU)
+        forward
     } else {
-        (last - outboard).rem_euclid(core::f64::consts::TAU)
+        core::f64::consts::TAU - forward
     };
     let crosses = to_outboard > 0.0 && to_outboard < sweep.abs();
 
@@ -4596,9 +4622,11 @@ mod tests {
     /// machine actually runs, each named with the clock it runs on.
     ///
     /// The stow pose carries the antennas the machine actually folds them to,
-    /// which is the one fixture arc where the accept's antenna resolution bites:
-    /// the short way round from neutral crosses the outboard sideways point, so
-    /// the loop sweeps the long way instead.
+    /// so its antenna leg is a landing and a length: the sweep from neutral is
+    /// most of a turn inboard over the head, and the fixture asserts the walk
+    /// lands on it and takes that long. Which branch of the arc policy produces
+    /// the inboard sweep is `an_antenna_sweep_misses_its_outboard_point`'s
+    /// question, not this one's.
     fn landing_fixtures() -> [(&'static str, JointTargets, JointTargets, f64); 4] {
         let rest = JointTargets {
             head_pose_body: rest_head_pose(),
@@ -9653,7 +9681,7 @@ mod tests {
 
     /// An antenna target is a direction, resolved against the frame the machine
     /// is already in. Run 4's geometry: the right antenna reads +162.334° after
-    /// torque-on and stow's fold is −174.752°, which is 22.9° away the near way
+    /// torque-on and the target is −174.752°, which is 22.9° away the near way
     /// and 337° away the way a raw difference asks for. The near way is what
     /// gets commanded.
     #[test]
@@ -9722,15 +9750,23 @@ mod tests {
 
     /// The arc policy: a sweep takes the way round that misses the antenna's own
     /// outboard sideways point, because that is the direction that sweeps the
-    /// widest envelope past whatever is standing beside the machine. Stow to
-    /// neutral and back is the move this exists for — the short way is 3.05 rad
-    /// straight through sideways, the way taken is 3.23 rad over the head.
+    /// widest envelope past whatever is standing beside the machine.
+    ///
+    /// Two legs per side, and they prove different halves. The stow fold leans
+    /// inboard of straight down, so its *short* arc to upright already misses
+    /// the outboard point and the policy never fires: that leg is the sweep the
+    /// machine actually makes, asserted to miss the point, land, and be a whole
+    /// turn less the difference. The synthetic fold short of half a turn is the
+    /// leg whose short arc does cross, so it is the one the long-way branch
+    /// carries; the same three assertions hold over it.
     #[test]
     fn an_antenna_sweep_misses_its_outboard_point() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = if side == 0 { -3.05 } else { 3.05 };
-            for (from, to) in [(stow, 0.0), (0.0, stow)] {
+            let stow = crate::disarm::STOW_ANTENNAS[side];
+            // Inboard of the outboard point, so its short arc crosses it.
+            let crossing = if side == 0 { -2.5 } else { 2.5 };
+            for (from, to) in [(stow, 0.0), (0.0, stow), (crossing, 0.0), (0.0, crossing)] {
                 let mut antennas = [0.0; 2];
                 antennas[side] = from;
                 let start = antennas_at(antennas);
@@ -9749,8 +9785,9 @@ mod tests {
                 let landed = *series.last().expect("a last goal");
                 assert!(wrap_to_pi(landed - to).abs() < 1e-9, "landed at {landed}");
                 let swept = (landed - from).abs();
+                let fold = if from == 0.0 { to } else { from };
                 assert!(
-                    (swept - (core::f64::consts::TAU - 3.05)).abs() < 1e-9,
+                    (swept - (core::f64::consts::TAU - fold.abs())).abs() < 1e-9,
                     "antenna {side} swept {swept} rad going {from} -> {to}"
                 );
             }
@@ -9764,7 +9801,7 @@ mod tests {
     fn an_antenna_at_sideways_takes_the_short_way() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = if side == 0 { -3.05 } else { 3.05 };
+            let stow = crate::disarm::STOW_ANTENNAS[side];
             let mut antennas = [0.0; 2];
             antennas[side] = outboard;
             let start = antennas_at(antennas);
@@ -9784,7 +9821,7 @@ mod tests {
             let landed = last_targets(&state).antennas[side];
             let swept = (landed - outboard).abs();
             assert!(
-                (swept - (3.05 - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
+                (swept - (stow.abs() - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
                 "antenna {side} swept {swept} rad from sideways"
             );
         }
@@ -9796,7 +9833,7 @@ mod tests {
     fn an_antenna_commanded_to_sideways_arrives_the_short_way() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = if side == 0 { -3.05 } else { 3.05 };
+            let stow = crate::disarm::STOW_ANTENNAS[side];
             let mut antennas = [0.0; 2];
             antennas[side] = stow;
             let start = antennas_at(antennas);
@@ -9815,15 +9852,15 @@ mod tests {
             let landed = last_targets(&state).antennas[side];
             let swept = (landed - stow).abs();
             assert!(
-                (swept - (3.05 - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
+                (swept - (stow.abs() - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
                 "antenna {side} swept {swept} rad to sideways"
             );
         }
     }
 
     /// The outboard constants are the physical sideways direction — a quarter
-    /// turn either side of straight up — and not the midpoint of the arc the
-    /// stow angles happen to span, which is 2.6° off it. A machine whose stow
+    /// turn either side of straight up — and not the halfway point between
+    /// straight up and the fold, which is 5.1° off it. A machine whose stow
     /// fold moved would keep the same two constants.
     #[test]
     fn the_outboard_directions_are_horizontal() {
@@ -9831,10 +9868,10 @@ mod tests {
             ANTENNA_OUTBOARD,
             [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2]
         );
-        let stow_midpoint = 3.05 / 2.0;
+        let stow_midpoint = crate::disarm::STOW_ANTENNAS[1] / 2.0;
         assert!(
             (stow_midpoint - core::f64::consts::FRAC_PI_2).abs() > 0.04,
-            "the stow arc's midpoint is {stow_midpoint}, which is not horizontal"
+            "halfway to the fold is {stow_midpoint}, which is not horizontal"
         );
     }
 
@@ -9876,7 +9913,11 @@ mod tests {
         let (mut state, mut pinned) = armed_at(&cfg, &start);
 
         let mut previous = start.antennas;
-        for directions in [[-3.05, 3.05], [0.0, 0.0], [-3.05, 3.05]] {
+        for directions in [
+            crate::disarm::STOW_ANTENNAS,
+            [0.0, 0.0],
+            crate::disarm::STOW_ANTENNAS,
+        ] {
             let (_, out) = run_move(
                 &cfg,
                 &mut state,

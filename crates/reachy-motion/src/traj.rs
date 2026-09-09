@@ -441,7 +441,7 @@ mod tests {
         JointTargets {
             head_pose_body: stow_head_pose(),
             body_yaw: 0.3,
-            antennas: [-3.05, 3.05],
+            antennas: crate::disarm::STOW_ANTENNAS,
         }
     }
 

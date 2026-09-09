@@ -516,7 +516,8 @@ pub enum BareError {
     /// difference the two phases exist to tell apart.
     #[error(
         "servo {id} has its bus watchdog at {read}, not 0; a session or a watchdog run left it \
-         armed. Reboot the servo, or run `off`, before the hold probe"
+         armed. `off` releases torque and writes nothing else, so it does not clear this: \
+         `reboot {id}`, or run `watchdog {id}`, before the hold probe"
     )]
     HoldProbeWatchdogArmed {
         /// The servo addressed.
@@ -4402,6 +4403,16 @@ mod tests {
                 shown.contains(&format!("bus watchdog at {armed}")),
                 "{shown}"
             );
+            // The remedy has to be one that works. `off` writes TorqueEnable
+            // and nothing else, so an operator who followed it would come
+            // straight back to this refusal.
+            assert!(shown.contains("does not clear this"), "{shown}");
+            // And one that works on *this* servo: both commands default to the
+            // antenna the watchdog self-test addresses, so a remedy naming
+            // neither servo sends an operator probing another joint to exercise
+            // the antenna and come back to this same refusal.
+            assert!(shown.contains(&format!("`reboot {id}`")), "{shown}");
+            assert!(shown.contains(&format!("run `watchdog {id}`")), "{shown}");
         }
     }
 

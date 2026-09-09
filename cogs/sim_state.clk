@@ -215,7 +215,7 @@ schema SimState
         #14 refused_injections: UInt64;
 
         // The nine modelled control tables: one cell per register per bus row,
-        // row-major, twenty-four registers to a row -- every register the
+        // row-major, twenty-three registers to a row -- every register the
         // vocabulary names except its no-register zero, which names no cell.
         //
         // A cell holds the register's engineering-unit value in the same
@@ -229,7 +229,7 @@ schema SimState
         // provisioning: what a healthy, correctly provisioned unit holds, so a
         // commissioning sequence verifies here against the numbers it verifies
         // against on hardware.
-        #15 regs: FixedArray<UInt64, 216>;
+        #15 regs: FixedArray<UInt64, 207>;
 
         // How many plant readings never reached a control table, all run: an
         // angle the modelled world made non-finite has no eight-byte carriage,
@@ -382,8 +382,9 @@ schema SimState
         // `reachy_motion::plant::RESPONSE_DEAD_SAMPLES` cycles, oldest first.
         // The modelled servo answers a setpoint that many cycles after the
         // driver holds it -- one cycle is the driver's own read-before-write
-        // ordering, which is certain, and the rest are fitted and attributed to
-        // the servo -- and this is that delay's storage. An entry nothing has
+        // ordering and the other is the servo's own start, late in the cycle
+        // after the write, both measured -- and this is that delay's storage.
+        // An entry nothing has
         // written yet holds where the machine stands, so the first goal is
         // chased from rest and never from an angle nobody commanded.
         //
@@ -391,7 +392,7 @@ schema SimState
         // decision tick's own ring of this carries: the depth is the dead time
         // and the width is the machine, and an index arithmetic that mixed the
         // two would read the wrong cycle the day the dead time moves.
-        #45 held: FixedArray<joints::Joints, 3>;
+        #45 held: FixedArray<joints::Joints, 2>;
     }
     history
     {

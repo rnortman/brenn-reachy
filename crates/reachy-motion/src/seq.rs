@@ -74,7 +74,6 @@ pub mod reg {
             RegId::MinVoltageLimit => "minimum voltage limit",
             RegId::CurrentLimit => "current limit",
             RegId::VelocityLimit => "velocity limit",
-            RegId::AccelerationLimit => "acceleration limit",
             RegId::TemperatureLimit => "temperature limit",
             RegId::BusWatchdog => "bus watchdog",
             RegId::ProfileAcceleration => "profile acceleration",
@@ -1179,9 +1178,12 @@ mod tests {
         /// It keys what a transaction asks a servo to do, in a slot and at the
         /// process edge, so the list is appended to and never renumbered: a
         /// register inserted among these turns a goal write into a shutdown
-        /// write in a peer built at the other revision.
+        /// write in a peer built at the other revision. #24 is retired and
+        /// reserved, so the past-the-end assertion sits on it: a register
+        /// numbered 24 turns this test red rather than taking a number some
+        /// build in between reads as the acceleration limit.
         the_register_numbering_is_the_one_written_down:
-            RegId as RegIdWire, past the end 25 {
+            RegId as RegIdWire, past the end 24 {
             RegId::None => 0,
             RegId::TorqueEnable => 1,
             RegId::GoalPosition => 2,
@@ -1206,7 +1208,6 @@ mod tests {
             RegId::PresentInputVoltage => 21,
             RegId::ModelNumber => 22,
             RegId::PresentTemperature => 23,
-            RegId::AccelerationLimit => 24,
         }
     }
 }

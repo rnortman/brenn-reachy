@@ -118,8 +118,9 @@ pub use phase::{
     PhaseWatch, mirror_offset,
 };
 pub use plant::{
-    GroupPlantError, GroupPlants, GroupProfiles, MAX_GAP_PERIODS, PlantError, PlantModel,
-    Predicted, ProfilePair, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS, SHIPPED_PROFILES,
+    GroupPlantError, GroupPlants, GroupProfiles, MAX_GAP_PERIODS, PROFILE_ACCELERATION_MAX,
+    PlantError, PlantModel, Predicted, ProfilePair, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS,
+    SHIPPED_PROFILES,
 };
 pub use postures::{NEUTRAL_ANTENNAS, neutral_targets, stow_pose_targets};
 pub use resume::{GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError};

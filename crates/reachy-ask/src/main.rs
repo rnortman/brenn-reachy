@@ -60,8 +60,8 @@ use signal_hook::flag;
 
 use gesture::{ASK_POD, body};
 use tour::{
-    END_MARGIN_MS, LAUNCHER_CONTROL, Leg, QUIT_CONNECT_WINDOW, RELEASE_ALLOWANCE_MS, Tour,
-    quit_launcher,
+    END_MARGIN_MS, LAUNCHER_CONTROL, Leg, PROBE_PREFIX, QUIT_CONNECT_WINDOW, RELEASE_ALLOWANCE_MS,
+    Tour, quit_launcher, select,
 };
 use watch::{Watch, is_released};
 
@@ -99,6 +99,10 @@ enum Mode {
     /// Print the tour's backstop budget for that sidecar, in whole seconds,
     /// and exit. Runs on the workstation, where there is no machine.
     Budget(PathBuf),
+    /// Print the names sidecar of the motions this run's selection over that
+    /// sidecar holds, and exit. Runs on the workstation, where there is no
+    /// machine.
+    Table(PathBuf),
 }
 
 /// What the invocation asked for.
@@ -111,6 +115,12 @@ struct Options {
     resting_timeout: Duration,
     /// How long to keep following the story once the gesture has gone out.
     run_window: Duration,
+    /// The one motion of the library to play, where the invocation names one.
+    ///
+    /// `None` is the whole selection the mode implies: for a tour, the library
+    /// minus its probes. A name here is a probe run — one motion, played once,
+    /// judged on its own.
+    motion: Option<String>,
     /// Which run this is.
     mode: Mode,
 }
@@ -120,6 +130,7 @@ impl Default for Options {
         Self {
             resting_timeout: RESTING_TIMEOUT,
             run_window: RUN_WINDOW,
+            motion: None,
             mode: Mode::Gesture,
         }
     }
@@ -129,8 +140,9 @@ impl Default for Options {
 fn usage() -> String {
     format!(
         "usage: reachy-ask [--resting-timeout SECONDS] [--run-window SECONDS]\n\
-         \x20      reachy-ask --tour SIDECAR [--resting-timeout SECONDS]\n\
-         \x20      reachy-ask --tour-budget SIDECAR\n\
+         \x20      reachy-ask --tour SIDECAR [--motion NAME] [--resting-timeout SECONDS]\n\
+         \x20      reachy-ask --tour-budget SIDECAR [--motion NAME]\n\
+         \x20      reachy-ask --tour-table SIDECAR [--motion NAME]\n\
          \n\
          Binds {REPORTS_OUT_PORT} on loopback, waits for the session to narrate that it\n\
          commissioned, sends compiled scripts to {SCRIPTS_IN_PORT}, and narrates the story.\n\
@@ -145,9 +157,19 @@ fn usage() -> String {
          terminal ending the sender reaches by itself quits the launcher, red as well as\n\
          green; only a stop signal does not, because then the launcher is already gone.\n\
          --run-window is refused with --tour: the tour knows its own end.\n\
+         A tour plays the library minus its `{PROBE_PREFIX}` instruments: a probe is a step\n\
+         goal held for a judged hold, and it is played one at a time.\n\
+         \n\
+         With --motion NAME: that one motion, and nothing else, whatever the mode. It is\n\
+         how a probe is played, and the name is a motion of the sidecar.\n\
          \n\
          With --tour-budget SIDECAR: print the backstop the harness should wrap the\n\
          launcher in, in whole seconds, and exit. Same plan, so the two agree.\n\
+         \n\
+         With --tour-table SIDECAR: print the names sidecar of the motions this\n\
+         selection holds, and exit. It is what the analyzer judges the run against and\n\
+         what a fetched run directory carries, so the plan and the verdict are one\n\
+         selection made once.\n\
          \n\
          Start it before the launcher: the bind has to precede the control process's first\n\
          narration, and this is what makes that true rather than likely.\n\
@@ -168,7 +190,8 @@ fn main() -> ExitCode {
             let ended = match &options.mode {
                 Mode::Gesture => run(&options),
                 Mode::Tour(sidecar) => tour_run(&options, sidecar),
-                Mode::Budget(sidecar) => budget(sidecar),
+                Mode::Budget(sidecar) => budget(sidecar, options.motion.as_deref()),
+                Mode::Table(sidecar) => emit_table(sidecar, options.motion.as_deref()),
             };
             match ended {
                 Ok(()) => ExitCode::SUCCESS,
@@ -203,18 +226,22 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
     while let Some(word) = args.next() {
         match word.as_str() {
-            "--tour" | "--tour-budget" => {
+            "--tour" | "--tour-budget" | "--tour-table" => {
                 let path = args
                     .next()
                     .ok_or_else(|| format!("{word} needs the path of a names sidecar"))?;
                 if mode_given {
-                    return Err("--tour and --tour-budget each name the one run this is".to_owned());
+                    return Err(
+                        "--tour, --tour-budget and --tour-table each name the one run this is"
+                            .to_owned(),
+                    );
                 }
                 mode_given = true;
-                options.mode = if word == "--tour" {
-                    Mode::Tour(PathBuf::from(path))
-                } else {
-                    Mode::Budget(PathBuf::from(path))
+                let path = PathBuf::from(path);
+                options.mode = match word.as_str() {
+                    "--tour" => Mode::Tour(path),
+                    "--tour-budget" => Mode::Budget(path),
+                    _ => Mode::Table(path),
                 };
             }
             "--resting-timeout" => {
@@ -224,6 +251,18 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
                 }
                 resting_given = true;
                 options.resting_timeout = value;
+            }
+            "--motion" => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| format!("{word} needs the name of a motion"))?;
+                if options.motion.is_some() {
+                    return Err(format!("{word} was given twice"));
+                }
+                if name.trim().is_empty() {
+                    return Err(format!("{word} takes a motion's name, not an empty one"));
+                }
+                options.motion = Some(name);
             }
             "--run-window" => {
                 let value = seconds(&word, args.next())?;
@@ -235,6 +274,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
             }
             other => return Err(format!("`{other}` is not an option this takes")),
         }
+    }
+    if options.motion.is_some() && options.mode == Mode::Gesture {
+        return Err(
+            "--motion names a motion of the library, and the wake gesture plays none; it goes \
+             with --tour, --tour-budget or --tour-table"
+                .to_owned(),
+        );
     }
     if window_given && options.mode != Mode::Gesture {
         return Err(
@@ -503,12 +549,18 @@ fn asked_line(script_id: u32, window_secs: u64, at: SyncTime) -> String {
     .to_string()
 }
 
-/// The tour's plan, out of the sidecar at `path`.
-fn plan(path: &Path) -> Result<(MotionTable, Tour), String> {
+/// The tour's plan, out of the sidecar at `path`, over the motions `motion`
+/// selects.
+///
+/// The table that comes back is the selection and not the library: it is what
+/// the edge resolves a script's name against, so a run cannot play a motion it
+/// was not asked to.
+fn plan(path: &Path, motion: Option<&str>) -> Result<(MotionTable, Tour), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("reading the names sidecar `{}`: {error}", path.display()))?;
-    let table = MotionTable::from_sidecar(&text)
+    let library = MotionTable::from_sidecar(&text)
         .map_err(|error| format!("reading the names sidecar `{}`: {error}", path.display()))?;
+    let table = select(&library, motion)?;
     let tour = Tour::of(&table)?;
     Ok((table, tour))
 }
@@ -519,9 +571,22 @@ fn plan(path: &Path) -> Result<(MotionTable, Tour), String> {
 /// The workstation side of the tour: no ports, no machine, no launcher — the
 /// deploy script asks this before it starts anything, and the number comes off
 /// the same plan the run itself follows.
-fn budget(path: &Path) -> Result<(), String> {
-    let (_, tour) = plan(path)?;
+fn budget(path: &Path, motion: Option<&str>) -> Result<(), String> {
+    let (_, tour) = plan(path, motion)?;
     println!("{}", tour.budget().as_secs());
+    Ok(())
+}
+
+/// Print the names sidecar of the motions this selection holds.
+///
+/// The other workstation side of a run: the harness writes this beside the
+/// records it fetched and hands it to the analyzer, so what a run is judged
+/// against is the table its plan came off rather than a second reading of the
+/// library. A selection that holds nothing is the refusal `plan` gives, before
+/// anything is pushed.
+fn emit_table(path: &Path, motion: Option<&str>) -> Result<(), String> {
+    let (table, _) = plan(path, motion)?;
+    println!("{}", table.to_sidecar());
     Ok(())
 }
 
@@ -568,7 +633,7 @@ fn tour_run(options: &Options, path: &Path) -> Result<(), String> {
 /// running for a plan that never started would spend the whole backstop.
 fn tour_ending(options: &Options, path: &Path, stop: &AtomicBool) -> Ending {
     let started = (|| {
-        let (table, tour) = plan(path)?;
+        let (table, tour) = plan(path, options.motion.as_deref())?;
         let ports = Ports::bind()?;
         Ok((table, tour, ports))
     })();
@@ -786,6 +851,7 @@ mod tests {
             Ok(Options {
                 resting_timeout: Duration::from_secs(5),
                 run_window: Duration::from_secs(9),
+                motion: None,
                 mode: Mode::Gesture,
             }),
         );
@@ -867,17 +933,74 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_run_names_the_one_motion_it_plays() {
+        let options = parsed(&[
+            "--tour",
+            "cogs/clip_library.names.json",
+            "--motion",
+            "probe/antenna-step-a",
+        ])
+        .expect("a probe run");
+        assert_eq!(
+            options.mode,
+            Mode::Tour(PathBuf::from("cogs/clip_library.names.json")),
+        );
+        assert_eq!(options.motion.as_deref(), Some("probe/antenna-step-a"));
+        let table = parsed(&["--tour-table", "names.json", "--motion", "bench/nod"])
+            .expect("the table a run is judged against");
+        assert_eq!(table.mode, Mode::Table(PathBuf::from("names.json")));
+        assert_eq!(table.motion.as_deref(), Some("bench/nod"));
+        assert_eq!(
+            parsed(&["--tour-budget", "names.json", "--motion", "bench/nod"])
+                .expect("the probe run's backstop")
+                .motion
+                .as_deref(),
+            Some("bench/nod"),
+            "the backstop comes off the plan the selection makes, not the library's",
+        );
+    }
+
+    #[test]
+    fn a_motion_is_named_once_and_never_for_the_gesture() {
+        let refused = parsed(&["--motion", "bench/nod"])
+            .expect_err("the gesture plays no motion of the library");
+        assert!(refused.contains("--motion"), "{refused}");
+        let refused = parsed(&[
+            "--tour",
+            "names.json",
+            "--motion",
+            "bench/nod",
+            "--motion",
+            "bench/perk",
+        ])
+        .expect_err("one motion, once");
+        assert!(refused.contains("twice"), "{refused}");
+        assert!(parsed(&["--tour", "names.json", "--motion"]).is_err());
+        let refused =
+            parsed(&["--tour", "names.json", "--motion", "  "]).expect_err("a name of nothing");
+        assert!(refused.contains("empty"), "{refused}");
+    }
+
+    #[test]
     fn one_run_per_invocation_and_each_mode_needs_its_sidecar() {
         let refused = parsed(&["--tour", "a.json", "--tour-budget", "a.json"])
             .expect_err("two runs in one invocation");
         assert!(refused.contains("the one run this is"), "{refused}");
+        let refused = parsed(&["--tour", "a.json", "--tour-table", "a.json"])
+            .expect_err("a run is not also a table to print");
+        assert!(refused.contains("the one run this is"), "{refused}");
+        assert!(
+            parsed(&["--tour-table"]).is_err(),
+            "a table needs a sidecar"
+        );
         let refused = parsed(&["--tour"]).expect_err("a mode with no sidecar");
         assert!(refused.contains("names sidecar"), "{refused}");
     }
 
     #[test]
     fn a_sidecar_that_will_not_read_is_the_senders_own_ending() {
-        let refused = plan(&PathBuf::from("no/such/names.json")).expect_err("a missing sidecar");
+        let refused =
+            plan(&PathBuf::from("no/such/names.json"), None).expect_err("a missing sidecar");
         assert!(refused.contains("no/such/names.json"), "{refused}");
     }
 

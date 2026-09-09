@@ -133,7 +133,6 @@ pub fn reg_for(reg: RegId) -> Result<Reg, MapError> {
         RegId::MinVoltageLimit => regs::MIN_VOLTAGE_LIMIT,
         RegId::CurrentLimit => regs::CURRENT_LIMIT,
         RegId::VelocityLimit => regs::VELOCITY_LIMIT,
-        RegId::AccelerationLimit => regs::ACCELERATION_LIMIT,
         RegId::TemperatureLimit => regs::TEMPERATURE_LIMIT,
         RegId::BusWatchdog => regs::BUS_WATCHDOG,
         RegId::ProfileAcceleration => regs::PROFILE_ACCELERATION,
@@ -200,7 +199,6 @@ pub fn value_kind(reg: RegId) -> Result<ValueShape, MapError> {
         RegId::MinPositionLimit
         | RegId::MaxPositionLimit
         | RegId::VelocityLimit
-        | RegId::AccelerationLimit
         | RegId::ProfileAcceleration
         | RegId::ProfileVelocity => ValueShape::U32,
     };
@@ -549,7 +547,6 @@ mod tests {
             (RegId::MinVoltageLimit, 34, 2),
             (RegId::CurrentLimit, 38, 2),
             (RegId::VelocityLimit, 44, 4),
-            (RegId::AccelerationLimit, 40, 4),
             (RegId::TemperatureLimit, 31, 1),
             (RegId::BusWatchdog, 98, 1),
             (RegId::ProfileAcceleration, 108, 4),

@@ -142,8 +142,8 @@ Nothing has been released, and nothing here has driven a motor.
   velocity profile whose two parameters — the velocity cap and the acceleration
   — are the registers the commissioning sweep already writes. A new plant model
   (`reachy_motion::plant`) predicts where each joint should be by stepping that
-  profile against the setpoints the driver reported holding, with a three-sample
-  dead time fitted on the recorded library tour. A joint whose reading diverges
+  profile against the setpoints the driver reported holding, with a two-sample
+  dead time measured off the goal steps of two capability tours. A joint whose reading diverges
   from its prediction by more than 0.6 rad for 200 ms is obstructed; a joint
   that is behind but still moving at half the profile velocity or better is slow,
   not stuck, and keeps its window restarting. The servo profile is a single
@@ -292,6 +292,99 @@ Nothing has been released, and nothing here has driven a motor.
   transcript line arrives in when the host's console write and the pipeline's
   event write race on the same descriptor. Previously every such line was
   counted as noise and every transcript the tool had ever read was lost.
+
+- **The legs are commissioned at their measured motor capability.** The
+  six Stewart-platform legs now run at `287 / 326` (Profile Acceleration /
+  Profile Velocity) against the previous `20 / 50`, confirmed by four library
+  tours reading 0.3242--0.3319 rad of worst tracking residual against the
+  0.4 rad bound. The profile file carries two pairs across three classes: the
+  body yaw is gain-bound at exactly the shipped acceleration, so no candidate
+  inside the instrument's ratio exists; the antennas' measured capability is on
+  record and not commissioned, because at the vendor's gains a fast generator
+  outruns the loop by one and a half to two periods of travel and the sizing
+  rule has no room for that lag. Obstruction-response timing moves with the
+  pair: a hand held on the head is answered in about half a second rather than
+  about a second on content that runs the legs at their cap, a brush shorter
+  than about 80 ms goes unanswered, and the grace after the first raise is
+  160--180 ms. Every one of those is an at-the-cap figure and comes later under
+  slower content; no outcome of the doctrine changes and nothing gates
+  de-torquing. Two windows of the confirming tour are kept as trace fixtures ---
+  the first in the suite recorded with different pairs on different classes ---
+  and every fixture is now replayed against the profile it was recorded at.
+
+- **The stow pose folds the antennas 10.2 degrees inboard of straight down**
+  rather than 5.2 degrees outboard of it, the vendor's shutdown angle. Straight
+  down is the mirror of straight up: gravity loads no side of the gearbox play
+  and the position loop hunts across it, which the antennas were watched and
+  measured doing at every gain and every profile pair tried. The rest pose has
+  leaned against the same mechanism since it was tuned; the fold now leans by
+  the same magnitude, and inboard, which also tucks the pair. This moves where
+  the machine parks at the Minimum Risk Condition. A trace fixture cut from a
+  probe run at the leaned fold asserts the stillness watch passes the pose a
+  fault response commands into.
+
+- **The antenna gains are the vendor's `200 / 0 / 0`**, the quietest triple
+  a sweep of gain ladders found. The shipped `500 / 0 / 100` hunts the left
+  antenna at 9 counts and 12.7 Hz over the rest hold; the vendor's triple is
+  quiet at the sides and at the leaned rest pose in every head-still judged
+  hold on record, with the proportional bound at 200 --- the rest pose hunts at
+  `300` and the pose pointing down hunts at `400`. The pose pointing down
+  hunted at 7--8 counts at every profile pair from the motor's ceiling to the
+  shipped floor; leaning the fold is what answered that. The body yaw's gains
+  were measured and left at the vendor's value, a P-only climb having found
+  nothing quieter.
+
+- **The plant model's dead time is two samples, measured rather than fitted.**
+  One period is the driver's read-before-write, the second is the servo's start
+  late in the period after the write, and every one of the 75 goal steps on two
+  capability tours moves in that period and ramps in the next. Every recorded
+  residual figure --- the tracking screen's two pinned worsts, the offline
+  analyzer's per-class p99.9 ranges, the replay suite's per-fixture pins and
+  the record's whole-tour table --- is re-read at the measured depth; the
+  0.6 rad screen is unchanged.
+
+- **The capability instrument reads a class against its own tracking error.**
+  Both analyzers now cut a class's per-period travel into error bands, name the
+  regime the bands read as (motor-bound, gain-bound or content-bound) with the
+  plateau the candidate velocity comes off, and list every goal step with the
+  ramp of its first whole period of acceleration, whose median is the candidate
+  acceleration. A top error band that came out slower than the band under it is
+  read past --- that shape is the periods after a large goal step or a stall,
+  not a motor losing speed --- and a class left content-bound by such a fall
+  offers no candidate. The residual summary says which side of its own
+  trajectory a joint stood on, because a joint behind its model and one ahead of
+  it call for opposite answers.
+
+- **Two antenna step probes and a single-motion playback target.** The clip
+  library gains `probe/antenna-step-a` and `probe/antenna-step-b`: antennas-only
+  documents that step to three held poses in one frame each, so the servo's own
+  profile generator is the whole of the move and the head stands still through
+  it. `make motion-probe MOTION=<name>` plays one motion of the library on its
+  own, records under `probe-log-<stamp>`, and both the plan and the verdict come
+  off one selection the intent source makes, written into the run directory so a
+  fetched run says for itself what it was asked to play. The library tour now
+  plays only the content --- every motion whose name does not start `probe/`.
+
+- **The library tour report judges stillness where the head is still.** An
+  antenna hold is judged only where no head row was commanded somewhere new
+  across it; a hold under head motion is printed with its figures and no
+  verdict. Beside every printed hold in both analyzers goes the settle line ---
+  what the joint did over the settle allowance the judged window drops, which is
+  the arrival and the ring-down after it, printed and never judged.
+
+- **The tuning record is written out.** Every run the campaign flew --- the
+  antenna hold probes, the vendor-rung motion runs, the body yaw's gain ladder,
+  the antenna gain sweep, both capability tours and the confirmation --- is in
+  `docs/servo-tuning.md` with its overlay, its run directories and its figures.
+  The procedure it records follows: the antenna step is a gain sweep over a hard
+  arrival at every pose, closed at the vendor's triple; the capability step
+  reads a class by the regime its error bands fall into; and the confirmation
+  step tells a candidate from a control and reads the residual's sign. The
+  Acceleration Limit register (address 40, unmapped on the XL330) is removed
+  from the vocabulary, the bus table, the provisioning table and the self-test.
+  Two fetch-side defects are fixed: a run's configuration copy is moved into
+  the run directory it belongs to, and the run directory is found by the
+  logger's own stamp rather than by taking the newest directory of any name.
 
 ### Removed
 

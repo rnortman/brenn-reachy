@@ -26,7 +26,7 @@ use reachy_motion::joints::{JointGroup, Name, flags, row};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::tick::default_motion_config;
 use scenario::check;
-use scenario::check::{present_rows, sample_at};
+use scenario::check::{present_rows, sample_at, sample_at_or};
 use scenario::read::Run;
 use scenario::{stow_clocks, up_clocks};
 
@@ -309,30 +309,65 @@ fn check_second_engagement(run: &Run, failures: &mut Vec<String>) {
 ///
 /// The premise the release rests on, and the one this run is the suite's only
 /// pin for. A released joint sets off from rest and restarts the reopened run
-/// by regaining the progress minimum on the third step of its ramp -- but only
-/// against a prediction that has stopped. Against one still running at the
-/// profile it can neither close nor pace, and the recovery bound this run
-/// releases inside is then two periods too late: the stow would be defeated on
-/// some runs and survive on others, with nothing naming the cause.
+/// by regaining the progress minimum in `pass_cycles` of that distance -- one
+/// cycle at the legs' commissioned pair -- but only against a prediction that
+/// has stopped. Against one still running at the profile it can neither close
+/// nor pace, and a recovery bound that assumes a standing prediction is then
+/// too late by however many periods the running generator costs the released
+/// joint: the stow would be defeated on some runs and survive on others, with
+/// nothing naming the cause.
 ///
-/// What makes the prediction stopped is the setpoint: it chases the one the
-/// driver held a dead time earlier, so a held setpoint that has not moved for
-/// the ramp and the response delay together is a trajectory at rest. The
-/// scenario places the jam so that this holds, off the walk of the raise; this
-/// is that placement read back out of the run.
+/// Stopped in the detector's own sense, which is the only sense the release
+/// depends on: the tolerance is `progress_min_rad`, the smallest motion the
+/// detector counts, because a prediction creeping under that is one a released
+/// joint closes on in a single step exactly as if it were still. The creep is
+/// real -- an arrived generator still has the raise's min-jerk tail coming in
+/// behind it -- and this is the pin that it stays under what the detector can
+/// see. The scenario places the jam so that the generator has arrived, off the
+/// walk of the raise; this is what that placement has to buy, read back out of
+/// the run.
+///
+/// Two assertions, because the property and the margin are different readings:
+/// the property is the progress minimum, and beside it [`CREEP_MARGIN_RAD`]
+/// holds the tail to an order over what this run measures, so a tail that grew
+/// tenfold is named here rather than passing quietly inside a bound sized on
+/// the detector.
 fn check_the_generator_had_stopped(run: &Run, failures: &mut Vec<String>) {
     let settled_from =
         raise_cycle() - scenario::ramp_cycles(JointGroup::Legs) - scenario::response_delay_cycles();
-    check::commanded_stands_still_rows(
+    let progress_min = default_motion_config().tracking.progress_min_rad;
+    let worst = check::commanded_stands_still_rows(
         run,
         jammed_rows(),
         settled_from,
         raise_cycle(),
-        0.0,
+        progress_min,
         "the cranks have arrived and their generator is braking to a stop before the fault lands",
         failures,
     );
+    if worst > CREEP_MARGIN_RAD {
+        failures.push(format!(
+            "the arrived generator crept {worst} rad over the stretch before the raise, past the \
+             {CREEP_MARGIN_RAD} rad this run has been reading. The property above still holds -- \
+             the progress minimum is {progress_min} rad -- so nothing has broken yet; what has \
+             changed is the margin the recoverable release rests on, and a plant, a warp or a \
+             clock that grew this tail is what to look at before the figure here is moved"
+        ));
+    }
 }
+
+/// The most the arrived generator's tail is allowed to creep over the stretch
+/// before the raise, radians.
+///
+/// The margin, beside the property. The assertion above is the property the
+/// release depends on -- a prediction moving less than the detector's progress
+/// minimum is one a released joint closes on in a single step -- and it passes
+/// with two orders of room, so it would pass just as quietly on a tail an order
+/// of magnitude fatter. This figure is an order over what the run actually
+/// reads -- 1.93e-4 rad, read back off this assertion with the figure at zero
+/// -- so growth in the min-jerk tail is named by the run that would otherwise
+/// absorb it silently.
+const CREEP_MARGIN_RAD: f64 = 2e-3;
 
 /// The machine came back on its own: every crank the hand held is back inside
 /// the screen's own distance of the goal it is being commanded to, a catch-up
@@ -361,8 +396,7 @@ fn check_the_cranks_caught_up(run: &Run, failures: &mut Vec<String>) {
     let Some(goal) = check::goal_at_or(run, at, what, failures) else {
         return;
     };
-    let Some(present) = sample_at(run, at).map(present_rows) else {
-        failures.push(format!("no sample for cycle {at}, where {what}"));
+    let Some(present) = sample_at_or(run, at, what, failures).map(present_rows) else {
         return;
     };
     for joint in flags::iter(jammed_rows()) {

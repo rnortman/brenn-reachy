@@ -144,6 +144,56 @@ pub const QUIT_CONNECT_WINDOW: Duration = Duration::from_secs(15);
 /// How long the quit waits between offers while the control port is not bound.
 const QUIT_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
+/// The name prefix that marks a motion as an instrument rather than content.
+///
+/// [`select`] leaves these motions out of a tour and a probe run names one of
+/// them.
+pub use reachy_edge::names::PROBE_PREFIX;
+
+/// The motions of `table` this run plays: the one called `motion`, or every
+/// motion of the library that is not a probe.
+///
+/// One selection, made once, for the plan the sender runs and for the table the
+/// analyzer judges the run against: both come through here, so a run's verdict
+/// is taken over the motions the run was asked for.
+///
+/// The entries are the library's own — the same index, the same window — so a
+/// selected table resolves a name to the motion the deployed library holds at
+/// that index. Nothing here renumbers.
+///
+/// # Errors
+///
+/// A `motion` the sidecar does not hold, which is a run asking for something
+/// the deployed library cannot play; or a selection that holds nothing, which
+/// is a library of probes alone and no tour to run.
+pub fn select(table: &MotionTable, motion: Option<&str>) -> Result<MotionTable, String> {
+    let rows: Vec<(String, MotionEntry)> = match motion {
+        Some(name) => {
+            let entry = table.resolve(name).ok_or_else(|| {
+                format!(
+                    "the names sidecar holds no motion called `{name}`, and it holds {} of \
+                     them; a run plays a motion the deployed library numbers",
+                    table.len()
+                )
+            })?;
+            vec![(name.to_owned(), entry)]
+        }
+        None => table
+            .entries()
+            .filter(|(name, _)| !name.starts_with(PROBE_PREFIX))
+            .map(|(name, entry)| ((*name).to_owned(), *entry))
+            .collect(),
+    };
+    if rows.is_empty() {
+        return Err(format!(
+            "the names sidecar's {} motion(s) are all `{PROBE_PREFIX}` instruments, so there \
+             is no content tour to run; a probe is played one at a time",
+            table.len()
+        ));
+    }
+    Ok(MotionTable::of(rows))
+}
+
 /// One motion's script and the sender's clock for it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Leg {
@@ -380,8 +430,8 @@ mod tests {
 
     use super::{
         BUDGET_MARGIN_S, COMMISSIONING_ALLOWANCE_MS, DISPATCH_ALLOWANCE, END_MARGIN_MS,
-        LAUNCHER_CONTROL, PLAY_AFTER_MS, RELEASE_ALLOWANCE_MS, STOW_MARGIN_MS, Tour, UP_AFTER_MS,
-        UP_DURATION_MS, quit_launcher,
+        LAUNCHER_CONTROL, PLAY_AFTER_MS, PROBE_PREFIX, RELEASE_ALLOWANCE_MS, STOW_MARGIN_MS, Tour,
+        UP_AFTER_MS, UP_DURATION_MS, quit_launcher, select,
     };
     use crate::gesture::ASK_POD;
 
@@ -416,6 +466,86 @@ mod tests {
             ("pollen/dances/nod", 4000, 200),
             ("pollen/emotions/oops", 2500, 120),
         ])
+    }
+
+    /// A library with two probes among its content, numbered as the emitter
+    /// numbers a library: by name order over the whole of it, probes included.
+    fn with_probes() -> MotionTable {
+        table(&[
+            ("pollen/dances/nod", 4000, 200),
+            ("pollen/emotions/oops", 2500, 120),
+            ("probe/antenna-step-a", 19_520, 200),
+            ("probe/antenna-step-b", 19_520, 200),
+        ])
+    }
+
+    #[test]
+    fn a_tour_is_the_library_without_its_probes() {
+        let content = select(&with_probes(), None).expect("a library with content in it");
+        let names: Vec<&str> = content.entries().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            vec!["pollen/dances/nod", "pollen/emotions/oops"],
+            "a probe is an instrument in the library, never part of the content tour",
+        );
+        assert_eq!(
+            content.resolve("pollen/emotions/oops").map(|e| e.motion_id),
+            Some(1),
+            "the selection keeps the library's own numbering; the wire carries the index",
+        );
+    }
+
+    #[test]
+    fn a_probe_run_plays_the_one_motion_it_names() {
+        let one = select(&with_probes(), Some("probe/antenna-step-b"))
+            .expect("a probe the library holds");
+        let names: Vec<&str> = one.entries().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["probe/antenna-step-b"]);
+        assert_eq!(
+            one.resolve("probe/antenna-step-b").map(|e| e.motion_id),
+            Some(3),
+            "the one row keeps the index the deployed library invokes it under",
+        );
+        let tour = Tour::of(&one).expect("one motion is a plan");
+        assert_eq!(tour.legs().len(), 1, "one motion, one script");
+    }
+
+    #[test]
+    fn a_motion_the_library_does_not_hold_is_refused_with_the_count_it_does() {
+        let refused =
+            select(&with_probes(), Some("probe/antenna-step-c")).expect_err("no such motion");
+        assert!(refused.contains("probe/antenna-step-c"), "{refused}");
+        assert!(refused.contains("4 of them"), "{refused}");
+    }
+
+    #[test]
+    fn a_library_of_probes_alone_is_no_tour() {
+        let probes = table(&[("probe/antenna-step-a", 19_520, 200)]);
+        let refused = select(&probes, None).expect_err("no content to tour");
+        assert!(refused.contains(PROBE_PREFIX), "{refused}");
+        assert!(
+            Tour::of(&probes).is_ok(),
+            "the refusal is the selection's, not the plan's: one motion is a lawful plan",
+        );
+    }
+
+    #[test]
+    fn the_selected_table_reads_back_as_the_sidecar_it_was_taken_from() {
+        let one = select(&with_probes(), Some("probe/antenna-step-a")).expect("the probe");
+        let text = one.to_sidecar();
+        let read = MotionTable::from_sidecar(&text).expect("what the analyzer reads");
+        assert_eq!(
+            read, one,
+            "the table the run is judged against is the one it played"
+        );
+        let content = select(&with_probes(), None).expect("the content");
+        let read = MotionTable::from_sidecar(&content.to_sidecar()).expect("the tour's table");
+        assert_eq!(read, content);
+        assert!(
+            !content.to_sidecar().contains(PROBE_PREFIX),
+            "a tour is judged against the motions it was asked for: {}",
+            content.to_sidecar(),
+        );
     }
 
     #[test]

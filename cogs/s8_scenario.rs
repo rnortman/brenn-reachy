@@ -110,7 +110,8 @@ pub const JAM_AFTER: i64 = 10;
 ///
 /// What it buys is a brush below the raise latency, answered with nothing:
 /// short enough that the detector never has evidence to act on, long enough
-/// that the machine visibly stops closing on the fold it was commanded to.
+/// that the goal the held cranks were commanded to moved on by more than the
+/// detector counts as motion while the cranks did not move at all.
 #[must_use]
 pub fn jam_cycles() -> i64 {
     scenario::crossing_cycles(JointGroup::Legs)

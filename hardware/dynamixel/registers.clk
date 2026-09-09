@@ -20,6 +20,11 @@
 // datagram, so this list is appended to and never renumbered. Zero means no
 // register, which is what a ping carries.
 //
+// Numbering is append-only; #24 is retired -- the XL330 has no
+// acceleration-limit register -- and will not be reused. The next register
+// takes #25. The numbering test in `reachy-motion`'s sequencer asserts that
+// #24 names nothing, which is the tombstone standing.
+//
 // Not an address. A register's address and width are the bus layer's table, and
 // two parts of this machine could place the same register differently; what a
 // name means is the same everywhere.
@@ -73,8 +78,10 @@ enum RegId
         // so the register is a stop-motion net rather than the de-torque net the
         // fault doctrine wants from it.
         #16 bus_watchdog { underlying_value: 16; }
-        // The acceleration limit of the servo's own profile, the backstop under
-        // host-side shaping.
+        // The acceleration of the servo's own profile, the backstop under
+        // host-side shaping. The XL330 has no separate acceleration-limit
+        // register: this field's own range, 0 to 32767, is the ceiling, and 0
+        // disables the profile's acceleration stage.
         #17 profile_acceleration { underlying_value: 17; }
         // The velocity limit of that profile.
         #18 profile_velocity { underlying_value: 18; }
@@ -88,9 +95,6 @@ enum RegId
         #22 model_number { underlying_value: 22; }
         // The measured temperature at the servo, degrees Celsius.
         #23 present_temperature { underlying_value: 23; }
-        // The acceleration ceiling the profile's own acceleration is bounded
-        // by. A profile written past it is refused by the servo.
-        #24 acceleration_limit { underlying_value: 24; }
     }
 }
 

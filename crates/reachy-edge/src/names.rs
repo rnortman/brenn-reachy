@@ -15,13 +15,15 @@
 //! machine's per-tick bounds satisfied, and playing a motion faster must not
 //! shorten it.
 //!
-//! Parsing only. The sidecar arrives as text — a runfile beside the payload —
-//! and reading the file is the host's business.
+//! Parsing, and the one writer beside it. The sidecar arrives as text — a
+//! runfile beside the payload — and reading the file is the host's business;
+//! writing one is the harness's, which asks for a table back in the shape this
+//! module reads, so both directions come off the one row definition here.
 
 use std::collections::BTreeMap;
 
 use motion_proto::PlayWindow;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// How many motions the library message the box loads holds, and so the
@@ -32,6 +34,18 @@ use thiserror::Error;
 /// library that grows fails there rather than at the session, which refuses an
 /// index past its own table and would blame the sender for the sidecar.
 pub const MAX_MOTIONS: usize = 128;
+
+/// The name prefix that marks a motion as an instrument rather than content.
+///
+/// A probe steps a joint to a pose in one frame and holds it, so that a hold
+/// can be judged after an arrival the planner never makes. It is played one at
+/// a time, and it is not part of the tour: the tour is the content the recorded
+/// fixtures come off, and a probe among them would put a step goal into the
+/// run those fixtures pin the detector's screen against. The prefix is the
+/// whole of the rule — a sender leaves these motions out of a tour, a probe run
+/// names one of them, and an analyzer handed a table of them alone is judging a
+/// probe run.
+pub const PROBE_PREFIX: &str = "probe/";
 
 /// What one motion name resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +145,46 @@ impl MotionTable {
             .map(|(name, entry)| (name.as_str(), entry))
     }
 
+    /// This table as sidecar text, in the shape [`Self::from_sidecar`] reads.
+    ///
+    /// What a harness hands an analyzer, and what a fetched run directory
+    /// carries: the table a run was asked for, written by the same row
+    /// definition that parses one, so a field added to the shape is added to
+    /// both directions at once. The clips table of an emitted library's own
+    /// sidecar is not restated — nothing that reads a sidecar reads it, and a
+    /// clip id is not a name a script carries.
+    #[must_use]
+    pub fn to_sidecar(&self) -> String {
+        let sidecar = Sidecar {
+            motions: self
+                .by_name
+                .iter()
+                .map(|(name, entry)| MotionRow {
+                    motion_id: u32::from(entry.motion_id),
+                    name: name.clone(),
+                    duration_ms: entry.window.duration_ms,
+                    blend_out_ms: entry.window.blend_out_ms,
+                })
+                .collect(),
+        };
+        serde_json::to_string_pretty(&sidecar).expect("a table of numbers and names serializes")
+    }
+
+    /// Whether every motion this table holds is a [`PROBE_PREFIX`] instrument,
+    /// and it holds at least one.
+    ///
+    /// What tells a probe run's table from a content tour's, for a reader that
+    /// was handed the table a run was asked for and has to know which kind of
+    /// run it is judging. An empty table is neither.
+    #[must_use]
+    pub fn probes_only(&self) -> bool {
+        !self.by_name.is_empty()
+            && self
+                .by_name
+                .keys()
+                .all(|name| name.starts_with(PROBE_PREFIX))
+    }
+
     /// How many motions the table holds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -205,12 +259,12 @@ pub enum SidecarError {
 ///
 /// No `deny_unknown_fields`: the clips table sits beside this one, and the
 /// emitter may add a field before a reader knows it.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Sidecar {
     motions: Vec<MotionRow>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct MotionRow {
     motion_id: u32,
     name: String,
@@ -230,6 +284,36 @@ mod tests {
   ]
 }"#;
 
+    /// Which kind of run a table describes, which is what an analyzer handed
+    /// one asks: a table of instruments alone is a probe run's, a table with
+    /// any content in it is a tour's, and an empty table is neither.
+    #[test]
+    fn a_table_of_instruments_alone_says_it_is_a_probe_runs() {
+        let probe = MotionTable::from_sidecar(
+            r#"{"motions": [
+                {"motion_id": 66, "name": "probe/antenna-step-a", "duration_ms": 19520,
+                 "blend_out_ms": 200}
+            ]}"#,
+        )
+        .expect("the emitter's own shape");
+        assert!(probe.probes_only());
+        let mixed = MotionTable::from_sidecar(
+            r#"{"motions": [
+                {"motion_id": 0, "name": "bench/nod", "duration_ms": 1000, "blend_out_ms": 60},
+                {"motion_id": 66, "name": "probe/antenna-step-a", "duration_ms": 19520,
+                 "blend_out_ms": 200}
+            ]}"#,
+        )
+        .expect("the emitter's own shape");
+        assert!(!mixed.probes_only());
+        assert!(
+            !MotionTable::from_sidecar(SIDECAR)
+                .expect("the emitter's own shape")
+                .probes_only()
+        );
+        assert!(!MotionTable::default().probes_only());
+    }
+
     #[test]
     fn the_sidecar_states_an_index_and_a_window_per_motion() {
         let table = MotionTable::from_sidecar(SIDECAR).expect("the emitter's own shape");
@@ -241,6 +325,33 @@ mod tests {
         assert_eq!(tour.window.duration_ms, 4500);
         assert_eq!(tour.window.blend_out_ms, 120);
         assert_eq!(table.resolve("bench/absent"), None);
+    }
+
+    /// The two directions are one shape: a table written out and read back is
+    /// the table it started as.
+    ///
+    /// The case that makes the writer's shape the reader's obligation rather
+    /// than a second opinion about the file — a field the parser requires and
+    /// the emitter stopped writing fails here, in this crate, rather than on a
+    /// device run judged against a table the analyzer could not read.
+    #[test]
+    fn a_table_written_out_reads_back_as_itself() {
+        let table = MotionTable::from_sidecar(SIDECAR).expect("the emitter's own shape");
+        let written = table.to_sidecar();
+        let read = MotionTable::from_sidecar(&written).expect("this module's own writing");
+        assert_eq!(read, table, "{written}");
+        // The row's own field names, not a shape only this crate can read.
+        for field in [
+            "motions",
+            "motion_id",
+            "name",
+            "duration_ms",
+            "blend_out_ms",
+        ] {
+            assert!(written.contains(field), "{written}");
+        }
+        // The clips half is not restated: nothing reads it.
+        assert!(!written.contains("clip_id"), "{written}");
     }
 
     /// The documented order, over a table built out of it: a caller visiting

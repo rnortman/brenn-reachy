@@ -70,6 +70,7 @@ use reachy_motion::disarm::{
     stow_targets,
 };
 use reachy_motion::joints::{self, JointGroup, JointRef, ROW_COUNT, ROWS, ServoHealth, flags};
+use reachy_motion::plant::ProfilePair;
 use reachy_motion::seq::{BusResult, SeqAction, Sequencer};
 use reachy_motion::snap::{duration_from_nanos, duration_nanos};
 use reachy_motion::tick::default_motion_config;
@@ -127,7 +128,10 @@ use reachy_motion::{txn, value};
 /// servos with nothing at all watching for a dead driver.
 pub fn init_arm_config(gains: GroupGains, profile: ProfileConfig) {
     for group in JointGroup::ALL {
-        let (acceleration, velocity) = profile.profiles.of(group);
+        let ProfilePair {
+            acceleration,
+            velocity,
+        } = profile.profiles.of(group);
         assert!(
             acceleration > 0 && velocity > 0,
             "the servo profile for the {} is {acceleration}/{velocity}, and zero in either \
@@ -1480,7 +1484,7 @@ mod tests {
     use brenn_reachy__cogs__session_clk_rs::SessionStateWire;
     use brenn_reachy__hardware__dynamixel__registers_clk_rs::{RegId, ValueShape};
     use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKind, BusTxnWire};
-    use reachy_motion::plant::GroupProfiles;
+    use reachy_motion::plant::{GroupProfiles, ProfilePair};
 
     /// The survey's own readings seed the picture the torque-on gate judges, row
     /// for row and stamped with the instant they were merged at.
@@ -1685,7 +1689,10 @@ mod tests {
             reachy_motion::arm::DEFAULT_GAINS,
             ProfileConfig {
                 profiles: GroupProfiles {
-                    legs: (0, 50),
+                    legs: ProfilePair {
+                        acceleration: 0,
+                        velocity: 50,
+                    },
                     ..reachy_motion::plant::SHIPPED_PROFILES
                 },
                 ..profile()
@@ -1703,7 +1710,10 @@ mod tests {
             reachy_motion::arm::DEFAULT_GAINS,
             ProfileConfig {
                 profiles: GroupProfiles {
-                    antennas: (20, 0),
+                    antennas: ProfilePair {
+                        acceleration: 20,
+                        velocity: 0,
+                    },
                     ..reachy_motion::plant::SHIPPED_PROFILES
                 },
                 ..profile()

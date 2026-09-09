@@ -339,12 +339,13 @@ schema MotionSnap
         // `reachy_motion::plant::RESPONSE_DEAD_SAMPLES` periods, oldest first.
         // What the modelled generator chases is the oldest entry, because a
         // setpoint takes that many periods to show in a reading: one is the
-        // driver's own read-before-write ordering within a cycle, which is
-        // certain, and the rest are fitted and attributed to the servo.
+        // driver's own read-before-write ordering within a cycle and the other
+        // is the servo's own start, late in the period after the write, both
+        // measured.
         //
         // Read before it is pushed, once per period, which is what keeps the
         // oldest entry a whole dead time old. The depth is that constant.
-        #21 held: FixedArray<joints::Joints, 3>;
+        #21 held: FixedArray<joints::Joints, 2>;
 
         // How many of `held`'s entries are setpoints the driver really held.
         // Below the full depth there is nothing to chase yet, so the model

@@ -148,11 +148,18 @@ export SSH_RUN_REACHED=no
 export RSYNC_STATUS=0
 export RSYNC_OLOG=full
 export RSYNC_CONSOLE=full
+export RSYNC_CONFIG=full
 export RSYNC_AUDIO=full
 export TEE_STATUS=0
 # The backstop a tour is given, and whether the sender could compute one at all.
 export TOUR_BUDGET=900
 export TOUR_BUDGET_STATUS=0
+# The table a run played, as the sender prints it, and whether it could print
+# one at all. What it says is nobody's business here -- the analyzer is stubbed
+# too -- but it has to be non-empty, because a run judged against an empty
+# table is judged against nothing.
+export TOUR_TABLE='{"motions": [{"motion_id": 0, "name": "bench/nod", "duration_ms": 800, "blend_out_ms": 200}]}'
+export TOUR_TABLE_STATUS=0
 
 # Every stub records its whole invocation on one line, so a case can assert both
 # that a command ran and that it did not.
@@ -196,7 +203,14 @@ STUB
 # rsync also has to *bring something back*, because the fetch decides on what
 # arrived: a run's records are a `.olog` with bytes in it, and a fetch that
 # brought none is refused. RSYNC_OLOG says what this invocation delivers into the
-# destination — a whole run, an empty file, or nothing at all.
+# destination — a whole run, an empty file, or nothing at all. RSYNC_CONFIG says
+# which configuration copies came with it — the log root's, none, or one at the
+# root and one already inside the run directory — which is what the fetch's
+# relocation reads.
+#
+# The run directory's name is decimal digits, which is the shape the logger
+# names one: the fetch takes the newest all-digit directory as the run, so a
+# stub that named it anything else would pin nothing about a real fetch.
 cat >"${stubs}/rsync" <<'STUB'
 #!/usr/bin/env bash
 printf 'rsync %s\n' "$*" >>"$CALLS"
@@ -259,16 +273,47 @@ if [ "$status" = 0 ]; then
 	esac
 	case "${RSYNC_OLOG:-full}" in
 		full)
-			mkdir -p -- "${dest}/run-20260825T120000Z"
-			echo records >"${dest}/run-20260825T120000Z/motion_0.olog"
+			mkdir -p -- "${dest}/1788832560362471129"
+			echo records >"${dest}/1788832560362471129/motion_0.olog"
 			# What the run copied into the log root: the stamp sits
 			# at the root beside the writer's run directory, so a
 			# fetch carries it home with no fetch-side logic.
 			echo "commit=${GIT_HEAD:-}" >"${dest}/provenance.txt"
 			;;
 		empty)
-			mkdir -p -- "${dest}/run-20260825T120000Z"
-			: >"${dest}/run-20260825T120000Z/motion_0.olog"
+			mkdir -p -- "${dest}/1788832560362471129"
+			: >"${dest}/1788832560362471129/motion_0.olog"
+			;;
+		none) ;;
+	esac
+	# What the launch chain copied out of the payload: at the log root,
+	# because the run directory did not exist when the chain ran.
+	case "${RSYNC_CONFIG:-full}" in
+		full)
+			mkdir -p -- "${dest}/config/cogs"
+			echo 'antennas_p: 200' \
+				>"${dest}/config/cogs/servo_gains.textproto"
+			;;
+		# A copy at the root *and* one already inside the run
+		# directory, which is what a fetch into a destination that
+		# has been used before brings home.
+		both)
+			mkdir -p -- "${dest}/config/cogs" \
+				"${dest}/1788832560362471129/config/cogs"
+			echo 'antennas_p: 200' \
+				>"${dest}/config/cogs/servo_gains.textproto"
+			echo 'antennas_p: 500' \
+				>"${dest}/1788832560362471129/config/cogs/servo_gains.textproto"
+			;;
+		# A root copy the relocation cannot make: the run directory the
+		# fetch brought home is not writable, so the `mv` into it
+		# fails. What a hardware run is owed then is its records and a
+		# line saying where the copy stayed.
+		unmovable)
+			mkdir -p -- "${dest}/config/cogs"
+			echo 'antennas_p: 200' \
+				>"${dest}/config/cogs/servo_gains.textproto"
+			chmod a-w -- "${dest}/1788832560362471129"
 			;;
 		none) ;;
 	esac
@@ -325,6 +370,15 @@ case " $* " in
 		# not the analyzer's verdict.
 		[ -n "${TOUR_BUDGET:-}" ] && echo "$TOUR_BUDGET"
 		exit "${TOUR_BUDGET_STATUS:-0}"
+		;;
+	*" --tour-table "*)
+		# The sender, asked which motions this run played, as a
+		# names sidecar. Its own knob for the same reason the
+		# budget has one: a table that will not print is a
+		# refusal over records already fetched, and it is not the
+		# analyzer's verdict either.
+		[ -n "${TOUR_TABLE:-}" ] && printf '%s\n' "$TOUR_TABLE"
+		exit "${TOUR_TABLE_STATUS:-0}"
 		;;
 esac
 exit "${BAZEL_STATUS:-0}"
@@ -976,9 +1030,9 @@ assert_lacks "and read out of the payload, not out of the tree" "$ran" "fromthet
 assert_contains "the analyzer judges the run directory that was discovered" "$ran" \
 	"bazel run -- //cogs:first_motion_report ${run_dest}/motion-log-"
 assert_contains "and the directory it names is the writer's own" "$ran" \
-	"run-20260825T120000Z"
+	"1788832560362471129"
 assert_lacks "a hardware log is read with no jitter band" "$ran" "--grid-jitter-ns"
-assert_contains "the run says where the log is" "$(output_of "$result")" "run-20260825T120000Z"
+assert_contains "the run says where the log is" "$(output_of "$result")" "1788832560362471129"
 
 # ---------------------------------------------------------------------------
 # What a run brings back besides the records
@@ -1046,9 +1100,22 @@ SSH_PROBE_STATUS=0
 # The console is beside the records rather than under them for a reason worth
 # pinning: the run directory is the newest *directory* under the fetched root,
 # so a directory of console files there would be judged as the run.
-assert_eq "nothing but run directories sits under the fetched records" 0 \
+assert_eq "nothing but the run directory sits under the fetched records" 0 \
 	"$(find "${run_dest}"/motion-log-*/ -mindepth 1 -maxdepth 1 -type d \
-		! -name 'run-*' | wc -l)"
+		! -name '1788832560362471129' | wc -l)"
+
+# And the reason there is nothing else there: the configuration copy the launch
+# chain left at the log root is moved into the run directory by the fetch. The
+# analyzers look for `config/` inside the run directory they are handed, and the
+# chain could not have written it there -- the logger had not named the
+# directory yet.
+fetched_run=$(find "${run_dest}"/motion-log-*/ -mindepth 1 -maxdepth 1 -type d \
+	-name '1788832560362471129')
+assert_file "the run's configuration copy is inside the run directory" \
+	"${fetched_run}/config/cogs/servo_gains.textproto"
+assert_eq "and no copy is left at the fetched root" 0 \
+	"$(find "${run_dest}"/motion-log-*/ -mindepth 1 -maxdepth 1 -type d \
+		-name config | wc -l)"
 
 assert_lacks "the analyzer is handed nothing but the log" "$ran" "--console"
 
@@ -1061,7 +1128,71 @@ assert_lacks "the analyzer is handed nothing but the log" "$ran" "--console"
 assert_eq "a root-level file in the fetched log root survives the fetch" 1 \
 	"$(find "${run_dest}"/motion-log-*/ -maxdepth 1 -type f -name provenance.txt | wc -l)"
 assert_contains "and the run directory is still the writer's own" "$ran" \
-	"run-20260825T120000Z"
+	"1788832560362471129"
+
+# A fetched root with no configuration copy is left alone rather than refused
+# *here*: the fetch invents no directory and still hands the run to the
+# analyzer, which is the thing that refuses a log saying nothing about the
+# machine it was recorded on. The analyzer is a stub in this harness, so what
+# this case pins is the fetch's own behaviour -- nothing created, nothing
+# skipped -- and not the refusal downstream of it.
+RSYNC_CONFIG=none
+result=$(deploy unit --run "${work}/run-noconfig")
+assert_status "a fetch that brought no configuration copy still reaches the analyzer" 0 \
+	"$(status_of "$result")"
+assert_contains "and the run is handed to it to refuse" "$(calls)" \
+	"//cogs:first_motion_report"
+assert_eq "with no empty config directory invented for it" 0 \
+	"$(find "${work}/run-noconfig" -type d -name config | wc -l)"
+RSYNC_CONFIG=full
+
+# A run directory that already carries a configuration copy keeps it: the
+# fetched one would be nested inside it by `mv`, and a relocation is never
+# worth a hardware run's verdict, so the copy stays at the root with a line
+# saying so and the analyzer is run all the same.
+RSYNC_CONFIG=both
+result=$(deploy unit --run "${work}/run-twoconfigs")
+assert_status "a run directory that already has a copy still reports" 0 \
+	"$(status_of "$result")"
+assert_contains "and says the fetched copy stayed where it landed" "$(output_of "$result")" \
+	"the fetched one stayed at"
+assert_contains "and the analyzer judged the run anyway" "$(calls)" \
+	"//cogs:first_motion_report"
+assert_eq "the run's own copy is the one it keeps" "antennas_p: 500" \
+	"$(cat "$(find "${work}/run-twoconfigs" -path '*1788832560362471129/config/cogs/servo_gains.textproto')")"
+RSYNC_CONFIG=full
+
+# The other leg of best-effort: a relocation that could not happen. The line it
+# writes is the operator's only trace of where the fetched configuration went —
+# the analyzer's own refusal names the directory it looked in, not the one the
+# copy is sitting in — so the path in it has to be the fetched root and not the
+# run directory, and the records have to be judged all the same.
+#
+# Read-only is how the failure is staged, so a run as root — which the mode bits
+# do not stop — has no failure to observe and the case is skipped rather than
+# asserting the success path under the failure's name.
+if [ "$(id -u)" -ne 0 ]; then
+	RSYNC_CONFIG=unmovable
+	unmovable_dest="${work}/run-unmovableconfig"
+	result=$(deploy unit --run "$unmovable_dest")
+	assert_status "a run whose configuration copy could not be moved still reports" 0 \
+		"$(status_of "$result")"
+	unmovable_root=$(find "$unmovable_dest" -mindepth 1 -maxdepth 1 -type d \
+		-name 'motion-log-*' ! -name '*.console')
+	assert_contains "and the line names the root the copy stayed at" \
+		"$(output_of "$result")" \
+		"the run's configuration copy stayed at ${unmovable_root}"
+	assert_lacks "and not the run directory it could not write into" \
+		"$(output_of "$result")" \
+		"stayed at ${unmovable_root}/1788832560362471129"
+	assert_eq "the copy is readable where it landed" "antennas_p: 200" \
+		"$(cat -- "${unmovable_root}/config/cogs/servo_gains.textproto")"
+	assert_contains "and the analyzer judged the run anyway" "$(calls)" \
+		"//cogs:first_motion_report"
+	# The harness owns this directory and has to be able to delete it.
+	chmod u+w -- "${unmovable_root}/1788832560362471129"
+	RSYNC_CONFIG=full
+fi
 
 # A console copy that fails is a lost console and nothing more. It happens on the
 # host, after the run, while the only copy of the records is still on a tmpfs the
@@ -1391,13 +1522,33 @@ assert_contains "the records are fetched under a name that says which run they c
 	"$toured" "${tour_dest}/tour-log-"
 assert_contains "the analyzer judges the run directory that was discovered" "$toured" \
 	"bazel run -- //cogs:library_tour_report ${tour_dest}/tour-log-"
-assert_contains "and is handed the library the tour was supposed to play" "$toured" \
-	"${names_table}"
+assert_contains "the table the tour played is asked of the sender, over the committed one" \
+	"$toured" "bazel run -- //crates/reachy-ask:reachy_ask --tour-table ${names_table}"
+assert_lacks "and the tour asks for no one motion of it" "$toured" "--motion"
+assert_contains "and is handed the table the run was asked for, not the library" \
+	"$toured" "/asked.names.json"
 assert_lacks "the tour is not judged by the gesture's analyzer" "$toured" \
 	"first_motion_report"
 assert_contains "the tour says the machine moves for minutes with nobody at it" \
 	"$(output_of "$result")" "several minutes"
 assert_contains "and says what the backstop is" "$(output_of "$result")" "900s is the backstop"
+
+# A tour's fetch relocates the configuration copy too: both fetch paths hand a
+# run directory to an analyzer that reads `config/` inside it.
+fetched_tour=$(find "${tour_dest}"/tour-log-*/ -mindepth 1 -maxdepth 1 -type d \
+	-name '1788832560362471129')
+assert_file "a tour's configuration copy is inside its run directory" \
+	"${fetched_tour}/config/cogs/servo_gains.textproto"
+# The table the run played, beside that copy: a fetched run directory says for
+# itself which motions were asked for, and a copy of it moved anywhere reads the
+# same.
+assert_file "and the table it played is beside it" \
+	"${fetched_tour}/asked.names.json"
+assert_contains "which is what the sender printed" \
+	"$(cat -- "${fetched_tour}/asked.names.json")" "bench/nod"
+assert_eq "and none is left at the tour's fetched root" 0 \
+	"$(find "${tour_dest}"/tour-log-*/ -mindepth 1 -maxdepth 1 -type d \
+		-name config | wc -l)"
 
 # A relative records directory, which is what the Makefile passes: both paths
 # the analyzer is handed have to be absolute, because it runs from its own
@@ -1522,6 +1673,125 @@ assert_contains "the refusal names the table and how to make one" \
 	"$(output_of "$result")" "make clip-config"
 assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
 mv -- "${names_table}.aside" "$names_table"
+
+# ---------------------------------------------------------------------------
+# A probe run: one motion of the library, played on its own
+# ---------------------------------------------------------------------------
+#
+# The tour's chain with one substitution -- the sender is told which motion to
+# play -- so what is pinned here is the substitution and everything downstream
+# of it: the fetch's own name, the table the analyzer is handed, and the
+# console line an operator reads before the machine moves. The remote command
+# is pinned to the letter for the reason the tour's is: it is what moves the
+# machine.
+
+SSH_RUN_STATUS=0
+SSH_RUN_REACHED=yes
+probe_dest="${work}/probe-records"
+result=$(deploy unit --probe "$probe_dest" probe/antenna-step-a)
+probed=$(calls)
+assert_status "a probe run that ended itself and passed the analyzer succeeds" 0 \
+	"$(status_of "$result")"
+assert_contains "the backstop is the sender's over the one motion" "$probed" \
+	"reachy_ask --tour-budget ${names_table} --motion probe/antenna-step-a"
+assert_contains "the sender is told to play that motion and nothing else" "$probed" \
+	"./reachy_ask --tour cogs/clip_library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+assert_contains "the records say which kind of run they came off" "$probed" \
+	"${probe_dest}/probe-log-"
+assert_contains "the table the run played names the one motion" "$probed" \
+	"reachy_ask --tour-table ${names_table} --motion probe/antenna-step-a"
+assert_contains "and the analyzer is handed that table beside the records" "$probed" \
+	"library_tour_report ${probe_dest}/probe-log-"
+assert_contains "a probe run says how long the machine moves for" \
+	"$(output_of "$result")" "about a minute"
+assert_contains "and names the motion it is playing" "$(output_of "$result")" \
+	"playing probe/antenna-step-a on unit"
+
+fetched_probe=$(find "${probe_dest}"/probe-log-*/ -mindepth 1 -maxdepth 1 -type d \
+	-name '1788832560362471129')
+assert_file "a probe run's configuration copy is inside its run directory too" \
+	"${fetched_probe}/config/cogs/servo_gains.textproto"
+assert_file "and the table it played is beside it" \
+	"${fetched_probe}/asked.names.json"
+
+# A probe run with no motion is not a run: which instrument to play is not
+# something this script guesses at, and the refusal is the usage.
+result=$(deploy unit --probe "${work}/probe-nomotion")
+assert_status "a probe run with no motion refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal is the usage" "$(output_of "$result")" \
+	"--probe <dir> <motion>"
+assert_lacks "and nothing is started" "$(calls)" "simplelaunch"
+result=$(deploy unit --probe "${work}/probe-extra" probe/antenna-step-a and-more)
+assert_status "an extra argument after the motion refuses" 1 "$(status_of "$result")"
+assert_lacks "and that starts nothing either" "$(calls)" "simplelaunch"
+
+# A motion name is pasted into the remote command run as root, so it goes
+# through the same screen the staged configuration's values do -- before the
+# build, the push and the sender are asked anything at all. A refusal after the
+# push is a unit already carrying the payload.
+result=$(deploy unit --probe "${work}/probe-metachar" 'probe/step; rm -rf /run/brenn-app')
+assert_status "a motion name carrying a metacharacter refuses the probe run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the value and the character set" \
+	"$(output_of "$result")" "which is not a plain path or name"
+assert_lacks "nothing is built" "$(calls)" "build-motion.sh"
+assert_lacks "nothing is asked of the sender" "$(calls)" "reachy_ask"
+assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
+result=$(deploy unit --probe "${work}/probe-spaced" 'probe/antenna step a')
+assert_status "a motion name with a space refuses the same way" 1 \
+	"$(status_of "$result")"
+assert_contains "and says so in the screen's words" "$(output_of "$result")" \
+	"which is not a plain path or name"
+assert_lacks "with the unit untouched" "$(calls)" "simplelaunch"
+
+# A motion the sender will not plan is a refusal before the unit is touched: it
+# reads the same table twice, so the budget is where a name the library does
+# not hold is caught.
+TOUR_BUDGET_STATUS=1
+TOUR_BUDGET=""
+result=$(deploy unit --probe "${work}/probe-noname" probe/antenna-step-z)
+assert_status "a motion the sender would not plan refuses the probe run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says a name the library does not hold is one cause" \
+	"$(output_of "$result")" "a motion it does not hold"
+assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
+TOUR_BUDGET_STATUS=0
+TOUR_BUDGET=900
+
+# A table the sender would not print is a refusal over records that are already
+# home: they are the point of the run, so the refusal says where they landed
+# rather than pretending the run did not happen.
+TOUR_TABLE_STATUS=1
+TOUR_TABLE=""
+result=$(deploy unit --probe "${work}/probe-notable" probe/antenna-step-a)
+assert_status "a table the sender would not print fails the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the records have nothing to be judged against" \
+	"$(output_of "$result")" "nothing to be judged against"
+assert_contains "and says where they are" "$(output_of "$result")" \
+	"${work}/probe-notable/probe-log-"
+assert_lacks "and the analyzer is not run over them" "$(calls)" "library_tour_report"
+assert_eq "and no unusable table is left in the run directory" 0 \
+	"$(find "${work}/probe-notable" -name asked.names.json | wc -l)"
+
+# The other refusal: the sender exits happily and prints nothing. An empty file
+# left in the run directory would read later as the table the run was judged
+# against, and nothing was, so the size check is its own arm and takes the file
+# back off too.
+TOUR_TABLE_STATUS=0
+TOUR_TABLE=""
+result=$(deploy unit --probe "${work}/probe-emptytable" probe/antenna-step-a)
+assert_status "a table that printed nothing fails the run" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says the sender printed no table" \
+	"$(output_of "$result")" "printed no table for this run"
+assert_lacks "and the analyzer is not run over the records" "$(calls)" \
+	"library_tour_report"
+assert_eq "and no empty table is left in the run directory" 0 \
+	"$(find "${work}/probe-emptytable" -name asked.names.json | wc -l)"
+
+TOUR_TABLE_STATUS=0
+TOUR_TABLE='{"motions": [{"motion_id": 0, "name": "bench/nod", "duration_ms": 800, "blend_out_ms": 200}]}'
 
 SSH_RUN_STATUS=124
 SSH_RUN_REACHED=no

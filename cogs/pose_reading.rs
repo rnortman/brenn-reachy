@@ -28,10 +28,10 @@ use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use dxl_proto::HardwareError;
 use log_read::Logged;
 use reachy_motion::arm::{Gains, GroupGains};
-use reachy_motion::joints::{JointGroup, ROWS, group_of, row, rows_of};
+use reachy_motion::joints::{JointGroup, JointRef, Name, ROWS, group_of, row, rows_of};
 use reachy_motion::plant::{
     GroupPlants, GroupProfiles, MAX_GAP_PERIODS, PROFILE_ACCELERATION_UNIT_RAD_PER_S2,
-    PROFILE_VELOCITY_UNIT_RAD_PER_S, Predicted, RESPONSE_DEAD_SAMPLES,
+    PROFILE_VELOCITY_UNIT_RAD_PER_S, Predicted, ProfilePair, RESPONSE_DEAD_SAMPLES,
 };
 use reachy_motion::stillness::COUNT_RAD;
 use reachy_motion::tick::{
@@ -218,10 +218,10 @@ fn profiles_of(text: &str, path: &str) -> Result<GroupProfiles, String> {
     // analysis time rather than a build that fails.
     GroupProfiles::try_of_each(|group| {
         let class = group.config_prefix();
-        Ok((
-            figure(&format!("{class}_profile_acceleration"))?,
-            figure(&format!("{class}_profile_velocity"))?,
-        ))
+        Ok(ProfilePair {
+            acceleration: figure(&format!("{class}_profile_acceleration"))?,
+            velocity: figure(&format!("{class}_profile_velocity"))?,
+        })
     })
 }
 
@@ -263,9 +263,10 @@ impl RunConfig {
     ///
     /// # Errors
     ///
-    /// That the directory is not there — which is a run recorded before the
-    /// copy existed, read with its own build — or the reason one of the three
-    /// files could not be read or does not state a name.
+    /// That the directory is not there — a log recorded by a payload that did
+    /// not carry the copy, which is a log this analyzer refuses rather than
+    /// judges against the analyzing tree's own files — or the reason one of the
+    /// three files could not be read or does not state a name.
     pub fn read(log_dir: &Path) -> Result<Self, String> {
         let root = log_dir.join(CONFIG_DIR);
         if !root.is_dir() {
@@ -357,6 +358,61 @@ impl RunConfig {
     }
 }
 
+/// How far one reading stood from its own model's prediction, and which side of
+/// the model it stood on.
+///
+/// A type and not a signed number, because the sign is a different fact from
+/// the magnitude rather than a direction of the same one. The magnitude is the
+/// disagreement the tracking screen is sized on; the side says whether the
+/// joint stood behind its own trajectory -- no nearer the goal it was
+/// answering than its prediction stood -- or ahead of it, and the two mean
+/// opposite things for a candidate profile pair. A caller reading the stored
+/// number as a distance would screen a joint behind its model at the wrong
+/// sign and see a clean report, so the number is not readable as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Residual(f64);
+
+impl Residual {
+    /// A reading `distance` rad from its prediction, standing no nearer the
+    /// goal the two were answering than the prediction did.
+    #[must_use]
+    pub fn behind(distance: f64) -> Self {
+        Self(-distance.abs())
+    }
+
+    /// A reading `distance` rad from its prediction, standing nearer that goal.
+    #[must_use]
+    pub fn ahead(distance: f64) -> Self {
+        Self(distance.abs())
+    }
+
+    /// What a sample the walk measured nothing at carries: no disagreement and
+    /// so no side either.
+    #[must_use]
+    pub fn unmeasured() -> Self {
+        Self(0.0)
+    }
+
+    /// How far the reading and the prediction disagree, radians, whichever
+    /// side the reading stood.
+    #[must_use]
+    pub fn magnitude(self) -> f64 {
+        self.0.abs()
+    }
+
+    /// Whether the joint stood behind its own trajectory.
+    #[must_use]
+    pub fn is_behind(self) -> bool {
+        self.0 < 0.0
+    }
+
+    /// Whether it stood ahead of it.
+    #[must_use]
+    pub fn is_ahead(self) -> bool {
+        self.0 > 0.0
+    }
+}
+
 /// How far each joint stood from where its servo's own trajectory generator
 /// had got to, sample by sample.
 ///
@@ -371,15 +427,15 @@ impl RunConfig {
 /// generator's position is not something arithmetic knows.
 ///
 /// One entry per sample that carried a reading, in nominal order: the instant
-/// and the nine unsigned residuals. A joint *ahead* of its prediction is as far
-/// off it as one behind, which is why they are unsigned — the question is
-/// whether the reading and the model agree.
+/// and the nine [`Residual`]s. A sample the walk measured nothing at -- one
+/// that re-seeded, or one the ring was still filling behind -- carries
+/// [`Residual::unmeasured`].
 #[must_use]
 pub fn residual_stream(
     samples: &[Logged<PoseSampleWire>],
     grid: Grid,
     plant: &GroupPlants,
-) -> Vec<(i64, [f64; ROWS.len()])> {
+) -> Vec<(i64, [Residual; ROWS.len()])> {
     // Nominal order is the model's own order, whatever order the log holds:
     // the prediction is a walk along the grid and a sample read out of turn
     // would step it backwards.
@@ -388,6 +444,11 @@ pub fn residual_stream(
     let mut predicted = [Predicted::default(); ROWS.len()];
     let mut seeded = [false; ROWS.len()];
     let mut ring: Vec<[f64; ROWS.len()]> = Vec::new();
+    // The goal each row's model was last stepped toward, which is the goal the
+    // servo was answering: a residual's sign is whether the reading or the
+    // prediction stood nearer it, so the sign needs the goal and not just the
+    // two positions.
+    let mut answering = [f64::NAN; ROWS.len()];
     let mut previous: Option<i64> = None;
     let mut out = Vec::new();
     for sample in ordered {
@@ -415,6 +476,7 @@ pub fn residual_stream(
                 for (index, state) in predicted.iter_mut().enumerate() {
                     if seeded[index] {
                         plant.for_row(index).step(state, target[index]);
+                        answering[index] = target[index];
                     }
                 }
                 if period + 1 < periods {
@@ -444,14 +506,30 @@ pub fn residual_stream(
         let Some(present) = present_rows(&sample.message) else {
             continue;
         };
-        let mut residual = [0.0; ROWS.len()];
+        let mut residual = [Residual::unmeasured(); ROWS.len()];
         for (index, state) in predicted.iter_mut().enumerate() {
             if !seeded[index] {
                 state.position = present[index];
                 state.velocity = 0.0;
                 seeded[index] = true;
+                answering[index] = f64::NAN;
             }
-            residual[index] = (present[index] - state.position).abs();
+            let disagreement = (present[index] - state.position).abs();
+            // Behind where the joint stood no nearer the goal than its
+            // prediction did, which includes the two standing equally near and
+            // a prediction that has already arrived: nothing can be nearer a
+            // goal the model is sitting on. A row with no goal on record is a
+            // row the walk stepped nothing for, and its disagreement is zero.
+            let goal = answering[index];
+            let nearer =
+                goal.is_finite() && (goal - present[index]).abs() < (goal - state.position).abs();
+            residual[index] = if disagreement == 0.0 {
+                Residual::unmeasured()
+            } else if nearer {
+                Residual::ahead(disagreement)
+            } else {
+                Residual::behind(disagreement)
+            };
         }
         out.push((nominal, residual));
     }
@@ -473,7 +551,7 @@ pub fn residual_stream(
 /// be the same walk, or they are two answers to one question. `samples` is
 /// carried only for the count of what the walk left out.
 pub fn residuals(
-    stream: &[(i64, [f64; ROWS.len()])],
+    stream: &[(i64, [Residual; ROWS.len()])],
     samples: &[Logged<PoseSampleWire>],
     plant: &GroupPlants,
     report: &mut Report,
@@ -489,12 +567,20 @@ pub fn residuals(
     // would read the same nine rows three times over the longest run this repo
     // takes.
     let mut seen: [Vec<f64>; JointGroup::ALL.len()] = Default::default();
+    let mut behind: [f64; JointGroup::ALL.len()] = Default::default();
+    let mut ahead: [f64; JointGroup::ALL.len()] = Default::default();
     for (_, residual) in stream {
         for joint in ROWS {
             let (Some(index), Some(group)) = (row(joint), group_of(joint)) else {
                 continue;
             };
-            seen[slot(group)].push(residual[index]);
+            let reading = residual[index];
+            seen[slot(group)].push(reading.magnitude());
+            if reading.is_behind() {
+                behind[slot(group)] = behind[slot(group)].max(reading.magnitude());
+            } else if reading.is_ahead() {
+                ahead[slot(group)] = ahead[slot(group)].max(reading.magnitude());
+            }
         }
     }
     for group in JointGroup::ALL {
@@ -504,13 +590,25 @@ pub fn residuals(
         let worst = ranked.last().copied().unwrap_or(0.0);
         let p999 = percentile(ranked, 0.999);
         let (low, high) = recorded_p999_range(group);
+        let configuration = recorded_p999_configuration(group);
         report.note(format!(
-            "{}: worst residual {worst:.4} rad, p99.9 {p999:.4} rad, recorded p99.9 under the \
-             shipped pair {low:.4}–{high:.4} rad over three tours, against a tracking screen \
+            "{}: worst residual {worst:.4} rad, p99.9 {p999:.4} rad, recorded p99.9 \
+             {low:.4}–{high:.4} rad over three tours {configuration}, against a tracking screen \
              at {threshold:.4} rad — commissioned at {:.6} rad/period and {:.6} rad/period²",
             group.name(),
             model.v_max,
             model.a_max,
+        ));
+        // The same worst, split by which way the joint stood off its model,
+        // because the two mean opposite things for a candidate pair: a joint
+        // behind its own generator is answered by a slower pair, and a joint
+        // ahead of one is a machine that outran a model derived as its floor,
+        // which stepping the pair down would only widen.
+        report.note(format!(
+            "{}: worst {:.4} rad behind its own trajectory, worst {:.4} rad ahead of it",
+            group.name(),
+            behind[slot(group)],
+            ahead[slot(group)],
         ));
     }
     report.note(format!(
@@ -682,31 +780,53 @@ pub fn health_summary(readings: &[Logged<HealthReportWire>], report: &mut Report
 /// How far a setpoint has to stand from where the joint is for the joint to be
 /// chasing it, radians.
 ///
-/// The gap the model fit was made over: past it the joint is moving as fast as
-/// it is going to, so the travel it makes in that period is what its motor
-/// achieves rather than what the content asked for. Under it the joint is
-/// arriving, and its travel says only how close it already was.
+/// Past it the joint is moving as fast as it is going to, so the travel it makes
+/// in that period is what its motor achieves rather than what the content asked
+/// for. Under it the joint is arriving, and its travel says only how close it
+/// already was.
+///
+/// Also the width of the error bins the travel table is read over
+/// ([`ClassCapability::bins`]) and the smallest goal change the step listing
+/// counts as a step: one gap is one bin, so the first bin starts where a chase
+/// starts and a bin's own name is the error it was measured at.
 pub const CHASE_GAP_RAD: f64 = 0.1;
 
-/// How many periods a ramp is looked at over, at most.
+/// How many periods after a goal step the listing prints travel over.
 ///
-/// A window rather than an averaging length: what is read out of it is the
-/// largest single period's gain inside it, and the window stops at the first
-/// period the joint stopped gaining in. A mean over a fixed four periods would
-/// read a motor that reached its cap in one period as a quarter of its own
-/// acceleration -- which is exactly the motor a capability run at a profile
-/// above the machine's own is taken to measure.
-pub const RAMP_PERIODS: usize = 4;
+/// The listing's width and nothing else. The step's ramp is read off the first
+/// two of them, and the four after those are printed so a person can see the
+/// cruise the ramp ran into and disagree with the reading. Six periods reach a
+/// tenth of a second past the write, which is longer than any ramp on this
+/// machine has taken.
+pub const STEP_LISTING_PERIODS: usize = 6;
 
-/// How many chasing samples a class needs before its figures describe its
-/// motor rather than the content.
+/// How many chasing samples an error bin needs before its percentiles are read.
 ///
-/// A tour is tens of thousands of samples, so a motor that is the binding
-/// constraint anywhere in the library clears this easily; a class that does not
-/// is one the library never asked more of than it could give, and its figures
-/// are the content's speed rather than the motor's. Which of the two a class is
-/// in is what a candidate profile pair is chosen off, so the report says it.
-pub const CAPABILITY_MIN_SAMPLES: usize = 500;
+/// Under it the bin is printed and marked unread rather than dropped: an
+/// absence is a reading too -- it says the content never held this class that
+/// far behind -- and a median over a handful of samples is the shape of one
+/// motion. Twenty is where a p10 and a p90 stop being the same two samples.
+pub const CAPABILITY_BIN_MIN_SAMPLES: usize = 20;
+
+/// How close two adjacent bins' median travel has to be for the speed between
+/// them to count as having stopped rising.
+///
+/// The one figure the regime reading turns on. A proportional loop's speed
+/// grows with its error until the motor is the binding constraint, and then it
+/// does not: two bins within this ratio are two errors the class answered at
+/// the same speed. 1.15 is over the run-to-run spread the same tour played
+/// twice shows (worst 1.07 across the two capability tours) and under the step
+/// a gain-bound class makes from one bin to the next.
+pub const CAPABILITY_PLATEAU_RATIO: f64 = 1.15;
+
+/// How many goal steps a class needs before the median of their ramps is read
+/// as the class's acceleration.
+///
+/// A median over fewer is the shape of one or two motions rather than the
+/// motor's: the ramp a step shows depends on how far the step reached, so the
+/// statistic needs steps of several sizes under it. A class below this prints
+/// its listing and no acceleration figure at all.
+pub const CAPABILITY_STEP_MIN_SAMPLES: usize = 10;
 
 /// The Velocity Limit register the read-only self-test recorded on the seven
 /// head servos, in Profile Velocity units.
@@ -720,6 +840,85 @@ pub const RECORDED_VELOCITY_LIMIT_HEAD: u32 = 445;
 
 /// The same register on the two antennas, which are a different XL330 variant.
 pub const RECORDED_VELOCITY_LIMIT_ANTENNAS: u32 = 1620;
+
+/// What the legs achieved on the capability tour, as a profile pair: Profile
+/// Acceleration then Profile Velocity, the order the configuration writes.
+///
+/// Read by this file's own instrument off the kept capability tour
+/// `tour-log-20260908T020318Z`, played at `(32767, 445)` so that the motor and
+/// not the generator was the binding constraint. The class read motor-bound:
+/// the velocity is the smallest median in the plateau bins and the
+/// acceleration is the median of the tour's goal-step ramps. The repeat tour
+/// `tour-log-20260908T031159Z` read `(307, 326)` by the same instrument, which
+/// is a ratio of 1.07 on the acceleration and equality on the velocity,
+/// against a repeatability gate of [`CAPABILITY_PLATEAU_RATIO`].
+///
+/// Commissioned: this is the pair `SHIPPED_PROFILES.legs` now carries, and a
+/// confirmation tour of the whole library at it held the six cranks 0.3319 rad
+/// from their own modelled trajectory at the worst, against a 0.4 rad bound;
+/// provenance in `docs/servo-tuning.md`.
+///
+/// That tour re-read the class motor-bound with the plateau's slowest median at
+/// 326 units, the recorded velocity to the digit. It read the goal-step ramp
+/// median at 82 units, and that figure is not a reading of this class: the
+/// steps in it are the library's own 0.10–0.23 rad leg moves under a generator
+/// commissioned at 287, so the ramp measured is the content's demand and the
+/// generator was never the binding constraint on it. The instrument cannot read
+/// a motor's acceleration through a generator written at it, which is why the
+/// acceleration here stays the wide-open tour's and the confirmation tour's
+/// figure is a note in `docs/servo-tuning.md`. The velocity does not suffer
+/// that, because the content does saturate the velocity.
+pub const RECORDED_CAPABILITY_LEGS: ProfilePair = ProfilePair {
+    acceleration: 287,
+    velocity: 326,
+};
+
+/// The same reading for the two antennas, also motor-bound on that tour; the
+/// repeat tour read `(522, 611)`, equality on the acceleration and 1.05 on the
+/// velocity.
+///
+/// The campaign's own offline script read this acceleration as 532 over 13
+/// goal steps on the kept tour and 15 on the repeat, where the instrument here
+/// finds 18 and 16 and reads 522 on both. The two readings differ by 1.02,
+/// inside the repeatability ratio, and the figure this file bakes is the
+/// instrument's: it is the one a re-read reproduces.
+///
+/// On record and *not* commissioned, unlike the legs': at the shipped
+/// `200 / 0 / 0` gains an antenna played at this pair reaches its generator's
+/// speed — three confirmation tours read the class motor-bound with a plateau
+/// above the commissioned velocity — but follows it 1.45 to 1.94 periods of
+/// travel behind, 0.42 to 0.51 rad, and the tracking screen is sized at half
+/// again the worst residual a healthy machine shows. So the pair the motor can
+/// do is faster than the plant model can be right at, and what stands between
+/// the two is a model that carries that following lag.
+/// `TODO(session-servo-profile)` holds the question.
+pub const RECORDED_CAPABILITY_ANTENNAS: ProfilePair = ProfilePair {
+    acceleration: 522,
+    velocity: 640,
+};
+
+/// The same reading for the body yaw, which read *gain-bound* on both tours:
+/// its velocity is the median of the bin two gaps out rather than a plateau's,
+/// and its acceleration is the median increase, because one goal step is fewer
+/// than [`CAPABILITY_STEP_MIN_SAMPLES`] and no ramp median exists. The
+/// acceleration is the shipped value, which is the reading: what holds this
+/// class back is its loop, not its motor.
+pub const RECORDED_CAPABILITY_BODY_YAW: ProfilePair = ProfilePair {
+    acceleration: 20,
+    velocity: 48,
+};
+
+/// The capability pair recorded for one class — the other figure, beside
+/// [`ClassCapability::recorded_velocity_limit`], that a fresh reading is
+/// compared against.
+#[must_use]
+pub fn recorded_capability(group: JointGroup) -> ProfilePair {
+    match group {
+        JointGroup::BodyYaw => RECORDED_CAPABILITY_BODY_YAW,
+        JointGroup::Legs => RECORDED_CAPABILITY_LEGS,
+        JointGroup::Antennas => RECORDED_CAPABILITY_ANTENNAS,
+    }
+}
 
 /// The temperature at which a run stops reading as healthy, degrees Celsius.
 ///
@@ -745,6 +944,157 @@ pub const RECORDED_VELOCITY_LIMIT_ANTENNAS: u32 = 1620;
 /// it, and no motion is stopped by it.
 pub const TEMPERATURE_STOP_C: i8 = 50;
 
+/// One band of tracking error, and the travel the class made while it stood
+/// that far behind.
+///
+/// The reading that separates a motor from a loop. A proportional controller's
+/// speed is its gain times its error, so a class whose bins keep rising is a
+/// class whose gain decided the speed; a class whose top bins read the same
+/// speed has reached what its motor does.
+pub struct ErrorBin {
+    /// The band's own error range, radians: `low` up to but not including
+    /// `high`, one [`CHASE_GAP_RAD`] wide.
+    pub low: f64,
+    /// The top of the band, radians.
+    pub high: f64,
+    /// How many chasing (sample, joint) pairs fell in it.
+    pub samples: usize,
+    /// The per-period travel over them, radians: a tenth were slower.
+    pub travel_p10: f64,
+    /// The median per-period travel in the band, radians. The figure the
+    /// regime and the plateau are read off.
+    pub travel_p50: f64,
+    /// The travel a tenth of the band's samples beat, radians.
+    pub travel_p90: f64,
+}
+
+impl ErrorBin {
+    /// Whether the band holds enough samples for its percentiles to be read.
+    #[must_use]
+    pub fn readable(&self) -> bool {
+        self.samples >= CAPABILITY_BIN_MIN_SAMPLES
+    }
+}
+
+/// A readable band the regime reading was taken under, because it came out
+/// slower than the band below it by more than [`CAPABILITY_PLATEAU_RATIO`].
+///
+/// Not a speed the class held: a motor at its ceiling holds a speed as the
+/// error grows rather than losing it, so a band that fell is the periods after
+/// a large goal step -- dead time and ramp, while the joint is a whole move
+/// behind -- or a stall. Printed with its own figures so a person can disagree
+/// with the walk.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FellAway {
+    /// The band's own error range, radians.
+    pub low: f64,
+    /// The top of the band, radians.
+    pub high: f64,
+    /// How many chasing (sample, joint) pairs fell in it.
+    pub samples: usize,
+    /// The band's median per-period travel, radians.
+    pub travel_p50: f64,
+    /// The median of the band under it, radians per period: the figure it fell
+    /// away from.
+    pub under: f64,
+}
+
+impl FellAway {
+    /// How far under the band below it this band's median sits, where that is
+    /// a number.
+    ///
+    /// [`None`] where the band read zero: the ratio is not a number, and the
+    /// report says the band stalled instead of printing an infinity.
+    #[must_use]
+    pub fn ratio(&self) -> Option<f64> {
+        (self.travel_p50 > 0.0).then(|| self.under / self.travel_p50)
+    }
+}
+
+/// What the travel table says was holding a class back.
+///
+/// A note and never a verdict: the report prints the name with the two figures
+/// it was read off, so a person can disagree with it. What it decides is which
+/// rule the candidate pair comes off, and that decision is theirs. Read over
+/// the bands below any fall: a band set aside as [`FellAway`] is no part of it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Regime {
+    /// The two highest bands left read the same speed: the class's speed
+    /// stopped rising with its error, so the motor is the binding constraint.
+    /// It carries the plateau, which is the only regime a plateau is a reading
+    /// of: a candidate velocity comes off it, and the other two regimes have
+    /// no speed the class held to take one from.
+    MotorBound(Plateau),
+    /// The highest band left is still faster than the one below it by more
+    /// than [`CAPABILITY_PLATEAU_RATIO`]: the speed is the loop's gain times
+    /// the error, and the motor was never reached.
+    GainBound,
+    /// Fewer than two bands left, so there is no pair of speeds to compare and
+    /// nothing says whether the class was ever the binding constraint. Where
+    /// bands fell away to reach it, the run is no measurement of the class at
+    /// all: it held the class far behind, and the far bands are the ones that
+    /// were set aside.
+    ContentBound,
+}
+
+impl Regime {
+    /// What the regime is called in a report line.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MotorBound(_) => "motor-bound",
+            Self::GainBound => "gain-bound",
+            Self::ContentBound => "content-bound",
+        }
+    }
+}
+
+/// The run of top bins whose speeds are one speed, and the slowest of them.
+///
+/// The slowest and not the fastest: a candidate Profile Velocity is the speed
+/// the loaded motor *holds* across the errors it cruises at, so a pair written
+/// from the plateau's top would be a pair the class only reaches at its widest
+/// error.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Plateau {
+    /// The bottom of the lowest bin in the run, radians.
+    pub low: f64,
+    /// The top of the highest, radians.
+    pub high: f64,
+    /// How many bins the run holds.
+    pub bins: usize,
+    /// The smallest median travel among them, radians per period.
+    pub travel: f64,
+}
+
+/// One goal change of more than a chase gap, written while the joint stood
+/// still, and what the joint did after it.
+///
+/// A listing and not a statistic: it is the direct reading of the dead time --
+/// how many periods the joint stood after the write -- and of the acceleration
+/// the motor ramps at, and both are things a person checks by looking rather
+/// than by reading a median.
+pub struct GoalStep {
+    /// Which joint the goal was written for.
+    pub joint: JointRef,
+    /// The instant of the sample the goal changed at, nanoseconds, so the step
+    /// can be handed to `//cogs:trace_export`.
+    pub at_ns: i64,
+    /// How far the goal moved in that one period, radians.
+    pub step: f64,
+    /// The joint's travel over the periods after the write, radians per
+    /// period, starting with the period after it.
+    pub travel: Vec<f64>,
+    /// The second post-write period's travel less the first's, radians per
+    /// period squared, or nothing where the stretch ended before both.
+    ///
+    /// The step's ramp: at a dead time of two periods the joint starts late in
+    /// the first period after the write and the second is its first whole
+    /// period of acceleration, so this is the trapezoid's own first ramp
+    /// period rather than a figure spread over a window.
+    pub ramp: Option<f64>,
+}
+
 /// What one class of servo achieved over a run, in the units its own two
 /// profile registers are written in.
 ///
@@ -766,19 +1116,32 @@ pub struct ClassCapability {
     pub travel_p90: f64,
     /// The fastest single period the class ran, radians.
     pub travel_max: f64,
-    /// How many ramps -- a joint setting off from rest and chasing -- the
-    /// increase figures came off.
-    pub ramps: usize,
-    /// How many of those ramps stopped gaining inside the window, so that the
-    /// figure they contributed is what the joint reached rather than what it
-    /// was still capable of. A class whose ramps mostly saturated is one whose
-    /// acceleration figure is a floor.
-    pub ramps_capped: usize,
-    /// The median ramp's largest single-period increase in travel, radians per
-    /// period squared.
-    pub ramp_p50: f64,
-    /// The increase a tenth of the ramps beat, radians per period squared.
-    pub ramp_p90: f64,
+    /// The same travel cut by how far behind the joint stood, lowest band
+    /// first.
+    pub bins: Vec<ErrorBin>,
+    /// What the bins say was holding the class back, and -- where that is the
+    /// motor -- the plateau its candidate velocity comes off.
+    pub regime: Regime,
+    /// The top bands the regime was read under, fastest first, because each
+    /// lost speed against the band below it.
+    pub fell_away: Vec<FellAway>,
+    /// How many chasing periods travelled at least an encoder count further
+    /// than the period before them.
+    pub increases: usize,
+    /// The median of those gains, radians per period squared.
+    pub increase_p50: f64,
+    /// The gain a tenth of them beat, radians per period squared.
+    pub increase_p90: f64,
+    /// Every goal step the class was written, in run order.
+    pub steps: Vec<GoalStep>,
+    /// How many samples found the class chasing on a non-finite reading, which
+    /// is corruption in the log rather than a speed, and measure nothing.
+    pub unreadable: usize,
+    /// The median step ramp, radians per period squared, where the class was
+    /// written at least [`CAPABILITY_STEP_MIN_SAMPLES`] steps that carried one.
+    pub step_ramp_p50: Option<f64>,
+    /// The ramp a tenth of the steps beat, on the same condition.
+    pub step_ramp_p90: Option<f64>,
     /// The grid these figures are per-period of, so they can be stated in
     /// register units.
     pub period_ns: i64,
@@ -827,31 +1190,185 @@ impl ClassCapability {
 pub fn capability(samples: &[Logged<PoseSampleWire>], grid: Grid) -> [ClassCapability; 3] {
     let mut ordered: Vec<&Logged<PoseSampleWire>> = samples.iter().collect();
     ordered.sort_by_key(|sample| sample.message.nominal_time().as_nanos());
-    let mut travels: [Vec<f64>; JointGroup::ALL.len()] = Default::default();
-    let mut ramps: [Vec<f64>; JointGroup::ALL.len()] = Default::default();
-    let mut capped: [usize; JointGroup::ALL.len()] = Default::default();
+    let mut tallies: [ClassTally; JointGroup::ALL.len()] = Default::default();
     for stretch in stretches(&ordered, grid) {
-        walk_stretch(&stretch, &mut travels, &mut ramps, &mut capped);
+        walk_stretch(&stretch, &mut tallies);
     }
     JointGroup::ALL.map(|group| {
-        let travel = &mut travels[slot(group)];
-        let ramp = &mut ramps[slot(group)];
-        travel.sort_by(f64::total_cmp);
-        ramp.sort_by(f64::total_cmp);
+        let tally = std::mem::take(&mut tallies[slot(group)]);
+        tally.finish(group, grid.period_ns)
+    })
+}
+
+/// One class's figures as the walk folds them, before they are ranked.
+///
+/// An accumulator per class rather than one array per figure: the walk pushes
+/// four different series and a listing, and five parallel arrays indexed by
+/// class is five chances to index one of them with another's slot.
+#[derive(Default)]
+struct ClassTally {
+    /// Per-period travel over every chasing sample, radians.
+    travel: Vec<f64>,
+    /// The same travels cut by the error the joint stood at, band `n` covering
+    /// `[(n + 1) · CHASE_GAP_RAD, (n + 2) · CHASE_GAP_RAD)`.
+    binned: Vec<Vec<f64>>,
+    /// Every chasing period's gain on the period before it, where it gained at
+    /// least an encoder count, radians per period squared.
+    increase: Vec<f64>,
+    /// Every goal step written to this class, in run order.
+    steps: Vec<GoalStep>,
+    /// How many chasing samples carried a non-finite reading and were left out
+    /// of every figure.
+    unreadable: usize,
+}
+
+impl ClassTally {
+    /// File one chasing sample's travel under the error it was made at.
+    ///
+    /// The error is finite, which the walk establishes: an infinite one indexes
+    /// a band at the top of the address space.
+    fn bin(&mut self, error: f64, travel: f64) {
+        let band = (error / CHASE_GAP_RAD).floor() as usize;
+        // A chase is more than a gap behind by construction, so band 1 is the
+        // first; saturating rather than asserting, because a rounding at the
+        // boundary must not panic an analyzer.
+        let index = band.saturating_sub(1);
+        if self.binned.len() <= index {
+            self.binned.resize_with(index + 1, Vec::new);
+        }
+        self.binned[index].push(travel);
+    }
+
+    /// The class's figures, every series ranked.
+    fn finish(mut self, group: JointGroup, period_ns: i64) -> ClassCapability {
+        self.travel.sort_by(f64::total_cmp);
+        self.increase.sort_by(f64::total_cmp);
+        let bins: Vec<ErrorBin> = self
+            .binned
+            .iter_mut()
+            .enumerate()
+            .map(|(index, band)| {
+                band.sort_by(f64::total_cmp);
+                ErrorBin {
+                    low: (index + 1) as f64 * CHASE_GAP_RAD,
+                    high: (index + 2) as f64 * CHASE_GAP_RAD,
+                    samples: band.len(),
+                    travel_p10: percentile(band, 0.10),
+                    travel_p50: percentile(band, 0.50),
+                    travel_p90: percentile(band, 0.90),
+                }
+            })
+            .collect();
+        let (regime, fell_away) = regime_of(&bins);
+        // The ramp median is the class's acceleration, so it exists only where
+        // the class was written enough steps for a median to be the motor's
+        // rather than one motion's.
+        let mut ramps: Vec<f64> = self.steps.iter().filter_map(|step| step.ramp).collect();
+        ramps.sort_by(f64::total_cmp);
+        let read_ramps = self.steps.len() >= CAPABILITY_STEP_MIN_SAMPLES && !ramps.is_empty();
         ClassCapability {
             group,
-            chasing: travel.len(),
-            travel_p10: percentile(travel, 0.10),
-            travel_p50: percentile(travel, 0.50),
-            travel_p90: percentile(travel, 0.90),
-            travel_max: travel.last().copied().unwrap_or(0.0),
-            ramps: ramp.len(),
-            ramps_capped: capped[slot(group)],
-            ramp_p50: percentile(ramp, 0.50),
-            ramp_p90: percentile(ramp, 0.90),
-            period_ns: grid.period_ns,
+            chasing: self.travel.len(),
+            travel_p10: percentile(&self.travel, 0.10),
+            travel_p50: percentile(&self.travel, 0.50),
+            travel_p90: percentile(&self.travel, 0.90),
+            travel_max: self.travel.last().copied().unwrap_or(0.0),
+            bins,
+            regime,
+            fell_away,
+            increases: self.increase.len(),
+            increase_p50: percentile(&self.increase, 0.50),
+            increase_p90: percentile(&self.increase, 0.90),
+            steps: self.steps,
+            unreadable: self.unreadable,
+            step_ramp_p50: read_ramps.then(|| percentile(&ramps, 0.50)),
+            step_ramp_p90: read_ramps.then(|| percentile(&ramps, 0.90)),
+            period_ns,
         }
-    })
+    }
+}
+
+/// Whether two bands' median travel is one speed.
+///
+/// [`CAPABILITY_PLATEAU_RATIO`]'s own meaning, in one place: the two are one
+/// speed when neither stands more than the ratio above the other. Symmetric,
+/// because which of two bands came out faster is not the question -- and a zero
+/// median, whose ratio is not a number, is not one speed with anything.
+fn one_speed(a: f64, b: f64) -> bool {
+    let ratio = a.max(b) / a.min(b);
+    matches!(
+        ratio.partial_cmp(&CAPABILITY_PLATEAU_RATIO),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    )
+}
+
+/// What the bins say was holding the class back, with the plateau where the
+/// answer is the motor, and the top bands the reading was taken under.
+///
+/// Off the readable bands alone: an unread band is a band the content never
+/// held the class in, and a comparison across one would be a comparison against
+/// a handful of samples.
+///
+/// One walk decides both halves, because a band the reading is taken under is
+/// exactly a band the plateau cannot start at.
+fn regime_of(bins: &[ErrorBin]) -> (Regime, Vec<FellAway>) {
+    let readable: Vec<&ErrorBin> = bins.iter().filter(|bin| bin.readable()).collect();
+    // From the top down, a band that lost speed against the band under it is
+    // set aside. A servo at its ceiling holds a speed as its error grows; it
+    // does not lose speed with more error, so such a band is never a ceiling
+    // reading -- it is the periods after a large goal step, when the joint is a
+    // whole move behind and still in its dead time or its ramp, or a stall. A
+    // band that is one speed with the one under it, or faster than it, ends the
+    // walk. The condition is the exact complement of the gain-bound test inside
+    // "not one speed", so a zero over a zero -- which `one_speed` refuses and
+    // `>` does not order -- falls away too.
+    let mut fell_away = Vec::new();
+    let mut kept = readable.len();
+    while kept >= 2 {
+        let top = readable[kept - 1];
+        let next = readable[kept - 2];
+        if one_speed(top.travel_p50, next.travel_p50) || top.travel_p50 > next.travel_p50 {
+            break;
+        }
+        fell_away.push(FellAway {
+            low: top.low,
+            high: top.high,
+            samples: top.samples,
+            travel_p50: top.travel_p50,
+            under: next.travel_p50,
+        });
+        kept -= 1;
+    }
+    let readable = &readable[..kept];
+    let (Some(top), Some(next)) = (
+        readable.last(),
+        readable.len().checked_sub(2).map(|at| readable[at]),
+    ) else {
+        return (Regime::ContentBound, fell_away);
+    };
+    // Gain-bound is the one positive test: the fastest band left is not one
+    // speed with the band below it *and* is the faster of the two, so its speed
+    // was still rising with its error. Everything else is a speed that has
+    // stopped rising.
+    if !one_speed(top.travel_p50, next.travel_p50) && top.travel_p50 > next.travel_p50 {
+        return (Regime::GainBound, fell_away);
+    }
+    // The plateau: the top band left and every readable band below it for as
+    // long as each adjacent pair reads one speed.
+    let mut lowest = readable.len() - 1;
+    while lowest > 0 && one_speed(readable[lowest].travel_p50, readable[lowest - 1].travel_p50) {
+        lowest -= 1;
+    }
+    let regime = Regime::MotorBound(Plateau {
+        low: readable[lowest].low,
+        high: top.high,
+        bins: readable.len() - lowest,
+        travel: readable[lowest..]
+            .iter()
+            .map(|bin| bin.travel_p50)
+            .fold(f64::INFINITY, f64::min),
+    });
+    (regime, fell_away)
 }
 
 /// Which of the three per-class accumulators a group's figures go in.
@@ -866,6 +1383,35 @@ fn slot(group: JointGroup) -> usize {
         .unwrap_or_default()
 }
 
+/// One class's recorded p99.9 residual floor: the figures, and the
+/// configuration they are a reading of.
+///
+/// One record per class rather than three parallel arrays, because the three
+/// classes' floors are no longer three readings of one overlay — the legs' come
+/// off different tours from the other two, and the antennas' come off gains the
+/// tree has moved on from. Positional alignment across the classes would say a
+/// relationship that is not there, and every reader of a figure needs the
+/// configuration beside it: a fresh worst read against a floor measured under
+/// some other configuration is a comparison of two machines. Carrying the
+/// provenance in the record is what lets the report line print it beside the
+/// range instead of leaving it to a reader of this source.
+pub struct RecordedFloor {
+    /// The three tours' p99.9 residuals, radians, in tour order.
+    ///
+    /// Three and not a slice: the arity is what makes the range below a range
+    /// of figures that exist, so a class that lost its tours cannot fold to a
+    /// sentinel. Three and not one because what a candidate pair's p99.9 is
+    /// read for is *growth*, and the run-to-run spread between identically
+    /// configured tours is the noise floor of that reading.
+    pub figures: [f64; 3],
+    /// What the figures were read at, as the report prints it after "over three
+    /// tours" — so a class whose floor is not its shipping configuration says
+    /// so on the bench and not only in this file.
+    ///
+    /// The tour count is the array's own arity and is not carried twice.
+    pub configuration: &'static str,
+}
+
 /// The body yaw's p99.9 residual under the shipped `20 / 50` pair, one figure
 /// per tour, in tour order.
 ///
@@ -875,31 +1421,68 @@ fn slot(group: JointGroup) -> usize {
 /// not grown, one above its top has, by at least the amount above. A single
 /// tour's figure would have every reader mistaking the spread for a change.
 ///
-/// Read over three tours of the whole library at the shipped profile, the
-/// shipped gains and an identical clip library; provenance in
-/// `docs/servo-tuning.md`.
+/// Read over three tours of the whole library at the `20 / 50` pair the class
+/// still runs, the `200 / 0 / 0` gains it still runs, and an identical clip
+/// library, walked at the measured dead time of two samples; provenance in
+/// `docs/servo-tuning.md`. The class was measured gain-bound at that pair — its
+/// loop and not its motor is what holds it back — so the pair was left there
+/// and these figures are the shipping configuration's.
 ///
 /// The other family of recorded residual figures off those same tours is the
 /// worst per joint group, `RECORDED_WORST_HEAD_RESIDUAL_RAD` and
 /// `RECORDED_WORST_ANTENNA_RESIDUAL_RAD` in `reachy_motion::tick`, which is
-/// what the tracking screen is sized on. A confirmation tour that re-bakes
-/// those worsts re-bakes these three arrays from the same tour, or the report
-/// prints a fresh worst beside a noise floor measured under a superseded
-/// profile.
-pub const RECORDED_P999_BODY_YAW_RESIDUAL_RAD: [f64; 3] = [0.2570, 0.3050, 0.2475];
+/// what the tracking screen is sized on. Each class's figures are one
+/// configuration's reading, at the pair and the gains the tree ships that class
+/// at, and are re-baked together for that class or not at all: a fresh worst
+/// printed against a noise floor measured under some other configuration is a
+/// comparison of two machines. Where a figure is not that class's shipping
+/// configuration, its own comment says so — the antennas' record below.
+pub const RECORDED_P999_BODY_YAW_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
+    figures: [0.2754, 0.3264, 0.2488],
+    configuration: "at the pair and gains this class ships",
+};
 
-/// The legs' p99.9 residual over the same three tours, in the same order.
-pub const RECORDED_P999_LEGS_RESIDUAL_RAD: [f64; 3] = [0.2083, 0.1976, 0.1925];
-
-/// The antennas' p99.9 residual over the same three tours, in the same order.
-pub const RECORDED_P999_ANTENNAS_RESIDUAL_RAD: [f64; 3] = [0.3096, 0.2745, 0.2962];
-
-/// The three recorded p99.9 residuals of one class.
+/// The legs' p99.9 residual over three tours at the pair the class is
+/// commissioned at, `287 / 326`, in tour order.
 ///
-/// Three and not a slice: the arity is what makes the range below a range of
-/// figures that exist, so a class that lost its tours cannot fold to a
-/// sentinel.
-fn recorded_p999(group: JointGroup) -> &'static [f64; 3] {
+/// Not the same three tours as the records either side of it: those read the
+/// legs under `20 / 50`, which the class no longer runs, and a candidate's
+/// growth read against a floor measured under a superseded pair is a comparison
+/// of two machines. These three ran the whole library, the same commissioned leg
+/// pair, the same leg gains `800 / 100 / 300`, the same clip library and the
+/// same commanded leg trajectories, walked at the measured dead time of two
+/// samples. What differed between them is the antennas' and the body yaw's
+/// pairs, which are other servos and do not enter a leg's residual: the legs
+/// read 0.1651 / 0.1674 / 0.1650 rad, a spread of 0.0023 rad against the
+/// 0.016 rad the class spread over the three `20 / 50` tours. So they are three
+/// identically configured tours *for this class*, and nobody should read them
+/// as three tours of the shipping overlay.
+///
+/// The confirmation tour that commissioned the pair is not folded in: this
+/// record is the floor, and that tour is the first reading against it, in
+/// `docs/servo-tuning.md`.
+pub const RECORDED_P999_LEGS_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
+    figures: [0.1651, 0.1674, 0.1650],
+    configuration: "at the pair and gains this class ships, on tours of its own",
+};
+
+/// The antennas' p99.9 residual over the same three tours as the body yaw's, in
+/// the same order.
+///
+/// Read at the `500 / 0 / 100` gains those tours ran, which this deployment no
+/// longer ships: the antennas went to the vendor's `200 / 0 / 0` afterwards,
+/// and the proportional term is what sets how far a joint follows behind its
+/// generator. So this record is a reading of the pair at gains the machine has
+/// moved off, and the first tour figure at the shipping configuration — the
+/// confirmation tour's antenna p99.9 — is in `docs/servo-tuning.md` rather than
+/// here. Three tours at that configuration are what re-bake it.
+pub const RECORDED_P999_ANTENNAS_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
+    figures: [0.2999, 0.2759, 0.3177],
+    configuration: "at gains this class no longer runs",
+};
+
+/// One class's recorded p99.9 residual floor.
+fn recorded_p999(group: JointGroup) -> &'static RecordedFloor {
     match group {
         JointGroup::BodyYaw => &RECORDED_P999_BODY_YAW_RESIDUAL_RAD,
         JointGroup::Legs => &RECORDED_P999_LEGS_RESIDUAL_RAD,
@@ -916,12 +1499,34 @@ fn recorded_p999(group: JointGroup) -> &'static [f64; 3] {
 /// each caller, and keeps the tour count out of the access path.
 #[must_use]
 pub fn recorded_p999_range(group: JointGroup) -> (f64, f64) {
-    let [first, second, third] = *recorded_p999(group);
+    let [first, second, third] = recorded_p999(group).figures;
     (first.min(second).min(third), first.max(second).max(third))
 }
 
-/// One sample's two nine-row readings, as a capability walk needs them.
-type Step = ([f64; ROWS.len()], [f64; ROWS.len()]);
+/// What a class's recorded p99.9 range was read at, as the report prints it.
+///
+/// Beside the range wherever the range is printed: the reader who needs it is
+/// the one on the bench comparing a fresh figure with the floor, and for the
+/// antennas that comparison is between two configurations.
+#[must_use]
+pub fn recorded_p999_configuration(group: JointGroup) -> &'static str {
+    recorded_p999(group).configuration
+}
+
+/// One sample's two nine-row readings and its instant, as a capability walk
+/// needs them.
+///
+/// The instant is carried because the goal-step listing names it: a step's own
+/// nanoseconds are what a person hands `//cogs:trace_export` to cut the periods
+/// after it out of the log and read the ramp for themselves.
+struct Step {
+    /// The sample's nominal instant, nanoseconds.
+    at_ns: i64,
+    /// The nine angles it was read at.
+    present: [f64; ROWS.len()],
+    /// The nine angles the driver was holding when it was read.
+    commanded: [f64; ROWS.len()],
+}
 
 /// The run's samples cut into stretches of consecutive grid cycles, each
 /// sample carrying both a reading and the setpoint it was held under.
@@ -934,9 +1539,16 @@ fn stretches(ordered: &[&Logged<PoseSampleWire>], grid: Grid) -> Vec<Vec<Step>> 
     let mut current: Vec<Step> = Vec::new();
     let mut previous: Option<i64> = None;
     for sample in ordered {
-        let (cycle, _) = grid.at(sample.message.nominal_time().as_nanos());
+        let at_ns = sample.message.nominal_time().as_nanos();
+        let (cycle, _) = grid.at(at_ns);
         let consecutive = previous.is_some_and(|before| cycle == before + 1);
-        let step = present_rows(&sample.message).zip(commanded_rows(&sample.message));
+        let step = present_rows(&sample.message)
+            .zip(commanded_rows(&sample.message))
+            .map(|(present, commanded)| Step {
+                at_ns,
+                present,
+                commanded,
+            });
         match step {
             Some(step) => {
                 if !consecutive && !current.is_empty() {
@@ -959,24 +1571,27 @@ fn stretches(ordered: &[&Logged<PoseSampleWire>], grid: Grid) -> Vec<Vec<Step>> 
     out
 }
 
-/// Every chasing sample in one stretch, folded into the per-class figures.
-fn walk_stretch(
-    stretch: &[Step],
-    travels: &mut [Vec<f64>; JointGroup::ALL.len()],
-    ramps: &mut [Vec<f64>; JointGroup::ALL.len()],
-    capped: &mut [usize; JointGroup::ALL.len()],
-) {
-    let travel = |at: usize, index: usize| (stretch[at].0[index] - stretch[at - 1].0[index]).abs();
-    // Whether the joint was chasing at this sample: the setpoint the driver was
-    // holding a dead time earlier -- which is the one the servo had had time to
-    // act on -- stood further than the gap from where the joint then was.
+/// Every chasing sample and every goal step in one stretch, folded into the
+/// per-class figures.
+fn walk_stretch(stretch: &[Step], tallies: &mut [ClassTally; JointGroup::ALL.len()]) {
+    let travel = |at: usize, index: usize| {
+        (stretch[at].present[index] - stretch[at - 1].present[index]).abs()
+    };
+    // Whether the joint was chasing at this sample: every setpoint the driver
+    // held over the dead time -- which is every goal the servo could have been
+    // answering -- stood further than the gap from where the joint then was. All
+    // of them and not the oldest alone, so a joint that has arrived at any of
+    // them is not counted as chasing the one it has left behind.
+    //
     // A dead time is at least one period, so every sample a chase can be read
     // at has a sample before it for the travel to be measured against.
     const _: () = assert!(RESPONSE_DEAD_SAMPLES >= 1);
     let chasing = |at: usize, index: usize| {
         at >= RESPONSE_DEAD_SAMPLES
-            && (stretch[at - RESPONSE_DEAD_SAMPLES].1[index] - stretch[at - 1].0[index]).abs()
-                > CHASE_GAP_RAD
+            && (1..=RESPONSE_DEAD_SAMPLES).all(|back| {
+                (stretch[at - back].commanded[index] - stretch[at - 1].present[index]).abs()
+                    > CHASE_GAP_RAD
+            })
     };
     for at in RESPONSE_DEAD_SAMPLES..stretch.len() {
         for joint in ROWS {
@@ -986,42 +1601,71 @@ fn walk_stretch(
             if !chasing(at, index) {
                 continue;
             }
-            travels[slot(group)].push(travel(at, index));
-            // A ramp is a joint setting off: it stood still last period and is
-            // chasing now, and what is read is the most it gained in any one
-            // period after, which is the acceleration its own generator or its
-            // own motor imposed. The largest single period and not the mean over
-            // the window: a joint that reaches its cap in one period gains
-            // nothing in the periods after, and averaging those in reports an
-            // acceleration the window's length decided rather than the motor.
-            // The window ends where the gaining does, for the same reason, and
-            // where the chase does, because a joint arriving is slowing down.
-            if at < 2 || travel(at - 1, index) >= COUNT_RAD {
+            let moved = travel(at, index);
+            let tally = &mut tallies[slot(group)];
+            // The error the travel was made at: how far the goal the driver was
+            // holding stood from the joint at the sample before, which is the
+            // error the loop was answering when it made this period's move.
+            let error = (stretch[at - 1].commanded[index] - stretch[at - 1].present[index]).abs();
+            // A non-finite reading is corruption in the log and not a fast
+            // joint: it stands further than the gap from anything, so it
+            // passes the chase test, and the band it indexes is the top of the
+            // address space. Counted and left out of every figure, so a run
+            // holding one is still a run the rest of the report is about.
+            if !moved.is_finite() || !error.is_finite() {
+                tally.unreadable += 1;
                 continue;
             }
-            let mut best: Option<f64> = None;
-            let mut stopped = false;
-            // From the period it set off in: a joint that reaches its speed in
-            // that one period gains nothing after it, and a window that started
-            // afterwards would read the fastest motor on the bus as no
-            // acceleration at all.
-            for ahead in 0..=RAMP_PERIODS {
-                if at + ahead >= stretch.len() || (ahead > 0 && !chasing(at + ahead, index)) {
-                    break;
-                }
-                let gained = travel(at + ahead, index) - travel(at + ahead - 1, index);
-                best = Some(best.map_or(gained, |most: f64| most.max(gained)));
-                if gained < COUNT_RAD {
-                    stopped = true;
-                    break;
+            tally.travel.push(moved);
+            tally.bin(error, moved);
+            // The increase: a chasing period that travelled at least an encoder
+            // count further than the one before it was still accelerating, and
+            // the gain is what it accelerated at. A note about the class, and
+            // the acceleration of a class whose speed never stopped rising --
+            // where a motor-bound class's own acceleration is read off its goal
+            // steps below.
+            if at >= 2 {
+                let gained = moved - travel(at - 1, index);
+                if gained >= COUNT_RAD {
+                    tally.increase.push(gained);
                 }
             }
-            if let Some(gained) = best {
-                ramps[slot(group)].push(gained);
-                if stopped {
-                    capped[slot(group)] += 1;
-                }
+        }
+    }
+    // The goal steps, over the whole stretch and not only its chasing samples:
+    // a step is read at the period the goal moved in, which is a period the
+    // joint had not yet answered and so was not chasing in.
+    for at in 1..stretch.len() {
+        for joint in ROWS {
+            let (Some(index), Some(group)) = (row(joint), group_of(joint)) else {
+                continue;
+            };
+            let step = stretch[at].commanded[index] - stretch[at - 1].commanded[index];
+            // A step is a goal moved further than a chase gap in one period
+            // while the joint itself stood still. Both halves matter: a smaller
+            // step does not put the joint into a chase, and a step written to a
+            // joint already moving ramps from the speed it had rather than from
+            // rest.
+            if step.abs() <= CHASE_GAP_RAD || travel(at, index) >= COUNT_RAD {
+                continue;
             }
+            let periods: Vec<f64> = (1..=STEP_LISTING_PERIODS)
+                .map_while(|ahead| (at + ahead < stretch.len()).then(|| travel(at + ahead, index)))
+                .collect();
+            // The ramp is the second post-write period's travel less the
+            // first's: at this dead time the joint starts late in the first and
+            // the second is its first whole period of acceleration.
+            let ramp = match periods.as_slice() {
+                [first, second, ..] => Some(second - first),
+                _ => None,
+            };
+            tallies[slot(group)].steps.push(GoalStep {
+                joint,
+                at_ns: stretch[at].at_ns,
+                step,
+                travel: periods,
+                ramp,
+            });
         }
     }
 }
@@ -1033,8 +1677,24 @@ fn walk_stretch(
 /// be commissioned at is a decision made by a person reading the run, against
 /// the class's own load and the content the run played. What the report owes
 /// that reading is the figures and the limit they sit under.
+///
+/// TODO(capability-report-volume): every band and every goal step is printed,
+/// on every run, which is on the order of a hundred lines per class on a
+/// library tour.
 pub fn capabilities(measured: &[ClassCapability; 3], report: &mut Report) {
     for class in measured {
+        // Before the figures, because a class whose samples were all
+        // unreadable has none: a log carrying a non-finite angle is a log to
+        // ask about, and a report that measured nothing over it has to say
+        // which of the two happened.
+        if class.unreadable > 0 {
+            report.note(format!(
+                "capability {}: {} chasing sample(s) carried a non-finite reading and measured \
+                 nothing; a log holding one is a log to ask about",
+                class.group.name(),
+                class.unreadable,
+            ));
+        }
         if class.chasing == 0 {
             report.note(format!(
                 "capability {}: no sample found this class chasing a setpoint more than \
@@ -1059,38 +1719,168 @@ pub fn capabilities(measured: &[ClassCapability; 3], report: &mut Report) {
             class.velocity_units(class.travel_max),
             class.recorded_velocity_limit(),
         ));
-        report.note(if class.chasing >= CAPABILITY_MIN_SAMPLES {
-            format!(
-                "capability {}: saturating -- past {CAPABILITY_MIN_SAMPLES} chasing samples, so \
-                 these figures are what the motors did rather than what the content asked",
-                class.group.name()
-            )
-        } else {
-            format!(
-                "capability {}: content-bound -- under {CAPABILITY_MIN_SAMPLES} chasing samples, \
-                 so what the library asked of this class is what these figures measure",
-                class.group.name()
-            )
-        });
-        if class.ramps == 0 {
-            report.note(format!(
-                "capability {}: no ramp -- no joint of this class set off from rest into a chase \
-                 that held for a period",
-                class.group.name()
-            ));
-            continue;
-        }
+        let recorded = recorded_capability(class.group);
         report.note(format!(
-            "capability {}: {} ramp(s) in a window of {RAMP_PERIODS} periods, {} of them capped \
-             inside it, largest increase per period p50 {:.6} rad ({:.0} units), p90 {:.6} ({:.0})",
+            "capability {}: the recorded reading of this class is acceleration {} / velocity {} \
+             units, off the kept capability tour",
             class.group.name(),
-            class.ramps,
-            class.ramps_capped,
-            class.ramp_p50,
-            class.acceleration_units(class.ramp_p50),
-            class.ramp_p90,
-            class.acceleration_units(class.ramp_p90),
+            recorded.acceleration,
+            recorded.velocity,
         ));
+        travel_against_error(class, report);
+        report.note(format!(
+            "capability {}: {} chasing period(s) travelled at least a count further than the \
+             period before, increase p50 {:.6} rad/period² ({:.0} units), p90 {:.6} ({:.0})",
+            class.group.name(),
+            class.increases,
+            class.increase_p50,
+            class.acceleration_units(class.increase_p50),
+            class.increase_p90,
+            class.acceleration_units(class.increase_p90),
+        ));
+        goal_steps(class, report);
+    }
+}
+
+/// One class's travel cut by the error it was made at, and the regime the cut
+/// reads as.
+///
+/// Every band, read or not: a band the content never held the class in is a
+/// reading about the content, and a table that printed only the readable bands
+/// would leave a person unable to tell a class the library never pushed from a
+/// class whose bands are all full.
+fn travel_against_error(class: &ClassCapability, report: &mut Report) {
+    for bin in &class.bins {
+        if bin.readable() {
+            report.note(format!(
+                "capability {}: error {:.2}–{:.2} rad, n {}, travel p10 {:.0} units, p50 {:.0}, \
+                 p90 {:.0}",
+                class.group.name(),
+                bin.low,
+                bin.high,
+                bin.samples,
+                class.velocity_units(bin.travel_p10),
+                class.velocity_units(bin.travel_p50),
+                class.velocity_units(bin.travel_p90),
+            ));
+        } else {
+            report.note(format!(
+                "capability {}: error {:.2}–{:.2} rad, n {}, unread -- under \
+                 {CAPABILITY_BIN_MIN_SAMPLES} samples",
+                class.group.name(),
+                bin.low,
+                bin.high,
+                bin.samples,
+            ));
+        }
+    }
+    for band in &class.fell_away {
+        let against = match band.ratio() {
+            Some(ratio) => format!("{ratio:.2} times slower"),
+            None => "read zero".to_string(),
+        };
+        report.note(format!(
+            "capability {}: error {:.2}–{:.2} rad, n {}, travel p50 {:.0} units -- fell away from \
+             the band under it ({:.0} units, {against}), read past as the periods after a goal \
+             step or a stall",
+            class.group.name(),
+            band.low,
+            band.high,
+            band.samples,
+            class.velocity_units(band.travel_p50),
+            class.velocity_units(band.under),
+        ));
+    }
+    let name = class.regime.name();
+    let read_under = if class.fell_away.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", read under {} band(s) that fell away",
+            class.fell_away.len()
+        )
+    };
+    match class.regime {
+        Regime::MotorBound(plateau) => report.note(format!(
+            "capability {}: {name} -- the speed stopped rising with the error, plateau \
+             {:.2}–{:.2} rad over {} band(s), slowest median in it {:.0} units{read_under}",
+            class.group.name(),
+            plateau.low,
+            plateau.high,
+            plateau.bins,
+            class.velocity_units(plateau.travel),
+        )),
+        Regime::GainBound => report.note(format!(
+            "capability {}: {name} -- the fastest band left is over {CAPABILITY_PLATEAU_RATIO} \
+             times the band below it, so the speed was still rising with the error and the motor \
+             was never reached{read_under}",
+            class.group.name(),
+        )),
+        // Content-bound after a fall says nothing about the class, and says so
+        // in its own words: the candidate rule for a content-bound class
+        // extrapolates above everything observed on the premise that the
+        // library never held the class far behind, and a class whose far bands
+        // were read past was held exactly there.
+        Regime::ContentBound if !class.fell_away.is_empty() => report.note(format!(
+            "capability {}: {name} -- the reading needs two speeds and {} band(s) above were read \
+             past, so this run is not a measurement of this class and offers no candidate",
+            class.group.name(),
+            class.fell_away.len(),
+        )),
+        Regime::ContentBound => report.note(format!(
+            "capability {}: {name} -- fewer than two readable error bands, so nothing here says \
+             whether this class was ever the binding constraint",
+            class.group.name(),
+        )),
+    }
+}
+
+/// Every goal step one class was written, and what the joint did after each.
+///
+/// A listing and not a statistic, printed step by step: it is the reading the
+/// dead time is checked against -- the periods a joint stands still after the
+/// write are visible in the row -- and the cross-check on the increase figure
+/// above it. The median under it is the class's acceleration, and it exists
+/// only where the class was written enough steps for a median to describe the
+/// motor.
+fn goal_steps(class: &ClassCapability, report: &mut Report) {
+    for step in &class.steps {
+        let travel: Vec<String> = step
+            .travel
+            .iter()
+            .map(|moved| format!("{:.0}", class.velocity_units(*moved)))
+            .collect();
+        let ramp = match step.ramp {
+            Some(ramp) => format!("{:.0} units", class.acceleration_units(ramp)),
+            None => "no ramp -- the stretch ended inside the step".to_string(),
+        };
+        report.note(format!(
+            "capability {}: goal step at {} on {}, {:+.4} rad, travel per period after it {} \
+             units, ramp {ramp}",
+            class.group.name(),
+            step.at_ns,
+            Name(step.joint),
+            step.step,
+            travel.join(", "),
+        ));
+    }
+    match (class.step_ramp_p50, class.step_ramp_p90) {
+        (Some(p50), Some(p90)) => report.note(format!(
+            "capability {}: {} goal step(s), ramp p50 {:.6} rad/period² ({:.0} units), p90 \
+             {:.6} ({:.0})",
+            class.group.name(),
+            class.steps.len(),
+            p50,
+            class.acceleration_units(p50),
+            p90,
+            class.acceleration_units(p90),
+        )),
+        _ => report.note(format!(
+            "capability {}: {} goal step(s), under {CAPABILITY_STEP_MIN_SAMPLES}, so this class \
+             has no ramp median and no acceleration figure the steps measured",
+            class.group.name(),
+            class.steps.len(),
+        )),
     }
 }
 
@@ -1238,15 +2028,20 @@ mod tests {
 
     use brenn_reachy__driver__health_clk_rs::HealthReportWire;
     use reachy_motion::joints::JointGroup;
-    use reachy_motion::plant::{PlantModel, SHIPPED_PROFILES};
+    use reachy_motion::plant::{
+        PROFILE_ACCELERATION_MAX, PlantModel, ProfilePair, SHIPPED_PROFILES,
+    };
     use reachy_motion::stillness::COUNT_RAD;
 
     use super::{
-        CAPABILITY_MIN_SAMPLES, CONFIG_FILES, Grid, RECORDED_P999_ANTENNAS_RESIDUAL_RAD,
-        RECORDED_P999_BODY_YAW_RESIDUAL_RAD, RECORDED_P999_LEGS_RESIDUAL_RAD,
-        RECORDED_VELOCITY_LIMIT_ANTENNAS, RECORDED_VELOCITY_LIMIT_HEAD, RunConfig, Skips,
-        TEMPERATURE_STOP_C, capabilities, capability, health_summary, lags, no_faults, percentile,
-        residual_stream, residuals, slot,
+        CAPABILITY_BIN_MIN_SAMPLES, CAPABILITY_PLATEAU_RATIO, CAPABILITY_STEP_MIN_SAMPLES,
+        CHASE_GAP_RAD, CONFIG_FILES, ClassCapability, ErrorBin, Grid, RECORDED_CAPABILITY_ANTENNAS,
+        RECORDED_CAPABILITY_BODY_YAW, RECORDED_CAPABILITY_LEGS,
+        RECORDED_P999_ANTENNAS_RESIDUAL_RAD, RECORDED_P999_BODY_YAW_RESIDUAL_RAD,
+        RECORDED_P999_LEGS_RESIDUAL_RAD, RECORDED_VELOCITY_LIMIT_ANTENNAS,
+        RECORDED_VELOCITY_LIMIT_HEAD, Regime, Residual, RunConfig, Skips, TEMPERATURE_STOP_C,
+        capabilities, capability, health_summary, lags, no_faults, one_speed, percentile,
+        recorded_capability, regime_of, residual_stream, residuals, slot, travel_against_error,
     };
 
     /// A period nothing round, so an arithmetic that assumed one shows.
@@ -1499,30 +2294,30 @@ mod tests {
     }
 
     /// The worst residual the driven row shows, and the worst any other row
-    /// does.
-    fn worsts(stream: &[(i64, [f64; ROW_COUNT])]) -> (f64, f64) {
+    /// does, both as disagreements: how far off the model, whichever side.
+    fn worsts(stream: &[(i64, [Residual; ROW_COUNT])]) -> (f64, f64) {
         let index = driven();
         let mut driven_row = 0.0_f64;
         let mut elsewhere = 0.0_f64;
         for (_, residual) in stream {
             for (at, figure) in residual.iter().enumerate() {
                 if at == index {
-                    driven_row = driven_row.max(*figure);
+                    driven_row = driven_row.max(figure.magnitude());
                 } else {
-                    elsewhere = elsewhere.max(*figure);
+                    elsewhere = elsewhere.max(figure.magnitude());
                 }
             }
         }
         (driven_row, elsewhere)
     }
 
-    /// The residual a sample carries, found by its instant.
-    fn at_cycle(stream: &[(i64, [f64; ROW_COUNT])], n: i64) -> f64 {
+    /// The residual a sample carries, as a disagreement.
+    fn at_cycle(stream: &[(i64, [Residual; ROW_COUNT])], n: i64) -> f64 {
         let index = driven();
         stream
             .iter()
             .find(|(nominal, _)| *nominal == ORIGIN_NS + n * PERIOD_NS)
-            .map(|(_, residual)| residual[index])
+            .map(|(_, residual)| residual[index].magnitude())
             .unwrap_or_else(|| panic!("the stream carries no sample for cycle {n}"))
     }
 
@@ -1576,7 +2371,7 @@ mod tests {
     /// the profile velocity.
     ///
     /// Which is what makes the case above an assertion about the dead time the
-    /// model was fitted at rather than about any delay at all.
+    /// model is measured at rather than about any delay at all.
     #[test]
     fn a_reading_that_answers_a_period_early_reads_a_residual() {
         let plant = GroupPlants::default();
@@ -1664,7 +2459,7 @@ mod tests {
         assert!(
             residual_stream(&samples, grid(), &plant)
                 .iter()
-                .any(|(_, residual)| residual[index] > 0.1),
+                .any(|(_, residual)| residual[index].magnitude() > 0.1),
             "the stream has to measure something for the re-seed to be visible"
         );
 
@@ -1702,13 +2497,70 @@ mod tests {
         }
     }
 
+    /// The residual line says which side of its own trajectory the joint stood,
+    /// because the two sides mean opposite things for a candidate pair.
+    ///
+    /// Two streams of the same motion: one whose reading answers a period late,
+    /// so the joint trails its prediction, and one whose reading answers a
+    /// period early, so it leads it. A summary that only carried the
+    /// disagreement would print the same figure for both, and the confirmation
+    /// run's decision tree would send a machine that outran its model to the
+    /// branch that slows it down further.
+    #[test]
+    fn the_residual_summary_says_which_side_of_the_model_the_joint_stood() {
+        let plant = GroupPlants::default();
+        let lagging = frozen(60, 2.0);
+        let leading = chase(&plant, &saturated(60), 1);
+        let index = driven();
+        // The two figures the line prints, taken off the same stream the
+        // summary reads, and the line itself, so the reading and its wording
+        // are pinned together.
+        let read = |samples: &[Logged<PoseSampleWire>]| {
+            let stream = residual_stream(samples, grid(), &plant);
+            let mut behind = 0.0_f64;
+            let mut ahead = 0.0_f64;
+            for (_, residual) in &stream {
+                if residual[index].is_behind() {
+                    behind = behind.max(residual[index].magnitude());
+                } else if residual[index].is_ahead() {
+                    ahead = ahead.max(residual[index].magnitude());
+                }
+            }
+            let mut report = Report::default();
+            residuals(&stream, samples, &plant, &mut report);
+            let wanted = format!(
+                "body yaw: worst {behind:.4} rad behind its own trajectory, worst {ahead:.4} rad \
+                 ahead of it"
+            );
+            assert!(
+                report.measured.contains(&wanted),
+                "{wanted:?} is not in {:?}",
+                report.measured
+            );
+            (behind, ahead)
+        };
+        let (behind, ahead) = read(&lagging);
+        assert!(
+            behind > 0.1 && ahead == 0.0,
+            "a joint that never moved under a far goal is only ever behind: {behind} / {ahead}"
+        );
+        let (behind, ahead) = read(&leading);
+        assert!(
+            ahead > 5.0 * behind,
+            "a reading that answers a period early leads its model: {behind} / {ahead}"
+        );
+    }
+
     /// Every class's residual line carries that class's own recorded p99.9
-    /// range, low figure first.
+    /// range, low figure first, and the configuration that range was read at.
     ///
     /// The floor is at the point of use because the reading it supports is a
-    /// comparison: a candidate pair's p99.9 against what the shipped pair did
-    /// over three tours. A line carrying another class's range, or the range
-    /// the wrong way round, would read as growth that is not there.
+    /// comparison: a candidate pair's p99.9 against what the class's own
+    /// recorded configuration did over three tours. A line carrying another
+    /// class's range, or the range the wrong way round, would read as growth
+    /// that is not there — and so would a line calling the antennas' floor a
+    /// shipping figure, which is the one class whose floor was read at gains
+    /// the tree has moved off.
     ///
     /// The figures are written out here rather than read back off the
     /// constants: they were transcribed by hand from an offline measurement,
@@ -1726,23 +2578,40 @@ mod tests {
         // range prints: a mistyped middle figure is inside the range it does
         // not move, so the printed line cannot see it.
         assert_eq!(
-            RECORDED_P999_BODY_YAW_RESIDUAL_RAD,
-            [0.2570, 0.3050, 0.2475]
+            RECORDED_P999_BODY_YAW_RESIDUAL_RAD.figures,
+            [0.2754, 0.3264, 0.2488]
         );
-        assert_eq!(RECORDED_P999_LEGS_RESIDUAL_RAD, [0.2083, 0.1976, 0.1925]);
         assert_eq!(
-            RECORDED_P999_ANTENNAS_RESIDUAL_RAD,
-            [0.3096, 0.2745, 0.2962]
+            RECORDED_P999_LEGS_RESIDUAL_RAD.figures,
+            [0.1651, 0.1674, 0.1650]
+        );
+        assert_eq!(
+            RECORDED_P999_ANTENNAS_RESIDUAL_RAD.figures,
+            [0.2999, 0.2759, 0.3177]
         );
 
+        // The provenance clause per class, written out the same way: the
+        // antennas' floor is the one that is not a shipping reading, and a line
+        // that called it one is the misreading the record exists to stop.
         let ranges = [
-            (JointGroup::BodyYaw, "0.2475–0.3050"),
-            (JointGroup::Legs, "0.1925–0.2083"),
-            (JointGroup::Antennas, "0.2745–0.3096"),
+            (
+                JointGroup::BodyYaw,
+                "0.2488–0.3264",
+                "at the pair and gains this class ships",
+            ),
+            (
+                JointGroup::Legs,
+                "0.1650–0.1674",
+                "at the pair and gains this class ships, on tours of its own",
+            ),
+            (
+                JointGroup::Antennas,
+                "0.2759–0.3177",
+                "at gains this class no longer runs",
+            ),
         ];
-        for (group, range) in ranges {
-            let wanted =
-                format!("recorded p99.9 under the shipped pair {range} rad over three tours");
+        for (group, range, configuration) in ranges {
+            let wanted = format!("recorded p99.9 {range} rad over three tours {configuration},");
             let line = report
                 .measured
                 .iter()
@@ -1797,7 +2666,7 @@ mod tests {
     fn a_configuration_is_read_from_its_fields_and_not_from_the_comments_around_them() {
         let gains = "legs_p: 800\nlegs_i: 100\nlegs_d: 300\n\
                      body_yaw_p: 200\nbody_yaw_i: 0\nbody_yaw_d: 0\n\
-                     antennas_p: 500\nantennas_i: 0\nantennas_d: 100\n";
+                     antennas_p: 200\nantennas_i: 0\nantennas_d: 0\n";
         let commented = staged(
             "commented",
             [
@@ -1815,9 +2684,18 @@ mod tests {
         assert_eq!(
             config.profiles,
             GroupProfiles {
-                legs: (20, 50),
-                yaw: (30, 60),
-                antennas: (40, 70),
+                legs: ProfilePair {
+                    acceleration: 20,
+                    velocity: 50,
+                },
+                yaw: ProfilePair {
+                    acceleration: 30,
+                    velocity: 60,
+                },
+                antennas: ProfilePair {
+                    acceleration: 40,
+                    velocity: 70,
+                },
             }
         );
         assert_eq!(config.gains, reachy_motion::arm::DEFAULT_GAINS);
@@ -1869,7 +2747,14 @@ mod tests {
             ],
         );
         let config = RunConfig::read(&spelled).expect("a configuration the loader would take");
-        assert_eq!(config.profiles.legs, (20, 50), "0x14 is twenty");
+        assert_eq!(
+            config.profiles.legs,
+            ProfilePair {
+                acceleration: 20,
+                velocity: 50
+            },
+            "0x14 is twenty"
+        );
         assert!(config.tracking_armed, "True is protobuf's true");
 
         let mut texts = tree_texts();
@@ -2167,69 +3052,113 @@ mod tests {
         samples
     }
 
-    /// A joint running its own generator's trapezoid reads back as that
-    /// generator: the median travel is the profile velocity and the ramp is the
-    /// profile acceleration, both to within an encoder count.
+    /// A run of far chases on one antenna, each opened by a goal step of
+    /// `reach` radians and answered by `model` a dead time later.
+    ///
+    /// The shape a capability tour has and `far_chase` does not: several goal
+    /// steps, so the step listing has a median under it and the error bands
+    /// fill. The goal accumulates in one direction, so no move starts before
+    /// the last has arrived at a goal it then leaves behind.
+    fn stepped_chases(
+        model: PlantModel,
+        moves: usize,
+        reach: f64,
+        hold: usize,
+    ) -> Vec<Logged<PoseSampleWire>> {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut samples = Vec::new();
+        let mut state = Predicted::default();
+        let mut present = [0.0; ROW_COUNT];
+        let mut commanded = [0.0; ROW_COUNT];
+        let mut goals: Vec<f64> = Vec::new();
+        for n in 0..2 + moves * hold {
+            samples.push(sample(n as i64, &present, &commanded));
+            if n >= 2 && (n - 2) % hold == 0 {
+                commanded[index] += reach;
+            }
+            goals.push(commanded[index]);
+            if n >= RESPONSE_DEAD_SAMPLES {
+                model.step(&mut state, goals[n - RESPONSE_DEAD_SAMPLES]);
+                present[index] = state.position;
+            }
+        }
+        samples
+    }
+
+    /// A joint running its own generator's trapezoid at a velocity its
+    /// acceleration reaches in one period reads back as that generator: every
+    /// readable error band's median travel is the profile velocity, the class
+    /// reads motor-bound, and the plateau's own figure is the velocity too.
     ///
     /// This is the measurement the capability run is taken for, checked against
-    /// the one case where the answer is known in advance.
+    /// the one case where the answer is known in advance. The regime is the
+    /// reading a candidate pair comes off, so a table that read a cruise as a
+    /// speed still rising would send a person to the wrong rule.
     #[test]
     fn capability_reads_a_trapezoid_back_as_its_own_pair() {
+        // A generator that reaches its cap in the first period, so every
+        // chasing period in the run travels the cap and the bands cannot
+        // disagree for any reason but the walk's arithmetic.
         let model = PlantModel::from_registers(
-            SHIPPED_PROFILES.antennas.1,
-            SHIPPED_PROFILES.antennas.0,
+            SHIPPED_PROFILES.antennas.velocity,
+            PROFILE_ACCELERATION_MAX,
             PERIOD_NS,
         )
         .expect("a plant");
-        let samples = far_chase(200, 8.0, model);
+        let samples = stepped_chases(model, 12, 0.55, 30);
         let measured = capability(&samples, grid());
         let antennas = &measured[slot(JointGroup::Antennas)];
-        assert!(
-            antennas.chasing > 150,
-            "the joint chased for most of the run: {}",
-            antennas.chasing
-        );
-        assert!(
-            (antennas.travel_p50 - model.v_max).abs() < COUNT_RAD,
-            "p50 {} against v_max {}",
-            antennas.travel_p50,
-            model.v_max
-        );
-        assert!(
-            (antennas.travel_p10 - model.v_max).abs() < COUNT_RAD,
-            "p10 {} against v_max {}",
+        for figure in [
             antennas.travel_p10,
-            model.v_max
-        );
-        assert!(
-            (antennas.travel_max - model.v_max).abs() < COUNT_RAD,
-            "max {} against v_max {}",
+            antennas.travel_p50,
+            antennas.travel_p90,
             antennas.travel_max,
+        ] {
+            assert!(
+                (figure - model.v_max).abs() < COUNT_RAD,
+                "{figure} against v_max {}",
+                model.v_max
+            );
+        }
+        let readable: Vec<&super::ErrorBin> =
+            antennas.bins.iter().filter(|bin| bin.readable()).collect();
+        assert!(
+            readable.len() >= 2,
+            "the run has to fill two bands for a regime to exist: {:?}",
+            antennas
+                .bins
+                .iter()
+                .map(|bin| (bin.low, bin.samples))
+                .collect::<Vec<_>>()
+        );
+        for bin in &readable {
+            assert!(
+                (bin.travel_p50 - model.v_max).abs() < COUNT_RAD,
+                "band {:.2}-{:.2} reads {} against v_max {}",
+                bin.low,
+                bin.high,
+                bin.travel_p50,
+                model.v_max
+            );
+        }
+        let Regime::MotorBound(plateau) = antennas.regime else {
+            panic!("the regime is motor-bound: {:?}", antennas.regime)
+        };
+        assert!(
+            (plateau.travel - model.v_max).abs() < COUNT_RAD,
+            "plateau {} against v_max {}",
+            plateau.travel,
             model.v_max
         );
-        assert_eq!(antennas.ramps, 1, "one setting-off in the run");
+        // The register figure is the pair the generator was built from, which
+        // is what a candidate profile is read off.
         assert!(
-            (antennas.ramp_p50 - model.a_max).abs() < COUNT_RAD,
-            "ramp p50 {} against a_max {}",
-            antennas.ramp_p50,
-            model.a_max
-        );
-        // The register figures are the pair the generator was built from,
-        // which is what a candidate profile is read off.
-        assert!(
-            (antennas.velocity_units(antennas.travel_p50) - f64::from(SHIPPED_PROFILES.antennas.1))
-                .abs()
-                < 1.0,
-            "{} units",
-            antennas.velocity_units(antennas.travel_p50)
-        );
-        assert!(
-            (antennas.acceleration_units(antennas.ramp_p50)
-                - f64::from(SHIPPED_PROFILES.antennas.0))
+            (antennas.velocity_units(plateau.travel)
+                - f64::from(SHIPPED_PROFILES.antennas.velocity))
             .abs()
                 < 1.0,
             "{} units",
-            antennas.acceleration_units(antennas.ramp_p50)
+            antennas.velocity_units(plateau.travel)
         );
         // Nothing else moved, so nothing else is measured.
         let legs = &measured[slot(JointGroup::Legs)];
@@ -2248,11 +3177,276 @@ mod tests {
             report
                 .measured
                 .iter()
-                .any(|line| line.contains("capability antennas: content-bound")),
-            "a 200-sample run is under the minimum: {:?}",
+                .any(|line| line.contains("capability antennas: motor-bound")
+                    && line.contains("slowest median in it 50 units")),
+            "{:?}",
             report.measured
         );
         assert!(report.findings.is_empty(), "capability never judges");
+    }
+
+    /// The goal-step listing is the direct reading of both measured numbers the
+    /// model rests on: the periods a joint stands still after a write, and the
+    /// acceleration of its first whole period of travel.
+    ///
+    /// Read off a trapezoid at the shipped pair, where the ramp takes several
+    /// periods and the second post-write period's gain is the generator's own
+    /// acceleration. A listing whose zero periods were miscounted, or a ramp
+    /// taken from the wrong pair of periods, would put the candidate
+    /// acceleration out by a factor.
+    #[test]
+    fn a_goal_step_listing_reads_the_dead_time_and_the_ramp() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        let samples = stepped_chases(model, 12, 1.2, 80);
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(antennas.steps.len(), 12, "one step per move");
+        for step in &antennas.steps {
+            // The write's own dead time, visible: the periods before the joint
+            // answers travel nothing, and the one after them is the ramp.
+            let dead = RESPONSE_DEAD_SAMPLES - 1;
+            assert!(
+                step.travel[..dead].iter().all(|moved| *moved == 0.0),
+                "{:?} should open with {dead} still period(s)",
+                step.travel
+            );
+            assert!(step.travel[dead] > 0.0, "{:?}", step.travel);
+            let ramp = step.ramp.expect("a ramp");
+            assert!(
+                (ramp - model.a_max).abs() < COUNT_RAD,
+                "step ramp {ramp} against a_max {}",
+                model.a_max
+            );
+        }
+        let p50 = antennas.step_ramp_p50.expect("a ramp median");
+        assert!(
+            (p50 - model.a_max).abs() < COUNT_RAD,
+            "ramp p50 {p50} against a_max {}",
+            model.a_max
+        );
+        assert!(
+            (antennas.acceleration_units(p50) - f64::from(SHIPPED_PROFILES.antennas.acceleration))
+                .abs()
+                < 1.0,
+            "{} units",
+            antennas.acceleration_units(p50)
+        );
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: 12 goal step(s), ramp p50")),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: goal step at")
+                    && line.contains("left antenna")),
+            "the listing names the joint and the instant: {:?}",
+            report.measured
+        );
+    }
+
+    /// A class the run wrote too few goal steps to has its listing printed and
+    /// no acceleration figure at all.
+    ///
+    /// The median is the class's candidate acceleration, and a median over one
+    /// or two steps is the shape of one motion rather than the motor's. The
+    /// listing still goes in, because a person reading two steps is reading
+    /// what there is.
+    #[test]
+    fn a_class_written_too_few_goal_steps_has_no_acceleration_figure() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        let samples = far_chase(200, 8.0, model);
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(antennas.steps.len(), 1, "one setting-off in the run");
+        assert!(antennas.steps.len() < CAPABILITY_STEP_MIN_SAMPLES);
+        assert!(antennas.step_ramp_p50.is_none());
+        assert!(antennas.step_ramp_p90.is_none());
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: 1 goal step(s), under 10")),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: goal step at")),
+            "the listing is printed anyway: {:?}",
+            report.measured
+        );
+    }
+
+    /// A joint whose speed is its error times a gain reads gain-bound, with its
+    /// bands rising all the way up.
+    ///
+    /// The other half of the regime reading, and the one that decides whether a
+    /// class's candidate pair comes off a plateau or off a fixed band: a
+    /// proportional loop never stops accelerating with its error, so no two
+    /// bands read one speed and there is no plateau to take a velocity from.
+    #[test]
+    fn a_proportional_loop_reads_gain_bound_with_its_bands_rising() {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let (gain, reach, hold, moves) = (0.03, 0.45, 90, 10);
+        let mut samples = Vec::new();
+        let mut present = [0.0; ROW_COUNT];
+        let mut commanded = [0.0; ROW_COUNT];
+        let mut goals: Vec<f64> = Vec::new();
+        for n in 0..2 + moves * hold {
+            samples.push(sample(n as i64, &present, &commanded));
+            if n >= 2 && (n - 2) % hold == 0 {
+                commanded[index] += reach;
+            }
+            goals.push(commanded[index]);
+            if n >= RESPONSE_DEAD_SAMPLES {
+                let target = goals[n - RESPONSE_DEAD_SAMPLES];
+                present[index] += gain * (target - present[index]);
+            }
+        }
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(antennas.regime, Regime::GainBound);
+        let readable: Vec<&super::ErrorBin> =
+            antennas.bins.iter().filter(|bin| bin.readable()).collect();
+        assert!(readable.len() >= 3, "{}", readable.len());
+        for pair in readable.windows(2) {
+            assert!(
+                pair[1].travel_p50 > pair[0].travel_p50,
+                "band {:.2} reads {} and band {:.2} reads {}",
+                pair[0].low,
+                pair[0].travel_p50,
+                pair[1].low,
+                pair[1].travel_p50
+            );
+        }
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: gain-bound")),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "capability never judges");
+    }
+
+    /// A chase that never leaves the first error band reads content-bound:
+    /// there is one speed on record and nothing to compare it against.
+    #[test]
+    fn a_chase_that_never_leaves_the_first_band_reads_content_bound() {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut samples = Vec::new();
+        for n in 0..200 {
+            let mut present = [0.0; ROW_COUNT];
+            present[index] = f64::from(n) * 0.01;
+            let mut commanded = present;
+            // A gap and a half ahead the whole way: enough to be a chase, never
+            // enough to leave the band it starts in.
+            commanded[index] += 1.5 * CHASE_GAP_RAD;
+            samples.push(sample(i64::from(n), &present, &commanded));
+        }
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert!(antennas.chasing > 150, "{}", antennas.chasing);
+        assert_eq!(antennas.bins.len(), 1, "one band, the first");
+        assert_eq!(antennas.regime, Regime::ContentBound);
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("capability antennas: content-bound")
+                    && line.contains("fewer than two readable error bands")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A joint standing on the newest goal is not chasing an older one that is
+    /// still far away.
+    ///
+    /// The chasing test compares against every goal the servo could have been
+    /// answering over the dead time, and not the oldest of them alone. The
+    /// difference is a joint the driver has just told to stop where it is: it is
+    /// not trying, and counting its travel would put the speed of an arrival
+    /// into the figures a profile pair is written from.
+    #[test]
+    fn a_joint_that_arrived_at_the_newest_goal_is_not_chasing_an_older_one() {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        // Two runs of the same motion: in one the driver writes the joint's own
+        // position for a single period, in the other it holds the far goal
+        // throughout.
+        let build = |interrupt: bool| {
+            let mut samples = Vec::new();
+            let mut present = [0.0; ROW_COUNT];
+            for n in 0..60 {
+                let mut commanded = [0.0; ROW_COUNT];
+                commanded[index] = if interrupt && n == 30 {
+                    present[index]
+                } else {
+                    4.0
+                };
+                samples.push(sample(n, &present, &commanded));
+                present[index] += 0.05;
+            }
+            capability(&samples, grid())[slot(JointGroup::Antennas)].chasing
+        };
+        let held = build(false);
+        let interrupted = build(true);
+        assert!(held > 40, "the control run chases throughout: {held}");
+        assert_eq!(
+            held - interrupted,
+            RESPONSE_DEAD_SAMPLES,
+            "one goal written at the joint's own position takes the samples it could have been \
+             answered at out of the chase: {held} against {interrupted}"
+        );
+    }
+
+    /// The recorded capability figures are the ones a re-read is compared
+    /// against, so they are written out here rather than read back off the
+    /// constants.
+    ///
+    /// Transcribed by hand from the instrument's re-read of the kept tour; an
+    /// expectation computed from the same constant cannot see a mistyped digit
+    /// or a class wired to another class's pair. Which figure is which is the
+    /// pair's own field names, so this case is about the digits alone.
+    #[test]
+    fn each_class_carries_its_own_recorded_capability_pair() {
+        let pair = |acceleration, velocity| ProfilePair {
+            acceleration,
+            velocity,
+        };
+        assert_eq!(RECORDED_CAPABILITY_LEGS, pair(287, 326));
+        assert_eq!(RECORDED_CAPABILITY_ANTENNAS, pair(522, 640));
+        assert_eq!(RECORDED_CAPABILITY_BODY_YAW, pair(20, 48));
+        assert_eq!(recorded_capability(JointGroup::Legs), pair(287, 326));
+        assert_eq!(recorded_capability(JointGroup::Antennas), pair(522, 640));
+        assert_eq!(recorded_capability(JointGroup::BodyYaw), pair(20, 48));
     }
 
     /// Content the joint keeps up with is not a capability measurement: no
@@ -2262,10 +3456,10 @@ mod tests {
     fn content_the_joint_keeps_up_with_measures_nothing() {
         let index = row(JointRef::AntennaLeft).expect("a bus row");
         let mut samples = Vec::new();
-        for n in 0..CAPABILITY_MIN_SAMPLES as i64 {
+        for n in 0..500 {
             let mut rows = [0.0; ROW_COUNT];
-            rows[index] = n as f64 * 0.01;
-            samples.push(sample(n, &rows, &rows));
+            rows[index] = f64::from(n) * 0.01;
+            samples.push(sample(i64::from(n), &rows, &rows));
         }
         let measured = capability(&samples, grid());
         let antennas = &measured[slot(JointGroup::Antennas)];
@@ -2273,7 +3467,9 @@ mod tests {
             antennas.chasing, 0,
             "a setpoint the joint is standing on is no chase"
         );
-        assert_eq!(antennas.ramps, 0);
+        assert!(antennas.bins.is_empty());
+        assert_eq!(antennas.increases, 0);
+        assert_eq!(antennas.regime, Regime::ContentBound);
     }
 
     /// A joint dragged along at per-period travels somebody chose, chasing a
@@ -2319,23 +3515,19 @@ mod tests {
         assert!((percentile(&[], 0.50)).abs() < f64::EPSILON);
     }
 
-    /// Travels that spread come back as an ordering, and a class that chased
-    /// past the minimum is reported as the motor's own figures.
+    /// Travels that spread come back as an ordering.
     ///
-    /// The two readings the decision tree is made of: which end of the spread a
-    /// candidate pair is taken from, and whether the class was the binding
-    /// constraint at all.
+    /// Which end of the spread a candidate pair is taken from is the whole
+    /// decision, and every other stream a capability pass is checked over runs
+    /// at one speed for most of its length: a swapped p10 and p90 reads
+    /// identically there.
     #[test]
-    fn a_spread_chase_reads_back_as_ranks_and_as_saturating() {
-        let samples = throttled_chase(
-            JointRef::AntennaLeft,
-            CAPABILITY_MIN_SAMPLES + 100,
-            &[0.01, 0.02, 0.03, 0.04, 0.05],
-        );
+    fn a_spread_chase_reads_back_as_ranks() {
+        let samples = throttled_chase(JointRef::AntennaLeft, 600, &[0.01, 0.02, 0.03, 0.04, 0.05]);
         let measured = capability(&samples, grid());
         let antennas = &measured[slot(JointGroup::Antennas)];
         assert!(
-            antennas.chasing >= CAPABILITY_MIN_SAMPLES,
+            antennas.chasing >= 500,
             "the joint chased the whole run: {}",
             antennas.chasing
         );
@@ -2355,14 +3547,6 @@ mod tests {
 
         let mut report = Report::default();
         capabilities(&measured, &mut report);
-        assert!(
-            report
-                .measured
-                .iter()
-                .any(|line| line.contains("capability antennas: saturating")),
-            "past the minimum the figures are the motor's: {:?}",
-            report.measured
-        );
         // The limit the figures are printed against is the class's own: the
         // antennas are a different XL330 variant from the seven head servos,
         // and a pair chosen against the wrong one is refused by the servo.
@@ -2379,23 +3563,24 @@ mod tests {
         assert!(report.findings.is_empty(), "capability never judges");
     }
 
-    /// A joint already moving when the stream starts is chasing but never set
-    /// off, so the class has travel figures and no acceleration figure -- and
-    /// the head's figures are printed against the head's own recorded limit.
+    /// A joint whose goal never moved was written no goal step, so the class
+    /// has travel figures and no acceleration figure -- and the head's figures
+    /// are printed against the head's own recorded limit.
     #[test]
-    fn a_chase_that_never_set_off_from_rest_reports_no_ramp() {
+    fn a_chase_under_a_goal_that_never_moved_has_no_acceleration_figure() {
         let samples = throttled_chase(JointRef::Leg0, 40, &[0.05]);
         let measured = capability(&samples, grid());
         let legs = &measured[slot(JointGroup::Legs)];
         assert!(legs.chasing > 30, "{}", legs.chasing);
-        assert_eq!(legs.ramps, 0, "nothing in the run stood still first");
+        assert!(legs.steps.is_empty(), "the goal stood still all run");
+        assert!(legs.step_ramp_p50.is_none());
         let mut report = Report::default();
         capabilities(&measured, &mut report);
         assert!(
             report
                 .measured
                 .iter()
-                .any(|line| line.contains("capability legs: no ramp")),
+                .any(|line| line.contains("capability legs: 0 goal step(s), under 10")),
             "{:?}",
             report.measured
         );
@@ -2412,39 +3597,678 @@ mod tests {
         );
     }
 
-    /// A motor that reaches its speed in one period is reported at that
-    /// period's gain, not at a quarter of it.
+    /// A band the content barely reached is printed and marked unread rather
+    /// than dropped, and the regime is read off the bands that were.
     ///
-    /// The window is a window and not an averaging length: a capability run is
-    /// taken at a profile above what the motors can do, where every ramp ends
-    /// inside it, and a mean over four periods would call that motor four times
-    /// slower than it is. The count of capped ramps says the figure is a floor.
+    /// The absence is a reading: it says the library never held this class that
+    /// far behind. A table that dropped it would leave a person unable to tell
+    /// that from a class the run never pushed at all, and a regime read across
+    /// it would turn a handful of samples into a plateau.
     #[test]
-    fn a_ramp_that_ends_inside_the_window_is_not_averaged_over_it() {
-        // Still, then one period at full speed and cruising there.
-        let samples = throttled_chase(JointRef::AntennaLeft, 40, &[0.0, 0.2, 0.2, 0.2, 0.2, 0.2]);
+    fn a_band_under_the_minimum_is_printed_unread_and_read_past() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            PROFILE_ACCELERATION_MAX,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        // Twelve moves fill the bands under 0.55 rad; one longer move puts a
+        // few samples in the bands above them and no more.
+        let mut samples = stepped_chases(model, 12, 0.55, 30);
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut present = [0.0; ROW_COUNT];
+        present[index] = 100.0;
+        let mut commanded = present;
+        commanded[index] += 0.95;
+        let base = samples.len() as i64 + 4;
+        for n in 0..6 {
+            samples.push(sample(base + n, &present, &commanded));
+            present[index] += model.v_max;
+        }
         let measured = capability(&samples, grid());
         let antennas = &measured[slot(JointGroup::Antennas)];
-        assert!(antennas.ramps > 0, "the joint set off repeatedly");
-        assert_eq!(
-            antennas.ramps, antennas.ramps_capped,
-            "every ramp reached its speed inside the window"
+        let unread: Vec<(f64, usize)> = antennas
+            .bins
+            .iter()
+            .filter(|bin| !bin.readable() && bin.samples > 0)
+            .map(|bin| (bin.low, bin.samples))
+            .collect();
+        assert!(!unread.is_empty(), "{:?}", unread);
+        assert!(
+            unread.iter().all(|(_, n)| *n < CAPABILITY_BIN_MIN_SAMPLES),
+            "{unread:?}"
         );
         assert!(
-            (antennas.ramp_p50 - 0.2).abs() < 1e-9,
-            "the one period's gain, not a quarter of it: {}",
-            antennas.ramp_p50
+            matches!(antennas.regime, Regime::MotorBound(_)),
+            "the regime is the readable bands', not the sparse ones': {:?}",
+            antennas.regime
         );
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report.measured.iter().any(|line| line
+                .contains("capability antennas: error 0.90–1.00 rad")
+                && line.contains("unread -- under 20 samples")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// One readable error band, `samples` of them all at one speed.
+    ///
+    /// Hand-built, because what the cases below are about is what a table of
+    /// bands reads as: a stream that filled the bands in a chosen order would
+    /// put the walk's own arithmetic under test at the same time, and the
+    /// orders these cases need are ones no generator produces on purpose.
+    fn band(index: usize, samples: usize, travel: f64) -> ErrorBin {
+        ErrorBin {
+            low: (index + 1) as f64 * CHASE_GAP_RAD,
+            high: (index + 2) as f64 * CHASE_GAP_RAD,
+            samples,
+            travel_p10: travel,
+            travel_p50: travel,
+            travel_p90: travel,
+        }
+    }
+
+    /// A class whose reading is those bands', with every figure the band table
+    /// does not decide left at nothing.
+    fn class_over(bins: Vec<ErrorBin>) -> ClassCapability {
+        let (regime, fell_away) = regime_of(&bins);
+        ClassCapability {
+            group: JointGroup::Antennas,
+            chasing: bins.iter().map(|bin| bin.samples).sum(),
+            travel_p10: 0.0,
+            travel_p50: 0.0,
+            travel_p90: 0.0,
+            travel_max: 0.0,
+            bins,
+            regime,
+            fell_away,
+            increases: 0,
+            increase_p50: 0.0,
+            increase_p90: 0.0,
+            steps: Vec::new(),
+            unreadable: 0,
+            step_ramp_p50: None,
+            step_ramp_p90: None,
+            period_ns: PERIOD_NS,
+        }
+    }
+
+    /// A top band slower than the one below it by more than the ratio is read
+    /// past, and the regime comes off the bands under it.
+    ///
+    /// A motor at its ceiling holds a speed as its error grows, so a band that
+    /// *lost* speed is never a ceiling reading: it is the periods after a large
+    /// goal step, or a stall. Reading it as the plateau would offer a candidate
+    /// Profile Velocity at a ramp speed -- under the cruise the class actually
+    /// held, which is the wrong side for nothing and the wrong figure for a
+    /// person.
+    #[test]
+    fn a_top_band_that_fell_away_is_read_past_and_the_plateau_is_under_it() {
+        let cruise = 0.05;
+        let class = class_over(vec![
+            band(0, 40, cruise),
+            band(1, 40, cruise),
+            band(2, 40, cruise),
+            band(3, 40, 0.5 * cruise),
+        ]);
+        let Regime::MotorBound(plateau) = class.regime else {
+            panic!("the bands under the fall are one speed: {:?}", class.regime)
+        };
+        assert_eq!(plateau.bins, 3, "the fall is read past, not walked into");
+        assert!(
+            (plateau.high - 4.0 * CHASE_GAP_RAD).abs() < 1e-12,
+            "the plateau tops out at the third band: {plateau:?}"
+        );
+        assert!(
+            (plateau.travel - cruise).abs() < 1e-12,
+            "the plateau's figure is the cruise: {plateau:?}"
+        );
+        assert_eq!(class.fell_away.len(), 1, "{:?}", class.fell_away);
+        let mut report = Report::default();
+        travel_against_error(&class, &mut report);
+        assert!(
+            report.measured.iter().any(|line| {
+                line.contains("capability antennas: error 0.40–0.50 rad, n 40")
+                    && line.contains(&format!(
+                        "travel p50 {:.0} units -- fell away",
+                        class.velocity_units(0.5 * cruise)
+                    ))
+                    && line.contains("2.00 times slower")
+            }),
+            "the fallen band is named with its own figures: {:?}",
+            report.measured
+        );
+        assert!(
+            report.measured.iter().any(|line| {
+                line.contains("capability antennas: motor-bound")
+                    && line.contains("over 3 band(s)")
+                    && line.contains(&format!(
+                        "slowest median in it {:.0} units",
+                        class.velocity_units(cruise)
+                    ))
+                    && line.contains("read under 1 band(s) that fell away")
+            }),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A band whose median came out zero is one speed with nothing, so a joint
+    /// that stalled while more than a gap behind its goal is not folded into a
+    /// plateau at zero units.
+    ///
+    /// The rule lives in `one_speed`'s arithmetic -- a ratio that is not a
+    /// number is not less than the ratio -- so it is asserted directly as well
+    /// as through a table. The natural-looking rewrite to a difference over a
+    /// maximum makes a zero-against-zero pair "one speed" and offers a
+    /// candidate Profile Velocity of zero, which is the figure
+    /// `PlantModel::from_registers` refuses.
+    #[test]
+    fn a_band_that_read_zero_is_one_speed_with_nothing() {
+        let cruise = 0.05;
+        assert!(!one_speed(0.0, 0.0), "a stall is not a speed");
+        assert!(!one_speed(0.0, cruise));
+        assert!(!one_speed(cruise, 0.0));
+        assert!(one_speed(cruise, cruise));
+        assert!(one_speed(
+            cruise,
+            cruise * (CAPABILITY_PLATEAU_RATIO - 0.05)
+        ));
+        assert!(!one_speed(
+            cruise,
+            cruise * (CAPABILITY_PLATEAU_RATIO + 0.05)
+        ));
+
+        // A stalled band under a cruise: the plateau is the cruise's two bands
+        // and the stall is below its foot.
+        let stalled = class_over(vec![
+            band(0, 40, 0.0),
+            band(1, 40, cruise),
+            band(2, 40, cruise),
+        ]);
+        let Regime::MotorBound(plateau) = stalled.regime else {
+            panic!("{:?}", stalled.regime)
+        };
+        assert_eq!(plateau.bins, 2, "{plateau:?}");
+        assert!((plateau.travel - cruise).abs() < 1e-12, "{plateau:?}");
+        assert!(stalled.fell_away.is_empty(), "{:?}", stalled.fell_away);
+
+        // A stalled *top* band is a fall at its extreme, so it is read past and
+        // the plateau is the cruise under it. No zero reaches a plateau figure.
+        let topped = class_over(vec![
+            band(0, 40, cruise),
+            band(1, 40, cruise),
+            band(2, 40, 0.0),
+        ]);
+        let Regime::MotorBound(plateau) = topped.regime else {
+            panic!("{:?}", topped.regime)
+        };
+        assert_eq!(plateau.bins, 2, "{plateau:?}");
+        assert!((plateau.travel - cruise).abs() < 1e-12, "{plateau:?}");
+        assert_eq!(topped.fell_away.len(), 1, "{:?}", topped.fell_away);
+        let mut report = Report::default();
+        travel_against_error(&topped, &mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("fell away") && line.contains("read zero")),
+            "a stalled band has no ratio to print: {:?}",
+            report.measured
+        );
+    }
+
+    /// Two stalled bands over a cruise are both read past, and the plateau is
+    /// the cruise.
+    ///
+    /// The case the walk's condition has to be a complement for: `one_speed`
+    /// refuses a zero against a zero and `>` does not order it either, so a
+    /// rule written as "not one speed and slower" catches the pair and a rule
+    /// written as "slower" alone would stop the walk on the upper zero and read
+    /// the plateau at zero units.
+    #[test]
+    fn two_stalled_bands_over_a_cruise_are_both_read_past() {
+        let cruise = 0.05;
+        let class = class_over(vec![
+            band(0, 40, cruise),
+            band(1, 40, cruise),
+            band(2, 40, 0.0),
+            band(3, 40, 0.0),
+        ]);
+        let Regime::MotorBound(plateau) = class.regime else {
+            panic!("{:?}", class.regime)
+        };
+        assert_eq!(plateau.bins, 2, "{plateau:?}");
+        assert!((plateau.travel - cruise).abs() < 1e-12, "{plateau:?}");
+        assert_eq!(class.fell_away.len(), 2, "{:?}", class.fell_away);
+    }
+
+    /// Two successive falls leave one band, and a class read content-bound with
+    /// bands read past is no measurement of that class.
+    ///
+    /// The content-bound candidate rule extrapolates a pair above everything
+    /// observed, on the premise that the library never held the class far
+    /// behind. A class whose far bands were read past was held exactly there,
+    /// so the premise is false and the report says the run offers no candidate
+    /// rather than repeating the never-held sentence.
+    #[test]
+    fn a_class_read_content_bound_after_a_fall_offers_no_candidate() {
+        let cruise = 0.05;
+        let class = class_over(vec![
+            band(0, 40, cruise),
+            band(1, 40, 0.6 * cruise),
+            band(2, 40, 0.3 * cruise),
+        ]);
+        assert_eq!(class.regime, Regime::ContentBound, "{:?}", class.regime);
+        assert_eq!(class.fell_away.len(), 2, "{:?}", class.fell_away);
+        let mut report = Report::default();
+        travel_against_error(&class, &mut report);
+        let fallen = report
+            .measured
+            .iter()
+            .filter(|line| line.contains("fell away"))
+            .count();
+        assert_eq!(fallen, 2, "{:?}", report.measured);
+        assert!(
+            report.measured.iter().any(|line| {
+                line.contains("capability antennas: content-bound")
+                    && line.contains("the reading needs two speeds")
+                    && line.contains("2 band(s) above were read past")
+                    && line.contains("not a measurement of this class")
+            }),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !report
+                .measured
+                .iter()
+                .any(|line| line.contains("fewer than two readable error bands")),
+            "the never-held sentence is a different reading: {:?}",
+            report.measured
+        );
+    }
+
+    /// One readable band and nothing read past still reads as the content never
+    /// having pushed the class.
+    ///
+    /// The other half of the case above: the two content-bound lines say
+    /// different things, and which one prints turns on whether a band was set
+    /// aside.
+    #[test]
+    fn content_bound_with_nothing_read_past_still_says_the_content_never_pushed() {
+        let class = class_over(vec![band(0, 40, 0.05), band(1, 4, 0.05)]);
+        assert_eq!(class.regime, Regime::ContentBound, "{:?}", class.regime);
+        assert!(class.fell_away.is_empty(), "{:?}", class.fell_away);
+        let mut report = Report::default();
+        travel_against_error(&class, &mut report);
+        assert!(
+            report.measured.iter().any(|line| {
+                line.contains("capability antennas: content-bound")
+                    && line.contains("fewer than two readable error bands")
+            }),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A fall over a rising remainder is read past and the remainder reads
+    /// gain-bound.
+    ///
+    /// The fell-away walk runs before the regime is named, so a run whose top
+    /// band is ramp periods does not hide a loop that was still speeding up
+    /// with its error underneath it.
+    #[test]
+    fn a_fall_over_a_rising_remainder_reads_gain_bound() {
+        let step = 0.01;
+        let class = class_over(vec![
+            band(0, 40, step),
+            band(1, 40, 2.0 * step),
+            band(2, 40, 4.0 * step),
+            band(3, 40, 8.0 * step),
+            band(4, 40, 6.0 * step),
+        ]);
+        assert_eq!(class.regime, Regime::GainBound, "{:?}", class.regime);
+        assert_eq!(class.fell_away.len(), 1, "{:?}", class.fell_away);
+        let mut report = Report::default();
+        travel_against_error(&class, &mut report);
+        assert!(
+            report.measured.iter().any(|line| {
+                line.contains("capability antennas: gain-bound")
+                    && line.contains("read under 1 band(s) that fell away")
+            }),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A top band slower than the one under it but inside the ratio is one
+    /// speed with it and stays in the plateau.
+    ///
+    /// The fall is the ratio and not the sign: two bands within
+    /// `CAPABILITY_PLATEAU_RATIO` are two errors the class answered at the same
+    /// speed, whichever came out the faster, and a rule keyed on the sign alone
+    /// would cut the plateau's own top band off it.
+    #[test]
+    fn a_top_band_slower_inside_the_ratio_is_one_speed_and_stays() {
+        let cruise = 0.05;
+        let class = class_over(vec![
+            band(0, 40, cruise),
+            band(1, 40, cruise),
+            band(2, 40, 0.9 * cruise),
+        ]);
+        let Regime::MotorBound(plateau) = class.regime else {
+            panic!("{:?}", class.regime)
+        };
+        assert_eq!(plateau.bins, 3, "{plateau:?}");
+        assert!(
+            (plateau.travel - 0.9 * cruise).abs() < 1e-12,
+            "the plateau's figure is its slowest median: {plateau:?}"
+        );
+        assert!(class.fell_away.is_empty(), "{:?}", class.fell_away);
+    }
+
+    /// A goal that moved less than a chase gap is no goal step: it does not put
+    /// the joint into a chase, so what follows it is an arrival and not a ramp.
+    ///
+    /// The median of the steps' ramps is the class's candidate Profile
+    /// Acceleration, so a listing that admitted arrivals would bias a figure
+    /// that ends up in a servo register.
+    #[test]
+    fn a_goal_moved_less_than_a_chase_gap_is_no_step() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        let samples = stepped_chases(model, 12, 0.5 * CHASE_GAP_RAD, 30);
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert!(
+            antennas.steps.is_empty(),
+            "twelve sub-gap goal moves are no steps: {:?}",
+            antennas
+                .steps
+                .iter()
+                .map(|step| step.step)
+                .collect::<Vec<_>>()
+        );
+        assert!(antennas.step_ramp_p50.is_none());
+        // The half-gap that is no step is no chase either, which is the reason
+        // the rejection exists: the class measured nothing, and the report says
+        // that rather than printing a listing of arrivals.
+        assert_eq!(antennas.chasing, 0);
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report.measured.iter().any(|line| line.contains(
+                "capability antennas: no sample found this class chasing a setpoint more than \
+                 0.1 rad away"
+            )),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A goal step written to a joint that was already travelling is not
+    /// listed: it ramps from the speed it had rather than from rest, so its
+    /// second period's gain is not the motor's acceleration.
+    ///
+    /// Both halves of the rejection matter and this is the other one. The
+    /// stream holds one write from rest and one made two periods into the
+    /// answer, and only the first is a reading.
+    #[test]
+    fn a_goal_step_written_mid_travel_is_not_listed() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let (from_rest, mid_travel) = (2_i64, 8_i64);
+        let mut samples = Vec::new();
+        let mut state = Predicted::default();
+        let mut present = [0.0; ROW_COUNT];
+        let mut commanded = [0.0; ROW_COUNT];
+        let mut goals: Vec<f64> = Vec::new();
+        for n in 0..60_i64 {
+            samples.push(sample(n, &present, &commanded));
+            if n == from_rest || n == mid_travel {
+                commanded[index] += 3.0;
+            }
+            goals.push(commanded[index]);
+            let at = usize::try_from(n).expect("a sample index");
+            if at >= RESPONSE_DEAD_SAMPLES {
+                model.step(&mut state, goals[at - RESPONSE_DEAD_SAMPLES]);
+                present[index] = state.position;
+            }
+        }
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(
+            antennas.steps.len(),
+            1,
+            "only the write the joint was standing still for: {:?}",
+            antennas
+                .steps
+                .iter()
+                .map(|step| step.at_ns - ORIGIN_NS)
+                .collect::<Vec<_>>()
+        );
+        // The instant is the sample the goal changed at, which is the period
+        // after the write in this stream's own shape.
+        assert_eq!(
+            antennas.steps[0].at_ns,
+            ORIGIN_NS + (from_rest + 1) * PERIOD_NS
+        );
+        assert!(
+            antennas.steps[0].ramp.is_some(),
+            "the from-rest step still carries its ramp"
+        );
+    }
+
+    /// A stretch that ended inside a step has no ramp for it, and says so
+    /// rather than printing a figure it did not measure.
+    ///
+    /// What a run cut mid-move produces -- a fetch whose log stops, a stretch
+    /// broken by a dropped sample. The `None` is also what stands between the
+    /// report and a median over no ramps at all: a class written enough steps
+    /// that none of them carried one has no acceleration figure, not a figure
+    /// of zero.
+    #[test]
+    fn a_step_the_stretch_ended_inside_has_no_ramp() {
+        let model = PlantModel::from_registers(
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
+            PERIOD_NS,
+        )
+        .expect("a plant");
+        // Twelve moves, then the stream cut one period after the last write's
+        // own sample: the step is read and the two periods its ramp is the
+        // difference of are not both there.
+        let hold = 80;
+        let mut samples = stepped_chases(model, 12, 1.2, hold);
+        samples.truncate(2 + 11 * hold + 3);
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(antennas.steps.len(), 12, "every write is still a step");
+        let last = antennas.steps.last().expect("a step");
+        assert!(
+            last.ramp.is_none(),
+            "the stretch ended inside it: {:?}",
+            last.travel
+        );
+        assert_eq!(last.travel.len(), 1, "one period after the write, not two");
         let mut report = Report::default();
         capabilities(&measured, &mut report);
         assert!(
             report
                 .measured
                 .iter()
-                .any(|line| line.contains(&format!("{} of them capped inside it", antennas.ramps))),
+                .any(|line| line.contains("capability antennas: goal step at")
+                    && line.contains("ramp no ramp -- the stretch ended inside the step")),
             "{:?}",
             report.measured
         );
+        // The eleven whole steps still carry the median, so this class's
+        // acceleration is read past the cut one.
+        assert!(antennas.step_ramp_p50.is_some());
+
+        // And a class whose steps all ended their stretches has no median at
+        // all: twelve two-sample stretches, each a write and one sample after
+        // it, with a gap between them.
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut cut = Vec::new();
+        // The joint stands where it is throughout: a step is a write made to a
+        // joint that was not travelling, and what this stream is about is the
+        // periods after the write that are not there.
+        let present = [0.0; ROW_COUNT];
+        let mut commanded = [0.0; ROW_COUNT];
+        for burst in 0..12_i64 {
+            // Four slots apart, which is past MAX_GAP_PERIODS, so no two
+            // bursts are one stretch.
+            let at = burst * (MAX_GAP_PERIODS as i64 + 4);
+            cut.push(sample(at, &present, &commanded));
+            commanded[index] += 3.0;
+            cut.push(sample(at + 1, &present, &commanded));
+        }
+        let stepless = capability(&cut, grid());
+        let antennas = &stepless[slot(JointGroup::Antennas)];
+        assert_eq!(antennas.steps.len(), 12);
+        assert!(
+            antennas.steps.iter().all(|step| step.ramp.is_none()),
+            "no burst holds two post-write periods"
+        );
+        assert!(
+            antennas.step_ramp_p50.is_none() && antennas.step_ramp_p90.is_none(),
+            "twelve steps and no ramp among them is no figure, not a zero: {:?} {:?}",
+            antennas.step_ramp_p50,
+            antennas.step_ramp_p90
+        );
+    }
+
+    /// The increase figures are the acceleration a class that never reached its
+    /// motor is read at, and over a joint accelerating by a known amount every
+    /// period they are that amount.
+    ///
+    /// `RECORDED_CAPABILITY_BODY_YAW`'s acceleration is this median -- the yaw
+    /// is written too few goal steps for a ramp median -- so an off-by-one in
+    /// the period pairing, or the loss of the encoder-count filter, moves a
+    /// figure Step B writes into a servo. A linear ramp catches both: a
+    /// mis-paired difference reads twice the gain or none of it.
+    #[test]
+    fn the_increase_median_is_the_acceleration_of_a_known_ramp() {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        // A joint whose per-period travel grows by `gain` every period, chasing
+        // a goal it never approaches.
+        let ramped = |gain: f64, periods: i64| {
+            let mut samples = Vec::new();
+            let mut present = [0.0; ROW_COUNT];
+            let mut commanded = [0.0; ROW_COUNT];
+            commanded[index] = 1_000.0;
+            for n in 0..periods {
+                samples.push(sample(n, &present, &commanded));
+                present[index] += gain * (n + 1) as f64;
+            }
+            samples
+        };
+        let gain = 0.01;
+        assert!(gain > COUNT_RAD, "the gain has to clear the filter");
+        let measured = capability(&ramped(gain, 40), grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        assert_eq!(
+            antennas.increases,
+            40 - RESPONSE_DEAD_SAMPLES,
+            "every chasing period after the first gained on the one before it"
+        );
+        for figure in [antennas.increase_p50, antennas.increase_p90] {
+            assert!(
+                (figure - gain).abs() < 1e-12,
+                "{figure} against a per-period gain of {gain}"
+            );
+        }
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report.measured.iter().any(|line| line.contains(&format!(
+                "capability antennas: {} chasing period(s) travelled at least a count further",
+                antennas.increases
+            )) && line
+                .contains(&format!("({:.0} units)", antennas.acceleration_units(gain)))),
+            "{:?}",
+            report.measured
+        );
+
+        // A ramp under an encoder count a period is filtered out: the figure is
+        // the acceleration of a joint that is accelerating, and a count is the
+        // smallest change the encoder can tell from stillness.
+        let under = capability(&ramped(0.5 * COUNT_RAD, 40), grid());
+        let antennas = &under[slot(JointGroup::Antennas)];
+        assert!(antennas.chasing > 30, "the joint chased throughout");
+        assert_eq!(
+            antennas.increases, 0,
+            "a gain under a count is encoder noise, not acceleration"
+        );
+    }
+
+    /// A non-finite reading in a log is corruption, not a fast joint: it is
+    /// counted, left out of every figure, and named in the report.
+    ///
+    /// It passes the chase test -- anything stands further than a gap from
+    /// infinity -- and the error band it would be filed under is at the top of
+    /// the address space, so binning it is an allocation the analyzer dies on.
+    /// A whole tour's report, health and residuals included, is lost with it.
+    #[test]
+    fn a_non_finite_reading_is_counted_and_measures_nothing() {
+        let index = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut samples = Vec::new();
+        let mut present = [0.0; ROW_COUNT];
+        let mut commanded = [0.0; ROW_COUNT];
+        commanded[index] = 1_000.0;
+        for n in 0..40 {
+            present[index] = if n == 20 {
+                f64::INFINITY
+            } else {
+                f64::from(n) * 0.05
+            };
+            samples.push(sample(i64::from(n), &present, &commanded));
+        }
+        let measured = capability(&samples, grid());
+        let antennas = &measured[slot(JointGroup::Antennas)];
+        // One infinite reading is in two periods' travel -- the one that
+        // reached it and the one that left it -- and in the second of those
+        // periods' error as well. Neither sample measures anything; the
+        // thirty-seven around them do.
+        assert_eq!(antennas.unreadable, 2, "{}", antennas.unreadable);
+        assert_eq!(antennas.chasing, 40 - RESPONSE_DEAD_SAMPLES - 2);
+        for figure in [
+            antennas.travel_p10,
+            antennas.travel_p50,
+            antennas.travel_p90,
+            antennas.travel_max,
+            antennas.increase_p50,
+            antennas.increase_p90,
+        ] {
+            assert!(figure.is_finite(), "{figure}");
+        }
+        assert!(
+            antennas.bins.iter().all(|bin| bin.travel_p50.is_finite()),
+            "no band holds it"
+        );
+        let mut report = Report::default();
+        capabilities(&measured, &mut report);
+        assert!(
+            report.measured.iter().any(|line| line
+                .contains("capability antennas: 2 chasing sample(s) carried a non-finite reading")),
+            "{:?}",
+            report.measured
+        );
+        assert!(report.findings.is_empty(), "capability never judges");
     }
 
     /// A gap in the sample stream is not a period: the travel across it is two
@@ -2453,8 +4277,8 @@ mod tests {
     #[test]
     fn a_gap_in_the_stream_is_not_a_per_period_travel() {
         let model = PlantModel::from_registers(
-            SHIPPED_PROFILES.antennas.1,
-            SHIPPED_PROFILES.antennas.0,
+            SHIPPED_PROFILES.antennas.velocity,
+            SHIPPED_PROFILES.antennas.acceleration,
             PERIOD_NS,
         )
         .expect("a plant");

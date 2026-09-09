@@ -22,7 +22,8 @@ use core::time::Duration;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, group_of, row};
 use reachy_motion::plant::{
-    GroupPlants, GroupProfiles, MAX_GAP_PERIODS, RESPONSE_DEAD_SAMPLES, SHIPPED_PERIOD_NS,
+    GroupPlants, GroupProfiles, MAX_GAP_PERIODS, ProfilePair, RESPONSE_DEAD_SAMPLES,
+    SHIPPED_PERIOD_NS, SHIPPED_PROFILES,
 };
 use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
@@ -86,7 +87,7 @@ fn gesture(durations: MoveDurations) -> MotionCommand {
 }
 
 /// The profile the recordings in `fixtures/traces` were made under, in register
-/// units: acceleration then velocity, as the commissioning sweep writes them.
+/// units.
 ///
 /// The bench nights ran a faster pair than the deployment ships, so every
 /// fixture here is judged against the plant it was actually recorded on. A log
@@ -95,9 +96,15 @@ fn gesture(durations: MoveDurations) -> MotionCommand {
 /// One pair for all three classes: the bench nights wrote one pair into all
 /// nine servos, which is what the recordings were made on.
 const BENCH_PROFILE: GroupProfiles = GroupProfiles {
-    legs: (400, 600),
-    yaw: (400, 600),
-    antennas: (400, 600),
+    legs: BENCH_PAIR,
+    yaw: BENCH_PAIR,
+    antennas: BENCH_PAIR,
+};
+
+/// The one pair those nights wrote into all nine servos.
+const BENCH_PAIR: ProfilePair = ProfilePair {
+    acceleration: 400,
+    velocity: 600,
 };
 
 /// The plant a recording is judged against: its own profile, on the grid that
@@ -298,15 +305,111 @@ fn sustained_residual(judged: &[Judged], periods: usize) -> f64 {
     worst
 }
 
-/// The recordings cut from the 2026-09-06 clip-library tour and the wake
-/// gesture beside it, which are the runs the shipped screen is sized on.
-const TOUR_FIXTURES: [&str; 5] = [
-    "trace-tour-toc-toc-toc",
-    "trace-tour-side-peekaboo",
-    "trace-tour-proud1",
-    "trace-tour-no-sad1",
-    "trace-wake-20260906",
+/// The recordings cut from the clip-library tours and the wake gesture beside
+/// them, which are the runs the shipped screen is sized on, each with the
+/// profile it was recorded under.
+///
+/// Two profiles across the seven: five recordings from the nights that wrote
+/// `20 / 50` into all nine servos, and two from the tour that confirmed the
+/// legs' commissioned pair, which ran the cranks at what the tree now ships
+/// them at and the other two classes at `20 / 50`. Both are literals, because a
+/// recording carries the profile it was made on and cannot follow a constant
+/// anywhere; that the second of the two is also what the tree ships today is
+/// asserted on its own, by
+/// [`the_confirmation_tour_is_still_the_shipping_profile`].
+const TOUR_FIXTURES: [(&str, GroupProfiles); 7] = [
+    ("trace-tour-toc-toc-toc", TOUR_2050_PROFILE),
+    ("trace-tour-side-peekaboo", TOUR_2050_PROFILE),
+    ("trace-tour-proud1", TOUR_2050_PROFILE),
+    ("trace-tour-no-sad1", TOUR_2050_PROFILE),
+    ("trace-wake-20260906", TOUR_2050_PROFILE),
+    ("trace-tour-grid-snap", CONFIRM_TOUR_PROFILE),
+    ("trace-tour-stumble-and-recover", CONFIRM_TOUR_PROFILE),
 ];
+
+/// The profile the confirmation tour of 2026-09-09 was flown at, in register
+/// units.
+///
+/// The legs at the pair the commissioning read off them, the other two classes
+/// at the pair the earlier tours wrote everywhere. Stated as a literal for the
+/// same reason [`TOUR_2050_PROFILE`] is: it is a fact about two recordings, and
+/// the fixtures are judged at the profile they were recorded at. It happens to
+/// equal [`SHIPPED_PROFILES`] today, and that coincidence is a separate
+/// statement with its own assertion — the day a class is commissioned, these
+/// two rows still have to be replayed against the tour they came from.
+const CONFIRM_TOUR_PROFILE: GroupProfiles = GroupProfiles {
+    legs: ProfilePair {
+        acceleration: 287,
+        velocity: 326,
+    },
+    yaw: TOUR_2050_PAIR,
+    antennas: TOUR_2050_PAIR,
+};
+
+/// The profile every recording of the 2026-09-06 tour and the wake gesture was
+/// made under, in register units.
+///
+/// The deployment commissioned one pair for all nine servos on those nights,
+/// and it no longer ships that pair on the legs: the cranks run their own
+/// measured capability now. So these recordings need the pair they were made
+/// on, stated here the way `BENCH_PROFILE` states the bench nights' — a leg
+/// recorded under `20 / 50` and replayed under the commissioned `287 / 326`
+/// would be a joint judged against a generator twelve times its own, and the
+/// difference would read as residual the machine never showed.
+const TOUR_2050_PROFILE: GroupProfiles = GroupProfiles {
+    legs: TOUR_2050_PAIR,
+    yaw: TOUR_2050_PAIR,
+    antennas: TOUR_2050_PAIR,
+};
+
+/// The one pair those tours wrote into all nine servos.
+const TOUR_2050_PAIR: ProfilePair = ProfilePair {
+    acceleration: 20,
+    velocity: 50,
+};
+
+/// The plant a recorded profile is judged against, on the shipped grid every
+/// one of the kept recordings was driven at.
+fn tour_plant_of(profiles: &GroupProfiles) -> GroupPlants {
+    GroupPlants::from_profiles(profiles, SHIPPED_PERIOD_NS)
+        .expect("a recorded tour profile is three models")
+}
+
+/// The plant a kept tour recording is judged against, found by the fixture's
+/// name: the profile of its own row in [`TOUR_FIXTURES`].
+///
+/// For a caller holding a name and no row — a fixture the suite reads without
+/// one fails here rather than being judged against whatever plant its caller
+/// had to hand. A caller walking the table itself holds the profile already and
+/// builds its plant with [`tour_plant_of`].
+fn tour_plant(name: &str) -> GroupPlants {
+    let profiles = TOUR_FIXTURES
+        .into_iter()
+        .find(|(fixture, _)| *fixture == name)
+        .map(|(_, profiles)| profiles)
+        .unwrap_or_else(|| panic!("{name} has no recorded profile in TOUR_FIXTURES"));
+    tour_plant_of(&profiles)
+}
+
+/// The two confirmation-tour fixtures were cut at the profile the tree ships,
+/// and the pins read off them are what the shipped screen is sized on.
+///
+/// The coupling the fixture rows used to carry by aliasing the shipped constant,
+/// stated where it can fail in its own words. The rows themselves cannot follow
+/// a commissioning — a recording is a recording — so when a class's pair next
+/// moves, what has to happen is a fresh tour and a fresh cut, not an edit to
+/// these two rows.
+#[test]
+fn the_confirmation_tour_is_still_the_shipping_profile() {
+    assert_eq!(
+        CONFIRM_TOUR_PROFILE, SHIPPED_PROFILES,
+        "the confirmation tour is no longer the shipping profile: the pins read off \
+         `trace-tour-grid-snap` and `trace-tour-stumble-and-recover` are readings at a profile \
+         the tree has stopped shipping. Fly a tour at the new pair, cut its worst windows, and \
+         move the pins onto the new fixtures -- do not rebind these two rows, which are \
+         replayable only against the plant they were recorded on"
+    );
+}
 
 /// Guard 1. Neither run that went well raises anything in the shipped tracking
 /// comparison, and the lags they ran at are the headroom record.
@@ -367,28 +470,30 @@ fn the_runs_that_went_well_raise_nothing() {
 /// The worst residual any head joint ran at on the bench recordings, radians.
 ///
 /// Local to this suite rather than a library constant, because no live run is
-/// reported against the bench profile: these recordings were made under a pair
-/// three times faster than the deployment commissions, so the figure screens
-/// nothing a report prints. What it is for is the model itself — the same
+/// reported against the bench profile: these recordings were made at `400 / 600`
+/// against the `20 / 50` the deployment commissions, and on a 32 ms grid against
+/// the shipped 20 ms, so the figure screens nothing a report prints. What it is
+/// for is the model itself — the same
 /// arithmetic over the same machine at a second setting, which is the only
 /// in-tree check that the model is the servo's generator rather than a fit to
 /// one profile.
-const BENCH_WORST_HEAD_RESIDUAL_RAD: f64 = 0.094;
+const BENCH_WORST_HEAD_RESIDUAL_RAD: f64 = 0.0315;
 
 /// The worst residual an antenna ran at on the fastest bench sweep, radians.
 ///
-/// Read the same way as [`BENCH_WORST_HEAD_RESIDUAL_RAD`], over the sweep whose
-/// goal ran at four times the profile it was commissioned at: the joint was a
-/// radian and a third behind that goal and this far from its own trajectory.
-const BENCH_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.792;
+/// Read the same way as [`BENCH_WORST_HEAD_RESIDUAL_RAD`], over the sweep that
+/// crossed 187° in 0.40 s at an 855°/s peak: the joint was a radian and a third
+/// behind its goal and this far from its own trajectory.
+const BENCH_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.3321;
 
 /// Guard 1. The clip library played on the unit raises nothing, and its worst
 /// residuals are the figures the shipped threshold is sized over.
 ///
-/// The five recordings cut from the 2026-09-06 tour and the wake gesture, under
-/// the profile the deployment commissions — the whole library's worst residual
-/// on record, its worst leg and antenna reversal excursions, its longest travel
-/// and the shipped gesture. A healthy machine on the content it ships with, so
+/// Every row of [`TOUR_FIXTURES`], each replayed at the profile it was recorded
+/// at — the whole library's worst residual on record, its worst leg and antenna
+/// reversal excursions, its longest travel and the shipped gesture, over the
+/// 2026-09-06 tour, the wake gesture beside it and the 2026-09-09 confirmation
+/// tour. A healthy machine on the content it ships with, so
 /// a raise here is the screen sized wrong; the pins are the library's own
 /// constants, so the figure a report prints beside a live run and the figure
 /// the recordings hold are one statement.
@@ -398,7 +503,7 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
     let window = cfg.tracking.ticks as usize;
     let mut judged = Vec::new();
     let mut sustained = 0.0_f64;
-    for name in TOUR_FIXTURES {
+    for (name, profiles) in TOUR_FIXTURES {
         let trace = fixture(name);
         assert_eq!(trace.runs(), 1, "{name} holds more than the window cut");
         // A fixture cut from a run at another period would be a different
@@ -408,7 +513,7 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
             SHIPPED_PERIOD_NS,
             "{name} was recorded on another grid"
         );
-        let outcome = replay(&cfg, &cfg.plant, trace.run(0));
+        let outcome = replay(&cfg, &tour_plant_of(&profiles), trace.run(0));
         assert!(
             outcome.trips.is_empty(),
             "{name}: {:?}",
@@ -476,20 +581,46 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
 /// prints a live run against, and those are the head's and the antennas'. This
 /// one is what one fixture is kept for — the excursion a crank makes when the
 /// goal turns round through it, which the aggregate head maximum (a body yaw
-/// reversal, half again this figure) hides.
-const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.274;
+/// reversal, a third again this figure) hides.
+const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.2978;
+
+/// The worst residual a leg ran at on the confirmation tour of the commissioned
+/// pair, radians.
+///
+/// The reason that tour was flown, held where it can be replayed: the same six
+/// cranks on the same library at `287 / 326` instead of `20 / 50`, a generator
+/// twelve times the velocity and fourteen times the ramp, judged against the
+/// model of the pair they actually ran. A crank that could not follow the pair
+/// it was commissioned at would stand further from its own trajectory here, not
+/// nearer, and 0.4 rad is the bound that tour was read against.
+const CONFIRM_WORST_LEG_RESIDUAL_RAD: f64 = 0.3319;
+
+/// The worst residual an antenna ran at on the stiffer gains the class no
+/// longer runs, radians.
+///
+/// `proud1`'s reversal, which was the library antenna pin until the class went
+/// to the vendor's `200 / 0 / 0` and a tour at those gains read 0.3913 rad. Kept
+/// as its own figure rather than dropped with the pin: the two recordings are
+/// the same class on the same pair at two proportional terms, which is the only
+/// in-tree reading of what a gain change does to the distance a joint follows
+/// its generator at.
+const CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD: f64 = 0.3782;
 
 /// The worst residual the shipped wake gesture and the hold after it ran at,
 /// radians: head then antennas.
 ///
 /// Local for the same reason, and kept because this recording is the evidence
-/// for a direction no other fixture holds. The dead time is three samples and
-/// not four because the tour's saturated moves improve with a deeper ring while
-/// this gesture's antennas get steadily worse — about a quarter per sample — so
-/// a ring deepened to chase the tour would mis-time every unsaturated move. The
-/// tour pins move under a dead-time change too, but they move in the direction
-/// that reads as an improvement; this pair is what says the trade was a trade.
-const WAKE_WORST_RESIDUAL_RAD: (f64, f64) = (0.1106, 0.0988);
+/// for a direction no other fixture holds. A change of dead time moves the
+/// model's clock by one period along the generator's own path, and it moved
+/// this pin's antennas *down* a period of travel — 0.0988 to 0.0748, 0.024 rad
+/// at `50` units — because the wake antennas' worst sample sat ahead of its
+/// prediction, while it moved the tour's pins *up* the same period because
+/// their worst samples sat behind. The two logs pull opposite ways with depth,
+/// so a depth minimised on either one alone would mis-time the other; that is
+/// why the depth is measured rather than fitted, and the measurement is
+/// `plant::RESPONSE_DEAD_SAMPLES`' own comment. This pair is the one fixture
+/// holding the downward sign.
+const WAKE_WORST_RESIDUAL_RAD: (f64, f64) = (0.1346, 0.0748);
 
 /// The worst a joint ran behind its *goal* on the library's longest travel,
 /// radians.
@@ -512,10 +643,11 @@ fn is_leg(joint: JointRef) -> bool {
 /// Guard 1. Each recording cut from the library holds the figure it is kept
 /// for.
 ///
-/// The test beside the aggregate one, per fixture rather than over the five at
-/// once. The library's two worst residuals are a maximum and the aggregate
-/// pins are where they belong; the rest of what these files are kept for is
-/// per file, and a maximum over the five says nothing about any of them. Cut a
+/// The test beside the aggregate one, per fixture rather than over every row of
+/// [`TOUR_FIXTURES`] at once. The library's two worst residuals are a maximum
+/// and the aggregate pins are where they belong; the rest of what these files
+/// are kept for is per file, and a maximum over the table says nothing about
+/// any of them. Cut a
 /// window differently, truncate one, swap two, and the aggregate is unmoved —
 /// which is the rot the README's own contract says one test per file prevents.
 ///
@@ -527,7 +659,7 @@ fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
     let judged = |name: &str| {
         let trace = fixture(name);
         let run = trace.run(0);
-        replay(&cfg, &cfg.plant, run).judged
+        replay(&cfg, &tour_plant(name), run).judged
     };
 
     // The worst residual on record is a body yaw reversal on `no_sad1`, and it
@@ -538,15 +670,38 @@ fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
         "no_sad1's worst head residual is {no_sad1:.4} rad"
     );
 
-    // The worst antenna reversal is `proud1`'s, which is the antenna pin.
+    // The worst antenna reversal at the gains the class ships is
+    // `stumble_and_recover`'s, on the confirmation tour, and that is the
+    // antenna pin.
+    let stumble = worst_residual(&judged("trace-tour-stumble-and-recover"), is_antenna);
+    assert!(
+        (stumble - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "stumble_and_recover's worst antenna residual is {stumble:.4} rad"
+    );
+
+    // `proud1` is the same class on the same pair at the stiffer gains it no
+    // longer runs, and holds its own figure for that reason.
     let proud1 = worst_residual(&judged("trace-tour-proud1"), is_antenna);
     assert!(
-        (proud1 - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        (proud1 - CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD).abs() < 5e-3,
         "proud1's worst antenna residual is {proud1:.4} rad"
+    );
+    assert!(
+        stumble > proud1,
+        "proud1 reads {proud1:.4} rad at `500 / 0 / 100` and stumble_and_recover {stumble:.4} rad \
+         at `200 / 0 / 0`: what these two are kept for is the softer loop following further behind"
+    );
+
+    // The commissioned leg pair, on the tour that confirmed it: the cranks'
+    // worst against the 0.4 rad bound that tour was read against.
+    let grid_snap = worst_residual(&judged("trace-tour-grid-snap"), is_leg);
+    assert!(
+        (grid_snap - CONFIRM_WORST_LEG_RESIDUAL_RAD).abs() < 5e-3,
+        "grid_snap's worst leg residual is {grid_snap:.4} rad"
     );
 
     // The worst *leg* reversal is `side_peekaboo`'s, and a crank's excursion is
-    // its own figure: the head maximum is a yaw and reads half again this.
+    // its own figure: the head maximum is a yaw and reads a third again this.
     let peekaboo = worst_residual(&judged("trace-tour-side-peekaboo"), is_leg);
     assert!(
         (peekaboo - CLIP_WORST_LEG_RESIDUAL_RAD).abs() < 5e-3,
@@ -602,9 +757,9 @@ fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
 /// and their residuals are pinned at that profile.
 ///
 /// The same model at a second setting: these runs were driven by servos
-/// commissioned three times faster, and the arithmetic that judges them is the
-/// deployment's with two registers changed. A model carrying a constant read
-/// off one profile would show up here rather than on the machine.
+/// commissioned at `400 / 600` on a 32 ms grid, and the arithmetic that judges
+/// them is the deployment's with two registers changed. A model carrying a
+/// constant read off one profile would show up here rather than on the machine.
 #[test]
 fn the_bench_runs_that_went_well_pin_their_residuals_at_their_own_profile() {
     let cfg = MotionConfig::default();
@@ -640,27 +795,22 @@ fn the_bench_runs_that_went_well_pin_their_residuals_at_their_own_profile() {
         (antennas - BENCH_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
         "the fast sweep's worst antenna residual is {antennas:.4} rad"
     );
-    // And what the two figures are of, which is the point of keeping them.
-    // The head, on a gesture the whole machine made well, reads a tenth of a
-    // radian: the model is the generator at either setting. The antenna on the
-    // speed record reads better than the screen, on a run nothing was wrong
-    // with — its goal outran the profile, the servo outran the profile's own
-    // stated cap by a few percent, and three samples of dead time on a 32 ms
-    // loop is half again the delay the same constant means on the 20 ms grid
-    // the machine ships. What keeps that joint in service is the pace rule and
-    // not the screen: it was moving with its generator the whole way. So this
-    // pair of pins is also the standing statement that the screen's margin is
-    // a figure about one profile on one grid, and the two rules behind it are
-    // what carry a machine on another.
+    // And what the two figures are of, which is the point of keeping them. The
+    // head on the validated gesture reads three hundredths of a radian and the
+    // antenna on the fastest content in the tree reads a third of one, both
+    // under the shipped tour's own worsts — at `400 / 600` against the
+    // commissioned `20 / 50`, on a 32 ms grid against the shipped 20 ms. So the
+    // model is the servo's generator at either setting. The screen's margin
+    // stays a figure about one profile on one grid; the evidence is that another
+    // pair on another grid still reads under it.
     assert!(
         head < cfg.tracking.threshold_rad,
         "the validated gesture's head now reaches the {:.4} rad screen",
         cfg.tracking.threshold_rad
     );
     assert!(
-        antennas > cfg.tracking.threshold_rad,
-        "the fast sweep's antenna no longer passes the {:.4} rad screen, so this pin no longer \
-         says that the pace rule is what carried it",
+        antennas < cfg.tracking.threshold_rad,
+        "the fast sweep's antenna now reaches the {:.4} rad screen",
         cfg.tracking.threshold_rad
     );
 }
@@ -1249,6 +1399,12 @@ fn the_gain_change_is_a_servo_under_the_pace_floor_and_the_same_servo_over_it() 
 /// regular period. This is the first fixture the stillness watch is replayed
 /// over at all, so it is also the check that a live window and a replayed one
 /// are the same window.
+///
+/// The settle allowance is read here too, because this file and its quiet
+/// sibling are the only recordings in the suite that hold a real arrival
+/// followed by a real hold: the segmentation — the allowance running from the
+/// goal write and ending the period before the judged window opens — is
+/// otherwise only ever asserted against series the cases laid out themselves.
 #[test]
 fn the_recorded_antenna_hold_reads_one_hunt_and_one_dither() {
     let cfg = StillnessConfig::default();
@@ -1272,19 +1428,21 @@ fn the_recorded_antenna_hold_reads_one_hunt_and_one_dither() {
         left.opened_after_ns as f64 / 1e9
     );
     assert!(
-        left.samples.abs_diff(161) <= 1,
+        left.readings.samples.abs_diff(161) <= 1,
         "the left window judged {} readings",
-        left.samples
+        left.readings.samples
     );
-    let left_reversals = left.reversals_per_s * left.length().as_secs_f64();
+    let left_reversals = left.readings.reversals_per_s * left.readings.length().as_secs_f64();
     assert!(
         (left_reversals - 81.0).abs() <= 1.0,
         "the left antenna turned round {left_reversals:.1} times"
     );
     let mean = left
+        .readings
         .reversal_interval_mean_samples
         .expect("a hunting antenna has intervals");
     let spread = left
+        .readings
         .reversal_interval_spread_samples
         .expect("and a spread of them");
     assert!((mean - 1.96).abs() < 0.02, "{left:?}");
@@ -1292,25 +1450,220 @@ fn the_recorded_antenna_hold_reads_one_hunt_and_one_dither() {
     // Near an alias of a quarter of the sample rate, and only near: the phase
     // and amplitude drift across the hold, so the turning is not locked to the
     // grid the goal is rewritten on.
-    let hz = left.apparent_frequency_hz().expect("a frequency");
+    let hz = left.readings.apparent_frequency_hz().expect("a frequency");
     assert!((hz - 12.7).abs() < 0.3, "{left:?} read {hz:.2} Hz apparent");
     let Err(complaint) = judge(&left, &cfg) else {
         panic!("the recorded hunt judged still: {left:?}");
     };
-    assert!((left.excursion_counts() - 9.0).abs() < 1.0, "{complaint}");
+    assert!(
+        (left.readings.excursion_counts() - 9.0).abs() < 1.0,
+        "{complaint}"
+    );
+    // The settle allowance, over the one recording that holds a real arrival
+    // followed by a real hold: the segmentation the synthetic square waves
+    // cannot check. The allowance is read from the goal write, and it ends the
+    // period before the judged window opens, so a reading pulled in from
+    // before the command or carried over from a previous hold shows up here.
+    let settle = left
+        .settle
+        .expect("the allowance ahead of the hold was read");
+    assert_eq!(
+        settle.end_ns,
+        left.readings.start_ns - trace.run(0).period_ns(),
+        "{settle:?} against a window opening at {}",
+        left.readings.start_ns
+    );
+    assert_eq!(settle.samples, 200, "{settle:?}");
+    // 1695 counts is the servo's own travel *after* the raise's last goal
+    // write: at the commissioned `20 / 50` the generator trails the streamed
+    // path by about two seconds, so the allowance holds the arrival itself and
+    // not a ring-down. Which is the reading the allowance exists to keep out of
+    // the verdict — the judged tail beside it is nine counts.
+    assert!(
+        (settle.excursion_counts() - 1695.0).abs() < 1.0,
+        "{settle:?}"
+    );
 
     // The right antenna: one count of encoder dither at the same reversal
     // rate, turning round at scattered intervals rather than on a period.
     let right = of(JointRef::AntennaRight);
     assert!(
-        right.samples.abs_diff(153) <= 1,
+        right.readings.samples.abs_diff(153) <= 1,
         "the right window judged {} readings",
-        right.samples
+        right.readings.samples
     );
     assert_eq!(judge(&right, &cfg), Ok(()), "{right:?}");
-    assert!((right.excursion_counts() - 1.0).abs() < 0.01, "{right:?}");
+    assert!(
+        (right.readings.excursion_counts() - 1.0).abs() < 0.01,
+        "{right:?}"
+    );
     let right_spread = right
+        .readings
         .reversal_interval_spread_samples
         .expect("a dithering antenna has intervals too");
     assert!(right_spread > 1.0, "{right:?}");
+}
+
+/// Guard 6b. The other half of the hold: a recorded antenna pair that held
+/// still, which is what the two-count bound was written to pass.
+///
+/// The 2026-09-08 raise at the vendor's `200 / 0 / 0`, cut the way the hunt
+/// file is — from before the raise's last goal write, ending in the first ticks
+/// of the stow — so the shipped settle allowance is spent inside the file and
+/// the window opens where the live watch opened it. The left antenna is the row
+/// that hunts 9 counts at the shipped gains, and over this hold it does not
+/// move at all; the right sits inside the count of encoder dither it sits
+/// inside everywhere. Without this file the bound is only ever asserted by
+/// something failing it, and a watch that judged every hold a hunt would pass
+/// the suite.
+#[test]
+fn the_recorded_quiet_antenna_hold_passes_the_bound() {
+    let cfg = StillnessConfig::default();
+    let trace = fixture("trace-antenna-still");
+    let windows = trace
+        .run(0)
+        .holds(cfg, &[JointRef::AntennaLeft, JointRef::AntennaRight]);
+    let of = |joint: JointRef| {
+        let mut held = windows.iter().filter(|window| window.joint == joint);
+        let window = *held.next().unwrap_or_else(|| panic!("{joint:?} held once"));
+        assert!(held.next().is_none(), "{joint:?} held once: {windows:?}");
+        window
+    };
+
+    // The left antenna: the hunt's own row, quiet. Zero counts is not a
+    // rounding of something small -- the encoder read the same value every
+    // period of the judged tail.
+    let left = of(JointRef::AntennaLeft);
+    assert!(
+        (left.opened_after_ns as f64 / 1e9 - 4.00).abs() < 0.03,
+        "the left window opened {:.2} s after the setpoint last moved",
+        left.opened_after_ns as f64 / 1e9
+    );
+    assert!(
+        left.readings.samples.abs_diff(161) <= 1,
+        "the left window judged {} readings",
+        left.readings.samples
+    );
+    assert_eq!(judge(&left, &cfg), Ok(()), "{left:?}");
+    assert_eq!(left.readings.excursion_counts(), 0.0, "{left:?}");
+    // The same allowance reading as the hunt file's, on the other recording:
+    // this file is cut the same way, so the arrival is inside the allowance and
+    // the judged tail is the joint at rest.
+    let settle = left
+        .settle
+        .expect("the allowance ahead of the hold was read");
+    assert_eq!(
+        settle.end_ns,
+        left.readings.start_ns - trace.run(0).period_ns(),
+        "{settle:?}"
+    );
+    assert_eq!(settle.samples, 200, "{settle:?}");
+    assert!(
+        (settle.excursion_counts() - 1731.0).abs() < 1.0,
+        "{settle:?}"
+    );
+    // A row that never turned round has no interval to report, which is the
+    // reading that tells a still joint from a slow limit cycle.
+    assert_eq!(left.readings.reversals_per_s, 0.0, "{left:?}");
+    assert_eq!(
+        left.readings.reversal_interval_mean_samples, None,
+        "{left:?}"
+    );
+    assert_eq!(left.readings.apparent_frequency_hz(), None, "{left:?}");
+
+    // The right antenna: the same count of dither it shows at the shipped
+    // gains, so this file says the gain change did not buy the right row
+    // anything and did not cost it anything either.
+    let right = of(JointRef::AntennaRight);
+    assert!(
+        right.readings.samples.abs_diff(153) <= 1,
+        "the right window judged {} readings",
+        right.readings.samples
+    );
+    assert_eq!(judge(&right, &cfg), Ok(()), "{right:?}");
+    assert!(
+        (right.readings.excursion_counts() - 1.0).abs() < 0.01,
+        "{right:?}"
+    );
+}
+
+/// Guard 6c. The third hold: both rods held at the fold the Minimum Risk
+/// Condition commands, which is the pose the stow angle was moved to reach.
+///
+/// The one pose a fault response leaves the machine in, and the one this cycle
+/// changed. The reading that moved [`reachy_motion::disarm::STOW_ANTENNAS`]
+/// inboard is a hold at this angle staying inside the bound where the same rung
+/// at the same gains hunted 7–8 counts pointing straight down, so the bound
+/// passing here is what says the lean did its job. What the file guards is the
+/// bound itself: a tightened excursion limit, or a watch that judged every hold
+/// a hunt, fails on a hold the machine was accepted at. Whether the pose is
+/// *still* quiet after a gain or profile change is a probe night's reading and
+/// not this file's; the fold angle the reading was taken at is pinned in
+/// `postures.rs`.
+///
+/// Cut from the first of the six leaned-fold probe runs
+/// (`probe-log-20260909T014542Z`), the way the two raise files are: the window
+/// opens 0.28 s before the step onto the fold and closes in the first periods
+/// of the step off it, so the shipped settle allowance is spent inside the file
+/// and the judged window opens where the live watch opened it. The stimulus is
+/// `probe/antenna-step-a`, whose one-frame jump makes the arrival the servo's
+/// own generator and nothing else's; both rods hold `∓9.6032` rad — the fold a
+/// turn up, the representative the sweep lands on.
+#[test]
+fn the_recorded_leaned_fold_hold_passes_the_bound() {
+    let cfg = StillnessConfig::default();
+    let trace = fixture("trace-antenna-fold-still");
+    let windows = trace
+        .run(0)
+        .holds(cfg, &[JointRef::AntennaLeft, JointRef::AntennaRight]);
+    let of = |joint: JointRef| {
+        let mut held = windows.iter().filter(|window| window.joint == joint);
+        let window = *held.next().unwrap_or_else(|| panic!("{joint:?} held once"));
+        assert!(held.next().is_none(), "{joint:?} held once: {windows:?}");
+        window
+    };
+
+    for (joint, held) in [
+        (JointRef::AntennaRight, of(JointRef::AntennaRight)),
+        (JointRef::AntennaLeft, of(JointRef::AntennaLeft)),
+    ] {
+        // Both windows open a settle allowance after the step, and the pose is
+        // held long enough that what is judged is the hold and not the arrival.
+        assert!(
+            (held.opened_after_ns as f64 / 1e9 - 4.02).abs() < 0.03,
+            "{joint:?}'s window opened {:.2} s after the setpoint last moved",
+            held.opened_after_ns as f64 / 1e9
+        );
+        assert!(
+            held.readings.samples.abs_diff(123) <= 1,
+            "{joint:?}'s window judged {} readings",
+            held.readings.samples
+        );
+        // One count peak to peak on each rod: the encoder's own flicker, which
+        // is what the two-count bound was written to pass, and an order under
+        // the unleaned pose's limit cycle.
+        assert!(
+            (held.readings.excursion_counts() - 1.0).abs() < 0.01,
+            "{joint:?}: {held:?}"
+        );
+        assert_eq!(judge(&held, &cfg), Ok(()), "{joint:?}: {held:?}");
+        // And the rod is on its goal, not resting short of it against
+        // something: the fold is commanded and reached.
+        assert!(
+            held.mean_error_rad.abs() < 0.002,
+            "{joint:?} held {:.4} rad from its goal",
+            held.mean_error_rad
+        );
+        // The arrival is inside the allowance ahead of the window, so the
+        // cycling this pose does on the way in is read and not judged.
+        let settle = held
+            .settle
+            .expect("the allowance ahead of the hold was read");
+        assert_eq!(
+            settle.end_ns,
+            held.readings.start_ns - trace.run(0).period_ns(),
+            "{joint:?}: {settle:?}"
+        );
+        assert!(settle.excursion_counts() > 1000.0, "{joint:?}: {settle:?}");
+    }
 }

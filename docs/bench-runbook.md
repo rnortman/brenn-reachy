@@ -80,10 +80,11 @@ Watch the machine; the verdict is `first_motion_report`'s over the records. Tail
 
     make library-run   # build, push, play every motion, fetch, judge
 
-Every motion in `cogs/clip_library.names.json`, in order, at recorded pace:
-minutes of unattended motion. **Keep the space around the machine clear until
-it returns.** The tour quits the launcher itself; the `timeout` is
-a backstop the sender sizes, and reaching it fails the run.
+Every motion in `cogs/clip_library.names.json` but the `probe/` instruments,
+which `make motion-probe MOTION=<name>` plays one at a time under
+`probe-log-<stamp>`, in order, at recorded pace: minutes of unattended motion.
+**Keep the space around the machine clear until it returns.** The tour quits the launcher itself; the
+`timeout` is a backstop the sender sizes, and reaching it fails the run.
 `library_tour_report` judges the records: every motion asked once in order, no
 fault, every window moving the machine, no gap in the samples. It prints
 residual, lag, peak step and antenna separation for **Open observations**.

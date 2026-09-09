@@ -1048,19 +1048,33 @@ refuse_if_source_newer() {
 #
 #   run_directory <log-root> <no-directory-hint> <no-records-hint>
 #
-# Echoes the newest directory directly under the log root that holds a
-# non-empty `.olog`. Both failures are refusals rather than a report over
-# nothing: an empty log root is the namespace-mismatch failure that survives a
-# whole session unnoticed if anything downstream is willing to read zero
-# records. The two hints are the caller's, because where a process's console
-# output landed and which configuration file states the namespace differ
-# between a host staging tree and a device fetch.
+# Echoes the newest directory directly under the log root whose name is the
+# logger's stamp -- decimal digits only, the instant it opened the log in
+# nanoseconds, as in `1788832560362471129` -- and that holds a non-empty
+# `.olog`. Other names are skipped: the log root also carries the `config/`
+# copy a deploy leaves beside the runs, and a sort that took the newest of
+# everything would hand a caller a directory holding no records at all. Newest
+# is a numeric sort, because a lexicographic one only agrees with it while
+# every stamp in a root is the same width. Both failures are
+# refusals rather than a report over nothing: an empty log root is the
+# namespace-mismatch failure that survives a whole session unnoticed if
+# anything downstream is willing to read zero records. The two hints are the
+# caller's, because where a process's console output landed and which
+# configuration file states the namespace differ between a host staging tree
+# and a device fetch.
 run_directory() {
 	local logs=$1 no_directory=$2 no_records=$3
 	local dir found
-	dir=$(find "$logs" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
+	# `|| :` on the filter: no stamp-named directory is an empty selection and
+	# the refusal below, never a pipeline status. Under `set -o pipefail` a
+	# `grep` that matched nothing exits the caller at this assignment with no
+	# message, and the two hints are the whole reason this function exists.
+	dir=$(find "$logs" -mindepth 1 -maxdepth 1 -type d -print \
+		| { grep -E '/[0-9]+$' || :; } \
+		| awk -F/ '{ print $NF "\t" $0 }' | sort -n | tail -n 1 | cut -f2-)
 	[ -n "$dir" ] || die \
-		"the logger wrote no run directory under ${logs}." "$no_directory"
+		"the logger wrote no stamp-named run directory under ${logs}." \
+		"$no_directory"
 	found=$(find "$dir" -name '*.olog' -size +0 -print -quit)
 	[ -n "$found" ] || die \
 		"${dir} holds no non-empty .olog file." "$no_records"

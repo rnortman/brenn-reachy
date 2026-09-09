@@ -164,7 +164,6 @@ provision_cells! {
     TemperatureLimit => temperature_limit,
     CurrentLimit => current_limit,
     VelocityLimit => velocity_limit,
-    AccelerationLimit => acceleration_limit,
     BusWatchdog => bus_watchdog,
     ProfileAcceleration => profile_acceleration,
     ProfileVelocity => profile_velocity;
@@ -392,7 +391,6 @@ mod tests {
             (RegId::TemperatureLimit, |row| &row.temperature_limit),
             (RegId::CurrentLimit, |row| &row.current_limit),
             (RegId::VelocityLimit, |row| &row.velocity_limit),
-            (RegId::AccelerationLimit, |row| &row.acceleration_limit),
             (RegId::BusWatchdog, |row| &row.bus_watchdog),
             (RegId::ProfileAcceleration, |row| &row.profile_acceleration),
             (RegId::ProfileVelocity, |row| &row.profile_velocity),

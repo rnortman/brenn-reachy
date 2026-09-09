@@ -196,8 +196,15 @@ answered with a stow is the parallel-linkage argument in the escalation ladder
 below.
 
 **What answering an obstruction costs.** A hand that stays on the head is
-answered in about a second at the commissioned profile; every figure in this
-paragraph and the next is evaluated at that profile and moves with it. The raise
+answered in about half a second on content that runs the legs at their cap —
+the first raise about a quarter of a second after the hand lands, the whole
+answer about twice that. Every figure in this paragraph and the next is
+evaluated at the commissioned profile and moves with it, and every one of them
+also depends on the content: they are the figures for a goal running the class
+at its profile velocity, which is the fastest the residual can open and so the
+soonest anything is raised. Under a goal slower than the cap — the wake raise,
+most of the library — the residual grows at the path's own speed and every
+instant below comes later, at the content's pace. The raise
 comes a window after the residual passes the threshold; the tick abandons its
 move and holds, and the keep-alive goes on writing the last goal that went out —
 at least the threshold past the held joint, and further on a saturated move; the
@@ -211,18 +218,19 @@ push this buys its question with, and the stow's own travel is never added to
 it.
 
 A hand that lets go: before the residual reaches the threshold — an obstruction
-shorter than about half a second under a goal at the profile — no run opens and
-nothing is raised. After the first raise, the stow completes only if the
-generator had stopped, or all but, by the raise — a hold at the end of a move, a
-static goal, a short move — and the hand comes off within about 140 ms of it, a
-window less the from-rest ramp to the progress minimum. A hand that took the
+shorter than about 80 ms under a goal at the cap, and longer than that at the
+content's own pace under a slower one — no run opens and nothing is raised.
+After the first raise, the stow completes only if the generator had stopped, or
+all but, by the raise — a hold at the end of a move, a static goal, a short
+move — and the hand comes off within about 180 ms of it, a window less the
+from-rest ramp to the progress minimum. A hand that took the
 head mid-move, with the goal still running at the profile past the prediction,
-has a period or two — tens of milliseconds, no interval a hand acts in: a joint
-released later than that paces under the pace fraction of a generator at the cap
-by the time the window runs out, so the second raise lands and the head is
-dropped where it is rather than folded. That is the trade, and it is a wide one:
-a grab of about 0.7 s on a saturated move ends the session, whether or not the
-hand then lets go.
+has about 160 ms — a window less the two periods a released crank takes to ramp
+from rest to the pace fraction of a generator at the cap: a joint released later
+than that is still under that fraction when the window runs out, so the second
+raise lands and the head is dropped where it is rather than folded. That is the
+trade: a grab of about 0.4 s on a saturated move ends the session, whether or
+not the hand then lets go.
 
 Classification happens exactly once, at the point the condition becomes one of
 these values, and travels as that value. No layer re-derives a class from a

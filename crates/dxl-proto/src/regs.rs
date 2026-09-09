@@ -75,9 +75,6 @@ pub const MAX_VOLTAGE_LIMIT: Reg = Reg::new(32, 2);
 pub const MIN_VOLTAGE_LIMIT: Reg = Reg::new(34, 2);
 /// Current ceiling, in raw register units.
 pub const CURRENT_LIMIT: Reg = Reg::new(38, 2);
-/// Acceleration ceiling, in raw register units. Bounds Profile Acceleration:
-/// a profile written past it is refused.
-pub const ACCELERATION_LIMIT: Reg = Reg::new(40, 4);
 /// Velocity ceiling, in raw register units.
 pub const VELOCITY_LIMIT: Reg = Reg::new(44, 4);
 /// Upper end of the servo-side position window, in counts.
@@ -162,7 +159,6 @@ mod tests {
         ("max_voltage_limit", MAX_VOLTAGE_LIMIT),
         ("min_voltage_limit", MIN_VOLTAGE_LIMIT),
         ("current_limit", CURRENT_LIMIT),
-        ("acceleration_limit", ACCELERATION_LIMIT),
         ("velocity_limit", VELOCITY_LIMIT),
         ("max_position_limit", MAX_POSITION_LIMIT),
         ("min_position_limit", MIN_POSITION_LIMIT),

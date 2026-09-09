@@ -113,6 +113,14 @@ schema ProvisionCell
 // the cells are a register each, and a column misplaced reports the shutdown
 // mask as a homing offset. The list must agree with
 // `reachy_motion::arm::PROVISION_REGS`.
+//
+// Numbering is append-only, like `RegId`'s and for the same reason: a row is
+// recorded in the arm reports inside kept `.olog` files, so a number outlives
+// the build that wrote it. #15 is retired -- it carried the XL330's
+// non-existent acceleration-limit register -- and will not be reused; a cell
+// taking it would read a pre-change log's cell under its own name, and a
+// `ProvisionCell` is a shape plus eight bytes, so it would decode without
+// complaint. The next cell takes #16.
 schema ProvisionRow
 {
     uuid: 422289f6-b38e-4e4b-b472-c465c2eace06;
@@ -148,8 +156,6 @@ schema ProvisionRow
         #13 profile_acceleration: ProvisionCell;
         // The motion profile's velocity, its own units.
         #14 profile_velocity: ProvisionCell;
-        // The acceleration ceiling, its own units.
-        #15 acceleration_limit: ProvisionCell;
     }
 }
 

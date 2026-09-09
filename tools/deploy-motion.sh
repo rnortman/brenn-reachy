@@ -5,6 +5,7 @@
 #   tools/deploy-motion.sh <host> --push [--stale-ok]
 #   tools/deploy-motion.sh <host> --run <dir>
 #   tools/deploy-motion.sh <host> --tour <dir>
+#   tools/deploy-motion.sh <host> --probe <dir> <motion>
 #   tools/deploy-motion.sh <host> --fetch <dir>
 #   tools/deploy-motion.sh <host> --speech <dir>
 #   tools/deploy-motion.sh <host> --speech-preflight
@@ -37,9 +38,18 @@
 #                stays as a backstop at the budget the tour computes here, and a
 #                run that reaches it is a failure. The records are fetched
 #                whatever ended the run — they are the point of it — and judged
-#                by `library_tour_report` against the same name table. Several
-#                minutes of motion with nobody at the machine, so the space
-#                around it has to be clear for the whole run.
+#                by `library_tour_report` against the table the run was asked
+#                for, which the fetch writes into the run directory. The tour is
+#                the library's content: the `probe/` instruments are left out of
+#                it, because a tour is what the recorded fixtures come off.
+#                Several minutes of motion with nobody at the machine, so the
+#                space around it has to be clear for the whole run.
+#   --probe      `--tour`'s chain over one named motion instead of the library:
+#                one script, one arrival per pose the motion steps to, and the
+#                same fetch and verdict. It is how a `probe/` instrument is
+#                played -- a step goal held long enough for a hold to be judged
+#                -- and the motion has to be one the committed name table
+#                holds. About a minute of motion with nobody at the machine.
 #   --fetch      copy the run's `.olog` directories back to a local directory,
 #                under a name stamped with the moment they were fetched so a
 #                session's runs accumulate rather than overwrite. Refuses a fetch
@@ -68,9 +78,9 @@
 #
 # A fetch brings back two things under one stamp, named for the kind of run it
 # came off — `motion-log-<stamp>` for a budgeted motion run, `tour-log-<stamp>`
-# for a library tour and `speech-log-<stamp>` for a supervised speech one, so a
-# session's kinds of records sit side by side and say which is which. Under
-# that name: the
+# for a library tour, `probe-log-<stamp>` for one motion played on its own, and
+# `speech-log-<stamp>` for a supervised speech one, so a session's kinds of
+# records sit side by side and say which is which. Under that name: the
 # records the analyzer judges — with `provenance.txt` at its root naming the
 # build that recorded them — and a `.console` directory of the same name beside
 # it, holding the console output of everything the launcher started. A run adds
@@ -518,6 +528,18 @@ run_seconds=36
 tour_names="${repo_root}/cogs/clip_library.names.json"
 tour_names_staged=cogs/clip_library.names.json
 
+# What the table this run was asked for is called inside the fetched run
+# directory.
+#
+# A run plays a selection over the committed library -- the content for a tour,
+# one motion for a probe run -- and the analyzer's every finding is about a
+# motion that should have been asked for, so it is handed the selection rather
+# than the library. The sender makes that selection for the plan it runs and
+# prints the same one here for the verdict, so the two cannot disagree; the copy
+# lands beside `config/` in the run directory, which is what makes a fetched run
+# say for itself what it was asked to play.
+asked_names_name=asked.names.json
+
 # The intent source's own label, built and run here for the tour's backstop
 # budget alone.
 #
@@ -630,7 +652,29 @@ workspace_paths=(
 )
 
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>"
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>"
+}
+
+# Refuse a value that is not a plain path or name, saying what it was.
+#
+#   plain_name <what it is, in the refusal's words> <value>
+#
+# The one screen every value pasted into a command goes through, wherever it
+# came from: the staged configuration below, or an argument this script was
+# invoked with. A value with a space or a metacharacter means something
+# different at each of those sites -- one of them builds a remote command run as
+# root, one a remote rsync path the far end re-parses -- and one refusal is
+# cheaper than quotings that have to agree. Refused before anything is pushed,
+# because a refusal after the push is a unit already carrying the payload.
+plain_name() {
+	local label=$1 value=$2
+	case $value in
+	*[!A-Za-z0-9/_.-]*)
+		die "${label} is '${value}', which is not a plain path or name." \
+			"These values are pasted into a remote command and a local one, so only" \
+			"[A-Za-z0-9/_.-] is accepted here."
+		;;
+	esac
 }
 
 # A scalar out of the staged protobuf text. One field per line and quoted
@@ -643,12 +687,8 @@ usage() {
 # submessage or a formatter that indents would turn every command here into a
 # refusal for a reason that has nothing to do with the values.
 #
-# Every value is checked here against the character set these fields can
-# legitimately hold, so the callers below can interpolate what they get plainly.
-# One of them builds a remote command run as root and one a remote rsync path the
-# far end re-parses: a value with a space or a metacharacter means something
-# different at each of those sites, and one refusal is cheaper than quotings that
-# have to agree.
+# Every value goes through `plain_name`, so the callers below can interpolate
+# what they get plainly.
 #
 # An empty value is refused in its own words. `field: ""` and a missing field are
 # the same thing to every caller and both are stops, but they are different edits
@@ -666,13 +706,7 @@ config_string() {
 	value=${value%\"}
 	[ -n "$value" ] ||
 		die "${logger_config} states an empty ${field}, so the command that needs it would name nothing."
-	case $value in
-	*[!A-Za-z0-9/_.-]*)
-		die "${logger_config}'s ${field} is '${value}', which is not a plain path or name." \
-			"These values are pasted into a remote command and a local one, so only" \
-			"[A-Za-z0-9/_.-] is accepted here."
-		;;
-	esac
+	plain_name "${logger_config}'s ${field}" "$value"
 	echo "$value"
 }
 
@@ -1215,14 +1249,15 @@ launch_and_capture() {
 	capture_clock "${aside}/clock-after.txt"
 }
 
-# The backstop budget for a tour of the committed library, in whole seconds.
+# The backstop budget for a run over the committed library, in whole seconds.
 #
-#   tour_budget
+#   tour_budget [motion]
 #
 # Asked of the sender, which is the only thing that knows the plan: it reads the
-# same name table the analyzer will judge against and prints the seconds its own
-# clock adds up to. A host build, run from its runfiles tree, so the sidecar is
-# named absolutely.
+# same name table the run plays, makes the same selection -- the content
+# library, or the one `motion` -- and prints the seconds its own clock adds up
+# to. A host build, run from its runfiles tree, so the sidecar is named
+# absolutely.
 #
 # Everything the answer is checked for is what it is about to be pasted into: a
 # `timeout` argument and the messages that quote it. A build that printed
@@ -1231,15 +1266,16 @@ launch_and_capture() {
 #
 # Everything it says goes to stderr: the caller reads the number off stdout.
 tour_budget() {
-	local seconds
-	[ -f "$tour_names" ] || die \
-		"no clip name table at ${tour_names}, so the tour has no library to play." \
-		"It is generated beside the library it describes: make clip-config"
-	echo "${prog}: asking ${ask_target} for the tour's backstop budget" >&2
+	local motion=${1:-} seconds
+	local args=(--tour-budget "$tour_names")
+	[ -z "$motion" ] || args+=(--motion "$motion")
+	require_tour_names
+	echo "${prog}: asking ${ask_target} for the run's backstop budget" >&2
 	seconds=$("$bazel" run "${build_flags[@]}" -- "$ask_target" \
-		--tour-budget "$tour_names") || die \
+		"${args[@]}") || die \
 		"the tour's budget could not be computed, so the run has no backstop." \
-		"That is a build failure or a name table the sender refused, and its output is above."
+		"That is a build failure, a name table the sender refused, or a motion it does not hold;" \
+		"its output is above."
 	case $seconds in
 	'' | *[!0-9]* | 0)
 		die "${ask_target} answered '${seconds}' for the tour's budget, which is not a number of seconds." \
@@ -1247,6 +1283,55 @@ tour_budget() {
 		;;
 	esac
 	echo "$seconds"
+}
+
+# Refuse a tree with no committed name table.
+#
+#   require_tour_names
+#
+# The sender reads the staged copy on the unit and this script reads the
+# committed one; a tree with none has no library to select from, and the
+# refusal comes before anything is pushed or started.
+require_tour_names() {
+	[ -f "$tour_names" ] || die \
+		"no clip name table at ${tour_names}, so the tour has no library to play." \
+		"It is generated beside the library it describes: make clip-config"
+}
+
+# Write the table this run was asked for into the fetched run directory.
+#
+#   asked_table <run directory> [motion]
+#
+# The sender's own selection over the committed library, printed as a names
+# sidecar: the content library, or the one `motion` a probe run played. It is
+# what the analyzer is then handed, so the verdict is taken over the motions the
+# plan was built from rather than over a second reading of the library, and the
+# run directory keeps it beside the `config/` copy for whoever reads the fetch
+# later.
+#
+# After the fetch rather than before the run, because the run directory is named
+# by the logger: the same selection made by the same sender over the same file
+# is what makes the copy the plan's own table and not a guess at it.
+asked_table() {
+	local run_dir=$1 motion=${2:-}
+	local args=(--tour-table "$tour_names")
+	[ -z "$motion" ] || args+=(--motion "$motion")
+	echo "${prog}: asking ${ask_target} for the table this run played" >&2
+	# The unusable file is taken back off before the refusal: an empty or
+	# half-written table left in a run directory reads later as the table the
+	# run was judged against, and nothing was.
+	if ! "$bazel" run "${build_flags[@]}" -- "$ask_target" "${args[@]}" \
+		>"${run_dir}/${asked_names_name}"; then
+		rm -f -- "${run_dir}/${asked_names_name}"
+		die "the table this run played could not be printed, so its records have nothing to be judged against." \
+			"The records are at ${run_dir} and its output is above."
+	fi
+	if [ ! -s "${run_dir}/${asked_names_name}" ]; then
+		rm -f -- "${run_dir}/${asked_names_name}"
+		die "${ask_target} printed no table for this run, so there is nothing to judge it against." \
+			"The records are at ${run_dir}."
+	fi
+	echo "${run_dir}/${asked_names_name}"
 }
 
 # The sender's last word, out of the console a tour brought home.
@@ -1267,6 +1352,139 @@ ask_last_line() {
 	fi
 }
 
+# Play the library, or one motion of it, and judge what came back.
+#
+#   play_from_library <records directory> [motion]
+#
+# `--run`'s chain with four substitutions: the sender is told to play a
+# selection over the committed library instead of the wake gesture, the
+# `timeout` carries the backstop the sender computed instead of a fixed budget,
+# the ssh status is the sender's whenever the launcher's is 0, and the records
+# are fetched before the run is judged.
+#
+# With no `motion` it is the content tour, which is the library minus its
+# `probe/` instruments and takes several minutes. With one it is a probe run:
+# one script, one motion, about a minute. Everything else -- the chain, the
+# refusals, the fetch, the analyzer -- is the same, because what differs between
+# the two is only which motions the plan holds.
+play_from_library() {
+	local dest=$1 motion=${2:-}
+	local budget log_root remote out console run_dir asked
+	# What the run is called in its own refusals, and what its fetch is named
+	# after: a records directory says which kind of run it came off, and an
+	# operator reading a refusal is told which run to look at.
+	local subject="the tour" article="a library tour" prefix="tour-log"
+	if [ -n "$motion" ]; then
+		subject="the probe run"
+		article="a probe run"
+		prefix="probe-log"
+	fi
+	# Absolute for the reason --run's is: both the records and the name
+	# table are handed to an analyzer running out of its own runfiles tree.
+	case $dest in
+	/*) ;;
+	*) dest="${PWD}/${dest}" ;;
+	esac
+	require_bazel "the run's budget, table and report"
+	budget=$(tour_budget "$motion")
+	log_root=$(config_string log_root_dir)
+	require_wipeable_log_root "$log_root"
+
+	remote=$(launch_chain "$log_root")
+	# The intent source, ahead of the launcher and in the background as
+	# --run's is, and told which motions to play: the sidecar is named
+	# relative to the release directory the chain has already cd'd into,
+	# where the build staged it, and the selection over it is the sender's
+	# own -- the content library, or the one motion named here. No
+	# --resting-timeout, so commissioning uses the sender's own default, and
+	# no --run-window: a plan knows its own end.
+	remote="${remote}; ./${ask_binary} --tour ${tour_names_staged}"
+	[ -z "$motion" ] || remote="${remote} --motion ${motion}"
+	remote="${remote} >${launch_logs}/${ask_console_name} 2>&1 &"
+	remote="${remote} ask=\$!"
+	# The budget is the backstop and not the stop: the sender ends the run
+	# itself, through the launcher's own quit API, and a run that reaches
+	# this timeout is one where that did not happen. --kill-after is the
+	# wedged-launcher grace --run's is.
+	remote="${remote}; timeout --signal=INT --kill-after=10"
+	remote="${remote} ${budget} ./simplelaunch ${launch_config}"
+	remote="${remote} --logdir ${launch_logs}"
+	# The sender's status is this run's whenever the launcher's is 0, which
+	# is where --run and this differ: the launcher returns 0 both when the
+	# sender quit it and when it fell over on its own, and only the sender
+	# knows which of those happened.
+	remote="${remote}; rc=\$?"
+	remote="${remote}; kill -INT \$ask 2>/dev/null"
+	remote="${remote}; wait \$ask; ask_rc=\$?"
+	remote="${remote}; exit \$(( rc != 0 ? rc : ask_rc ))"
+
+	if [ -n "$motion" ]; then
+		echo "${prog}: playing ${motion} on ${host}; the machine moves for" >&2
+		echo "${prog}: about a minute and stops itself. Keep the space" >&2
+	else
+		echo "${prog}: touring ${host}'s library; the machine moves for" >&2
+		echo "${prog}: several minutes and stops itself. Keep the space" >&2
+	fi
+	echo "${prog}: around it clear; ${budget}s is the backstop." >&2
+	launch_and_capture "$remote" \
+		"will not reach the unit: ${subject} ends the run itself, and" \
+		"stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'."
+
+	# The chain's own refusals, as --run's: a console with no sentinel in it
+	# is a chain that refused or an ssh that never connected, and nothing was
+	# recorded to fetch.
+	if ! launcher_reached "${aside}/run-console.log"; then
+		bus_refusal "$rc" "$article" \
+			"255 is ssh's own code and also the run's if the launcher exited with it" \
+			"Its own error is above. Check ${launch_logs} on ${host} before re-running," \
+			"and ${prog} ${host} --fetch <records-dir> first if this run's records matter:" \
+			"the next run empties the log root."
+		chain_refusal "$rc" "$launch_config" --fetch \
+			"The payload there predates the harness twin — push again:"
+	fi
+
+	# The fetch comes before the judgement here, which is the other way
+	# round from --run. A run that ended badly ended after playing some of
+	# its plan, and what it did play is the reading the run exists to take:
+	# the records are the point of it whatever stopped it, and they live on a
+	# tmpfs until they are brought home. The refusals below quote the
+	# sender's own last line, which is in the console this fetch carries.
+	out=$(fetch_records "$dest" "$log_root" "$prefix" motion)
+
+	console=$(file_captures "$aside" "$out")
+	echo "${prog}: console ${console}"
+
+	case "$rc" in
+	0)
+		# The sender ended the run and said nothing red: the expected
+		# end of a whole plan.
+		;;
+	124)
+		die "${subject} did not end within its ${budget}s backstop, so the launcher was stopped for it." \
+			"The sender's last line: $(ask_last_line "$console")" \
+			"Its records were fetched to ${out} and say how far it got."
+		;;
+	137)
+		die "the launcher did not stop on SIGINT and was killed (exit ${rc})." \
+			"That is a launcher wedged in its own shutdown; its output is under ${launch_logs} on ${host}."
+		;;
+	*)
+		die "${subject} on ${host} failed (exit ${rc})." \
+			"The sender's last line: $(ask_last_line "$console")" \
+			"Its records were fetched to ${out}; the launcher's output is under ${launch_logs} on ${host}."
+		;;
+	esac
+
+	run_dir=$(fetched_run_dir "$out")
+
+	# Judged against the motions it was supposed to play: the analyzer needs
+	# the name table as well as the log, because every one of its findings is
+	# about a motion that should have been asked for. The table is the
+	# sender's own selection, written into the run directory here.
+	asked=$(asked_table "$run_dir" "$motion")
+	tour_verdict "$run_dir" "$asked"
+}
+
 # The chain fragment that puts this run's configuration beside its records.
 #
 #   config_into_log_root <log root>
@@ -1284,6 +1502,11 @@ ask_last_line() {
 # nothing at risk. The payload-relative path is kept whole, so
 # `config/cogs/servo_profile.textproto` says where on the unit the file was read
 # from.
+#
+# The copy lands in the log root and not in the run directory because the run
+# directory does not exist when the chain runs; the fetch moves it in
+# (`config_into_run_dir`), so a fetched run directory is self-contained and the
+# analyzers' one lookup stands.
 config_into_log_root() {
 	local log_root=$1 name dir fragment="" dirs=()
 	# One `mkdir` per directory the set lands in, not one per file: the
@@ -1303,6 +1526,62 @@ config_into_log_root() {
 		fragment="${fragment}; cp -- ${release}/${name} ${log_root}/config/${name} || exit ${rc_post_wipe}"
 	done
 	printf '%s' "$fragment"
+}
+
+# The run's configuration copy, moved from the fetched root into the run
+# directory.
+#
+#   config_into_run_dir <fetched root> <run directory>
+#
+# The analyzers look for `config/` inside the run directory they are given, and
+# the chain could only leave the copy one level up (the run directory is named
+# by the logger, after the chain has run). So the fetch closes the gap: a run
+# directory that comes home carries the files that produced it, and a copy of
+# it moved anywhere else still reads.
+#
+# A fetched root with no `config/` is left alone rather than refused here: the
+# analyzer is what refuses a log that states nothing about the machine it was
+# recorded on, and it names the missing directory when it does. Nothing in this
+# script can answer for a payload that never wrote the copy.
+#
+# Best-effort, like the console and audio copies above: a relocation that could
+# not happen is a line on stderr and a `config/` left where it landed, never a
+# hardware run whose records came home and whose verdict was thrown away. A
+# `config/` already in the run directory is the run's own and is kept -- `mv`
+# would nest the fetched copy inside it.
+#
+# What makes a root-level copy this run's own is that every fetch lands in a
+# destination of its own, under `motion-log-<stamp>`, `tour-log-<stamp>` or
+# `probe-log-<stamp>`: a destination reused across runs could hold a `config/`
+# an earlier fetch left, and this would move that copy into a newer run to be
+# judged as its configuration.
+config_into_run_dir() {
+	local root=$1 run_dir=$2
+	[ -d "${root}/config" ] || return 0
+	if [ -e "${run_dir}/config" ]; then
+		echo "${prog}: ${run_dir} already carries a configuration copy; the fetched one stayed at ${root}" >&2
+		return 0
+	fi
+	mv -- "${root}/config" "${run_dir}/config" ||
+		echo "${prog}: the run's configuration copy stayed at ${root}" >&2
+}
+
+# The fetched run directory, with its configuration copy moved in.
+#
+#   fetched_run_dir <fetched root>
+#
+# Echoes the run directory. One helper because both fetch paths ask exactly
+# this and the two refusal hints are the same text: a second copy of them
+# drifts, and a hint that tells an operator to look at the wrong thing is worse
+# than no hint.
+fetched_run_dir() {
+	local root=$1 run_dir
+	run_dir=$(run_directory "$root" \
+		"Either it never started or it could not open a file there; its output is under ${launch_logs} on ${host}." \
+		"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
+	echo "${prog}: log  ${run_dir}" >&2
+	config_into_run_dir "$root" "$run_dir"
+	printf '%s\n' "$run_dir"
 }
 
 # The remote chain both run modes start with, up to the sentinel, as one string.
@@ -1674,10 +1953,7 @@ case "$mode" in
 		# host tool and the fetched copy is the one that outlives the
 		# tmpfs. No jitter band — a hardware log sits on an absolute
 		# grid, so it is read strictly.
-		run_dir=$(run_directory "$out" \
-			"Either it never started or it could not open a file there; its output is under ${launch_logs} on ${host}." \
-			"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
-		echo "${prog}: log  ${run_dir}"
+		run_dir=$(fetched_run_dir "$out")
 
 		# The report's verdict is this script's, and it is read off the
 		# log alone: the driver republishes its whole account of the run
@@ -1690,108 +1966,20 @@ case "$mode" in
 		dest=${1:-}
 		[ -n "$dest" ] || usage
 		[ $# -eq 1 ] || usage
-		# Absolute for the reason --run's is: both the records and the
-		# name table are handed to an analyzer running out of its own
-		# runfiles tree.
-		case $dest in
-		/*) ;;
-		*) dest="${PWD}/${dest}" ;;
-		esac
-		require_bazel "the tour's budget and report"
-		budget=$(tour_budget)
-		log_root=$(config_string log_root_dir)
-		require_wipeable_log_root "$log_root"
+		play_from_library "$dest"
+		;;
 
-		remote=$(launch_chain "$log_root")
-		# The intent source, ahead of the launcher and in the
-		# background as --run's is, and told to play the library: the
-		# sidecar is named relative to the release directory the chain
-		# has already cd'd into, where the build staged it. No
-		# --resting-timeout, so commissioning uses the sender's own
-		# default, and no --run-window: a tour knows its
-		# own end and refuses to be given one.
-		remote="${remote}; ./${ask_binary} --tour ${tour_names_staged}"
-		remote="${remote} >${launch_logs}/${ask_console_name} 2>&1 &"
-		remote="${remote} ask=\$!"
-		# The budget is the backstop and not the stop: the tour ends
-		# the run itself, through the launcher's own quit API, and a
-		# run that reaches this timeout is one where that did not
-		# happen. --kill-after is the wedged-launcher grace --run's is.
-		remote="${remote}; timeout --signal=INT --kill-after=10"
-		remote="${remote} ${budget} ./simplelaunch ${launch_config}"
-		remote="${remote} --logdir ${launch_logs}"
-		# The sender's status is this run's whenever the launcher's is
-		# 0, which is where --run and a tour differ: the launcher
-		# returns 0 both when the tour quit it and when it fell over on
-		# its own, and only the sender knows which of those happened.
-		remote="${remote}; rc=\$?"
-		remote="${remote}; kill -INT \$ask 2>/dev/null"
-		remote="${remote}; wait \$ask; ask_rc=\$?"
-		remote="${remote}; exit \$(( rc != 0 ? rc : ask_rc ))"
-
-		echo "${prog}: touring ${host}'s library; the machine moves for" >&2
-		echo "${prog}: several minutes and stops itself. Keep the space" >&2
-		echo "${prog}: around it clear; ${budget}s is the backstop." >&2
-		launch_and_capture "$remote" \
-			"will not reach the unit: the tour ends the run itself, and" \
-			"stopping it sooner is 'ssh root@${host} pkill -x simplelaunch'."
-
-		# The chain's own refusals, as --run's: a console with no
-		# sentinel in it is a chain that refused or an ssh that never
-		# connected, and nothing was recorded to fetch.
-		if ! launcher_reached "${aside}/run-console.log"; then
-			bus_refusal "$rc" "a library tour" \
-				"255 is ssh's own code and also the run's if the launcher exited with it" \
-				"Its own error is above. Check ${launch_logs} on ${host} before re-running," \
-				"and ${prog} ${host} --fetch <records-dir> first if this run's records matter:" \
-				"the next run empties the log root."
-			chain_refusal "$rc" "$launch_config" --fetch \
-				"The payload there predates the harness twin — push again:"
-		fi
-
-		# The fetch comes before the judgement here, which is the other
-		# way round from --run. A tour that ended badly ended after
-		# playing some of the library, and what it did play is the
-		# reading the run exists to take: the records are the point of
-		# it whatever stopped it, and they live on a tmpfs until they
-		# are brought home. The refusals below quote the sender's own
-		# last line, which is in the console this fetch carries.
-		out=$(fetch_records "$dest" "$log_root" tour-log motion)
-
-		console=$(file_captures "$aside" "$out")
-		echo "${prog}: console ${console}"
-
-		case "$rc" in
-		0)
-			# The sender ended the run and said nothing red: the
-			# expected end of a whole tour.
-			;;
-		124)
-			die "the tour did not end within its ${budget}s backstop, so the launcher was stopped for it." \
-				"The sender's last line: $(ask_last_line "$console")" \
-				"Its records were fetched to ${out} and say how far the tour got."
-			;;
-		137)
-			die "the launcher did not stop on SIGINT and was killed (exit ${rc})." \
-				"That is a launcher wedged in its own shutdown; its output is under ${launch_logs} on ${host}."
-			;;
-		*)
-			die "the tour on ${host} failed (exit ${rc})." \
-				"The sender's last line: $(ask_last_line "$console")" \
-				"Its records were fetched to ${out}; the launcher's output is under ${launch_logs} on ${host}."
-			;;
-		esac
-
-		run_dir=$(run_directory "$out" \
-			"Either it never started or it could not open a file there; its output is under ${launch_logs} on ${host}." \
-			"The logger came up and wrote nothing, which is what a pinion namespace or shm-root disagreement looks like: compare the payload's cogs/robot_logger.textproto against the flagless defaults every process runs on.")
-		echo "${prog}: log  ${run_dir}"
-
-		# Judged against the library it was supposed to play: the
-		# analyzer needs the name table as well as the log, because
-		# every one of its findings is about a motion that should have
-		# been asked for.
-		tour_verdict "$run_dir" "$tour_names"
+	--probe)
+		dest=${1:-}
+		motion=${2:-}
+		[ -n "$dest" ] || usage
+		[ -n "$motion" ] || usage
+		[ $# -eq 2 ] || usage
+		# The name is pasted into the remote command run as root, so it
+		# goes through the same screen the staged configuration's values
+		# do, before the build and the push.
+		plain_name "the motion name" "$motion"
+		play_from_library "$dest" "$motion"
 		;;
 
 	--fetch)

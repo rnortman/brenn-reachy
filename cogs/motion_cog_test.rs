@@ -61,7 +61,7 @@ use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
     self, JointGroup, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
 };
-use reachy_motion::plant::RESPONSE_DEAD_SAMPLES;
+use reachy_motion::plant::{ProfilePair, RESPONSE_DEAD_SAMPLES};
 use reachy_motion::record;
 use reachy_motion::snap::PoseSnapshotError;
 use reachy_motion::tick::ResponseKind;
@@ -946,9 +946,9 @@ fn read_report(fault: &TickFaultWire) -> Report {
 /// Which way an antenna points, wrapped into a half turn either side of
 /// upright.
 ///
-/// An antenna is a free rotor and a sweep takes the arc that misses its
-/// outboard direction, so a fold at -3.05 rad reaches upright by continuing to
-/// a whole turn rather than by turning back through the outboard side. The
+/// An antenna is a free rotor and a sweep goes inboard over the head rather
+/// than out through its own sideways point, so a fold at -3.32 rad reaches
+/// upright by continuing on to a whole turn rather than by turning back. The
 /// reading is the turns as well as the direction; what a case about posture
 /// means is the direction.
 fn direction(angle: f64) -> f64 {
@@ -1316,9 +1316,13 @@ fn every_profile_field_reaches_the_class_it_names() {
     message.set_antennas_profile_acceleration(5);
     message.set_antennas_profile_velocity(6);
     let mapped = motion_cogs::group_profiles(message.validate().expect("six registers read"));
-    assert_eq!(mapped.legs, (1, 2));
-    assert_eq!(mapped.yaw, (3, 4));
-    assert_eq!(mapped.antennas, (5, 6));
+    let pair = |acceleration, velocity| ProfilePair {
+        acceleration,
+        velocity,
+    };
+    assert_eq!(mapped.legs, pair(1, 2));
+    assert_eq!(mapped.yaw, pair(3, 4));
+    assert_eq!(mapped.antennas, pair(5, 6));
 }
 
 /// The detector's arming is the parameter file's field, in both directions.
@@ -3248,7 +3252,7 @@ const STARTUP_GRACE_NS: i64 = 2_000_000_000;
 const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 
 /// The servo-side profile the commissioning sweep writes, register units: the
-/// pair `cogs/servo_profile.textproto` ships.
+/// pairs `cogs/servo_profile.textproto` ships, per class.
 ///
 /// Restated here for a different reason from the three above it. Zero in either
 /// register is a servo running unlimited, which is what a configuration missing
@@ -3256,8 +3260,8 @@ const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 /// running on any other pair would be a case running a machine no deployment
 /// ships. The scenario harness is what checks these two numbers against the
 /// file.
-const LEGS_PROFILE_ACCELERATION: u32 = 20;
-const LEGS_PROFILE_VELOCITY: u32 = 50;
+const LEGS_PROFILE_ACCELERATION: u32 = 287;
+const LEGS_PROFILE_VELOCITY: u32 = 326;
 const BODY_YAW_PROFILE_ACCELERATION: u32 = 20;
 const BODY_YAW_PROFILE_VELOCITY: u32 = 50;
 const ANTENNAS_PROFILE_ACCELERATION: u32 = 20;

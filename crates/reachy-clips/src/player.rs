@@ -591,9 +591,10 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
             if current == target {
                 continue;
             }
-            // The ramps are the clips' own, already floored at load against
-            // each one's largest frame delta, so a ramp reaching here is one the
-            // step bounds admit over a static base.
+            // The ramps are the clips' own: the document's figure, or the
+            // format's default where it states none. A clip that authors none
+            // takes full weight in one period, so its first delta reaches the
+            // tick whole — content, which is walked as content.
             let ms = if target > current {
                 self.entering_ramp_ms(position)
             } else {
@@ -889,7 +890,7 @@ mod tests {
         ClipLimits::default()
     }
 
-    use crate::format::{ClipDoc, FrameDoc};
+    use crate::format::{ClipDoc, DEFAULT_BLEND_MS, FrameDoc};
 
     const TICK: Duration = Duration::from_millis(20);
 
@@ -1113,6 +1114,84 @@ mod tests {
         for (index, value) in right.iter().take(7).enumerate() {
             let expected = (index as f64) * 0.05;
             assert!((value - expected).abs() < 1e-12, "tick {index}: {value}");
+        }
+    }
+
+    /// At 1.0x a jump between two frames reaches the tick as the jump the
+    /// document holds: one far goal written in one period, from which the
+    /// servo's own profile generator is the whole trajectory. That is the
+    /// stimulus the antenna step probes are, and the interpolation the case
+    /// above reads at half speed is why they are played at 1.0x and at nothing
+    /// else.
+    ///
+    /// The step value is test-local and about the size of the probes' own: what
+    /// this case reads is that a far jump is emitted whole, and a figure taken
+    /// off the posture constants would make a moved pose a failure here, in a
+    /// module whose subject is frame arithmetic.
+    #[test]
+    fn a_one_frame_jump_is_emitted_as_is_at_full_speed() {
+        let step = [0.0, 0.0, -3.1455, -3.1455];
+        let track = Track::of(&antenna_clip("step", &step, 0));
+        let mut row_player = Row::new();
+        let mut player = row_player.play(track.view(), 1.0);
+        let samples = run(&mut player, 10);
+        let right: Vec<f64> = samples
+            .iter()
+            .map(|sample| sample.frame.antennas.expect("antennas driven")[0])
+            .collect();
+        assert_eq!(right, step);
+    }
+
+    /// The other half of that stimulus, and the half the frame track alone does
+    /// not carry: the entry blend is a *weight* ramp over the whole delta a
+    /// frame holds, so a clip that steps under an entry blend reaches the tick
+    /// as a ramp anyway.
+    ///
+    /// A clip opening on the base is no protection — frame 0 at delta zero
+    /// composes to the base at any weight, and the ramp is then spent on the
+    /// frame that carries the step. Which is why the antenna step probes author
+    /// no entry blend: the composed value on the first non-zero frame is the
+    /// whole pose or it is not a step.
+    ///
+    /// The step value is test-local, as in the case above.
+    #[test]
+    fn an_entry_blend_ramps_the_first_step_and_no_entry_blend_steps_it() {
+        // Fifteen frames, so a clip of 300 ms holds the format's own 200 ms
+        // ramp: the arithmetic is the same at any length the ramp fits in.
+        let fold = -3.1455;
+        let mut step = [fold; 15];
+        step[0] = 0.0;
+        let composed = |blend_ms: u32| -> Vec<f64> {
+            let track = Track::of(&antenna_clip("step", &step, blend_ms));
+            let mut row_player = Row::new();
+            let mut player = row_player.play(track.view(), 1.0);
+            let base = JointTargets {
+                antennas: [0.1745, -0.1745],
+                ..JointTargets::default()
+            };
+            (0..4)
+                .map(|_| {
+                    let sample = player.advance(TICK).expect("still playing");
+                    compose(base, &[sample]).antennas[0]
+                })
+                .collect()
+        };
+        // Ten periods of ramp at the format's default, of which these are the
+        // first three: a tenth of the pose, then a fifth.
+        let ramped = composed(DEFAULT_BLEND_MS);
+        assert!(
+            (ramped[1] - (0.1745 + fold / 10.0)).abs() < 1e-9,
+            "{ramped:?}"
+        );
+        assert!(
+            (ramped[2] - (0.1745 + fold / 5.0)).abs() < 1e-9,
+            "{ramped:?}"
+        );
+        // And with none, the frame the document holds, in one period.
+        let stepped = composed(0);
+        assert!((stepped[0] - 0.1745).abs() < 1e-12, "{stepped:?}");
+        for value in &stepped[1..] {
+            assert!((value - (0.1745 + fold)).abs() < 1e-12, "{stepped:?}");
         }
     }
 

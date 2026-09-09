@@ -2768,6 +2768,11 @@ pub fn stands_still_rows(
 /// A sample the driver held nothing on is skipped: a released machine is
 /// commanded nothing, which is a different assertion, and the sample at
 /// `from_cycle` holding nothing is a scenario that named the wrong cycle.
+///
+/// Returns the widest motion any of `rows` was commanded over the stretch,
+/// radians, so a caller whose premise is a *margin* rather than a bound can
+/// assert against what the run measured instead of only against what it
+/// allows. Zero where nothing was read, which is the case the failures cover.
 pub fn commanded_stands_still_rows(
     run: &Run,
     rows: JointFlags,
@@ -2776,12 +2781,13 @@ pub fn commanded_stands_still_rows(
     within_rad: f64,
     why: &str,
     failures: &mut Vec<String>,
-) {
+) -> f64 {
+    let mut worst = 0.0_f64;
     let Some(held) = sample_at(run, from_cycle).and_then(commanded_rows) else {
         failures.push(format!(
             "no sample for cycle {from_cycle} holds a setpoint, where {why}"
         ));
-        return;
+        return worst;
     };
     for sample in &run.samples {
         let sample = &sample.message;
@@ -2799,7 +2805,9 @@ pub fn commanded_stands_still_rows(
                 failures.push(format!("{} sits on no bus row", Name(joint)));
                 continue;
             };
-            if (commanded[row] - held[row]).abs() > within_rad {
+            let moved = (commanded[row] - held[row]).abs();
+            worst = worst.max(moved);
+            if moved > within_rad {
                 failures.push(format!(
                     "the setpoint held for {} stands {} rad on cycle {cycle}, past the \
                      {within_rad} rad this stretch allows it from the {} rad it was on at cycle \
@@ -2808,10 +2816,11 @@ pub fn commanded_stands_still_rows(
                     commanded[row],
                     held[row]
                 ));
-                return;
+                return worst;
             }
         }
     }
+    worst
 }
 
 /// Run one scenario's checker: read the log the harness produced, put the

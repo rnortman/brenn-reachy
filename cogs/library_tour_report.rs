@@ -49,8 +49,8 @@ use motion_channels::{
     EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL,
 };
 use pose_reading::{
-    Grid, RunConfig, Skips, capabilities, capability, commanded_rows, health_summary, lags,
-    no_faults, present_rows, residual_stream, residuals,
+    Grid, Residual, RunConfig, Skips, capabilities, capability, commanded_rows, health_summary,
+    lags, no_faults, present_rows, residual_stream, residuals,
 };
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_edge::names::MotionTable;
@@ -58,6 +58,7 @@ use reachy_motion::joints::{JointRef, Name, ROWS, row};
 use reachy_motion::phase::{ANTENNA_CONTACT_BAND_RAD, inside_band, mirror_offset};
 use reachy_motion::plant::GroupPlants;
 use run_report::{Report, verdict};
+use stillness_report::{Standard, Stillness, say};
 
 /// How far a goal has to move for the window it moved in to count as having
 /// driven the machine, radians.
@@ -620,7 +621,7 @@ fn measurements(
     events: &[&Logged<DriverEventWire>],
     planned: &[Window],
     by_id: &BTreeMap<u16, String>,
-    stream: &[(i64, [f64; ROWS.len()])],
+    stream: &[(i64, [Residual; ROWS.len()])],
     report: &mut Report,
 ) {
     for window in planned {
@@ -662,7 +663,10 @@ fn measurements(
         for (_, figures) in &stream[lo..hi] {
             for joint in ROWS {
                 let Some(index) = row(joint) else { continue };
-                residual.offer(joint, figures[index]);
+                // The magnitude: the window's line names the joint furthest off
+                // its own model, and which side of the model it stood is the
+                // whole run's reading rather than a window's.
+                residual.offer(joint, figures[index].magnitude());
             }
         }
         let skipped = events_inside(events, window)
@@ -679,6 +683,48 @@ fn measurements(
             window.start_ns,
             window.end_ns
         ));
+    }
+}
+
+/// Whether the antennas stood still where the head let them.
+///
+/// The tour's own stillness verdict, over the same measurement the motion
+/// report prints: the holds are cut out of the sample stream, and an antenna
+/// hold is judged only where no head row was commanded somewhere new across it.
+/// A tour holds the antennas mostly while the head is moving, and such a hold
+/// reads the rod following the platform it is mounted on rather than the
+/// antenna's own loop -- so it is printed with its figures and no verdict, and
+/// a tour that held none with the head still says it measured nothing rather
+/// than failing.
+///
+/// The whole stream rather than the windows: a hold that opens inside one
+/// motion and closes inside the next is a hold, and the raise and the closing
+/// stow are where the head stands longest.
+///
+/// `standard` is the one thing this tool's two kinds of run disagree about, and
+/// it comes off the table the run was asked for: see [`held_standard`].
+fn stillness(ordered: &[&Logged<PoseSampleWire>], standard: Standard, report: &mut Report) {
+    let mut held = Stillness::default();
+    for sample in ordered {
+        held.sample(&sample.message);
+    }
+    held.finish();
+    say(&held, standard, report);
+}
+
+/// Which stillness standard the run this table describes is judged under.
+///
+/// A probe run's table holds instruments alone, and a probe is a step goal
+/// followed by a hold with the head standing at the raised base: the head-still
+/// hold is the whole run, so a run that produced none measured nothing it was
+/// asked to measure and fails. A content tour holds the antennas almost only
+/// while the head moves, so the same absence there is a reading of the content
+/// and fails nothing.
+fn held_standard(table: &MotionTable) -> Standard {
+    if table.probes_only() {
+        Standard::JudgedWhereHeadStillRequired
+    } else {
+        Standard::JudgedWhereHeadStill
     }
 }
 
@@ -742,6 +788,7 @@ fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
     // good as the content that demanded it, and a temperature only means
     // something over a long play.
     capabilities(&capability(&run.samples, grid), &mut report);
+    stillness(&ordered, held_standard(table), &mut report);
     health_summary(&run.readings, &mut report);
     report
 }
@@ -817,6 +864,7 @@ mod tests {
     use reachy_driver::NOMINAL_CYCLE_NS;
     use reachy_edge::names::MotionEntry;
     use reachy_motion::joints::{JointGroup, JointRef, ROW_COUNT, row, write_rows};
+    use reachy_motion::stillness::COUNT_RAD;
 
     /// An arbitrary instant a synthetic run starts at, chosen for being nothing
     /// round.
@@ -1683,6 +1731,211 @@ mod tests {
         let report = analyze(&run, &table(), &shipped());
         assert!(
             measured(&report, &format!("{POSE_CHANNEL} x42")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// How many cycles a synthetic long run gives the head to settle before the
+    /// antennas are commanded to the pose they then hold: past the last window,
+    /// so the head's own walk is over before the hold this asks about opens.
+    const HEAD_SETTLED: i64 = 50;
+
+    /// A tour-shaped run long enough to hold: the body yaw walks through both
+    /// windows as `heartbeat` has it, the antennas are commanded to one pose at
+    /// `HEAD_SETTLED` and hold it to the end reading `swing` either side of it,
+    /// and the head either stands from the last window or is commanded
+    /// somewhere new every hundred cycles after it.
+    fn long_run(cycles: i64, swing: f64, head_moves: bool) -> Run {
+        let yaw = row(JointRef::BodyYaw).expect("a bus row");
+        let right = row(JointRef::AntennaRight).expect("a bus row");
+        let left = row(JointRef::AntennaLeft).expect("a bus row");
+        let windows = 2 + 2 * WINDOW_CYCLES;
+        let samples = (0..cycles)
+            .map(|n| {
+                let mut commanded = [0.0; ROW_COUNT];
+                commanded[yaw] = if n < windows {
+                    n as f64 * 1e-3
+                } else if head_moves {
+                    (windows - 1) as f64 * 1e-3 + ((n - windows) / 100) as f64 * 0.1
+                } else {
+                    (windows - 1) as f64 * 1e-3
+                };
+                let goal = if n < HEAD_SETTLED { 0.0 } else { 0.5 };
+                commanded[right] = goal;
+                commanded[left] = goal;
+                let mut present = commanded;
+                let reading = if n % 2 == 0 { swing } else { -swing };
+                present[right] += reading;
+                present[left] += reading;
+                at(n, sample(n, &present, &commanded))
+            })
+            .collect();
+        Run { samples, ..clean() }
+    }
+
+    /// The tour's stillness verdict: a hold the head stood still across is
+    /// judged, and a hunting antenna over a still head fails the run the way it
+    /// does in the motion report.
+    #[test]
+    fn a_hunting_antenna_hold_with_the_head_still_fails_the_tour() {
+        let report = analyze(&long_run(500, 3.0 * COUNT_RAD, false), &table(), &shipped());
+        assert!(
+            found(&report, "right antenna moved 6.0 counts"),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            measured(&report, "stillness:") && measured(&report, "right antenna over a"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !measured(&report, "under head motion"),
+            "the head stood still across this hold: {:?}",
+            report.measured
+        );
+    }
+
+    /// The same hold with the head being commanded across it is printed with
+    /// its figures and no verdict: the excursion is the rod following the
+    /// platform, which is not what the bound is written for.
+    #[test]
+    fn an_antenna_hold_under_head_motion_is_printed_and_judges_nothing() {
+        let report = analyze(&long_run(500, 3.0 * COUNT_RAD, true), &table(), &shipped());
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "under head motion, not judged"),
+            "{:?}",
+            report.measured
+        );
+        assert!(measured(&report, "6.0 counts"), "{:?}", report.measured);
+    }
+
+    /// And a tour that held the antennas only under head motion says it
+    /// measured nothing about them rather than failing: a content tour holds
+    /// them almost only while the head moves, which is the content's shape and
+    /// not a defect.
+    #[test]
+    fn a_tour_with_no_head_still_antenna_hold_measures_nothing() {
+        let report = analyze(&long_run(500, 0.0, true), &table(), &shipped());
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "with the head still, so this run says nothing"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "2 antenna hold(s) read under head motion"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The table of a probe run: one instrument, played on its own.
+    fn probe_table() -> MotionTable {
+        MotionTable::of([(
+            "probe/antenna-step-a".to_string(),
+            MotionEntry {
+                motion_id: 0,
+                window: PlayWindow {
+                    duration_ms: 400,
+                    blend_out_ms: 200,
+                },
+            },
+        )])
+    }
+
+    /// The same run, judged as a probe run: holding nothing with the head still
+    /// is a **failure** there, where under the content tour it is a reading.
+    ///
+    /// Only the stillness sentence is read: a hand-built run's scripts and this
+    /// one-motion table disagree about what was asked for, which is the tour
+    /// contract's own finding and not this case's subject.
+    #[test]
+    fn a_probe_run_that_held_nothing_with_the_head_still_fails() {
+        let run = long_run(500, 0.0, true);
+        const SAYS: &str = "with the head still, so this run says nothing";
+        let content = analyze(&run, &table(), &shipped());
+        assert!(measured(&content, SAYS), "{:?}", content.measured);
+        assert!(!found(&content, SAYS), "{:?}", content.findings);
+        let probe = analyze(&run, &probe_table(), &shipped());
+        assert!(found(&probe, SAYS), "{:?}", probe.findings);
+        assert!(!measured(&probe, SAYS), "{:?}", probe.measured);
+    }
+
+    /// And where the probe run did hold, the qualifier judges it: the hold is
+    /// the run's own, so a hunt in it is the finding either standard gives.
+    #[test]
+    fn a_probe_runs_head_still_hold_is_judged_as_any_other() {
+        let probe = analyze(
+            &long_run(500, 3.0 * COUNT_RAD, false),
+            &probe_table(),
+            &shipped(),
+        );
+        assert!(
+            found(&probe, "right antenna moved 6.0 counts"),
+            "{:?}",
+            probe.findings
+        );
+        assert!(
+            !found(&probe, "with the head still, so this run says nothing"),
+            "{:?}",
+            probe.findings
+        );
+    }
+
+    /// The settle line, which is what a probe run is read by: the arrival the
+    /// judged window drops is printed under the hold with its own figures, so a
+    /// joint that rang down ten counts and then stood still passes with the
+    /// ring-down on the page.
+    #[test]
+    fn the_settle_line_prints_the_ring_down_under_the_hold() {
+        let yaw = row(JointRef::BodyYaw).expect("a bus row");
+        let right = row(JointRef::AntennaRight).expect("a bus row");
+        let left = row(JointRef::AntennaLeft).expect("a bus row");
+        let windows = 2 + 2 * WINDOW_CYCLES;
+        let samples = (0..500)
+            .map(|n| {
+                let mut commanded = [0.0; ROW_COUNT];
+                commanded[yaw] = if n < windows {
+                    n as f64 * 1e-3
+                } else {
+                    (windows - 1) as f64 * 1e-3
+                };
+                let goal = if n < HEAD_SETTLED { 0.0 } else { 0.5 };
+                commanded[right] = goal;
+                commanded[left] = goal;
+                let mut present = commanded;
+                // The first four seconds after the command are the arrival: a
+                // five-count swing either side, turning round every cycle.
+                if (HEAD_SETTLED..HEAD_SETTLED + 200).contains(&n) {
+                    let reading = if n % 2 == 0 { 5.0 } else { -5.0 } * COUNT_RAD;
+                    present[right] += reading;
+                    present[left] += reading;
+                }
+                at(n, sample(n, &present, &commanded))
+            })
+            .collect();
+        let report = analyze(&Run { samples, ..clean() }, &table(), &shipped());
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("settling into it")
+                    && line.contains("10.0 counts")
+                    && line.contains("25.0 Hz apparent")
+                    && line.contains("not judged")),
+            "{:?}",
+            report.measured
+        );
+        // The judged tail is the joint at rest, which is what the verdict is.
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("right antenna over a") && line.contains("0.0 counts")),
             "{:?}",
             report.measured
         );

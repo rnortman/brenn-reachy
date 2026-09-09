@@ -27,19 +27,53 @@ legs_p: 800
 legs_i: 100
 legs_d: 300
 
-# The value the vendor's own stack writes at startup. Nothing has ever
-# implicated the yaw, so nothing has moved it.
+# The value the vendor's own stack writes at startup, and now a measured one.
+# The yaw is gain-bound rather than motor-bound -- it reached 48 velocity units
+# on the capability tour where the legs reached 326 -- so a stiffer loop was the
+# obvious rung, and it was walked P-only over the wake gesture's 17 s stow hold:
+# 400 limit-cycles at 3.0 counts, 8-11 Hz apparent, in three holds of three;
+# 800 in one of three; 200 sits at 2.0 counts of dither, inside the stillness
+# watch's two-count bound. A P-only ladder is non-monotonic here, so it stopped
+# at the vendor's value.
+#
+# TODO(body-yaw-gains): the derivative term is the next rung -- damping is what
+# a P-only ladder had nothing of -- read from `hold-probe <yaw id> --gains` and
+# from a motion run that produces the long stow hold.
 body_yaw_p: 200
 body_yaw_i: 0
 body_yaw_d: 0
 
-# Stiff enough to carry a 0.3 s sweep, which the vendor's 200 lags badly enough
-# to overshoot the crossing. No integral term: an antenna holds nothing up, so
-# there is no standing error to integrate away.
+# The vendor's own triple, and the measured one. Walked over the antenna step
+# probes -- one commanded frame per pose, so the servo's own generator makes the
+# whole move and stops it -- with every hold judged by the stillness watch where
+# the head stood still, six runs a rung and six rungs:
 #
-# TODO(antenna-hold-gains): the sweep this was measured against is not the one
-# a session plays, and these are the next thing to move if resting the antennas
-# off vertical does not quiet them.
-antennas_p: 500
+# - Quiet at the sides pose and at the leaned up pose in every judged hold on
+#   record, 0-1 counts against the two-count bound.
+# - 200 is the proportional bound. At 400 the up pose hunts at 14-15 counts and
+#   the down pose on both antennas at 8-10; at 300 the rest hold hunts at
+#   7-9 counts; the shipped 500 / 0 / 100 hunts the rest hold at 9 counts and
+#   12.7 Hz. The cycle's amplitude grows with the proportional term at every
+#   pose that hunts.
+# - The pose selects the hunt, not the arrival. At the vendor's own antenna fold
+#   the down pose hunted at 7-8 counts and 10-11 Hz at every profile pair from
+#   the motor's measured ceiling to the shipped floor, and halving the
+#   deceleration four times moved the arrival by seconds and the excursion by
+#   nothing. Gravity loads no side of the gearbox backlash at a vertical, which
+#   is why the fold now leans (`disarm.rs`' STOW_ANTENNAS) as the raised pose
+#   already did: at the leaned fold the same rung is quiet in six of six runs,
+#   with the cycle still visible in the arrival's settle allowance and gone from
+#   the judged hold.
+#
+# No integral term: an antenna holds nothing up, so there is no weight to
+# integrate away. The cost is a parking error -- with no integral term the loop
+# stops where friction balances the proportional push -- and it is measured: the
+# right antenna parks 0.026 rad (16-17 counts) short at the sides pose on the
+# arrival from the fold, on a hold whose excursion is inside a count, at two
+# profile pairs alike.
+#
+# TODO(antenna-hold-gains): the integral term at this proportional term is the
+# rung nobody has walked, against that parking error.
+antennas_p: 200
 antennas_i: 0
-antennas_d: 100
+antennas_d: 0

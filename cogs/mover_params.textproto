@@ -15,7 +15,13 @@ lag_k: 2
 # cycles of a length the driver does not run on lands at the wrong instant.
 period_ns: 20000000
 
-# 0.8 s to stand up.
+# 0.8 s to stand up. One duration for the whole raise: head and antennas start
+# together on one command, and the tick shapes each joint's own min-jerk path
+# over it.
+#
+# TODO(antenna-raise-clock): the antennas' raise wants a clock of its own, so
+# they can snap into position without speeding the head's raise on the cranks
+# with them.
 up_duration_ns: 800000000
 
 # 2.0 s to stow. Longer than the way up: stowing is how every session ends and

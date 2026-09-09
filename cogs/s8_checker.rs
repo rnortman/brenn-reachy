@@ -292,27 +292,50 @@ fn check_the_jam_lands_inside_the_maneuver(
     }
 }
 
-/// The jam is a lag in the record: some jammed crank ends it sitting further
-/// from its goal than the detector's own threshold.
+/// The jam is a lag in the record: over the jam, the goal some jammed crank was
+/// commanded to opened at least the detector's progress minimum of distance
+/// from it while the crank did not move at all.
+///
+/// The measured figure is that distance's growth — how far the goal stood from
+/// the crank when the hand came off, less how far it stood when the hand landed
+/// — and not the goal's own travel. The two are the same reading here only
+/// because `stands_still_rows` pins the crank still over the same cycles; the
+/// growth is the figure because it is the lag the detector would have screened
+/// on, and a goal that closed on the crank over the jam reads negative and
+/// fails.
 ///
 /// This is what makes the absent raise a statement: the hand really did stop
 /// the machine closing on the fold it was being commanded to, so the run is
-/// about a stall and not about a machine nothing happened to.
+/// about a stall and not about a machine nothing happened to. `stands_still_rows`
+/// pins the other half, that the cranks stood.
 ///
-/// A lag against the goal, which is not the figure the detector screens on --
-/// what it measures is the distance to the joint's own generator, and under the
-/// fold's lead-in that generator had not travelled the screen's distance in the
-/// periods the hand was on. So the two figures are the point: radians behind
-/// the goal, and nothing raised.
+/// The progress minimum is the figure because it is the detector's own line
+/// between motion and jitter -- a goal that moved on by at least that much is
+/// one the detector itself would count as having moved -- and the placement
+/// that makes this run say nothing, a hand laid where the goal is standing
+/// still, is exactly what fails it. The two figures are the point: radians of
+/// lag the goal opened while the cranks stood, and nothing raised, because the
+/// generator behind that goal had not opened the screen's distance in the
+/// periods the hand was on.
 fn check_the_jam_was_a_lag(run: &Run, failures: &mut Vec<String>) {
-    let threshold = default_motion_config().tracking.threshold_rad;
+    let floor = default_motion_config().tracking.progress_min_rad;
+    let before = jam_cycle() - 1;
     let at = jam_release_cycle() - 1;
+    let opening = "the jam is about to be laid on";
     let what = "the jam is about to be released";
+    let Some(opening_goal) = check::goal_at_or(run, before, opening, failures) else {
+        return;
+    };
     let Some(goal) = check::goal_at_or(run, at, what, failures) else {
         return;
     };
-    let Some(present) = check::sample_at(run, at).map(check::present_rows) else {
-        failures.push(format!("no sample for cycle {at}, where {what}"));
+    let Some(opening_present) =
+        check::sample_at_or(run, before, opening, failures).map(check::present_rows)
+    else {
+        return;
+    };
+    let Some(present) = check::sample_at_or(run, at, what, failures).map(check::present_rows)
+    else {
         return;
     };
     let mut worst: f64 = 0.0;
@@ -321,13 +344,15 @@ fn check_the_jam_was_a_lag(run: &Run, failures: &mut Vec<String>) {
             failures.push(format!("{} sits on no bus row", Name(joint)));
             continue;
         };
-        worst = worst.max((goal[row] - present[row]).abs());
+        let opened =
+            (goal[row] - present[row]).abs() - (opening_goal[row] - opening_present[row]).abs();
+        worst = worst.max(opened);
     }
-    if worst < threshold {
+    if worst < floor {
         failures.push(format!(
-            "at cycle {at} the furthest jammed crank sits {worst} rad from its goal, inside the \
-             {threshold} rad the detector screens on: a jam nothing measures is a jam this run \
-             cannot say anything about"
+            "over the jam the goal of the furthest jammed crank opened {worst} rad of distance \
+             from it, under the {floor} rad the detector counts as motion: a jam the commanded \
+             fold stood still through is a jam this run cannot say anything about"
         ));
     }
 }

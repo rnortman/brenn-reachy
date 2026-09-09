@@ -58,7 +58,7 @@ use reachy_kin::{
 use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
-use reachy_motion::plant::{GroupPlants, GroupProfiles};
+use reachy_motion::plant::{GroupPlants, GroupProfiles, ProfilePair};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
@@ -732,18 +732,18 @@ pub fn group_gains(gains: &ServoGains) -> GroupGains {
 #[must_use]
 pub fn group_profiles(profile: &ServoProfile) -> GroupProfiles {
     GroupProfiles {
-        legs: (
-            profile.legs_profile_acceleration,
-            profile.legs_profile_velocity,
-        ),
-        yaw: (
-            profile.body_yaw_profile_acceleration,
-            profile.body_yaw_profile_velocity,
-        ),
-        antennas: (
-            profile.antennas_profile_acceleration,
-            profile.antennas_profile_velocity,
-        ),
+        legs: ProfilePair {
+            acceleration: profile.legs_profile_acceleration,
+            velocity: profile.legs_profile_velocity,
+        },
+        yaw: ProfilePair {
+            acceleration: profile.body_yaw_profile_acceleration,
+            velocity: profile.body_yaw_profile_velocity,
+        },
+        antennas: ProfilePair {
+            acceleration: profile.antennas_profile_acceleration,
+            velocity: profile.antennas_profile_velocity,
+        },
     }
 }
 

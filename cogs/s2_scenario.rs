@@ -95,8 +95,8 @@ pub fn raise_cycle() -> i64 {
 ///
 /// The run reopens on the tick after the raise and runs out `ticks` after it,
 /// and what restarts it is the released joint regaining the progress minimum --
-/// three steps of a from-rest ramp, which is what `pass_cycles` answers for that
-/// distance. A release later than this is a second raise and a defeated stow.
+/// `pass_cycles` of that distance, one step at the legs' commissioned pair. A
+/// release later than this is a second raise and a defeated stow.
 #[must_use]
 pub fn recovery_bound_cycle() -> i64 {
     let cfg = reachy_motion::tick::default_motion_config();

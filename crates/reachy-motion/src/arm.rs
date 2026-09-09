@@ -197,9 +197,9 @@ pub type GroupGains = PerGroup<Gains>;
 
 /// The gains this platform is armed with.
 ///
-/// Tuned on the bench against recorded step responses, except the yaw, which
-/// still carries the value the vendor's own stack writes at startup — nothing
-/// has ever implicated it.
+/// Tuned on the bench against recorded step responses, and the yaw and the
+/// antennas against recorded holds; both of the latter sit at the value the
+/// vendor's own stack writes at startup, which measurement did not beat.
 pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // A proportional term alone cannot hold the head's weight up this linkage:
     // at the vendor's P-only 300 the two most loaded cranks park 3.9–4.3° short
@@ -211,19 +211,28 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
         i: 100,
         d: 300,
     },
-    yaw: Gains { p: 200, i: 0, d: 0 },
-    // Stiff enough to carry a 0.3 s sweep, which the vendor's 200 lags badly
-    // enough to overshoot the crossing. No integral term: an antenna holds
-    // nothing up, so there is no standing error to integrate away.
+    // The vendor's value, and a measured one: the yaw is gain-bound, and a
+    // P-only climb hunts at 400 and at 800 where 200 sits at two counts of
+    // dither.
     //
-    // TODO(antenna-hold-gains): the sweep this was measured against is not the
-    // one a session plays, and these are the next thing to move if resting the
-    // antennas off vertical does not quiet them.
-    antennas: Gains {
-        p: 500,
-        i: 0,
-        d: 100,
-    },
+    // TODO(body-yaw-gains): the derivative term is the next rung.
+    yaw: Gains { p: 200, i: 0, d: 0 },
+    // The vendor's own triple, and the measured one: over the antenna step
+    // probes, where the servo's own generator makes and stops the whole move,
+    // 200 is the proportional bound -- 300 hunts the rest hold, 400 the raised
+    // pose, and the shipped 500 / 0 / 100 the rest hold at 9 counts and
+    // 12.7 Hz -- and this triple is inside the two-count bound at every pose
+    // the probes hold. What selected the one hunt on record was the pose and
+    // not the arrival: the antenna fold hunted at every profile pair from the
+    // motor's ceiling to the shipped floor until the fold was leaned off the
+    // vertical, which is what `disarm::STOW_ANTENNAS` is. No integral term: an
+    // antenna holds nothing up. The cost is a parking error -- the loop stops
+    // where friction balances the proportional push, 0.026 rad short at the
+    // sides pose on the arrival from the fold.
+    //
+    // TODO(antenna-hold-gains): the integral term at this proportional term is
+    // the rung nobody has walked, against that parking error.
+    antennas: Gains { p: 200, i: 0, d: 0 },
 };
 
 /// The servo-side motion profile, the backstop under host-side shaping.
@@ -253,7 +262,7 @@ pub struct ProfileConfig {
 /// whatever shape the wire layer decodes it to, not engineering units — these
 /// are integers a person compares against a data sheet, and an angle converted
 /// from them would be the wrong thing to compare.
-pub const PROVISION_REGS: [RegId; 16] = [
+pub const PROVISION_REGS: [RegId; 15] = [
     RegId::ReturnDelayTime,
     RegId::OperatingMode,
     RegId::DriveMode,
@@ -266,7 +275,6 @@ pub const PROVISION_REGS: [RegId; 16] = [
     RegId::TemperatureLimit,
     RegId::CurrentLimit,
     RegId::VelocityLimit,
-    RegId::AccelerationLimit,
     RegId::BusWatchdog,
     RegId::ProfileAcceleration,
     RegId::ProfileVelocity,
@@ -303,10 +311,10 @@ pub const PROFILE_REGS: [ProfileWrite; 4] = [
     (RegId::BusWatchdog, |_, _| value::u8(0)),
     (RegId::BusWatchdog, |cfg, _| value::u8(cfg.bus_watchdog)),
     (RegId::ProfileAcceleration, |cfg, row| {
-        value::u32(cfg.profiles.for_row(row).0)
+        value::u32(cfg.profiles.for_row(row).acceleration)
     }),
     (RegId::ProfileVelocity, |cfg, row| {
-        value::u32(cfg.profiles.for_row(row).1)
+        value::u32(cfg.profiles.for_row(row).velocity)
     }),
 ];
 
@@ -1641,6 +1649,7 @@ mod tests {
 
     use super::*;
     use crate::joints::group_of_row;
+    use crate::plant::ProfilePair;
     use crate::testutil::{Asked, ScriptedBus, asked};
     use crate::txn::AuxOpKind;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -1749,7 +1758,7 @@ mod tests {
             [rad_from_counts(-202), rad_from_counts(4051)],
             [3.6, -4.2],
             [0.2, -0.15],
-            [-3.05, 3.05],
+            crate::disarm::STOW_ANTENNAS,
             [
                 10.0 * core::f64::consts::TAU,
                 -10.0 * core::f64::consts::TAU,
@@ -2177,6 +2186,12 @@ mod tests {
     /// group holding a weight up: the measured droop a proportional term alone
     /// leaves is what that term is there to close, so a leg gain set without one
     /// is the configuration that droop was measured on.
+    ///
+    /// The other two groups sit at the vendor's own value for reasons of their
+    /// own: the yaw because a P-only climb found nothing quieter, and the
+    /// antennas because a stiffer loop hunts at the rest pose. Each is
+    /// asserted on its own terms, because both classes have a ladder left to
+    /// walk and a rung on one says nothing about the other.
     #[test]
     fn gains_are_per_group() {
         let gains = DEFAULT_GAINS;
@@ -2184,7 +2199,9 @@ mod tests {
         assert_eq!(gains.for_joint(JointRef::BodyYaw), gains.yaw);
         assert_eq!(gains.for_joint(JointRef::AntennaLeft), gains.antennas);
         assert!(gains.legs.p > gains.antennas.p);
-        assert!(gains.antennas.p > gains.yaw.p);
+        assert!(gains.legs.p > gains.yaw.p);
+        assert_eq!(gains.antennas.d, 0, "a quiet antenna needs no damping");
+        assert_eq!(gains.yaw.d, 0, "the yaw's damping is a rung nobody has run");
         assert!(gains.legs.i > 0, "the loaded group integrates its error");
         assert_eq!((gains.yaw.i, gains.antennas.i), (0, 0));
         for group in [gains.legs, gains.yaw, gains.antennas] {
@@ -2556,9 +2573,18 @@ mod tests {
     #[test]
     fn the_sweep_writes_each_servo_its_own_class_pair() {
         let profiles = GroupProfiles {
-            legs: (20, 50),
-            yaw: (30, 60),
-            antennas: (40, 70),
+            legs: ProfilePair {
+                acceleration: 20,
+                velocity: 50,
+            },
+            yaw: ProfilePair {
+                acceleration: 30,
+                velocity: 60,
+            },
+            antennas: ProfilePair {
+                acceleration: 40,
+                velocity: 70,
+            },
         };
         let cfg = ArmConfig {
             profile: ProfileConfig {
@@ -2571,7 +2597,10 @@ mod tests {
         commission(&cfg, &mut machine).expect("commissioning passes");
 
         for (row, id) in SERVO_IDS.iter().enumerate() {
-            let (acceleration, velocity) = profiles.for_row(row);
+            let ProfilePair {
+                acceleration,
+                velocity,
+            } = profiles.for_row(row);
             let written = |reg: RegId| {
                 machine
                     .log

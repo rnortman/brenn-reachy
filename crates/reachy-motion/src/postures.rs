@@ -23,6 +23,14 @@ use crate::joints::JointTargets;
 /// lets the rod's own weight hold the play to one side, and the loop has
 /// something to push against. Small enough that the pair still rests well
 /// inside the contact band, so the rest pose changes no phase judgement.
+///
+/// The lean alone was not enough: at 500 / 0 / 100 the left antenna still hunts
+/// at this pose, 9 counts at 12.7 Hz. At the vendor's 200 / 0 / 0 it is quiet
+/// here, and the two together are what hold the joint inside the two-count
+/// bound.
+///
+/// [`STOW_ANTENNAS`] leans by the same magnitude for the same reason: straight
+/// down loads no side of the play either.
 pub const NEUTRAL_ANTENNAS: [f64; 2] = [-0.1745, 0.1745];
 
 /// The neutral configuration: head square and level at nominal height, body
@@ -95,6 +103,62 @@ mod tests {
                  {ANTENNA_CONTACT_BAND_RAD} rad: a rest outside the band moves where a sweep is \
                  judged",
                 rest.abs(),
+            );
+        }
+    }
+
+    /// The fold leans the *other* way — inboard — by the same magnitude, and
+    /// the two poses' rules are written out together because a reader who finds
+    /// only the rest rule above will read the fold as breaking it.
+    ///
+    /// Why the fold is exempt. The rest rule is about the arc a rod sweeps near
+    /// upright, where the two arcs face each other and a lean the wrong way is a
+    /// lean into the other antenna's. At the fold each rod points down, past the
+    /// vertical by this lean, and the pair stands twice the lean apart with the
+    /// arcs pointing away from each other. What the lean buys is the same thing
+    /// at both poses: gravity taking up one side of the gearbox backlash instead
+    /// of leaving the rod balanced on the play, which is why the magnitudes are
+    /// the same figure and not two.
+    ///
+    /// What this case does *not* assert is clearance. No check in this workspace
+    /// bounds the linkage or the antenna pair against itself
+    /// (`TODO(collision-envelope)`), so the separation at the fold is a measured
+    /// reading and not a derived one — [`STOW_ANTENNAS`] carries the runs. A
+    /// mechanical figure arriving later belongs here, against this separation.
+    #[test]
+    fn each_antenna_folds_a_little_way_past_down_toward_the_centreline() {
+        // Transcribed from a measurement, so written out here: the six
+        // leaned-fold probe runs held *this* angle, and the rules below pass
+        // over a degree of angles either side of it. A fold edited off the one
+        // the runs were made at leaves the reading beside the constant
+        // describing a pose the machine no longer holds, so the digit is pinned
+        // beside them.
+        assert_eq!(STOW_ANTENNAS, [-3.32, 3.32]);
+        for (side, fold) in STOW_ANTENNAS.into_iter().enumerate() {
+            assert_eq!(
+                fold.signum(),
+                ANTENNA_OUTBOARD[side].signum(),
+                "antenna {side} folds to {fold} rad and its outboard is {}: the fold is measured \
+                 the way the arc runs, up through outboard to down",
+                ANTENNA_OUTBOARD[side],
+            );
+            assert!(
+                fold.abs() > core::f64::consts::PI,
+                "antenna {side} folds to {} rad, short of the {} rad that is straight down: the \
+                 fold leans outboard, which is the vendor's shutdown angle and the way that \
+                 splays the pair",
+                fold.abs(),
+                core::f64::consts::PI,
+            );
+            // Within a degree and not equal to the digit: the fold is rounded
+            // to 3.32 rad so that the sweep between the two poses is not a tie
+            // between the two half turns for the arc policy to break.
+            let lean = fold.abs() - core::f64::consts::PI;
+            assert!(
+                (lean - NEUTRAL_ANTENNAS[side].abs()).abs() < 1.0_f64.to_radians(),
+                "antenna {side} folds {lean} rad past down and rests {} rad off upright: the two \
+                 leans answer the same backlash and are the same figure to a degree",
+                NEUTRAL_ANTENNAS[side].abs(),
             );
         }
     }

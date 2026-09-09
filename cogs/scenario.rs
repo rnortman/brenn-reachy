@@ -138,10 +138,10 @@ pub const SESSION_CONFIRM_BUDGET_NS: i64 = 500_000_000;
 /// datagrams. What makes it the pair the decision tick judges those joints
 /// against is [`check_params`], which compares the file with the motion
 /// library's own `plant::SHIPPED_PROFILES`.
-pub const LEGS_PROFILE_ACCELERATION: i64 = 20;
+pub const LEGS_PROFILE_ACCELERATION: i64 = 287;
 
 /// The six cranks' profile velocity the sweep writes, register units.
-pub const LEGS_PROFILE_VELOCITY: i64 = 50;
+pub const LEGS_PROFILE_VELOCITY: i64 = 326;
 
 /// The body yaw servo's profile acceleration, register units. Its own pair
 /// because its motor and its load are its own.
@@ -593,10 +593,14 @@ pub fn pass_cycles(group: reachy_motion::joints::JointGroup, distance_rad: f64) 
 ///
 /// The raise latency's first term: a run opens on the tick the residual passes
 /// `threshold_rad` and the fault comes `ticks` ticks later, so a jam shorter
-/// than this raises nothing at all whatever the goal was doing, and one longer
-/// than this plus the window raises. A scenario placing a hand on the machine
-/// says which of the two it is by this figure rather than by an integer. Per
-/// class, as the profile is.
+/// than this raises nothing at all whatever the goal was doing. The converse —
+/// that a jam longer than this plus the window raises — holds only where the
+/// goal is running the generator at its cap; under a slower goal the residual
+/// grows at the goal's own speed and a hand held that long raises nothing, so
+/// this figure is a floor on the latency rather than a threshold on the hand.
+/// A scenario placing a hand on the machine says which side of it the hand
+/// falls by this figure rather than by an integer. Per class, as the profile
+/// is.
 #[must_use]
 pub fn crossing_cycles(group: reachy_motion::joints::JointGroup) -> i64 {
     let cfg = reachy_motion::tick::default_motion_config();
@@ -648,13 +652,23 @@ pub fn head_jam_rows() -> brenn_reachy__motion__joints_clk_rs::JointFlags {
 /// their generator to travel the screen's own distance after it: a hand laid on
 /// a joint that had nearly arrived opens no run at all.
 ///
-/// And their generator has to have *stopped* by the time the fault lands, a
-/// response delay before it, so the reading the run reopens against is a joint
-/// standing beside a trajectory that has come to rest. That is what makes a
-/// release recoverable, for the run that lets go: the reopened window is
-/// restarted by a released joint regaining the progress minimum, which takes
-/// three steps of its ramp, while a generator still running at the profile is
-/// one a joint setting off from rest cannot pace before the window runs out.
+/// And the held rows' generator has to have *arrived* on its target a response
+/// delay before the fault lands, so the reading the run reopens against is a
+/// joint standing beside a trajectory that is not going anywhere. That is what
+/// makes a release recoverable, for the run that lets go: the reopened window
+/// is restarted by a released joint regaining the progress minimum, which takes
+/// `pass_cycles` of that distance — one cycle at the legs' commissioned pair —
+/// while a generator still running at the profile is one a joint setting off
+/// from rest cannot pace before the window runs out.
+///
+/// An arrived generator is not perfectly still: the shaped path behind it goes
+/// on creeping toward the same angle over its min-jerk tail, 1.5e-4 rad a cycle
+/// at the legs' commissioned pair. That is an observed margin and not something
+/// this search selects for, and the pin on it is
+/// `check_the_generator_had_stopped`'s tolerance, the detector's own progress
+/// minimum: a pair whose tail creeps faster than the detector counts as motion
+/// goes red in that checker rather than here, which is the right place for it,
+/// since what the tolerance states is exactly the recoverable release.
 ///
 /// The earliest jam satisfying the second condition is the one taken, which is
 /// the one that leaves the most distance for the first: it puts the residual
@@ -1412,7 +1426,7 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
     // no deployment runs. Per class, because a check that compared one pair
     // would pass a file that gave the antennas the legs' numbers.
     let shipped = reachy_motion::plant::SHIPPED_PROFILES;
-    for (class, (acceleration, velocity), (expected_a, expected_v)) in [
+    for (class, pair, (expected_a, expected_v)) in [
         (
             "legs",
             shipped.legs,
@@ -1429,6 +1443,7 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
             (ANTENNAS_PROFILE_ACCELERATION, ANTENNAS_PROFILE_VELOCITY),
         ),
     ] {
+        let (acceleration, velocity) = (pair.acceleration, pair.velocity);
         if i64::from(acceleration) != expected_a || i64::from(velocity) != expected_v {
             failures.push(format!(
                 "the motion library ships the {class} at profile {acceleration}/{velocity} and \
@@ -1610,10 +1625,10 @@ mod tests {
     /// from have lost their edges. Nothing else in the tree reads this
     /// arithmetic back.
     ///
-    /// The distance is the long way round: the planner routes each antenna away
-    /// from its outboard direction, so the fold-to-upright arc is a whole turn
-    /// less the difference between the two postures' angles rather than that
-    /// difference. Arrival is at or after the closed form because the closed
+    /// The distance is the arc the planner takes, not the difference between
+    /// the angles: each antenna is routed inboard over the head rather than out
+    /// through its own sideways point, so the fold-to-upright arc is a whole
+    /// turn less that difference. Arrival is at or after the closed form because the closed
     /// form is a straight-line travel from rest to rest, and a joint chasing a
     /// min-jerk goal is slower than its profile for the first cycles because
     /// the goal is -- so it saturates late and arrives later. Two small terms
@@ -1805,15 +1820,27 @@ mod tests {
                 (
                     "servo_profile.textproto",
                     vec![
-                        ("legs_profile_acceleration", shipped.legs.0.to_string()),
-                        ("legs_profile_velocity", shipped.legs.1.to_string()),
-                        ("body_yaw_profile_acceleration", shipped.yaw.0.to_string()),
-                        ("body_yaw_profile_velocity", shipped.yaw.1.to_string()),
+                        (
+                            "legs_profile_acceleration",
+                            shipped.legs.acceleration.to_string(),
+                        ),
+                        ("legs_profile_velocity", shipped.legs.velocity.to_string()),
+                        (
+                            "body_yaw_profile_acceleration",
+                            shipped.yaw.acceleration.to_string(),
+                        ),
+                        (
+                            "body_yaw_profile_velocity",
+                            shipped.yaw.velocity.to_string(),
+                        ),
                         (
                             "antennas_profile_acceleration",
-                            shipped.antennas.0.to_string(),
+                            shipped.antennas.acceleration.to_string(),
                         ),
-                        ("antennas_profile_velocity", shipped.antennas.1.to_string()),
+                        (
+                            "antennas_profile_velocity",
+                            shipped.antennas.velocity.to_string(),
+                        ),
                     ],
                 ),
                 (

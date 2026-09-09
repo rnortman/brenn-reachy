@@ -400,6 +400,82 @@ assert_eq "a doubled dot inside a name is not a climb" \
 	"$(speech_credential_paths "${work}/dots.toml")"
 
 # ---------------------------------------------------------------------------
+# The run directory under a log root
+# ---------------------------------------------------------------------------
+
+# A fetched log root is not only run directories. The deploy leaves the
+# payload's `config/` copy in it, and the fetch puts the launcher's consoles
+# and a speech run's audio store beside it; the run is the newest directory
+# whose name is the logger's stamp, and a name that is not all digits is not a
+# candidate however new it is.
+#
+# Every stamp here is the shape the logger writes one: the instant it opened
+# the log, in nanoseconds, nineteen digits of it.
+logs="${work}/logroot"
+mkdir -p -- "${logs}/20260908T020318Z" "${logs}/1788832560362471129" \
+	"${logs}/config/cogs" "${logs}/1788899999999999999.console"
+: >"${logs}/1788832560362471129/motion.olog"
+printf 'x' >>"${logs}/1788832560362471129/motion.olog"
+printf 'x' >"${logs}/config/cogs/servo_profile.textproto"
+assert_eq "the stamped run is found past a config copy and a console sibling" \
+	"${logs}/1788832560362471129" \
+	"$(run_directory "$logs" "no directory hint" "no records hint")"
+
+# The stamp is the logger's, and the logger's stamps are digits. A root holding
+# only names that are not — a `config/` copy left by a deploy whose run never
+# opened a log, say — has no run in it, and that is a refusal naming what it
+# looked for rather than a report over the configuration directory.
+empty="${work}/logroot-unstamped"
+mkdir -p -- "${empty}/config" "${empty}/20260908T020318Z"
+: >"${empty}/config/held.olog"
+printf 'x' >>"${empty}/config/held.olog"
+result=$(attempt run_directory "$empty" "the launcher's console is elsewhere" "hint")
+assert_status "a root with no all-digit directory refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal says a stamp is what it wanted" "$(output_of "$result")" \
+	"no stamp-named run directory"
+assert_contains "and carries the caller's hint" "$(output_of "$result")" \
+	"the launcher's console is elsewhere"
+
+# A stamped directory that holds no records is still the run: the refusal is
+# about the records, so the message points at the run rather than at the root.
+bare="${work}/logroot-bare"
+mkdir -p -- "${bare}/1788832560362471129"
+result=$(attempt run_directory "$bare" "hint" "and which file states the namespace")
+assert_status "a stamped run with no .olog refuses on the records" 1 "$(status_of "$result")"
+assert_contains "naming the run directory" "$(output_of "$result")" \
+	"${bare}/1788832560362471129 holds no non-empty .olog"
+
+# Newest is newest by number and not by spelling. A root holding stamps of two
+# widths -- a merged fetch, or a stamp format that changed under a run -- would
+# hand the analyzer the older records under a lexicographic sort, and report a
+# verdict about them without saying so.
+# The refusal has to survive a caller that does not swallow errexit. Every
+# script here runs `set -euo pipefail`, and the newest-stamp pipeline's filter
+# exits non-zero when no name is all digits: read through `inherit_errexit`, or
+# called outside a substitution, an unswallowed status would end the caller at
+# the assignment with neither the refusal nor the hint the two arguments carry.
+probe="${work}/inherit-errexit.sh"
+cat >"$probe" <<'PROBE'
+set -euo pipefail
+shopt -s inherit_errexit
+. "$1"
+run_directory "$2" "the launcher's console is elsewhere" "hint"
+PROBE
+result=$(attempt bash "$probe" "$lib_path" "$empty")
+assert_status "an unstamped root refuses under inherit_errexit too" 1 "$(status_of "$result")"
+assert_contains "with the refusal, and not a silent exit at the pipeline" \
+	"$(output_of "$result")" "no stamp-named run directory"
+assert_contains "and the caller's hint with it" "$(output_of "$result")" \
+	"the launcher's console is elsewhere"
+
+widths="${work}/logroot-widths"
+mkdir -p -- "${widths}/999999999999999999" "${widths}/1788832560362471129"
+for run in "${widths}"/*; do printf 'x' >"${run}/motion.olog"; done
+assert_eq "the newest of two stamp widths is the larger number" \
+	"${widths}/1788832560362471129" \
+	"$(run_directory "$widths" "no directory hint" "no records hint")"
+
+# ---------------------------------------------------------------------------
 # The service endpoints, and what a remote command can carry
 # ---------------------------------------------------------------------------
 #

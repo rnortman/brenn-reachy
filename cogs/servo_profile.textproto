@@ -23,15 +23,31 @@
 # registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
 # acceleration).
 #
-# This pair is the measured velocity cap of the recorded library tour: every
-# joint class chasing a goal more than 0.1 rad away travels a median of
-# 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the velocity
-# below converts to, and a joint setting off from rest ramps at the
-# acceleration. The whole tour ran velocity-saturated -- the content asks for
-# 3-20 rad/s against a 1.2 rad/s ceiling -- so the pair is what shapes the
-# motion rather than a backstop under it. Whether it is the right pair for this
-# machine is still nobody's measurement, and the mark for that is on the
-# schema's own field in `cogs/config.clk`.
+# Two pairs across the three classes, and each one a measurement.
+#
+# The legs run their own capability: a tour of the whole clip library at
+# `(32767, 445)` -- the generator wide open, so the motor and not the generator
+# was the binding constraint -- read the class motor-bound at 326 velocity units
+# with a goal-step ramp median of 287, and a confirmation tour of the same
+# library at 287 / 326 held the six cranks 0.3319 rad from their own modelled
+# trajectory at the worst, against a 0.4 rad bound, reading the class
+# motor-bound at 326 again.
+#
+# The body yaw and the antennas run the measured velocity cap of the recorded
+# library tour: every joint class chasing a goal more than 0.1 rad away travels
+# a median of 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the
+# velocity 50 converts to, and a joint setting off from rest ramps at the
+# acceleration. At that pair those two classes run velocity-saturated -- the
+# content asks for 3-20 rad/s against a 1.2 rad/s ceiling -- so the pair is what
+# shapes their motion rather than a backstop under it. The body yaw is there
+# because its own capability reading is that pair to within the capability
+# instrument's ratio: what holds the class back is its loop, not its motor. The
+# antennas are there because their measured capability is faster than the plant
+# model can be right at -- at the shipped gains the joint reaches its
+# generator's speed but follows it about one and a half periods of travel
+# behind, and the tracking screen has no room for that lag -- so the fast pair
+# stays on record and uncommissioned. The mark is on the schema's own field in
+# `cogs/config.clk`.
 #
 # The bench's trial-validated figures (400/600, including an 855°/s antenna
 # sweep and the 0.8 s presence gesture) were sized for a host commanding whole
@@ -40,13 +56,10 @@
 # step-bounded setpoints instead, one per cycle, which is what the low pair is
 # for.
 #
-# All three classes carry the one measured pair: no per-class capability has
-# been measured yet, so a class running a different pair would be a guess.
-#
 # Zero in either register is a servo with no generator at all. Both readers
 # refuse it, per class, before anything is commanded.
-legs_profile_acceleration: 20
-legs_profile_velocity: 50
+legs_profile_acceleration: 287
+legs_profile_velocity: 326
 body_yaw_profile_acceleration: 20
 body_yaw_profile_velocity: 50
 antennas_profile_acceleration: 20

@@ -49,16 +49,14 @@ const TRACE_FIXTURES_ENV: &str = "REACHY_MOTION_TRACE_FIXTURES";
 /// Panics rather than answers: neither a missing fixture nor a missing
 /// environment is a test case.
 ///
-/// TODO(antenna-hold-fixture): there is a recording of the hunt
-/// (`trace-antenna-hunt.csv`) and none of an antenna pair holding still, so
-/// nothing here says what a quiet hold reads. `//cogs:trace_export` cuts a
-/// window of a log into a file this reads; what such a file must carry is what
-/// the parser here refuses to guess at: the header is
-/// `run,tick,t_s,phase,<joint>_present_rad…,<joint>_goal_rad…`, the `phase`
-/// cell is exactly `commanding` or `settling` and panics otherwise, present
-/// cells are all nine or all blank, and a joint holding no goal has a blank
-/// goal cell rather than a zero. The cut runs from before the raise's last
-/// goal write, so the shipped settle allowance opens the window inside it.
+/// `//cogs:trace_export` cuts a window of a log into a file this reads. What
+/// such a file must carry is what the parser here refuses to guess at: the
+/// header is `run,tick,t_s,phase,<joint>_present_rad…,<joint>_goal_rad…`, the
+/// `phase` cell is exactly `commanding` or `settling` and panics otherwise,
+/// present cells are all nine or all blank, and a joint holding no goal has a
+/// blank goal cell rather than a zero. A hold fixture is cut from before the
+/// raise's last goal write, so the shipped settle allowance opens the window
+/// inside it.
 pub fn fixture(name: &str) -> Trace {
     let dir = std::env::var(TRACE_FIXTURES_ENV).unwrap_or_else(|_| {
         panic!(

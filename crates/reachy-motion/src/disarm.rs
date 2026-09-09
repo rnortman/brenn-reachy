@@ -75,10 +75,32 @@ pub use brenn_reachy__motion__disarm_clk_rs::{
 
 /// Where the antennas are stowed, right then left, radians.
 ///
-/// Folded back against the head rather than left standing: the antennas have no
-/// travel limit of their own in the servo, and this is the far end of the range
-/// the platform's own shutdown procedure uses.
-pub const STOW_ANTENNAS: [f64; 2] = [-3.05, 3.05];
+/// Folded back against the head rather than left standing, and leaning 10.2°
+/// past straight down toward the machine's centreline rather than resting on
+/// the vertical. Straight down is the mirror of straight up: gravity puts no
+/// load across the gearbox backlash, the rod balances on the play, and the
+/// position loop hunts across the gap — the same mechanism
+/// [`crate::postures::NEUTRAL_ANTENNAS`] leans the rest pose against, at the
+/// same magnitude, which is the one lean this machine has been measured quiet
+/// at. Leaning inboard also tucks the folded pair rather than splaying it,
+/// which is the direction the *rest* pose is forbidden to lean, because a rest
+/// lean the wrong way is a lean into the other antenna's arc partway up. Down
+/// at the fold the arcs no longer face each other: each rod is past the
+/// vertical by this lean and the two stand 20.4° apart, and nothing in this
+/// stack derives the clearance — no envelope check bounds the linkage or the
+/// pair against itself. So the reading is the evidence, not the geometry: six
+/// `make motion-probe` runs at this angle held both rods here for 6.5 s and
+/// then folded the head over them, reading 0–1 encoder counts of excursion,
+/// both antennas 0.0005 rad from stow and `at_stow` true in all six
+/// (`probe-log-20260909T014542Z` and the five after it). A rod resting short
+/// against the fold or against its partner is what those figures would have
+/// shown as a deviation toward the goal's near side. The first of those runs is
+/// kept as `fixtures/traces/trace-antenna-fold-still.csv`, so the hold is
+/// replayed under `make check` and not only recorded here.
+///
+/// Not the vendor's shutdown angle. That one is 5.2° short of straight down on
+/// the *outboard* side, which is half this lean and the other way.
+pub const STOW_ANTENNAS: [f64; 2] = [-3.32, 3.32];
 
 /// How long the platform is left to settle at stow before torque comes off.
 pub const DEFAULT_STOW_DWELL: Duration = Duration::from_secs(2);
@@ -984,10 +1006,11 @@ mod tests {
     }
 
     /// An antenna is judged on where it physically points, not on which turn its
-    /// reading sits on. A machine whose right antenna is folded 23° short of its
-    /// −174.75° fold but reads it from the other side of the half turn, at
-    /// +162.25°, is 23° from stow — not the 337° a linear difference reports and
-    /// refuses on.
+    /// reading sits on. A machine whose right antenna is folded 23° past its
+    /// fold but reads it from the other side of the half turn is 23° from stow —
+    /// not the 337° a linear difference reports and refuses on. The reading is
+    /// derived from the fold rather than written out, because which side of the
+    /// half turn it lands on is the fold's own arithmetic.
     ///
     /// Both antennas, and each read across the half turn from its own fold: a
     /// reading on the same side of it needs no wrapping to come out right, and
@@ -1003,12 +1026,16 @@ mod tests {
         };
 
         let cases = [
-            (0usize, 7usize, 162.248_f64, JointRef::AntennaRight),
-            (1, 8, -162.248, JointRef::AntennaLeft),
+            (0usize, 7usize, JointRef::AntennaRight),
+            (1, 8, JointRef::AntennaLeft),
         ];
-        for (side, row, degrees, joint) in cases {
+        for (side, row, joint) in cases {
+            // 23° past the fold, away from upright, wrapped into the half turn
+            // either side of it — the other side from the fold's own.
+            let fold = STOW_ANTENNAS[side];
+            let radians = wrap_to_pi(fold + 23.0_f64.to_radians() * fold.signum());
             let mut machine = bus();
-            machine.present.antennas[side] = degrees.to_radians();
+            machine.present.antennas[side] = radians;
 
             let summary = drive(&wide, &mut machine).expect("23° is inside a 25° gate");
             assert!(summary.at_stow, "{}", Name(joint));
@@ -1023,7 +1050,7 @@ mod tests {
             // stow, and by the circular figure: nothing here waives the
             // measurement, it measures it.
             let mut machine = bus();
-            machine.present.antennas[side] = degrees.to_radians();
+            machine.present.antennas[side] = radians;
             let summary = drive(&config(), &mut machine).expect("nothing here refuses");
             assert!(!summary.at_stow, "23° is past a 2° tolerance");
             assert_eq!(summary.worst_deviation().0, joint);

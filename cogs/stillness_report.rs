@@ -37,7 +37,7 @@ use reachy_motion::joints::{
     JointGroup, JointVector, Name, ROW_COUNT, ROWS, group_of, row, vector_of, write_rows,
 };
 use reachy_motion::stillness::{
-    COUNT_RAD, HoldWindow, Sample, StillnessConfig, StillnessCounts, StillnessWatch, judge,
+    COUNT_RAD, HoldWindow, Sample, StillnessConfig, StillnessCounts, StillnessWatch, Wobbled, judge,
 };
 use run_report::Report;
 
@@ -55,8 +55,38 @@ pub enum Standard {
     /// An antenna hold past the bound fails the run, and a run holding no
     /// antenna still long enough to judge fails too.
     Judged,
+    /// The same, over the antenna holds the head stood still across; a hold the
+    /// head moved during is printed and not judged, and a run that holds none
+    /// with the head still says so without failing.
+    ///
+    /// For a run whose content moves the head while the antennas hold: the rod
+    /// follows the platform it is mounted on, so such a hold reads the head's
+    /// motion rather than the antenna's loop, and the bound is written for the
+    /// loop. A run that holds the antennas only under head motion has measured
+    /// nothing about them, which is a reading and not a defect.
+    JudgedWhereHeadStill,
+    /// The same qualifier, over a run that exists to produce such a hold: one
+    /// that holds none fails.
+    ///
+    /// For a probe run. A probe steps the antennas to a pose and holds it with
+    /// the head standing at the raised base, so every one of its holds is a
+    /// head-still hold; a report of none is a run whose stimulus did not
+    /// arrive or whose head was commanded across it, and a green verdict there
+    /// would make a rung's *quiet* reading vacuously true over nothing.
+    JudgedWhereHeadStillRequired,
     /// Every hold is a number, whatever it says.
     Printed,
+}
+
+impl Standard {
+    /// Whether an antenna hold is judged only where the head stood still
+    /// across it.
+    const fn head_still_only(self) -> bool {
+        matches!(
+            self,
+            Self::JudgedWhereHeadStill | Self::JudgedWhereHeadStillRequired
+        )
+    }
 }
 
 /// The stillness measurement over one recorded sample stream.
@@ -66,12 +96,17 @@ pub enum Standard {
 /// distinguishes a run nothing could be judged over from one that was.
 #[derive(Debug)]
 pub struct Stillness {
+    /// The measurement, told that the head rows are the platform the antennas
+    /// are mounted on: every hold it closes says whether the head stood still
+    /// across it.
     watch: StillnessWatch,
     /// The first [`ANTENNA_LINES`] antenna holds: those are what is judged, and
     /// what a reader of a failing run wants one line each of.
-    windows: Vec<HoldWindow>,
+    windows: Vec<Hold>,
     /// One entry per antenna row that held past that cap, folded as the head
-    /// rows are and judged as the holds above are.
+    /// rows are and judged as the holds above are — one per row per side of the
+    /// head-still question, so a hold the head moved through cannot fold away
+    /// the one hold a run took with the head still.
     beyond: Vec<Head>,
     /// One entry per head row that held at all, and nothing more however many
     /// holds a run contains.
@@ -86,7 +121,30 @@ pub struct Stillness {
     unreadable: usize,
 }
 
-/// One head row's holds, folded: the widest one, and how many there were.
+/// Every row that is not an antenna: the platform the antennas are mounted on.
+///
+/// The body yaw and the six legs, taken off the group rather than listed, so a
+/// machine with another row in its head carries it here without an edit.
+fn head_rows() -> Vec<reachy_motion::joints::JointRef> {
+    ROWS.into_iter()
+        .filter(|joint| group_of(*joint) != Some(JointGroup::Antennas))
+        .collect()
+}
+
+/// One hold, and whether the head stood still across it.
+///
+/// The flag is the hold's own property and is taken on every run: what a
+/// report does with it is the [`Standard`] it prints under.
+#[derive(Clone, Copy, Debug)]
+pub struct Hold {
+    /// What the joint did.
+    pub window: HoldWindow,
+    /// Whether no head row was commanded somewhere new between this hold's
+    /// setpoint change and its last judged reading.
+    pub head_still: bool,
+}
+
+/// One row's holds, folded: the widest one, and how many there were.
 ///
 /// The head is a baseline rather than a verdict, and a conversation holds the
 /// head as often as it is left alone, so keeping every hold would make the
@@ -94,8 +152,9 @@ pub struct Stillness {
 /// conversation the day somebody complains about a head row.
 #[derive(Clone, Copy, Debug)]
 pub struct Head {
-    /// The widest hold this row showed.
-    pub worst: HoldWindow,
+    /// The widest hold this row showed, and whether the head stood still
+    /// across it. An antenna row folds one of these per side of that question.
+    pub worst: Hold,
     /// How many holds it was the widest of.
     pub holds: usize,
 }
@@ -103,7 +162,7 @@ pub struct Head {
 impl Default for Stillness {
     fn default() -> Self {
         Self {
-            watch: StillnessWatch::new(StillnessConfig::default(), &ROWS),
+            watch: StillnessWatch::with_platform(StillnessConfig::default(), &ROWS, &head_rows()),
             windows: Vec::new(),
             beyond: Vec::new(),
             heads: Vec::new(),
@@ -150,17 +209,15 @@ impl Stillness {
         };
         let t_ns = sample.sample_time().as_nanos();
         self.first_ns.get_or_insert(t_ns);
-        self.watch.look(
-            &Sample {
-                t_ns,
-                present_valid: sample.present_valid(),
-                commanded_valid: sample.commanded_valid(),
-                missing,
-                present: &present,
-                commanded: &commanded,
-            },
-            &mut self.closed,
-        );
+        let cycle = Sample {
+            t_ns,
+            present_valid: sample.present_valid(),
+            commanded_valid: sample.commanded_valid(),
+            missing,
+            present: &present,
+            commanded: &commanded,
+        };
+        self.watch.look(&cycle, &mut self.closed);
         self.take_closed();
     }
 
@@ -168,8 +225,12 @@ impl Stillness {
     fn take_closed(&mut self) {
         for window in self.closed.drain(..) {
             let antenna = group_of(window.joint) == Some(JointGroup::Antennas);
+            // The head's own holds are not qualified on the head standing
+            // still: the row in question *is* the head.
+            let head_still = !antenna || window.platform_still;
+            let hold = Hold { window, head_still };
             if antenna && self.windows.len() < ANTENNA_LINES {
-                self.windows.push(window);
+                self.windows.push(hold);
                 continue;
             }
             let into = if antenna {
@@ -177,18 +238,19 @@ impl Stillness {
             } else {
                 &mut self.heads
             };
-            match into
-                .iter_mut()
-                .find(|head| head.worst.joint == window.joint)
-            {
+            match into.iter_mut().find(|head| {
+                head.worst.window.joint == hold.window.joint
+                    && head.worst.head_still == hold.head_still
+            }) {
                 Some(head) => {
                     head.holds += 1;
-                    if window.excursion_rad > head.worst.excursion_rad {
-                        head.worst = window;
+                    if hold.window.readings.excursion_rad > head.worst.window.readings.excursion_rad
+                    {
+                        head.worst = hold;
                     }
                 }
                 None => into.push(Head {
-                    worst: window,
+                    worst: hold,
                     holds: 1,
                 }),
             }
@@ -208,8 +270,27 @@ impl Stillness {
     /// The antenna holds printed a line each: every one the run held, up to
     /// [`ANTENNA_LINES`].
     #[must_use]
-    pub fn windows(&self) -> &[HoldWindow] {
+    pub fn windows(&self) -> &[Hold] {
         &self.windows
+    }
+
+    /// How many antenna holds the run held, folded ones included.
+    #[must_use]
+    pub fn antenna_holds(&self) -> usize {
+        self.windows.len() + self.beyond.iter().map(|folded| folded.holds).sum::<usize>()
+    }
+
+    /// How many of those the head stood still across — the holds a run's
+    /// verdict about the antennas' own loop can be taken over.
+    #[must_use]
+    pub fn head_still_holds(&self) -> usize {
+        self.windows.iter().filter(|hold| hold.head_still).count()
+            + self
+                .beyond
+                .iter()
+                .filter(|folded| folded.worst.head_still)
+                .map(|folded| folded.holds)
+                .sum::<usize>()
     }
 
     /// The antenna rows that held past that cap, one folded entry each.
@@ -257,39 +338,67 @@ impl Stillness {
 /// The excursion twice, in counts and in radians: counts are what the bound is
 /// argued in — a still joint reads one, or flickers between it and its
 /// neighbour — and radians are what every other figure in these reports is in.
+///
+/// The setpoint is on the line beside the instant, because which pose a hold
+/// was taken at is half of what the record carries per hold: a probe run holds
+/// three of them, and a run offset alone leaves the reader to infer which.
 fn line(held: &Stillness, window: &HoldWindow) -> String {
+    let read = &window.readings;
     format!(
-        "  {} over a {:.2} s hold from {}: {:.1} counts ({:.4} rad) peak to peak, {:.1} \
-         reversals/s, {}, mean error {:+.4} rad, over {} reading(s), opened {:.2} s after the \
-         setpoint last moved at {:+.4} rad of error",
+        "  {} over a {:.2} s hold from {} at {:+.4} rad: {:.1} counts ({:.4} rad) peak to peak, \
+         {:.1} reversals/s, {}, mean error {:+.4} rad, over {} reading(s), opened {:.2} s after \
+         the setpoint last moved at {:+.4} rad of error",
         Name(window.joint),
-        window.length().as_secs_f64(),
-        held.run_offset(window.start_ns),
-        window.excursion_counts(),
-        window.excursion_rad,
-        window.reversals_per_s,
-        period(window),
+        read.length().as_secs_f64(),
+        held.run_offset(read.start_ns),
+        window.held_rad,
+        read.excursion_counts(),
+        read.excursion_rad,
+        read.reversals_per_s,
+        period(read),
         window.mean_error_rad,
-        window.samples,
+        read.samples,
         window.opened_after_ns as f64 / 1e9,
         window.error_at_open_rad
     )
 }
 
-/// How regular the turning was, for the middle of that line.
+/// What the joint did over the settle allowance the judged window drops, on a
+/// line of its own under the hold's.
+///
+/// Printed, never judged. The arrival is what this reads: a joint that reached
+/// a far goal at its own profile's stop swings and rings down inside the
+/// allowance, and the figures here say how wide that swing was and how fast it
+/// turned round, beside the judged tail's verdict that it then stood still. A
+/// hold whose allowance the recording holds nothing over prints no line.
+fn settle_line(held: &Stillness, window: &HoldWindow) -> Option<String> {
+    let settle = window.settle?;
+    Some(format!(
+        "    settling into it over {:.2} s from {}: {:.1} counts ({:.4} rad) peak to peak, {:.1} reversals/s, {}, over {} reading(s), not judged",
+        settle.length().as_secs_f64(),
+        held.run_offset(settle.start_ns),
+        settle.excursion_counts(),
+        settle.excursion_rad,
+        settle.reversals_per_s,
+        period(&settle),
+        settle.samples
+    ))
+}
+
+/// How regular the turning was, for the middle of either of those lines.
 ///
 /// The frequency is *apparent* and says so: it is computed against the
-/// window's own measured sample rate, and anything above half that rate
+/// stretch's own measured sample rate, and anything above half that rate
 /// arrives folded down onto it. What the spread beside it says is whether the
 /// turning was a regular oscillation (small against the mean) or scattered
-/// encoder dither (comparable to it). A hold with fewer than two reversals has
-/// no interval to measure and says so rather than printing a figure made of
-/// one turn.
-fn period(window: &HoldWindow) -> String {
+/// encoder dither (comparable to it). A stretch with fewer than two reversals
+/// has no interval to measure and says so rather than printing a figure made
+/// of one turn.
+fn period(read: &Wobbled) -> String {
     match (
-        window.apparent_period_samples(),
-        window.reversal_interval_spread_samples,
-        window.apparent_frequency_hz(),
+        read.apparent_period_samples(),
+        read.reversal_interval_spread_samples,
+        read.apparent_frequency_hz(),
     ) {
         (Some(samples), Some(spread), Some(hz)) => {
             format!("period ≈ {samples:.1} samples ({hz:.1} Hz apparent, spread {spread:.1})")
@@ -301,15 +410,20 @@ fn period(window: &HoldWindow) -> String {
     }
 }
 
-/// Say what the run held still for, and — under [`Standard::Judged`] — what it
-/// did not.
+/// Say what the run held still for, and — where it is judged — what it did not.
 ///
 /// Every antenna hold is printed up to the cap and the rest fold to one line
-/// per row; each head row is printed once, as the widest hold it showed. The
+/// per row; each head row is printed once, as the widest hold it showed. Under
+/// each hold goes the settle line, the arrival the hold's own figures skip. The
 /// judging is the antennas' alone, folded or not, and the two sentences it can
 /// produce are the ones the bring-up assertion is made of: a hold that moved
 /// further than a still joint may, and a run that never held one long enough to
 /// ask.
+///
+/// Under [`Standard::JudgedWhereHeadStill`] an antenna hold the head moved
+/// across is printed with what it read and no verdict, because what it read is
+/// the platform; the run's own sentence then asks for a head-still hold rather
+/// than any hold.
 pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
     let counts = held.counts();
     let cfg = held.config();
@@ -342,50 +456,103 @@ pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
         cfg.max_excursion_rad / COUNT_RAD,
         cfg.max_excursion_rad
     ));
-    for window in held.windows() {
-        report.note(line(held, window));
-        if let Err(err) = judge(window, &cfg) {
-            match standard {
-                Standard::Judged => report.fail(err.to_string()),
-                Standard::Printed => report.note(err.to_string()),
-            }
+    for hold in held.windows() {
+        report.note(format!(
+            "{}{}",
+            line(held, &hold.window),
+            unjudged(standard, hold)
+        ));
+        if let Some(settling) = settle_line(held, &hold.window) {
+            report.note(settling);
         }
+        verdict(hold, standard, &cfg, report);
     }
     for folded in held.beyond() {
         report.note(format!(
-            "{}, the widest of {} further hold(s) this row held",
-            line(held, &folded.worst),
-            folded.holds
+            "{}, the widest of {} further hold(s) this row held{}",
+            line(held, &folded.worst.window),
+            folded.holds,
+            unjudged(standard, &folded.worst)
         ));
-        if let Err(err) = judge(&folded.worst, &cfg) {
-            match standard {
-                Standard::Judged => report.fail(err.to_string()),
-                Standard::Printed => report.note(err.to_string()),
-            }
+        if let Some(settling) = settle_line(held, &folded.worst.window) {
+            report.note(settling);
         }
+        verdict(&folded.worst, standard, &cfg, report);
     }
     for head in held.heads() {
         report.note(format!(
             "{}, the widest of {} hold(s) this row held",
-            line(held, &head.worst),
+            line(held, &head.worst.window),
             head.holds
         ));
+        if let Some(settling) = settle_line(held, &head.worst.window) {
+            report.note(settling);
+        }
     }
-    if !held.windows().is_empty() {
+    // What the run has to have held for its verdict to mean anything: any
+    // antenna hold, or — where the head's motion disqualifies one — a hold the
+    // head stood still across.
+    let held_one = if standard.head_still_only() {
+        held.head_still_holds() > 0
+    } else {
+        !held.windows().is_empty()
+    };
+    if held_one {
         return;
     }
-    let says = format!(
-        "no antenna held one setpoint for {:.1} s after a {:.1} s settle, so this run says \
-         nothing about whether the antennas stand still: {} sample(s) read, {} goal change(s) \
-         over them",
-        cfg.min_hold.as_secs_f64(),
-        cfg.settle.as_secs_f64(),
-        counts.samples,
-        counts.goal_changes
-    );
+    let says = if standard.head_still_only() {
+        format!(
+            "no antenna held one setpoint for {:.1} s after a {:.1} s settle with the head still, \
+             so this run says nothing about whether the antennas stand still: {} antenna hold(s) \
+             read under head motion, {} sample(s) read, {} goal change(s) over them",
+            cfg.min_hold.as_secs_f64(),
+            cfg.settle.as_secs_f64(),
+            held.antenna_holds(),
+            counts.samples,
+            counts.goal_changes
+        )
+    } else {
+        format!(
+            "no antenna held one setpoint for {:.1} s after a {:.1} s settle, so this run says \
+             nothing about whether the antennas stand still: {} sample(s) read, {} goal change(s) \
+             over them",
+            cfg.min_hold.as_secs_f64(),
+            cfg.settle.as_secs_f64(),
+            counts.samples,
+            counts.goal_changes
+        )
+    };
     match standard {
-        Standard::Judged => report.fail(says),
-        Standard::Printed => report.note(says),
+        // A probe run's whole purpose is the hold, so a run without one is a
+        // run that measured nothing it was asked to measure.
+        Standard::Judged | Standard::JudgedWhereHeadStillRequired => report.fail(says),
+        // A content tour holds the antennas almost only while the head moves,
+        // and having taken no reading of the loop is a reading of the content.
+        Standard::JudgedWhereHeadStill | Standard::Printed => report.note(says),
+    }
+}
+
+/// What a hold's own line says about not being judged, or nothing.
+fn unjudged(standard: Standard, hold: &Hold) -> &'static str {
+    if standard.head_still_only() && !hold.head_still {
+        ", under head motion, not judged"
+    } else {
+        ""
+    }
+}
+
+/// Whether `hold` passes the bound, said in the words its standard asks for.
+fn verdict(hold: &Hold, standard: Standard, cfg: &StillnessConfig, report: &mut Report) {
+    if standard.head_still_only() && !hold.head_still {
+        return;
+    }
+    if let Err(err) = judge(&hold.window, cfg) {
+        match standard {
+            Standard::Judged
+            | Standard::JudgedWhereHeadStill
+            | Standard::JudgedWhereHeadStillRequired => report.fail(err.to_string()),
+            Standard::Printed => report.note(err.to_string()),
+        }
     }
 }
 
@@ -478,7 +645,7 @@ pub mod fixture {
 #[cfg(test)]
 mod tests {
     use super::fixture;
-    use super::{ROW_COUNT, Standard, Stillness, say};
+    use super::{ROW_COUNT, Standard, Stillness, row, say};
     use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
     use reachy_motion::joints::JointRef;
     use reachy_motion::stillness::COUNT_RAD;
@@ -790,6 +957,186 @@ mod tests {
         );
     }
 
+    /// The invariant the fold key exists for: past the cap an antenna row
+    /// folds *twice*, once per side of the head-still question, so the one hold
+    /// a run took with the head still cannot be folded away by the wider holds
+    /// the head moved through.
+    ///
+    /// The shape this is written against is a long run whose head is commanded
+    /// somewhere new in the middle of every hold but the last: with one folded
+    /// entry per row the run's own reading would be a head-moved hold, and the
+    /// section would say it measured nothing about the antennas over a run in
+    /// which the last hold measured exactly that — and withhold the verdict on
+    /// a hunt in it.
+    #[test]
+    fn a_head_still_hold_past_the_cap_folds_apart_from_the_head_moved_ones() {
+        let mut held = Stillness::default();
+        let leg = row(JointRef::Leg1).expect("a bus row");
+        let right = row(JointRef::AntennaRight).expect("a bus row");
+        let left = row(JointRef::AntennaLeft).expect("a bus row");
+        let mut n = 0_i64;
+        // Twenty holds of ten seconds: twelve per antenna fill the cap and the
+        // remaining eight fold, so the last one is a folded hold.
+        for hold in 0..20 {
+            let last = hold == 19;
+            for cycle in 0..500 {
+                let mut commanded = [0.0; ROW_COUNT];
+                commanded[right] = f64::from(hold);
+                commanded[left] = f64::from(hold);
+                // The head is commanded somewhere new halfway through every
+                // hold but the last, which leaves the last hold — and only it
+                // — one the head stood still across.
+                commanded[leg] = if last {
+                    f64::from(hold)
+                } else {
+                    f64::from(hold) + if cycle < 250 { 0.0 } else { 0.5 }
+                };
+                let swing = if last { 3.0 } else { 10.0 } * COUNT_RAD;
+                let mut present = commanded;
+                present[right] += if cycle % 2 == 0 { swing } else { -swing };
+                present[left] += if cycle % 2 == 0 { swing } else { -swing };
+                held.sample(&fixture::cycle(
+                    T0 + n * PERIOD_NS,
+                    &present,
+                    Some(&commanded),
+                ));
+                n += 1;
+            }
+        }
+        held.finish();
+        assert_eq!(held.windows().len(), 24, "the cap, and no further");
+        assert_eq!(
+            held.beyond().len(),
+            4,
+            "two antenna rows, each side of the head-still question: {:?}",
+            held.beyond()
+        );
+        assert_eq!(
+            held.head_still_holds(),
+            2,
+            "the last hold of each antenna, and nothing else"
+        );
+        let report = said(&held, Standard::JudgedWhereHeadStill);
+        // The run measured the loop, so it does not say it measured nothing.
+        assert!(
+            !says(&report.measured, "so this run says nothing"),
+            "{:?}",
+            report.measured
+        );
+        // The head-still fold is judged, and it is the six-count hunt of the
+        // last hold rather than the twenty-count sway of the folded rest.
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|line| line.contains("right antenna moved 6.0 counts")),
+            "{:?}",
+            report.findings
+        );
+        // And the head-moved fold is still on the page, unjudged.
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("20.0 counts")
+                    && line.contains("under head motion, not judged")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The other half of the settle line's rule: a hold whose allowance the
+    /// recording holds nothing over prints **no** line.
+    ///
+    /// The watch reads `None` there — the case beside this one, at the watch —
+    /// and what matters here is what the report then does with it. A fallback
+    /// standing in for the missing reading would print an arrival of zero
+    /// counts over zero seconds, which an operator reads as a joint that
+    /// arrived perfectly rather than as an arrival nobody recorded.
+    #[test]
+    fn a_hold_whose_allowance_was_never_read_prints_no_settle_line() {
+        let mut held = Stillness::default();
+        for n in 0..500 {
+            let cycle = fixture::cycle(
+                T0 + n * PERIOD_NS,
+                &[0.0; ROW_COUNT],
+                Some(&[0.0; ROW_COUNT]),
+            );
+            // The whole four-second allowance is bus-quiet, so it holds no
+            // readings; the hold that opens after it is read as ever.
+            held.sample(&if n < 200 {
+                fixture::blind(cycle)
+            } else {
+                cycle
+            });
+        }
+        held.finish();
+        let report = said(&held, Standard::Judged);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            says(&report.measured, "right antenna over a"),
+            "the hold itself is still printed: {:?}",
+            report.measured
+        );
+        assert!(
+            !says(&report.measured, "settling into it"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The settle line's period arm with no frequency beside it, which only a
+    /// recording whose clock stood still can reach.
+    ///
+    /// The turning is counted in samples and the rate is measured off the
+    /// stretch's own instants, so a stretch that reversed but spans no time has
+    /// an apparent period and no rate to convert it with. A judged window
+    /// cannot be that stretch — it has to span the minimum hold — so this is
+    /// the settle allowance's arm alone: the reading is a stuck sample clock,
+    /// and the line says the period in samples and claims no hertz.
+    #[test]
+    fn a_settle_allowance_on_a_stuck_clock_reads_a_period_and_no_frequency() {
+        let mut held = Stillness::default();
+        // Six readings inside the allowance, all stamped the same instant: the
+        // goal changes on the first of them and the joint turns round on every
+        // one after it.
+        for n in 0..6 {
+            let swing = if n % 2 == 0 { 5.0 } else { -5.0 } * COUNT_RAD;
+            held.sample(&fixture::cycle(
+                T0,
+                &[swing; ROW_COUNT],
+                Some(&[0.0; ROW_COUNT]),
+            ));
+        }
+        // Then the clock runs again, past the allowance, and the hold is judged
+        // over a joint at rest.
+        for n in 0..400 {
+            held.sample(&fixture::cycle(
+                T0 + 4 * 1_000_000_000 + n * PERIOD_NS,
+                &[0.0; ROW_COUNT],
+                Some(&[0.0; ROW_COUNT]),
+            ));
+        }
+        held.finish();
+        let report = said(&held, Standard::Judged);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        let settling: Vec<&String> = report
+            .measured
+            .iter()
+            .filter(|line| line.contains("settling into it"))
+            .collect();
+        assert_eq!(settling.len(), ROW_COUNT, "{:?}", report.measured);
+        for line in settling {
+            assert!(
+                line.contains("period \u{2248} 2.0 samples (spread 0.0)"),
+                "{line}"
+            );
+            assert!(!line.contains("Hz apparent"), "{line}");
+            assert!(line.contains("10.0 counts"), "{line}");
+        }
+    }
+
     /// A bus that went quiet mid-hold is a gap in the reading, not the end of
     /// the hold and not a sample this build could not read.
     #[test]
@@ -811,10 +1158,10 @@ mod tests {
         assert_eq!(held.unreadable(), 0, "a blind cycle is a reading gap");
         assert_eq!(held.counts().samples, 500);
         assert_eq!(held.windows().len(), 2, "{:?}", held.windows());
-        let window = held.windows()[0];
-        assert_eq!(window.samples, 500 - 200 - 25);
+        let window = held.windows()[0].window;
+        assert_eq!(window.readings.samples, 500 - 200 - 25);
         assert!(
-            (window.length().as_secs_f64() - 5.98).abs() < 1e-6,
+            (window.readings.length().as_secs_f64() - 5.98).abs() < 1e-6,
             "{window:?}"
         );
     }
@@ -842,16 +1189,21 @@ mod tests {
         let right = held
             .windows()
             .iter()
-            .find(|window| window.joint == JointRef::AntennaRight)
-            .expect("the right antenna held");
+            .find(|hold| hold.window.joint == JointRef::AntennaRight)
+            .expect("the right antenna held")
+            .window;
         let left = held
             .windows()
             .iter()
-            .find(|window| window.joint == JointRef::AntennaLeft)
-            .expect("the left antenna held");
-        assert_eq!(right.start_ns, left.start_ns, "one gap, not one split");
-        assert_eq!(right.end_ns, left.end_ns);
-        assert_eq!(right.samples, left.samples - 25);
+            .find(|hold| hold.window.joint == JointRef::AntennaLeft)
+            .expect("the left antenna held")
+            .window;
+        assert_eq!(
+            right.readings.start_ns, left.readings.start_ns,
+            "one gap, not one split"
+        );
+        assert_eq!(right.readings.end_ns, left.readings.end_ns);
+        assert_eq!(right.readings.samples, left.readings.samples - 25);
     }
 
     /// Read jitter puts one sample's completion before its predecessor's. The
@@ -872,11 +1224,11 @@ mod tests {
         }
         held.finish();
         assert_eq!(held.windows().len(), 2, "{:?}", held.windows());
-        let window = held.windows()[0];
+        let window = held.windows()[0].window;
         // Within a sample of the run without the jitter in it: the allowance
         // runs from a first sample that was itself late.
-        assert!(window.samples >= 500 - 200 - 1, "{window:?}");
-        assert!(window.length().as_secs_f64() > 5.9, "{window:?}");
+        assert!(window.readings.samples >= 500 - 200 - 1, "{window:?}");
+        assert!(window.readings.length().as_secs_f64() > 5.9, "{window:?}");
     }
 
     /// A sample naming a set of servos this build cannot read is counted rather
@@ -898,6 +1250,211 @@ mod tests {
                 "10 sample(s) this build could not read"
             ),
             "the unreadable samples went unsaid"
+        );
+    }
+
+    /// A run in which every row is held at zero and both antennas read `wobble`
+    /// either side of it, with the first head row commanded somewhere new every
+    /// `every` cycles — a hold of the antennas across a moving platform.
+    fn under_head_motion(cycles: i64, wobble: f64, every: Option<i64>) -> Stillness {
+        let mut held = Stillness::default();
+        let leg = row(JointRef::Leg1).expect("a bus row");
+        let right = row(JointRef::AntennaRight).expect("a bus row");
+        let left = row(JointRef::AntennaLeft).expect("a bus row");
+        for n in 0..cycles {
+            let swing = if n % 2 == 0 { wobble } else { -wobble };
+            let mut present = [0.0; ROW_COUNT];
+            present[right] = swing;
+            present[left] = swing;
+            let mut commanded = [0.0; ROW_COUNT];
+            if let Some(every) = every {
+                commanded[leg] = (n / every) as f64 * 0.1;
+            }
+            held.sample(&fixture::cycle(
+                T0 + n * PERIOD_NS,
+                &present,
+                Some(&commanded),
+            ));
+        }
+        held.finish();
+        held
+    }
+
+    /// The tour's rule: an antenna holding one setpoint while the head moves
+    /// reads the head's motion, so the hold is printed with what it read and no
+    /// verdict — where the same hold under the unqualified standard is a
+    /// finding.
+    #[test]
+    fn an_antenna_hold_the_head_moved_across_is_printed_and_not_judged() {
+        let held = under_head_motion(500, 3.0 * COUNT_RAD, Some(100));
+        assert_eq!(held.antenna_holds(), 2, "one hold per antenna");
+        assert_eq!(held.head_still_holds(), 0);
+        let report = said(&held, Standard::JudgedWhereHeadStill);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            says(&report.measured, "under head motion, not judged"),
+            "{:?}",
+            report.measured
+        );
+        // The figures are printed all the same: what the hold read is the
+        // reading, and only the verdict is withheld.
+        assert!(
+            says(&report.measured, "6.0 counts"),
+            "{:?}",
+            report.measured
+        );
+        // And the run says it measured nothing about the antennas' own loop,
+        // without failing over content that moves the head.
+        assert!(
+            says(
+                &report.measured,
+                "with the head still, so this run says nothing"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            says(&report.measured, "2 antenna hold(s) read under head motion"),
+            "{:?}",
+            report.measured
+        );
+        // The same hold, unqualified, is the finding it always was.
+        assert_eq!(said(&held, Standard::Judged).findings.len(), 2);
+    }
+
+    /// A posture change commands every row on one cycle, so the hold it opens
+    /// is a hold the head stood still across — and the verdict over it is
+    /// taken, not excused.
+    ///
+    /// The one behaviour the head-still reading is timed for: the antenna's
+    /// hold begins at the same instant the head was last commanded, and a
+    /// reading that counted that command as falling *inside* the hold would
+    /// withhold the verdict on exactly the holds a probe run exists to
+    /// produce — a report saying it measured nothing about a run that measured
+    /// the thing.
+    #[test]
+    fn a_hold_opened_by_a_posture_change_is_still_judged_head_still() {
+        let mut held = Stillness::default();
+        let leg = row(JointRef::Leg1).expect("a bus row");
+        let right = row(JointRef::AntennaRight).expect("a bus row");
+        let left = row(JointRef::AntennaLeft).expect("a bus row");
+        for n in 0..700 {
+            let mut present = [0.0; ROW_COUNT];
+            let mut commanded = [0.0; ROW_COUNT];
+            if n >= 200 {
+                commanded[right] = 0.3;
+                commanded[left] = 0.3;
+                commanded[leg] = 0.5;
+                let swing = if n % 2 == 0 {
+                    3.0 * COUNT_RAD
+                } else {
+                    -3.0 * COUNT_RAD
+                };
+                present[right] = 0.3 + swing;
+                present[left] = 0.3 + swing;
+            }
+            held.sample(&fixture::cycle(
+                T0 + n * PERIOD_NS,
+                &present,
+                Some(&commanded),
+            ));
+        }
+        held.finish();
+        assert_eq!(held.antenna_holds(), 2, "one hold per antenna");
+        assert_eq!(held.head_still_holds(), 2, "{:?}", held.windows());
+        let report = said(&held, Standard::JudgedWhereHeadStill);
+        assert!(
+            !says(&report.measured, "under head motion"),
+            "{:?}",
+            report.measured
+        );
+        // And the line says which pose the hold was taken at, which is what a
+        // record of three poses in one run is filled from.
+        assert!(
+            says(&report.measured, "right antenna over a")
+                && says(&report.measured, "at +0.3000 rad:"),
+            "{:?}",
+            report.measured
+        );
+        // The hunt in that hold is the finding it would be under either
+        // standard, which is what says the hold was judged rather than skipped.
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        assert_eq!(said(&held, Standard::Judged).findings.len(), 2);
+    }
+
+    /// The qualifier withholds nothing where the head stood still: a hunting
+    /// antenna over a still platform is the finding the section exists for.
+    #[test]
+    fn an_antenna_that_hunts_with_the_head_still_fails_the_qualified_standard() {
+        let held = under_head_motion(500, 3.0 * COUNT_RAD, None);
+        assert_eq!(held.head_still_holds(), 2);
+        let report = said(&held, Standard::JudgedWhereHeadStill);
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        assert!(
+            !says(&report.measured, "under head motion"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The settle line: the arrival the judged window drops is printed under
+    /// it, so a joint that swung ten counts on the way in and then stood still
+    /// passes with the swing on the page.
+    #[test]
+    fn the_settle_line_reads_the_arrival_the_hold_skips() {
+        let mut held = Stillness::default();
+        for n in 0..500 {
+            let swing = if n >= 200 {
+                0.0
+            } else if n % 2 == 0 {
+                5.0 * COUNT_RAD
+            } else {
+                -5.0 * COUNT_RAD
+            };
+            held.sample(&fixture::cycle(
+                T0 + n * PERIOD_NS,
+                &[swing; ROW_COUNT],
+                Some(&[0.0; ROW_COUNT]),
+            ));
+        }
+        held.finish();
+        let report = said(&held, Standard::Judged);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            says(&report.measured, "settling into it over 3.98 s"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("settling into it")
+                    && line.contains("10.0 counts")
+                    && line.contains("25.0 Hz apparent")
+                    && line.contains("not judged")),
+            "{:?}",
+            report.measured
+        );
+        // One line per printed hold, and the hold's own line still reads the
+        // rest that followed the arrival.
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.contains("settling into it"))
+                .count(),
+            ROW_COUNT,
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("right antenna over a") && line.contains("0.0 counts")),
+            "{:?}",
+            report.measured
         );
     }
 }

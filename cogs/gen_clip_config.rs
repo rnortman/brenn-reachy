@@ -752,6 +752,85 @@ mod tests {
         );
     }
 
+    /// The two antenna step probes are instruments, and what makes them
+    /// instruments is the shape of their frame tracks: three poses off the
+    /// raised base, each reached in **one** frame and then held long enough for
+    /// the stillness watch to judge the hold. A document re-authored into a
+    /// ramp would load and emit exactly as happily, so the step and the hold
+    /// are pinned here rather than left to the eye.
+    ///
+    /// The pose figures are the antennas' outboard horizontal and their stow,
+    /// as deltas over the rest lean the base holds them at. The two probes
+    /// visit them in opposite orders, so between them every arrival — from up,
+    /// from sides, from down — is judged once.
+    ///
+    /// The entry blend is pinned at zero for the same reason: it is a *weight*
+    /// ramp over the whole delta the frame carries, so a probe taking the
+    /// format's default would compose its first pose a tenth at a time and its
+    /// first arrival would be a ten-period ramp rather than a step.
+    #[test]
+    fn each_antenna_step_probe_steps_to_three_held_poses() {
+        let emitted = baseline();
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
+        let motions = sidecar["motions"].as_array().expect("a motions table");
+        for name in ["probe/antenna-step-a", "probe/antenna-step-b"] {
+            let clip = emitted
+                .clips
+                .entries
+                .iter()
+                .find(|clip| clip.name == name)
+                .unwrap_or_else(|| panic!("{name} is not in the library"));
+            // The base frame, then three poses of 325 frames: 6.5 s each, the
+            // watch's shortest judgeable hold and half a second.
+            assert_eq!(clip.parts, 1 + 3 * 325, "{name}");
+            let motion = motions
+                .iter()
+                .find(|row| row["name"] == json!(name))
+                .unwrap_or_else(|| panic!("{name} is not playable"));
+            assert_eq!(motion["duration_ms"], json!(19_520), "{name}");
+            assert_eq!(motion["blend_out_ms"], json!(200), "{name}");
+            let block = emitted
+                .textproto
+                .split("\n# ")
+                .find(|block| block.starts_with(&format!("{name}\nclips {{")))
+                .unwrap_or_else(|| panic!("{name}'s clip block is not in the text"));
+            assert!(
+                block.contains("\n  blend_in_ms: 0\n"),
+                "{name}: {block:.200}"
+            );
+        }
+        // Each pose is held 325 frames in each of the two probes, and the last
+        // pose of both is the base itself, whose figures every other clip's
+        // undriven channels print too.
+        //
+        // The two off-base poses are derived from the constants they exist to
+        // put the antennas at, not transcribed: a document authored against a
+        // fold or a sideways point the tree has since moved would still load,
+        // emit and hold, and read as the instrument it no longer is.
+        //
+        // TODO(probe-clip-emitted-from-constants): this detects a stale
+        // document; it does not write a fresh one. The probes still hold ~1300
+        // copies of the two deltas as literals, re-transcribed by hand whenever
+        // either constant moves.
+        let base = reachy_motion::postures::NEUTRAL_ANTENNAS;
+        for target in [
+            reachy_motion::ANTENNA_OUTBOARD,
+            reachy_motion::disarm::STOW_ANTENNAS,
+        ] {
+            let pose = format!(
+                "antenna_right_d: {} antenna_left_d: {}",
+                target[0] - base[0],
+                target[1] - base[1]
+            );
+            assert_eq!(
+                emitted.textproto.matches(&pose).count(),
+                2 * 325,
+                "{pose} is not held for a judgeable hold in both probes"
+            );
+        }
+    }
+
     /// A clip id is an index into the emitted order, which is the order the
     /// sources arrive in — not the alphabetical order of the names, which the
     /// library itself is keyed by.

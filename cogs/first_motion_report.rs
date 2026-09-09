@@ -4113,6 +4113,57 @@ mod tests {
         );
     }
 
+    /// The settle line, in the report the harness run is judged by: what the
+    /// joint did over the allowance the judged window drops is printed under
+    /// the hold, never judged, because the arrival is not a joint at rest.
+    ///
+    /// The one reading a hard arrival leaves that the verdict cannot carry: a
+    /// joint that rang down and then stood still passes, and the ring-down is
+    /// on the page beside the pass.
+    #[test]
+    fn the_settle_line_prints_the_arrival_the_hold_skips() {
+        let samples: Vec<Logged<PoseSampleWire>> = (0..500)
+            .map(|n| {
+                // Four seconds of ringing down five counts either side, then a
+                // joint sitting on its goal.
+                let swing = if n < 200 {
+                    (if n % 2 == 0 { 5.0 } else { -5.0 }) * COUNT_RAD
+                } else {
+                    0.0
+                };
+                at(
+                    n,
+                    fixture::cycle(
+                        T0 + n * NOMINAL_CYCLE_NS,
+                        &[swing; ROW_COUNT],
+                        Some(&[0.0; ROW_COUNT]),
+                    ),
+                )
+            })
+            .collect();
+        let report = analyze(&Run {
+            samples,
+            ..Run::default()
+        });
+        assert_eq!(
+            findings_about(&report, "moved"),
+            0,
+            "the judged tail is a joint at rest: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("settling into it")
+                    && line.contains("10.0 counts")
+                    && line.contains("25.0 Hz apparent")
+                    && line.contains("not judged")),
+            "{:?}",
+            report.measured
+        );
+    }
+
     /// A run that never held an antenna long enough to ask fails: the harness
     /// exists to produce one such hold, and a run without one has not tested
     /// the thing it was run for.

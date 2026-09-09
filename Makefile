@@ -93,6 +93,7 @@ help:
 	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
 	@echo "  make library-run     play every motion in the library on the unit and judge it"
+	@echo "  make motion-probe    play one motion (MOTION=...) on the unit and judge it"
 	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
@@ -522,10 +523,12 @@ motion-run: device-host motion-deploy require-bazel
 # Play the whole clip library on the unit at recorded pace, fetch and judge.
 #
 # The same build, push and fetch as `motion-run`, and three differences: the
-# intent source asks for every motion in the committed name table instead of the
-# wake gesture, the run is as long as the library rather than as long as a fixed
-# budget — the tour stops the launcher itself when the story is over — and the
-# verdict is `library_tour_report`'s over the same name table.
+# intent source asks for the library's content instead of the wake gesture — the
+# committed name table minus its `probe/` instruments, which are played one at a
+# time by `motion-probe` — the run is as long as the library rather than as long
+# as a fixed budget (the tour stops the launcher itself when the story is over),
+# and the verdict is `library_tour_report`'s over the table the run was asked
+# for, which the fetch leaves in the run directory.
 #
 # No variable of its own: the unit and the operator's host parameters are read
 # where every device target reads them, and what the run plays is the committed
@@ -535,6 +538,42 @@ motion-run: device-host motion-deploy require-bazel
 .PHONY: library-run
 library-run: device-host motion-deploy require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --tour $(MOTION_RECORDS)
+
+# Play one motion of the library on the unit, fetch and judge.
+#
+# `library-run`'s chain over one motion instead of the whole library: the same
+# build, push, fetch and analyzer, and a plan of one script. It is how a
+# `probe/` instrument is played -- a clip that steps the antennas to a pose in
+# one frame and holds it, so the hold after a hard arrival can be judged -- and
+# those motions are not in the tour for that reason.
+#
+# MOTION names the motion, as the committed name table spells it. About a
+# minute of motion with nobody at the machine; `docs/bench-runbook.md` is the
+# procedure.
+#
+#   make motion-probe MOTION=probe/antenna-step-a
+#
+# The name check is a recipe line rather than a prerequisite beside the deploy:
+# independent prerequisites race under `-j`, typed or inherited through
+# MAKEFLAGS, so a check made that way can lose to the push it exists to come
+# before — and a run with no MOTION would build and push a payload nothing then
+# plays.
+.PHONY: motion-probe
+motion-probe: device-host require-bazel
+	$(MAKE) probe-motion
+	$(MAKE) motion-deploy
+	tools/deploy-motion.sh $(REACHY_HOST) --probe $(MOTION_RECORDS) "$(MOTION)"
+
+# The motion `motion-probe` plays, which has no default: a probe run is one
+# named instrument, and guessing which one is not this target's to do.
+.PHONY: probe-motion
+probe-motion:
+	@[ -n "$(MOTION)" ] || { \
+	    echo "MOTION is not set, so there is no motion to play." >&2; \
+	    echo "Name one the committed library holds:" >&2; \
+	    echo "    make motion-probe MOTION=probe/antenna-step-a" >&2; \
+	    exit 1; \
+	}
 
 # Bring a run's records back. Each fetch lands under its own timestamped
 # directory, so a session's runs accumulate rather than overwrite.

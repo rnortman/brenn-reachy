@@ -410,6 +410,11 @@ rust_binary(
     deps = [
         ":config_clk_rs",
         "//crates/reachy-clips:reachy_clips",
+        # Direct for the probe pin: the step probes' poses are asserted as
+        # differences of the antenna constants rather than as literals, so a
+        # moved fold or sideways point fails the emit's own case. Already
+        # transitive through reachy_clips' envelope walk.
+        "//crates/reachy-motion:reachy_motion",
         "@brenn_reachy_crates//:anyhow",
         "@brenn_reachy_crates//:serde_json",
     ],
@@ -503,6 +508,7 @@ rust_binary(
         ":run_report",
         ":schedule_clk_rs",
         ":script_clk_rs",
+        ":stillness_report",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-motion:reachy_motion",

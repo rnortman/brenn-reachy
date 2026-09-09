@@ -212,7 +212,9 @@ with open("cogs/host_logger.textproto", encoding="utf-8") as config:
 
 writes = os.environ.get("LAUNCHER_WRITES", "full")
 if writes in ("full", "empty"):
-    run = os.path.join(root, "run_000001")
+    # Decimal digits, the shape the logger names a run directory: the reader
+    # takes the newest all-digit directory under the log root as the run.
+    run = os.path.join(root, "1788832560362471129")
     os.makedirs(run, exist_ok=True)
     with open(os.path.join(run, "robot_000000.olog"), "w", encoding="utf-8") as log:
         if writes == "full":
@@ -367,13 +369,13 @@ assert_eq "and there are two cqueries, not one per target" 2 \
 for file in cogs/servo_profile.textproto cogs/servo_gains.textproto cogs/mover_params.textproto; do
 	assert_eq "${file} is staged beside the records the analyzer reads" \
 		"$(cat -- "${staging}/${file}")" \
-		"$(cat -- "${logs}/run_000001/config/${file}")"
+		"$(cat -- "${logs}/1788832560362471129/config/${file}")"
 done
 
 assert_contains "the analyzer is run over the log the writer wrote" "$(calls)" \
 	"run -- //cogs:first_motion_report --grid-jitter-ns"
 assert_contains "and the run directory it names is the one under the scratch log root" \
-	"$(calls)" "${logs}/run_000001"
+	"$(calls)" "${logs}/1788832560362471129"
 assert_contains "the launcher is started on a probed control port" "$(calls)" \
 	"launcher hostcpu.textproto --logdir"
 assert_contains "the intent source is started too" "$(calls)" "ask --resting-timeout"
@@ -385,7 +387,7 @@ assert_contains "the intent source is started too" "$(calls)" "ask --resting-tim
 assert_eq "and before the launcher" "reachy-ask" \
 	"$(output_of "$result" | sed -n 's/^host-motion-run.sh: \(reachy-ask\|launcher\) pid .*/\1/p' | head -1)"
 assert_contains "the run says where the log is" "$(output_of "$result")" \
-	"${logs}/run_000001"
+	"${logs}/1788832560362471129"
 
 # The analyzer's verdict is the run's verdict: a green harness over a log the
 # report failed would be the whole exercise saying nothing.
@@ -424,7 +426,7 @@ LAUNCHER_WRITES=none
 result=$(host_run)
 assert_status "a run with no log directory refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names the log root" "$(output_of "$result")" \
-	"wrote no run directory under ${logs}"
+	"wrote no stamp-named run directory under ${logs}"
 assert_lacks "and the analyzer was never run over nothing" "$(calls)" \
 	"run -- //cogs:first_motion_report"
 
