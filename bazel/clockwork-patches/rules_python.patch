@@ -228,13 +228,13 @@ index a979fd4..27614dc 100644
 +[report]
 +exclude_also =
 +    # Exclude empty list checks (e.g., "if []:")
-+    if\s+\[\s*\]\s*:
++    if\\s+\\[\\s*\\]\\s*:
 +    # Exclude empty dict checks (e.g., "if {{}}:")
-+    if\s+\{{\s*\}}\s*:
++    if\\s+\\{{\\s*\\}}\\s*:
 +    # Exclude main module checks (e.g., "if __name__ == '__main__':")
-+    if\s+__name__\s*==\s*.__main__.\s*:
++    if\\s+__name__\\s*==\\s*.__main__.\\s*:
 +    # Exclude type checking blocks (e.g., "if TYPE_CHECKING:" or "if typing.TYPE_CHECKING:")
-+    if\s+(typing\.)?TYPE_CHECKING\s*:
++    if\\s+(typing\\.)?TYPE_CHECKING\\s*:
  ''')
    PrintVerboseCoverage('Coverage entrypoint:', coverage_entrypoint)
    # First run the target Python file via coveragepy to create a .coverage

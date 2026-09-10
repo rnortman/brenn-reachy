@@ -22,12 +22,13 @@
 # table, deliberately keeping its list-and-comprehension shape so that a drop
 # upgrade is a mechanical diff of the two tables rather than a re-reading of
 # both. On upgrade: bump the `archive_override` below, diff this table against
-# the new drop's, apply, rebuild. Three intentional differences from the drop's
+# the new drop's, apply, rebuild. Four intentional differences from the drop's
 # text, and no others:
 #
-#   1. Patch labels point at our own verbatim copies of the drop's patch files,
-#      under bazel/clockwork-patches/. Bazel accepts a patch label only from the
-#      main repository, so referencing them in place is not possible.
+#   1. Patch labels point at our own copies of the drop's patch files, under
+#      bazel/clockwork-patches/. Bazel accepts a patch label only from the main
+#      repository, so referencing them in place is not possible. The copies are
+#      byte-identical to the drop's except for item 4.
 #   2. The drop's `local_path_override` branch is absent. Its table currently
 #      has no entry using it, and an entry that appeared would point into the
 #      drop's own working tree, which we do not have. One showing up on upgrade
@@ -39,6 +40,25 @@
 #      is the first release that declares it and is otherwise a superset. This
 #      one is ours, not the drop's, and it reverts the moment the drop moves its
 #      own pin forward.
+#   4. clockwork-patches/rules_python.patch doubles the backslashes in the
+#      coverage-rcfile block its last hunk adds to
+#      python/private/python_bootstrap_template.txt. The drop writes the
+#      coveragepy regexes (`if\s+\[\s*\]\s*:` and friends) into a plain
+#      f-string, where `\s`, `\{`, `\}` and `\.` are not escape sequences
+#      Python recognises. That template is the `system_python` bootstrap: it
+#      carries a `#!/usr/bin/env python3` shebang and so is compiled by the
+#      machine's interpreter before it re-execs the hermetic one, which puts it
+#      outside the PYTHON_VERSION pin. Python 3.12 promoted invalid escape
+#      sequences from a hidden DeprecationWarning to a SyntaxWarning shown by
+#      default, so every py_binary action -- rusty_cogs_gen, clkc -- prints six
+#      warnings to stderr on any host whose python3 is 3.12 or newer. Doubling
+#      the backslashes is output-neutral, because an unrecognised escape already
+#      passes its backslash through: the rcfile coveragepy receives is
+#      byte-identical either way. Do not make the string raw instead; the same
+#      f-string carries `\t{source}`, where the escape is real and wanted.
+#      Upstreaming this is not open to us, so the divergence is permanent and a
+#      drop upgrade has to re-apply it -- diff the new patch file against ours
+#      and keep the doubling if that hunk is still there.
 #
 # Standing consequence of consuming the drop this way: the pinned versions
 # below bind *our* whole module graph, not just the drop's subtree. Any rule set
