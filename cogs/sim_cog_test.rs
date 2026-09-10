@@ -34,7 +34,9 @@ use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
     self, JointRef, ServoHealth, flags, rows_of, write_rows, write_vector,
 };
-use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
+use reachy_motion::plant::{
+    MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES, SHIPPED_PROFILES,
+};
 use reachy_motion::value;
 use sim_cogs::{sim_aux, sim_regs};
 
@@ -76,23 +78,35 @@ const LAG: i64 = 2;
 /// steps through, so it is that constant and not a second number.
 const MAX_CATCHUP_CYCLES: i64 = MAX_GAP_PERIODS as i64;
 
-/// The trajectory generator the pair above describes on this grid: what every
-/// commissioned row's motion is asserted against.
-fn plant() -> PlantModel {
-    PlantModel::from_registers(PROFILE_VELOCITY, PROFILE_ACCELERATION, PERIOD)
-        .expect("the deployed profile describes a generator")
+/// The trajectory generator the pair above describes on this grid for the class
+/// bus row `row` belongs to: what that row's motion is asserted against.
+///
+/// The pair is the test's own because every commissioned row is written the
+/// same two registers, but the following lag is per class to match the sim's
+/// per-class plants. Taking one class's lag for all nine would assert a leg
+/// against the antennas' loop, and the two lags differing by a fraction of a
+/// period of travel would drift the assertions rather than break them.
+fn plant_of(row: usize) -> PlantModel {
+    PlantModel::from_registers(
+        PROFILE_VELOCITY,
+        PROFILE_ACCELERATION,
+        SHIPPED_PROFILES.for_row(row).following_lag_us,
+        PERIOD,
+    )
+    .expect("the deployed profile describes a generator")
 }
 
-/// Where one row's modelled trajectory stands after `cycles` cycles of chasing
-/// `target` from `position`, at the plant's own profile.
+/// Where bus row `row`'s modelled trajectory stands after `cycles` cycles of
+/// chasing `target` from `position`, at its own class's profile.
 ///
 /// The same function the plant steps, stepped here: a case that restated the
 /// arithmetic would be asserting the plant against a second model of it.
-fn travelled(position: f64, target: f64, cycles: i64) -> f64 {
-    let plant = plant();
+fn travelled(row: usize, position: f64, target: f64, cycles: i64) -> f64 {
+    let plant = plant_of(row);
     let mut predicted = Predicted {
-        position,
+        generator: position,
         velocity: 0.0,
+        position,
     };
     for _ in 0..cycles {
         plant.step(&mut predicted, target);
@@ -587,6 +601,111 @@ fn the_driver_and_the_vocabulary_name_the_same_bus() {
     assert_eq!(reachy_driver::every_row(), flags::all());
 }
 
+/// The modelled servo carries the following lag the decision tick believes the
+/// real one has.
+///
+/// The pair comes off the row's own registers, which a scenario may overlay,
+/// and the lag off the shipped profile, which it may not: a scenario that
+/// overlaid the lag would be describing a tick that mis-believes its plant, and
+/// the plant it mis-believes is this one. So on the shipped configuration the
+/// two agree by construction, and this is the case that says so -- a sim whose
+/// shafts answered a lag the tick did not model would show as residual on every
+/// scenario, on a machine doing exactly what it was told.
+///
+/// Every row and not one: the lag is read per class, so a reader that took one
+/// class's figure for all nine would be a sim whose legs answered the antennas'
+/// loop, and that is a difference no scenario could see until the day the two
+/// figures differ.
+#[test]
+fn the_modelled_servo_runs_the_shipped_following_lag() {
+    let mut sim = Sim::commissioned();
+    let mut target = stow_rows();
+    let start = rows_of(&sim.slot().positions);
+    for (row, angle) in target.iter_mut().enumerate() {
+        // Twenty cycles of the row's own cruise, so no class arrives inside the
+        // walk below: an arrived shaft is snapped onto its generator and says
+        // nothing about the loop. Per row because the classes' generators
+        // differ by a factor of twelve.
+        *angle = start[row] + 20.0 * plant_of(row).v_max;
+    }
+    // Far enough in to be mid-move: every generator is running and each shaft
+    // is wherever its own loop has got to behind it.
+    for _ in 0..10 {
+        sim.commanded_step(&target, JointFlagsWire::from(flags::all()).0);
+    }
+    let before = rows_of(&sim.slot().positions);
+    sim.commanded_step(&target, JointFlagsWire::from(flags::all()).0);
+    let after = rows_of(&sim.slot().positions);
+    for row in 0..JOINT_COUNT {
+        let shaft = after[row];
+        let generator = sim.slot().generators[row];
+        // The model's own law, with the alpha this row's class's lag gives: the
+        // shaft closes that fraction of its distance to the generator each
+        // cycle.
+        let expected = before[row] + plant_of(row).lag_alpha * (generator - before[row]);
+        assert!(
+            (shaft - expected).abs() < 1e-12,
+            "row {row}'s shaft moved to {shaft} where its class's lag puts it at {expected}"
+        );
+        if SHIPPED_PROFILES.for_row(row).following_lag_us == 0 {
+            assert_eq!(
+                shaft, generator,
+                "row {row} carries no lag, so its shaft is its generator itself"
+            );
+        } else {
+            assert!(
+                (generator - shaft).abs() > 0.0,
+                "row {row}'s lagged shaft trails its generator: {shaft} against {generator}"
+            );
+        }
+    }
+}
+
+/// A servo let go of has a generator at rest where its shaft stands, and the
+/// next move it is asked for sets off from there.
+///
+/// The bookkeeping the lag made necessary: the generator is state of its own
+/// now, so a release that left it standing where the trajectory had got to
+/// would start the next move from a position the shaft is not at, and the
+/// modelled shaft would jump. That the ramp itself then starts from rest is
+/// `a_released_row_sets_off_from_rest`; this is the state the release leaves
+/// behind.
+#[test]
+fn a_released_row_has_its_generator_back_on_its_shaft() {
+    let mut sim = Sim::commissioned();
+    let antenna = joints::row(JointRef::AntennaLeft).expect("a bus row");
+    let mut target = stow_rows();
+    target[antenna] = stow_rows()[antenna] + 1.0;
+    for _ in 0..10 {
+        sim.commanded_step(&target, JointFlagsWire::from(flags::all()).0);
+    }
+    let mid_move = rows_of(&sim.slot().positions)[antenna];
+    assert!(
+        (mid_move - stow_rows()[antenna]).abs() > 0.0,
+        "the row is mid-move before it is let go of"
+    );
+
+    sim.inject(SimOpWire::TORQUE_OFF, flags::all());
+    sim.step();
+    let slot = sim.slot();
+    let shaft = rows_of(&slot.positions)[antenna];
+    assert_eq!(
+        slot.generators[antenna], shaft,
+        "a de-torqued row's generator stands where its shaft does"
+    );
+    assert_eq!(
+        slot.velocities[antenna], 0.0,
+        "and carries no speed into the next move it is asked for"
+    );
+    for row in 0..JOINT_COUNT {
+        assert_eq!(
+            slot.generators[row],
+            rows_of(&slot.positions)[row],
+            "row {row} was let go of with the rest of the machine"
+        );
+    }
+}
+
 #[test]
 fn the_machine_starts_stowed_de_torqued_and_saying_so() {
     let mut sim = Sim::new();
@@ -1058,7 +1177,9 @@ fn a_commissioned_servo_runs_the_profile_its_registers_describe() {
 
     let start = stow_rows();
     let mut previous = start;
-    let plant = plant();
+    // The acceleration below is the pair's and the same for every class;
+    // row 1 is any leg row.
+    let plant = plant_of(1);
     // The other rows are asked for a step the first cycle of the ramp already
     // covers, which the plant's own landing arm puts them on in the cycle they
     // answer rather than creeping up on. Half the profile acceleration: from
@@ -1091,6 +1212,7 @@ fn a_commissioned_servo_runs_the_profile_its_registers_describe() {
         assert_close(
             previous[row],
             travelled(
+                row,
                 start[row],
                 targets[row],
                 20 - LAG - RESPONSE_DEAD_SAMPLES as i64,
@@ -1099,12 +1221,20 @@ fn a_commissioned_servo_runs_the_profile_its_registers_describe() {
         );
     }
     for row in landing_rows {
+        // The generator covers this step in the first cycle it answers the
+        // setpoint at, which is the commanded lag and the response delay; the
+        // shaft then closes on it at its own class's rate, which is one cycle
+        // for a class with no following lag and a few more for one with. Both
+        // halves are `travel_cycles`, which walks the model to the arrival and
+        // counts the dead time, so what is stated here is the class's own
+        // arithmetic rather than a cycle somebody counted.
+        let arrival = LAG + plant_of(row).travel_cycles(short) as i64 - 1;
         assert_eq!(
             landed[row],
-            Some(LAG + RESPONSE_DEAD_SAMPLES as i64),
-            "row {row} was asked for a step inside one cycle of the ramp: it arrives on the \
-             first cycle it answers the setpoint at, which is the commanded lag and the \
-             response delay and nothing else",
+            Some(arrival),
+            "row {row} was asked for a step inside one cycle of the ramp: it arrives when its \
+             own class's loop closes on a generator that got there on the first cycle it \
+             answered the setpoint at",
         );
         assert_eq!(
             previous[row], targets[row],
@@ -1162,7 +1292,7 @@ fn a_released_row_sets_off_from_rest() {
     }
 
     sim.inject(SimOpWire::RELEASE_OBSTRUCTION, one(JointRef::Leg0));
-    let plant = plant();
+    let plant = plant_of(1);
     let mut previous = jammed_at;
     let mut moves = Vec::new();
     for _ in 0..4 {
@@ -1174,12 +1304,19 @@ fn a_released_row_sets_off_from_rest() {
         .iter()
         .position(|moved| *moved != 0.0)
         .expect("the released row sets off");
-    // One cycle of acceleration, then two, then three: the generator starts
-    // from rest rather than carrying the speed it had when the hand went on.
+    // The row climbs the ramp a model set off from rest at this angle climbs:
+    // one cycle of the generator's acceleration, then two, then three, seen
+    // through the class's own following lag. The generator is not carrying the
+    // speed it had when the hand went on, which is the whole claim, and the
+    // walk states it rather than a closed form that would have to grow a lag
+    // term of its own.
     for (step, moved) in moves[first..].iter().enumerate() {
+        let cycles = (step + 1) as i64;
+        let climbed = travelled(1, jammed_at, targets[1], cycles)
+            - travelled(1, jammed_at, targets[1], cycles - 1);
         assert_close(
             *moved,
-            (step + 1) as f64 * plant.a_max,
+            climbed,
             "the released row climbs its ramp from rest",
         );
         assert!(
@@ -1243,6 +1380,7 @@ fn the_plant_and_the_model_of_it_agree_across_a_lost_cycle() {
         "the machine moved through the gap",
     );
     let wanted = travelled(
+        1,
         start[1],
         targets[1],
         cycles - LAG - RESPONSE_DEAD_SAMPLES as i64,
@@ -1407,7 +1545,7 @@ fn a_teleported_row_sets_off_from_rest() {
     for (step, at) in readings[landed..].iter().enumerate() {
         assert_close(
             *at,
-            travelled(wanted[1], targets[1], step as i64 + 1),
+            travelled(1, wanted[1], targets[1], step as i64 + 1),
             "the teleported row runs the plant's own ramp from rest",
         );
     }
@@ -2112,12 +2250,15 @@ fn a_late_cycle_makes_up_whole_cycles_of_motion_and_no_more() {
     let mut targets = stow_rows();
     targets[1] += 100.0;
     // Up to the profile velocity first, so what the gaps below cover is whole
-    // cycles at the cap rather than part of the ramp.
-    for _ in 0..20 {
+    // cycles at the cap rather than part of the ramp. Forty and not twenty
+    // because the shaft closes on its generator geometrically: a class with a
+    // following lag is still gaining a hundred-thousandth of a radian a cycle
+    // twenty cycles in, which is a hundred times the band asserted below.
+    for _ in 0..40 {
         sim.commanded_step(&targets, JOINT_MASK_ALL);
     }
 
-    let v_max = plant().v_max;
+    let v_max = plant_of(1).v_max;
     let on_time = sim.commanded_step(&targets, JOINT_MASK_ALL);
     let late = sim.commanded_step_by(&targets, JOINT_MASK_ALL, 5);
     assert_close(

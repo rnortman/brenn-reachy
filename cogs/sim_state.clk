@@ -378,6 +378,15 @@ schema SimState
         // both of which leave a real generator at rest.
         #43 velocities: FixedArray<Float64, 9>;
 
+        // Each row's modelled generator position, radians, in bus order. The
+        // trapezoid alone: `positions` is the shaft that follows it a class's
+        // following lag behind, and the lag is a decay toward this rather than
+        // toward the setpoint, so where the generator got to is state. Equal to
+        // `positions` for a class with no lag, and put back onto the shaft
+        // whenever a row goes limp or is let go of after a jam, both of which
+        // leave a real generator at rest where the shaft stands.
+        #46 generators: FixedArray<Float64, 9>;
+
         // What the machine was being asked for over the last
         // `reachy_motion::plant::RESPONSE_DEAD_SAMPLES` cycles, oldest first.
         // The modelled servo answers a setpoint that many cycles after the
@@ -396,7 +405,7 @@ schema SimState
     }
     history
     {
-        version: 45;
+        version: 46;
         removed: [39, 40, 41, 42, 44];
     }
 }

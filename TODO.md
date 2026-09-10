@@ -397,52 +397,45 @@ wants an answer of its own with it. Marked at `Answer` in `cogs/sim_aux.rs`.
 
 ## `session-servo-profile`
 
-Commission the body yaw and the antennas from measurement, as the legs now are.
+Commission the body yaw from measurement, as the legs and the antennas now are.
 
-Deferral context: the legs are done. A tour of the whole clip library with the
-generator wide open read the class motor-bound at 326 velocity units with a
-goal-step ramp median of 287, and a confirmation tour at `287 / 326` held the
-six cranks 0.3319 rad from their own modelled trajectory at the worst, against a
-0.4 rad bound and beside three earlier tours at the same pair at 0.3242-0.3288
-rad. That pair is in `cogs/servo_profile.textproto` and in
-`plant::SHIPPED_PROFILES`, its p99.9 floor is
-`RECORDED_P999_LEGS_RESIDUAL_RAD`, and the tour's worst leg window is a kept
-fixture.
+Deferral context: two classes of the three are done and this entry is the third.
+The legs run `287 / 326`, read off a tour of the whole clip library with the
+generator wide open and confirmed on a tour at the pair. The antennas run
+`522 / 640`, their own measured capability: what stood between that pair and an
+armed detector was the plant model, which carried the servo's trajectory
+generator and not the position loop following it, and that loop's following lag
+is now a measured constant per class, read by the scan `plant.rs`' header
+describes and accepted only on the agreement of two recordings. Under it the
+antennas' worst residual at the measured pair reads 0.2536 rad against the
+0.4 rad bound a candidate is judged at, and six armed runs at the pair confirmed
+it. Both pairs and both lags are in `cogs/servo_profile.textproto` and
+`plant::SHIPPED_PROFILES`, the p99.9 floors are `RECORDED_P999_LEGS_RESIDUAL_RAD`
+and `RECORDED_P999_ANTENNAS_RESIDUAL_RAD`, and each class's worst window is a
+kept fixture. Both ladders, rung by rung, are in `docs/servo-tuning.md`.
 
-The body yaw is measured and left where it is. The capability instrument reads
-the class *gain-bound* at the shipped acceleration -- what holds it back is its
-loop and not its motor -- and the reading it offers, `(20, 48)`, is inside the
-instrument's own repeatability ratio of the shipped `(20, 50)`. So there is no
-pair to commission: what headroom the class has is a gains question, which is
-`TODO(body-yaw-gains)`. Its residual readings at the shipped pair span
-0.3275-0.4035 rad over six tours, and one tour in three stands past the 0.4 rad
-bound a candidate would be judged at; that is the class's own spread, recorded,
-and not a capability reading.
+The body yaw is measured and left where it is, and it is the class with no pair
+to commission and no reading that would offer one. The capability instrument
+reads it *gain-bound* at the shipped acceleration -- what holds it back is its
+loop and not its motor -- and the pair it does offer, `(20, 48)`, is inside the
+instrument's own repeatability ratio of the shipped `(20, 50)`. Its residual
+readings at the shipped pair span 0.3275-0.4035 rad over six tours, and one tour
+in three stands past the 0.4 rad bound a candidate would be judged at; that is
+the class's own spread, recorded, and not a capability reading. Its following
+lag is 0 for the same reason the pair is: a lag is read off a recording the
+class holds its generator's speed on, no run has ever put this motor there, and
+the scan runs out of grid rather than finding a floor. What headroom the class's
+loop has is headroom rather than the lever this entry needs, and stays
+`TODO(body-yaw-gains)`.
 
-The antennas are measured and *not* commissioned. Their capability is
-`RECORDED_CAPABILITY_ANTENNAS`, `(522, 640)`, off a tour played at
-`(32767, 1620)`. Three confirmation tours at `(522, 640)`, `(418, 512)` and
-`(334, 410)` read the class motor-bound at the first two with a plateau above
-the commissioned velocity -- the servo reaches its generator's speed -- and
-found it standing 1.45, 1.51 and 1.94 periods of travel behind that generator
-(p99.9 0.4458, 0.3707, 0.3813 rad; worsts 0.5078, 0.4238, 0.5989). A slower pair
-shrinks that lag in radians while it stays the same in periods, down to a floor
-near 0.38 rad -- where the third rung read the class gain-bound and the
-instrument could no longer see the motor through the pair -- so stepping the
-pair down is not an answer, and the tracking screen, sized at half again the
-worst residual a healthy machine shows, has no room for the lag at the measured
-pair. What stands between the two is the plant model: it carries a trapezoid and
-no following lag (`plant.rs`' header lists what it leaves out), and a lag term,
-or a dead time that grows with speed, is what would let the detector be armed at
-the measured capability. Whether the screen's sizing rule should read the worst
-sample or the worst sustained window is the same question's other half, since
-the detector faults on the latter and `replay_test.rs` computes both.
-
-Next step: that model, read offline against the kept tour logs at all three
-antenna pairs and the recorded `20 / 50` tours -- no hardware run is owed before
-it, because the analyzers walk kept logs -- and then one confirmation at the
-pair the model is right at. The three-rung table is in
-`docs/servo-tuning.md`.
+Next step: read the yaw's motor, which is a campaign of its own rather than a
+step here. A `probe/yaw-step` document -- a row in `cogs/probe_clips.rs`' table
+-- played attended and with the tracking detector disarmed at a wide-open yaw
+profile, read by the capability instrument; then the same read-the-lag and
+commission-under-the-model procedure the antennas have just been through. Two
+things keep it out of the cycle that commissioned the antennas: no analyzer today
+reads a disarmed run, and a wide-open yaw step swings the whole head mass, which
+is the rapid head acceleration a wear question is about.
 
 Whoever commissions a pair also re-derives the prose figures evaluated at that
 class's pair: the obstruction-cost paragraphs of `docs/fault-management.md` and
@@ -450,8 +443,10 @@ the tracking-detector sentence in `CLAUDE.md` -- the first raise's latency
 (`crossing_cycles() + ticks`), the settled-move grace
 (`ticks - pass_cycles(progress_min_rad)`), and the saturated-move grace, which
 is the window less the periods a released joint's from-rest ramp takes to reach
-`pace_min` of a generator at the cap: two at the legs' commissioned pair, four
-at `20 / 50`, and its own count at any other. Every one of them is a figure for
+`pace_min` of a generator at the cap -- the model's own walk, which moves with a
+class's loop as well as with its pair: three at the legs' commissioned pair and
+measured lag, where the trapezoid alone gave two, and its own count at any
+other. Every one of them is a figure for
 content that runs the class at its profile velocity, and the documents say so.
 The scenario suite is written over those expressions and moves by itself; the
 documents do not, and no test reads a document.
@@ -469,9 +464,9 @@ sizing rule asks for, and the tree ships that knowingly. The threshold is not
 widened to close the gap; what closes it is a pair whose worst leaves the
 margin, or a decision, recorded, that 1.491 is the margin this machine has.
 
-Done = the body yaw and the antennas each either commissioned at a measured pair
-or recorded as not commissionable under this detector, with the run that says so.
-Marked at the profile fields in `cogs/config.clk`, at `SHIPPED_PROFILES` in
+Done = the body yaw either commissioned at a measured pair or recorded as not
+commissionable under this detector, with the run that says so. Marked at the
+profile fields in `cogs/config.clk`, at `SHIPPED_PROFILES` in
 `crates/reachy-motion/src/plant.rs` and at the head residual pin in
 `crates/reachy-motion/src/tick.rs`.
 
@@ -1146,68 +1141,41 @@ Done = `stt_compare` has no stream loop of its own, and `futures` is named by
 this repository only if something else still needs it. Marked at `transcribe` in
 `crates/reachy-host/src/bin/stt_compare.rs`.
 
-## `antenna-hold-gains`
-
-Try an integral term on the antennas at the vendor's proportional term, against
-the parking error the term-free loop leaves.
-
-Deferral context: the hunt half of this entry is closed. The antennas were
-walked over the step probes -- one commanded frame per pose, so the servo's own
-generator makes and stops the whole move -- six rungs of six runs, every hold
-judged by the stillness watch where the head stood still. 200 is the
-proportional bound (300 hunts the rest hold, 400 the raised pose), the pose and
-not the arrival selected the one hunt on record, and the fold that hunted at
-every profile pair from the motor's ceiling to the shipped floor is quiet now
-that the fold leans off the vertical. The user has ruled the remaining
-occasional oscillation acceptable, so no further proportional or derivative rung
-is owed.
-
-What is left is the parking error. With no integral term the loop stops where
-friction balances the proportional push: the right antenna parks 0.026 rad
-(16-17 counts) short at the sides pose on the arrival from the fold,
-analyzer-read at two profile pairs alike, on a hold whose excursion is inside a
-count. A second reading of the same defect, 0.10-0.13 rad over 47 samples of a
-kept tour, comes off a throwaway script and no tree instrument reproduces it: a
-resting antenna under content whose goal moved by less than its breakaway error.
-The instrument for the arrival reading is a probe run's `sides<-down` hold and
-its signed mean error; the instrument for the content reading is a tour-side
-parking reading -- over the tour's chasing samples with zero travel, per antenna,
-the count, the signed error to the goal, how far the goal moved across each run
-of such samples, and the head's travel over them -- which does not exist yet and
-is this entry's own first piece of work, with its bring-up assertion being that
-it reproduces the kept tour's 47 samples at 0.10-0.13 rad before any fresh tour
-is read.
-
-Done = both readings inside the stillness watch's two-count bound, or the cost
-recorded as accepted. A rung is a number in `cogs/servo_gains.textproto` rather
-than a code edit, and the library's own `DEFAULT_GAINS` is what that file is
-pinned to, so a trial that lands is two statements moved together. Marked at
-both: the antennas' triple in that file and `DEFAULT_GAINS.antennas` in
-`crates/reachy-motion/src/arm.rs`.
-
 ## `body-yaw-gains`
 
-Try a derivative term on the body yaw, and re-read the proportional climb under
-it.
+Headroom: a stiffer body-yaw loop, a derivative term first, if a measured yaw
+pair ever wants one.
 
-Deferral context: the yaw is the one class that is gain-bound rather than
+Deferral context: the yaw is the one class that reads gain-bound rather than
 motor-bound -- it reached 48 velocity units on a tour where the legs reached
-326 and the antennas 640 -- so its ceiling is the loop rather than the motor,
-and a stiffer loop is the lever. The P-only climb was walked and came back
-non-monotonic: over the wake gesture's 17 s stow hold, 400 limit-cycles at
-3.0 counts and 8-11 Hz apparent in three holds of three, 800 in one of three,
-and the vendor's 200 sits at 2.0 counts of dither inside the two-count bound.
-Damping is what a P-only ladder has none of, and it is what would let a higher
-proportional term hold still, so the derivative term is the next rung rather
-than a fourth proportional one. Nothing has complained about the yaw; this is
-headroom left on the table, not a defect.
+326 and the antennas 640 -- so what caps it is its own loop and not its motor.
+The P-only climb was walked and came back non-monotonic: over the wake gesture's
+17 s stow hold, 400 limit-cycles at 3.0 counts and 8-11 Hz apparent in three
+holds of three, 800 in one of three, and the vendor's 200 sits at 2.0 counts of
+dither inside the two-count bound. Damping is what a P-only ladder has none of,
+which is why a derivative term is the rung after it rather than a fourth
+proportional one.
+
+What changed the standing of this entry is the plant model. A stiffer loop used
+to be the only lever against the yaw's own following lag, because the model
+carried the servo's trajectory generator and nothing that follows it, so every
+period the loop trailed came out of the tracking screen. The model now carries a
+measured following lag per class, and the yaw's is 0 for a reason that is about
+the instrument and not the loop: no recording has ever put this motor at its
+generator's speed, so there is nothing to read a lag off. So the loop's
+stiffness is no longer what stands between the yaw and a faster pair -- its
+unmeasured motor is, and reading that is `TODO(session-servo-profile)`'s
+campaign. Nothing has complained about the yaw at the pair it runs.
 
 Done = either a derivative term is committed with the hold it was measured on,
 or the record says a stiffer yaw loop is not available and the entry closes on
-that. The instruments are `hold-probe <yaw id> --gains P,I,D` for the ladder
-and a motion run that produces the long stow hold for the verdict. Marked at
-both: the yaw's triple in `cogs/servo_gains.textproto` and `DEFAULT_GAINS.yaw`
-in `crates/reachy-motion/src/arm.rs`.
+that. Walk it when a measured yaw pair asks for it -- a candidate the loop
+cannot hold quietly is the reading that makes this worth doing -- or on its own
+if the hold is ever judged a defect. The instruments are `hold-probe <yaw id>
+--gains P,I,D` for the ladder and a motion run that produces the long stow hold
+for the verdict. Marked at both: the yaw's triple in
+`cogs/servo_gains.textproto` and `DEFAULT_GAINS.yaw` in
+`crates/reachy-motion/src/arm.rs`.
 
 ## `antenna-raise-clock`
 
@@ -1220,10 +1188,11 @@ which the tick shapes into a min-jerk path for every joint -- so shortening it
 speeds the head's raise on the six cranks too, which is a different move against
 a different capability and not a taste knob. The servo profile is not the lever
 either: nothing in the planner reads it, and what a faster pair changes is how
-closely the servo follows the streamed path, not how fast the path is. At the
-antennas' commissioned `20 / 50` the servo trails the 0.8 s raise by about two
-seconds, so a shorter clock has nothing behind it until the antennas run a pair
-they can follow -- which is `TODO(session-servo-profile)`'s antenna half. A snap
+closely the servo follows the streamed path, not how fast the path is. At the `20 / 50` the
+antennas ran when this was written the servo trailed the 0.8 s raise by about two
+seconds, so a shorter clock had nothing behind it; the antennas have since been
+commissioned at `522 / 640`, which is a pair that follows the raise, so what is
+left here is the clock itself. A snap
 that is the antennas alone is a mover change with the detector's margin and the
 head's timing in it, and it wants its own reading.
 
@@ -1273,26 +1242,3 @@ contain rather than a formatting tidy-up. Marked at `capabilities` in
 Done = a routine run's capability section is bounded in length, and every
 reading it stops printing in full is either still derivable from what it prints
 or written down as deliberately dropped.
-
-## `probe-clip-emitted-from-constants`
-
-Emit the two antenna step probe clips from the poses they step to, instead of
-holding those poses as hand-written frame literals.
-
-Deferral context: `cogs/clips/probe/antenna-step-a.json` and `…-b.json` hold
-about 650 copies each of two deltas — the fold and the sideways point, both as
-differences from the rest pose — one per held frame, because the clip format
-carries a value per frame and has no frame-repeat. The emit's own case checks
-that the counts and the deltas match the constants, so a moved pose fails the
-build; nothing writes the corrected document, and the last move of the fold
-re-transcribed both files by hand. The fix is a decision about what
-`make clip-config` owns: the emit writes the library textproto and the names
-sidecar from the clip documents today, and having it author a clip document
-instead makes a `cogs/clips/` asset generated output for the first time, with a
-second choice — a frame-repeat in the format — that would change the format
-every clip is validated against. Marked at
-`each_antenna_step_probe_steps_to_three_held_poses` in
-`cogs/gen_clip_config.rs`.
-
-Done = moving either antenna constant regenerates the probe documents, or holds
-the delta once, and no frame literal is transcribed by hand.

@@ -30,8 +30,8 @@ use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, t
 use motion_channels::POSE_CHANNEL;
 use pose_reading::{Grid, commanded_rows, present_rows};
 use reachy_driver::NOMINAL_CYCLE_NS;
-use reachy_motion::JointRef;
-use reachy_motion::joints::{ROWS, column_name};
+use reachy_motion::joints::ROWS;
+use reachy_motion::trace::{goal_column, present_column};
 
 /// The sample stream, and nothing else.
 ///
@@ -80,25 +80,21 @@ impl Run {
 ///
 /// The nine readings in bus order, then the nine setpoints in bus order, which
 /// is the shape the replay suite's parser resolves by name. Both halves of the
-/// format's vocabulary come from the motion crate: the column prefixes are
-/// `joints::column_name` and the order is `joints::ROWS`, so the tool that
-/// writes a fixture and the suite that reads one cannot disagree about which
-/// crank a column belongs to.
+/// format's vocabulary come from the motion crate: the column names are
+/// `trace::present_column` and `trace::goal_column`, the same two functions the
+/// parser resolves the header with, and the order is `joints::ROWS` -- so the
+/// tool that writes a fixture and the suite that reads one cannot disagree
+/// about which crank a column belongs to.
 #[must_use]
 pub fn header() -> String {
     let mut header = String::from("run,tick,t_s,phase");
     for joint in ROWS {
-        let _ = write!(header, ",{}_present_rad", column(joint));
+        let _ = write!(header, ",{}", present_column(joint));
     }
     for joint in ROWS {
-        let _ = write!(header, ",{}_goal_rad", column(joint));
+        let _ = write!(header, ",{}", goal_column(joint));
     }
     header
-}
-
-/// What the trace calls `joint`'s pair of columns.
-fn column(joint: JointRef) -> &'static str {
-    column_name(joint).expect("the nine bus rows each name a column")
 }
 
 /// The samples between two nominal instants, inclusive of both, as a trace.

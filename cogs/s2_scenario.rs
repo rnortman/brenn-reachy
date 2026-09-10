@@ -2,10 +2,11 @@
 //! answered by carrying the machine down and letting it go.
 //!
 //! S1's run, with a hand held against the head cranks part way through the
-//! raise. The tracking detector judges every joint against the trajectory its
-//! own servo's generator is running, so cranks that stop closing on a goal still
-//! moving away from them are a joint it screens on: a run opens when the
-//! residual passes the threshold and `head_obstructed` is raised a window later.
+//! raise. The tracking detector judges every joint against where a healthy
+//! servo following its generator would stand, so cranks that stop closing on a
+//! goal still moving away from them are a joint it screens on: a run opens when
+//! the residual passes the threshold and `head_obstructed` is raised a window
+//! later.
 //! What this run exercises is the whole of the doctrine's answer to that -- the
 //! move abandoned and the tick holding, the rest-class stow the session commands
 //! in its place, the machine measured at the fold and let go of at rest, and a

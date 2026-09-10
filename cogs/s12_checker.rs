@@ -3,13 +3,29 @@
 //! Four arguments: the output log directory and the three config textprotos the
 //! process ran against. Everything asserted here is read out of those.
 //!
-//! Three claims are S12's own. The antennas really were lagging when the goal
-//! turned round -- past the tracking window's own threshold, which is what says
-//! the run reached the code it is about rather than skirting it. Nothing was
-//! reported about them: no fault on the tick's channel, and no row of the
-//! session's narration about a fault or a pair let go. And the head came up all
-//! the same, measured off the plant, with the antennas pointing where the
-//! posture puts them.
+//! Three claims are S12's own. The replacement landed inside the fold's move,
+//! which is the premise the splice is exercised by. Nothing was reported for
+//! it: no fault on the tick's channel, and no row of the session's narration
+//! about a fault or a pair let go. And the head came up, measured off the
+//! plant, with the antennas pointing where the posture puts them.
+//!
+//! A fourth states the condition those negatives are read under. At the shipped
+//! servo profiles the fold is followed rather than chased: on the reversal
+//! cycle every antenna stands nearer its goal than the figure the detector
+//! screens at, which is the headroom the commissioning bought over the postures
+//! this system plans for itself, with the screen's own width of margin even
+//! against a model carrying no lag at all.
+//!
+//! The negatives are about the splice and not about the detector: what they
+//! guard is a replacement landing mid-move raising nothing, letting go of
+//! nothing, de-torquing nothing. The detector's screen is not exercised on this
+//! run, and cannot be: the simulated shaft is the tick's own plant model stepped
+//! on the same inputs, so an unobstructed row and the tick's prediction of it
+//! agree cycle for cycle and the residual is nil however far the goal jumps.
+//! The detector's rule is exercised by the pace cases in
+//! `crates/reachy-motion/src/tick.rs`, on a synthetic plant that can be made to
+//! deviate; its silence on the real machine is the hardware record in
+//! `docs/servo-tuning.md`.
 //!
 //! Everything else is `scenario::check`'s and every one of them still holds: one
 //! engagement across both scripts, one unbroken stretch of goal stream, the
@@ -22,8 +38,7 @@
 use std::process::ExitCode;
 
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
-use reachy_motion::default_motion_config;
-use reachy_motion::joints::{Name, flags, row};
+use reachy_motion::joints::Name;
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
@@ -73,7 +88,7 @@ fn main() -> ExitCode {
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
         check_reversal_landed_mid_move(failures);
-        check_the_antennas_were_lagging(run, failures);
+        check_the_antennas_were_following(run, failures);
         check_replacement(run, engaged, failures);
         check_arrival(run, failures);
         // The load-bearing negative, in both places a complaint about an
@@ -110,9 +125,9 @@ fn main() -> ExitCode {
 ///
 /// Arithmetic on the scenario's own numbers rather than a reading of the run,
 /// and it is here because it is the premise every other assertion rests on: a
-/// replacement that landed after the stow had arrived would find the antennas
-/// standing still, and a joint with nothing left to carry the old direction
-/// with reverses instantly however lagged its loop is.
+/// goal still moving is what the splice turns round, and a replacement landing
+/// after the fold had arrived would find the joints already standing still,
+/// with nothing to reverse.
 fn check_reversal_landed_mid_move(failures: &mut Vec<String>) {
     let moving = stow_move_cycles();
     let after = reversal_after_stow();
@@ -125,35 +140,35 @@ fn check_reversal_landed_mid_move(failures: &mut Vec<String>) {
     }
 }
 
-/// The antennas were behind their goal, by more than the detector's threshold,
-/// on the wake the replacement arrived on.
+/// Every antenna stood nearer its goal than the screen's own figure on the wake
+/// the replacement arrived on: the machine's own fold is followed, not chased.
 ///
-/// The assertion that the run reached the rule it is about. The tracking window
-/// does not look at a joint nearer its goal than `threshold_rad` at all, so a
-/// plant that ignored the response delay -- or a delay too short to matter --
-/// would produce a run in which no window was ever open, every negative below
-/// would pass, and none of them would mean anything.
-fn check_the_antennas_were_lagging(run: &Run, failures: &mut Vec<String>) {
-    let threshold = default_motion_config().tracking.threshold_rad;
+/// A relation between the antennas' commissioned pair and loop lag on one side
+/// and the fold's arc and clock (`STOW_DURATION_NS`) on the other, read against
+/// the width of the detector's screen because that is the margin the
+/// commissioning was sized to keep. It fails when any of those moves far enough
+/// to give that margin back -- a re-commissioning that slows the pair under the
+/// fold's clock, or a fold clock cut to where the generator no longer carries
+/// the arc. The raise's clock does not enter, since the instant read is the
+/// last cycle of the fold's move.
+///
+/// Goal error and not the detector's operand: the residual on this run is nil
+/// by the harness's construction, and nothing here concludes anything about
+/// the window.
+fn check_the_antennas_were_following(run: &Run, failures: &mut Vec<String>) {
+    let threshold = check::tracking_screen();
     let at = reversal_cycle();
-    let (Some(sample), Some(goal)) = (check::sample_at(run, at), check::goal_at(run, at)) else {
-        failures.push(format!(
-            "cycle {at} carries no sample and goal to measure the antennas' lag against"
-        ));
+    let Some(errors) = check::goal_errors_at(run, at, antenna_rows(), "the antennas", failures)
+    else {
         return;
     };
-    let present = check::present_rows(sample);
-    for joint in flags::iter(antenna_rows()) {
-        let Some(index) = row(joint) else {
-            failures.push(format!("{} sits on no bus row", Name(joint)));
-            continue;
-        };
-        let error = (present[index] - goal[index]).abs();
-        if error <= threshold {
+    for (joint, error) in errors {
+        if error >= threshold {
             failures.push(format!(
-                "at cycle {at} {} stood {error} rad from its goal, inside the {threshold} rad the \
-                 detector screens out: this run is about a goal turning round under a joint that \
-                 is lagging it, and nothing was lagging",
+                "at cycle {at} {} stood {error} rad from its goal on the machine's own fold, past \
+                 the {threshold} rad the detector screens at: the headroom the commissioning \
+                 bought over the postures this system plans for itself has been given back -- \
+                 re-read this scenario's subject before touching anything else",
                 Name(joint)
             ));
         }
@@ -189,8 +204,8 @@ fn check_replacement(run: &Run, engaged: Option<check::Engaged>, failures: &mut 
 /// The machine arrived where each schedule sent it, read off the plant.
 ///
 /// Three instants: upright under the opening script, upright again after the
-/// reversal -- which is the positive this whole run is for, since a joint the
-/// window had faulted would have been let go of and left where it stood -- and
+/// reversal -- the positive this run is for, that the spliced raise really did
+/// reach the posture from wherever the interrupted fold had got to -- and
 /// stowed at the end.
 fn check_arrival(run: &Run, failures: &mut Vec<String>) {
     check::arrived_at(

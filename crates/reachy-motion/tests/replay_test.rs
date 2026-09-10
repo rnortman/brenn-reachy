@@ -22,12 +22,12 @@ use core::time::Duration;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, group_of, row};
 use reachy_motion::plant::{
-    GroupPlants, GroupProfiles, MAX_GAP_PERIODS, ProfilePair, RESPONSE_DEAD_SAMPLES,
+    ClassProfile, GroupPlants, GroupProfiles, MAX_GAP_PERIODS, RESPONSE_DEAD_SAMPLES,
     SHIPPED_PERIOD_NS, SHIPPED_PROFILES,
 };
 use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
-    RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, tracking,
+    RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, sustained_residual, tracking,
 };
 use reachy_motion::{
     ANTENNA_PHASE_SEPARATION_RAD, JointGroup, JointRef, JointTargets, JointVector, MotionCommand,
@@ -35,7 +35,8 @@ use reachy_motion::{
     floor_move_clock, judge, stow_pose_targets, stow_targets,
 };
 
-use replay_trace::{ARRIVED_TOLERANCE_RAD, Run, Sample, Trace, fixture};
+use reachy_motion::trace::{Run, Sample, Trace};
+use replay_trace::{ARRIVED_TOLERANCE_RAD, RunMetrics as _, fixture};
 
 /// The rate the recordings were driven at and the shipped floors are derived
 /// at.
@@ -101,11 +102,21 @@ const BENCH_PROFILE: GroupProfiles = GroupProfiles {
     antennas: BENCH_PAIR,
 };
 
-/// The one pair those nights wrote into all nine servos.
-const BENCH_PAIR: ProfilePair = ProfilePair {
-    acceleration: 400,
-    velocity: 600,
-};
+/// The one pair those nights wrote into all nine servos, at the following lag
+/// those recordings are judged with — none, because none of these loops is a
+/// loop a lag was read on. The antennas ran `500 / 0 / 100` and the legs
+/// changed gains partway through `trace-newgains`, with no triple on record for
+/// the other three nights; a lag belongs to one gains triple, and a class whose
+/// triple has no reading is judged at the generator alone. Not that the pair is
+/// too slow to show one: `400 / 600` is the fastest pair in the fixture set, and
+/// 1.2 periods of it would be a third of a radian of prediction.
+const BENCH_PAIR: ClassProfile = at(
+    Pair {
+        acceleration: 400,
+        velocity: 600,
+    },
+    0,
+);
 
 /// The plant a recording is judged against: its own profile, on the grid that
 /// recording was actually driven at.
@@ -268,56 +279,74 @@ fn worst_residual(judged: &[Judged], admit: fn(JointRef) -> bool) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-/// The worst residual any row held for a whole window of `periods` judged
-/// periods of one recording.
+/// One class's two profile registers, without the loop that answered them.
 ///
-/// The minimum within a window, maximised over the rows and the windows: a
-/// residual a run never came back under for that long is the shape the detector
-/// answers, and an excursion that closes inside the window is the shape it must
-/// not.
-///
-/// A window is `periods` *judged* periods and not `periods` grid slots, because
-/// that is the window the detector counts: a period whose grouped read fell
-/// short is stepped and never judged, and a stale tick leaves every run exactly
-/// where it stood rather than growing or clearing it. So a run spans a hole and
-/// runs out on its tenth live reading whatever grid distance the ten covered,
-/// and a window formed only from adjacent slots would drop the stretches that
-/// straddle a dropped read — the direction that hides margin the machine has
-/// already lost.
-///
-/// Only within one recording, though: the caller passes one run's judged
-/// periods, since a window straddling two of them would be a figure about two
-/// machines.
-///
-/// Every row rather than a group at a time: the figure is the worst any joint
-/// held, and the head and the antennas are all nine of them.
-fn sustained_residual(judged: &[Judged], periods: usize) -> f64 {
-    let mut worst = 0.0_f64;
-    for window in judged.windows(periods) {
-        for row in ROWS.into_iter().filter_map(row) {
-            let held = window
-                .iter()
-                .map(|judged| judged.residuals[row])
-                .fold(f64::INFINITY, f64::min);
-            worst = worst.max(held);
-        }
-    }
-    worst
+/// The rows below pair a recording's pair with the lag of the loop it was made
+/// on, and the two are read from different places: a pair is what the
+/// commissioning sweep wrote into the servo, a lag is what a scan read off that
+/// servo's gains.
+struct Pair {
+    acceleration: u32,
+    velocity: u32,
 }
 
-/// The recordings cut from the clip-library tours and the wake gesture beside
-/// them, which are the runs the shipped screen is sized on, each with the
-/// profile it was recorded under.
+/// A class's row: the pair it ran, at the lag of the loop it ran on.
+const fn at(pair: Pair, following_lag_us: u32) -> ClassProfile {
+    ClassProfile {
+        acceleration: pair.acceleration,
+        velocity: pair.velocity,
+        following_lag_us,
+    }
+}
+
+/// The pair the deployment wrote into all nine servos before any class was
+/// commissioned, register units, and the pair the body yaw still runs.
+const TOUR_2050_PAIR: Pair = Pair {
+    acceleration: 20,
+    velocity: 50,
+};
+
+/// The legs' own measured capability, register units: what the cranks ship at
+/// and what every recording made after their commissioning ran them at.
+const LEG_PAIR: Pair = Pair {
+    acceleration: 287,
+    velocity: 326,
+};
+
+/// The antennas' own measured capability, register units: what the class ships
+/// at, read off the capability instrument and confirmed by the armed runs of
+/// 2026-09-09.
+const ANTENNA_PAIR: Pair = Pair {
+    acceleration: 522,
+    velocity: 640,
+};
+
+/// The yaw's register as the capability sweep of 2026-09-09 left it, which is
+/// what the fast-pair tour of that morning was flown at.
 ///
-/// Two profiles across the seven: five recordings from the nights that wrote
-/// `20 / 50` into all nine servos, and two from the tour that confirmed the
-/// legs' commissioned pair, which ran the cranks at what the tree now ships
-/// them at and the other two classes at `20 / 50`. Both are literals, because a
+/// Two units under the round figure every other row carries, and its own
+/// constant rather than a digit inside one: a recording is replayed at the
+/// register it ran under.
+const SWEPT_YAW_PAIR: Pair = Pair {
+    acceleration: 20,
+    velocity: 48,
+};
+
+/// The recordings cut from the clip-library tours, the wake gesture, and the
+/// runs that confirmed the antennas' commissioned pair, which are the runs the
+/// shipped screen is sized on, each with the profile it was recorded under.
+///
+/// Four profiles across the ten: five recordings from the nights that wrote
+/// `20 / 50` into all nine servos, two from the tour that confirmed the legs'
+/// commissioned pair, which ran the cranks at what the tree ships them at and
+/// the other two classes at `20 / 50`, one from the tour that ran the antennas
+/// at their own measured capability an hour earlier, and two from the armed
+/// probe runs that confirmed that pair. All four are literals, because a
 /// recording carries the profile it was made on and cannot follow a constant
-/// anywhere; that the second of the two is also what the tree ships today is
+/// anywhere; that the last of the four is also what the tree ships today is
 /// asserted on its own, by
-/// [`the_confirmation_tour_is_still_the_shipping_profile`].
-const TOUR_FIXTURES: [(&str, GroupProfiles); 7] = [
+/// [`the_antenna_confirmation_is_still_the_shipping_profile`].
+const TOUR_FIXTURES: [(&str, GroupProfiles); 10] = [
     ("trace-tour-toc-toc-toc", TOUR_2050_PROFILE),
     ("trace-tour-side-peekaboo", TOUR_2050_PROFILE),
     ("trace-tour-proud1", TOUR_2050_PROFILE),
@@ -325,48 +354,133 @@ const TOUR_FIXTURES: [(&str, GroupProfiles); 7] = [
     ("trace-wake-20260906", TOUR_2050_PROFILE),
     ("trace-tour-grid-snap", CONFIRM_TOUR_PROFILE),
     ("trace-tour-stumble-and-recover", CONFIRM_TOUR_PROFILE),
+    ("trace-tour-sharp-side-tilt-fast", FAST_TOUR_PROFILE),
+    ("trace-probe-antenna-sweep", CONFIRM_ANTENNA_PROFILE),
+    ("trace-probe-antenna-step-a", CONFIRM_ANTENNA_PROFILE),
 ];
 
+/// The profile the antennas' confirmation runs of 2026-09-09 were flown at, in
+/// register units, with the following lag of each class's loop on them.
+///
+/// Every class at what the tree ships: the legs at their commissioned pair, the
+/// body yaw at the pair its own capability reading agrees with, and the
+/// antennas at the capability the instrument read off them, which these runs are
+/// what commissioned. Stated as a literal for the reason the three profiles
+/// above are — a recording is judged at the plant it was made on — and that it
+/// equals [`SHIPPED_PROFILES`] today is the separate statement
+/// [`the_antenna_confirmation_is_still_the_shipping_profile`] makes.
+const CONFIRM_ANTENNA_PROFILE: GroupProfiles = GroupProfiles {
+    // At gains `800 / 100 / 300`, the triple the legs' lag was read on and the
+    // one the class runs.
+    legs: at(LEG_PAIR, LEGS_LAG_US),
+    // At `200 / 0 / 0`, read as no lag.
+    yaw: at(TOUR_2050_PAIR, 0),
+    // At `200 / 0 / 0`, the triple the antennas' lag was read on: the integral
+    // rung was walked on these same probes and refused, so the gains the class
+    // ships are the gains the lag was read on.
+    antennas: at(ANTENNA_PAIR, ANTENNAS_LAG_US),
+};
+
 /// The profile the confirmation tour of 2026-09-09 was flown at, in register
-/// units.
+/// units, with the following lag of each class's loop on that tour.
 ///
 /// The legs at the pair the commissioning read off them, the other two classes
 /// at the pair the earlier tours wrote everywhere. Stated as a literal for the
 /// same reason [`TOUR_2050_PROFILE`] is: it is a fact about two recordings, and
-/// the fixtures are judged at the profile they were recorded at. It happens to
-/// equal [`SHIPPED_PROFILES`] today, and that coincidence is a separate
-/// statement with its own assertion — the day a class is commissioned, these
-/// two rows still have to be replayed against the tour they came from.
+/// the fixtures are judged at the profile they were recorded at. It is no
+/// longer the shipping profile — the antennas were commissioned at their own
+/// capability after this tour was flown — and these two rows did not move with
+/// them, which is what a recording being a recording means. What they still
+/// pin is the legs, whose pair and loop have not moved since.
 const CONFIRM_TOUR_PROFILE: GroupProfiles = GroupProfiles {
-    legs: ProfilePair {
-        acceleration: 287,
-        velocity: 326,
-    },
-    yaw: TOUR_2050_PAIR,
-    antennas: TOUR_2050_PAIR,
+    // At gains `800 / 100 / 300`, which is the triple the legs' lag was read
+    // on and the one the class still runs.
+    legs: at(LEG_PAIR, LEGS_LAG_US),
+    // At `200 / 0 / 0`, read as no lag: the class is gain-bound on every
+    // recording and no run holds its motor's speed to read a loop against.
+    yaw: at(TOUR_2050_PAIR, 0),
+    // At `200 / 0 / 0`, which is the triple the antennas' lag was read on and
+    // the one the class ships.
+    antennas: at(TOUR_2050_PAIR, ANTENNAS_LAG_US),
+};
+
+/// The profile the fast-pair tour of 2026-09-09 was flown at, in register
+/// units, with the following lag of each class's loop on that tour.
+///
+/// The tour that ran the antennas at the capability instrument's own reading —
+/// `522 / 640`, which the class is commissioned at — with the legs at their
+/// commissioned pair and the yaw where the capability sweep of that morning had
+/// put it. It is the only library reading of the antennas at the pair they
+/// ship, which is what the class's own pin is read off, and it is judged at the
+/// plant it was made on like every other row. The row is not the shipping
+/// profile all the same: the yaw's register read 48 that morning.
+///
+/// All three loops are the confirmation tour's: the two tours were flown an
+/// hour apart on one set of gains, so the two lag readings reach this row
+/// unchanged. What differs is the antennas' pair, which is the whole reason
+/// this row exists.
+const FAST_TOUR_PROFILE: GroupProfiles = GroupProfiles {
+    // At gains `800 / 100 / 300`, the triple the legs' lag was read on.
+    legs: at(LEG_PAIR, LEGS_LAG_US),
+    // At `200 / 0 / 0`, read as no lag, at the pair that morning's capability
+    // sweep had left in the register.
+    yaw: at(SWEPT_YAW_PAIR, 0),
+    // At `200 / 0 / 0`, the triple the antennas' lag was read on, at the pair
+    // the capability instrument read off the class rather than the one it is
+    // commissioned with.
+    antennas: at(ANTENNA_PAIR, ANTENNAS_LAG_US),
 };
 
 /// The profile every recording of the 2026-09-06 tour and the wake gesture was
-/// made under, in register units.
+/// made under, in register units, with the following lag of each class's loop
+/// on those nights.
 ///
 /// The deployment commissioned one pair for all nine servos on those nights,
-/// and it no longer ships that pair on the legs: the cranks run their own
-/// measured capability now. So these recordings need the pair they were made
+/// and it does not ship that pair on the legs: the cranks run their own
+/// measured capability. So these recordings need the pair they were made
 /// on, stated here the way `BENCH_PROFILE` states the bench nights' — a leg
 /// recorded under `20 / 50` and replayed under the commissioned `287 / 326`
 /// would be a joint judged against a generator twelve times its own, and the
 /// difference would read as residual the machine never showed.
+///
+/// The pair is one pair and the three lags are not, which is why this is three
+/// rows and not one: a lag is a reading of a loop, and these nights ran
+/// the antennas at `500 / 0 / 100` while the two 2026-09-09 fixtures ran them
+/// at the `200 / 0 / 0` the class ships. The tree has no reading for the
+/// stiffer loop, so these recordings replay at the trapezoid alone — the same
+/// answer the offline analyzer gives a live run whose configuration states no
+/// lag.
 const TOUR_2050_PROFILE: GroupProfiles = GroupProfiles {
-    legs: TOUR_2050_PAIR,
-    yaw: TOUR_2050_PAIR,
-    antennas: TOUR_2050_PAIR,
+    // At gains `800 / 100 / 300`, the triple the legs' lag was read on: the
+    // legs' gains did not move between these nights and the confirmation tour.
+    legs: at(TOUR_2050_PAIR, LEGS_LAG_US),
+    // At `200 / 0 / 0`, read as no lag.
+    yaw: at(TOUR_2050_PAIR, 0),
+    // At `500 / 0 / 100`, a proportional term two and a half times the one the
+    // antennas' lag was read on, and a loop no scan has read. Nothing here
+    // stands for it, so these five recordings are judged at the generator
+    // alone.
+    antennas: at(TOUR_2050_PAIR, 0),
 };
 
-/// The one pair those tours wrote into all nine servos.
-const TOUR_2050_PAIR: ProfilePair = ProfilePair {
-    acceleration: 20,
-    velocity: 50,
-};
+/// The six platform servos' following lag on `800 / 100 / 300`, the gains every
+/// kept tour was flown at, microseconds.
+///
+/// A literal and not [`SHIPPED_PROFILES`]'s figure, for the reason the pairs
+/// beside it are literals: these are readings of the loops these recordings
+/// were made on, and a fixture that followed a shipped constant would be
+/// re-judged by a commissioning it has no part in. That the tree ships this
+/// same figure today is a separate statement, asserted by
+/// [`the_antenna_confirmation_is_still_the_shipping_profile`].
+const LEGS_LAG_US: u32 = 24_000;
+
+/// The antennas' following lag on the `200 / 0 / 0` gains the class ships,
+/// microseconds.
+///
+/// A literal for the same reason, and it reaches only the five 2026-09-09
+/// fixtures: the earlier five ran the stiffer `500 / 0 / 100` loop, which no
+/// scan has read.
+const ANTENNAS_LAG_US: u32 = 24_000;
 
 /// The plant a recorded profile is judged against, on the shipped grid every
 /// one of the kept recordings was driven at.
@@ -391,23 +505,23 @@ fn tour_plant(name: &str) -> GroupPlants {
     tour_plant_of(&profiles)
 }
 
-/// The two confirmation-tour fixtures were cut at the profile the tree ships,
-/// and the pins read off them are what the shipped screen is sized on.
+/// The two antenna confirmation fixtures were cut at the profile the tree
+/// ships, and the pins read off them are what the shipped screen is sized on.
 ///
 /// The coupling the fixture rows used to carry by aliasing the shipped constant,
 /// stated where it can fail in its own words. The rows themselves cannot follow
 /// a commissioning — a recording is a recording — so when a class's pair next
-/// moves, what has to happen is a fresh tour and a fresh cut, not an edit to
-/// these two rows.
+/// moves, what has to happen is a fresh run at the new pair and a fresh cut,
+/// not an edit to these two rows.
 #[test]
-fn the_confirmation_tour_is_still_the_shipping_profile() {
+fn the_antenna_confirmation_is_still_the_shipping_profile() {
     assert_eq!(
-        CONFIRM_TOUR_PROFILE, SHIPPED_PROFILES,
-        "the confirmation tour is no longer the shipping profile: the pins read off \
-         `trace-tour-grid-snap` and `trace-tour-stumble-and-recover` are readings at a profile \
-         the tree has stopped shipping. Fly a tour at the new pair, cut its worst windows, and \
-         move the pins onto the new fixtures -- do not rebind these two rows, which are \
-         replayable only against the plant they were recorded on"
+        CONFIRM_ANTENNA_PROFILE, SHIPPED_PROFILES,
+        "the antennas' confirmation runs are no longer at the shipping profile: the pins read \
+         off `trace-probe-antenna-sweep` and `trace-probe-antenna-step-a` are readings at a \
+         profile the tree has stopped shipping. Run the confirmation at the new pair, cut its \
+         worst windows, and move the pins onto the new fixtures -- do not rebind these two rows, \
+         which are replayable only against the plant they were recorded on"
     );
 }
 
@@ -492,8 +606,9 @@ const BENCH_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.3321;
 /// Every row of [`TOUR_FIXTURES`], each replayed at the profile it was recorded
 /// at — the whole library's worst residual on record, its worst leg and antenna
 /// reversal excursions, its longest travel and the shipped gesture, over the
-/// 2026-09-06 tour, the wake gesture beside it and the 2026-09-09 confirmation
-/// tour. A healthy machine on the content it ships with, so
+/// 2026-09-06 tour, the wake gesture beside it, the 2026-09-09 confirmation
+/// tour and the fast-pair tour of the same morning. A healthy machine on the
+/// content it ships with, so
 /// a raise here is the screen sized wrong; the pins are the library's own
 /// constants, so the figure a report prints beside a live run and the figure
 /// the recordings hold are one statement.
@@ -526,7 +641,12 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
         // The sustained figure is taken per recording, because a window is a
         // stretch of one run's own judged periods; the worst period is a
         // maximum and takes the whole library at once.
-        sustained = sustained.max(sustained_residual(&outcome.judged, window));
+        let held: Vec<[f64; ROW_COUNT]> = outcome
+            .judged
+            .iter()
+            .map(|judged| judged.residuals)
+            .collect();
+        sustained = sustained.max(sustained_residual(&held, window));
         judged.extend(outcome.judged);
     }
 
@@ -536,8 +656,21 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
         (head - RECORDED_WORST_HEAD_RESIDUAL_RAD).abs() < 5e-3,
         "the recorded library's worst head residual is {head:.4} rad"
     );
+    // The antennas' maximum over these recordings is not their pin, and two
+    // constants stand between them. The five 2026-09-06 recordings ran the
+    // class on `500 / 0 / 100`, a loop no scan has read, so they are replayed
+    // at the generator alone, and `proud1` judged by that emptier model is the
+    // largest antenna sample here. The two confirmation-tour recordings ran the
+    // shipping loop at the `20 / 50` pair the class has since left. The pin is
+    // the class at its shipping configuration, by the rule that a class's
+    // recorded figures are one configuration's reading; what these recordings
+    // hold is the largest of the three, which is the figure the sizing rule
+    // below screens.
+    let recorded_antennas = RECORDED_WORST_ANTENNA_RESIDUAL_RAD
+        .max(CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD)
+        .max(CLIP_WORST_ANTENNA_RESIDUAL_AT_THE_SLOW_PAIR_RAD);
     assert!(
-        (antennas - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        (antennas - recorded_antennas).abs() < 5e-3,
         "the recorded library's worst antenna residual is {antennas:.4} rad"
     );
 
@@ -581,8 +714,11 @@ fn the_recorded_library_raises_nothing_and_pins_the_residuals_the_screen_is_size
 /// prints a live run against, and those are the head's and the antennas'. This
 /// one is what one fixture is kept for — the excursion a crank makes when the
 /// goal turns round through it, which the aggregate head maximum (a body yaw
-/// reversal, a third again this figure) hides.
-const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.2978;
+/// reversal, half again this figure) hides. What is left after the class's
+/// following lag is taken out of it, the lag being 0.0288 rad of travel at this
+/// pair: the excursion is the reversal itself, which the model does not carry
+/// and the threshold's margin covers.
+const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.2691;
 
 /// The worst residual a leg ran at on the confirmation tour of the commissioned
 /// pair, radians.
@@ -593,18 +729,53 @@ const CLIP_WORST_LEG_RESIDUAL_RAD: f64 = 0.2978;
 /// model of the pair they actually ran. A crank that could not follow the pair
 /// it was commissioned at would stand further from its own trajectory here, not
 /// nearer, and 0.4 rad is the bound that tour was read against.
-const CONFIRM_WORST_LEG_RESIDUAL_RAD: f64 = 0.3319;
+///
+/// Read under the lag measured on the class's own loop.
+const CONFIRM_WORST_LEG_RESIDUAL_RAD: f64 = 0.1983;
 
 /// The worst residual an antenna ran at on the stiffer gains the class no
 /// longer runs, radians.
 ///
-/// `proud1`'s reversal, which was the library antenna pin until the class went
-/// to the vendor's `200 / 0 / 0` and a tour at those gains read 0.3913 rad. Kept
-/// as its own figure rather than dropped with the pin: the two recordings are
-/// the same class on the same pair at two proportional terms, which is the only
-/// in-tree reading of what a gain change does to the distance a joint follows
-/// its generator at.
+/// `proud1`'s reversal, at `500 / 0 / 100` and judged at the generator alone
+/// because no lag has been read on that loop. It is the library's largest
+/// antenna sample and it is not the class's figure — the class ships
+/// `200 / 0 / 0` and is judged under the lag measured there — so the aggregate
+/// assertion needs this constant beside the pin to say what the library holds.
+/// What a gains change costs the follow is the lag itself, 1.2 periods at
+/// `200` and unread at `500`.
 const CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD: f64 = 0.3782;
+
+/// The worst residual an antenna ran at on the `20 / 50` pair, a pair the
+/// class does not ship, radians.
+///
+/// `stumble_and_recover`'s reversal off the confirmation tour, at the
+/// `200 / 0 / 0` gains the class runs and under the lag read on them, but at a
+/// pair the class does not carry. Kept because the aggregate assertion needs
+/// every kept fixture's antenna worst beside the pin: the reversal excursion
+/// the model does not carry is a fixed number of radians, so it reads larger
+/// against the slow pair's small lag than against the fast pair's large one.
+const CLIP_WORST_ANTENNA_RESIDUAL_AT_THE_SLOW_PAIR_RAD: f64 = 0.3625;
+
+/// The worst residual an antenna ran at on the sweep that confirmed the
+/// commissioned pair, radians.
+///
+/// The residual instrument of the confirmation: streamed content at the
+/// class's own cap, reversals at arrival and mid-move, and the outboard arc,
+/// which is the library's antenna stress in miniature at a shape that keeps the
+/// setpoint moving at constant speed — the shape a following lag is largest
+/// under. Local to this suite because the figure a live antenna run is reported
+/// against is the class's pin, and this is one run of six that confirmed it.
+const SWEEP_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.2105;
+
+/// The worst residual an antenna ran at on the step probe of the same
+/// confirmation, radians.
+///
+/// The largest of the six confirmation runs, and the shape that produces it is
+/// the one the sweep leaves out: a one-frame goal step of more than a radian,
+/// where the generator ramps from rest and the shaft follows it a lag behind.
+/// It is a hair under the tour's own worst at this pair, which is the class's
+/// pin, and that is the sizing rule's headroom read twice on two contents.
+const STEP_PROBE_WORST_ANTENNA_RESIDUAL_RAD: f64 = 0.2535;
 
 /// The worst residual the shipped wake gesture and the hold after it ran at,
 /// radians: head then antennas.
@@ -620,7 +791,12 @@ const CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD: f64 = 0.3782;
 /// why the depth is measured rather than fitted, and the measurement is
 /// `plant::RESPONSE_DEAD_SAMPLES`' own comment. This pair is the one fixture
 /// holding the downward sign.
-const WAKE_WORST_RESIDUAL_RAD: (f64, f64) = (0.1346, 0.0748);
+///
+/// The head half is read under the legs' following lag, 0.0288 rad of travel
+/// at `50` units. The
+/// antenna half is unmoved: this recording's antennas ran `500 / 0 / 100`, a
+/// loop with no reading, and are judged at the generator alone.
+const WAKE_WORST_RESIDUAL_RAD: (f64, f64) = (0.1058, 0.0748);
 
 /// The worst a joint ran behind its *goal* on the library's longest travel,
 /// radians.
@@ -670,26 +846,22 @@ fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
         "no_sad1's worst head residual is {no_sad1:.4} rad"
     );
 
-    // The worst antenna reversal at the gains the class ships is
-    // `stumble_and_recover`'s, on the confirmation tour, and that is the
-    // antenna pin.
+    // The worst antenna reversal at the `20 / 50` pair, a pair the class does
+    // not ship: the same loop it runs, at a generator twelve times slower than
+    // the commissioned one.
     let stumble = worst_residual(&judged("trace-tour-stumble-and-recover"), is_antenna);
     assert!(
-        (stumble - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        (stumble - CLIP_WORST_ANTENNA_RESIDUAL_AT_THE_SLOW_PAIR_RAD).abs() < 5e-3,
         "stumble_and_recover's worst antenna residual is {stumble:.4} rad"
     );
 
     // `proud1` is the same class on the same pair at the stiffer gains it no
-    // longer runs, and holds its own figure for that reason.
+    // longer runs, judged at the generator alone for want of a reading on that
+    // loop, and it holds its own figure for that reason.
     let proud1 = worst_residual(&judged("trace-tour-proud1"), is_antenna);
     assert!(
         (proud1 - CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD).abs() < 5e-3,
         "proud1's worst antenna residual is {proud1:.4} rad"
-    );
-    assert!(
-        stumble > proud1,
-        "proud1 reads {proud1:.4} rad at `500 / 0 / 100` and stumble_and_recover {stumble:.4} rad \
-         at `200 / 0 / 0`: what these two are kept for is the softer loop following further behind"
     );
 
     // The commissioned leg pair, on the tour that confirmed it: the cranks'
@@ -699,6 +871,57 @@ fn each_recorded_clip_pins_the_figure_it_is_kept_for() {
         (grid_snap - CONFIRM_WORST_LEG_RESIDUAL_RAD).abs() < 5e-3,
         "grid_snap's worst leg residual is {grid_snap:.4} rad"
     );
+
+    // The antennas at the pair they are commissioned at, on the only tour
+    // of the whole library that flew it: the class's worst antenna window at
+    // its shipping configuration, and the antenna pin. The bound is the sizing
+    // rule's own worst -- the threshold divided by the margin it is derived at
+    // -- so a re-cut window or a model change that pushed this over it would be
+    // a pair that cannot be commissioned under this detector, read here rather
+    // than as a red sizing gate with the threshold as the only edit that clears
+    // it.
+    let sharp_side_tilt = worst_residual(&judged("trace-tour-sharp-side-tilt-fast"), is_antenna);
+    assert!(
+        (sharp_side_tilt - RECORDED_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "sharp_side_tilt's worst antenna residual at the commissioned pair is \
+         {sharp_side_tilt:.4} rad"
+    );
+    assert!(
+        sharp_side_tilt <= cfg.tracking.threshold_rad / 1.5,
+        "the antennas read {sharp_side_tilt:.4} rad at `522 / 640`, over the {:.4} rad a \
+         {:.4} rad screen sized at half again leaves a healthy machine: that pair is not \
+         commissionable under this detector and the record, not the threshold, is what moves",
+        cfg.tracking.threshold_rad / 1.5,
+        cfg.tracking.threshold_rad
+    );
+
+    // The two runs that confirmed the pair on the machine, armed: the sweep
+    // that is the residual instrument, and the step probe that holds the
+    // largest antenna sample of the six. Both ran the whole shipping profile,
+    // so both are screened against the same bound the tour is, and the three
+    // figures together are what the commissioning rests on.
+    let sweep = worst_residual(&judged("trace-probe-antenna-sweep"), is_antenna);
+    assert!(
+        (sweep - SWEEP_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "the confirmation sweep's worst antenna residual is {sweep:.4} rad"
+    );
+    let step_probe = worst_residual(&judged("trace-probe-antenna-step-a"), is_antenna);
+    assert!(
+        (step_probe - STEP_PROBE_WORST_ANTENNA_RESIDUAL_RAD).abs() < 5e-3,
+        "the confirmation step probe's worst antenna residual is {step_probe:.4} rad"
+    );
+    for (name, worst) in [
+        ("the confirmation sweep", sweep),
+        ("the confirmation step probe", step_probe),
+    ] {
+        assert!(
+            worst <= cfg.tracking.threshold_rad / 1.5,
+            "{name} read {worst:.4} rad on the antennas, over the {:.4} rad a {:.4} rad screen \
+             sized at half again leaves a healthy machine",
+            cfg.tracking.threshold_rad / 1.5,
+            cfg.tracking.threshold_rad
+        );
+    }
 
     // The worst *leg* reversal is `side_peekaboo`'s, and a crank's excursion is
     // its own figure: the head maximum is a yaw and reads a third again this.

@@ -707,6 +707,19 @@ impl<T: Copy> PerGroup<T> {
 impl<T> PerGroup<T> {
     /// One value per class, each made from the class it belongs to.
     ///
+    /// Keyed off the class rather than written out field by field, so a caller
+    /// building three values from one rule cannot put the antennas' in the
+    /// legs' slot.
+    pub fn of_each(mut f: impl FnMut(JointGroup) -> T) -> PerGroup<T> {
+        PerGroup {
+            legs: f(JointGroup::Legs),
+            yaw: f(JointGroup::BodyYaw),
+            antennas: f(JointGroup::Antennas),
+        }
+    }
+
+    /// One value per class, each made from the class it belongs to.
+    ///
     /// # Errors
     ///
     /// The first class `f` refuses, with whatever it refused it for.

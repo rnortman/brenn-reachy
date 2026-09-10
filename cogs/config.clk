@@ -187,9 +187,9 @@ schema ServoProfile
     fields
     {
         // The six platform servos' profile acceleration, in the register's own
-        // units of 214.577 rev/min². This class is commissioned at its own
-        // measured capability, confirmed on a tour of the whole clip library;
-        // the other two classes are not, for reasons of their own:
+        // units of 214.577 rev/min². This class and the antennas below are
+        // commissioned at their own measured capability, each confirmed at the
+        // pair; the body yaw is not, for a reason of its own:
         // TODO(session-servo-profile)
         #2 legs_profile_acceleration: UInt32;
 
@@ -208,10 +208,25 @@ schema ServoProfile
 
         // The two antenna servos' profile velocity, same units.
         #7 antennas_profile_velocity: UInt32;
+
+        // How far the six platform servos' position loops stand behind the
+        // trajectory their generators run, in microseconds of that
+        // trajectory's own travel. Not a register: nothing writes this to a
+        // servo. It is a measurement of the loop, which the tick's model needs
+        // in order to predict where a healthy joint stands rather than where
+        // its generator got to. Microseconds so the figure does not depend on
+        // the control period it was read on; zero is the generator alone.
+        #8 legs_following_lag_us: UInt32;
+
+        // The body yaw servo's following lag, same units.
+        #9 body_yaw_following_lag_us: UInt32;
+
+        // The two antenna servos' following lag, same units.
+        #10 antennas_following_lag_us: UInt32;
     }
     history
     {
-        version: 1;
+        version: 2;
         removed: [0, 1];
     }
 }

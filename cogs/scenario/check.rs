@@ -171,6 +171,33 @@ pub fn goal_stream(run: &Run, failures: &mut Vec<String>) -> Option<GoalStream> 
     goal_stream_without(run, JointFlags::NONE, failures)
 }
 
+/// The goal stream of a machine carrying streamed content on `content` over
+/// `cycles`: every property [`goal_stream`] asserts, except the per-cycle
+/// travel bound on those rows over those cycles.
+///
+/// That bound is the planner's own, and the planner's alone: it is what the tick
+/// refuses the moves *this system plans* past, sized off the fastest gesture the
+/// machine is known to make well. A clip carries no such ceiling — content is
+/// sent as it is authored — so a document that steps a joint further in a period
+/// than the joint can travel is a machine that lags its goal, which is a thing
+/// the system is built to do and not a stream that is malformed.
+///
+/// The exemption is bounded on both axes because a row is content-driven only
+/// while something is playing on it: the same antenna is carried by the
+/// planner's own raise before the window opens and after it closes, and those
+/// are exactly the moves the bound exists to police. `cycles` is the stretch
+/// the content covers, by the cycle each goal was decided on.
+pub fn goal_stream_playing(
+    run: &Run,
+    content: JointFlags,
+    cycles: Range<i64>,
+    failures: &mut Vec<String>,
+) -> Option<GoalStream> {
+    streams(run, JointFlags::NONE, content, cycles, 1, failures)
+        .into_iter()
+        .next()
+}
+
 /// The goal stream: one datagram per sample of an engaged, armed machine, each
 /// dated `lag_k` cycles ahead of the sample that decided it, each speaking for
 /// every row still in service, each within one cycle's travel of the one before.
@@ -222,6 +249,34 @@ pub fn goal_streams_exactly(
     engagements: usize,
     failures: &mut Vec<String>,
 ) -> Vec<GoalStream> {
+    streams(
+        run,
+        may_leave,
+        JointFlags::NONE,
+        NO_CONTENT,
+        engagements,
+        failures,
+    )
+}
+
+/// The stretch a run carrying no streamed content exempts from the travel
+/// bound: none of it.
+const NO_CONTENT: Range<i64> = 0..0;
+
+/// Every stretch of goal stream, with the rows carrying streamed content named
+/// and the cycles they carry it over.
+///
+/// The one implementation the three entry points above share; `content` and
+/// `cycles` are [`goal_stream_playing`]'s exemption, and are empty for the
+/// other two.
+fn streams(
+    run: &Run,
+    may_leave: JointFlags,
+    content: JointFlags,
+    cycles: Range<i64>,
+    engagements: usize,
+    failures: &mut Vec<String>,
+) -> Vec<GoalStream> {
     if run.goals.is_empty() {
         failures.push("the decision tick published no goals at all".to_owned());
         return Vec::new();
@@ -238,6 +293,8 @@ pub fn goal_streams_exactly(
             &run.goals[start..index],
             streams.len() + 1,
             may_leave,
+            content,
+            cycles.clone(),
             failures,
         ) {
             streams.push(stream);
@@ -272,6 +329,8 @@ fn one_stream(
     goals: &[Logged<GoalSetpointWire>],
     stretch: usize,
     may_leave: JointFlags,
+    content: JointFlags,
+    cycles: Range<i64>,
     failures: &mut Vec<String>,
 ) -> Option<GoalStream> {
     let first = match cycle_of(goals[0].at_ns - CONTROL_DELAY_NS) {
@@ -365,6 +424,13 @@ fn one_stream(
                 );
             }
             for (row, before) in was.iter().enumerate() {
+                if cycles.contains(&cycle)
+                    && joint_ref(row).is_some_and(|id| flags::contains(content, id))
+                {
+                    // Streamed content, which no planner bound applies to --
+                    // over the cycles it is playing and no others.
+                    continue;
+                }
                 let step = (targets[row] - before).abs();
                 let Some(cap) = step_bound_of(row) else {
                     travel.push(
@@ -2221,6 +2287,64 @@ pub fn commanded_rows(sample: &PoseSampleWire) -> Option<[f64; ROW_COUNT]> {
     sample.commanded().validate().ok().map(rows_of)
 }
 
+/// How far each of `rows` stood from the goal it was given, radians, on
+/// `cycle` -- or `None` where the log carries no sample and goal for it.
+///
+/// Goal error, read one way for every scenario that asks about it, so a checker
+/// states its predicate and its own wording and nothing else.
+///
+/// This is **not** the quantity the tracking detector screens: that is the
+/// distance from the plant model's prediction, which trails the goal by the
+/// travel a healthy servo has yet to make. The two are unordered in general --
+/// a joint standing ahead of its model and short of its goal has a small goal
+/// error and a large residual, which is the regime the hardware record's
+/// "ahead" figures are read in -- so no checker may read a conclusion about
+/// the screen, open or shut, out of this helper. In the scenario harness the
+/// residual on an unobstructed row is nil by construction anyway: the
+/// simulated shaft is the tick's own model stepped on the same inputs. A
+/// scenario that wants the residual itself is asking for the tick's, which the
+/// output log carries only on a fault.
+///
+/// `what` says what the cycle is, so a missing message reads as the run being
+/// short rather than as the property failing.
+pub fn goal_errors_at(
+    run: &Run,
+    cycle: i64,
+    rows: JointFlags,
+    what: &str,
+    failures: &mut Vec<String>,
+) -> Option<Vec<(JointRef, f64)>> {
+    let (Some(sample), Some(goal)) = (sample_at(run, cycle), goal_at(run, cycle)) else {
+        failures.push(format!(
+            "cycle {cycle} carries no sample and goal to measure {what} against"
+        ));
+        return None;
+    };
+    let present = present_rows(sample);
+    let mut errors = Vec::new();
+    for joint in flags::iter(rows) {
+        let Some(index) = row(joint) else {
+            failures.push(format!("{} sits on no bus row", Name(joint)));
+            continue;
+        };
+        errors.push((joint, (present[index] - goal[index]).abs()));
+    }
+    Some(errors)
+}
+
+/// The threshold the tracking detector screens a residual at, radians.
+///
+/// One statement of where that figure comes from for the whole suite: a
+/// scenario that names the screen's width names the one the tick judges at.
+/// The figure, not the quantity screened -- the detector applies it to the
+/// distance from the model's prediction, which no checker here reads.
+#[must_use]
+pub fn tracking_screen() -> f64 {
+    reachy_motion::tick::default_motion_config()
+        .tracking
+        .threshold_rad
+}
+
 /// Whether the machine was standing at the fold on `cycle`, by the maneuver's
 /// own measure, or `None` where the log has no readable sample for it.
 ///
@@ -2865,4 +2989,105 @@ pub fn main(name: &str, assert: impl FnOnce(&Run, &mut Vec<String>)) -> ExitCode
         eprintln!("{name}: {failure}");
     }
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
+    use clockwork_rs::SyncTime;
+    use log_read::Logged;
+    use reachy_motion::joints::{JointGroup, ROW_COUNT, flags, write_rows};
+
+    use super::{CONTROL_DELAY_NS, LAG_K, PERIOD_NS, Run, goal_stream_playing, step_bound_of};
+    use crate::cycle_at;
+
+    /// The first cycle the synthesised streams below carry a goal on.
+    const FIRST: i64 = 10;
+
+    /// A goal stream of `cycles` goals from [`FIRST`], every row held on the
+    /// pose it started at except `row`, which steps by `step` radians on the
+    /// cycle `steps_on`.
+    ///
+    /// Everything else the stream is asserted on is made correct here -- the
+    /// grid, the lag the goal is due at, the full mask, the order -- so a case
+    /// below reads only the travel bound.
+    fn stream(cycles: i64, row: usize, steps_on: i64, step: f64) -> Run {
+        let mut run = Run::default();
+        for index in 0..cycles {
+            let cycle = FIRST + index;
+            let mut targets = [0.0; ROW_COUNT];
+            if cycle >= steps_on {
+                targets[row] = step;
+            }
+            let mut message = GoalSetpointWire::new();
+            let view = message.clear_valid();
+            view.execute_at = SyncTime::from_nanos(cycle_at(cycle) + LAG_K * PERIOD_NS);
+            view.mask = flags::all();
+            write_rows(&mut view.targets, &targets);
+            run.goals.push(Logged {
+                at_ns: cycle_at(cycle) + CONTROL_DELAY_NS,
+                sequence_number: index as u32,
+                message,
+            });
+        }
+        run
+    }
+
+    /// A step past the planner's own bound, on a row the exemption does not
+    /// name, is still reported however the window is placed.
+    ///
+    /// The exemption's failure mode is not failing, so what is asserted about it
+    /// is where it stops applying. This is the row axis: a head row inside the
+    /// content window is a planned move and the bound is the planner's own.
+    #[test]
+    fn the_exemption_leaves_the_bound_on_a_row_no_content_names() {
+        let row = reachy_motion::joints::row(reachy_motion::joints::ROWS[0])
+            .expect("the first row of the machine sits on a bus row");
+        let step = step_bound_of(row).expect("a bus row has a step bound") * 2.0;
+        let mut failures = Vec::new();
+        let run = stream(6, row, FIRST + 3, step);
+        goal_stream_playing(
+            &run,
+            JointGroup::Antennas.joints(),
+            FIRST..FIRST + 6,
+            &mut failures,
+        );
+        assert!(
+            failures.iter().any(|failure| failure.contains("past the")),
+            "a head row stepping {step} rad inside the window was not reported: {failures:?}"
+        );
+    }
+
+    /// The same step on an exempt row, one cycle either side of the range the
+    /// content covers, is reported; inside it, it is not.
+    ///
+    /// The cycle axis, at both edges of the half-open range: the same antenna is
+    /// carried by the planner's own moves before the window opens and after it
+    /// closes, and those are the moves the bound exists to police.
+    #[test]
+    fn the_exemption_covers_the_content_cycles_and_no_others() {
+        let joint = flags::iter(JointGroup::Antennas.joints())
+            .next()
+            .expect("the machine has antennas");
+        let row = reachy_motion::joints::row(joint).expect("an antenna sits on a bus row");
+        let step = step_bound_of(row).expect("a bus row has a step bound") * 2.0;
+        let content = JointGroup::Antennas.joints();
+        // The step lands on `FIRST + 3`, and the window is walked over it: shut
+        // before, open across it, shut again after.
+        for (open, close, reported, what) in [
+            (FIRST + 4, FIRST + 6, true, "a cycle after the step"),
+            (FIRST, FIRST + 3, true, "closing on the cycle of the step"),
+            (FIRST, FIRST + 6, false, "spanning the step"),
+        ] {
+            let mut failures = Vec::new();
+            let run = stream(6, row, FIRST + 3, step);
+            goal_stream_playing(&run, content, open..close, &mut failures);
+            let saw = failures.iter().any(|failure| failure.contains("past the"));
+            assert_eq!(
+                saw, reported,
+                "with the window {what}, the antenna's {step} rad step read as \
+                 {saw} against {reported}: {failures:?}"
+            );
+        }
+    }
 }

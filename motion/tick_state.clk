@@ -101,8 +101,9 @@ enum BusSourceKind
 // tracking threshold.
 //
 // Two things per row, because the second is only ever judged against the first:
-// where the servo's own trajectory generator stands, stepped every period from
-// the setpoints the driver held, and how long the joint has stood away from
+// where a healthy servo following its generator stands -- that generator
+// stepped every period from the setpoints the driver held, with the position
+// loop's own following lag on it -- and how long the joint has stood away from
 // that without closing on it or keeping pace with it. The prediction is plant
 // state and outlives every run: a raise, a degrade or an abort forgets the run
 // and leaves the model where the plant is, because a hold does not stop the
@@ -123,8 +124,10 @@ schema TrackingRowSnap
         // Zero on a closed run.
         #3 count: UInt32;
 
-        // Where the modelled generator's trajectory stands for this joint,
-        // radians. Meaningless until `seeded`.
+        // Where the modelled servo's shaft stands for this joint, radians:
+        // the generator's trajectory with the position loop's own following
+        // lag on it, which is what a reading is judged against. Meaningless
+        // until `seeded`.
         #5 predicted: Float64;
 
         // That trajectory's velocity, radians per control period, signed.
@@ -143,10 +146,18 @@ schema TrackingRowSnap
         // chase: a prediction is only ever seeded from where the joint is, and
         // never from where a goal says it should be.
         #9 seeded: Bool;
+
+        // Where the modelled generator's own trajectory stands, radians: the
+        // profile's trapezoid alone, which `predicted` follows a following lag
+        // behind. Carried because the lag is a decay toward this and not a
+        // function of the setpoint, so a step needs where the generator got to
+        // last period. Equal to `predicted` for a class with no lag, and set
+        // to the reading with it when a row is seeded.
+        #10 generator: Float64;
     }
     history
     {
-        version: 9;
+        version: 10;
         removed: [1, 2, 4];
     }
 }

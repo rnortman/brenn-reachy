@@ -40,6 +40,10 @@ use reachy_clips::files::documents;
 use reachy_clips::format::Clip;
 use reachy_clips::library::{Library, Motion};
 
+mod probe_clips;
+
+use probe_clips::PROBES;
+
 /// What the emitted asset says about itself before its first clip.
 ///
 /// Fixed text: the drift check compares a fresh emit against the checked-in
@@ -124,6 +128,7 @@ fn parse(words: impl Iterator<Item = String>) -> anyhow::Result<Args> {
 
 /// Read the documents, emit both files, and say what was written.
 fn run(args: &Args, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
+    write_probes(&args.clips, say)?;
     let texts = read_documents(&args.clips)?;
     let emitted = emit(&texts)?;
     write(&args.out, &emitted.textproto)?;
@@ -136,6 +141,33 @@ fn run(args: &Args, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
         args.out.display(),
         args.names.display()
     ));
+    Ok(())
+}
+
+/// Write every probe document from its table, before the walk reads them.
+///
+/// The probes are instruments whose poses are the tree's own constants, so they
+/// are authored here rather than by hand: a document holding hundreds of copies
+/// of a delta is re-transcribed whenever the constant behind it moves, and a
+/// stale one loads and emits exactly as happily as a fresh one. The rest of the
+/// library is recorded content and arrives as documents.
+///
+/// The write is part of the emit rather than a target of its own so that `make
+/// clip-config` is one command for both halves, and so the asset can never be
+/// regenerated from probe documents the table has moved on from.
+fn write_probes(clips: &Path, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
+    for probe in PROBES {
+        let path = probe.path(clips);
+        let document = probe.document().with_context(|| {
+            format!("{}: the probe table does not author a document", probe.name)
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot make {}", parent.display()))?;
+        }
+        write(&path, &document)?;
+        say(format!("probe {} to {}", probe.name, path.display()));
+    }
     Ok(())
 }
 
@@ -564,6 +596,8 @@ mod tests {
     use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS};
     use reachy_scratch::scratch_dir;
 
+    use super::probe_clips::Pose;
+
     /// The environment variable naming the committed documents' directory,
     /// relative to the runfiles root, which is a test's working directory.
     ///
@@ -752,43 +786,85 @@ mod tests {
         );
     }
 
-    /// The two antenna step probes are instruments, and what makes them
-    /// instruments is the shape of their frame tracks: three poses off the
-    /// raised base, each reached in **one** frame and then held long enough for
-    /// the stillness watch to judge the hold. A document re-authored into a
-    /// ramp would load and emit exactly as happily, so the step and the hold
-    /// are pinned here rather than left to the eye.
+    /// The committed probe documents are what the table authors, byte for byte.
     ///
-    /// The pose figures are the antennas' outboard horizontal and their stow,
-    /// as deltas over the rest lean the base holds them at. The two probes
-    /// visit them in opposite orders, so between them every arrival — from up,
-    /// from sides, from down — is judged once.
-    ///
-    /// The entry blend is pinned at zero for the same reason: it is a *weight*
-    /// ramp over the whole delta the frame carries, so a probe taking the
-    /// format's default would compose its first pose a tenth at a time and its
-    /// first arrival would be a ten-period ramp rather than a step.
+    /// The same gate the emitted asset has, one level up: a probe's poses are
+    /// the tree's own constants, and a document holding hundreds of copies of a
+    /// delta the constant has moved off would load, emit and hold exactly as
+    /// happily while reading as the instrument it no longer is. Answered by
+    /// `make clip-config`, which rewrites them.
     #[test]
-    fn each_antenna_step_probe_steps_to_three_held_poses() {
+    fn the_committed_probe_documents_are_what_the_table_authors() {
+        let texts = texts();
+        for probe in PROBES {
+            let suffix = format!("{}.json", probe.name);
+            let (source, text) = texts
+                .iter()
+                .find(|(source, _)| source.ends_with(&suffix))
+                .unwrap_or_else(|| panic!("{} is not a committed document", probe.name));
+            assert_eq!(
+                *text,
+                probe.document().expect("the table authors a document"),
+                "{source} is stale; run `make clip-config`"
+            );
+        }
+        // And nothing under `probe/` is a hand-authored document the table has
+        // never heard of: such a file would emit into the library, be playable
+        // by name, and answer to nothing.
+        for (source, _) in &texts {
+            // The last `clips/` in the path and not the first: a checkout, or a
+            // documents directory, that itself sits under a `clips/` would
+            // otherwise leave `rest` starting somewhere above the tree and skip
+            // every probe document without a word.
+            if let Some(rest) = source.rsplit_once("clips/").map(|(_, rest)| rest)
+                && rest.starts_with("probe/")
+            {
+                let name = rest.trim_end_matches(".json");
+                assert!(
+                    PROBES.iter().any(|probe| probe.name == name),
+                    "{source} is a probe document with no row in the table"
+                );
+            }
+        }
+    }
+
+    /// A probe is an instrument, and what makes it one is the shape of its
+    /// frame track. The table states that shape; this is the assertion that the
+    /// shape survives into the library the machine plays.
+    ///
+    /// Every named pose is counted rather than eyeballed: the step probes hold
+    /// theirs 325 frames each — 6.5 s, the watch's shortest judgeable hold and
+    /// half a second — and the sweep passes through its own on the frames its
+    /// ramps hand over on. The figures are differences of the antenna constants,
+    /// so a moved fold or sideways point fails here.
+    ///
+    /// The entry blend is pinned at zero for a related reason: it is a *weight*
+    /// ramp over the whole delta a frame carries, so a probe taking the format's
+    /// default would compose its first pose a tenth at a time and its first
+    /// arrival would be a ten-period ramp rather than the step or the stated
+    /// ramp the table says.
+    #[test]
+    fn every_probe_the_library_carries_is_the_track_the_table_states() {
         let emitted = baseline();
         let sidecar: serde_json::Value =
             serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
         let motions = sidecar["motions"].as_array().expect("a motions table");
-        for name in ["probe/antenna-step-a", "probe/antenna-step-b"] {
+        for probe in PROBES {
+            let name = probe.name;
+            let frames = probe.antenna_frames().expect("the table chains");
             let clip = emitted
                 .clips
                 .entries
                 .iter()
                 .find(|clip| clip.name == name)
                 .unwrap_or_else(|| panic!("{name} is not in the library"));
-            // The base frame, then three poses of 325 frames: 6.5 s each, the
-            // watch's shortest judgeable hold and half a second.
-            assert_eq!(clip.parts, 1 + 3 * 325, "{name}");
+            assert_eq!(clip.parts, frames.len(), "{name}");
             let motion = motions
                 .iter()
                 .find(|row| row["name"] == json!(name))
                 .unwrap_or_else(|| panic!("{name} is not playable"));
-            assert_eq!(motion["duration_ms"], json!(19_520), "{name}");
+            // 20 ms a frame, which is the tick rate the format pins.
+            assert_eq!(motion["duration_ms"], json!(frames.len() * 20), "{name}");
             assert_eq!(motion["blend_out_ms"], json!(200), "{name}");
             let block = emitted
                 .textproto
@@ -799,36 +875,50 @@ mod tests {
                 block.contains("\n  blend_in_ms: 0\n"),
                 "{name}: {block:.200}"
             );
+            for pose in [Pose::Up, Pose::Sides, Pose::Down, Pose::HalfDown] {
+                let angles = pose.antennas();
+                let printed = format!(
+                    "antenna_right_d: {} antenna_left_d: {}",
+                    number(angles[0]),
+                    number(angles[1])
+                );
+                assert_eq!(
+                    block.matches(&printed).count(),
+                    frames.iter().filter(|frame| **frame == angles).count(),
+                    "{name} does not carry {pose:?} the number of times its table states"
+                );
+            }
         }
-        // Each pose is held 325 frames in each of the two probes, and the last
-        // pose of both is the base itself, whose figures every other clip's
-        // undriven channels print too.
-        //
-        // The two off-base poses are derived from the constants they exist to
-        // put the antennas at, not transcribed: a document authored against a
-        // fold or a sideways point the tree has since moved would still load,
-        // emit and hold, and read as the instrument it no longer is.
-        //
-        // TODO(probe-clip-emitted-from-constants): this detects a stale
-        // document; it does not write a fresh one. The probes still hold ~1300
-        // copies of the two deltas as literals, re-transcribed by hand whenever
-        // either constant moves.
-        let base = reachy_motion::postures::NEUTRAL_ANTENNAS;
-        for target in [
-            reachy_motion::ANTENNA_OUTBOARD,
-            reachy_motion::disarm::STOW_ANTENNAS,
-        ] {
-            let pose = format!(
-                "antenna_right_d: {} antenna_left_d: {}",
-                target[0] - base[0],
-                target[1] - base[1]
-            );
-            assert_eq!(
-                emitted.textproto.matches(&pose).count(),
-                2 * 325,
-                "{pose} is not held for a judgeable hold in both probes"
-            );
+    }
+
+    /// The sweep is the residual instrument: 15.5 s of streamed antenna content
+    /// with one judgeable hold at the end, so a run of it has a hold to judge
+    /// while everything before it is moving.
+    #[test]
+    fn the_sweep_is_a_streamed_run_with_one_judgeable_hold() {
+        let sweep = PROBES
+            .iter()
+            .find(|probe| probe.name == "probe/antenna-sweep")
+            .expect("the sweep is in the table");
+        let frames = sweep.antenna_frames().expect("the table chains");
+        assert_eq!(frames.len(), 775);
+        let base = Pose::Up.antennas();
+        let tail = frames
+            .iter()
+            .rev()
+            .take_while(|frame| **frame == base)
+            .count();
+        assert_eq!(tail, 325, "6.5 s of stillness, on the base");
+        let (mut longest, mut run) = (0, 0);
+        for window in frames[..frames.len() - 325].windows(2) {
+            run = if window[0] == window[1] { run + 1 } else { 0 };
+            longest = longest.max(run + 1);
         }
+        assert!(
+            longest < 325,
+            "the sweep's longest other stretch of stillness is {longest} frames, which the watch \
+             would judge as a second hold"
+        );
     }
 
     /// A clip id is an index into the emitted order, which is the order the

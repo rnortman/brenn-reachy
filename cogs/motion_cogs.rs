@@ -58,7 +58,7 @@ use reachy_kin::{
 use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
-use reachy_motion::plant::{GroupPlants, GroupProfiles, ProfilePair};
+use reachy_motion::plant::{ClassProfile, GroupPlants, GroupProfiles};
 use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
@@ -724,7 +724,8 @@ pub fn group_gains(gains: &ServoGains) -> GroupGains {
     }
 }
 
-/// The configuration file's six scalars as the motion library's three pairs.
+/// The configuration file's nine scalars as the motion library's three class
+/// profiles.
 ///
 /// The one place the field names and the classes are joined, so the session
 /// that writes the registers and the tick that models them read the file the
@@ -732,17 +733,20 @@ pub fn group_gains(gains: &ServoGains) -> GroupGains {
 #[must_use]
 pub fn group_profiles(profile: &ServoProfile) -> GroupProfiles {
     GroupProfiles {
-        legs: ProfilePair {
+        legs: ClassProfile {
             acceleration: profile.legs_profile_acceleration,
             velocity: profile.legs_profile_velocity,
+            following_lag_us: profile.legs_following_lag_us,
         },
-        yaw: ProfilePair {
+        yaw: ClassProfile {
             acceleration: profile.body_yaw_profile_acceleration,
             velocity: profile.body_yaw_profile_velocity,
+            following_lag_us: profile.body_yaw_following_lag_us,
         },
-        antennas: ProfilePair {
+        antennas: ClassProfile {
             acceleration: profile.antennas_profile_acceleration,
             velocity: profile.antennas_profile_velocity,
+            following_lag_us: profile.antennas_following_lag_us,
         },
     }
 }

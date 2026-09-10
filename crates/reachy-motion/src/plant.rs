@@ -16,16 +16,31 @@
 //! cannot, and the same residual over the same recordings is about 0.4 rad,
 //! 0.4024 rad at the worst.
 //!
-//! The model has no fitted constants. Its two parameters are the two registers
-//! the sweep writes, converted into the caller's control period. The one
-//! measured number in the module is [`RESPONSE_DEAD_SAMPLES`], and its
-//! measurement is in its own comment.
+//! The generator is only half of what a servo does with a goal. Its position
+//! loop follows that trajectory, and a proportional loop is a first-order lag:
+//! at cruise the shaft stands a fixed number of periods of travel behind the
+//! trajectory it is chasing. So a class has three parameters here — the two
+//! registers the sweep writes, converted into the caller's control period, and
+//! the loop's following lag ([`ClassProfile::following_lag_us`]). At a slow
+//! pair that lag is a hundredth of a radian and invisible; at a class's own
+//! measured capability it is most of the detector's screen, spent on a healthy
+//! machine doing nothing wrong.
+//!
+//! The measured numbers here are [`RESPONSE_DEAD_SAMPLES`] and the per-class
+//! lag, and each carries its measurement in its own comment. A lag is read by
+//! scanning it over a recording for the figure that minimises the class's
+//! p99.9 residual, is accepted only where two recordings at different pairs
+//! agree on it and no kept fixture's worst sample rises under it, and is never
+//! adjusted to make a fixture pass. It is measured at a gains triple and a
+//! change of gains re-reads it. A class whose recordings disagree carries no
+//! lag: zero is a valid figure and is the trapezoid alone.
 //!
 //! What it does not model: the stiction-and-backlash excursion a real joint
-//! shows when a goal turns round through it, a load-dependent steady offset,
-//! and count quantisation. Those are what a detector's margin is for. Fitting
-//! them would put constants read off one machine on one day into a model whose
-//! whole claim is that it has none.
+//! shows when a goal turns round through it — travel lost through a reversal,
+//! of a fixed radian size rather than a speed-proportional one — a
+//! load-dependent steady offset, and count quantisation. Those are what a
+//! detector's margin is for. Fitting them would put constants read off one
+//! machine on one day into a model of one machine's bad day.
 //!
 //! [`PlantModel::step`] saturates a *prediction*. Nothing here is written to a
 //! bus and nothing here touches a goal: the no-clamp rule is about commanded
@@ -39,6 +54,17 @@ use core::f64::consts::TAU;
 use thiserror::Error;
 
 use crate::joints::{JointGroup, PerGroup};
+use crate::stillness::COUNT_RAD;
+
+/// The most periods either of the two walks below steps the model through
+/// before it gives up.
+///
+/// A guard and not a limit anybody plans against: the longest thing this
+/// machine asks of a joint is an antenna's stow-to-neutral arc, which is a few
+/// hundred periods at the slowest pair the tree ships. A walk that runs past
+/// this is a model whose output is not converging on its generator, not a long
+/// move, and the debug assertion beside each walk says so.
+pub const MAX_TRAVEL_CYCLES: usize = 6_000;
 
 /// Radians per second per least-significant bit of the Profile Velocity
 /// register, whose own unit is 0.229 rev/min.
@@ -59,19 +85,37 @@ pub const PROFILE_VELOCITY_UNIT_RAD_PER_S: f64 = 0.229 * TAU / 60.0;
 /// Restated here for the reason the velocity unit above it is.
 pub const PROFILE_ACCELERATION_UNIT_RAD_PER_S2: f64 = 214.577 * TAU / 3600.0;
 
-/// One servo class's two profile registers, in register units.
+/// One servo class's commissioned profile: the two registers the sweep writes,
+/// and the following lag its position loop answers them with.
 ///
-/// Named fields rather than a pair of numbers, because the two orders in this
-/// tree disagree: the configuration file writes acceleration first and
+/// Named fields rather than a run of numbers, because the orders in this tree
+/// disagree: the configuration file writes acceleration first and
 /// [`PlantModel::from_registers`] takes the velocity first, so a positional
-/// pair is a swap that type-checks. A swapped pair commissions a class at a
+/// triple is a swap that type-checks. A swapped pair commissions a class at a
 /// hundredth of its speed.
+///
+/// The two registers are a *command* — they are written to the servo and its
+/// generator changes — and the lag is the *plant*, a property of the loop that
+/// follows that generator. Nothing writes the lag anywhere: it only ever
+/// changes what a model believes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProfilePair {
+pub struct ClassProfile {
     /// Profile Acceleration, the ramp the servo's generator runs.
     pub acceleration: u32,
     /// Profile Velocity, the cruise it ramps to.
     pub velocity: u32,
+    /// How far the position loop stands behind the trajectory it follows, in
+    /// microseconds of that trajectory's own travel.
+    ///
+    /// Microseconds rather than periods so that the figure does not depend on
+    /// the grid it is read on: a lag stated in periods and re-read at another
+    /// control period would be a different loop. [`PlantModel::from_registers`]
+    /// divides by the caller's period to get the periods-of-travel figure the
+    /// model steps with.
+    ///
+    /// Zero is the trapezoid alone, and is what a class carries until a
+    /// reading is accepted for it.
+    pub following_lag_us: u32,
 }
 
 /// The ceiling a Profile Acceleration may be written at.
@@ -88,7 +132,7 @@ pub const PROFILE_ACCELERATION_MAX: u32 = 32767;
 /// two different XL330 variants: the antennas' Velocity Limit is 1620 register
 /// units against the head's 445, so a pair the antennas can hold is a pair the
 /// head's servos refuse.
-pub type GroupProfiles = PerGroup<ProfilePair>;
+pub type GroupProfiles = PerGroup<ClassProfile>;
 
 /// The profile pairs this deployment ships, in register units.
 ///
@@ -98,26 +142,39 @@ pub type GroupProfiles = PerGroup<ProfilePair>;
 /// scenario harness's parameter check, which reads the file and compares it
 /// with this.
 ///
-/// Two pairs across the three classes. The legs run their own measured
-/// capability, confirmed on a tour of the whole clip library at it; the body
-/// yaw and the antennas run the measured velocity cap of the recorded library
-/// tour, which is the pair every class started at. The per-class capability the
-/// machine has been measured at is `cogs/pose_reading.rs`'s
-/// `RECORDED_CAPABILITY_*`; the body yaw's reading is that pair to within the
-/// instrument's own ratio, and the antennas' is a faster pair that is on record
-/// and not commissioned, which is what TODO(session-servo-profile) now carries.
+/// Three pairs across the three classes. The legs and the antennas run their
+/// own measured capability, each confirmed at it — the legs on a tour of the
+/// whole clip library, the antennas on a tour read offline under the model plus
+/// six armed runs at the pair; the body yaw runs the measured velocity cap of
+/// the recorded library tour, which is the pair every class started at. The
+/// per-class capability the machine has been measured at is
+/// `cogs/pose_reading.rs`'s `RECORDED_CAPABILITY_*`, and the body yaw's reading
+/// is that pair to within the instrument's own ratio, which is why the class
+/// that is not at its capability is still at the pair it ships.
+///
+/// Two of the three classes carry a following lag, each read by the scan the
+/// header describes over the 2026-09-09 tours and accepted on the agreement of
+/// two recordings at different pairs. The legs read 1.2 periods of the 20 ms
+/// grid at gains `800 / 100 / 300` and the antennas 1.2 and 1.3 at
+/// `200 / 0 / 0`, both minima over twice as deep as the acceptance rule asks
+/// for; the body yaw has no motor-bound recording to read one on, its scan runs
+/// out of grid rather than finding a floor, and it carries the trapezoid alone.
+/// A lag belongs to the loop it was read on, so a gains change re-reads it.
 pub const SHIPPED_PROFILES: GroupProfiles = GroupProfiles {
-    legs: ProfilePair {
+    legs: ClassProfile {
         acceleration: 287,
         velocity: 326,
+        following_lag_us: 24_000,
     },
-    yaw: ProfilePair {
+    yaw: ClassProfile {
         acceleration: 20,
         velocity: 50,
+        following_lag_us: 0,
     },
-    antennas: ProfilePair {
-        acceleration: 20,
-        velocity: 50,
+    antennas: ClassProfile {
+        acceleration: 522,
+        velocity: 640,
+        following_lag_us: 24_000,
     },
 };
 
@@ -171,8 +228,8 @@ pub const RESPONSE_DEAD_SAMPLES: usize = 2;
 /// one. Coupled to the simulated driver's catch-up cap.
 pub const MAX_GAP_PERIODS: usize = 8;
 
-/// The servo's trajectory generator, as configured: the velocity cap it ramps
-/// up to and the acceleration it ramps at, both in the caller's control period.
+/// The servo as configured: the generator's velocity cap and acceleration, and
+/// the position loop's lag behind it, all in the caller's control period.
 ///
 /// Radians per period and radians per period squared, not per second. The
 /// period is baked in at construction ([`PlantModel::from_registers`]) so that
@@ -184,19 +241,29 @@ pub struct PlantModel {
     pub v_max: f64,
     /// The acceleration, radians per period squared.
     pub a_max: f64,
+    /// How much of the distance to the generator the loop's output closes each
+    /// period: `1 / (1 + λ)` for a lag of `λ` periods, so a zero lag is `1.0`
+    /// and the output is the generator itself.
+    pub lag_alpha: f64,
 }
 
-/// Where the generator's trajectory stands for one joint.
+/// Where the modelled servo stands for one joint: its generator's trajectory,
+/// and the shaft following it.
 ///
-/// Position and velocity of the *model*, never of the machine: the machine's
-/// position is a reading, and the whole point of holding this is to have
-/// something to compare that reading with.
+/// The model's own state, never the machine's: the machine's position is a
+/// reading, and the whole point of holding this is to have something to compare
+/// that reading with.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Predicted {
-    /// The trajectory's position, radians.
-    pub position: f64,
-    /// The trajectory's velocity, radians per period, signed.
+    /// The generator's trajectory position, radians. The trapezoid alone,
+    /// which the loop below chases.
+    pub generator: f64,
+    /// That trajectory's velocity, radians per period, signed.
     pub velocity: f64,
+    /// Where the loop following that trajectory stands, radians. This is what
+    /// a reading is compared against: it is the model's statement of where a
+    /// healthy shaft is, generator and loop together.
+    pub position: f64,
 }
 
 /// Why a profile could not be modelled.
@@ -252,9 +319,14 @@ impl GroupPlants {
         profiles: &GroupProfiles,
         period_ns: i64,
     ) -> Result<Self, GroupPlantError> {
-        profiles.try_map(|group, pair| {
-            PlantModel::from_registers(pair.velocity, pair.acceleration, period_ns)
-                .map_err(|source| GroupPlantError { group, source })
+        profiles.try_map(|group, profile| {
+            PlantModel::from_registers(
+                profile.velocity,
+                profile.acceleration,
+                profile.following_lag_us,
+                period_ns,
+            )
+            .map_err(|source| GroupPlantError { group, source })
         })
     }
 }
@@ -272,12 +344,18 @@ impl Default for GroupPlants {
 }
 
 impl PlantModel {
-    /// The model of a servo commissioned with these two registers, stepped on a
-    /// grid of `period_ns`.
+    /// The model of a servo commissioned with these two registers and measured
+    /// with this following lag, stepped on a grid of `period_ns`.
     ///
     /// The period is the caller's configured one and never a constant here: the
     /// tick passes the grid its samples arrive on, the simulated driver its own
-    /// cycle, an offline pass the grid of the log it is reading.
+    /// cycle, an offline pass the grid of the log it is reading. It is also
+    /// what the lag is divided by, so a lag stated in microseconds means the
+    /// same loop whatever grid it is read on.
+    ///
+    /// A `following_lag_us` of zero is the trapezoid alone and is refused by
+    /// nothing: unlike the two registers, a loop with no lag is a model, just
+    /// not this machine's.
     ///
     /// # Errors
     ///
@@ -286,6 +364,7 @@ impl PlantModel {
     pub fn from_registers(
         velocity: u32,
         acceleration: u32,
+        following_lag_us: u32,
         period_ns: i64,
     ) -> Result<Self, PlantError> {
         if velocity == 0 {
@@ -302,16 +381,22 @@ impl PlantModel {
             return Err(PlantError::NoPeriod { period_ns });
         }
         let period_s = period_ns as f64 * 1e-9;
+        // The lag in periods of travel, which is what the step is written in:
+        // the file states microseconds so that the figure survives a change of
+        // grid.
+        let lag_periods = f64::from(following_lag_us) * 1e-6 / period_s;
         Ok(Self {
             v_max: f64::from(velocity) * PROFILE_VELOCITY_UNIT_RAD_PER_S * period_s,
             a_max: f64::from(acceleration)
                 * PROFILE_ACCELERATION_UNIT_RAD_PER_S2
                 * period_s
                 * period_s,
+            lag_alpha: 1.0 / (1.0 + lag_periods),
         })
     }
 
-    /// Advance one joint's trajectory by one period, toward `target`.
+    /// Advance one joint's generator and the loop following it by one period,
+    /// toward `target`.
     ///
     /// The velocity the generator wants is the fastest one that still stops on
     /// the target under its own acceleration, capped at the profile velocity;
@@ -325,10 +410,19 @@ impl PlantModel {
     /// setpoint is — produces a continuous trajectory and not a train of
     /// restarted ramps.
     ///
+    /// The loop then closes `lag_alpha` of its distance to wherever the
+    /// generator got to, which at cruise leaves it `v_max · λ` behind and is
+    /// the whole of what the lag term claims. Once the generator has stopped on
+    /// its target and the loop is inside half an encoder count of it, the
+    /// output takes the generator's position exactly: a first-order decay never
+    /// arrives, and an arrival that is never final is one no caller can wait
+    /// for. The snap is under the quantisation of the reading it is compared
+    /// with, and with a zero lag it is a no-op.
+    ///
     /// The two saturations here are the model of the servo's own two limiters.
     /// Nothing in `state` is ever commanded.
     pub fn step(&self, state: &mut Predicted, target: f64) {
-        let d = target - state.position;
+        let d = target - state.generator;
         // The braking curve: at this speed, decelerating at `a_max` from here
         // arrives at the target with zero velocity. Approaching faster would
         // overshoot, which is what makes this and not `v_max` the binding term
@@ -337,40 +431,57 @@ impl PlantModel {
         let v_want = d.signum() * self.v_max.min(v_stop);
         state.velocity += (v_want - state.velocity).clamp(-self.a_max, self.a_max);
         if state.velocity.abs() >= d.abs() && state.velocity.signum() == d.signum() {
-            state.position = target;
+            state.generator = target;
             state.velocity = 0.0;
         } else {
-            state.position += state.velocity;
+            state.generator += state.velocity;
+        }
+        state.position += self.lag_alpha * (state.generator - state.position);
+        if state.velocity == 0.0
+            && state.generator == target
+            && (state.generator - state.position).abs() < COUNT_RAD / 2.0
+        {
+            state.position = state.generator;
         }
     }
 
-    /// How many periods this generator takes to move `distance_rad` from rest
-    /// and stop, including the response dead time.
+    /// How many periods this modelled servo takes to move `distance_rad` from
+    /// rest and stand on it, including the response dead time.
     ///
-    /// The closed form of the profile rather than a stepped simulation, so that
-    /// a test or a scenario can state an arrival instant as an expression over
-    /// the travel it is waiting for instead of as an integer somebody nudged
-    /// until it passed. Long moves are trapezoids — ramp up, run at the cap,
-    /// ramp down — and short ones never reach the cap and are triangles.
+    /// The model's own walk and not a closed form of the profile: the answer
+    /// has to be the arrival of the thing a caller is waiting on, and what a
+    /// caller waits on is the shaft, which is the generator plus the loop
+    /// behind it. A closed form would be the generator's arrival alone, and
+    /// would have to grow a second term the day the lag did.
     ///
-    /// Rounded up, and a period the move ends inside still counts: an arrival
-    /// is not observable until the sample that follows it.
+    /// A test or a scenario states an arrival instant as an expression over
+    /// this rather than as an integer somebody nudged until it passed, so the
+    /// arithmetic is the reason the number is what it is.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the move does not finish inside
+    /// [`MAX_TRAVEL_CYCLES`], which for any distance this machine's joints
+    /// cover is a model that is not converging rather than a long move. A
+    /// release build carries no assertion and answers the bound itself plus the
+    /// dead time, which a caller reads as a very long move: every build the
+    /// tests, the scenario harness and the bench run is a debug build, and the
+    /// assertion is what makes a model that does not converge a failure there.
     #[must_use]
     pub fn travel_cycles(&self, distance_rad: f64) -> usize {
         let d = distance_rad.abs();
-        // The distance a full ramp up and back down covers. Anything shorter
-        // turns round before the cap.
-        let d_ramp = self.v_max * self.v_max / self.a_max;
-        let periods = if d >= d_ramp {
-            d / self.v_max + self.v_max / self.a_max
-        } else {
-            2.0 * (d / self.a_max).sqrt()
-        };
+        let mut state = Predicted::default();
+        let mut periods = 0;
+        while state.position != d && periods < MAX_TRAVEL_CYCLES {
+            self.step(&mut state, d);
+            periods += 1;
+        }
         debug_assert!(
-            periods.is_finite(),
-            "a travel of {distance_rad} rad is not a distance this generator crosses"
+            periods < MAX_TRAVEL_CYCLES,
+            "a travel of {distance_rad} rad is not a distance this servo crosses in \
+             {MAX_TRAVEL_CYCLES} periods"
         );
-        periods.ceil() as usize + RESPONSE_DEAD_SAMPLES
+        periods + RESPONSE_DEAD_SAMPLES
     }
 
     /// How many periods this generator takes to *pass* `distance_rad` from
@@ -389,27 +500,33 @@ impl PlantModel {
     /// the same cycle's read shows it. A caller bounding a commanded pass
     /// adds the dead time itself.
     ///
-    /// Rounded up, so the answer is the first period on which the trajectory
-    /// stands at or past the distance. Continued linearly once the cap binds.
+    /// The answer is the first period on which the shaft stands at or past the
+    /// distance, walked from the model rather than solved, for the reason
+    /// [`Self::travel_cycles`] gives.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the distance is not passed inside
+    /// [`MAX_TRAVEL_CYCLES`]. A release build answers the bound instead, as
+    /// [`Self::travel_cycles`] says.
     #[must_use]
     pub fn pass_cycles(&self, distance_rad: f64) -> usize {
         let d = distance_rad.abs();
-        // Where the ramp ends: the period the cap binds on, and how far the
-        // ramp itself covered getting there. One period of the ramp covers
-        // `a_max` more than the last, so `k` of them cover `a_max · k(k+1)/2`.
-        let ramp = self.v_max / self.a_max;
-        let ramped = self.a_max * ramp * (ramp + 1.0) / 2.0;
-        let periods = if d <= ramped {
-            // The ramp's own quadratic, solved for the period it reaches `d`.
-            (-1.0 + (1.0 + 8.0 * d / self.a_max).sqrt()) / 2.0
-        } else {
-            ramp + (d - ramped) / self.v_max
-        };
+        // Aimed well beyond, on purpose: a trajectory aimed *at* the distance
+        // brakes onto it, which is the other question.
+        let target = 10.0 * d + 10.0;
+        let mut state = Predicted::default();
+        let mut periods = 0;
+        while state.position < d && periods < MAX_TRAVEL_CYCLES {
+            self.step(&mut state, target);
+            periods += 1;
+        }
         debug_assert!(
-            periods.is_finite(),
-            "a distance of {distance_rad} rad is not one this generator passes"
+            periods < MAX_TRAVEL_CYCLES,
+            "a distance of {distance_rad} rad is not one this servo passes in \
+             {MAX_TRAVEL_CYCLES} periods"
         );
-        periods.ceil() as usize
+        periods
     }
 }
 
@@ -418,16 +535,34 @@ mod tests {
     use super::*;
     use crate::joints::{ROWS, group_of};
 
-    /// A profile pair, in the order the configuration file writes one.
+    /// A profile with no lag, its two registers in the order the configuration
+    /// file writes them.
     ///
     /// The cases below distinguish the three classes by giving each a pair of
-    /// its own, and the field names spelled out per pair would bury the numbers
-    /// the case is about.
-    fn pair(acceleration: u32, velocity: u32) -> ProfilePair {
-        ProfilePair {
+    /// its own, and the field names spelled out per class would bury the
+    /// numbers the case is about. The lag cases state their own profiles.
+    fn pair(acceleration: u32, velocity: u32) -> ClassProfile {
+        ClassProfile {
             acceleration,
             velocity,
+            following_lag_us: 0,
         }
+    }
+
+    /// The same at a stated following lag, microseconds.
+    fn lagged(acceleration: u32, velocity: u32, following_lag_us: u32) -> ClassProfile {
+        ClassProfile {
+            acceleration,
+            velocity,
+            following_lag_us,
+        }
+    }
+
+    /// The shipped pair the cases pin figures at, with a following lag of
+    /// `lag_us` microseconds on top of it.
+    fn shipped_with_lag(lag_us: u32) -> PlantModel {
+        PlantModel::from_registers(50, 20, lag_us, SHIPPED_PERIOD_NS)
+            .expect("the shipped pair is a model at any lag")
     }
 
     /// The model the body yaw and the antennas run on the shipped machine, and
@@ -505,17 +640,22 @@ mod tests {
         }
     }
 
-    /// A long move is a trapezoid the closed form bounds from above, within the
-    /// [`CLOSED_FORM_SLACK`] the two arithmetics differ by.
+    /// A long move is a trapezoid — ramp up, run at the cap, ramp down — and
+    /// its length is the profile's own arithmetic to within a period.
+    ///
+    /// The continuous-time figure, kept here as the check that the walk is
+    /// still walking a trapezoid: a stepped model covers half a period of
+    /// velocity more than the integral on each of the two ramps, so it arrives
+    /// a period or three early and never late.
     #[test]
-    fn a_long_move_takes_the_time_the_closed_form_states() {
+    fn a_long_move_takes_the_time_the_profile_implies() {
         let plant = shipped();
         for distance in [1.0, 2.875, 2.0 * TAU] {
-            let stepped = periods_to_arrive(&plant, distance);
-            let closed = plant.travel_cycles(distance) - RESPONSE_DEAD_SAMPLES;
+            let stepped = plant.travel_cycles(distance) - RESPONSE_DEAD_SAMPLES;
+            let closed = (distance / plant.v_max + plant.v_max / plant.a_max).ceil() as usize;
             assert!(
-                closed >= stepped && closed - stepped <= CLOSED_FORM_SLACK,
-                "{distance} rad: stepped in {stepped} periods, closed form says {closed}"
+                closed >= stepped && closed - stepped <= 3,
+                "{distance} rad: stepped in {stepped} periods, the profile implies {closed}"
             );
         }
     }
@@ -612,13 +752,13 @@ mod tests {
     fn a_profile_that_is_not_a_generator_is_refused() {
         let period = SHIPPED_PERIOD_NS;
         assert!(matches!(
-            PlantModel::from_registers(0, 20, period),
+            PlantModel::from_registers(0, 20, 0, period),
             Err(PlantError::GeneratorDisabled {
                 register: "velocity"
             })
         ));
         assert!(matches!(
-            PlantModel::from_registers(50, 0, period),
+            PlantModel::from_registers(50, 0, 0, period),
             Err(PlantError::GeneratorDisabled {
                 register: "acceleration"
             })
@@ -626,7 +766,7 @@ mod tests {
         for bad in [0, -1, -20_000_000] {
             assert!(
                 matches!(
-                    PlantModel::from_registers(50, 20, bad),
+                    PlantModel::from_registers(50, 20, 0, bad),
                     Err(PlantError::NoPeriod { .. })
                 ),
                 "{bad} ns"
@@ -634,18 +774,20 @@ mod tests {
         }
     }
 
-    /// Every bus row reads its own class's pair, and the three classes are
+    /// Every bus row reads its own class's profile, and the three classes are
     /// three separate models.
     ///
     /// Table-driven over all nine rows, because the mapping is what a differing
-    /// antenna pair would otherwise get silently wrong: a row read as the legs'
-    /// would be judged against a generator its servo is not running.
+    /// antenna profile would otherwise get silently wrong: a row read as the
+    /// legs' would be judged against a generator its servo is not running, or
+    /// against a loop its servo does not have. Three distinct lags, for the
+    /// second half of that.
     #[test]
     fn every_row_reads_its_own_classs_profile_and_model() {
         let profiles = GroupProfiles {
-            legs: pair(20, 50),
-            yaw: pair(30, 60),
-            antennas: pair(40, 70),
+            legs: lagged(20, 50, 10_000),
+            yaw: lagged(30, 60, 0),
+            antennas: lagged(40, 70, 30_000),
         };
         let plants = GroupPlants::from_profiles(&profiles, SHIPPED_PERIOD_NS)
             .expect("three pairs and a grid are three models");
@@ -662,6 +804,7 @@ mod tests {
                 PlantModel::from_registers(
                     expected.velocity,
                     expected.acceleration,
+                    expected.following_lag_us,
                     SHIPPED_PERIOD_NS
                 )
                 .expect("the case's pairs are models"),
@@ -674,23 +817,61 @@ mod tests {
         assert_eq!(plants.of(JointGroup::Antennas), plants.antennas);
     }
 
-    /// The shipped triple is two models: the legs' commissioned capability and
-    /// the pair the other two classes still run. Per class, because the whole
-    /// point of the plumbing is that a class judged against another class's
-    /// generator is judged against a trajectory nothing runs.
+    /// The shipped triple is three pairs and two loops: the legs' and the
+    /// antennas' commissioned capabilities and the pair the body yaw still
+    /// runs, with the measured following lag on the two classes a scan has read
+    /// one for and zero on the body yaw, which has no motor-bound recording to
+    /// read. Per class, because the whole point of the plumbing is that a class
+    /// judged against another class's generator is judged against a trajectory
+    /// nothing runs, and all three fields, because a lag that went missing
+    /// between the file and the model would be a class judged against a loop it
+    /// does not have.
     #[test]
-    fn the_shipped_triple_is_the_legs_capability_and_the_tour_cap_on_the_rest() {
+    fn the_shipped_triple_is_the_measured_capabilities_and_the_tour_cap_on_the_yaw() {
+        assert_eq!(
+            SHIPPED_PROFILES.legs,
+            ClassProfile {
+                acceleration: 287,
+                velocity: 326,
+                following_lag_us: 24_000,
+            }
+        );
+        assert_eq!(SHIPPED_PROFILES.yaw, pair(20, 50));
+        assert_eq!(
+            SHIPPED_PROFILES.antennas,
+            ClassProfile {
+                acceleration: 522,
+                velocity: 640,
+                following_lag_us: 24_000,
+            }
+        );
         let plants = GroupPlants::default();
-        let legs = PlantModel::from_registers(326, 287, SHIPPED_PERIOD_NS)
+        let legs = PlantModel::from_registers(326, 287, 24_000, SHIPPED_PERIOD_NS)
             .expect("the legs' pair is a model");
-        let rest = PlantModel::from_registers(50, 20, SHIPPED_PERIOD_NS)
+        let yaw = PlantModel::from_registers(50, 20, 0, SHIPPED_PERIOD_NS)
             .expect("the tour's cap is a model");
+        let antennas = PlantModel::from_registers(640, 522, 24_000, SHIPPED_PERIOD_NS)
+            .expect("the antennas' capability under their own loop is a model");
         assert_eq!(plants.legs, legs);
-        assert_eq!(plants.yaw, rest);
-        assert_eq!(plants.antennas, rest);
+        assert_eq!(plants.yaw, yaw);
+        assert_eq!(plants.antennas, antennas);
         assert!(
-            legs.v_max > rest.v_max && legs.a_max > rest.a_max,
-            "the legs' generator is the faster of the two"
+            legs.v_max > yaw.v_max && legs.a_max > yaw.a_max,
+            "the legs' generator is faster than the yaw's"
+        );
+        assert!(
+            antennas.v_max > legs.v_max && antennas.a_max > legs.a_max,
+            "the antennas' generator is the fastest of the three, as their motor is"
+        );
+        // 24 000 us is 1.2 periods of the shipped 20 ms grid, so a cruising
+        // shaft stands 1.2 periods of travel behind its generator on the two
+        // classes a lag was read for, and on the generator itself on the yaw.
+        let lag_alpha = 1.0 / (1.0 + 1.2);
+        assert!((plants.legs.lag_alpha - lag_alpha).abs() < 1e-12);
+        assert!((plants.antennas.lag_alpha - lag_alpha).abs() < 1e-12);
+        assert_eq!(
+            plants.yaw.lag_alpha, 1.0,
+            "the body yaw has no reading and runs the generator alone"
         );
     }
 
@@ -742,106 +923,186 @@ mod tests {
     /// lets one model explain recordings made under either.
     #[test]
     fn the_bench_profile_is_the_same_model_an_order_of_magnitude_up() {
-        let bench = PlantModel::from_registers(600, 400, SHIPPED_PERIOD_NS)
+        let bench = PlantModel::from_registers(600, 400, 0, SHIPPED_PERIOD_NS)
             .expect("the bench pair is a model");
         assert!((bench.v_max - 0.28777).abs() < 5e-5, "{}", bench.v_max);
         assert!((bench.a_max - 0.059921).abs() < 5e-6, "{}", bench.a_max);
     }
 
-    /// `travel_cycles` bounds a stepped simulation from above across a triangle
-    /// and two trapezoids, and clocks the antenna raise the deterministic
-    /// scenarios wait out.
+    /// `travel_cycles` is the period the walked model really stands on its
+    /// target, and it clocks the antenna raise the deterministic scenarios wait
+    /// out.
+    ///
+    /// The figures are the walk's own, transcribed: a case computing them from
+    /// the same loop the function runs would assert that the loop is itself.
     #[test]
-    fn travel_cycles_matches_the_stepped_plant_and_clocks_the_antenna_raise() {
+    fn travel_cycles_is_the_period_the_model_stands_on_the_target() {
         let plant = shipped();
-        for distance in [0.01, 0.1, 1.0, 2.875, 12.56] {
-            let stepped = periods_to_arrive(&plant, distance) + RESPONSE_DEAD_SAMPLES;
-            let stated = plant.travel_cycles(distance);
-            assert!(
-                stated >= stepped && stated - stepped <= CLOSED_FORM_SLACK,
-                "{distance} rad: stepped in {stepped} periods, stated {stated}"
-            );
+        for (distance, periods) in [(0.01, 5), (0.1, 12), (1.0, 49), (12.56, 531)] {
+            assert_eq!(plant.travel_cycles(distance), periods, "{distance} rad");
         }
         // The stow-to-neutral travel of one antenna, which is the longest thing
         // any posture change asks of this machine.
-        assert_eq!(plant.travel_cycles(2.875), 130);
+        assert_eq!(plant.travel_cycles(2.875), 128);
         // Sign is not a distance.
-        assert_eq!(plant.travel_cycles(-2.875), 130);
+        assert_eq!(plant.travel_cycles(-2.875), 128);
+        assert_eq!(plant.travel_cycles(0.0), RESPONSE_DEAD_SAMPLES);
     }
 
-    /// How far above the stepped model's own arrival the closed form may sit.
+    /// A lagged loop takes longer to arrive than its generator does, by the
+    /// periods the output spends decaying onto a generator that has stopped.
     ///
-    /// Measured, not chosen: three periods, over distances from 0.01 rad to
-    /// four turns. The closed form is continuous-time and the model steps
-    /// forward-Euler, which covers half a period of velocity more than the
-    /// integral on each of the two ramps, so the stepped trajectory always
-    /// arrives a little early. The direction is what matters and it is the safe
-    /// one — an instant derived from `travel_cycles` is never before the joint
-    /// got there.
-    const CLOSED_FORM_SLACK: usize = 3;
-
-    /// How many periods the model takes to land on a target `distance` away,
-    /// starting from rest at zero.
-    fn periods_to_arrive(plant: &PlantModel, distance: f64) -> usize {
-        let mut state = Predicted::default();
-        for period in 1..100_000 {
-            plant.step(&mut state, distance);
-            if (state.position - distance).abs() < 1e-12 && state.velocity == 0.0 {
-                return period;
-            }
-        }
-        panic!("the model never arrived at {distance} rad");
-    }
-
-    /// `pass_cycles` is the stepped model's own answer, and it is not
-    /// `travel_cycles`.
-    ///
-    /// Both halves matter. The first is what lets a scenario state a recovery
-    /// bound as an expression: the closed form has to be the period the
-    /// trajectory really stands past the distance on, not a period either side
-    /// of it. The second is why the helper exists at all — the two answer
-    /// different questions, and at the progress minimum they are more than
-    /// twice apart: passing is three periods of ramp, arriving is four of them
-    /// plus the dead time a commanded arrival takes to be read.
+    /// The same arc as above at a lag of one and a half periods — the order of
+    /// the figures the antennas read at their motor-bound rungs — which is what
+    /// makes the settle allowance in `stillness` a function of the lag as well
+    /// as of the pair.
     #[test]
-    fn pass_cycles_is_the_stepped_ramp_and_not_the_travel() {
+    fn a_lagged_arrival_is_the_generators_plus_the_decay() {
+        let plain = shipped();
+        let lagged = shipped_with_lag(30_000);
+        assert_eq!(plain.travel_cycles(2.875), 128);
+        assert_eq!(lagged.travel_cycles(2.875), 134);
+    }
+
+    /// A loop that never closes on its generator is a broken model and says so,
+    /// rather than answering with the bound as though it were a long move.
+    ///
+    /// The guard is the one thing standing between a profile these walks cannot
+    /// resolve and a scenario reading its arrival as six thousand periods of
+    /// travel. A lag of an hour on the shipped pair is the shape of it: the
+    /// generator arrives on the first few periods and the output crawls after
+    /// it for the rest of the day.
+    #[test]
+    #[should_panic(expected = "is not a distance this servo crosses")]
+    fn a_travel_the_model_never_finishes_is_a_model_and_not_a_move() {
+        let _ = shipped_with_lag(3_600_000_000).travel_cycles(2.875);
+    }
+
+    /// The same guard on the other walk, whose caller is the tracking window's
+    /// recovery bound.
+    #[test]
+    #[should_panic(expected = "is not one this servo passes")]
+    fn a_distance_the_model_never_passes_is_a_model_and_not_a_move() {
+        let _ = shipped_with_lag(3_600_000_000).pass_cycles(2.875);
+    }
+
+    /// `pass_cycles` is the ramp alone, and it is not `travel_cycles`.
+    ///
+    /// The two answer different questions, and at the progress minimum they are
+    /// nearly twice apart: passing is three periods of ramp, arriving is three
+    /// of them plus the dead time a commanded arrival takes to be read.
+    #[test]
+    fn pass_cycles_is_the_ramp_and_not_the_travel() {
         let plant = shipped();
-        for distance in [0.001, 0.01, 0.05, 0.1, 0.192, 0.6, 1.0, 2.875, 12.56] {
-            let stepped = periods_to_pass(&plant, distance);
-            assert_eq!(
-                plant.pass_cycles(distance),
-                stepped,
-                "{distance} rad: the stepped model passes it on period {stepped}"
-            );
+        for (distance, periods) in [(0.01, 3), (0.1, 8), (1.0, 46), (2.875, 124), (12.56, 528)] {
+            assert_eq!(plant.pass_cycles(distance), periods, "{distance} rad");
             assert_eq!(
                 plant.pass_cycles(-distance),
-                stepped,
+                periods,
                 "{distance} rad, back"
             );
         }
         // The figure the tracking window's recovery bound is stated over: the
         // first `progress_min_rad` a released joint regains, three periods of
-        // ramp and nothing else. Being commanded to stop there instead costs a
-        // fourth period of braking and the dead time on top.
+        // ramp and nothing else. Being commanded to stop there instead costs
+        // the dead time on top.
         assert_eq!(plant.pass_cycles(0.01), 3);
-        assert_eq!(plant.travel_cycles(0.01), 6);
+        assert_eq!(plant.travel_cycles(0.01), 5);
+        // A loop behind its generator passes the distance later than the
+        // generator did.
+        assert_eq!(shipped_with_lag(30_000).pass_cycles(0.01), 4);
     }
 
-    /// How many periods the model takes to stand at or past `distance`,
-    /// starting from rest at zero and chasing a target well beyond it.
-    ///
-    /// The target is beyond on purpose: a trajectory aimed *at* the distance
-    /// brakes onto it, which is the other helper's question.
-    fn periods_to_pass(plant: &PlantModel, distance: f64) -> usize {
-        let d = distance.abs();
-        let target = 10.0 * d + 10.0;
+    /// A zero lag is the trapezoid alone: the output is the generator on every
+    /// period of a move, bit for bit, so the model at rest here is the model
+    /// this deployment has always run.
+    #[test]
+    fn a_zero_lag_puts_the_output_on_the_generator_every_period() {
+        let plant = shipped();
+        assert_eq!(plant.lag_alpha, 1.0);
         let mut state = Predicted::default();
-        for period in 1..100_000 {
-            plant.step(&mut state, target);
-            if state.position >= d - 1e-15 {
-                return period;
+        for target in [1.0, 1.0, -0.5, -0.5, 0.02] {
+            for _ in 0..40 {
+                plant.step(&mut state, target);
+                assert_eq!(
+                    state.position, state.generator,
+                    "the output left the generator at target {target}"
+                );
             }
         }
-        panic!("the model never passed {distance} rad");
+    }
+
+    /// At cruise a lagged loop settles exactly `v_max · λ` behind its
+    /// generator, which is what makes the constant the periods-of-travel figure
+    /// the recordings are read in.
+    #[test]
+    fn a_cruise_settles_a_lag_of_travel_behind_the_generator() {
+        for (lag_us, lag_periods) in [(30_000, 1.5), (20_000, 1.0), (9_000, 0.45)] {
+            let plant = shipped_with_lag(lag_us);
+            let mut state = Predicted::default();
+            for _ in 0..400 {
+                plant.step(&mut state, 100.0);
+            }
+            assert!(
+                (state.velocity - plant.v_max).abs() < 1e-12,
+                "{lag_us} us: the generator has to be cruising to read the lag"
+            );
+            let behind = state.generator - state.position;
+            assert!(
+                (behind - plant.v_max * lag_periods).abs() < 1e-9,
+                "{lag_us} us: {behind} rad behind, against {} rad of travel",
+                plant.v_max * lag_periods
+            );
+        }
+    }
+
+    /// A lag stated in microseconds is the same loop on any grid: the periods
+    /// of travel it means are the microseconds divided by the period.
+    #[test]
+    fn a_lag_in_microseconds_is_periods_of_travel_at_the_grid() {
+        let on_20ms = shipped_with_lag(30_000);
+        assert!(
+            (on_20ms.lag_alpha - 1.0 / 2.5).abs() < 1e-15,
+            "30 000 us on the 20 ms grid is 1.5 periods: {}",
+            on_20ms.lag_alpha
+        );
+        let on_10ms = PlantModel::from_registers(50, 20, 30_000, SHIPPED_PERIOD_NS / 2)
+            .expect("half the shipped grid is a grid");
+        assert!(
+            (on_10ms.lag_alpha - 1.0 / 4.0).abs() < 1e-15,
+            "the same lag is three periods on a 10 ms grid: {}",
+            on_10ms.lag_alpha
+        );
+    }
+
+    /// A stopped generator's output lands on it exactly rather than decaying
+    /// toward it for ever, and it does so inside half an encoder count.
+    #[test]
+    fn a_stopped_generator_is_arrived_at_and_not_approached_for_ever() {
+        let plant = shipped_with_lag(30_000);
+        let target = 0.4;
+        let mut state = Predicted::default();
+        let mut snapped = None;
+        for period in 1..1_000 {
+            let before = (state.generator - state.position).abs();
+            plant.step(&mut state, target);
+            if state.position == state.generator && state.velocity == 0.0 && snapped.is_none() {
+                // What the decay left before the snap took the rest: the gap
+                // shrinks by `1 - lag_alpha` on a generator that has stopped.
+                let decayed = before * (1.0 - plant.lag_alpha);
+                assert!(
+                    decayed < COUNT_RAD / 2.0,
+                    "it snapped from {decayed} rad out, which a reading could tell apart"
+                );
+                snapped = Some(period);
+            }
+        }
+        let period = snapped.expect("the lagged output arrives");
+        assert_eq!(state.position, target, "it arrived somewhere else");
+        assert_eq!(
+            period,
+            plant.travel_cycles(target) - RESPONSE_DEAD_SAMPLES,
+            "the walk and the step disagree about the arrival"
+        );
     }
 }

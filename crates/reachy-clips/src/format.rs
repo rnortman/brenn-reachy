@@ -487,8 +487,9 @@ pub struct FrameDoc {
 
 /// A clip as written on disk.
 ///
-/// Unknown keys are refused. The format is ours end to end — the importer is
-/// the only writer — so a key this reader does not know is a document from
+/// Unknown keys are refused. The format is ours end to end — every writer of it
+/// is this struct's own serialisation, the vendor importer and the probe
+/// generator alike — so a key this reader does not know is a document from
 /// somewhere else or a typo in a hand-authored asset, and both are worth
 /// hearing about at load rather than at the bench.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

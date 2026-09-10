@@ -57,7 +57,9 @@ use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
     ROW_COUNT, angle_of, flags, row, rows_of, set_angle, write_rows, write_vector,
 };
-use reachy_motion::plant::{MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES};
+use reachy_motion::plant::{
+    MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES, SHIPPED_PROFILES,
+};
 use reachy_motion::value::Value;
 
 pub mod sim_aux;
@@ -909,15 +911,18 @@ fn release(state: &mut SimState, nominal: i64) {
     state.swept_at = SyncTime::from_nanos(nominal);
 }
 
-/// Stop the modelled generators on these rows.
+/// Stop the modelled generators on these rows, where the shafts stand.
 ///
 /// A servo whose torque comes off, or that is let go of after a jam, has a
 /// trajectory generator at rest: it is not carrying speed into the next move it
-/// is asked for. Position is untouched -- these gearboxes do not back-drive.
+/// is asked for, and it is not standing somewhere its shaft is not, because
+/// nothing is driving the two apart any more. The shaft is untouched -- these
+/// gearboxes do not back-drive.
 fn stop(state: &mut SimState, rows: JointFlags) {
     for joint in flags::iter(rows) {
-        if let Some(index) = row(joint) {
+        if let (Some(index), Some(position)) = (row(joint), angle_of(&state.positions, joint)) {
             state.velocities[index] = 0.0;
+            state.generators[index] = position;
         }
     }
 }
@@ -1003,6 +1008,9 @@ fn seed_held(state: &mut SimState) {
         write_rows(&mut state.held[age], &standing);
     }
     state.velocities = [0.0; ROW_COUNT];
+    // At rest where the shafts stand: a generator ahead of its shaft is one
+    // mid-move, and nothing has commanded a move yet.
+    state.generators = rows_of(&state.positions);
 }
 
 /// Put the newest setpoint into the ring, dropping the oldest.
@@ -1044,9 +1052,17 @@ fn generator(state: &SimState, index: usize, period_ns: i64) -> Option<PlantMode
         Value::as_u32(carried)
             .unwrap_or_else(|| panic!("row {index}'s {reg:?} is no register value: {carried:?}"))
     };
+    // The pair comes off the row's own registers and the following lag off the
+    // shipped profile, because they are different kinds of thing: the pair is a
+    // command -- a scenario that overlays it changes what the real servo's
+    // generator does, so it has to change what the modelled one does -- and the
+    // lag is the plant, a property of the loop this build models. A scenario
+    // that overlays a lag is a scenario about a tick that mis-believes its
+    // plant, and the plant it mis-believes is this one.
     PlantModel::from_registers(
         register(RegId::ProfileVelocity),
         register(RegId::ProfileAcceleration),
+        SHIPPED_PROFILES.for_row(index).following_lag_us,
         period_ns,
     )
     .ok()
@@ -1108,15 +1124,18 @@ fn step_cycle(state: &mut SimState, period_ns: i64) {
             // loop closes on it.
             set_angle(&mut state.positions, joint, target);
             state.velocities[index] = 0.0;
+            state.generators[index] = target;
             continue;
         };
         let mut predicted = Predicted {
-            position,
+            generator: state.generators[index],
             velocity: state.velocities[index],
+            position,
         };
         model.step(&mut predicted, target);
         set_angle(&mut state.positions, joint, predicted.position);
         state.velocities[index] = predicted.velocity;
+        state.generators[index] = predicted.generator;
     }
 }
 

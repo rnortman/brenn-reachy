@@ -12,7 +12,8 @@
 # machine's own generators are running. A second statement of any of these
 # numbers is a screen sized for a machine nobody commissioned.
 #
-# One pair per servo class, stated as six flat keys. The classes are separate
+# One pair per servo class and one loop constant beside it, stated as nine flat
+# keys. The classes are separate
 # because their motors and their Velocity Limits are: the antennas' Velocity
 # Limit register reads 1620 and the seven head servos' reads 445, so what the
 # antennas can be commissioned with is not what the head can. Flat keys rather
@@ -23,44 +24,70 @@
 # registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
 # acceleration).
 #
-# Two pairs across the three classes, and each one a measurement.
+# Three pairs across the three classes, and each one a measurement.
 #
 # The legs run their own capability: a tour of the whole clip library at
 # `(32767, 445)` -- the generator wide open, so the motor and not the generator
 # was the binding constraint -- read the class motor-bound at 326 velocity units
 # with a goal-step ramp median of 287, and a confirmation tour of the same
-# library at 287 / 326 held the six cranks 0.3319 rad from their own modelled
+# library at 287 / 326 held the six cranks 0.1983 rad from their own modelled
 # trajectory at the worst, against a 0.4 rad bound, reading the class
 # motor-bound at 326 again.
 #
-# The body yaw and the antennas run the measured velocity cap of the recorded
-# library tour: every joint class chasing a goal more than 0.1 rad away travels
-# a median of 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the
-# velocity 50 converts to, and a joint setting off from rest ramps at the
-# acceleration. At that pair those two classes run velocity-saturated -- the
-# content asks for 3-20 rad/s against a 1.2 rad/s ceiling -- so the pair is what
-# shapes their motion rather than a backstop under it. The body yaw is there
-# because its own capability reading is that pair to within the capability
-# instrument's ratio: what holds the class back is its loop, not its motor. The
-# antennas are there because their measured capability is faster than the plant
-# model can be right at -- at the shipped gains the joint reaches its
-# generator's speed but follows it about one and a half periods of travel
-# behind, and the tracking screen has no room for that lag -- so the fast pair
-# stays on record and uncommissioned. The mark is on the schema's own field in
+# The antennas run their own capability too: a tour at `(32767, 1620)` read the
+# class motor-bound at 640 velocity units with a goal-step ramp median of 522,
+# and a tour of the whole library at 522 / 640 stands 0.2536 rad from the
+# modelled trajectory at the worst once the loop's own following lag is in the
+# model -- 0.5078 rad against the generator alone, which is what kept the pair
+# on record and uncommissioned until the lag was measured. Two sweeps and two
+# step probes at the pair, armed, read 0.2051-0.2535 rad behind and
+# 0.1913-0.2152 rad ahead against a 0.4 rad bound, and the same tour reads the
+# class motor-bound with a plateau of 675 against the 640 commissioned.
+#
+# The body yaw runs the measured velocity cap of the recorded library tour:
+# every joint class chasing a goal more than 0.1 rad away travels a median of
+# 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the velocity 50
+# converts to, and a joint setting off from rest ramps at the acceleration. At
+# that pair the class runs velocity-saturated -- the content asks for 3-20 rad/s
+# against a 1.2 rad/s ceiling -- so the pair is what shapes its motion rather
+# than a backstop under it. It is there because its own capability reading is
+# that pair to within the capability instrument's ratio: what holds the class
+# back is its loop, not its motor. The mark is on the schema's own field in
 # `cogs/config.clk`.
 #
 # The bench's trial-validated figures (400/600, including an 855°/s antenna
 # sweep and the 0.8 s presence gesture) were sized for a host commanding whole
 # moves, where the profile is only the backstop under host-side shaping and a
 # tight one throttles the shaped motion itself. The session streams
-# step-bounded setpoints instead, one per cycle, which is what the low pair is
-# for.
+# step-bounded setpoints instead, one per cycle, so a class's pair is read off
+# what its own motor does rather than off what a host wanted headroom for.
 #
 # Zero in either register is a servo with no generator at all. Both readers
 # refuse it, per class, before anything is commanded.
+#
+# The following lags are not registers and are written to no servo: each is a
+# measurement of how far a class's position loop stands behind the trajectory
+# it is following, which is what lets the tick predict a healthy joint rather
+# than its generator. A lag is read by scanning it over a kept recording for
+# the figure that minimises the class's p99.9 residual, and accepted only where
+# two recordings at different profile pairs agree on it. A lag is a property of
+# the loop, so it is read at a gains triple and a change of gains re-reads it.
+#
+# The legs' 24 000 us is 1.2 periods of the 20 ms grid, read at gains
+# 800 / 100 / 300 off the two 2026-09-09 tours whose legs ran motor-bound at
+# 287 / 326; both scans minimise at 1.2 and each cuts the class's p99.9
+# residual by over half. The antennas' 24 000 us is read at gains 200 / 0 / 0
+# off the same day's tours at 522 / 640 and 418 / 512, which minimise at 1.2
+# and 1.3 -- inside the quarter period the agreement rule allows -- for 2.28x
+# and 1.83x. The body yaw is zero because it has no reading: it runs gain-bound
+# on every recording, so no tour holds its motor's own speed to read a loop
+# against, and its scan finds no floor. Zero is the generator alone.
 legs_profile_acceleration: 287
 legs_profile_velocity: 326
 body_yaw_profile_acceleration: 20
 body_yaw_profile_velocity: 50
-antennas_profile_acceleration: 20
-antennas_profile_velocity: 50
+antennas_profile_acceleration: 522
+antennas_profile_velocity: 640
+legs_following_lag_us: 24000
+body_yaw_following_lag_us: 0
+antennas_following_lag_us: 24000

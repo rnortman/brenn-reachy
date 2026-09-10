@@ -397,7 +397,12 @@ rust_test(
 # host-side: it reads clip documents, not hardware.
 rust_binary(
     name = "gen_clip_config",
-    srcs = ["gen_clip_config.rs"],
+    srcs = [
+        "gen_clip_config.rs",
+        # The probe documents' own table: the emitter writes them from the
+        # antenna constants before it walks the directory.
+        "probe_clips.rs",
+    ],
     # The committed asset is embedded, so the drift case compares a fresh emit
     # against the file itself. The documents it comes from are not: they are a
     # tree that grows by import, and the test target below supplies them through
@@ -1252,11 +1257,13 @@ scenario_suite(
     ],
 )
 
-# S12, a reversal mid-stow: the same four cogs S1 runs on, with the antennas
-# given a response delay so that a replacement arriving a second into the fold
-# turns their goal round under joints still carrying the old direction. That
-# instant is where the lagging antennas stand furthest behind the fold, which is
-# what leaves a tracking run open outside the threshold at the crossing.
+# S12, the mid-fold re-raise: the same four cogs S1 runs on, with a replacement
+# arriving one cycle inside the fold's move so the joints turn round under a
+# goal that had not yet stopped. What is under test is the splice -- schedule
+# swapped under a fresh epoch, raise reaching the posture, nothing raised or let
+# go for it -- on a fold the shipped profiles follow rather than chase, every
+# antenna staying nearer its goal than the figure the detector screens at. The
+# detector's own rule is the pace cases in crates/reachy-motion/src/tick.rs.
 scenario_suite(
     name = "s12",
     author_deps = [
@@ -1325,6 +1332,34 @@ scenario_suite(
         "//motion:joints_clk_rs",
         "//motion:reports_clk_rs",
         "//motion:timeline_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)
+
+# S15, content that outruns the antennas: the same four cogs S1 runs on, with
+# the antenna step probe played at full gain over a held raise. Each of the
+# document's three poses is reached in one frame, past the bound the planner
+# refuses its own moves at, so what is under test is that such content composes
+# through the overlay and the mover unsmoothed, keeps the goal stream whole, and
+# is arrived at with nothing raised or let go. The tracking detector's screen is
+# not exercised here -- the simulated shaft is the tick's own plant model, so an
+# unobstructed row's residual is nil -- and its rule is the pace cases in
+# crates/reachy-motion/src/tick.rs.
+scenario_suite(
+    name = "s15",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:reports_clk_rs",
     ],
     configs = SIM_CONFIGS,
     exe = SIM_EXE,
@@ -2103,4 +2138,47 @@ rust_test(
     deps = [
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
+)
+
+# What a recorded run looks like to the tracking detector, read off an exported
+# trace: `bazel run //cogs:trace_judge -- <trace.csv> <config-dir>`, with
+# `--lag <class>=<microseconds>` for a what-if replay at a lag the run was not
+# judged at.
+#
+# The offline half of the two live analyzers, over the CSV `trace_export` writes
+# rather than over a log: a run recorded by an older tree may be one this tree's
+# log reader refuses, and a recording nobody can read is a figure nobody can
+# take. An exported recording is stated in the same words as a run judged on
+# the day. The three configuration files are `data` because the report says
+# whether the run's copy differs from what this tree ships.
+rust_binary(
+    name = "trace_judge",
+    srcs = ["trace_judge.rs"],
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":pose_reading",
+        ":run_report",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:pose_clk_rs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The judge over the recordings the replay suite is built on, and over traces
+# made from the model itself: the kept fixtures read to the figures that suite
+# pins them at, a synthetic lag is read back by the scan, a stated lag reaches
+# the model and is named in the report, and a file with a hole in it is refused.
+rust_test(
+    name = "trace_judge_test",
+    size = "small",
+    crate = ":trace_judge",
+    data = ["//crates/reachy-motion:trace_fixtures"],
+    env = {"REACHY_MOTION_TRACE_FIXTURES": "crates/reachy-motion/fixtures/traces"},
 )

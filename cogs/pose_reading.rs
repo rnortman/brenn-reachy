@@ -30,13 +30,15 @@ use log_read::Logged;
 use reachy_motion::arm::{Gains, GroupGains};
 use reachy_motion::joints::{JointGroup, JointRef, Name, ROWS, group_of, row, rows_of};
 use reachy_motion::plant::{
-    GroupPlants, GroupProfiles, MAX_GAP_PERIODS, PROFILE_ACCELERATION_UNIT_RAD_PER_S2,
-    PROFILE_VELOCITY_UNIT_RAD_PER_S, Predicted, ProfilePair, RESPONSE_DEAD_SAMPLES,
+    ClassProfile, GroupPlants, GroupProfiles, MAX_GAP_PERIODS,
+    PROFILE_ACCELERATION_UNIT_RAD_PER_S2, PROFILE_VELOCITY_UNIT_RAD_PER_S, PlantModel, Predicted,
+    RESPONSE_DEAD_SAMPLES,
 };
 use reachy_motion::stillness::COUNT_RAD;
 use reachy_motion::tick::{
     RECORDED_WORST_ANTENNA_LAG_RAD, RECORDED_WORST_ANTENNA_RESIDUAL_RAD,
     RECORDED_WORST_HEAD_LAG_RAD, RECORDED_WORST_HEAD_RESIDUAL_RAD, TrackingFaultConfig,
+    sustained_per_row,
 };
 use run_report::Report;
 
@@ -205,12 +207,45 @@ fn integer(value: &str, path: &str, name: &str, noun: &str) -> Result<u64, Strin
     }
 }
 
-/// The three pairs stated by the text of a `servo_profile.textproto`.
+/// The three profiles stated by the text of a `servo_profile.textproto`.
+///
+/// The two registers are required and the following lag is not. A run recorded
+/// before the lag existed carries no such key in its own `config/` copy, and it
+/// was judged at the generator alone: reading it back at the generator alone is
+/// the honest replay of it, so a missing lag key is zero here rather than a
+/// refusal. It is the only key in any of these files that a run may leave out,
+/// and [`RunConfig::configuration`] says out loud when one did.
+///
+/// A key that is *present* and unreadable is still a refusal: what that is is a
+/// file this analyzer and the machine's own loader read differently.
+///
+/// The omission is all three classes or none. A file stating a lag for some
+/// classes and not others is no run recorded before the keys existed; it is a
+/// hand-edited file, and reading the classes it leaves out at the generator
+/// alone would judge them at a lag nobody stated and say nothing about having
+/// done so.
 fn profiles_of(text: &str, path: &str) -> Result<GroupProfiles, String> {
     let figure = |name: &str| -> Result<u32, String> {
         let value = integer(field(text, path, name)?, path, name, "register value")?;
         u32::try_from(value)
             .map_err(|_| format!("{path}'s {name} is {value}, which no register holds"))
+    };
+    let any_lag = states_a_lag(text, path);
+    let lag = |name: &str| -> Result<u32, String> {
+        let Ok(stated) = field(text, path, name) else {
+            if any_lag {
+                return Err(format!(
+                    "{path} states a following lag for some classes and not others, and {name} is \
+                     one of the ones it leaves out: a file recorded before the lag existed states \
+                     none of them and is read at the generator alone, and any other file states \
+                     all three"
+                ));
+            }
+            return Ok(0);
+        };
+        let value = integer(stated, path, name, "lag in microseconds")?;
+        u32::try_from(value)
+            .map_err(|_| format!("{path}'s {name} is {value}, which is no following lag"))
     };
     // Keyed off the classes themselves, so the file's field names and the
     // classes have one statement between them: a spelling here and a spelling
@@ -218,10 +253,27 @@ fn profiles_of(text: &str, path: &str) -> Result<GroupProfiles, String> {
     // analysis time rather than a build that fails.
     GroupProfiles::try_of_each(|group| {
         let class = group.config_prefix();
-        Ok(ProfilePair {
+        Ok(ClassProfile {
             acceleration: figure(&format!("{class}_profile_acceleration"))?,
             velocity: figure(&format!("{class}_profile_velocity"))?,
+            following_lag_us: lag(&format!("{class}_following_lag_us"))?,
         })
+    })
+}
+
+/// Whether a `servo_profile.textproto`'s text states any following lag at all.
+///
+/// What tells a run recorded before the lag existed from one recorded at a lag
+/// of zero. The two are judged identically and the note is what says which was
+/// read.
+fn states_a_lag(text: &str, path: &str) -> bool {
+    JointGroup::ALL.iter().any(|group| {
+        field(
+            text,
+            path,
+            &format!("{}_following_lag_us", group.config_prefix()),
+        )
+        .is_ok()
     })
 }
 
@@ -276,6 +328,20 @@ impl RunConfig {
                 log_dir.display()
             ));
         }
+        Self::read_config(&root)
+    }
+
+    /// Read the run configuration from a `config/` directory.
+    ///
+    /// The files and everything read out of them are the same as
+    /// [`read`](Self::read); this entry point takes the directory itself, for
+    /// tools that hold the configuration path rather than a log.
+    ///
+    /// # Errors
+    ///
+    /// The reason one of the three files could not be read or does not state a
+    /// name.
+    pub fn read_config(root: &Path) -> Result<Self, String> {
         let mut texts = [const { String::new() }; CONFIG_FILES.len()];
         for (text, name) in texts.iter_mut().zip(CONFIG_FILES) {
             let path = root.join(name);
@@ -323,9 +389,18 @@ impl RunConfig {
     pub fn configuration(&self, report: &mut Report) {
         report.note(format!(
             "configuration {}: legs {:?}, body yaw {:?}, antennas {:?}, acceleration first, in \
-             register units",
+             register units, following lag in microseconds",
             CONFIG_FILES[0], self.profiles.legs, self.profiles.yaw, self.profiles.antennas,
         ));
+        if let Some(texts) = &self.texts
+            && !states_a_lag(&texts[0], CONFIG_FILES[0])
+        {
+            report.note(format!(
+                "configuration {}: states no following lag for any class, so this run is judged \
+                 at the generator alone -- which is what it was judged at when it ran",
+                CONFIG_FILES[0],
+            ));
+        }
         report.note(format!(
             "configuration {}: legs {}, body yaw {}, antennas {}",
             CONFIG_FILES[1], self.gains.legs, self.gains.yaw, self.gains.antennas,
@@ -413,8 +488,9 @@ impl Residual {
     }
 }
 
-/// How far each joint stood from where its servo's own trajectory generator
-/// had got to, sample by sample.
+/// How far each joint stood from where a healthy servo following its generator
+/// would stand — the generator's trajectory with the position loop's own
+/// following lag on it — sample by sample.
 ///
 /// The offline half of the live comparison, stepped the way the tick steps it
 /// so that a run is judged offline by the arithmetic that judged it live:
@@ -436,6 +512,24 @@ pub fn residual_stream(
     grid: Grid,
     plant: &GroupPlants,
 ) -> Vec<(i64, [Residual; ROWS.len()])> {
+    let mut out = Vec::new();
+    residual_stream_into(samples, grid, plant, &mut out);
+    out
+}
+
+/// The same walk, into a buffer the caller keeps.
+///
+/// `out` is cleared and refilled, which is the whole of the difference: a
+/// caller walking the same run once per point of a grid -- the lag scan is
+/// forty-one such walks -- otherwise allocates a run-length vector per point,
+/// and the run is the longest recording this repo keeps.
+pub fn residual_stream_into(
+    samples: &[Logged<PoseSampleWire>],
+    grid: Grid,
+    plant: &GroupPlants,
+    out: &mut Vec<(i64, [Residual; ROWS.len()])>,
+) {
+    out.clear();
     // Nominal order is the model's own order, whatever order the log holds:
     // the prediction is a walk along the grid and a sample read out of turn
     // would step it backwards.
@@ -450,7 +544,6 @@ pub fn residual_stream(
     // two positions.
     let mut answering = [f64::NAN; ROWS.len()];
     let mut previous: Option<i64> = None;
-    let mut out = Vec::new();
     for sample in ordered {
         let nominal = sample.message.nominal_time().as_nanos();
         let (cycle, _) = grid.at(nominal);
@@ -509,6 +602,7 @@ pub fn residual_stream(
         let mut residual = [Residual::unmeasured(); ROWS.len()];
         for (index, state) in predicted.iter_mut().enumerate() {
             if !seeded[index] {
+                state.generator = present[index];
                 state.position = present[index];
                 state.velocity = 0.0;
                 seeded[index] = true;
@@ -533,7 +627,6 @@ pub fn residual_stream(
         }
         out.push((nominal, residual));
     }
-    out
 }
 
 /// How far the machine stood from its own modelled trajectory, over a whole
@@ -556,7 +649,12 @@ pub fn residuals(
     plant: &GroupPlants,
     report: &mut Report,
 ) {
-    let threshold = TrackingFaultConfig::default().threshold_rad;
+    let TrackingFaultConfig {
+        threshold_rad: threshold,
+        ticks,
+        ..
+    } = TrackingFaultConfig::default();
+    let window = ticks as usize;
     report.note(format!(
         "{} of {} samples were judged against the modelled trajectory of the servo's own class",
         stream.len(),
@@ -569,12 +667,18 @@ pub fn residuals(
     let mut seen: [Vec<f64>; JointGroup::ALL.len()] = Default::default();
     let mut behind: [f64; JointGroup::ALL.len()] = Default::default();
     let mut ahead: [f64; JointGroup::ALL.len()] = Default::default();
+    // The same walk's magnitudes, kept per period, because the window rule
+    // below is a second pass over the run and not a figure a single period
+    // carries.
+    let mut judged: Vec<[f64; ROWS.len()]> = Vec::with_capacity(stream.len());
     for (_, residual) in stream {
+        let mut period = [0.0; ROWS.len()];
         for joint in ROWS {
             let (Some(index), Some(group)) = (row(joint), group_of(joint)) else {
                 continue;
             };
             let reading = residual[index];
+            period[index] = reading.magnitude();
             seen[slot(group)].push(reading.magnitude());
             if reading.is_behind() {
                 behind[slot(group)] = behind[slot(group)].max(reading.magnitude());
@@ -582,7 +686,9 @@ pub fn residuals(
                 ahead[slot(group)] = ahead[slot(group)].max(reading.magnitude());
             }
         }
+        judged.push(period);
     }
+    let sustained = sustained_per_row(&judged, window);
     for group in JointGroup::ALL {
         let model = plant.of(group);
         let ranked = &mut seen[slot(group)];
@@ -593,8 +699,9 @@ pub fn residuals(
         let configuration = recorded_p999_configuration(group);
         report.note(format!(
             "{}: worst residual {worst:.4} rad, p99.9 {p999:.4} rad, recorded p99.9 \
-             {low:.4}–{high:.4} rad over three tours {configuration}, against a tracking screen \
-             at {threshold:.4} rad — commissioned at {:.6} rad/period and {:.6} rad/period²",
+             {low:.4}–{high:.4} rad over three recordings {configuration}, against a tracking \
+             screen at {threshold:.4} rad — commissioned at {:.6} rad/period and {:.6} \
+             rad/period²",
             group.name(),
             model.v_max,
             model.a_max,
@@ -610,11 +717,25 @@ pub fn residuals(
             behind[slot(group)],
             ahead[slot(group)],
         ));
+        // And the figure the detector actually answers, beside the figure the
+        // screen is sized by. A worst sample is one period and the fault needs
+        // a whole window of them, so a run whose worst sample nearly reaches
+        // the screen and whose sustained reading is a tenth of it is a healthy
+        // run — and the two printed apart is what says which of those a report
+        // is describing.
+        report.note(format!(
+            "{}: sustained residual {:.4} rad, the worst any of its joints held across a whole \
+             {window}-period window without coming back under it, which is what the detector \
+             answers against the {threshold:.4} rad screen",
+            group.name(),
+            sustained_of(&sustained, group),
+        ));
     }
     report.note(format!(
         "the recorded library ran at {RECORDED_WORST_HEAD_RESIDUAL_RAD:.4} rad on the head and \
-         {RECORDED_WORST_ANTENNA_RESIDUAL_RAD:.4} rad on the antennas, which is what the screen \
-         is sized over"
+         {RECORDED_WORST_ANTENNA_RESIDUAL_RAD:.4} rad on the antennas, each class at the pair, \
+         the gains and the following lag it ships; the screen is sized over every kept fixture, \
+         including recordings of loops the classes no longer run"
     ));
 }
 
@@ -630,6 +751,282 @@ fn percentile(values: &[f64], fraction: f64) -> f64 {
     }
     let rank = (fraction * values.len() as f64).ceil() as usize;
     values[rank.saturating_sub(1).min(values.len() - 1)]
+}
+
+/// The same value off an unordered series, which is reordered around that one
+/// rank rather than sorted.
+///
+/// For a caller asking one rank of one series and then throwing the series
+/// away: the scan below asks forty-one such questions of a run's every judged
+/// period, where a sort each time is the work of ordering readings nothing ever
+/// reads in order.
+fn ranked_percentile(values: &mut [f64], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let rank = (fraction * values.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(values.len() - 1);
+    let (_, at, _) = values.select_nth_unstable_by(index, f64::total_cmp);
+    *at
+}
+
+/// The worst residual one class held across a whole window of judged periods,
+/// radians.
+///
+/// The shipped window rule's per-row answer ([`sustained_per_row`]), folded to
+/// the rows of one class. Per class because the two register pairs are per
+/// class and a figure that mixed them would say nothing about either.
+fn sustained_of(per_row: &[f64; ROWS.len()], group: JointGroup) -> f64 {
+    ROWS.into_iter()
+        .filter(|joint| group_of(*joint) == Some(group))
+        .filter_map(row)
+        .map(|index| per_row[index])
+        .fold(0.0_f64, f64::max)
+}
+
+/// How much a following lag has to take off a class's p99.9 residual before the
+/// scan below calls it a lag at all.
+///
+/// A ratio: the p99.9 at no lag over the p99.9 at the scan's best figure. Under
+/// it the floor is flat and the class carries no lag, which is a finding rather
+/// than a failure.
+///
+/// Not [`CAPABILITY_PLATEAU_RATIO`], which is sized on tour-to-tour speed
+/// repeatability and means a different thing. Its own derivation is the two
+/// mechanisms a residual is made of. Where the loop's lag *is* what the p99.9
+/// is measuring, the term recovers the whole of the periods-of-travel figure —
+/// at the antennas' fastest recorded pair, 0.445 rad of a 0.4458 rad p99.9,
+/// which is a ratio in the hundreds. Where the p99.9 is really the excursion a
+/// joint loses through a goal reversal, the most a lag term can take off it is
+/// the lag at that pair's own speed: 0.036 rad of 0.30 rad at `20 / 50`, a
+/// ratio of 1.13. This sits well clear of both, and is the figure that keeps a
+/// scan over a slow recording from writing a lag the loop does not have.
+pub const LAG_SCAN_MIN_GAIN: f64 = 1.5;
+
+/// The coarsest following lag the scan considers, in periods of travel.
+///
+/// Four periods is well past both readings on record (1.45 and 1.51) and past
+/// anything a first-order position loop on these servos plausibly does. A
+/// minimum that lands on this top is read as the dead time being wrong rather
+/// than the lag being long, and is a stop rather than a reading.
+pub const LAG_SCAN_MAX_PERIODS: f64 = 4.0;
+
+/// How far apart the scan's grid points stand, in periods of travel.
+///
+/// A tenth of a period is 2 ms at the shipped grid, which is finer than the
+/// agreement rule the reading is accepted under (a quarter of a period) and so
+/// is not the limit on what the figure means.
+pub const LAG_SCAN_STEP_PERIODS: f64 = 0.1;
+
+/// What a scan over one recording read for one class.
+///
+/// The reading and not the decision: whether a class *has* a lag is settled
+/// across recordings at different pairs, and this is one recording's half of
+/// that. Every field is printed, because the shape of the floor is what says
+/// whether the minimum means anything.
+#[derive(Clone, Copy, Debug)]
+pub struct LagScan {
+    /// The class it is about.
+    pub group: JointGroup,
+    /// The lag that minimised the class's p99.9 residual, in periods of travel.
+    pub best_periods: f64,
+    /// The same figure in microseconds, which is what the profile file states
+    /// and what does not depend on the grid it was read on.
+    pub best_lag_us: u32,
+    /// The class's p99.9 residual at no lag, radians — the trapezoid alone,
+    /// which is what the run was judged at when it ran.
+    pub p999_at_zero: f64,
+    /// Its p99.9 at the best figure.
+    pub p999_at_best: f64,
+    /// Its p99.9 half a period below the best figure, where the grid holds one.
+    pub p999_below: Option<f64>,
+    /// And half a period above.
+    pub p999_above: Option<f64>,
+    /// How many (period, joint) readings the percentiles were taken over.
+    pub readings: usize,
+    /// Whether this run is an instrument for this class at all: a lag is the
+    /// distance a loop stands behind a generator it is keeping up with, so it
+    /// is only readable where the motor reached the generator's own speed.
+    pub instrument: bool,
+    /// What the capability pass said was holding the class back, which is what
+    /// the line above is decided by.
+    pub regime: Regime,
+}
+
+impl LagScan {
+    /// How much the lag took off the class's p99.9: the ratio
+    /// [`LAG_SCAN_MIN_GAIN`] is the floor on.
+    ///
+    /// Infinite where the scan drove the p99.9 to nothing, which a synthetic
+    /// trace stepped from the model itself does.
+    #[must_use]
+    pub fn gain(&self) -> f64 {
+        if self.p999_at_zero == 0.0 {
+            // A run the trapezoid alone explains to the digit has no gain to
+            // be had, and the ratio of two zeros is not a reading of one.
+            return 1.0;
+        }
+        self.p999_at_zero / self.p999_at_best
+    }
+
+    /// Whether the floor is a floor rather than a flat: the gain clears
+    /// [`LAG_SCAN_MIN_GAIN`] and the minimum is not the grid's own top.
+    #[must_use]
+    pub fn is_a_minimum(&self) -> bool {
+        self.gain() >= LAG_SCAN_MIN_GAIN && self.best_periods < LAG_SCAN_MAX_PERIODS
+    }
+}
+
+/// The following lag each class's readings are best explained by, scanned over
+/// one run.
+///
+/// The scan is the model driven over the whole recording once per grid point,
+/// with all three classes carrying that point's lag: a class's residual depends
+/// on its own class's model alone, so one walk answers for all three and 41
+/// walks answer the whole grid.
+///
+/// What it selects on is the p99.9 and not the worst sample. One sample is
+/// noise and a percentile is not, and a lag read off the worst sample would be
+/// read off whatever single period the recording's worst reversal landed on.
+/// The consequence is that the selected figure has to be checked against the
+/// worst sample separately, in both directions — a first-order lag can only
+/// move a prediction *behind*, so a lag that trims a cruise-dominated p99.9 can
+/// add to the reading of an arrival that overshoots.
+///
+/// `measured` is the same run's capability reading, which is what says whether
+/// the run is an instrument for a class: below the motor's own speed the
+/// generator caps the joint and what the residual holds is the reversal
+/// excursion, not the loop.
+///
+/// # Errors
+///
+/// A profile that is no generator at some point on the grid, named. Nothing is
+/// scanned from a model that does not exist.
+pub fn lag_scan(
+    samples: &[Logged<PoseSampleWire>],
+    grid: Grid,
+    profiles: &GroupProfiles,
+    measured: &[ClassCapability; JointGroup::ALL.len()],
+) -> Result<[LagScan; JointGroup::ALL.len()], String> {
+    let period_us = grid.period_ns as f64 / 1_000.0;
+    let steps = (LAG_SCAN_MAX_PERIODS / LAG_SCAN_STEP_PERIODS).round() as usize + 1;
+    // One row per grid point: the three classes' p99.9 at that lag, and how
+    // many readings each came off.
+    let mut floor: Vec<[f64; JointGroup::ALL.len()]> = Vec::with_capacity(steps);
+    let mut readings = [0_usize; JointGroup::ALL.len()];
+    // The walk's own buffer and the three magnitude columns, kept across the
+    // grid: every point reads the same run, so the storage is the same size
+    // every time and re-allocating it forty-one times is forty-one copies of
+    // the recording for nothing.
+    let mut stream: Vec<(i64, [Residual; ROWS.len()])> = Vec::new();
+    let mut seen: [Vec<f64>; JointGroup::ALL.len()] = Default::default();
+    for step in 0..steps {
+        let periods = step as f64 * LAG_SCAN_STEP_PERIODS;
+        let lag_us = (periods * period_us).round() as u32;
+        let at = GroupProfiles::of_each(|group| ClassProfile {
+            following_lag_us: lag_us,
+            ..profiles.of(group)
+        });
+        let plant = GroupPlants::from_profiles(&at, grid.period_ns).map_err(|error| {
+            format!("the lag scan's {periods:.1}-period model is none: {error}")
+        })?;
+        residual_stream_into(samples, grid, &plant, &mut stream);
+        for column in &mut seen {
+            column.clear();
+        }
+        for (_, residual) in &stream {
+            for joint in ROWS {
+                let (Some(index), Some(group)) = (row(joint), group_of(joint)) else {
+                    continue;
+                };
+                seen[slot(group)].push(residual[index].magnitude());
+            }
+        }
+        let mut row_of_floor = [0.0; JointGroup::ALL.len()];
+        for group in JointGroup::ALL {
+            let ranked = &mut seen[slot(group)];
+            readings[slot(group)] = ranked.len();
+            row_of_floor[slot(group)] = ranked_percentile(ranked, 0.999);
+        }
+        floor.push(row_of_floor);
+    }
+    let half = (0.5 / LAG_SCAN_STEP_PERIODS).round() as usize;
+    Ok(JointGroup::ALL.map(|group| {
+        let column: Vec<f64> = floor.iter().map(|row| row[slot(group)]).collect();
+        // The lowest point, earliest first: a flat floor reads as no lag rather
+        // than as whichever end of the flat the comparison happened to keep.
+        let best = (0..column.len())
+            .min_by(|left, right| column[*left].total_cmp(&column[*right]))
+            .unwrap_or(0);
+        let regime = measured[slot(group)].regime;
+        let model = PlantModel::from_registers(
+            profiles.of(group).velocity,
+            profiles.of(group).acceleration,
+            0,
+            grid.period_ns,
+        );
+        LagScan {
+            group,
+            best_periods: best as f64 * LAG_SCAN_STEP_PERIODS,
+            best_lag_us: (best as f64 * LAG_SCAN_STEP_PERIODS * period_us).round() as u32,
+            p999_at_zero: column[0],
+            p999_at_best: column[best],
+            p999_below: best.checked_sub(half).map(|index| column[index]),
+            p999_above: column.get(best + half).copied(),
+            readings: readings[slot(group)],
+            instrument: match (regime, model) {
+                (Regime::MotorBound(plateau), Ok(model)) => plateau.travel >= model.v_max,
+                _ => false,
+            },
+            regime,
+        }
+    }))
+}
+
+/// What the scan read, per class, and whether the run it was read over is an
+/// instrument for it.
+///
+/// Five figures and a word rather than the whole grid: the shape of the floor
+/// is what a reader needs and the two points half a period either side of the
+/// minimum are what state it. TODO(capability-report-volume) is where the full
+/// table would go if anyone ever wants it.
+pub fn lag_scans(scans: &[LagScan; JointGroup::ALL.len()], report: &mut Report) {
+    for scan in scans {
+        let shoulder = |figure: Option<f64>| match figure {
+            Some(p999) => format!("{p999:.4} rad"),
+            None => "off the grid".to_string(),
+        };
+        report.note(format!(
+            "{}: lag scan minimum {:.1} periods ({} us), p99.9 {:.4} rad at no lag against \
+             {:.4} rad there, {} half a period below and {} above, over {} readings — a gain of \
+             {:.2}x against the {LAG_SCAN_MIN_GAIN:.2}x a reading has to clear, so this run \
+             reads {}",
+            scan.group.name(),
+            scan.best_periods,
+            scan.best_lag_us,
+            scan.p999_at_zero,
+            scan.p999_at_best,
+            shoulder(scan.p999_below),
+            shoulder(scan.p999_above),
+            scan.readings,
+            scan.gain(),
+            if scan.is_a_minimum() {
+                "a lag"
+            } else if scan.best_periods >= LAG_SCAN_MAX_PERIODS {
+                "a minimum at the grid's own top, which is the dead time being wrong rather than \
+                 a lag being long"
+            } else {
+                "a flat floor and so no lag"
+            },
+        ));
+        report.note(format!(
+            "{}: {} on this run, so it {} a following-lag instrument for the class — a lag is \
+             only readable where the motor reached its generator's own speed",
+            scan.group.name(),
+            scan.regime.name(),
+            if scan.instrument { "is" } else { "is not" },
+        ));
+    }
 }
 
 /// What the health rotation saw, per servo, over the whole run.
@@ -854,8 +1251,9 @@ pub const RECORDED_VELOCITY_LIMIT_ANTENNAS: u32 = 1620;
 /// against a repeatability gate of [`CAPABILITY_PLATEAU_RATIO`].
 ///
 /// Commissioned: this is the pair `SHIPPED_PROFILES.legs` now carries, and a
-/// confirmation tour of the whole library at it held the six cranks 0.3319 rad
-/// from their own modelled trajectory at the worst, against a 0.4 rad bound;
+/// confirmation tour of the whole library at it held the six cranks 0.1983 rad
+/// from their own modelled trajectory at the worst, under the class's own
+/// following lag, against a 0.4 rad bound;
 /// provenance in `docs/servo-tuning.md`.
 ///
 /// That tour re-read the class motor-bound with the plateau's slowest median at
@@ -868,9 +1266,13 @@ pub const RECORDED_VELOCITY_LIMIT_ANTENNAS: u32 = 1620;
 /// acceleration here stays the wide-open tour's and the confirmation tour's
 /// figure is a note in `docs/servo-tuning.md`. The velocity does not suffer
 /// that, because the content does saturate the velocity.
-pub const RECORDED_CAPABILITY_LEGS: ProfilePair = ProfilePair {
+pub const RECORDED_CAPABILITY_LEGS: ClassProfile = ClassProfile {
     acceleration: 287,
     velocity: 326,
+    // A capability reading is the two registers a class's motor can
+    // manage. What its loop then does with them is a separate measurement,
+    // read off a recording at a commissioned pair, and is not this.
+    following_lag_us: 0,
 };
 
 /// The same reading for the two antennas, also motor-bound on that tour; the
@@ -883,18 +1285,22 @@ pub const RECORDED_CAPABILITY_LEGS: ProfilePair = ProfilePair {
 /// inside the repeatability ratio, and the figure this file bakes is the
 /// instrument's: it is the one a re-read reproduces.
 ///
-/// On record and *not* commissioned, unlike the legs': at the shipped
-/// `200 / 0 / 0` gains an antenna played at this pair reaches its generator's
-/// speed — three confirmation tours read the class motor-bound with a plateau
-/// above the commissioned velocity — but follows it 1.45 to 1.94 periods of
-/// travel behind, 0.42 to 0.51 rad, and the tracking screen is sized at half
-/// again the worst residual a healthy machine shows. So the pair the motor can
-/// do is faster than the plant model can be right at, and what stands between
-/// the two is a model that carries that following lag.
-/// `TODO(session-servo-profile)` holds the question.
-pub const RECORDED_CAPABILITY_ANTENNAS: ProfilePair = ProfilePair {
+/// The pair `SHIPPED_PROFILES.antennas` carries. At
+/// the shipped `200 / 0 / 0` gains an antenna played at this pair reaches its
+/// generator's speed — three tours read the class motor-bound with a plateau
+/// above the commissioned velocity — and follows it about 1.2 periods of travel
+/// behind, which is the following lag the plant model carries. Under that model
+/// the library tour at this pair stands 0.2536 rad from the modelled trajectory
+/// at the worst, against 0.5078 rad at the generator alone, and the four armed
+/// runs at the pair that chase content -- two sweeps and two step probes --
+/// read 0.2051–0.2535 rad behind and 0.1913–0.2152 rad ahead, with the
+/// confirmation's two wake runs inside that band at 0.0326 and 0.0818 rad. The
+/// tracking screen is sized at half again the worst residual a healthy machine
+/// shows, and that is the reading it is sized over.
+pub const RECORDED_CAPABILITY_ANTENNAS: ClassProfile = ClassProfile {
     acceleration: 522,
     velocity: 640,
+    following_lag_us: 0,
 };
 
 /// The same reading for the body yaw, which read *gain-bound* on both tours:
@@ -903,16 +1309,17 @@ pub const RECORDED_CAPABILITY_ANTENNAS: ProfilePair = ProfilePair {
 /// than [`CAPABILITY_STEP_MIN_SAMPLES`] and no ramp median exists. The
 /// acceleration is the shipped value, which is the reading: what holds this
 /// class back is its loop, not its motor.
-pub const RECORDED_CAPABILITY_BODY_YAW: ProfilePair = ProfilePair {
+pub const RECORDED_CAPABILITY_BODY_YAW: ClassProfile = ClassProfile {
     acceleration: 20,
     velocity: 48,
+    following_lag_us: 0,
 };
 
 /// The capability pair recorded for one class — the other figure, beside
 /// [`ClassCapability::recorded_velocity_limit`], that a fresh reading is
 /// compared against.
 #[must_use]
-pub fn recorded_capability(group: JointGroup) -> ProfilePair {
+pub fn recorded_capability(group: JointGroup) -> ClassProfile {
     match group {
         JointGroup::BodyYaw => RECORDED_CAPABILITY_BODY_YAW,
         JointGroup::Legs => RECORDED_CAPABILITY_LEGS,
@@ -1396,19 +1803,21 @@ fn slot(group: JointGroup) -> usize {
 /// provenance in the record is what lets the report line print it beside the
 /// range instead of leaving it to a reader of this source.
 pub struct RecordedFloor {
-    /// The three tours' p99.9 residuals, radians, in tour order.
+    /// The three recordings' p99.9 residuals, radians, in the order they were
+    /// made.
     ///
     /// Three and not a slice: the arity is what makes the range below a range
-    /// of figures that exist, so a class that lost its tours cannot fold to a
-    /// sentinel. Three and not one because what a candidate pair's p99.9 is
-    /// read for is *growth*, and the run-to-run spread between identically
-    /// configured tours is the noise floor of that reading.
+    /// of figures that exist, so a class that lost its recordings cannot fold
+    /// to a sentinel. Three and not one because what a candidate pair's p99.9
+    /// is read for is *growth*, and the run-to-run spread between identically
+    /// configured recordings is the noise floor of that reading.
     pub figures: [f64; 3],
     /// What the figures were read at, as the report prints it after "over three
-    /// tours" — so a class whose floor is not its shipping configuration says
-    /// so on the bench and not only in this file.
+    /// tours" — so a class whose floor is not its shipping configuration, or is
+    /// not read over tours at all, says so on the bench and not only in this
+    /// file.
     ///
-    /// The tour count is the array's own arity and is not carried twice.
+    /// The recording count is the array's own arity and is not carried twice.
     pub configuration: &'static str,
 }
 
@@ -1435,8 +1844,8 @@ pub struct RecordedFloor {
 /// configuration's reading, at the pair and the gains the tree ships that class
 /// at, and are re-baked together for that class or not at all: a fresh worst
 /// printed against a noise floor measured under some other configuration is a
-/// comparison of two machines. Where a figure is not that class's shipping
-/// configuration, its own comment says so — the antennas' record below.
+/// comparison of two machines. Where a figure is not read over three tours of
+/// the library, its own comment says so — the antennas' record below.
 pub const RECORDED_P999_BODY_YAW_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
     figures: [0.2754, 0.3264, 0.2488],
     configuration: "at the pair and gains this class ships",
@@ -1466,19 +1875,33 @@ pub const RECORDED_P999_LEGS_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
     configuration: "at the pair and gains this class ships, on tours of its own",
 };
 
-/// The antennas' p99.9 residual over the same three tours as the body yaw's, in
-/// the same order.
+/// The antennas' p99.9 residual over the three recordings this deployment has
+/// at the configuration the class ships, in the order they were made.
 ///
-/// Read at the `500 / 0 / 100` gains those tours ran, which this deployment no
-/// longer ships: the antennas went to the vendor's `200 / 0 / 0` afterwards,
-/// and the proportional term is what sets how far a joint follows behind its
-/// generator. So this record is a reading of the pair at gains the machine has
-/// moved off, and the first tour figure at the shipping configuration — the
-/// confirmation tour's antenna p99.9 — is in `docs/servo-tuning.md` rather than
-/// here. Three tours at that configuration are what re-bake it.
+/// Not three tours, and the only class whose floor is not: the library tour at
+/// `522 / 640` first, then the two sweeps of the confirmation that commissioned
+/// the pair. The tour is what a candidate's growth is really read against — it
+/// is the whole library's breadth — and the two sweeps are the run-to-run
+/// spread of one crafted content at the same configuration, which is the noise
+/// floor this range is for. Three recordings at one configuration is what the
+/// rule asks for; that only one of them tours the library is the cost of
+/// commissioning a class without flying the library again, and the next tour at
+/// this configuration is what folds in.
+///
+/// The earlier three tours are not here: they ran the class at `20 / 50` on
+/// `500 / 0 / 100` gains, two configurations back, and a candidate's growth
+/// read against a floor measured under a superseded configuration compares two
+/// machines. Their figures are in `docs/servo-tuning.md` with the rest of the
+/// record.
+///
+/// Each figure is a percentile over a whole run, so nothing in the tree
+/// re-derives it: the two kept fixtures cut from these recordings are the worst
+/// windows of a few hundred periods, whose p99.9 is the window's own maximum
+/// rather than the run's floor. What re-reads these is a report over the
+/// recorded run log, or `//cogs:trace_judge` over the exported whole-run CSV.
 pub const RECORDED_P999_ANTENNAS_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
-    figures: [0.2999, 0.2759, 0.3177],
-    configuration: "at gains this class no longer runs",
+    figures: [0.1955, 0.1988, 0.1967],
+    configuration: "at the pair and gains this class ships, on a tour and two sweeps",
 };
 
 /// One class's recorded p99.9 residual floor.
@@ -2029,26 +2452,54 @@ mod tests {
     use brenn_reachy__driver__health_clk_rs::HealthReportWire;
     use reachy_motion::joints::JointGroup;
     use reachy_motion::plant::{
-        PROFILE_ACCELERATION_MAX, PlantModel, ProfilePair, SHIPPED_PROFILES,
+        ClassProfile, PROFILE_ACCELERATION_MAX, PlantModel, SHIPPED_PROFILES,
     };
     use reachy_motion::stillness::COUNT_RAD;
 
     use super::{
         CAPABILITY_BIN_MIN_SAMPLES, CAPABILITY_PLATEAU_RATIO, CAPABILITY_STEP_MIN_SAMPLES,
-        CHASE_GAP_RAD, CONFIG_FILES, ClassCapability, ErrorBin, Grid, RECORDED_CAPABILITY_ANTENNAS,
-        RECORDED_CAPABILITY_BODY_YAW, RECORDED_CAPABILITY_LEGS,
+        CHASE_GAP_RAD, CONFIG_FILES, ClassCapability, ErrorBin, Grid, LAG_SCAN_MIN_GAIN,
+        RECORDED_CAPABILITY_ANTENNAS, RECORDED_CAPABILITY_BODY_YAW, RECORDED_CAPABILITY_LEGS,
         RECORDED_P999_ANTENNAS_RESIDUAL_RAD, RECORDED_P999_BODY_YAW_RESIDUAL_RAD,
         RECORDED_P999_LEGS_RESIDUAL_RAD, RECORDED_VELOCITY_LIMIT_ANTENNAS,
         RECORDED_VELOCITY_LIMIT_HEAD, Regime, Residual, RunConfig, Skips, TEMPERATURE_STOP_C,
-        capabilities, capability, health_summary, lags, no_faults, one_speed, percentile,
-        recorded_capability, regime_of, residual_stream, residuals, slot, travel_against_error,
+        capabilities, capability, health_summary, lag_scan, lag_scans, lags, no_faults, one_speed,
+        percentile, recorded_capability, regime_of, residual_stream, residuals, slot,
+        travel_against_error,
     };
+    use super::{LAG_SCAN_MAX_PERIODS, LagScan, Plateau, ranked_percentile};
 
     /// A period nothing round, so an arithmetic that assumed one shows.
     const PERIOD_NS: i64 = 20_000_000;
 
     /// An origin nothing round, for the same reason.
     const ORIGIN_NS: i64 = 1_772_000_000_123_456_789;
+
+    /// The profile velocity the capability cases build their instrument
+    /// generator at, register units.
+    ///
+    /// Named because the assertion that the instrument reads its own pair back
+    /// compares against this figure, and a bare number on both sides of that
+    /// comparison would agree with itself however it drifted.
+    const INSTRUMENT_VELOCITY: u32 = 50;
+
+    /// The generator the capability cases measure with.
+    ///
+    /// The generator alone and not a class's own loop: what the capability
+    /// instrument reads is the trajectory, and a shaft filtered by a following
+    /// lag would be a reading of the loop, which is the lag scan's case.
+    ///
+    /// A velocity of its own, small against the 0.1 rad error bands, so that a
+    /// 0.55 rad chase puts a sample in every band on its way in. What a class
+    /// is commissioned at is not that -- the antennas cross three bands in a
+    /// period -- and a chase that skips bands is a property of the pair rather
+    /// than of the instrument under test here. The acceleration is the
+    /// register's ceiling, so the generator reaches its cap in the first period
+    /// and every chasing period in the run travels that cap.
+    fn instrument_model() -> PlantModel {
+        PlantModel::from_registers(INSTRUMENT_VELOCITY, PROFILE_ACCELERATION_MAX, 0, PERIOD_NS)
+            .expect("a plant")
+    }
 
     /// The grid a case reads instants against.
     fn grid() -> Grid {
@@ -2556,11 +3007,11 @@ mod tests {
     ///
     /// The floor is at the point of use because the reading it supports is a
     /// comparison: a candidate pair's p99.9 against what the class's own
-    /// recorded configuration did over three tours. A line carrying another
-    /// class's range, or the range the wrong way round, would read as growth
-    /// that is not there — and so would a line calling the antennas' floor a
-    /// shipping figure, which is the one class whose floor was read at gains
-    /// the tree has moved off.
+    /// recorded configuration did over three recordings. A line carrying
+    /// another class's range, or the range the wrong way round, would read as
+    /// growth that is not there — and so would a line calling the antennas'
+    /// floor three tours of the library, which is the one class whose floor is
+    /// a tour and two crafted sweeps.
     ///
     /// The figures are written out here rather than read back off the
     /// constants: they were transcribed by hand from an offline measurement,
@@ -2587,12 +3038,13 @@ mod tests {
         );
         assert_eq!(
             RECORDED_P999_ANTENNAS_RESIDUAL_RAD.figures,
-            [0.2999, 0.2759, 0.3177]
+            [0.1955, 0.1988, 0.1967]
         );
 
         // The provenance clause per class, written out the same way: the
-        // antennas' floor is the one that is not a shipping reading, and a line
-        // that called it one is the misreading the record exists to stop.
+        // antennas' floor is the one that is not three tours of the library,
+        // and a line that called it one is the misreading the record exists to
+        // stop.
         let ranges = [
             (
                 JointGroup::BodyYaw,
@@ -2606,12 +3058,13 @@ mod tests {
             ),
             (
                 JointGroup::Antennas,
-                "0.2759–0.3177",
-                "at gains this class no longer runs",
+                "0.1955–0.1988",
+                "at the pair and gains this class ships, on a tour and two sweeps",
             ),
         ];
         for (group, range, configuration) in ranges {
-            let wanted = format!("recorded p99.9 {range} rad over three tours {configuration},");
+            let wanted =
+                format!("recorded p99.9 {range} rad over three recordings {configuration},");
             let line = report
                 .measured
                 .iter()
@@ -2684,17 +3137,20 @@ mod tests {
         assert_eq!(
             config.profiles,
             GroupProfiles {
-                legs: ProfilePair {
+                legs: ClassProfile {
                     acceleration: 20,
                     velocity: 50,
+                    following_lag_us: 0,
                 },
-                yaw: ProfilePair {
+                yaw: ClassProfile {
                     acceleration: 30,
                     velocity: 60,
+                    following_lag_us: 0,
                 },
-                antennas: ProfilePair {
+                antennas: ClassProfile {
                     acceleration: 40,
                     velocity: 70,
+                    following_lag_us: 0,
                 },
             }
         );
@@ -2749,9 +3205,10 @@ mod tests {
         let config = RunConfig::read(&spelled).expect("a configuration the loader would take");
         assert_eq!(
             config.profiles.legs,
-            ProfilePair {
+            ClassProfile {
                 acceleration: 20,
-                velocity: 50
+                velocity: 50,
+                following_lag_us: 0
             },
             "0x14 is twenty"
         );
@@ -2848,6 +3305,99 @@ mod tests {
                 .any(|line| line.contains("tracking detector was disarmed")),
             "a disarmed run never reads green: {:?}",
             report.findings
+        );
+    }
+
+    /// A following lag is read per class where the run states one, and a run
+    /// recorded before the lag existed is judged at the generator alone and
+    /// told so.
+    ///
+    /// The missing key is the only omission any of these files is allowed, so
+    /// it is the one that has to be said out loud: a run silently re-judged
+    /// under this tree's lags would be a machine nobody recorded. Distinct
+    /// figures per class, because one lag reaching every class is what a
+    /// crossed reader looks like.
+    #[test]
+    fn a_following_lag_is_read_per_class_and_a_run_without_one_says_so() {
+        let mut texts = tree_texts();
+        texts[0] = "legs_profile_acceleration: 287\nlegs_profile_velocity: 326\n\
+                    body_yaw_profile_acceleration: 20\nbody_yaw_profile_velocity: 50\n\
+                    antennas_profile_acceleration: 20\nantennas_profile_velocity: 50\n\
+                    legs_following_lag_us: 30000\nbody_yaw_following_lag_us: 0\n\
+                    antennas_following_lag_us: 9000\n"
+            .to_string();
+        let stated = staged("lagged", texts.each_ref().map(String::as_str));
+        let config = RunConfig::read(&stated).expect("a configuration");
+        assert_eq!(config.profiles.legs.following_lag_us, 30_000);
+        assert_eq!(config.profiles.yaw.following_lag_us, 0);
+        assert_eq!(config.profiles.antennas.following_lag_us, 9_000);
+        let mut report = Report::default();
+        config.configuration(&mut report);
+        assert!(
+            !report
+                .measured
+                .iter()
+                .any(|line| line.contains("states no following lag")),
+            "a run that stated its lags is not one that stated none: {:?}",
+            report.measured
+        );
+
+        let mut texts = tree_texts();
+        texts[0] = "legs_profile_acceleration: 287\nlegs_profile_velocity: 326\n\
+                    body_yaw_profile_acceleration: 20\nbody_yaw_profile_velocity: 50\n\
+                    antennas_profile_acceleration: 20\nantennas_profile_velocity: 50\n"
+            .to_string();
+        let older = staged("older", texts.each_ref().map(String::as_str));
+        let config = RunConfig::read(&older).expect("a run recorded before the lag existed");
+        for group in JointGroup::ALL {
+            assert_eq!(
+                config.profiles.of(group).following_lag_us,
+                0,
+                "{}",
+                group.name()
+            );
+        }
+        let mut report = Report::default();
+        config.configuration(&mut report);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("states no following lag for any class")),
+            "{:?}",
+            report.measured
+        );
+
+        let mut texts = tree_texts();
+        texts[0] = "legs_profile_acceleration: 287\nlegs_profile_velocity: 326\n\
+                    body_yaw_profile_acceleration: 20\nbody_yaw_profile_velocity: 50\n\
+                    antennas_profile_acceleration: 20\nantennas_profile_velocity: 50\n\
+                    legs_following_lag_us: quick\n"
+            .to_string();
+        let unreadable = staged("unreadable-lag", texts.each_ref().map(String::as_str));
+        assert!(
+            RunConfig::read(&unreadable).is_err_and(|says| says
+                .contains("legs_following_lag_us is no lag in microseconds")),
+            "a lag that is stated and unreadable is a refusal, not a zero"
+        );
+
+        // The omission is all three classes or none. A file stating one class's
+        // lag and leaving the others out is no run recorded before the keys
+        // existed: judging those classes at the generator alone would be a
+        // reading taken at a lag nobody stated, and the file-wide note that
+        // says a run was judged there would not even be printed.
+        let mut texts = tree_texts();
+        texts[0] = "legs_profile_acceleration: 287\nlegs_profile_velocity: 326\n\
+                    body_yaw_profile_acceleration: 20\nbody_yaw_profile_velocity: 50\n\
+                    antennas_profile_acceleration: 20\nantennas_profile_velocity: 50\n\
+                    legs_following_lag_us: 30000\n"
+            .to_string();
+        let partial = staged("partial-lag", texts.each_ref().map(String::as_str));
+        assert!(
+            RunConfig::read(&partial).is_err_and(
+                |says| says.contains("states a following lag for some classes and not others")
+            ),
+            "a file stating one class's lag and not the others is a refusal, not a zero"
         );
     }
 
@@ -3096,15 +3646,7 @@ mod tests {
     /// speed still rising would send a person to the wrong rule.
     #[test]
     fn capability_reads_a_trapezoid_back_as_its_own_pair() {
-        // A generator that reaches its cap in the first period, so every
-        // chasing period in the run travels the cap and the bands cannot
-        // disagree for any reason but the walk's arithmetic.
-        let model = PlantModel::from_registers(
-            SHIPPED_PROFILES.antennas.velocity,
-            PROFILE_ACCELERATION_MAX,
-            PERIOD_NS,
-        )
-        .expect("a plant");
+        let model = instrument_model();
         let samples = stepped_chases(model, 12, 0.55, 30);
         let measured = capability(&samples, grid());
         let antennas = &measured[slot(JointGroup::Antennas)];
@@ -3150,13 +3692,10 @@ mod tests {
             plateau.travel,
             model.v_max
         );
-        // The register figure is the pair the generator was built from, which
-        // is what a candidate profile is read off.
+        // The register figure is the velocity the generator was built from,
+        // which is what a candidate profile is read off.
         assert!(
-            (antennas.velocity_units(plateau.travel)
-                - f64::from(SHIPPED_PROFILES.antennas.velocity))
-            .abs()
-                < 1.0,
+            (antennas.velocity_units(plateau.travel) - f64::from(INSTRUMENT_VELOCITY)).abs() < 1.0,
             "{} units",
             antennas.velocity_units(plateau.travel)
         );
@@ -3199,6 +3738,10 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            // The generator alone, for the reason
+            // `capability_reads_a_trapezoid_back_as_its_own_pair` gives: the
+            // dead time and the ramp this reads are the trajectory's.
+            0,
             PERIOD_NS,
         )
         .expect("a plant");
@@ -3269,6 +3812,7 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            SHIPPED_PROFILES.antennas.following_lag_us,
             PERIOD_NS,
         )
         .expect("a plant");
@@ -3437,9 +3981,10 @@ mod tests {
     /// pair's own field names, so this case is about the digits alone.
     #[test]
     fn each_class_carries_its_own_recorded_capability_pair() {
-        let pair = |acceleration, velocity| ProfilePair {
+        let pair = |acceleration, velocity| ClassProfile {
             acceleration,
             velocity,
+            following_lag_us: 0,
         };
         assert_eq!(RECORDED_CAPABILITY_LEGS, pair(287, 326));
         assert_eq!(RECORDED_CAPABILITY_ANTENNAS, pair(522, 640));
@@ -3606,12 +4151,7 @@ mod tests {
     /// it would turn a handful of samples into a plateau.
     #[test]
     fn a_band_under_the_minimum_is_printed_unread_and_read_past() {
-        let model = PlantModel::from_registers(
-            SHIPPED_PROFILES.antennas.velocity,
-            PROFILE_ACCELERATION_MAX,
-            PERIOD_NS,
-        )
-        .expect("a plant");
+        let model = instrument_model();
         // Twelve moves fill the bands under 0.55 rad; one longer move puts a
         // few samples in the bands above them and no more.
         let mut samples = stepped_chases(model, 12, 0.55, 30);
@@ -3982,6 +4522,7 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            SHIPPED_PROFILES.antennas.following_lag_us,
             PERIOD_NS,
         )
         .expect("a plant");
@@ -4026,6 +4567,7 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            SHIPPED_PROFILES.antennas.following_lag_us,
             PERIOD_NS,
         )
         .expect("a plant");
@@ -4085,6 +4627,7 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            SHIPPED_PROFILES.antennas.following_lag_us,
             PERIOD_NS,
         )
         .expect("a plant");
@@ -4279,12 +4822,16 @@ mod tests {
         let model = PlantModel::from_registers(
             SHIPPED_PROFILES.antennas.velocity,
             SHIPPED_PROFILES.antennas.acceleration,
+            SHIPPED_PROFILES.antennas.following_lag_us,
             PERIOD_NS,
         )
         .expect("a plant");
-        let whole = far_chase(60, 8.0, model);
-        let mut gapped = far_chase(60, 8.0, model);
-        gapped.remove(30);
+        // Long enough that the shaft is at its steady cruise well before the
+        // hole and well after it: the lag closes on that cruise geometrically,
+        // and the two figures below are compared exactly.
+        let whole = far_chase(120, 24.0, model);
+        let mut gapped = far_chase(120, 24.0, model);
+        gapped.remove(60);
         let across = capability(&gapped, grid())[slot(JointGroup::Antennas)].travel_max;
         let straight = capability(&whole, grid())[slot(JointGroup::Antennas)].travel_max;
         // Both figures are the generator's own cruise: an equality between two
@@ -4298,6 +4845,462 @@ mod tests {
         assert!(
             (across - straight).abs() < f64::EPSILON,
             "the two-period step across the hole was counted: {across} against {straight}"
+        );
+    }
+
+    /// How many periods a lag-scan case is synthesised over.
+    ///
+    /// Long enough that the p99.9 is a percentile of something: the scan takes
+    /// the top thousandth of a class's readings, and under a thousand of them
+    /// the rank is the series' own maximum — the single worst sample the design
+    /// deliberately does not select on. The binding class is the antennas, who
+    /// contribute two readings a period, so a case needs more than five hundred
+    /// periods before its own scan is reading a percentile at all.
+    const SCAN_PERIODS: usize = 600;
+
+    /// The profile the lag-scan cases are synthesised and read at.
+    ///
+    /// The antennas at the fastest pair on record, because a following lag is
+    /// `v · λ` and at the shipped pair it is a hundredth of a radian; the other
+    /// two classes as the tree ships them.
+    fn scan_profiles() -> GroupProfiles {
+        GroupProfiles {
+            legs: ClassProfile {
+                following_lag_us: 0,
+                ..SHIPPED_PROFILES.legs
+            },
+            yaw: ClassProfile {
+                following_lag_us: 0,
+                ..SHIPPED_PROFILES.yaw
+            },
+            // The antennas' fast rung, which is where a lag is large enough to
+            // read. Every lag here is zero: this is what the run's readings are
+            // judged at, and the readings' own lags are the case's `truth`.
+            antennas: ClassProfile {
+                acceleration: 522,
+                velocity: 640,
+                following_lag_us: 0,
+            },
+        }
+    }
+
+    /// One class's setpoints: a ramp out and back at twice its own cap, which
+    /// keeps its generator saturated and turns it round once.
+    ///
+    /// Saturated because that is the shape a following lag is largest under —
+    /// the lag is the distance a loop stands behind a trajectory it is keeping
+    /// up with, so content the generator can follow easily reads nothing.
+    fn saturated_content(model: &PlantModel) -> Vec<f64> {
+        let step = 2.0 * model.v_max;
+        let half = SCAN_PERIODS / 2;
+        (0..SCAN_PERIODS)
+            .map(|n| {
+                if n < half {
+                    n as f64 * step
+                } else {
+                    (SCAN_PERIODS - n) as f64 * step
+                }
+            })
+            .collect()
+    }
+
+    /// The readings a class whose plant is `profile` would have shown against
+    /// `content`, stepped exactly as the offline walk steps its prediction.
+    ///
+    /// The walk seeds on the period its ring first comes full and from there
+    /// steps on the setpoint [`RESPONSE_DEAD_SAMPLES`] periods old, so a series
+    /// built the same way is one the walk reproduces to the bit at the profile
+    /// it was built from. That is what makes the scan's answer readable: the
+    /// minimum is where the model and the machine are the same arithmetic.
+    fn readings_of(profile: ClassProfile, content: &[f64]) -> Vec<f64> {
+        let plant = PlantModel::from_registers(
+            profile.velocity,
+            profile.acceleration,
+            profile.following_lag_us,
+            PERIOD_NS,
+        )
+        .expect("a synthesised class is a generator");
+        let mut state = Predicted {
+            generator: content[0],
+            position: content[0],
+            velocity: 0.0,
+        };
+        let mut readings = vec![content[0]; RESPONSE_DEAD_SAMPLES + 1];
+        for n in (RESPONSE_DEAD_SAMPLES + 1)..content.len() {
+            plant.step(&mut state, content[n - RESPONSE_DEAD_SAMPLES]);
+            readings.push(state.position);
+        }
+        readings
+    }
+
+    /// A run whose every class is driven by saturated content and reads back
+    /// exactly what a plant carrying `truth`'s lags would have shown.
+    fn scan_run(truth: GroupProfiles) -> Vec<Logged<PoseSampleWire>> {
+        let commissioned = scan_profiles();
+        let plants = GroupPlants::from_profiles(&commissioned, PERIOD_NS)
+            .expect("the scan profiles are three generators");
+        let content: [Vec<f64>; JointGroup::ALL.len()] =
+            JointGroup::ALL.map(|group| saturated_content(&plants.of(group)));
+        let readings: [Vec<f64>; JointGroup::ALL.len()] = JointGroup::ALL.map(|group| {
+            readings_of(
+                ClassProfile {
+                    following_lag_us: truth.of(group).following_lag_us,
+                    ..commissioned.of(group)
+                },
+                &content[slot(group)],
+            )
+        });
+        (0..SCAN_PERIODS)
+            .map(|n| {
+                let mut present = [0.0; ROW_COUNT];
+                let mut commanded = [0.0; ROW_COUNT];
+                for joint in super::ROWS {
+                    let (Some(index), Some(group)) = (row(joint), super::group_of(joint)) else {
+                        continue;
+                    };
+                    present[index] = readings[slot(group)][n];
+                    commanded[index] = content[slot(group)][n];
+                }
+                sample(n as i64, &present, &commanded)
+            })
+            .collect()
+    }
+
+    /// The scan finds the lag a class's readings were made with, and reads a
+    /// class whose readings are the trapezoid itself as having none.
+    ///
+    /// Both halves in one run, because the scan walks all three classes at
+    /// every grid point and what would be wrong is a lag read off one class
+    /// landing on another. The antennas carry a period and a half of lag — the
+    /// figure the record quotes at their motor-bound rungs — and the legs carry
+    /// none.
+    #[test]
+    fn a_lag_scan_reads_the_lag_its_readings_were_made_with() {
+        let truth = GroupProfiles {
+            antennas: ClassProfile {
+                following_lag_us: 30_000,
+                ..scan_profiles().antennas
+            },
+            ..scan_profiles()
+        };
+        let samples = scan_run(truth);
+        let measured = capability(&samples, grid());
+        let scans = lag_scan(&samples, grid(), &scan_profiles(), &measured).expect("three models");
+
+        let antennas = scans[slot(JointGroup::Antennas)];
+        assert!(
+            (antennas.best_periods - 1.5).abs() < 1e-9,
+            "a period and a half of lag reads as {:.1} periods",
+            antennas.best_periods
+        );
+        assert_eq!(antennas.best_lag_us, 30_000, "and as its own microseconds");
+        assert!(
+            antennas.p999_at_best < COUNT_RAD,
+            "the model at the reading's own lag is the reading: {:.6} rad",
+            antennas.p999_at_best
+        );
+        assert!(
+            antennas.p999_at_zero > 0.4,
+            "and the trapezoid alone stands most of the screen away: {:.4} rad",
+            antennas.p999_at_zero
+        );
+        assert!(
+            antennas.is_a_minimum(),
+            "which clears the {LAG_SCAN_MIN_GAIN} gain: {}",
+            antennas.gain()
+        );
+        // Both shoulders are worse than the minimum, which is what says the
+        // floor is a floor rather than the end of a slope.
+        for shoulder in [antennas.p999_below, antennas.p999_above] {
+            let shoulder = shoulder.expect("half a period either side is on the grid");
+            assert!(
+                shoulder > antennas.p999_at_best,
+                "a shoulder at {shoulder:.4} rad against the minimum's {:.4}",
+                antennas.p999_at_best
+            );
+        }
+
+        assert!(
+            antennas.readings > 1_000,
+            "the p99.9 is a percentile of the class's readings and not their maximum: {} of them",
+            antennas.readings
+        );
+
+        let legs = scans[slot(JointGroup::Legs)];
+        assert_eq!(
+            legs.best_periods, 0.0,
+            "a trapezoid reading is explained by the trapezoid"
+        );
+        assert_eq!(legs.best_lag_us, 0);
+        assert!(
+            !legs.is_a_minimum(),
+            "so there is no gain to be had and no lag to write: {}",
+            legs.gain()
+        );
+        assert!(
+            legs.readings > 0,
+            "and the reading was taken over the run's own periods"
+        );
+    }
+
+    /// A run is a following-lag instrument for a class only where the class's
+    /// own motor was reached, and says which it is.
+    ///
+    /// The gate the offline reading is accepted under: a lag is the distance a
+    /// loop stands behind a trajectory it is keeping up with, so a recording
+    /// whose generator outran the motor holds a reversal excursion and not a
+    /// loop. A scan admitted off a gain-bound tour is a constant written into
+    /// the profile file off the wrong mechanism, which is what the rule exists
+    /// to stop, so both branches are asserted rather than the sentence being
+    /// found on the page.
+    #[test]
+    fn a_run_is_an_instrument_for_a_class_only_where_its_motor_was_reached() {
+        let truth = GroupProfiles {
+            antennas: ClassProfile {
+                following_lag_us: 30_000,
+                ..scan_profiles().antennas
+            },
+            ..scan_profiles()
+        };
+        let samples = scan_run(truth);
+        let antennas = PlantModel::from_registers(
+            scan_profiles().antennas.velocity,
+            scan_profiles().antennas.acceleration,
+            0,
+            PERIOD_NS,
+        )
+        .expect("the fastest recorded pair is a generator");
+
+        // The same run read under each of the three regimes the capability pass
+        // can hand the scan, the plateau standing at the pair's own cap and
+        // then just under it.
+        let read_under = |regime: Regime| {
+            let mut measured = capability(&samples, grid());
+            measured[slot(JointGroup::Antennas)].regime = regime;
+            let scans =
+                lag_scan(&samples, grid(), &scan_profiles(), &measured).expect("three models");
+            let mut report = Report::default();
+            lag_scans(&scans, &mut report);
+            (scans[slot(JointGroup::Antennas)].instrument, report)
+        };
+        let plateau = |travel: f64| {
+            Regime::MotorBound(Plateau {
+                low: 0.0,
+                high: CHASE_GAP_RAD,
+                bins: 2,
+                travel,
+            })
+        };
+
+        let (instrument, report) = read_under(plateau(antennas.v_max));
+        assert!(
+            instrument,
+            "a motor that held its generator's own speed is what a lag is readable off"
+        );
+        assert!(
+            report.measured.iter().any(|line| line.contains(
+                "antennas: motor-bound on this run, so it is a \
+                                           following-lag instrument"
+            )),
+            "{:?}",
+            report.measured
+        );
+
+        for regime in [
+            plateau(antennas.v_max * 0.9),
+            Regime::GainBound,
+            Regime::ContentBound,
+        ] {
+            let (instrument, report) = read_under(regime);
+            assert!(!instrument, "{} is no reading of the loop", regime.name());
+            assert!(
+                report.measured.iter().any(|line| line.contains("antennas:")
+                    && line.contains("so it is not a following-lag instrument")),
+                "{:?}",
+                report.measured
+            );
+        }
+    }
+
+    /// A minimum standing on the grid's own top is not a reading, and the line
+    /// says which of the two refusals it is.
+    ///
+    /// The design reads a lag of four periods as the dead time being wrong
+    /// rather than the loop being that slow, and stops. What must not happen is
+    /// an operator reading `4.0 periods` off the printed line and writing it
+    /// into the profile file, so the scan refuses it and the page says why.
+    #[test]
+    fn a_minimum_on_the_grids_own_top_is_the_dead_time_and_not_a_lag() {
+        let truth = GroupProfiles {
+            antennas: ClassProfile {
+                // Well past the grid's four periods: whatever this is, the
+                // model the scan has is not it.
+                following_lag_us: 200_000,
+                ..scan_profiles().antennas
+            },
+            ..scan_profiles()
+        };
+        let samples = scan_run(truth);
+        let measured = capability(&samples, grid());
+        let scans = lag_scan(&samples, grid(), &scan_profiles(), &measured).expect("three models");
+        let antennas = scans[slot(JointGroup::Antennas)];
+        assert_eq!(
+            antennas.best_periods, LAG_SCAN_MAX_PERIODS,
+            "a lag past the grid pins the minimum on the top of it"
+        );
+        assert!(
+            !antennas.is_a_minimum(),
+            "which is no reading, whatever the gain there was: {}",
+            antennas.gain()
+        );
+        let mut report = Report::default();
+        lag_scans(&scans, &mut report);
+        assert!(
+            report.measured.iter().any(|line| line
+                .contains("a minimum at the grid's own top, which is the dead time being wrong")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// A class the trapezoid alone explains to the digit has no gain to be had,
+    /// and the ratio of two nothings is not a reading of one.
+    #[test]
+    fn a_scan_over_a_run_with_no_residual_reads_no_gain() {
+        let flat = LagScan {
+            group: JointGroup::Antennas,
+            best_periods: 0.0,
+            best_lag_us: 0,
+            p999_at_zero: 0.0,
+            p999_at_best: 0.0,
+            p999_below: None,
+            p999_above: None,
+            readings: 1_200,
+            instrument: true,
+            regime: Regime::GainBound,
+        };
+        assert_eq!(
+            flat.gain(),
+            1.0,
+            "no gain, rather than a nought over a nought"
+        );
+        assert!(!flat.is_a_minimum(), "and so no lag to write");
+    }
+
+    /// The rank the scan selects a lag on is the rank the report prints beside
+    /// it.
+    ///
+    /// Two arithmetics over one figure: the report's p99.9 sorts the series and
+    /// the scan reorders it around the one rank. A disagreement between them
+    /// would choose the constant off one statistic and quote it beside another,
+    /// and both pages would look self-consistent.
+    #[test]
+    fn the_ranked_percentile_is_the_percentile_of_the_sorted_series() {
+        let series: [Vec<f64>; 6] = [
+            Vec::new(),
+            vec![0.5],
+            vec![0.25, 0.25, 0.25, 0.25],
+            (0..1_000).map(|n| f64::from(n) * 1e-3).collect(),
+            (0..1_001).map(|n| f64::from(1_000 - n) * 1e-3).collect(),
+            vec![0.4, 0.1, 0.4, 0.2, 0.9, 0.9, 0.3],
+        ];
+        for values in series {
+            let mut sorted = values.clone();
+            sorted.sort_by(f64::total_cmp);
+            for fraction in [0.5, 0.999, 1.0] {
+                let mut unordered = values.clone();
+                assert_eq!(
+                    ranked_percentile(&mut unordered, fraction),
+                    percentile(&sorted, fraction),
+                    "{fraction} of {} readings",
+                    values.len()
+                );
+            }
+        }
+    }
+
+    /// A profile that is no generator is no scan either, and the refusal names
+    /// the class and the grid point it was reached at.
+    ///
+    /// Nothing is scanned from a model that does not exist: a class read at a
+    /// zero register would otherwise contribute a column of residuals against
+    /// no trajectory at all, and the minimum of that column is a lag.
+    #[test]
+    fn a_profile_that_is_no_generator_is_no_scan() {
+        let samples = scan_run(scan_profiles());
+        let measured = capability(&samples, grid());
+        let stopped = GroupProfiles {
+            antennas: ClassProfile {
+                velocity: 0,
+                ..scan_profiles().antennas
+            },
+            ..scan_profiles()
+        };
+        let refusal = lag_scan(&samples, grid(), &stopped, &measured)
+            .expect_err("a class with no velocity is no plant to scan against");
+        assert!(
+            refusal.contains("the lag scan's 0.0-period model is none")
+                && refusal.contains("antennas"),
+            "{refusal}"
+        );
+    }
+
+    /// The two lines the offline reading is taken off appear in a report, with
+    /// the figures the scan and the window rule computed.
+    ///
+    /// What an operator does with these is compare one run's figures against
+    /// another's, so what is asserted is that the numbers reach the page at all
+    /// and under the words that say what they are. The instrument sentence is
+    /// asserted branch by branch in
+    /// `a_run_is_an_instrument_for_a_class_only_where_its_motor_was_reached`,
+    /// where the decision it states is the thing under test.
+    #[test]
+    fn the_report_carries_the_sustained_reading_and_the_lag_scan() {
+        let truth = GroupProfiles {
+            antennas: ClassProfile {
+                following_lag_us: 30_000,
+                ..scan_profiles().antennas
+            },
+            ..scan_profiles()
+        };
+        let samples = scan_run(truth);
+        let plant = GroupPlants::from_profiles(&scan_profiles(), PERIOD_NS).expect("three models");
+        let stream = residual_stream(&samples, grid(), &plant);
+        let mut report = Report::default();
+        residuals(&stream, &samples, &plant, &mut report);
+        let measured = capability(&samples, grid());
+        let scans = lag_scan(&samples, grid(), &scan_profiles(), &measured).expect("three models");
+        lag_scans(&scans, &mut report);
+
+        let magnitudes: Vec<[f64; super::ROWS.len()]> = stream
+            .iter()
+            .map(|(_, residual)| {
+                let mut period = [0.0; super::ROWS.len()];
+                for (index, reading) in residual.iter().enumerate() {
+                    period[index] = reading.magnitude();
+                }
+                period
+            })
+            .collect();
+        let held = super::sustained_of(
+            &super::sustained_per_row(&magnitudes, 10),
+            JointGroup::Antennas,
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!("antennas: sustained residual {held:.4} rad"))),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("antennas: lag scan minimum 1.5 periods (30000 us)")),
+            "{:?}",
+            report.measured
         );
     }
 }

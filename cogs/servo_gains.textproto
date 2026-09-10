@@ -27,7 +27,7 @@ legs_p: 800
 legs_i: 100
 legs_d: 300
 
-# The value the vendor's own stack writes at startup, and now a measured one.
+# The value the vendor's own stack writes at startup, and a measured one.
 # The yaw is gain-bound rather than motor-bound -- it reached 48 velocity units
 # on the capability tour where the legs reached 326 -- so a stiffer loop was the
 # obvious rung, and it was walked P-only over the wake gesture's 17 s stow hold:
@@ -36,9 +36,10 @@ legs_d: 300
 # watch's two-count bound. A P-only ladder is non-monotonic here, so it stopped
 # at the vendor's value.
 #
-# TODO(body-yaw-gains): the derivative term is the next rung -- damping is what
-# a P-only ladder had nothing of -- read from `hold-probe <yaw id> --gains` and
-# from a motion run that produces the long stow hold.
+# TODO(body-yaw-gains): a derivative term is the next rung -- damping is
+# what a P-only ladder has nothing of -- read from `hold-probe <yaw id>
+# --gains` and from a motion run that produces the long stow hold.
+# Headroom, not a need at the current pair.
 body_yaw_p: 200
 body_yaw_i: 0
 body_yaw_d: 0
@@ -65,15 +66,28 @@ body_yaw_d: 0
 #   with the cycle still visible in the arrival's settle allowance and gone from
 #   the judged hold.
 #
-# No integral term: an antenna holds nothing up, so there is no weight to
-# integrate away. The cost is a parking error -- with no integral term the loop
-# stops where friction balances the proportional push -- and it is measured: the
+# No integral term, and that is a measured choice rather than an untried one.
+# An antenna holds nothing up, so there is no weight to integrate away, and the
+# term was walked at this proportional term over the same step probes at the
+# antennas' fastest recorded pair, six runs a rung:
+#
+# - `I 50` puts a judged hold past the two-count bound in six of six, 3-8 counts,
+#   the widest of them limit-cycling at 12-18 Hz with the interval regular to
+#   within a sample. The control at the same pair is 0-1 counts everywhere.
+# - `I 25` is worse, not better: past the bound in six of six at 3-12 counts,
+#   with the same regular signature at 12-14 Hz on some holds and, on the right
+#   antenna at the sides pose, a monotone walk of 9-12 counts with no reversal at
+#   all and a mean error of -0.0095 to -0.0110 rad. That is the integrator
+#   winding inside the loop's own deadband, which is the parking error the term
+#   was for with its sign turned round.
+#
+# The cost of leaving it out is that parking error -- the loop stops where
+# friction balances the proportional push -- and it is measured and accepted: the
 # right antenna parks 0.026 rad (16-17 counts) short at the sides pose on the
 # arrival from the fold, on a hold whose excursion is inside a count, at two
-# profile pairs alike.
-#
-# TODO(antenna-hold-gains): the integral term at this proportional term is the
-# rung nobody has walked, against that parking error.
+# profile pairs alike. A resting antenna under content whose goal moves by less
+# than its breakaway error parks 0.10-0.13 rad out on a kept tour; no tree
+# instrument reads that one.
 antennas_p: 200
 antennas_i: 0
 antennas_d: 0

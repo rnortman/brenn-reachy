@@ -99,14 +99,17 @@ pub const MAX_EXCURSION_RAD: f64 = 2.0 * COUNT_RAD;
 ///
 /// The allowance runs from the last *commanded* change, and the command is not
 /// the motion: the servo's own profile generator paces every move, so a joint
-/// is still travelling for seconds after its setpoint stops changing. The
-/// widest hold this stack judges follows the antennas' arc from stow to rest,
-/// 3.1377 rad at the antennas' `20 / 50`: 131 periods of it at the velocity
-/// cap, and 141 periods — about 2.8 seconds — for the whole move, the ramp off
-/// the cap and the two periods of dead time included. The rod then rings down.
-/// Four seconds covers both, with about 1.2 seconds of it for the ring-down. A
-/// shorter allowance judges the tail of the move and reads it as a joint that
-/// will not stand still.
+/// is still travelling after its setpoint stops changing. The widest hold this
+/// stack judges follows the antennas' arc from stow to rest, 3.1377 rad at the
+/// antennas' commissioned `522 / 640` under the class's measured following lag:
+/// 25 periods — half a second — for the whole move, the ramps at either end,
+/// the two periods of dead time and the shaft's decay onto the arrived
+/// generator included. The rod then rings down. Four seconds covers both, with
+/// about 3.5 seconds of it for the ring-down, most of the allowance now that
+/// the class runs its own motor's speed. A shorter allowance judges the tail of
+/// the move and reads it as a joint that will not stand still. Both a slower
+/// pair and a longer following lag move that figure, which is what the case
+/// below re-reads it against.
 const SETTLE: Duration = Duration::from_secs(4);
 
 /// The default shortest judged hold.
@@ -1324,8 +1327,8 @@ mod tests {
     /// leave a ring-down after it.
     ///
     /// Both inputs move under this crate's own hands — the fold angle is a
-    /// constant here and the antennas' profile pair is one commissioning away
-    /// (`TODO(session-servo-profile)`) — and neither of them is anywhere near
+    /// constant here and the antennas' profile pair is a commissioning away —
+    /// and neither of them is anywhere near
     /// this file. Without this case an allowance that no longer covers the move
     /// leaves the watch opening its window inside the tail of the arrival and
     /// reading a rod still travelling as one that will not stand still, with
@@ -1347,7 +1350,7 @@ mod tests {
         }
         // The figures the allowance's comment states, so a moved fold or a
         // moved pair fails here naming both of them.
-        assert_eq!(widest, 141, "the widest judged arc takes {widest} periods");
+        assert_eq!(widest, 25, "the widest judged arc takes {widest} periods");
         let travel = DRIVER_PERIOD * u32::try_from(widest).expect("a period count fits");
         assert!(
             travel + RING_DOWN <= SETTLE,

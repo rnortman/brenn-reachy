@@ -16,9 +16,10 @@
 //! Two distances per window, and they answer different questions. The lag is
 //! how far a joint stood behind its goal, which on velocity-capped servos is a
 //! figure about how fast the content is. The residual is how far it stood from
-//! where its own trajectory generator had got to, stepped by the same model the
-//! decision tick screens on -- so a run is judged offline by the arithmetic
-//! that judged it live.
+//! where a healthy servo following its generator would stand -- that generator
+//! with the position loop's own following lag on it -- stepped by the same
+//! model the decision tick screens on, so a run is judged offline by the
+//! arithmetic that judged it live.
 //!
 //! It reads the log and the names sidecar, and nothing else. The sidecar is what
 //! says which motions the library holds and what they are called, which is the
@@ -50,7 +51,7 @@ use motion_channels::{
 };
 use pose_reading::{
     Grid, Residual, RunConfig, Skips, capabilities, capability, commanded_rows, health_summary,
-    lags, no_faults, present_rows, residual_stream, residuals,
+    lag_scan, lag_scans, lags, no_faults, present_rows, residual_stream, residuals,
 };
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_edge::names::MotionTable;
@@ -787,7 +788,12 @@ fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
     // the run these two are worth taking off: a capability figure is only as
     // good as the content that demanded it, and a temperature only means
     // something over a long play.
-    capabilities(&capability(&run.samples, grid), &mut report);
+    let measured = capability(&run.samples, grid);
+    capabilities(&measured, &mut report);
+    match lag_scan(&run.samples, grid, &config.profiles, &measured) {
+        Ok(scans) => lag_scans(&scans, &mut report),
+        Err(error) => report.fail(error),
+    }
     stillness(&ordered, held_standard(table), &mut report);
     health_summary(&run.readings, &mut report);
     report

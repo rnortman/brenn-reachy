@@ -31,7 +31,7 @@ Three files are configuration a run can vary:
 
 | file | what it sets |
 |---|---|
-| `cogs/servo_profile.textproto` | six scalars: acceleration and velocity per class |
+| `cogs/servo_profile.textproto` | nine scalars: acceleration, velocity and following lag per class |
 | `cogs/servo_gains.textproto` | nine scalars: P, I, D per class |
 | `cogs/mover_params.textproto` | among them `tracking_armed` |
 
@@ -47,6 +47,13 @@ as `config/<payload-relative path>`, and `provenance.txt` gains a
 root back whole, so a fetched run carries the configuration that produced it,
 and both analyzers read the run's own `config/` rather than the tree's. A log
 with no `config/` is refused: read it with its own build.
+
+The following lag is not a register: nothing is written to a servo from it. It
+is the constant the model of the servo's position loop carries, and it sits in
+this file because this file is the one statement of what the tick judges a
+class against. A file states it for all three classes or for none — the second
+is a run recorded before the key existed, judged at the trajectory generator
+alone, and an analyzer says so when it reads one.
 
 Two consequences worth knowing before an experiment:
 
@@ -113,6 +120,35 @@ Two consequences worth knowing before an experiment:
   a joint ahead of it call for opposite answers to the same figure — stepping a
   pair down widens the second — so step 3's branches read the sign before the
   magnitude.
+- **The sustained residual**, in both analyzers' residual section beside the
+  worst and the p99.9: the largest residual a class held across every window of
+  ten consecutive judged periods, which is the quantity the tracking detector
+  actually faults on. The worst sample is what the screen is *sized* over and
+  the sustained figure is what the screen is *crossed* by, so a run whose worst
+  is a single spike and a run that stands out there for a fifth of a second read
+  the same on one line and differently on the other.
+- **The lag scan**, per class, in the same section: the following lag that
+  minimises that class's p99.9 residual over a 0–4 period grid at a tenth of a
+  period, with the p99.9 at zero lag, at the minimum and at the minimum ± half a
+  period, the sample count it was read over, and whether the run is a λ
+  *instrument* for the class — motor-bound with the plateau at or above the
+  commissioned velocity — or not. Five figures and a word rather than the
+  41-point table. It is the instrument step 2b reads a lag off and the one step
+  3 re-reads it with; a run that is not an instrument still prints its scan, and
+  its scan is a note.
+- **`//cogs:trace_judge`**, over an exported recording rather than a log:
+  `bazel run //cogs:trace_judge -- <trace.csv> <config-dir>`. It reads a
+  `//cogs:trace_export` CSV and a run's `config/` directory, walks the residual
+  through the same `PlantModel::step` the tick walks, and prints the residual
+  section above plus the capability and goal-step lines the tour report prints —
+  the same code and the same words as a live report, on a recording the live
+  analyzers cannot open. That is what it is for: a log written at an older
+  `.clk` schema may be refused at HEAD, while a CSV has no schema to refuse.
+  `--lag <class>=<us>` replays a class at a stated lag instead of the
+  configuration's and names the override at the top of the report, which is how
+  a what-if is read without editing a file. A trace holding several runs is
+  judged run by run; its instants are offsets into the file and not the log's
+  own clock, and the run header says so.
 - **The stillness watch's period line**, in the `stillness` section: mean and
   spread of the sample count between reversals, and the apparent frequency at
   the window's own sample rate. A regular limit cycle reads as a small spread; a
@@ -216,6 +252,33 @@ Two consequences worth knowing before an experiment:
   played one at a time, deliberately, and never as one leg of a tour. The rule
   is the sender's: it makes the selection for the plan it runs and prints the
   same one for the verdict, so the two cannot disagree.
+- **The antenna sweep**, `probe/antenna-sweep`. The third probe document, and
+  the one that is not a stillness instrument: antennas only over the raised
+  base, 775 frames at 50 Hz, fifteen segments of linear ramps and holds that put
+  the library's antenna stress in miniature into a quarter of a minute — a
+  saturating move at the slow pair, moves at the fast pair's own cap, a reversal
+  at arrival, a reversal mid-move, the outboard arc the probes take, and a long
+  climb near the `20 / 50` cap. Linear interpolation puts the streamed setpoint
+  at constant speed through each leg, which is the shape a following lag is
+  largest under, so **the sweep is the residual instrument**: it is what a
+  candidate pair's worst residual and lag scan are read off when no tour may be
+  played. It is **not** a capability instrument, and its capability line is
+  recorded and not judged. A streamed setpoint stands at most a frame plus the
+  loop's lag ahead of the shaft, so the sweep never opens the large tracking
+  error a plateau is read over; reading a motor needs a generator saturated
+  against a far goal for hundreds of periods, which is a tour's shape and not a
+  clip's. One 6.5 s hold on the base closes it, so the probe standard's rule
+  that a probe run holding nothing judgeable has failed to stimulate anything is
+  satisfied by construction.
+- **The probe documents are generated from the constants they step between.**
+  `cogs/probe_clips.rs` holds a table — per probe, a name, a description, a
+  channel and a list of hold and ramp segments over the tree's own named poses —
+  and `make clip-config` writes every `cogs/clips/probe/<name>.json` from it
+  before it emits the library, so both halves are one command. A gate test holds
+  the committed documents byte-equal to what the table authors, in both
+  directions: a table row with no document and a document with no row each fail.
+  A retuned pose therefore moves the probes with it, and a 775-frame sweep is a
+  table row rather than a hand-transcribed file.
 
 ## The procedure
 
@@ -340,9 +403,9 @@ The bound is never widened, and a hunt this procedure cannot quieten is not
 made to disappear by a looser one. What is left, if a pose ever hunts that a
 lean cannot answer: a derivative term above the vendor's P, current-based
 position mode, feedforward gains, or resting the antennas de-torqued — and that
-choice is the user's. The one gain rung still deferred is the integral term at
-`P 200`, against the parking error alone, carried by
-`TODO(antenna-hold-gains)`.
+choice is the user's. The integral term at `P 200`, which was the one gain rung
+still owed against the parking error, has since been walked and refused: see
+**Antennas -- the integral rung** below.
 
 ### 2. Motor capability
 
@@ -407,7 +470,8 @@ Read, in this order:
    step before step 3.
 4. Write the candidate pairs into a second overlay carrying the pairs alone; the
    tree's `mover_params.textproto` falls through, armed. Then go to step 2a if
-   any class's gains are open, else to step 3.
+   any class's gains are open, then to step 2b if a candidate is fast enough for
+   its loop's lag to be visible, else to step 3.
 
 This run's residual figures are meaningless by construction — the model was the
 wrong one on purpose — and its verdict is a `fail` on the disarmed detector. Its
@@ -449,6 +513,69 @@ widened.
   reading, not a reason to prefer the higher rung. A rung on which the machine
   showed a limit cycle hunts, whatever the rungs around it did.
 
+### 2b. The model, before a pair is confirmed
+
+A class that reads *motor-bound with a plateau at or above its commissioned
+velocity* has reached its generator's speed, and what is left between it and
+the detector is not the pair: it is the position loop following that generator.
+A proportional loop is a first-order lag, so at cruise the shaft stands a fixed
+number of periods of travel behind the trajectory it chases — at the 1.2
+periods this cycle measured, three hundredths of a radian at `20 / 50` and
+0.368 rad, three fifths of the 0.6 rad screen, at the antennas' commissioned
+`522 / 640` — spent by a healthy machine doing nothing wrong. This step reads
+that lag and puts it in the model, so that the screen's width goes to the
+joint's actual deviation instead of to the loop's health. It is run whenever
+step 2 leaves a candidate pair fast enough for the lag to be visible, and
+before step 3 confirms one.
+
+No hardware. Export the kept tours whole with `//cogs:trace_export` — from a
+worktree at the recording commit if HEAD refuses the log's schema — and read
+each with `//cogs:trace_judge` at the run's own `config/`. The CSVs are working
+data and are not committed.
+
+1. **Read the scan.** Per class, per recording, the lag scan's minimum over the
+   0–4 period grid. A recording is an **instrument** for a class only where that
+   class reads motor-bound with the plateau at or above the commissioned
+   velocity: below that the generator is what caps the joint and the residual is
+   the reversal excursion rather than a lag, so the scan is printed and not
+   read.
+2. **Accept only on agreement.** A class has a lag when three things hold: two
+   instruments at *different* pairs give minima within 0.25 period of each
+   other; the minimum is a minimum — the p99.9 there is `LAG_SCAN_MIN_GAIN`
+   (1.5) below the p99.9 at zero lag; and no kept fixture that carries the lag
+   reads a *worse* worst sample under it. Any of the three failing leaves the
+   class at zero — the trapezoid alone — and the scan goes into the record as a
+   finding. A minimum landing on the grid's own top is read as the dead time
+   being wrong rather than the lag being long, and stops the step.
+3. **Bake it where the pair is.** The figure is written in microseconds
+   (`*_following_lag_us` in `cogs/servo_profile.textproto` and
+   `SHIPPED_PROFILES`), so it survives a change of control grid; the file's
+   comment names the instruments and the gains triple it was read at. **A lag
+   belongs to one gains triple.** A gains rung re-reads it, and a recording made
+   at another triple is replayed at *that* triple's lag or, where none was ever
+   read, at zero — which is the honest replay of a loop nobody has measured.
+   Applying a lag to a loop it was not read on is measurably worse than no lag
+   at all; the record's `fast4` line is that reading.
+4. **Re-bake the pins and check the controls.** Every kept fixture is replayed
+   at its recorded pair and its own loop's lag, and each pin moves off the
+   suite's own failure message. A pin moving by clearly more than the lag's own
+   periods of travel at that fixture's pair, in either direction, or any class's
+   worst magnitude *rising* on a fixture that carries the lag, is a model
+   finding and stops the step: the loop is not first-order where the worst is.
+   The classes the lag was not read on are the controls — their pins moving is
+   the same finding.
+5. **Then a candidate.** With the model right at a pair, the pair the ladder
+   read is a candidate for step 3 and the confirmation is what decides it. If
+   the scan finds no lag for the class the candidate belongs to, there is no
+   model that is right at that pair and step 3 does not run: the reading goes to
+   a person with both scans.
+
+The threshold is never part of this. `threshold_rad` is 0.6 rad with no override
+path, and the sizing rule is the assertion that it is at least 1.5 × the worst
+sample over every kept fixture. A better model lowers that worst and widens the
+headroom under a fixed screen; it cannot narrow the screen, and no reading here
+edits either number.
+
 ### 3. Confirmation
 
 `make library-run` then `make motion-run` under the candidate overlay, armed,
@@ -457,11 +584,27 @@ configuration that ships if it passes, and nothing else. A candidate carried
 beside a pair that is not shipping makes the bake mixed-provenance, which is a
 comparison of two machines.
 
+**Where a tour may not be flown**, the confirmation is the sweep twice, both
+step probes once each, and `make motion-run` twice, under that same one overlay.
+The sweep is the residual instrument and carries the content the library's
+antenna worst windows are made of — long saturated moves and reversals — the
+step probes carry the arrivals, and the wake runs carry the gesture the machine
+actually performs. What that set does not carry is the library's *breadth*: if
+the shipping configuration is one an existing tour was flown at, that tour is
+the library reading and its worst window is the kept fixture; if it is not, the
+pin comes off the sweep's worst window and a TODO is owed to cut the library
+window at the shipping configuration the next time the library is toured.
+
 **Pass**: no tick fault, no obstruction report, every window moving, health
 flat, and for each **candidate** class a worst residual at most **two thirds of
 the 0.6 rad tracking screen, 0.4 rad** — the sizing rule's own margin, since the
 screen is 1.5 × the worst sample over the kept fixtures and a bake that failed
-that assertion is a bake that cannot ship. The p99.9 is printed against the
+that assertion is a bake that cannot ship. The bound is read on **both** sides:
+a joint standing that far ahead of its model is as far outside it as one
+standing behind, and the ahead side is where an integral term's overshoot shows.
+The **sustained** figure — the largest residual held across a whole window — is
+read against the screen itself, 0.6 rad, because that is the quantity the
+detector faults on. The p99.9 is printed against the
 baseline's and read, not judged: a p99.9 that grew more than the worst did is a
 motor lagging everywhere rather than at a few extremes, and is written into the
 record beside the pair. The residual is read with its sign, because the two
@@ -478,6 +621,24 @@ compares two different measurements. A class with no record at the shipping
 configuration is read against the 0.4 rad margin instead, which the shipping
 configuration has to clear whether or not its pair moved.
 
+**The lag is re-read on the confirmation, not assumed.** Each run's lag scan for
+the candidate class must land within 0.25 period of the lag the payload ran with.
+A larger disagreement with everything else passing is the gains having moved the
+loop — an integral term shortens a following lag — and is answered by re-baking
+the lag to the confirmation's own reading, re-pushing and re-running once. A
+second disagreement is a stop.
+
+**The capability re-read's operand is a library tour at the shipping gains and
+the shipping pair**, and not a run of this step. The Pass bullet below is the
+rule and its outcome; what this adds is where the reading comes from. The most
+recent such tour is the instrument, including one flown in an earlier cycle,
+since capability takes no lag and a tour made before the model existed reads it
+soundly. The sweep's and the step probes' own capability lines are **recorded
+and not judged**, for the same reason a control class's are: content that never
+opens a large tracking error offers no plateau to read a motor through. Where no
+tour at the shipping triple exists, this rule has no instrument and the reading
+is owed to the next tour rather than taken off a probe.
+
 Stillness is printed and recorded per hold — both the motion run's section and
 the tour's head-still-judged one — and does not gate. The analyzer's non-zero
 exit on a stillness finding is not a confirmation failure: the antennas' gain
@@ -490,11 +651,12 @@ runs.
   tour's worst windows as new fixtures, each replayed under the profile it was
   recorded at and each with a row saying so; re-derive the prose figures that
   quote the old pair's timings, each with the regime it is evaluated under;
-  record the margin against the shipped pair's. The tour's capability re-read of
-  a candidate class must land inside `CAPABILITY_PLATEAU_RATIO` of the pair it
-  ran at; a plateau above the candidate by more than the ratio is recorded and
-  **one** further iteration at the re-read pair is allowed, so that the loop
-  closes. A second excess is recorded as headroom left, not chased.
+  record the margin against the shipped pair's. The capability re-read of a
+  candidate class — off the tour named above — must land inside
+  `CAPABILITY_PLATEAU_RATIO` of the pair it ran at; a plateau above the
+  candidate by more than the ratio is recorded and **one** further iteration at
+  the re-read pair is allowed, so that the loop closes. A second excess is
+  recorded as headroom left, not chased.
 - **Fail on residual, the joint behind its trajectory**: stop, and take the
   residual-against-pair table to a person. There is no ladder down. A class that
   reaches its generator's speed — motor-bound with a plateau at or above the
@@ -506,7 +668,14 @@ runs.
   the motor at all; the answer is a plant model that carries the lag, which is a
   design question and not a pair. Read the class's p99.9 in periods of travel at
   the pair it ran at, and its capability regime, before reading its worst in
-  radians.
+  radians. **Where step 2b has already put that lag in the model**, this branch
+  is narrower and does not stop: the pair is not commissionable at this lag under
+  this detector, so step to the next slower rung *that is on record and passed
+  step 2b* and re-run this step once. No pair that no recording holds is
+  invented. If no recorded rung is left, the class stays where it is, the
+  shipping configuration gets its own confirmation runs so that what ships has
+  been flown, and the fast pair is recorded as not commissionable with its
+  figures.
 - **Fail on residual, the joint ahead of its trajectory**: escalate with the
   residual table and the goal-step listing. Stepping the pair down would widen
   the reading, not close it.
@@ -522,8 +691,9 @@ figure baked that the step's decision tree did not name.
 Each entry names the log or record directory, the configuration it ran under,
 and the figures read out of it. Every step of the procedure has been run: the
 offline baseline, the antenna hold probes, the body yaw's gain ladder, the two
-capability tours, the antenna gain sweep over the step probes, and the
-confirmation. The gain sweep and the confirmation each closed on a reading the
+capability tours, the antenna gain sweep over the step probes, the model, and
+the confirmation — the last twice, once for the legs' pair and once for the
+antennas'. The gain sweep and both confirmations each closed on a reading the
 step's own decision tree did not name, and each entry below says what the
 reading was and what was decided instead.
 
@@ -889,9 +1059,9 @@ Four readings the table does not carry:
   soft, so this is a resting joint whose goal moved by less than its breakaway
   error and not a deficiency a hold can read. The analyzer-read parking figure
   the record does hold is the right antenna's 0.026 rad at the sides pose on the
-  `sides←down` arrival (the sweep below); the instrument for the content reading
-  is a tour-side parking reading over the tour's zero-travel chasing samples,
-  which `TODO(antenna-hold-gains)` carries as work rather than as a figure.
+  `sides←down` arrival (the sweep below). No tree instrument reads the content
+  figure; the integral rung that would have closed either of them was walked and
+  refused, and both costs stand recorded as accepted.
 
 ### Body yaw — gain ladder
 
@@ -932,12 +1102,16 @@ readings go with that:
   comparison these runs hold. That is recorded, and it does not promote `800`:
   a rung on which the machine showed a limit cycle hunts, and the bound is not
   widened to accept one.
-- **The next lever is a derivative term at a P above the vendor's**, carried as
-  `TODO(body-yaw-gains)`. Its value is a guess today, between the antennas' 10
-  and the legs' 300, and the diagnostic long hold arrives on only about half the
-  runs, so it needs its own instrument choice: `hold-probe <yaw id> --gains
-  P,I,D` for the probe half and a motion run that produces the long hold every
-  time for the confirmation half.
+- **The next rung would be a derivative term at a P above the vendor's**,
+  carried as `TODO(body-yaw-gains)`. Its value is a guess today, between the
+  antennas' 10 and the legs' 300, and the diagnostic long hold arrives on only
+  about half the runs, so it needs its own instrument choice: `hold-probe <yaw
+  id> --gains P,I,D` for the probe half and a motion run that produces the long
+  hold every time for the confirmation half. Step 2b is what demoted it from a
+  lever to headroom: a stiffer loop was the only answer to the yaw's own
+  following lag while the model carried the generator alone, and the model
+  carries a measured lag per class now. What stands between this class and a
+  faster pair is its unmeasured motor.
 
 ### Capability
 
@@ -1213,10 +1387,113 @@ the constant: `probe-log-20260909T014542Z` and `…T014804Z`, `…T014858Z`,
 - Antennas' worst residual 0.4722–0.5247 rad behind, the same band as the
   unleaned rung's; health flat (servo 17 peak 33–34 C, servo 18 35–36 C).
 
-What stays open is the parking half, carried by `TODO(antenna-hold-gains)`: the
-integral term at `P 200` against the sides-pose offset, with the probes as the
-instrument for the arrival reading and a tour-side parking reading for the
-content one.
+What stayed open after this ladder was the parking half -- the integral term at
+`P 200` against the sides-pose offset. It was walked afterwards, on the probes,
+and refused; **Antennas -- the integral rung** below is that reading.
+
+### The model — the loop's following lag, read offline
+
+No hardware. The four 2026-09-09 capability and confirmation tours were exported
+whole with `//cogs:trace_export` (~21 700 periods each, working data, never
+committed) and read with `//cogs:trace_judge` at each run's own `config/`. All
+scan figures are **[A]**, off the lag-scan line the two analyzers and the tool
+share.
+
+**The scans, and what the acceptance rule did with them.**
+
+| class | instruments | λ\* | gain over zero lag | accepted |
+|---|---|---|---|---|
+| antennas | `…T015956Z` at `(522, 640)`, `…T020934Z` at `(418, 512)` | 1.2, 1.3 | 2.28×, 1.83× | **24 000 µs** — 1.2 periods of the 20 ms grid, at gains `200 / 0 / 0` |
+| legs | `…T015956Z` and `…T100150Z`, both motor-bound at 326 | 1.2, 1.2 | over 2× on both | **24 000 µs**, at gains `800 / 100 / 300` |
+| body yaw | none | grid top | 1.23–1.32× | **0** — the trapezoid alone |
+
+The antennas' two instruments are at two different pairs and agree to 0.1 period,
+which is what the rule asks: a servo that reaches its generator's speed and still
+stands the *same number of periods* behind it at two speeds is a first-order loop
+and not a motor short of its trapezoid. `…T020934Z` and `…T021726Z` are not legs
+instruments — their leg plateaux read 294 and 291 units against the commissioned
+326 — and are excluded from the legs' read although their scans give 1.2–1.3 all
+the same. The body yaw is the flat-floor case the rule is written for: it is
+gain-bound on all four tours, so no run has ever put its motor at its generator's
+speed, its scan runs out of grid rather than finding a floor, and 1.32× is under
+the 1.5× a minimum has to clear. It carries no lag, and that is a finding about
+the instrument rather than about the loop.
+
+**What the accepted lags did to the kept pins.** Every fixture replayed at its
+recorded pair and at the lag of the gains triple it was recorded at, read off the
+replay suite's own failure messages:
+
+| pin | at the trapezoid | at its loop's lag |
+|---|---|---|
+| `RECORDED_WORST_ANTENNA_RESIDUAL_RAD` (`stumble-and-recover`) | 0.3913 | **0.3625** |
+| `CONFIRM_WORST_LEG_RESIDUAL_RAD` (`grid-snap`, legs) | 0.3319 | **0.1983** |
+| `CLIP_WORST_LEG_RESIDUAL_RAD` (`side-peekaboo`) | 0.2978 | **0.2691** |
+| `WAKE_WORST_RESIDUAL_RAD`, head | 0.1346 | **0.1058** |
+| `WAKE_WORST_RESIDUAL_RAD`, antennas | 0.0748 | 0.0748, unmoved — `500 / 0 / 100`, a loop with no reading |
+| `RECORDED_WORST_HEAD_RESIDUAL_RAD` (`no-sad1`, a yaw) | 0.3884 | 0.3884, unmoved — the yaw carries no lag |
+| `CLIP_WORST_ANTENNA_RESIDUAL_AT_STIFF_GAINS_RAD` (`proud1`) | 0.3782 | 0.3782, unmoved, same reason |
+
+Every move is inside the lag's own periods of travel at that fixture's pair
+(0.0288 rad at 50 units, 0.188 rad at 326), and no class's worst magnitude rose
+on a fixture carrying the lag, so neither of step 2b's stop triggers fired. The
+library-wide antenna maximum becomes `proud1`'s 0.3782 rad — a recording of a
+loop the class no longer runs, judged at the generator alone — and the sizing
+rule clears it at 1.59 ×. The stillness watch's widest judged arc moves from 139
+to 144 periods under the antennas' lag, inside the 150 the settle allowance
+covers, so `SETTLE` was not touched.
+
+**A lag applied to a loop it was not read on is worse than no lag** — the one
+figure that makes the binding to a gains triple concrete. `fast4`, the antennas'
+bench speed record at `500 / 0 / 100` and `400 / 600` on a 31.984 ms grid, is
+judged at the trapezoid and reads a worst of 0.3321 rad, all of it ahead **[A]**.
+Replayed through `trace_judge --lag antennas=24000` — the microseconds the tree
+ships, which is λ ≈ 0.75 on that grid — it reads **0.6635 rad ahead**, past the
+0.6 rad screen, on a healthy sweep. `fast4` is kept and judged at the trapezoid;
+the figure is recorded here and nowhere in the code, and it is why a gains rung
+re-reads the lag and why step 3 re-reads it on the confirmation.
+
+**The window the model moves.** The `015956Z` tour's antenna worst was
+`toc-toc-toc` at 0.5078 rad under the trapezoid; under the model it is
+`sharp_side_tilt` at **0.2536 rad**, and the six worst motions re-order entirely
+(0.3806 → 0.2536, 0.4911 → 0.2286, 0.5078 → 0.1936, 0.4975 → 0.1873, 0.4997 →
+0.1865, 0.4569 → 0.1741) **[A]**, off `//cogs:library_tour_report` run over that
+log twice, once at its own `config/` and once at a copy carrying the three lag
+keys. 0.2536 rad is inside the 0.4 rad sizing bound, so that window is cut as
+`trace-tour-sharp-side-tilt-fast.csv` and the fast pair stayed a candidate. That
+run's body yaw was at `20 / 48`, left there by the morning's capability sweep,
+and the fixture is replayed at the register the recording ran under.
+
+### Antennas — the integral rung
+
+Twelve probe runs on `reachy00`, payload `b1f6ac4`, detector armed from the
+tree's `cogs/mover_params.textproto`. Every overlay carries the antennas at
+their fastest recorded pair `522 / 640` with the class's measured following lag,
+so both rungs are judged at one stimulus; the gains overlay is the only thing
+that moves between them. The control is the six `200 / 0 / 0` runs at that same
+pair and the leaned fold recorded above: every judged hold 0-1 counts, the right
+antenna parked 0.026 rad short at `sides←down`. All twelve figures are **[A]**,
+off `library_tour_report`'s stillness section.
+
+- **`200 / 50 / 0`, six runs.** A judged hold past the two-count bound in six of
+  six, 3-8 counts, with the regular-interval signature on the widest: 17.9 Hz at
+  a spread of 0.5 samples, 13.9 Hz at 1.2, 11.4 Hz at 1.0, 12.5 Hz at 0.7,
+  12.2 Hz at 0.8. Antennas' worst residual 0.2825-0.3210 rad behind and
+  0.2432-0.2553 rad ahead, sustained 0.1034-0.1141 rad; no fault, no obstruction
+  report, health flat. The term does what it was added for at one arrival --
+  `sides←down` parks at +0.0006 to +0.0011 rad, inside the bound, against the
+  control's 0.026 rad -- and costs a hunt at every pose to do it.
+- **`200 / 25 / 0`, six runs.** The bisection, and it is worse rather than
+  quieter: past the bound in six of six at 3-12 counts, the regular signature
+  still there at 11.9-14.1 Hz, and a second shape beside it. The right antenna's
+  sides hold moves 9-12 counts with **no reversal at all** and a mean error of
+  -0.0095 to -0.0110 rad -- a monotone walk past the goal, which is the
+  integrator winding while the loop sits inside its own deadband. Residuals
+  0.2608-0.3057 rad behind, 0.2229-0.2291 ahead, sustained 0.0790-0.0850.
+
+Verdict: the antennas keep `200 / 0 / 0`. Two rungs of the integral term were
+walked at the proportional bound and both hunt, so the parking error is the
+cost this loop is left with, recorded and accepted rather than traded for a
+limit cycle at every pose.
 
 ### Confirmation
 
@@ -1353,12 +1630,106 @@ and not commissioned**: at the tree's `P 200` the class follows a fast generator
 1.45–1.94 periods of travel behind, and the sizing rule the 0.6 rad screen is
 derived from has no room for that lag (0.5078 × 1.5 = 0.762). What stands
 between the measured pair and the tree is a plant model that accounts for the
-following lag, which is `TODO(session-servo-profile)`'s next step; the kept tour
-logs at all three antenna pairs are that work's data, and no hardware run is
-owed before it.
+following lag; the kept tour logs at all three antenna pairs are that work's
+data, and no hardware run is owed before it. That model was read and the
+antennas were commissioned at `(522, 640)` in the cycle after this one, which
+has its own sections in this record; what is left of
+`TODO(session-servo-profile)` is the body yaw.
 
 **Next step after that**: `TODO(antenna-raise-clock)`. The wake raise is one
 0.8 s min-jerk duration for the head and the antennas together, so the pair the
 model cycle commissions changes the antennas' *follow* and not the clock; a
 raise the user would call a snap is the antennas' raise on its own clock, read
 at the pair once it is settled.
+
+### Confirmation — the antennas at their measured pair
+
+The second confirmation, one cycle after the one above and under the model that
+cycle read. Six runs on `reachy00`, payload `b1f6ac4`, detector armed from the
+tree's `cogs/mover_params.textproto`. One overlay throughout,
+`.local/experiment/step37-confirm-antennas-522-640`: `servo_profile.textproto`
+alone with the antennas at `(522, 640)` and their 24 000 µs lag, the legs at
+`(287, 326)` and 24 000 µs and the body yaw at `(20, 50)` and 0 falling through
+from the tree; profile digest `b5a31c7365e09a78…`, gains digest
+`3f93c6c83d6f1f1b…`, which is the tree's `200 / 0 / 0` — the integral rung
+above having been refused, the candidate gains *are* the tree's. No tour: the
+library was not flown this cycle, so the confirmation is the set step 3 names
+for that case. All six exit `0` — no finding from either analyzer, no
+`TickFaults` row, no obstruction report, health flat (servo 17 peak 33–34 C,
+servo 18 36–37 C, rail 7.30–7.50 V, worst error byte `0x01`), every window
+moving. **[A]** throughout.
+
+| # | run directory | motion | antennas worst behind / ahead | sustained | lag scan | judged antenna holds |
+|---|---|---|---|---|---|---|
+| 13 | `probe-log-20260909T234131Z/1788997249461989783` | sweep | 0.2105 / 0.1988 | 0.1290 | 1.1 periods, 2.48× | all 0–1 counts |
+| 14 | `probe-log-20260909T234221Z/1788997299577314035` | sweep | 0.2051 / 0.1913 | 0.1222 | 1.1 periods, 2.50× | all 0–1 counts |
+| 15 | `probe-log-20260909T234440Z/1788997434947436053` | step-a | 0.2535 / 0.2152 | 0.0742 | 1.1 periods, 2.26× | all 0–1 counts |
+| 16 | `probe-log-20260909T234534Z/1788997489144309109` | step-b | 0.2363 / 0.1958 | 0.0577 | 1.2 periods, 2.27× | all 0–1 counts |
+| 17 | `motion-log-20260909T234627Z/1788997548054490632` | wake | 0.0314 / 0.0818 | 0.0577 | 0.9 periods, 3.37× | all 0–1 counts |
+| 18 | `motion-log-20260909T234714Z/1788997595065396579` | wake | 0.0326 / 0.0817 | 0.0577 | 0.9 periods, 3.27× | all 0–1 counts |
+
+- **Residual, the candidate class: pass on both sides.** Worst behind 0.2535 rad
+  and worst ahead 0.2152 rad against the 0.4 rad bound, both a little over half
+  of it; worst sustained 0.1290 rad against the 0.6000 rad screen. The four
+  content-chasing runs are the band; the two wake runs sit far inside it, the
+  gesture being a shaped path the class now follows easily.
+- **The lag re-read: pass.** Both sweeps read 1.1 periods against the payload's
+  1.2, a disagreement of 0.1 against the 0.25 allowed; the step probes read 1.1
+  and 1.2 and the wake runs 0.9. The gains did not move this cycle and the loop
+  did not either.
+- **The controls: pass, with room.** Legs worst 0.0627–0.0654 rad against a kept
+  0.1983 rad, body yaw 0.0138–0.0184 rad against a kept 0.3884 rad, and both
+  classes' lag scans re-read at what they were baked at — 1.1–1.2 periods for
+  the legs, a flat floor for the yaw.
+- **The probes: pass as the integral rung left them.** Every judged hold in runs
+  15 and 16 is 0–1 counts, and the `sides←down` parking error is on record
+  again at the figure that entry accepted — right antenna −0.0261 rad, left
+  +0.0123 rad.
+- **Capability: pass, read off the prior cycle's tour.** The operand is
+  `tour-log-20260909T015956Z`, the library at `(522, 640)` and `200 / 0 / 0` —
+  the shipping gains and the shipping pair — imported as an offline trace: the
+  class reads motor-bound with a plateau of 675 units against the pair's 640, a
+  ratio of 1.05 inside `CAPABILITY_PLATEAU_RATIO`. Capability takes no lag, so a
+  tour flown before the model existed reads it soundly.
+
+**The sweeps' own capability line is not that reading, and this is where the
+step first stopped.** Both sweeps read the antennas motor-bound at a plateau of
+310 units against 640, a ratio of 2.06. It is the instrument and not the motor:
+the same runs' chasing travel reaches p90 643 and max 787 units, over the pair,
+and the step probes on the same overlay reach 694–787. What the sweep lacks is
+samples at a *large* error — 281 chasing samples for the class, with every band
+above 0.60 rad holding 6–12 and printing `unread -- under 20 samples` — so the
+readable bands are the ramps into and out of each leg rather than a cruise. A
+joint following a streamed setpoint written at its own cap never opens the error
+a plateau is read over; a tour, whose generator stays saturated for hundreds of
+periods, does. The step probes are no better placed: run 15 reads the class
+gain-bound and run 16 content-bound on the same overlay. The confirmation was
+stopped on this reading and nothing was baked from it until the rule above was
+written; the six runs stand exactly as recorded, and it is the rule that moved,
+not a figure.
+
+**Verdict: pass, and the antennas are commissioned.** `(522, 640)` with a
+24 000 µs following lag goes into `cogs/servo_profile.textproto` and
+`SHIPPED_PROFILES`, alongside the legs' 24 000 µs. The two sweeps' and the step
+probe's worst antenna windows are kept as `trace-probe-antenna-sweep.csv` and
+`trace-probe-antenna-step-a.csv`, replayed at the profile the tree ships;
+`RECORDED_WORST_ANTENNA_RESIDUAL_RAD` is re-baked to 0.2536 rad, the class at
+the configuration it now runs, and `RECORDED_P999_ANTENNAS_RESIDUAL_RAD` to the
+three recordings at that configuration — the `015956Z` tour and the two sweeps
+— rather than to three tours. The obstruction-cost figures in
+`docs/fault-management.md` and `CLAUDE.md` are re-derived at both commissioned
+pairs, and the antennas get their own paragraph there: a held antenna crosses
+the 0.6 rad screen in two periods at the cap and the pair is torqued off about a
+quarter of a second after the hand lands.
+
+**What this does not deliver**: the snap. The wake raise is still one 0.8 s
+clock for the head and the antennas together, and a pair that follows that clock
+closely is not a faster clock. `TODO(antenna-raise-clock)` is what remains, and
+it is now a mover change with nothing behind it but the clock.
+
+**What the confirmation set still owes**: nothing this cycle, because the
+shipping configuration's library tour already exists. Had the integral rung
+passed, the gains would have moved and no tour at the shipping triple would
+exist — the antenna pin would have come off the sweep's worst window and a
+library window at the shipping configuration would have been owed to the next
+tour. That branch was not taken.

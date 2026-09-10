@@ -153,10 +153,31 @@ pub const BODY_YAW_PROFILE_VELOCITY: i64 = 50;
 /// The two antennas' profile acceleration, register units. Their own pair: the
 /// antenna servos are a different XL330 variant with a Velocity Limit 3.6x the
 /// head's.
-pub const ANTENNAS_PROFILE_ACCELERATION: i64 = 20;
+pub const ANTENNAS_PROFILE_ACCELERATION: i64 = 522;
 
-/// The two antennas' profile velocity, register units.
-pub const ANTENNAS_PROFILE_VELOCITY: i64 = 50;
+/// The two antennas' profile velocity, register units. The class's own measured
+/// capability, which it is commissioned at.
+pub const ANTENNAS_PROFILE_VELOCITY: i64 = 640;
+
+/// The six platform servos' following lag, microseconds.
+///
+/// Not a register and written to no servo: how far the class's position loop
+/// stands behind the trajectory its generator runs, which the decision tick's
+/// model carries so that it predicts a healthy joint rather than a generator.
+/// Mirrors the deployed `ServoProfile.legs_following_lag_us`. Zero is the
+/// generator alone, and is what a class carries until a reading is accepted for
+/// it. This one is 1.2 periods of the shipped grid, read at the class's own
+/// gains.
+pub const LEGS_FOLLOWING_LAG_US: i64 = 24_000;
+
+/// The body yaw servo's following lag, microseconds.
+///
+/// Zero: the class is gain-bound on every recording, so no kept run holds its
+/// motor's own speed to read a loop against.
+pub const BODY_YAW_FOLLOWING_LAG_US: i64 = 0;
+
+/// The two antennas' following lag, microseconds, read at `200 / 0 / 0`.
+pub const ANTENNAS_FOLLOWING_LAG_US: i64 = 24_000;
 
 /// Whether the deployed `MoverParams` arms the plant-model tracking detector.
 ///
@@ -272,9 +293,12 @@ pub fn cycles_for(duration_ns: i64) -> i64 {
 /// expression over this rather than as an integer somebody nudged until the run
 /// went green -- the arithmetic is then the reason the number is what it is.
 ///
-/// The figure is an upper bound on the stepped plant by a cycle or three (the
-/// closed form is continuous-time), which is the direction an arrival assertion
-/// needs: an instant taken from here is never before the joint got there.
+/// The figure is the walked model's own arrival period, exactly: the plant
+/// steps the same trapezoid and the same loop the sim runs, so this is when the
+/// modelled shaft stands on the distance and not a bound either side of it. A
+/// caller that wants margin -- for a goal the planner eases into, or for a
+/// clock the scenario counts from a cycle earlier -- adds it here, because
+/// nothing is carried in the figure.
 ///
 /// The class is named because the profile is per class: a travel worked out on
 /// the legs' generator and asserted about an antenna is an instant off a
@@ -438,8 +462,9 @@ pub fn posture_walk(
         .joints()
         .map(|(_, angle)| angle);
     let mut state = standing.map(|angle| reachy_motion::plant::Predicted {
-        position: angle,
+        generator: angle,
         velocity: 0.0,
+        position: angle,
     });
     // The setpoints the servos have been handed and not yet answered, oldest
     // first: the response delay, stepped the way the plant and the decision
@@ -525,7 +550,10 @@ pub fn stow_walk() -> &'static PostureWalk {
 /// How long the walk above may run before it is a bug rather than a slow
 /// machine: two minutes of cycles, against the longest posture move's three
 /// seconds.
-const MAX_TRAVEL_CYCLES: i64 = 6_000;
+///
+/// The plant's own guard on the same question, so the walk here and the walks
+/// inside the model give up at one bound rather than two.
+const MAX_TRAVEL_CYCLES: i64 = reachy_motion::plant::MAX_TRAVEL_CYCLES as i64;
 
 /// How many cycles after it is commanded the machine is standing upright.
 #[must_use]
@@ -1384,6 +1412,15 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
                 "antennas_profile_velocity",
                 Value::Int(ANTENNAS_PROFILE_VELOCITY),
             ),
+            ("legs_following_lag_us", Value::Int(LEGS_FOLLOWING_LAG_US)),
+            (
+                "body_yaw_following_lag_us",
+                Value::Int(BODY_YAW_FOLLOWING_LAG_US),
+            ),
+            (
+                "antennas_following_lag_us",
+                Value::Int(ANTENNAS_FOLLOWING_LAG_US),
+            ),
         ],
         &mut failures,
     );
@@ -1426,28 +1463,47 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
     // no deployment runs. Per class, because a check that compared one pair
     // would pass a file that gave the antennas the legs' numbers.
     let shipped = reachy_motion::plant::SHIPPED_PROFILES;
-    for (class, pair, (expected_a, expected_v)) in [
+    for (class, profile, (expected_a, expected_v, expected_lag)) in [
         (
             "legs",
             shipped.legs,
-            (LEGS_PROFILE_ACCELERATION, LEGS_PROFILE_VELOCITY),
+            (
+                LEGS_PROFILE_ACCELERATION,
+                LEGS_PROFILE_VELOCITY,
+                LEGS_FOLLOWING_LAG_US,
+            ),
         ),
         (
             "body yaw",
             shipped.yaw,
-            (BODY_YAW_PROFILE_ACCELERATION, BODY_YAW_PROFILE_VELOCITY),
+            (
+                BODY_YAW_PROFILE_ACCELERATION,
+                BODY_YAW_PROFILE_VELOCITY,
+                BODY_YAW_FOLLOWING_LAG_US,
+            ),
         ),
         (
             "antennas",
             shipped.antennas,
-            (ANTENNAS_PROFILE_ACCELERATION, ANTENNAS_PROFILE_VELOCITY),
+            (
+                ANTENNAS_PROFILE_ACCELERATION,
+                ANTENNAS_PROFILE_VELOCITY,
+                ANTENNAS_FOLLOWING_LAG_US,
+            ),
         ),
     ] {
-        let (acceleration, velocity) = (pair.acceleration, pair.velocity);
+        let (acceleration, velocity) = (profile.acceleration, profile.velocity);
         if i64::from(acceleration) != expected_a || i64::from(velocity) != expected_v {
             failures.push(format!(
                 "the motion library ships the {class} at profile {acceleration}/{velocity} and \
                  the scenarios expect {expected_a}/{expected_v}",
+            ));
+        }
+        let lag = profile.following_lag_us;
+        if i64::from(lag) != expected_lag {
+            failures.push(format!(
+                "the motion library models the {class} at a following lag of {lag} us and the \
+                 scenarios expect {expected_lag} us",
             ));
         }
     }
@@ -1614,8 +1670,9 @@ mod tests {
     }
 
     /// The stepped walk every re-derived instant in the suite is an expression
-    /// over lands where the plant's own closed form says it must: at or after
-    /// it, and within a few cycles of it.
+    /// over lands where the move's own arithmetic says it must: at or after the
+    /// plant's travel, and within a few cycles of whichever of the clock and
+    /// that travel is binding.
     ///
     /// The failure direction is the silent one. A walk that over-estimates --
     /// sampling the planned path at the wrong instant, pushing a setpoint
@@ -1628,15 +1685,26 @@ mod tests {
     /// The distance is the arc the planner takes, not the difference between
     /// the angles: each antenna is routed inboard over the head rather than out
     /// through its own sideways point, so the fold-to-upright arc is a whole
-    /// turn less that difference. Arrival is at or after the closed form because the closed
-    /// form is a straight-line travel from rest to rest, and a joint chasing a
-    /// min-jerk goal is slower than its profile for the first cycles because
-    /// the goal is -- so it saturates late and arrives later. Two small terms
-    /// pull the other way and nearly cancel it: the closed form is
-    /// continuous-time and over-estimates the stepped plant by a cycle or
-    /// three, and the walk counts from the cycle the move is commanded on
-    /// rather than from the one the first setpoint is dated at. So the band is
-    /// stated wide at the top and tight at the bottom.
+    /// turn less that difference. Arrival is at or after the plant's travel
+    /// because that travel is a straight-line move from rest to rest, and a
+    /// joint chasing a min-jerk goal is slower than its profile for the first
+    /// cycles because the goal is -- so it saturates late and arrives later.
+    /// One small term pulls the other way: the walk counts from the cycle the
+    /// move is commanded on rather than from the one the first setpoint is
+    /// dated at. So the band is stated wide at the top and tight at the
+    /// bottom.
+    ///
+    /// Which of the two is binding depends on the commissioning. With the
+    /// antennas at their own measured capability the generator carries the
+    /// whole planned path, so the arrival is set by the later antenna's own
+    /// clock rather than by the plant; at a slower pair the plant's travel
+    /// binds. The ceiling is read against whichever of them is larger and not
+    /// against their sum, so that it keeps an edge under either commissioning:
+    /// their sum at the shipped pair would be tens of cycles of slack and would
+    /// catch only a walk riding its own 6 000-cycle guard. What is added to the
+    /// binding term is what the walk itself adds and nothing else -- the goal's
+    /// own lag, the servo's response delay, and one settle's worth for the
+    /// min-jerk tail to come inside the arrival tolerance.
     #[test]
     fn the_stepped_arrival_walk_agrees_with_the_plant_it_walks() {
         let stow = reachy_motion::postures::stow_pose_targets();
@@ -1644,19 +1712,23 @@ mod tests {
         let folded = posture_joints(&stow);
         let upright = posture_joints(&neutral);
         let arc = core::f64::consts::TAU - (upright.antennas[0] - folded.antennas[0]).abs();
-        let closed_form = travel_cycles(reachy_motion::joints::JointGroup::Antennas, arc);
+        let plant_cycles = travel_cycles(reachy_motion::joints::JointGroup::Antennas, arc);
 
         let arrived = up_travel();
         assert!(
-            arrived >= closed_form,
-            "the walk has the machine upright at cycle {arrived}, before the {closed_form} \
+            arrived >= plant_cycles,
+            "the walk has the machine upright at cycle {arrived}, before the {plant_cycles} \
              cycles the plant needs for {arc:.4} rad"
         );
+        let binding = plant_cycles.max(crate::up_clocks().cycles());
+        let ceiling =
+            binding + LAG_K + crate::response_delay_cycles() + crate::ARRIVAL_SETTLE_CYCLES;
         assert!(
-            arrived <= closed_form + LAG_K + 12,
-            "the walk has the machine upright at cycle {arrived}, well past the {closed_form} \
-             cycles the plant needs for {arc:.4} rad: a row that never registered its arrival \
-             would widen every arrival window in the suite"
+            arrived <= ceiling,
+            "the walk has the machine upright at cycle {arrived}, past the {ceiling} cycles the \
+             binding {binding} of clock or plant travel for {arc:.4} rad, the goal's own lag, the \
+             servo's response delay and a settle come to: a row that never registered its arrival \
+             would widen every arrival window in the suite",
         );
 
         // The row that arrives last is an antenna, which is the premise
@@ -1841,6 +1913,18 @@ mod tests {
                             "antennas_profile_velocity",
                             shipped.antennas.velocity.to_string(),
                         ),
+                        (
+                            "legs_following_lag_us",
+                            shipped.legs.following_lag_us.to_string(),
+                        ),
+                        (
+                            "body_yaw_following_lag_us",
+                            shipped.yaw.following_lag_us.to_string(),
+                        ),
+                        (
+                            "antennas_following_lag_us",
+                            shipped.antennas.following_lag_us.to_string(),
+                        ),
                     ],
                 ),
                 (
@@ -1922,7 +2006,7 @@ mod tests {
 
         // One perturbation per pinned key, each a value the field could
         // plausibly drift to.
-        let perturbations: [(&str, &str, &str); 16] = [
+        let perturbations: [(&str, &str, &str); 19] = [
             ("mover_params.textproto", "tracking_armed", "false"),
             ("servo_profile.textproto", "legs_profile_acceleration", "21"),
             ("servo_profile.textproto", "legs_profile_velocity", "51"),
@@ -1938,6 +2022,17 @@ mod tests {
                 "21",
             ),
             ("servo_profile.textproto", "antennas_profile_velocity", "51"),
+            ("servo_profile.textproto", "legs_following_lag_us", "30000"),
+            (
+                "servo_profile.textproto",
+                "body_yaw_following_lag_us",
+                "30000",
+            ),
+            (
+                "servo_profile.textproto",
+                "antennas_following_lag_us",
+                "30000",
+            ),
             ("servo_gains.textproto", "legs_p", "801"),
             ("servo_gains.textproto", "legs_i", "101"),
             ("servo_gains.textproto", "legs_d", "301"),

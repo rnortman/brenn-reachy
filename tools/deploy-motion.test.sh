@@ -1894,21 +1894,25 @@ assert_lacks "a failed fetch leaves no directory to analyse" \
 	"$(find "$failed_dest" -maxdepth 1)" ".part"
 RSYNC_STATUS=0
 
-# Two fetches inside one UTC second. `mv` moves a directory into an existing one
-# of the same name, so this used to file the second run's records at
-# motion-log-<stamp>/motion-log-<stamp>.part while printing the first run's path.
-# The stamp cannot be finer than the name it makes, so the collision is refused.
+# Two fetches inside one UTC second.  The stamp cannot be finer than the name it
+# makes, so the collision is refused.
 #
 # The stamp is the subject's own `date`, so the destination is pre-created for
 # this second and the next several: the second can tick between this line and the
 # subject's read, and a self-check that fails once an hour is a self-check
-# nobody believes. Ten seconds, because three cases each run a whole fetch and
-# the window is measured under `make check`, where the machine is also building.
+# nobody believes. Each case below occupies its own ten-second window, which is
+# the width a whole fetch has to finish inside.
+#
+# The window must be contiguous, so all ten stamps come off one epoch read: ten
+# separate clock reads can straddle a tick, leaving every stamp from that
+# iteration on a second late and one second inside the window unoccupied. The
+# subject then stamps into that hole and fetches.
 collide="${work}/collide"
 occupy() {
-	local dir=$1 suffix=$2 ahead
+	local dir=$1 suffix=$2 base ahead
+	base=$(date -u +%s)
 	for ahead in 0 1 2 3 4 5 6 7 8 9; do
-		mkdir -p -- "${dir}/motion-log-$(date -u -d "+${ahead} seconds" +%Y%m%dT%H%M%SZ)${suffix}"
+		mkdir -p -- "${dir}/motion-log-$(date -u -d "@$((base + ahead))" +%Y%m%dT%H%M%SZ)${suffix}"
 	done
 }
 occupy "$collide" ""

@@ -66,8 +66,8 @@ use motion_evidence::{ARRIVAL_TURN_RAD, closest, solved_pose};
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use pose_reading::{
-    Grid, RunConfig, Skips, capabilities, capability, health_summary, lags, no_faults,
-    present_rows, residual_stream, residuals,
+    Grid, RunConfig, Skips, capabilities, capability, health_summary, lag_scan, lag_scans, lags,
+    no_faults, present_rows, residual_stream, residuals,
 };
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, row, rows_of};
@@ -2248,7 +2248,16 @@ fn analyze(run: &Run) -> Report {
     lags(&run.samples, &mut report);
     stillness(run, &mut report);
     health_summary(&run.readings, &mut report);
-    capabilities(&capability(&run.samples, grid), &mut report);
+    let measured = capability(&run.samples, grid);
+    capabilities(&measured, &mut report);
+    let profiles = run
+        .config
+        .as_ref()
+        .map_or(SHIPPED_PROFILES, |config| config.profiles);
+    match lag_scan(&run.samples, grid, &profiles, &measured) {
+        Ok(scans) => lag_scans(&scans, &mut report),
+        Err(error) => report.fail(error),
+    }
     transactions(run, &traffic, &mut report);
     head_of_the_log(run, &mut report);
     counter_cross_check(run, &traffic, &mut report);

@@ -1,26 +1,35 @@
-//! S12, a reversal mid-stow: the scenario that says a goal turning round under
-//! a lagging joint is not a snag.
+//! S12, the mid-fold re-raise: the scenario that says a wake word landing
+//! inside the machine's own fold is answered by a splice and nothing else.
 //!
 //! A machine folding itself away is asked to come back up, a second into a 2 s
 //! fold. The head takes it as any replacement: the schedule is swapped under a
 //! fresh epoch and the mover splices a raise from the last commanded targets.
-//! What makes the run worth a scenario is the antennas, which have three
-//! radians to unwind at a servo profile that carries a fifth of that in the
-//! time the fold is given: the goal reverses under a joint still carrying the
-//! old direction, and for as long as that lasts the joint is running *away*
-//! from where it is being asked to go.
+//! What makes the run worth a scenario is the instant it lands on -- one cycle
+//! inside the fold's move, so what turns round is a goal that had not yet
+//! stopped, and the joints reverse with it. No other scenario in this suite
+//! carries a replacement that turns the joints' direction round mid-move.
 //!
-//! That is the run the bench produced an `antenna_obstructed` on. Nothing is
-//! wrong with the machine: the joint follows, late, and arrives. So the
-//! load-bearing assertion here is a negative -- no fault reported, no antenna
-//! pair let go -- and the positive beside it is that the head really did come
-//! up, measured off the plant.
+//! The load-bearing assertions are the replacement's mechanics -- the schedule
+//! swapped under a fresh epoch on the wake it arrived, the reversal landing
+//! inside the move, the raise reaching the posture measured off the plant --
+//! and the negative beside them: nothing was raised for the splice, no pair was
+//! let go, no torque was touched.
 //!
-//! No hand on the plant at all. The modelled servos run the profile the
-//! commissioning sweep wrote into them, and the fold asks an antenna for
-//! 2.9 rad in 2 s -- more than twice what that profile can carry -- so the joint
-//! trails the fold's goal by more than the detector's threshold on its own.
-//! Every answer the run gives is the system's own.
+//! At the shipped servo profiles the fold is *followed*, not chased: the
+//! antennas' generator carries ten times the fold's arc in the fold's clock, so
+//! on the reversal cycle every antenna stands nearer its goal than the figure
+//! the detector screens at. The checker states that as a fact rather than
+//! leaving it implied, because it is the headroom the commissioning was sized
+//! to keep over the machine's own postures. It is a statement about goal error
+//! and not about the detector: in this harness the simulated shaft is the
+//! tick's own plant model, so an unobstructed row's residual is nil and the
+//! screen is not exercised here at all. The detector's rule is exercised by the
+//! pace cases in `crates/reachy-motion/src/tick.rs` and its silence on the real
+//! machine is the hardware record in `docs/servo-tuning.md`.
+//!
+//! No hand on the plant at all: the modelled servos run the profile the
+//! commissioning sweep wrote into them, and every answer the run gives is the
+//! system's own.
 //!
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. Every instant is a cycle count from the epoch.
@@ -69,12 +78,9 @@ pub fn stow_cycles() -> i64 {
 
 /// How many cycles into the fold the replacement arrives.
 ///
-/// Where the joint stands furthest behind the fold's goal. The fold asks for
-/// 2.9 rad of antenna in the 100 cycles its clock runs and the servo's profile
-/// carries 0.024 rad a cycle, so the gap grows for as long as the goal is
-/// moving and is widest on the last cycle of the move -- which is where this
-/// lands, one cycle inside the move so that the goal turning round is a goal
-/// that had not yet stopped.
+/// One cycle inside the fold's move, so that the goal turning round is a goal
+/// that had not yet stopped: what the splice reverses is a joint still
+/// following a moving target, which is the run's whole subject.
 #[must_use]
 pub fn reversal_after_stow() -> i64 {
     stow_move_cycles() - 1
@@ -94,7 +100,7 @@ pub fn raise_cycles() -> i64 {
 ///
 /// The group rather than two named servos, because what is being measured is
 /// the part -- both antennas are the same rotor on the same profile, and a
-/// machine that grew another one would trail the fold with it.
+/// machine that grew another one would follow the fold with them.
 #[must_use]
 pub fn antenna_rows() -> JointFlags {
     JointGroup::Antennas.joints()
@@ -106,8 +112,8 @@ pub fn stow_start_cycle() -> i64 {
     up_start_cycle() + opening_up_cycles()
 }
 
-/// The cycle the replacement is sent on: at the end of the fold's move, where
-/// the lagging antennas stand furthest behind it.
+/// The cycle the replacement is sent on: the end of the fold's move, with the
+/// goal still travelling.
 #[must_use]
 pub fn reversal_cycle() -> i64 {
     stow_start_cycle() + reversal_after_stow()

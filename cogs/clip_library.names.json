@@ -274,10 +274,14 @@
     },
     {
       "clip_id": 68,
-      "name": "bench/sway"
+      "name": "probe/antenna-sweep"
     },
     {
       "clip_id": 69,
+      "name": "bench/sway"
+    },
+    {
+      "clip_id": 70,
       "name": "bench/tip"
     }
   ],
@@ -692,20 +696,26 @@
     },
     {
       "blend_out_ms": 200,
-      "duration_ms": 800,
+      "duration_ms": 15500,
       "motion_id": 68,
+      "name": "probe/antenna-sweep"
+    },
+    {
+      "blend_out_ms": 200,
+      "duration_ms": 800,
+      "motion_id": 69,
       "name": "bench/sway"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 500,
-      "motion_id": 69,
+      "motion_id": 70,
       "name": "bench/tip"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 1701,
-      "motion_id": 70,
+      "motion_id": 71,
       "name": "bench/tour"
     }
   ]

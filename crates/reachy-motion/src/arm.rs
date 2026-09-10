@@ -215,7 +215,8 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // P-only climb hunts at 400 and at 800 where 200 sits at two counts of
     // dither.
     //
-    // TODO(body-yaw-gains): the derivative term is the next rung.
+    // TODO(body-yaw-gains): a derivative term is the next rung; headroom,
+    // not a need at the current pair.
     yaw: Gains { p: 200, i: 0, d: 0 },
     // The vendor's own triple, and the measured one: over the antenna step
     // probes, where the servo's own generator makes and stops the whole move,
@@ -225,13 +226,12 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // the probes hold. What selected the one hunt on record was the pose and
     // not the arrival: the antenna fold hunted at every profile pair from the
     // motor's ceiling to the shipped floor until the fold was leaned off the
-    // vertical, which is what `disarm::STOW_ANTENNAS` is. No integral term: an
-    // antenna holds nothing up. The cost is a parking error -- the loop stops
-    // where friction balances the proportional push, 0.026 rad short at the
-    // sides pose on the arrival from the fold.
-    //
-    // TODO(antenna-hold-gains): the integral term at this proportional term is
-    // the rung nobody has walked, against that parking error.
+    // vertical, which is what `disarm::STOW_ANTENNAS` is. No integral term:
+    // an antenna holds nothing up, and both `I 50` and `I 25` hunt past the
+    // two-count bound — the second winds the joint past its goal without
+    // reversing. The accepted cost is a parking error: the loop stops where
+    // friction balances the proportional push, 0.026 rad short at the sides
+    // pose on the arrival from the fold.
     antennas: Gains { p: 200, i: 0, d: 0 },
 };
 
@@ -1649,7 +1649,7 @@ mod tests {
 
     use super::*;
     use crate::joints::group_of_row;
-    use crate::plant::ProfilePair;
+    use crate::plant::ClassProfile;
     use crate::testutil::{Asked, ScriptedBus, asked};
     use crate::txn::AuxOpKind;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -2573,17 +2573,20 @@ mod tests {
     #[test]
     fn the_sweep_writes_each_servo_its_own_class_pair() {
         let profiles = GroupProfiles {
-            legs: ProfilePair {
+            legs: ClassProfile {
                 acceleration: 20,
                 velocity: 50,
+                following_lag_us: 0,
             },
-            yaw: ProfilePair {
+            yaw: ClassProfile {
                 acceleration: 30,
                 velocity: 60,
+                following_lag_us: 0,
             },
-            antennas: ProfilePair {
+            antennas: ClassProfile {
                 acceleration: 40,
                 velocity: 70,
+                following_lag_us: 0,
             },
         };
         let cfg = ArmConfig {
@@ -2597,9 +2600,10 @@ mod tests {
         commission(&cfg, &mut machine).expect("commissioning passes");
 
         for (row, id) in SERVO_IDS.iter().enumerate() {
-            let ProfilePair {
+            let ClassProfile {
                 acceleration,
                 velocity,
+                ..
             } = profiles.for_row(row);
             let written = |reg: RegId| {
                 machine

@@ -47,6 +47,14 @@ rust_test(
 # directory beside the `data` attribute that supplies it, so the two halves of
 # that arrangement sit in one place. The path is relative to the runfiles root,
 # which is a test's working directory.
+# The recordings themselves, named once: the replay suite and
+# `//cogs:trace_judge` both read them.
+filegroup(
+    name = "trace_fixtures",
+    srcs = glob(["fixtures/traces/*.csv"]),
+    visibility = ["//visibility:public"],
+)
+
 rust_test(
     name = "replay_test",
     size = "small",
@@ -55,7 +63,7 @@ rust_test(
         "tests/replay_trace.rs",
     ],
     crate_root = "tests/replay_test.rs",
-    data = glob(["fixtures/traces/*.csv"]),
+    data = [":trace_fixtures"],
     env = {"REACHY_MOTION_TRACE_FIXTURES": "crates/reachy-motion/fixtures/traces"},
     deps = [
         ":reachy_motion",

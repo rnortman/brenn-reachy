@@ -61,7 +61,7 @@ use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
     self, JointGroup, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
 };
-use reachy_motion::plant::{ProfilePair, RESPONSE_DEAD_SAMPLES};
+use reachy_motion::plant::{ClassProfile, RESPONSE_DEAD_SAMPLES};
 use reachy_motion::record;
 use reachy_motion::snap::PoseSnapshotError;
 use reachy_motion::tick::ResponseKind;
@@ -1303,9 +1303,10 @@ fn every_gain_field_reaches_the_class_it_names() {
     assert_eq!(mapped.antennas, Gains { p: 7, i: 8, d: 9 });
 }
 
-/// The same for the profile file's six, for the same reason: three pairs that
-/// differ are the only arrangement in which a crossed reader shows, and the
-/// deployment ships three that are equal.
+/// The same for the profile file's nine, for the same reason: three profiles
+/// that differ are the only arrangement in which a crossed reader shows, and
+/// the deployment ships three whose lags are all zero and two of whose pairs
+/// are equal.
 #[test]
 fn every_profile_field_reaches_the_class_it_names() {
     let mut message = ServoProfileWire::new();
@@ -1315,14 +1316,18 @@ fn every_profile_field_reaches_the_class_it_names() {
     message.set_body_yaw_profile_velocity(4);
     message.set_antennas_profile_acceleration(5);
     message.set_antennas_profile_velocity(6);
-    let mapped = motion_cogs::group_profiles(message.validate().expect("six registers read"));
-    let pair = |acceleration, velocity| ProfilePair {
+    message.set_legs_following_lag_us(7);
+    message.set_body_yaw_following_lag_us(8);
+    message.set_antennas_following_lag_us(9);
+    let mapped = motion_cogs::group_profiles(message.validate().expect("nine figures read"));
+    let pair = |acceleration, velocity, following_lag_us| ClassProfile {
         acceleration,
         velocity,
+        following_lag_us,
     };
-    assert_eq!(mapped.legs, pair(1, 2));
-    assert_eq!(mapped.yaw, pair(3, 4));
-    assert_eq!(mapped.antennas, pair(5, 6));
+    assert_eq!(mapped.legs, pair(1, 2, 7));
+    assert_eq!(mapped.yaw, pair(3, 4, 8));
+    assert_eq!(mapped.antennas, pair(5, 6, 9));
 }
 
 /// The detector's arming is the parameter file's field, in both directions.
@@ -3264,8 +3269,8 @@ const LEGS_PROFILE_ACCELERATION: u32 = 287;
 const LEGS_PROFILE_VELOCITY: u32 = 326;
 const BODY_YAW_PROFILE_ACCELERATION: u32 = 20;
 const BODY_YAW_PROFILE_VELOCITY: u32 = 50;
-const ANTENNAS_PROFILE_ACCELERATION: u32 = 20;
-const ANTENNAS_PROFILE_VELOCITY: u32 = 50;
+const ANTENNAS_PROFILE_ACCELERATION: u32 = 522;
+const ANTENNAS_PROFILE_VELOCITY: u32 = 640;
 
 /// The environment variable naming the shipped profile, relative to the
 /// runfiles root.

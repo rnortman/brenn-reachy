@@ -166,9 +166,9 @@ about anything a control step can see.
 
 | slug | what it detects | response |
 |---|---|---|
-| `antenna_obstructed` | an antenna standing past the tracking threshold from where its own servo's trajectory generator has got to, for a whole window, without closing on it or keeping pace with it: interference, a snag, a hand | `degrade_antennas` |
+| `antenna_obstructed` | an antenna standing past the tracking threshold from where a healthy servo following its generator would stand, for a whole window, without closing on it or keeping pace with it: interference, a snag, a hand | `degrade_antennas` |
 | `antenna_servo_fault` | hardware-error bits on an antenna servo, mid-run or at engage | `degrade_antennas` |
-| `head_obstructed` | a leg or the body yaw standing past the threshold from its generator's trajectory for a whole window, without closing or pacing: a grab, a snag, a jam. Not a motor failure — the servo still commands | `slow_stow_to_rest` |
+| `head_obstructed` | a leg or the body yaw standing past the threshold from where a healthy servo following its generator would stand, for a whole window, without closing or pacing: a grab, a snag, a jam. Not a motor failure — the servo still commands | `slow_stow_to_rest` |
 | `head_servo_fault` | hardware-error bits on a leg or body-yaw servo mid-run | `masked_slow_stow_to_park` |
 | `position_feedback_lost` | too many consecutive periods with no usable position read; a reading nobody can place counts as one of them | `immediate_all_torque_off_to_park` |
 | `measured_pose_invalid` | the measured cranks yield no believable head pose for a whole run of live reads — a mechanism outside its own model | `immediate_all_torque_off_to_park` |
@@ -225,12 +225,31 @@ all but, by the raise — a hold at the end of a move, a static goal, a short
 move — and the hand comes off within about 180 ms of it, a window less the
 from-rest ramp to the progress minimum. A hand that took the
 head mid-move, with the goal still running at the profile past the prediction,
-has about 160 ms — a window less the two periods a released crank takes to ramp
-from rest to the pace fraction of a generator at the cap: a joint released later
+has about 140 ms — a window less the three periods a released crank takes to
+ramp from rest to the pace fraction of a generator at the cap: a joint released later
 than that is still under that fraction when the window runs out, so the second
 raise lands and the head is dropped where it is rather than folded. That is the
 trade: a grab of about 0.4 s on a saturated move ends the session, whether or
 not the hand then lets go.
+
+**What answering a held antenna costs, and what does not open that window.**
+The antennas' answer is a torque-off of the pair on the spot rather than a
+stow, so it is one raise and no ladder: at their commissioned `522 / 640` the
+generator carries 0.307 rad a period, a held antenna crosses the 0.6 rad screen
+in two of them, and the pair goes limp about a quarter of a second after the
+hand lands — on content running the class at its profile velocity, and later at
+the content's own pace under a slower goal, as above. What does *not* open that
+window at this profile is anything the machine is doing right: neither the
+postures it plans for itself nor content that outruns the antennas takes one
+past the screen, because the model carries the loop's measured following lag.
+The one-frame step probes are the evidence — over a radian written in a single
+period, armed — and read a worst residual of 0.2535 rad against the 0.4 rad
+sizing bound, and a sustained 0.0742 rad against the 0.6 rad screen, which is
+the quantity the detector faults on. The window opens on a joint that is not
+following its model: held, snagged, or a loop worn past that lag. This
+paragraph is the antennas'. The legs and the body yaw are not covered by it:
+what has been read against the screen for them is their own prior records, not
+their planned postures.
 
 Classification happens exactly once, at the point the condition becomes one of
 these values, and travels as that value. No layer re-derives a class from a
