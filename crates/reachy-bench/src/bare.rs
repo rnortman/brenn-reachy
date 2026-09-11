@@ -4,11 +4,19 @@
 //! Each one opens with a bus and a roster and nothing else. `provision` writes
 //! the antennas' operating mode, `reboot` restarts the servos, `off` sweeps
 //! torque off, `watchdog` establishes what an armed Bus Watchdog does to one
-//! servo, and `hold-probe` watches one held servo far faster than a driver
-//! cycle can. None of them commands an angle — the goal `watchdog` and
-//! `hold-probe` write is the count the servo reports for itself — so none of
-//! them needs an envelope, a pose or a control loop; what they share is the
-//! register-level plumbing at the bottom of this file.
+//! servo, `hold-probe` watches one held servo far faster than a driver
+//! cycle can, and `pose-log` streams the nine positions at 50 Hz while a person
+//! moves the machine by hand. None of them commands an angle — the goal
+//! `watchdog` and `hold-probe` write is the count the servo reports for itself —
+//! so none of them needs an envelope, a pose or a control loop; what they share
+//! is the register-level plumbing at the bottom of this file.
+//!
+//! `pose-log` is the one whose code path writes to no register whatever: it
+//! reads Torque Enable, refuses a roster that is not limp, and then reads
+//! Present Position in one grouped exchange every 20 ms until it is stopped.
+//! Nothing releases torque on its way in, because releasing drops a head that
+//! torque is holding up and that is an operator's own act with a hand on the
+//! head.
 //!
 //! `watchdog` and `hold-probe` are the two that torque a servo, and they are the
 //! odd ones here for that reason: each is a supervised bring-up assertion, one
@@ -39,17 +47,23 @@ use std::time::Instant;
 
 use dxl_proto::{HardwareError, StatusCode, StatusError, counts_to_rad};
 use reachy_bus::{
-    Bus, BusPort, BusTiming, MapError, RawValue, ServoMap, XactError, named_reg, reg_for,
-    with_retry,
+    Bus, BusPort, BusTiming, MapError, RawValue, ServoMap, SyncReadOutcome, XactError, named_reg,
+    reg_for, with_retry,
 };
-use reachy_motion::joints::{Name, ROW_COUNT, row};
+use reachy_motion::joints::{Name, ROW_COUNT, ROWS, flags, row};
 use reachy_motion::reg::Name as RegName;
 use reachy_motion::stillness;
 use reachy_motion::value;
 use reachy_motion::{
-    EXPECTED_MODELS, EXPECTED_OPERATING_MODES, Gains, JointRef, RegId, Value, ValueShape,
+    EXPECTED_MODELS, EXPECTED_OPERATING_MODES, Gains, JointRef, JointSample, JointVector,
+    MotionSegmenter, RegId, SegmentConfig, SegmentConfigError, SegmentKind, Value, ValueShape,
 };
 use thiserror::Error;
+
+use crate::poselog::{
+    EndedLine, LateLine, POSE_LOG_PERIOD_MS, PoseLine, RefusedLine, SampleLine, SegmenterLine,
+    StartedLine, StateLine, micros, nanos,
+};
 
 /// The joints `provision` writes: the two antennas, whose extended-position
 /// mode is this project's own provisioning rather than the vendor's.
@@ -558,6 +572,40 @@ pub enum BareError {
         /// that says which mechanism this is. Carried as the figures, and
         /// worded by the one place that words them.
         period: Option<ProbePeriod>,
+    },
+
+    /// A servo was holding torque when the pose log opened. The session this
+    /// command streams is a person's hands inside the linkage for minutes, and
+    /// the one hazard in it is a joint that can push back. Refused across the
+    /// whole roster before the first sample.
+    #[error(
+        "servo {id} is holding torque; release it with `make bench-run ARGS=off` — taking the \
+         head's weight first — before logging poses"
+    )]
+    PoseLogTorqueHeld {
+        /// The servo addressed.
+        id: u8,
+    },
+
+    /// Not one servo answered the pose log's first grouped read, so there is no
+    /// pose stream to take. Raised before the run is announced rather than
+    /// letting it open and stream nine nulls at 50 Hz.
+    #[error(
+        "no servo answered the first grouped position read of the roster {asked:?}, so there is \
+         no pose stream to log"
+    )]
+    PoseLogBusSilent {
+        /// The servos the read asked, in bus order.
+        asked: [u8; ROW_COUNT],
+    },
+
+    /// The live segmenter cannot cut on the thresholds it was built with at the
+    /// grid this command samples on. Raised rather than streaming a session
+    /// whose live notes say nothing ever moved.
+    #[error("the live segmentation cannot run on the pose log's grid: {source}")]
+    PoseLogSegmenter {
+        /// Which invariant the configuration breaks.
+        source: SegmentConfigError,
     },
 }
 
@@ -2022,6 +2070,376 @@ fn read_gains<P: BusPort>(
     })?;
     Ok(Gains { p, i, d })
 }
+pub use crate::poselog::{POSE_LOG_PERIOD, PoseLogEnd};
+
+/// What an operator asked a pose log for.
+#[derive(Clone, Debug)]
+pub struct PoseLogRequest {
+    /// The port the stream is being read over, for the opening line. The
+    /// command is handed an open port and cannot ask it its own name.
+    pub device: String,
+    /// How long to stream for, or nothing for until a signal arrives. No
+    /// default cap: torque is off for the whole run, so unlike a hold probe
+    /// there is nothing a cap protects.
+    pub seconds: Option<u64>,
+}
+
+/// The host seams a pose log reads that are neither the bus nor its pacing
+/// clock: wall time, and whether the operator has asked it to stop.
+///
+/// Together in one place because they are one thing — the process the command is
+/// running inside — and because the command's own argument list is at the bound
+/// the lint gate holds it to.
+pub struct PoseLogSeam<'a> {
+    /// Wall time as epoch nanoseconds, taken per sample. The session's other
+    /// stream stamps the same clock, which is what makes the two joinable.
+    pub wall: &'a mut dyn FnMut() -> i64,
+    /// Whether a stop has been asked for: a signal handler's flag, read once
+    /// per period.
+    pub stop: &'a dyn Fn() -> bool,
+}
+
+/// What a pose log streamed: the bookkeeping the caller sees after the samples
+/// have already gone out line by line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoseLogSummary {
+    /// Samples written.
+    pub samples: usize,
+    /// Samples that landed more than a period behind the grid.
+    pub late: usize,
+    /// How the run ended.
+    pub cause: PoseLogEnd,
+    /// What Torque Enable read on each servo after the run, or nothing for a
+    /// servo that no longer answered.
+    pub torque: [Option<u8>; ROW_COUNT],
+}
+
+/// Stream the nine present positions to `line` as JSON, one line per sample.
+///
+/// The read-only half of the bench, and the one command in this file whose code
+/// path writes to no register at all: it reads Torque Enable, it reads Present
+/// Position, and that is every instruction it puts on the wire. That property is
+/// the whole safety argument for a session with a person's hands inside the
+/// linkage, so it is asserted over the traffic rather than described here.
+///
+/// Torque must already be off on every servo, and a servo holding it refuses the
+/// run rather than being released here: `off` drops a head that torque is
+/// holding up, which is why it is a command an operator gives with a hand on the
+/// head and never a step another command takes on its own.
+///
+/// Counts, not radians: a count is what the servo said, the conversion is one
+/// linear unwrapped map, and a hand-turned antenna's multi-turn reading survives
+/// it. The stamp is taken immediately before the instruction frame goes out; the
+/// nine servos latch their positions as the frame reaches them, within the
+/// exchange the sample's own `read_us` records.
+///
+/// `wall` is the clock the stamps are on — the session's other stream stamps the
+/// same one — and `clock` is the monotonic grid the loop paces itself against.
+/// Two clocks because a stamped stream wants the wall clock and a 50 Hz cadence
+/// must not be steered by one.
+pub fn pose_log<P: BusPort>(
+    map: &ServoMap,
+    timing: BusTiming,
+    port: P,
+    request: PoseLogRequest,
+    clock: &mut dyn Clock,
+    seam: &mut PoseLogSeam,
+    line: &mut dyn FnMut(&str),
+) -> Result<PoseLogSummary, BareError> {
+    let mut bus = Bus::new(port, timing);
+    // A refusal is a line of the stream too. The analyzer reads this file and
+    // nothing else, and its verdict on a run that never recorded anything is
+    // read off exactly this line; an error that only ever reached the exit
+    // status would leave a fetched session indistinguishable from one that
+    // streamed nothing for its own reasons.
+    //
+    // Only a run that never started, though. A failure under a run that has
+    // already announced itself closes the stream with an `ended` line naming
+    // it, because the samples ahead of it are a recording and a reader told the
+    // recorder refused to run would throw them away.
+    let mut announced = false;
+    match stream_poses(map, &mut bus, &request, clock, seam, line, &mut announced) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            if !announced {
+                let t_ns = (seam.wall)();
+                emit(
+                    line,
+                    &PoseLine::Refused(RefusedLine {
+                        t_ns,
+                        error: error.to_string(),
+                    }),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The run itself, so every way out of it goes through one refusal line.
+///
+/// `announced` is set the moment the opening line goes out, which is what tells
+/// the caller whether a failure is a refusal or the end of a recording.
+fn stream_poses<P: BusPort>(
+    map: &ServoMap,
+    bus: &mut Bus<P>,
+    request: &PoseLogRequest,
+    clock: &mut dyn Clock,
+    seam: &mut PoseLogSeam,
+    line: &mut dyn FnMut(&str),
+    announced: &mut bool,
+) -> Result<PoseLogSummary, BareError> {
+    let ids = map.ids();
+    let position = named_reg(RegId::PresentPosition);
+
+    // Every servo, before anything is streamed: the roster is refused whole, so
+    // a torqued joint is found before an operator has their hands anywhere near
+    // the linkage.
+    let mut torque = [0u8; ROW_COUNT];
+    for (row, held) in torque.iter_mut().enumerate() {
+        *held = read_byte(bus, map, row, RegId::TorqueEnable)?;
+        if *held != 0 {
+            return Err(BareError::PoseLogTorqueHeld { id: ids[row] });
+        }
+    }
+
+    // A probe read rather than the first sample: what it establishes is that
+    // there is a machine on the other end, and the answer belongs before the
+    // opening line rather than in a stream that has not been announced.
+    let mut outcome = SyncReadOutcome::new();
+    read_positions(bus, &ids, position, &mut outcome)?;
+    if !answered_any(&outcome) {
+        return Err(BareError::PoseLogBusSilent { asked: ids });
+    }
+
+    // The live segmenter before the opening line, because the opening line
+    // states the thresholds it will cut on and a configuration it cannot cut on
+    // is a refusal rather than a footnote to an announced run.
+    let cfg = SegmentConfig::default();
+    let mut segmenter = MotionSegmenter::new(cfg, POSE_LOG_PERIOD)
+        .map_err(|source| BareError::PoseLogSegmenter { source })?;
+    emit(
+        line,
+        &PoseLine::Started(StartedLine {
+            t_ns: (seam.wall)(),
+            device: request.device.clone(),
+            ids,
+            period_ms: POSE_LOG_PERIOD_MS,
+            torque,
+            segmenter: SegmenterLine::of(cfg),
+        }),
+    );
+    *announced = true;
+    let mut closed = Vec::new();
+    let mut samples = 0usize;
+    let mut late = 0usize;
+    // The stamp of the stream's first reading any servo answered, which is
+    // where a hold the run opened inside of began.
+    let mut opened_ns: Option<i64> = None;
+    let cap = request.seconds.map(Duration::from_secs);
+    let began = clock.now();
+    let mut next = began;
+
+    // What ended a run that ended on a failure. The stream is closed the same
+    // way either way and the failure is the caller's answer afterwards: a
+    // recording that stopped early is still a recording, and the reader needs
+    // the closing line to know where it stopped and why.
+    let mut failure: Option<BareError> = None;
+
+    let cause = loop {
+        if (seam.stop)() {
+            break PoseLogEnd::Signal;
+        }
+        if cap.is_some_and(|cap| clock.now().saturating_sub(began) >= cap) {
+            break PoseLogEnd::Seconds;
+        }
+
+        let t_ns = (seam.wall)();
+        let before = clock.now();
+        // The grid clock read immediately after the wall stamp, before the
+        // frame goes out — and the same reading the loop paces on, so the bus
+        // exchange is outside both stamps. Two clocks per sample is what makes
+        // a wall step visible to a reader: the grid does not step, so a pair
+        // that disagree is the clock moving and a pair that agree is the stream
+        // missing a stretch.
+        let mono_ns = nanos(before);
+        if let Err(error) = read_positions(bus, &ids, position, &mut outcome) {
+            failure = Some(error);
+            break PoseLogEnd::Aborted;
+        }
+        let read_us = micros(clock.now().saturating_sub(before));
+
+        let mut counts = [None; ROW_COUNT];
+        for (row, slot) in counts.iter_mut().enumerate() {
+            *slot = outcome
+                .at(row)
+                .and_then(|(_, answered)| answered.value())
+                .and_then(|raw| raw.i32());
+        }
+        emit(
+            line,
+            &PoseLine::Sample(SampleLine {
+                t_ns,
+                mono_ns,
+                read_us,
+                counts,
+            }),
+        );
+        samples += 1;
+
+        // The operator's feedback, and the stream's only use of the segmenter:
+        // the samples are the record, and the offline pass recomputes them under
+        // whatever thresholds it is given without reading these lines.
+        let mut present = JointVector::default();
+        let mut missing = [false; ROW_COUNT];
+        for (row, count) in counts.iter().enumerate() {
+            match count {
+                Some(count) => {
+                    present.set(ROWS[row], counts_to_rad(*count));
+                }
+                None => missing[row] = true,
+            }
+        }
+        let was = segmenter.state();
+        // Stamped on the wall clock, like the offline pass: the notes read
+        // beside the stream's own stamps, and a step under a live session costs
+        // one note said late or early on an operator's screen. The samples are
+        // the record, and the offline pass says which stretches a step crossed.
+        segmenter.look(
+            &JointSample {
+                t_ns,
+                present: &present,
+                missing: flags::from_rows(&missing),
+            },
+            &mut closed,
+        );
+        let mut announced = false;
+        for segment in closed.drain(..) {
+            // A segment that just closed is the state that just began, and its
+            // own end stamp is where that state started — retroactively, for a
+            // hold, which is why the line can only be written once the hold has
+            // lasted long enough to be one.
+            let began = StateLine {
+                t0_ns: segment.t1_ns,
+            };
+            emit(
+                line,
+                &match segment.kind {
+                    SegmentKind::Motion => PoseLine::Still(began),
+                    SegmentKind::Still => PoseLine::Moving(began),
+                },
+            );
+            announced = true;
+        }
+        if !announced && segmenter.state() != was {
+            // A stream that opened at rest: there was no move ahead of the
+            // first hold to close, so nothing was emitted to carry its start,
+            // and the run began inside the hold. That is the only state change
+            // that closes no segment, so `opened_ns` is the stamp it began at.
+            emit(
+                line,
+                &PoseLine::Still(StateLine {
+                    t0_ns: opened_ns.unwrap_or(t_ns),
+                }),
+            );
+        }
+        // Only a reading the segmenter counted: an exchange no servo answered
+        // advances nothing there, so a stream opening on one would have the
+        // live note and the offline pass naming stamps a period apart.
+        if missing.iter().any(|absent| !*absent) {
+            opened_ns = opened_ns.or(Some(t_ns));
+        }
+
+        next += POSE_LOG_PERIOD;
+        let now = clock.now();
+        if now > next + POSE_LOG_PERIOD {
+            // A stamped stream tolerates a late sample; what it does not
+            // tolerate is a grid that then tries to catch up, which would put a
+            // burst of reads on the wire against a period that has already
+            // passed. So the note is the record of it and the grid re-anchors.
+            emit(
+                line,
+                &PoseLine::Late(LateLine {
+                    t_ns: (seam.wall)(),
+                    behind_us: micros(now.saturating_sub(next)),
+                }),
+            );
+            late += 1;
+            next = now;
+        }
+        clock.sleep_until(next);
+    };
+
+    // The closing sweep is read and reported, never judged: nothing in this
+    // command writes torque, so a servo answering anything but zero here is a
+    // reading for whoever reads the stream, and a servo that stopped answering
+    // is a null rather than a failure of a run that is already over. It is
+    // attempted after a failure too — a bus that answers nothing answers nulls
+    // here, which is itself the reading.
+    let mut ended = [None; ROW_COUNT];
+    for (row, slot) in ended.iter_mut().enumerate() {
+        *slot = read_byte(bus, map, row, RegId::TorqueEnable).ok();
+    }
+    emit(
+        line,
+        &PoseLine::Ended(EndedLine {
+            t_ns: (seam.wall)(),
+            samples,
+            late,
+            torque: ended,
+            cause,
+            error: failure.as_ref().map(ToString::to_string),
+        }),
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+
+    Ok(PoseLogSummary {
+        samples,
+        late,
+        cause,
+        torque: ended,
+    })
+}
+
+/// One grouped read of every servo's position.
+///
+/// What a servo does is recorded against that servo and fails nothing; the call
+/// fails only when the request could not be built or the port did, and that is
+/// the end of the stream rather than a null row.
+fn read_positions<P: BusPort>(
+    bus: &mut Bus<P>,
+    ids: &[u8; ROW_COUNT],
+    position: dxl_proto::Reg,
+    outcome: &mut SyncReadOutcome,
+) -> Result<(), BareError> {
+    bus.sync_read(ids, position, outcome)
+        .map_err(|source| BareError::BusRead {
+            id: source.id(),
+            reg: RegId::PresentPosition,
+            source,
+        })
+}
+
+/// Whether any servo answered a grouped read at all.
+fn answered_any(outcome: &SyncReadOutcome) -> bool {
+    (0..outcome.len()).any(|index| {
+        outcome
+            .at(index)
+            .is_some_and(|(_, answered)| answered.value().is_some())
+    })
+}
+
+/// Write one line of the stream.
+///
+/// A line is a plain record of numbers and strings, so serialization cannot
+/// fail; a JSON writer that returned an error here would mean one of them had
+/// grown a map with non-string keys.
+fn emit(line: &mut dyn FnMut(&str), value: &PoseLine) {
+    let text = serde_json::to_string(value).expect("a record of numbers and strings serializes");
+    line(&text);
+}
 
 /// Write where the servo stands as its goal, then enable torque, and answer
 /// with the goal that was written.
@@ -2175,7 +2593,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use dxl_proto::frame::{INST_REBOOT, INST_WRITE};
+    use dxl_proto::frame::{INST_READ, INST_REBOOT, INST_SYNC_READ, INST_WRITE};
 
     use super::*;
 
@@ -4805,5 +5223,677 @@ mod tests {
             "{:?}",
             probed.run.printed
         );
+    }
+
+    /// The epoch the fake wall clock counts from: a stamp with the shape of a
+    /// real one, so a case reading a transcript sees the digits an operator
+    /// would.
+    const FAKE_EPOCH_NS: i64 = 1_789_000_000_000_000_000;
+
+    /// A pose log's whole transcript: every line it wrote, parsed, and what it
+    /// returned.
+    struct Streamed {
+        outcome: Result<PoseLogSummary, BareError>,
+        lines: Vec<serde_json::Value>,
+        registers: Rc<RefCell<FakeMachine>>,
+        log: Rc<RefCell<Vec<(u8, u8)>>>,
+    }
+
+    impl Streamed {
+        /// The run streamed, or this says why it did not.
+        fn ok(&self, what: &str) -> &PoseLogSummary {
+            match &self.outcome {
+                Ok(summary) => summary,
+                Err(error) => panic!("{what}: {error}"),
+            }
+        }
+
+        /// The run refused, and this is the refusal.
+        fn err(&self, what: &str) -> &BareError {
+            match &self.outcome {
+                Ok(_) => panic!("{what}"),
+                Err(error) => error,
+            }
+        }
+
+        /// Every line of one kind, in the order they were written.
+        fn of(&self, kind: &str) -> Vec<&serde_json::Value> {
+            self.lines
+                .iter()
+                .filter(|line| line["kind"] == kind)
+                .collect()
+        }
+
+        /// The one line of a kind there is exactly one of.
+        fn only(&self, kind: &str) -> &serde_json::Value {
+            let found = self.of(kind);
+            assert_eq!(found.len(), 1, "{kind}: {:?}", self.lines);
+            found[0]
+        }
+
+        /// Every line of one kind, with the stamp of the sample it was written
+        /// on: what the operator's screen said, and when it said it.
+        ///
+        /// The distinction the live notes turn on — a hold's stamp is
+        /// retroactive, a move's is the sample it was seen on — is only
+        /// assertable against where in the stream the line actually landed.
+        fn said_on(&self, kind: &str) -> Vec<(i64, &serde_json::Value)> {
+            let mut latest: Option<i64> = None;
+            let mut found = Vec::new();
+            for line in &self.lines {
+                if line["kind"] == "sample" {
+                    latest = line["t_ns"].as_i64();
+                } else if line["kind"] == kind {
+                    found.push((latest.expect("a note after a sample"), line));
+                }
+            }
+            found
+        }
+
+        /// The kinds of every line, in order.
+        fn kinds(&self) -> Vec<String> {
+            self.lines
+                .iter()
+                .filter_map(|line| line["kind"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        /// Every sample's stamp, in the order they were taken.
+        fn stamps(&self) -> Vec<i64> {
+            self.stamped("t_ns")
+        }
+
+        /// Every sample's grid stamp, in the order they were taken.
+        fn grid(&self) -> Vec<i64> {
+            self.stamped("mono_ns")
+        }
+
+        /// One stamp of every sample, in the order they were taken.
+        fn stamped(&self, field: &str) -> Vec<i64> {
+            self.of("sample")
+                .iter()
+                .map(|line| line[field].as_i64().expect("a stamp is a number"))
+                .collect()
+        }
+
+        /// Nothing was written to any register, by any instruction.
+        ///
+        /// The safety property of this command, read off the traffic rather than
+        /// off the register file: a write the machine refused or dropped is
+        /// still a write the host sent, and this is the assertion that no
+        /// version of it happened.
+        fn wrote_nothing(&self) {
+            for (id, instruction) in self.log.borrow().iter() {
+                assert!(
+                    *instruction == INST_READ || *instruction == INST_SYNC_READ,
+                    "servo {id} was sent instruction {instruction:#04x}, and this command reads",
+                );
+            }
+            assert!(
+                self.registers.borrow().written.is_empty(),
+                "{:?}",
+                self.registers.borrow().written
+            );
+        }
+    }
+
+    /// What a case can reach part way through a run, handed to `on_sample`.
+    ///
+    /// One named bundle rather than a row of positional handles: a case that
+    /// wants none of them writes `|_|`, and a dial added here costs nothing to
+    /// the cases that do not turn it.
+    struct SampleHook<'a> {
+        /// How many samples the stream has written, this one included.
+        samples: usize,
+        /// The machine the bus answers from, for a joint that moves mid-run.
+        machine: &'a Rc<RefCell<FakeMachine>>,
+        /// The grid clock, which the pacing advances and a case can step.
+        grid: &'a Rc<Cell<Duration>>,
+        /// The stop flag the run's seam reads.
+        stop: &'a Cell<bool>,
+        /// The wall clock's offset from the grid, which a time sync steps.
+        wall_offset: &'a Rc<Cell<i64>>,
+    }
+
+    /// Stream a pose log against `machine`, with `per_frame` of the fake clock
+    /// spent on every frame that crosses the wire.
+    ///
+    /// `on_sample` is called with a [`SampleHook`] after every sample line: a
+    /// case that wants a clock step part way through a run, a signal at the
+    /// fourth sample, or a joint that starts moving under the operator's hands,
+    /// says so in the run's own transcript rather than by counting the
+    /// exchanges that come first.
+    ///
+    /// The two clocks are two dials. The grid clock is what `per_frame` and the
+    /// pacing advance; the wall clock is that plus an offset a case can step,
+    /// which is what a unit whose time sync lands mid-session does to it.
+    fn streamed(
+        machine: FakeMachine,
+        cfg: &Configured,
+        seconds: Option<u64>,
+        per_frame: Duration,
+        mut on_sample: impl FnMut(SampleHook),
+    ) -> Streamed {
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let mut machine = machine;
+        machine.spends_time(&now, per_frame);
+        let spy = Spy::new(machine);
+        let registers = spy.machine();
+        let driven = spy.machine();
+        let log = spy.log();
+        let mut clock = TestClock::sharing(&now);
+        let stop = Cell::new(false);
+        let mut lines: Vec<serde_json::Value> = Vec::new();
+        let mut samples = 0usize;
+
+        let wall_offset = Rc::new(Cell::new(0_i64));
+        let ticking = Rc::clone(&now);
+        let stepped = Rc::clone(&wall_offset);
+        let mut wall = move || {
+            FAKE_EPOCH_NS
+                + stepped.get()
+                + i64::try_from(ticking.get().as_nanos()).expect("a fake run is short")
+        };
+        let halt = || stop.get();
+        let mut seam = PoseLogSeam {
+            wall: &mut wall,
+            stop: &halt,
+        };
+
+        let outcome = pose_log(
+            &cfg.map,
+            cfg.timing,
+            spy,
+            PoseLogRequest {
+                device: "/dev/ttyFAKE".to_string(),
+                seconds,
+            },
+            &mut clock,
+            &mut seam,
+            &mut |text| {
+                let line: serde_json::Value =
+                    serde_json::from_str(text).expect("every line of the stream is JSON");
+                if line["kind"] == "sample" {
+                    samples += 1;
+                    on_sample(SampleHook {
+                        samples,
+                        machine: &driven,
+                        grid: &now,
+                        stop: &stop,
+                        wall_offset: &wall_offset,
+                    });
+                }
+                lines.push(line);
+            },
+        );
+
+        Streamed {
+            outcome,
+            lines,
+            registers,
+            log,
+        }
+    }
+
+    /// A servo holding torque refuses the run before a single sample, and the
+    /// refusal names it and the release.
+    ///
+    /// The one hazard in a recording session is a joint that can push back while
+    /// a person's hands are inside the linkage, and this is where it is refused.
+    /// Nothing is released here: `off` drops a head that torque is holding up,
+    /// so it stays an operator's own act.
+    #[test]
+    fn a_torqued_servo_refuses_the_pose_log_before_any_sample() {
+        let cfg = resolved();
+        let held = cfg.map.ids()[4];
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        machine.set(held, named_reg(RegId::TorqueEnable), &[1]);
+
+        let run = streamed(machine, &cfg, Some(1), Duration::from_millis(2), |_| {});
+        let error = run.err("a servo holding torque is not a machine to record on");
+        let BareError::PoseLogTorqueHeld { id } = error else {
+            panic!("expected a torque refusal, got {error}");
+        };
+        assert_eq!(*id, held);
+        assert!(
+            error.to_string().contains("bench-run ARGS=off"),
+            "the refusal names the release: {error}"
+        );
+
+        // The sweep reached the fifth servo and stopped: five reads, and not one
+        // frame of anything else.
+        assert_eq!(run.log.borrow().len(), 5, "{:?}", run.log.borrow());
+        run.wrote_nothing();
+        assert!(run.of("started").is_empty(), "{:?}", run.lines);
+        assert!(run.of("sample").is_empty(), "{:?}", run.lines);
+        let refused = run.only("refused");
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("holding torque")),
+            "{refused}"
+        );
+    }
+
+    /// A machine nobody is touching, for a second of fake time: fifty samples on
+    /// the grid, the opening and closing lines around them, and no write of any
+    /// kind on the wire.
+    #[test]
+    fn a_second_of_a_healthy_machine_is_fifty_stamped_samples() {
+        let cfg = resolved();
+        let run = streamed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            Some(1),
+            Duration::from_millis(2),
+            |_| {},
+        );
+        let summary = run.ok("a limp machine that answers streams");
+        assert_eq!(summary.samples, 50);
+        assert_eq!(summary.late, 0);
+        assert_eq!(summary.cause, PoseLogEnd::Seconds);
+        assert_eq!(summary.torque, [Some(0); ROW_COUNT]);
+
+        let started = run.only("started");
+        assert_eq!(started["device"], "/dev/ttyFAKE");
+        assert_eq!(started["period_ms"], 20);
+        assert_eq!(started["torque"].as_array().expect("nine").len(), ROW_COUNT);
+        assert!(
+            started["torque"]
+                .as_array()
+                .expect("nine")
+                .iter()
+                .all(|held| held == &serde_json::json!(0)),
+            "{started}"
+        );
+        let ids: Vec<u64> = started["ids"]
+            .as_array()
+            .expect("nine")
+            .iter()
+            .map(|id| id.as_u64().expect("an id is a number"))
+            .collect();
+        assert_eq!(ids, cfg.map.ids().map(u64::from).to_vec());
+        assert_eq!(started["segmenter"]["speed_window_ms"], 100);
+        assert_eq!(started["segmenter"]["min_still_ms"], 500);
+
+        let stamps = run.stamps();
+        assert_eq!(stamps.len(), 50);
+        assert_eq!(
+            stamps[0],
+            FAKE_EPOCH_NS + 20_000_000,
+            "the torque sweep and \
+             the probe read cost ten frames of two milliseconds before the first sample"
+        );
+        for pair in stamps.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                20_000_000,
+                "the grid is twenty milliseconds: {stamps:?}"
+            );
+        }
+        for sample in run.of("sample") {
+            assert_eq!(sample["read_us"], 2_000, "{sample}");
+            let counts = sample["counts"].as_array().expect("nine rows");
+            assert_eq!(counts.len(), ROW_COUNT);
+            assert!(counts.iter().all(|count| count.is_i64()), "{sample}");
+        }
+
+        let ended = run.only("ended");
+        assert_eq!(ended["samples"], 50);
+        assert_eq!(ended["late"], 0);
+        assert_eq!(ended["cause"], "seconds");
+        assert!(run.of("late").is_empty(), "{:?}", run.lines);
+
+        // A machine standing still is a hold, and the note lands `min_still`
+        // after the hold began — which is where the stream opened, because the
+        // run began inside it.
+        let still = run.only("still");
+        assert_eq!(still["t0_ns"], stamps[0]);
+        assert!(run.of("moving").is_empty(), "{:?}", run.lines);
+
+        run.wrote_nothing();
+    }
+
+    /// A servo that stops answering leaves its row null and the other eight
+    /// where they were: the stream carries on, because a joint nobody can read
+    /// is not a session anybody wants ended for them.
+    #[test]
+    fn a_servo_that_stops_answering_leaves_its_row_null() {
+        let cfg = resolved();
+        let quiet = cfg.map.ids()[3];
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        // The probe read and the first sample answer; from the second on, this
+        // servo is gone.
+        machine
+            .deafens_after
+            .insert((quiet, named_reg(RegId::PresentPosition).addr), 2);
+
+        let run = streamed(machine, &cfg, Some(1), Duration::from_millis(2), |_| {});
+        run.ok("eight servos answering is still a stream");
+
+        let samples = run.of("sample");
+        assert_eq!(samples.len(), 50);
+        assert!(samples[0]["counts"][3].is_i64(), "{}", samples[0]);
+        for sample in samples.iter().skip(1) {
+            assert!(sample["counts"][3].is_null(), "{sample}");
+            for row in [0usize, 1, 2, 4, 5, 6, 7, 8] {
+                assert!(sample["counts"][row].is_i64(), "row {row}: {sample}");
+            }
+        }
+        run.wrote_nothing();
+    }
+
+    /// A clock that steps forward mid-run costs one sample and says so: a note
+    /// per occurrence, and a grid re-anchored to now rather than one trying to
+    /// catch up with a burst of reads.
+    #[test]
+    fn a_clock_step_is_one_late_note_and_a_re_anchored_grid() {
+        let cfg = resolved();
+        let run = streamed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            Some(1),
+            Duration::from_millis(2),
+            |hook| {
+                if hook.samples == 1 {
+                    hook.grid.set(hook.grid.get() + Duration::from_millis(100));
+                }
+            },
+        );
+        let summary = run.ok("a step is a note, not a failure");
+        assert_eq!(summary.late, 1);
+
+        let late = run.only("late");
+        let behind = late["behind_us"].as_u64().expect("a figure");
+        assert!((80_000..=100_000).contains(&behind), "{late}");
+
+        // The grid picked up from where the step left it: one long gap, and
+        // every other spacing back on the period.
+        let stamps = run.stamps();
+        let gaps: Vec<i64> = stamps.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(
+            gaps.iter().filter(|gap| **gap != 20_000_000).count(),
+            1,
+            "{gaps:?}"
+        );
+        assert!(gaps[0] > 100_000_000, "{gaps:?}");
+        run.wrote_nothing();
+    }
+
+    /// The two stamps are two clocks, and a wall that steps under the run moves
+    /// one of them.
+    ///
+    /// This is what the pair is for: the grid stays on its period across the
+    /// step, so a reader differencing the two sees the step exactly rather than
+    /// guessing at a widened wall interval that a late loop produces just as
+    /// well. The unit sets its clock from the network after booting from RAM,
+    /// so a session that starts before the first sync gets one of these.
+    #[test]
+    fn the_wall_stamp_steps_where_the_grid_stamp_does_not() {
+        let cfg = resolved();
+        let step_ns = 30 * 1_000_000_000_i64;
+        let run = streamed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            Some(1),
+            Duration::from_millis(2),
+            |hook| {
+                if hook.samples == 10 {
+                    hook.wall_offset.set(hook.wall_offset.get() + step_ns);
+                }
+            },
+        );
+        run.ok("a clock that stepped is not a bus that failed");
+
+        // The grid clock is the run's own epoch — the sweep and the probe read
+        // ahead of the first sample are all that is on it — and every step of
+        // it is the period.
+        let grid = run.grid();
+        assert_eq!(grid.len(), 50);
+        assert!((0..1_000_000_000).contains(&grid[0]), "{}", grid[0]);
+        for (at, pair) in grid.windows(2).enumerate() {
+            assert_eq!(pair[1] - pair[0], 20_000_000, "sample {at}: {grid:?}");
+        }
+
+        // The wall clock is the one that jumped, once, by what the step was —
+        // and it is still the epoch clock, not the grid's.
+        let wall = run.stamps();
+        let steps: Vec<i64> = wall.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let jumped: Vec<(usize, i64)> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| **step != 20_000_000)
+            .map(|(at, step)| (at, *step))
+            .collect();
+        assert_eq!(jumped, vec![(9, step_ns + 20_000_000)], "{steps:?}");
+
+        // The pairing itself, on every sample and not just the first: the two
+        // stamps name one instant, so the whole of the difference between them
+        // is the epoch and whatever the wall clock stepped by. A grid reading
+        // taken on the far side of the bus exchange would leave every other
+        // assertion here standing and read downstream as a clock step of one
+        // read latency on every sample.
+        for (at, (wall_ns, grid_ns)) in wall.iter().zip(&grid).enumerate() {
+            let stepped = if at >= 10 { step_ns } else { 0 };
+            assert_eq!(
+                *wall_ns,
+                FAKE_EPOCH_NS + stepped + grid_ns,
+                "sample {at}: {wall:?} {grid:?}"
+            );
+        }
+        // And the exchange is really between the pair and the next one: a run
+        // whose frames cost no time could not see the reordering above.
+        for line in run.of("sample") {
+            assert_eq!(line["read_us"], 2000, "{line}");
+        }
+        assert_eq!(run.only("ended")["samples"], 50);
+        run.wrote_nothing();
+    }
+
+    /// The stop flag ends the run, and the closing line says a signal did it.
+    #[test]
+    fn a_stop_signal_ends_the_stream_and_the_closing_line_says_so() {
+        let cfg = resolved();
+        let run = streamed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            None,
+            Duration::from_millis(2),
+            |hook| {
+                if hook.samples == 4 {
+                    hook.stop.set(true);
+                }
+            },
+        );
+        let summary = run.ok("a stream a signal ended is a stream");
+        assert_eq!(summary.samples, 4);
+        assert_eq!(summary.cause, PoseLogEnd::Signal);
+        assert_eq!(run.only("ended")["cause"], "signal");
+        assert_eq!(run.only("ended")["samples"], 4);
+        run.wrote_nothing();
+    }
+
+    /// A bus nobody answers on refuses the run rather than opening a stream of
+    /// nine nulls at fifty hertz.
+    #[test]
+    fn a_silent_bus_refuses_the_pose_log() {
+        let cfg = resolved();
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        for id in cfg.map.ids() {
+            machine.go_deaf(id, named_reg(RegId::PresentPosition).addr);
+        }
+
+        let run = streamed(machine, &cfg, Some(1), Duration::from_millis(2), |_| {});
+        let error = run.err("a bus with no positions on it is no pose stream");
+        let BareError::PoseLogBusSilent { asked } = error else {
+            panic!("expected a silent bus, got {error}");
+        };
+        assert_eq!(*asked, cfg.map.ids());
+        assert!(run.of("started").is_empty(), "{:?}", run.lines);
+        assert_eq!(run.of("refused").len(), 1);
+        run.wrote_nothing();
+    }
+
+    /// A joint that moves under the operator's hands and then settles: a
+    /// `moving` note on the sample it was seen on, and a `still` note carrying
+    /// the retroactive start of the hold.
+    ///
+    /// The two notes are the only feedback a session with both hands on the head
+    /// has, and they map from a *closing* segment to the state that just began —
+    /// exactly the mapping that ships inverted, telling an operator a pose
+    /// registered as they start moving.
+    #[test]
+    fn a_joint_moved_and_settled_says_moving_and_then_still() {
+        /// Samples of hold before the move starts.
+        const HELD: usize = 50;
+        /// Samples the move takes.
+        const MOVED: usize = 30;
+        /// How far the move travels, radians: 0.5 rad in 0.6 s.
+        const TRAVEL: f64 = 0.5;
+
+        let cfg = resolved();
+        let leg = cfg.map.ids()[1];
+        let base = stow_legs()[0];
+        let run = streamed(
+            machine_at(&example_config(), &stow_legs()),
+            &cfg,
+            Some(3),
+            Duration::from_millis(2),
+            |hook| {
+                if hook.samples > HELD && hook.samples <= HELD + MOVED {
+                    let step = (hook.samples - HELD) as f64 / MOVED as f64;
+                    let counts = dxl_proto::conv::rad_to_counts(base + TRAVEL * step)
+                        .expect("an angle a servo reports");
+                    hook.machine.borrow_mut().set(
+                        leg,
+                        named_reg(RegId::PresentPosition),
+                        &counts.to_le_bytes(),
+                    );
+                }
+            },
+        );
+        run.ok("a hand on the head is a stream");
+
+        // A hold, a move, a hold, and nothing else said twice.
+        let notes: Vec<String> = run
+            .kinds()
+            .into_iter()
+            .filter(|kind| kind != "sample")
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["started", "still", "moving", "still", "ended"],
+            "{:?}",
+            run.lines
+        );
+
+        let stamps = run.stamps();
+        let opening = run.said_on("still")[0];
+        assert_eq!(
+            opening.1["t0_ns"], stamps[0],
+            "the run opened inside the hold"
+        );
+        assert_eq!(
+            opening.0 - stamps[0],
+            500_000_000,
+            "the note lands min_still after the hold began"
+        );
+
+        // The move is announced on the sample it was seen on, which is the
+        // first sample whose difference baseline holds any of the travel.
+        let (said_on, moving) = run.said_on("moving")[0];
+        assert_eq!(moving["t0_ns"], said_on, "{moving}");
+        assert_eq!(
+            moving["t0_ns"].as_i64().expect("a stamp"),
+            stamps[HELD + 1],
+            "the onset is the first sample carrying the move"
+        );
+
+        // And the hold after it carries the start of the hold rather than the
+        // sample the note was written on: the trailing lag puts the quiet run's
+        // first sample five samples after the last of the travel, and the note
+        // min_still after that.
+        let (written_on, settled) = run.said_on("still")[1];
+        let started_at = settled["t0_ns"].as_i64().expect("a stamp");
+        assert_eq!(
+            written_on - started_at,
+            500_000_000,
+            "the hold's start is retroactive by min_still: {settled}"
+        );
+        assert_eq!(
+            started_at,
+            stamps[HELD + MOVED + 5],
+            "the quiet run opens where the baseline holds none of the travel"
+        );
+        run.wrote_nothing();
+    }
+
+    /// A port that goes away mid-session closes the stream with what happened
+    /// and keeps the samples ahead of it.
+    ///
+    /// The distinction the analyzer's verdict turns on: a run that refused is a
+    /// run that recorded nothing, and twenty good minutes ending on a hiccuping
+    /// adapter must not read as one.
+    #[test]
+    fn a_bus_that_dies_mid_stream_ends_the_run_rather_than_refusing_it() {
+        /// Frames the opening costs: nine Torque Enable reads and the probe.
+        const OPENING: u32 = ROW_COUNT as u32 + 1;
+        /// Samples that go out before the port stops taking frames.
+        const RECORDED: u32 = 5;
+
+        let cfg = resolved();
+        let mut machine = machine_at(&example_config(), &stow_legs());
+        machine.port_fails_after = Some(OPENING + RECORDED);
+
+        let run = streamed(machine, &cfg, Some(1), Duration::from_millis(2), |_| {});
+        let error = run.err("a port that will not take a frame ends the run");
+        assert!(
+            matches!(
+                error,
+                BareError::BusRead {
+                    reg: RegId::PresentPosition,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+
+        // The stream says what it recorded and how it ended, and it does not
+        // say it refused: the samples are a recording.
+        assert_eq!(run.of("started").len(), 1);
+        assert_eq!(run.of("sample").len(), RECORDED as usize);
+        assert!(run.of("refused").is_empty(), "{:?}", run.lines);
+        let ended = run.only("ended");
+        assert_eq!(ended["cause"], "aborted");
+        assert_eq!(ended["samples"], RECORDED);
+        assert!(
+            ended["error"]
+                .as_str()
+                .is_some_and(|said| said.contains("present position")
+                    || said.contains("Present Position")
+                    || said.contains("read")),
+            "{ended}"
+        );
+        // The closing sweep was attempted over the dead port and answered
+        // nothing, which is the reading rather than a second failure.
+        assert!(
+            ended["torque"]
+                .as_array()
+                .expect("nine")
+                .iter()
+                .all(serde_json::Value::is_null),
+            "{ended}"
+        );
+        run.wrote_nothing();
+    }
+
+    /// The live segmenter's configuration is one the recorder's own grid
+    /// admits, which is what makes its refusal unreachable rather than
+    /// untested.
+    #[test]
+    fn the_recorders_grid_admits_the_default_thresholds() {
+        SegmentConfig::default()
+            .check(POSE_LOG_PERIOD)
+            .expect("the defaults cut on the grid the recorder samples at");
     }
 }

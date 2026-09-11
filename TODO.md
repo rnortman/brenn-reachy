@@ -1084,16 +1084,21 @@ reads a figure. Marked at `Closed::samples` in `cogs/speech_run_report.rs`.
 
 ## `clip-one-pass-per-log`
 
-Cut a run's turn clips in one pass per frame log. The run report resolves each
-turn's carve on its own, and the resolver has no index to seek by: it decodes
-every record from the head of the log and stops when it reaches the span's end.
-Every turn of a session is carved from the same log, so turn *k* re-decodes what
-turns 1..k-1 already decoded, and the work is quadratic in the turns of a
+Cut a run's clips in one pass per frame log. Both offline analyzers resolve each
+carve on its own, and the resolver has no index to seek by: it decodes every
+record from the head of the log and stops when it reaches the span's end. Every
+carve of a session comes out of the same log, so carve *k* re-decodes what
+carves 1..k-1 already decoded, and the work is quadratic in the things said in a
 session. At the recorded store's configured cap — about 35 minutes, some 52,000
 frames — an eight-turn session decodes roughly 200,000 frames instead of 52,000.
 
+A recording session is the worse of the two cases: it transcribes with no wake
+word and the operator narrates every pose, so its utterance count is an order of
+magnitude above a conversational run's turn count, and the pose session report
+runs inline on `make pose-record` with the operator still at the machine.
+
 Deferral context: seconds, not minutes, at the session lengths run so far, and
-the report is on the `make speech-run` critical path where that cost is
+both reports are on a deploy chain's critical path where that cost is so far
 invisible. Closing it means splicing one pass into several output buffers, which
 is an entry point beside `AudioSpan::resolve` in the pipeline crate — another
 repository's public surface, and a pinned one — rather than anything this tool
@@ -1101,7 +1106,8 @@ can do over the API it has. The ceiling grows as the square of the turns per
 session, which is the thing an acceptance run wants more of.
 
 Done = a run's clips cost one decode of each log they come out of. Marked at
-`cut` in `cogs/speech_run_report.rs`.
+`resolve` in `cogs/audio_store.rs`, which is the one place both analyzers decode
+a span through.
 
 ## `pod-ingest-test-util-in-host`
 
@@ -1114,10 +1120,10 @@ included. The fixtures are inert today, so the cost is only that the rule the
 upstream comment states is no longer the rule, and the next person to give a
 fixture builder a dependency or a panic has nothing telling them otherwise.
 
-Deferral context: the fix is one comment in the other repository, but that
-repository's revision is the one this repository's pin is about to name, and
-which revision is published and pinned is the operator's call rather than an
-implementer's. It rides on that move.
+Deferral context: the fix is one comment in the other repository, and it lands
+there on its own schedule; this tree sees it when `BRENN_POD_REV` next names a
+revision carrying it, and which revision is published and pinned is the
+operator's call rather than an implementer's.
 
 Done = the frame-log crate's feature comment says who enables it and what
 carries the module, and this repository's spec comment agrees. Marked at the
@@ -1242,3 +1248,33 @@ contain rather than a formatting tidy-up. Marked at `capabilities` in
 Done = a routine run's capability section is bounded in length, and every
 reading it stops printing in full is either still derivable from what it prints
 or written down as deliberately dropped.
+
+## `proc-seam-crate`
+
+One home for the two process-level seams every binary in this tree opens by
+hand: the SIGINT/SIGTERM stop flag, and wall time as epoch nanoseconds.
+
+Deferral context: `stop_flag()` is spelled four times — `reachy-motord`, which
+carries the reasoning in a doc comment (both signals mean the same thing, a
+second one is idempotent, the handler does nothing but the store so the effect
+runs on the loop thread), plus `reachy-host`, `reachy-ask` and now the bench's
+`pose-log`. `now_ns()` is spelled twice, in the driver's tick and in the bench's
+entry point, and both bodies assert the same two decisions: epoch nanoseconds,
+and zero rather than a wrap on a machine whose clock was never set. That second
+one is load-bearing beyond either binary — it is the join key between the pose
+stream and the voice host's stream, so a copy changed to raise instead would
+silently mis-attribute utterances to segments rather than fail.
+
+What blocks it is placement, not work. No existing crate is reachable from all
+four binaries: `reachy-bus` is, for the driver and the bench, but `reachy-host`
+and `reachy-ask` do not depend on it and should not acquire a serial-port crate
+to install a signal handler; `reachy-motion` is sans-I/O by charter, and a
+clock read and a signal handler are exactly the I/O that rule excludes; a bench
+depending on the driver inverts the layering. So the answer is a new small
+crate, and the tree's crate set is charter — it is enumerated in `README.md`
+and each entry says what it is — which makes adding one a decision about the
+charter rather than a refactor.
+
+Done = one `stop_flag()` and one `now_ns()`, four and two call sites
+respectively, and the two conventions written down once. Marked at the bench's
+copies in `crates/reachy-bench/src/main.rs`.

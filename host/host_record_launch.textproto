@@ -1,0 +1,32 @@
+# The voice host's entry in the recording launcher config
+# (`cogs:robotcpu_record.textproto`), beside the production entry in
+# `host_launch.textproto`.
+#
+# One message of simplelaunch's `AppConfig`, hand-written for the reason that
+# one is: the renderer only knows about Clockwork processes and the host is not
+# one. Paths are payload-relative, as in the production entry.
+#
+# The one difference is which speech configuration it names. A recording session
+# transcribes everything said with no wake word, reads each transcript back over
+# the speaker and bridges to nothing, which differs in kind from the site's
+# arrangement rather than in a value: `[wake] policy = "bypass"`, `[brain] mode
+# = "echo"`, no `[brenn]`. The payload has one speech-config slot per launcher
+# entry and the entry names it literally, so a second arrangement is a second
+# file rather than an override -- and it is the operator's own file for the same
+# reason the site's is, because it names the STT and TTS services and the pod's
+# link keys.
+#
+# The path below is where the build stages `REACHY_RECORD_SPEECH_CONFIG`; a
+# payload built without one carries no file there, and `deploy-motion.sh
+# --record` refuses it: a recording session whose transcripts are missing is a
+# session that has to be run again.
+#
+# Merged into the recording config only. The production config and the harness
+# twin name `host/speech.toml`, and no config names both files: a host started
+# twice over one mic array is two claimants on the pod's audio link.
+app {
+  name: "voice_host"
+  executable: "reachy_host"
+  args: "--speech-config"
+  args: "host/speech-record.toml"
+}

@@ -1,0 +1,11 @@
+# Apache-2.0. The bench's place in a recording session's payload: one launcher
+# app entry for a binary this package does not build.
+#
+# A package with no target that compiles anything -- the binary is
+# `//crates/reachy-bench:reachy_bench`, and this is only where it runs.
+
+# The recorder's entry in the launcher's app table, merged into the recording
+# launcher config (`cogs:robotcpu_record.textproto`) and named by no other
+# config: a run that moves the machine must not carry a second holder of the
+# servo bus.
+exports_files(["record_launch.textproto"])

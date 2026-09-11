@@ -190,6 +190,16 @@ impl ChannelMask {
         Self(PerChannel::new([false; Channel::COUNT]))
     }
 
+    /// The mask driving every channel there is.
+    ///
+    /// Here rather than folded together at each call site, for the reason
+    /// [`Self::parse`] is here: the day a fourth channel is added, a hand-rolled
+    /// union is still three channels wide and nothing says so.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self(PerChannel::new([true; Channel::COUNT]))
+    }
+
     /// The mask driving `channel` and nothing else.
     #[must_use]
     pub fn of(channel: Channel) -> Self {
@@ -238,6 +248,62 @@ impl ChannelMask {
     pub fn iter(self) -> impl Iterator<Item = Channel> {
         Channel::ALL.into_iter().filter(move |c| self.contains(*c))
     }
+
+    /// The mask a comma-separated list of channel names spells, as
+    /// `head,antennas,body_yaw`.
+    ///
+    /// The spellings are [`Channel::as_str`]'s, so a list reads the way a
+    /// document writes it. Here rather than in each tool that takes such a
+    /// list: two command lines with their own parse are two tools that
+    /// disagree about what `body-yaw` means, and the answer has to be the
+    /// format's.
+    ///
+    /// # Errors
+    ///
+    /// [`MaskError`]: a word that is not a channel, a channel named twice, or
+    /// a list naming nothing.
+    pub fn parse(list: &str) -> Result<Self, MaskError> {
+        // Checked ahead of the walk rather than after it: an empty list splits
+        // into one empty word, and "" is not a channel is a worse answer to
+        // `--channels ` than the one this arm gives.
+        if list.trim().is_empty() {
+            return Err(MaskError::Nothing);
+        }
+        let mut mask = Self::empty();
+        for word in list.split(',') {
+            let word = word.trim();
+            let channel = Channel::ALL
+                .into_iter()
+                .find(|channel| channel.as_str() == word)
+                .ok_or_else(|| MaskError::NotAChannel {
+                    word: word.to_owned(),
+                })?;
+            if !mask.insert(channel) {
+                return Err(MaskError::Twice { channel });
+            }
+        }
+        Ok(mask)
+    }
+}
+
+/// Why a channel list is not a mask.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum MaskError {
+    /// A word in the list is not a channel's name.
+    #[error("{word:?} is not a channel; head, antennas or body_yaw")]
+    NotAChannel {
+        /// The word as given.
+        word: String,
+    },
+    /// A channel is named more than once.
+    #[error("{} is named twice", channel.as_str())]
+    Twice {
+        /// The channel named twice.
+        channel: Channel,
+    },
+    /// The list names no channel at all.
+    #[error("a channel list names at least one channel")]
+    Nothing,
 }
 
 /// Why a name cannot be used.
@@ -1092,9 +1158,7 @@ mod tests {
     /// before it hands frames to a player, over a frame that drives everything.
     #[test]
     fn a_frames_numbers_and_rotation_are_checked_whole() {
-        let mask = ChannelMask::of(Channel::Head)
-            .union(ChannelMask::of(Channel::Antennas))
-            .union(ChannelMask::of(Channel::BodyYaw));
+        let mask = ChannelMask::all();
         let zero = DeltaFrame::zero(mask);
         assert!(zero.is_finite());
         assert_eq!(zero.rotation_norm_error(), Some(0.0));
@@ -1528,6 +1592,35 @@ mod tests {
             values.iter().map(|(c, _)| c).collect::<Vec<_>>(),
             Channel::ALL.to_vec()
         );
+    }
+
+    /// The list spelling every tool that takes one reads: the format's own
+    /// words, in any order, and each of the three ways a list is not a mask.
+    #[test]
+    fn a_channel_list_parses_to_the_mask_it_names() {
+        let parsed = ChannelMask::parse("antennas, head").expect("two channels");
+        assert_eq!(
+            parsed.iter().collect::<Vec<_>>(),
+            vec![Channel::Head, Channel::Antennas],
+            "document order, whatever order the list was in"
+        );
+        assert_eq!(
+            ChannelMask::parse("body_yaw"),
+            Ok(ChannelMask::of(Channel::BodyYaw))
+        );
+        assert_eq!(
+            ChannelMask::parse("legs"),
+            Err(MaskError::NotAChannel {
+                word: "legs".to_owned()
+            })
+        );
+        assert_eq!(
+            ChannelMask::parse("head,head"),
+            Err(MaskError::Twice {
+                channel: Channel::Head
+            })
+        );
+        assert_eq!(ChannelMask::parse(""), Err(MaskError::Nothing));
     }
 
     #[test]

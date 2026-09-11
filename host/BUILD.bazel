@@ -45,8 +45,12 @@ rust_clk_module(
 # by nothing on a unit -- the configuration a unit runs is an operator's own,
 # staged into RAM by `tools/build-motion.sh`; and the host's entry in the
 # launcher's app table, which `cogs/robot.clk`'s `RobotCpu` merges into the
-# production launcher config and the harness twin deliberately leaves out.
+# production launcher config and the harness twin deliberately leaves out; and
+# the same entry for a recording session, which names the recording speech
+# configuration instead of the site's and is merged into
+# `cogs:robotcpu_record.textproto` alone.
 exports_files([
     "host_launch.textproto",
     "host_params.example.textproto",
+    "host_record_launch.textproto",
 ])

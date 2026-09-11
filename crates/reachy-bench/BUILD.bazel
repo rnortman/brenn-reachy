@@ -15,10 +15,15 @@ rust_library(
         "src/bare.rs",
         "src/config.rs",
         "src/lib.rs",
+        "src/poselog.rs",
         "src/selftest.rs",
         "src/testutil.rs",
     ],
     crate_name = "reachy_bench",
+    # The pose log's line schema is read by `//cogs:pose_session_report`, which
+    # analyzes the stream this crate writes: one declaration of that contract,
+    # reached from the other package rather than copied into it.
+    visibility = ["//visibility:public"],
     deps = [
         "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-bus:reachy_bus",
@@ -26,6 +31,7 @@ rust_library(
         "//crates/reachy-motion:reachy_motion",
         "@brenn_reachy_crates//:anyhow",
         "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:serde_json",
         "@brenn_reachy_crates//:thiserror",
         "@brenn_reachy_crates//:toml",
     ],
@@ -55,6 +61,7 @@ rust_binary(
         "//crates/reachy-bus:reachy_bus",
         "//crates/reachy-motion:reachy_motion",
         "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:signal-hook",
     ],
 )
 

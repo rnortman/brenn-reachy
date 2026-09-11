@@ -14,10 +14,12 @@
 //!   the resting pose with its clearance margins. No torque, no motion, nothing
 //!   written to a servo. One line per case, and a case that did not run counts as
 //!   a failure rather than as silence.
-//! - **The bare-bus commands.** `provision`, `reboot` and `off`: a bus, a
-//!   roster, and no sequencer between them. Nothing here arms anything, and
-//!   `off` reaches the minimum risk condition's de-torqued half from wherever
-//!   the machine stands.
+//! - **The bare-bus commands.** `provision`, `reboot`, `off` and `pose-log`: a
+//!   bus, a roster, and no sequencer between them. Nothing here arms anything,
+//!   and `off` reaches the minimum risk condition's de-torqued half from
+//!   wherever the machine stands. `pose-log` writes to no register at all: it
+//!   refuses a roster that is not limp and then streams the nine present
+//!   positions, which is how a pose a person put the machine in is captured.
 //!
 //! The registry is how this project brings up hardware: write a case that
 //! asserts the behaviour we expect, let it fail, and read the discovery out of
@@ -33,6 +35,7 @@
 
 pub mod bare;
 pub mod config;
+pub mod poselog;
 pub mod selftest;
 #[cfg(test)]
 mod testutil;

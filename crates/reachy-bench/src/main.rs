@@ -5,29 +5,36 @@
 //! tests that need no port and no machine. This file owns only the argument
 //! shape, the port, the printing and the exit code.
 //!
-//! `selftest` is read-only. The other five write to a servo, and none of them
-//! commands an angle: `provision` writes one non-volatile register on a limp
-//! machine, `reboot` and `off` are de-torques, which nothing gates, `watchdog`
-//! torques one servo at the position it is already standing at and watches what
-//! its bus watchdog does to it — a stop, with torque held — and `hold-probe`
-//! torques one servo at that same position and reads it as fast as the bus
-//! answers, to see whether a joint told to stand still does.
+//! `selftest` and `pose-log` are read-only: the first sweeps the registers, the
+//! second streams the nine positions at 50 Hz while a person moves the machine
+//! by hand. The other five write to a servo, and none of them commands an angle:
+//! `provision` writes one non-volatile register on a limp machine, `reboot` and
+//! `off` are de-torques, which nothing gates, `watchdog` torques one servo at
+//! the position it is already standing at and watches what its bus watchdog does
+//! to it — a stop, with torque held — and `hold-probe` torques one servo at that
+//! same position and reads it as fast as the bus answers, to see whether a joint
+//! told to stand still does.
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, bail};
 
 use reachy_bench::bare::{
-    self, BareError, HOLD_PROBE_SECONDS, HOLD_PROBE_SERIES_PREFIX, MonotonicClock, ProbeRequest,
-    ProbeRun,
+    self, BareError, HOLD_PROBE_SECONDS, HOLD_PROBE_SERIES_PREFIX, MonotonicClock, POSE_LOG_PERIOD,
+    PoseLogRequest, PoseLogSeam, ProbeRequest, ProbeRun,
 };
 use reachy_bench::config::{self, RECORD_NAME};
 use reachy_bench::selftest::{Case, Registry, Report, now_unix};
 use reachy_bus::{SerialBusPort, ServoMap};
 use reachy_motion::Gains;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::flag;
 
 /// Where the configuration is read from unless `--config` says otherwise.
 const DEFAULT_CONFIG: &str = "reachy-bench.toml";
@@ -80,6 +87,8 @@ fn usage() -> String {
          it\n\
          \x20 hold-probe [id]       torque one servo and read it at bus speed to see whether \
          it holds still\n\
+         \x20 pose-log              read-only: stream the nine positions as JSON lines at \
+         {period_ms} ms; no torque\n\
          \n\
          Nothing here commands an angle: this tool reads the machine, provisions it and \
          releases it.\n\
@@ -119,8 +128,17 @@ fn usage() -> String {
          phases: run it at rest, never with the head up. The two series are written beside the\n\
          record as hold-probe-<stamp>-<id>.csv, whether the run passed or not.\n\
          \n\
+         `pose-log` writes nothing to any servo at all: it reads Torque Enable, refuses unless\n\
+         every servo is limp, and then reads the nine positions in one grouped exchange every\n\
+         {period_ms} ms, one JSON line per sample on stdout, until SIGINT or SIGTERM — or until\n\
+         `--seconds N` runs out, if you name one. It is the stream a hand-moved head is captured\n\
+         as, so it holds no torque and takes no weight off you; release the machine yourself with\n\
+         `off` first. Still and moving notes go out beside the samples as the machine settles and\n\
+         moves, which is what tells you a pose registered.\n\
+         \n\
          Configuration defaults to {DEFAULT_CONFIG}; the record is written to \
-         {RECORD_NAME} beside it."
+         {RECORD_NAME} beside it.",
+        period_ms = POSE_LOG_PERIOD.as_millis(),
     )
 }
 
@@ -142,18 +160,20 @@ enum Command {
     Off,
     Watchdog,
     HoldProbe,
+    PoseLog,
 }
 
 impl Command {
     /// Every command, for the tests that walk them.
     #[cfg(test)]
-    const ALL: [Command; 6] = [
+    const ALL: [Command; 7] = [
         Self::Selftest,
         Self::Provision,
         Self::Reboot,
         Self::Off,
         Self::Watchdog,
         Self::HoldProbe,
+        Self::PoseLog,
     ];
 
     /// The command `word` names, or nothing.
@@ -165,6 +185,7 @@ impl Command {
             "off" => Self::Off,
             "watchdog" => Self::Watchdog,
             "hold-probe" => Self::HoldProbe,
+            "pose-log" => Self::PoseLog,
             _ => return None,
         })
     }
@@ -178,6 +199,7 @@ impl Command {
             Self::Off => "off",
             Self::Watchdog => "watchdog",
             Self::HoldProbe => "hold-probe",
+            Self::PoseLog => "pose-log",
         }
     }
 
@@ -188,7 +210,7 @@ impl Command {
     /// servo means all of them.
     fn operands(self) -> usize {
         match self {
-            Self::Selftest | Self::Provision | Self::Off => 0,
+            Self::Selftest | Self::Provision | Self::Off | Self::PoseLog => 0,
             Self::Reboot | Self::Watchdog | Self::HoldProbe => 1,
         }
     }
@@ -204,6 +226,7 @@ impl Command {
             Self::Selftest => &[RECORD_FLAG],
             Self::Provision | Self::Reboot | Self::Off | Self::Watchdog => &[],
             Self::HoldProbe => &[RECORD_FLAG, GAINS_FLAG, SECONDS_FLAG],
+            Self::PoseLog => &[SECONDS_FLAG],
         }
     }
 }
@@ -226,6 +249,7 @@ fn dispatch(argv: impl Iterator<Item = String>) -> anyhow::Result<()> {
         Command::Off => off(&args),
         Command::Watchdog => watchdog(&args, optional_id(&args)?),
         Command::HoldProbe => hold_probe(&args, optional_id(&args)?),
+        Command::PoseLog => pose_log(&args),
     }
 }
 
@@ -570,6 +594,114 @@ fn hold_probe(args: &Args, target: Option<u8>) -> anyhow::Result<()> {
     verdict_before_write(run.outcome, saved)
 }
 
+/// Stream the nine present positions as JSON lines until the operator stops it.
+///
+/// Not gated on anything, and it needs no envelope, no kinematics and no datum:
+/// nothing here converts an angle for the wire, because nothing here writes one.
+/// The command's own refusal is the only gate it has, and it points the other
+/// way — a servo still holding torque refuses the run, because the session this
+/// streams is a person's hands inside the linkage.
+///
+/// Torque is not released here. `off` drops a head that torque is holding up,
+/// which is why it is a command an operator gives with a hand on the head and
+/// never a step another command takes for them.
+///
+/// Two clocks: the stamps are wall time, because the session's other stream —
+/// the voice host's — stamps the same one and the two are joined on it
+/// afterwards; the pacing is monotonic, because a 50 Hz cadence must not be
+/// steered by a clock that can step.
+fn pose_log(args: &Args) -> anyhow::Result<()> {
+    let (map, timing, device) = bare_config(args)?;
+
+    // Stderr, not stdout: stdout is the record, and a reader counting the lines
+    // it could not place would count these forever and never notice a torn one.
+    eprintln!(
+        "pose-log over {device} at {} baud. It writes to no register: torque must already be off \
+         on all nine, and this command will not release them — `off` does that, and it drops a \
+         head that torque is holding up, so take the head's weight and give it yourself.",
+        timing.baud
+    );
+    eprintln!("Ctrl-C ends the stream.");
+
+    // TODO(proc-seam-crate): the fourth copy of this loop in this tree.
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM] {
+        flag::register(signal, Arc::clone(&stop))
+            .with_context(|| format!("installing the stop flag for signal {signal}"))?;
+    }
+
+    let port = bare_port(&device, timing.baud)?;
+    let mut clock = MonotonicClock::new();
+    let request = PoseLogRequest {
+        device: device.clone(),
+        seconds: args.seconds,
+    };
+
+    // Writing a line is fallible, and a run of tens of thousands of them is
+    // where that shows: under the launcher stdout is a file on a tmpfs that can
+    // fill, and by hand it is a pipe the operator can close. A panic out of the
+    // middle of the loop would take the closing sweep and the `ended` line with
+    // it, which are the diagnostics for exactly this; so the first failure ends
+    // the run through the stop seam and is reported afterwards.
+    let unwritable: RefCell<Option<std::io::Error>> = RefCell::new(None);
+    let stdout = std::io::stdout();
+    let asked_to_stop = || stop.load(Ordering::Relaxed) || unwritable.borrow().is_some();
+    let mut write_line = |line: &str| {
+        if unwritable.borrow().is_some() {
+            return;
+        }
+        if let Err(error) = writeln!(stdout.lock(), "{line}") {
+            *unwritable.borrow_mut() = Some(error);
+        }
+    };
+
+    let mut wall = now_ns;
+    let mut seam = PoseLogSeam {
+        wall: &mut wall,
+        stop: &asked_to_stop,
+    };
+    let outcome = bare::pose_log(
+        &map,
+        timing,
+        port,
+        request,
+        &mut clock,
+        &mut seam,
+        &mut write_line,
+    );
+
+    // The output first: a run whose stream stopped being writable has already
+    // been ended for it, and the summary it returned would read as an ordinary
+    // close.
+    if let Some(error) = unwritable.into_inner() {
+        bail!("pose-log: the pose stream could not be written: {error}");
+    }
+    let summary = outcome.map_err(|error| refused("pose-log", error))?;
+
+    eprintln!(
+        "pose-log: {} samples, {} late, ended on {:?}",
+        summary.samples, summary.late, summary.cause
+    );
+    Ok(())
+}
+
+/// Wall time as epoch nanoseconds: the clock the pose stamps are on.
+///
+/// Must be the same `CLOCK_REALTIME` the session's other stream stamps, so the
+/// two are joinable with no offset to estimate. A clock before the epoch, which
+/// is a machine that has never had the time set, reads as zero rather than
+/// wrapping.
+// TODO(proc-seam-crate): the driver states the same convention in its own
+// function body, and the two streams' stamps only mean the same thing while
+// both say this.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
 /// What a probe run exits with: its own verdict, or the series write's failure
 /// when the probe had nothing to report.
 ///
@@ -853,6 +985,7 @@ mod tests {
             vec!["reboot", "11", "12"],
             vec!["off", "please"],
             vec!["watchdog", "11", "12"],
+            vec!["pose-log", "11"],
         ] {
             let refused = dispatch(argv(&words)).expect_err("that word means nothing here");
             let printed = refused.to_string();
@@ -875,6 +1008,8 @@ mod tests {
             vec!["reboot", "--record", "/tmp/r"],
             vec!["watchdog", "--gains", "200,0,0"],
             vec!["selftest", "--seconds", "5"],
+            vec!["pose-log", "--record", "/tmp/r"],
+            vec!["pose-log", "--gains", "200,0,0"],
         ] {
             let refused = dispatch(argv(&words)).expect_err("that command does not read it");
             let printed = refused.to_string();
@@ -893,6 +1028,9 @@ mod tests {
             &[RECORD_FLAG, GAINS_FLAG, SECONDS_FLAG]
         );
         assert_eq!(Command::Selftest.flags(), &[RECORD_FLAG]);
+        // Not `--record`: that flag names where a self-test record is written,
+        // not a pose recording.
+        assert_eq!(Command::PoseLog.flags(), &[SECONDS_FLAG]);
         for command in Command::ALL {
             assert!(
                 !command.flags().contains(&CONFIG_FLAG),

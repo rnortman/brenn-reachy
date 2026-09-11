@@ -26,7 +26,13 @@
 # no business carrying. Cleared here rather than per suite: the guard belongs to
 # whatever sources `lib.sh`, which is every one of them. Each case sets what it
 # needs.
+#
+# REACHY_RECORD_SPEECH_CONFIG and BENCH_CONFIG are cleared for the same reason
+# and one more: the Makefile exports BENCH_CONFIG unconditionally, so a suite
+# that did not clear it would decide whether a fixture payload can record a
+# session by whether this workstation has a bench file.
 unset REACHY_SPEECH_CONFIG REACHY_HOST_PARAMS REACHY_HOST REACHY_POD_BINARY BRENN_POD_DIR
+unset REACHY_RECORD_SPEECH_CONFIG BENCH_CONFIG
 
 # ---------------------------------------------------------------------------
 # The tally

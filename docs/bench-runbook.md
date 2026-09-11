@@ -1,13 +1,13 @@
 # Bench runbook — running this repo's binaries against a real unit
 
-One run moves nothing, two move the machine, one adds the voice pipeline.
+One run moves nothing, two move the machine, one adds the voice pipeline,
+one records your hands on a de-torqued head.
 Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
 `docs/fault-management.md`.
 
 ## What you need
 
-- **bazel** (bazelisk; `.bazelversion` pins it) on x86_64: the device build
-  cross-compiles with its toolchains.
+- **bazel** (bazelisk; `.bazelversion` pins it) on x86_64.
 - **ssh as root to the unit**, key-based; every script runs `BatchMode=yes`.
 - **`.local/reachy.conf`**, gitignored, read by every target here:
 
@@ -21,9 +21,8 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
   `crates/reachy-bench/reachy-bench.example.toml`, fill in `[bus]`'s serial
   node.
 - **A sibling brenn-pod checkout** (`BRENN_POD_DIR=<path>` otherwise):
-  `make motion-build` stages its prebuilt audio binary — built once by
-  `make -C ../brenn-pod/firmware reachy-pod`, or `REACHY_POD_BINARY=<path>` —
-  and `make speech-run` invokes its provisioning for the pod's half.
+  `make motion-build` stages its prebuilt audio binary and `make speech-run`
+  invokes its provisioning for the pod's half.
 - For a speech run, the mic array.
 
 ## Where things live
@@ -31,10 +30,10 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
 | | |
 |---|---|
 | `target/motion-arm64/release/` | the staged payload |
-| `.local/motion-logs/`, `.local/speech-logs/` | fetched runs, one timestamped directory each: a `.console` beside it, a `provenance.txt` naming this tree's commit and the brenn-pod revision (or `overlay:` tree) |
+| `.local/motion-logs/`, `.local/speech-logs/`, `.local/pose-sessions/` | fetched runs, one timestamped directory each: a `.console` beside it, a `provenance.txt` naming this tree's commit and the brenn-pod revision |
 | `/run/brenn-app/releases/motion/` | the payload, and every process's working directory |
 | `/run/brenn-app/logs/motion/`, `logs/launch/` | `.olog` directories; consoles |
-| `/run/brenn-app/conf/audio.conf` | the pod's link credentials, brenn-pod's to write |
+| `/run/brenn-app/conf/audio.conf` | the pod's link credentials |
 | `/var/lib/brenn-app/` | the bench's configuration and self-test record |
 
 All RAM: no dev cycle touches the eMMC, a reboot clears it.
@@ -59,17 +58,14 @@ motion daemon and takes the bus.
     make bench-run ARGS="off"            # the rest; ARGS="" lists them
     make bench-fetch
 
-`bench-run` builds first, never a binary older than your tree; `--stale-ok`
-after `--run` runs an old one deliberately. An unexpected reading goes to
-a person before anything is made green.
+An unexpected reading goes to a person before anything is made green.
 
 ## The motion test
 
     make motion-run    # build, push, run on a 36 s budget, fetch, judge
 
 **Run `make bench-run ARGS="watchdog"` and power-cycle before a unit's first
-motion run.** It fails here; that failure is the record of a watchdog trip:
-servos stop still holding torque.
+motion run.** It fails here: a watchdog trip stops the servos with torque held.
 
 Watch the machine; the verdict is `first_motion_report`'s over the records. Tail from a second shell, under `/run/brenn-app/logs/launch`:
 `motord_0.log`, `proc_0.log`, `logger_proc_0.log`, plus `voice_host_0.log` and
@@ -81,19 +77,16 @@ Watch the machine; the verdict is `first_motion_report`'s over the records. Tail
     make library-run   # build, push, play every motion, fetch, judge
 
 Every motion in `cogs/clip_library.names.json` but the `probe/` instruments,
-which `make motion-probe MOTION=<name>` plays one at a time under
-`probe-log-<stamp>`, in order, at recorded pace: minutes of unattended motion.
-**Keep the space around the machine clear until it returns.** The tour quits the launcher itself; the
-`timeout` is a backstop the sender sizes, and reaching it fails the run.
-`library_tour_report` judges the records: every motion asked once in order, no
-fault, every window moving the machine, no gap in the samples. It prints
-residual, lag, peak step and antenna separation for **Open observations**.
+which `make motion-probe MOTION=<name>` plays one at a time, in order, at
+recorded pace: minutes of unattended motion.
+**Keep the space around the machine clear until it returns.** Reaching the `timeout` fails the run;
+`library_tour_report` is the verdict.
 
 ## The hold test, and tuning
 
 `make motion-run`, then read `stillness`: antennas judged, head printed; never
-widen the bound. The gains and profile ladders, the `hold-probe` command, the
-`REACHY_EXPERIMENT_DIR` overlay and the record of every run read so far are
+widen the bound. Gains, profiles, `hold-probe`, the
+`REACHY_EXPERIMENT_DIR` overlay and every run read so far:
 `docs/servo-tuning.md`.
 
 ## The speech run
@@ -101,27 +94,41 @@ widen the bound. The gains and profile ladders, the `hold-probe` command, the
     make speech-run     # provision, build, push, preflight, run, fetch, judge
     make speech-fetch   # recover a run whose terminal died
 
-Build and push are a motion run's. Provisioning is brenn-pod's
-`reachy-provision`, every time, because `audio.conf` is tmpfs;
-`make speech-provision` runs it alone. The far end is the production launcher
-config: voice host and audio device beside the motion stack. No budget — Ctrl-C
-ends it, so a non-terminal stdin is refused first.
+Provisioning is brenn-pod's `reachy-provision`, every time (`audio.conf` is
+tmpfs); `make speech-provision` runs it alone. The far end is the production
+launcher config: voice host and audio device beside the motion stack. No
+budget — Ctrl-C ends it.
 
 The **assembly directory** is `speech.toml` plus the credentials it names,
 outside this tree, named by `REACHY_SPEECH_CONFIG`. It names them by the
 **payload-relative paths they will occupy** —
-`pod_psk_file = "secrets/pod-psk.toml"` is `<assembly>/secrets/pod-psk.toml`,
-since the host resolves from the payload root; an absolute path is a refused
-build. The build stages each at 0600; the push refuses one rotated since. Site
-values: loopback `listen_addr`; `[stt]`/`[tts]` URLs reachable *from the
+`pod_psk_file = "secrets/pod-psk.toml"` is `<assembly>/secrets/pod-psk.toml`.
+Site values: loopback `listen_addr`; `[stt]`/`[tts]` URLs reachable *from the
 robot*, never `localhost`; `[brenn.bridge]`'s `wss://` URL and `token_file`,
 absent for a bus-less pipeline; four model paths spelling the staged
-`models/...` names; `[jsonl] sink = "stdout"`, so events ride
-`voice_host_0.log` home.
+`models/...` names; `[jsonl] sink = "stdout"`.
 
 Talk to it, then Ctrl-C. However it ends, the run is fetched and
-`speech_run_report` judges it; one that recorded no channels too, its console
-the evidence.
+`speech_run_report` judges it.
+
+## Recording poses
+
+    make pose-record    # provision, build, push, preflight, record, fetch
+    make pose-fetch     # recover a session whose terminal died
+
+Stop `reachy-motiond`; if the servos may hold torque, take the head's weight
+and `make bench-run ARGS="off"`. Hands on the head, hold or move it, say what
+it is; the robot reads each transcript back. **Let the read-back finish
+before speaking again**: a shorter pause merges two utterances. The tail is
+`recorder_0.log` and `voice_host_0.log`. Ctrl-C ends it.
+
+`speech-record.toml` (`REACHY_RECORD_SPEECH_CONFIG`) is `speech.toml` without
+`[brenn]`, with `[wake] policy = "bypass"`, `[brain] mode = "echo"`, `[record]
+enabled = true`; `listen_addr`, `pod_psk_file` and `[pods]` must match.
+
+The fetch prints the `pose_session_report` command; it writes `session.json`
+and `timeline.txt` (a line per hold, move, utterance). Other segmenter flags
+tune it; `--extract <segment>` drafts a clip.
 
 ## Exit codes
 
@@ -135,10 +142,12 @@ the evidence.
 - **11** — `reachy_host --check` refused the staged configuration.
 - **12** — `audio.conf` absent or empty; provisioning never landed.
 - **13** — a speech service the config names is unreachable from the unit.
+- **14** — no staged `host/speech-record.toml`.
+- **15** — no staged `bench/reachy-bench.toml`.
+- **16** — `speech-record.toml` and `speech.toml` disagree on `listen_addr` or `pod_psk_file`.
 
-5 to 8, 12 and 13 are the remote chain's: a message and exit 1. A launcher
-exiting 5 is not the chain refusing — the chain prints a sentinel past its last
-refusal.
+5 to 8, 12 and 13 are the remote chain's: a message and exit 1; past its
+sentinel line the exit is the launcher's.
 
 ## Open observations
 
@@ -146,5 +155,5 @@ refusal.
   Tripwire: the self-test's `antenna-fold` case, failing by name outside the
   turn a fold leaves. Never widen it.
 - **A log recorded before a schema append cannot be read by a later build.**
-  Schemas bind by byte equality, with no evolution history: analyze a run with
+  Schemas bind by byte equality: analyze a run with
   the build that recorded it. `provenance.txt` names both sides.

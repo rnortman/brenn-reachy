@@ -20,11 +20,11 @@
 //! place the rule for which files in a directory *are* assets lives — a rule
 //! the daemon, the bench and the importer all have to agree on.
 //!
-//! The authoring half — [`format`], [`library`], [`vendor`], [`files`] and the
-//! importer binary — is host-side only: playback reads clips out of the
-//! configuration message, so nothing the running machine reaches enters it. It
-//! is one build target with the playback half all the same, which is why this
-//! header has to say so instead of the build.
+//! The authoring half — [`format`], [`library`], [`vendor`], [`record`],
+//! [`files`] and the importer binary — is host-side only: playback reads clips
+//! out of the configuration message, so nothing the running machine reaches
+//! enters it. It is one build target with the playback half all the same,
+//! which is why this header has to say so instead of the build.
 //! TODO(clips-authoring-split)
 //!
 //! **Nothing here is a safety gate.** Validation refuses assets that are
@@ -46,5 +46,6 @@ pub mod files;
 pub mod format;
 pub mod library;
 pub mod player;
+pub mod record;
 pub mod sequence;
 pub mod vendor;

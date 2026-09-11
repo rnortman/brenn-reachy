@@ -658,6 +658,45 @@ host_params=${REACHY_HOST_PARAMS:-${repo_root}/.local/host_params.textproto}
 # why the launcher entry passes no `--config` at all.
 host_params_path=host/host_params.textproto
 
+# The recording session's own speech configuration: a second arrangement of the
+# voice pipeline (bypassed wake gate, echo brain, no bridge), and a site's file
+# for the same reason `speech_config` is. The payload has one speech-config slot
+# per launcher entry, so a second arrangement is a second file, staged beside
+# the site's.
+#
+# Optional in the build, refused by `deploy-motion.sh --record`. Named and
+# missing is a refused build.
+record_speech_config=${REACHY_RECORD_SPEECH_CONFIG:-${repo_root}/host/speech-record.toml}
+# Whether an operator named it, which is the difference between "not there and
+# that is the shipped state" and "not there and you asked for it".
+record_speech_config_named=${REACHY_RECORD_SPEECH_CONFIG:+named}
+
+# Where it goes under the payload root: the path
+# `host/host_record_launch.textproto` spells in its `--speech-config` argument.
+# The two have to agree, and `tools/build-motion.test.sh` holds them to each
+# other.
+record_speech_config_path=host/speech-record.toml
+
+# The bench's own configuration: the serial node this unit's servos are on. A
+# per-unit file, never in this tree. One knob shared with the bench payload,
+# because both name the same physical serial node.
+#
+# A relative value is relative to this repository's root: the Makefile's default
+# is spelled relatively, so a value arriving here may be one no human typed.
+#
+# Optional in the build; `deploy-motion.sh --record` refuses a payload without
+# one.
+bench_config=${BENCH_CONFIG:-${repo_root}/.local/reachy-bench.toml}
+case $bench_config in
+/*) ;;
+*) bench_config=${repo_root}/${bench_config} ;;
+esac
+
+# Where it goes under the payload root: the path
+# `bench/record_launch.textproto` spells in the recorder's `--config` argument.
+# `tools/build-motion.test.sh` holds the two to each other.
+bench_config_path=bench/reachy-bench.toml
+
 # ---------------------------------------------------------------------------
 # Reading the speech configuration
 # ---------------------------------------------------------------------------
@@ -1137,6 +1176,24 @@ speech_report_target=//cogs:speech_run_report
 # directory within it the way `run_directory` above does.
 speech_verdict() {
 	analyzer_verdict "$speech_report_target" "$1"
+}
+
+# The analyzer of a recording session, which reads a fetch holding no records at
+# all: the composition that recorded it runs no logger, and the pose stream and
+# the transcripts are both consoles. Its document is what an operator and an LLM
+# turn into clips.
+pose_report_target=//cogs:pose_session_report
+
+# Judge a recording session's fetch, and write its document.
+#
+#   pose_verdict <fetched records directory>
+#
+# The document goes beside the fetch under the fetch's own name, the way the
+# console and the audio store do: a session's segment ids are only meaningful
+# under the configuration that produced them, so the document that names them
+# belongs to that fetch and not to a shared output directory.
+pose_verdict() {
+	analyzer_verdict "$pose_report_target" "$1" --out "${1}.session"
 }
 
 # The analyzer of a library tour, which judges a run against the library it was

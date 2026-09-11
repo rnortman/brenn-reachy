@@ -499,6 +499,59 @@ impl Wobble {
         self.highest - self.lowest
     }
 
+    /// Fold a later series' reading into this one.
+    ///
+    /// For a caller that reads one stretch as two and then finds the two were
+    /// one — a quiet run that never got long enough to be a hold, folded into
+    /// the motion around it — so the merged reading is the stretch's own rather
+    /// than either half's.
+    ///
+    /// What merges exactly: the sample count, the extremes, and therefore the
+    /// excursion. What the seam costs: the direction change between this
+    /// series' last reading and the later one's first is not counted, and the
+    /// interval that spans the seam is not measured. The reversal count is the
+    /// two halves' sum and the interval statistics are the two halves' pooled
+    /// moments, so both are a reading of the merged stretch missing at most one
+    /// turn at the join.
+    ///
+    /// The reversal position is rebased onto the merged numbering, because it
+    /// is an index into a sample count that has just grown: carried across
+    /// verbatim it would measure the next interval from the wrong origin and
+    /// keep doing so for the rest of the series, which is not a seam cost but a
+    /// corrupted figure.
+    pub fn absorb(&mut self, other: &Self) {
+        if other.samples == 0 {
+            return;
+        }
+        if self.samples == 0 {
+            *self = *other;
+            return;
+        }
+        let (mine, theirs) = (self.intervals as f64, other.intervals as f64);
+        if self.intervals > 0 && other.intervals > 0 {
+            let total = mine + theirs;
+            let delta = other.interval_mean - self.interval_mean;
+            self.interval_mean += delta * theirs / total;
+            self.interval_m2 += other.interval_m2 + delta * delta * mine * theirs / total;
+        } else if other.intervals > 0 {
+            self.interval_mean = other.interval_mean;
+            self.interval_m2 = other.interval_m2;
+        }
+        self.intervals += other.intervals;
+        // The later series' readings sit this many places along in the merged
+        // numbering, which is what its reversal index has to be read against.
+        let ahead = self.samples;
+        self.samples += other.samples;
+        self.lowest = self.lowest.min(other.lowest);
+        self.highest = self.highest.max(other.highest);
+        self.reversals += other.reversals;
+        if other.last_reversal_sample != 0 {
+            self.last_reversal_sample = ahead + other.last_reversal_sample;
+        }
+        self.direction = other.direction;
+        self.previous = other.previous;
+    }
+
     /// How many times the direction of travel changed.
     #[must_use]
     pub fn reversals(&self) -> usize {
@@ -1646,6 +1699,78 @@ mod tests {
             spread.is_some_and(|spread| spread.abs() < 1e-12),
             "{spread:?}"
         );
+    }
+
+    /// One stretch read as two halves and then merged reads as the stretch:
+    /// the count, the extremes and the turns are the whole series', and the
+    /// interval that spans the join is the one figure the seam costs.
+    ///
+    /// The merge is what a quiet run that never got long enough to be a hold
+    /// goes through, so every figure an instrument prints off a merged reading
+    /// is only as good as this.
+    #[test]
+    fn two_halves_absorbed_read_as_the_whole_series() {
+        // Up to three, down to nothing, up to four, down to two: turns at the
+        // fifth, eighth and twelfth reading.
+        let whole = [
+            0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0,
+        ];
+        let read = Wobble::over(whole);
+        assert_eq!(read.samples(), 13);
+        assert_eq!(read.reversals(), 3);
+        assert_eq!(read.interval_stats(), (Some(3.5), Some(0.5)));
+
+        // Split where the direction runs straight through, so no turn falls on
+        // the join and the reversal count is comparable.
+        let mut merged = Wobble::over(whole[..9].iter().copied());
+        let later = Wobble::over(whole[9..].iter().copied());
+        assert_eq!((merged.samples(), later.samples()), (9, 4));
+        merged.absorb(&later);
+        assert_eq!(merged.samples(), read.samples());
+        assert!((merged.excursion() - read.excursion()).abs() < 1e-12);
+        assert_eq!(merged.reversals(), read.reversals());
+        // The seam allowance, spelled: the interval from the eighth reading to
+        // the twelfth spans the join and is not measured, so the merged reading
+        // carries one interval of the whole series' two.
+        assert_eq!(merged.interval_stats(), (Some(3.0), Some(0.0)));
+
+        // And the turn *after* the merge is measured from where that turn
+        // actually fell in the merged numbering. The twelfth reading was the
+        // last turn; a fourteenth that turns again is two readings later, so
+        // the second interval is 2 and the mean of the two is 2.5. Read
+        // against the later half's own numbering the index would be 3, the
+        // interval 11, and the mean 7.
+        merged.take(3.0);
+        let (mean, _) = merged.interval_stats();
+        assert!(
+            mean.is_some_and(|mean| (mean - 2.5).abs() < 1e-12),
+            "{mean:?}"
+        );
+
+        // A later half with no turn of its own leaves this one's position
+        // standing rather than zeroing it, which would skip the next interval
+        // instead of mis-measuring it.
+        let mut straight = Wobble::over(whole[..9].iter().copied());
+        straight.absorb(&Wobble::over([2.0, 3.0, 4.0]));
+        straight.take(3.0);
+        let (mean, _) = straight.interval_stats();
+        // Turns at the fifth and eighth readings, then at the thirteenth: the
+        // intervals are 3 and 5.
+        assert!(
+            mean.is_some_and(|mean| (mean - 4.0).abs() < 1e-12),
+            "{mean:?}"
+        );
+
+        // Nothing on either side is not a merge: an empty series absorbs into
+        // nothing and takes on whatever it absorbs whole.
+        let mut nothing = Wobble::default();
+        nothing.absorb(&read);
+        assert_eq!(nothing.samples(), read.samples());
+        assert_eq!(nothing.interval_stats(), read.interval_stats());
+        let mut all_of_it = read;
+        all_of_it.absorb(&Wobble::default());
+        assert_eq!(all_of_it.samples(), read.samples());
+        assert_eq!(all_of_it.interval_stats(), read.interval_stats());
     }
 
     /// The allowance is read as well as skipped, and what it reads is the

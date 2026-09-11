@@ -43,6 +43,15 @@ ifdef REACHY_SPEECH_CONFIG
 export REACHY_SPEECH_CONFIG
 endif
 
+# The operator's speech configuration for a recording session, whose voice half
+# transcribes with no wake word and reads each transcript back. A second file
+# rather than an override of the one above: the payload has one speech-config
+# slot per launcher entry, and the recording entry names this one literally.
+# Exported for the reason the site's configuration is.
+ifdef REACHY_RECORD_SPEECH_CONFIG
+export REACHY_RECORD_SPEECH_CONFIG
+endif
+
 # The operator's host configuration, for the payload's edge half. Read by the
 # scripts the same way, and exported for the same reason; the unnamed default is
 # `.local/host_params.textproto`, which `tools/lib.sh` names.
@@ -97,6 +106,8 @@ help:
 	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
+	@echo "  make pose-record     de-torqued, hands on the head: record poses and speech"
+	@echo "  make pose-fetch      bring a recording session's streams back, timestamped"
 
 # The shell half of the gate. These scripts push binaries and configuration onto
 # real hardware and drop privileges there, and they already carry
@@ -400,7 +411,14 @@ motion-host-run: require-bazel
 
 # The bench's configuration for this unit. Gitignored: it holds the serial node
 # this machine's servos are on.
+#
+# Exported, because two things read it and only one of them is a recipe: a bench
+# night pushes this file as its own payload, and `tools/build-motion.sh` stages a
+# copy of it into the motion payload for the recording session's recorder to
+# read. One knob, because a unit whose bench and whose recorder looked at
+# different serial nodes would be one nobody could explain.
 BENCH_CONFIG ?= .local/reachy-bench.toml
+export BENCH_CONFIG
 
 # Where fetched state files accumulate. One per run, named for its fetch time.
 BENCH_RECORDS ?= .local/records
@@ -498,6 +516,11 @@ MOTION_RECORDS ?= .local/motion-logs
 # configuration, taken from `host/speech.toml` or from `REACHY_SPEECH_CONFIG`. A
 # payload built without one stages a host that narrates the session and does not
 # listen.
+#
+# Two more are optional in the same way, and what wants them is a recording
+# session: `REACHY_RECORD_SPEECH_CONFIG` (or `host/speech-record.toml`), the
+# voice half of one, and `BENCH_CONFIG`, the recorder's own configuration. A
+# payload without them builds and runs everything else.
 .PHONY: motion-build
 motion-build:
 	tools/build-motion.sh
@@ -645,3 +668,49 @@ speech-run: device-host require-bazel
 .PHONY: speech-fetch
 speech-fetch: device-host
 	tools/deploy-motion.sh $(REACHY_HOST) --speech-fetch $(SPEECH_RECORDS)
+
+# ---------------------------------------------------------------------------
+# The recording session: the servos de-torqued, the operator's two hands on the
+# head, and both streams — poses at 50 Hz and every utterance with its
+# transcript — written on one clock.
+#
+# The machine is at the Minimum Risk Condition for the whole session, with a
+# person's hands in the linkage: what starts is the pose recorder, which reads
+# Present Position and writes to no register, beside the voice host and the
+# audio device. No driver, no control process, no logger, and nothing in the
+# composition that can arm anything.
+#
+# The operator's sequence, which this target is the middle of, is in
+# `docs/bench-runbook.md`: stop the motion daemon, take the head's weight and
+# `make bench-run ARGS=off` if the servos may still be torqued, then this.
+# Dropping torque is never a step a deploy script takes on its own — `off` drops
+# a head that torque is holding up.
+
+# Where fetched recording sessions accumulate. Separate again from the other
+# two: a third analyzer reads these, and the fetch names each for the kind of
+# run it came off.
+POSE_RECORDS ?= .local/pose-sessions
+
+# Provision, build, push, preflight, record, fetch, analyze. The steps and their
+# order are `speech-run`'s, for `speech-run`'s reasons — the terminal check
+# leads because a session nobody can end is refused whatever else happened, and
+# provisioning precedes the build because on a fresh assembly directory it is
+# what writes the PSK table the build then stages.
+#
+# The pod's half is provisioned from the site's speech configuration, which is
+# the same provisioning a speech run does; the recording session's own
+# configuration is the voice host's half, and `--record` refuses a pair that
+# would put the two on different addresses.
+.PHONY: pose-record
+pose-record: device-host require-bazel
+	tools/deploy-motion.sh $(REACHY_HOST) --record-preflight
+	$(MAKE) speech-provision
+	$(MAKE) motion-deploy
+	tools/deploy-motion.sh $(REACHY_HOST) --record $(POSE_RECORDS)
+
+# Bring a recording session's streams back — the session whose terminal died, or
+# whose document is wanted a second time, which is also how a threshold is tuned:
+# the analyzer is re-run over one fetched session with different segmenter flags.
+.PHONY: pose-fetch
+pose-fetch: device-host
+	tools/deploy-motion.sh $(REACHY_HOST) --record-fetch $(POSE_RECORDS)

@@ -103,7 +103,8 @@ crate.spec(
 )
 
 # JSON at runtime and in tests. motion-proto decodes the motion intent bodies
-# that arrive on the wire; reachy-clips reads the clip assets; reachy-kin's baked
+# that arrive on the wire; reachy-clips reads the clip assets; reachy-bench
+# writes the pose log's one line per sample; reachy-kin's baked
 # linkage constants are asserted against the vendored copy of the vendor file
 # they were transcribed from, and that file is JSON. `float_roundtrip` because
 # that comparison is exact equality against transcribed decimals.
@@ -140,7 +141,8 @@ crate.spec(
 # syscall and every crate in this tree forbids unsafe code; `signal_hook::flag`
 # is a safe wrapper over exactly that. reachy-motord, reachy-host, reachy-ask --
 # the last two because a background child of a non-interactive shell inherits
-# SIGINT ignored, so the handler is what makes a harness stop act at all.
+# SIGINT ignored, so the handler is what makes a harness stop act at all. Also
+# reachy-bench, whose pose log streams until the operator ends the session.
 crate.spec(
     default_features = False,
     package = "signal-hook",
@@ -167,7 +169,9 @@ crate.spec(
 
 # The bench binary's configuration file format: the bus port and its baud, the
 # arm thresholds the self-test registry reads, and the register values
-# provisioning writes. Also the self-test record written beside that file.
+# provisioning writes. Also the self-test record written beside that file, and
+# the three endpointer values the pose session report reads out of a recording
+# run's own speech configuration. reachy-bench, //cogs:pose_session_report.
 crate.spec(
     package = "toml",
     version = "1",
@@ -236,7 +240,7 @@ crate.spec(
 # so a fork, a mirror or a bump cannot reach some of them and not the rest.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "b8e1c21a1bcf90b17cd45fc44a020cf61baa761c"
+BRENN_POD_REV = "13a513d6b38a14194ecb2e1853a7a55d9e7f7dab"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
@@ -260,7 +264,9 @@ crate.spec(
 )
 
 # The pipeline stages the surface drives. Named here because the host states
-# its own pipeline wiring. reachy-host.
+# its own pipeline wiring, and by the two offline analyzers for the store
+# reader and wav writer they cut a run's audio with. reachy-host,
+# //cogs:speech_run_report, //cogs:pose_session_report.
 crate.spec(
     git = BRENN_POD_GIT,
     package = "speech-pipeline",
@@ -280,9 +286,10 @@ crate.spec(
 
 # The frame-log format the pod records into and the store the fetch brings home.
 # Named here for its `test-util` fixtures, which are the only writer of that
-# format: `//cogs:speech_run_report_test` writes a store with them and holds the
-# report's turn clips to what comes back out, and `//cogs:speech_run_report`
-# names the crate for the cause a clip's replay stopped for.
+# format: `//cogs:speech_run_report_test` and
+# `//cogs:pose_session_report_test` each write a store with them and hold their
+# report's cuts to what comes back out, and `//cogs:speech_run_report` names the
+# crate for the cause a clip's replay stopped for.
 #
 # A spec's features are a property of the package and not of the edge that
 # names it, so this turns `test-util` on for every consumer in the closure --

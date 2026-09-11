@@ -11,6 +11,24 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Added
 
+- **A pose recorder for authoring clips by hand.** `make pose-record` runs a
+  recording session: the servos de-torqued, the operator's hands on the head,
+  and three streams on one clock --- servo positions at 50 Hz from a new
+  read-only bench command (`reachy-bench pose-log`), the speech pipeline
+  transcribing spoken labels with each one read back over the speaker, and the
+  audio itself. The operator speaks a label, hears it confirmed, then moves the
+  head; no screen needed. A streaming motion segmenter
+  (`reachy_motion::segments`) classifies the pose stream into still holds and
+  motion stretches in real time, so the console says when a pose registered.
+  After the session, `pose_session_report` joins the two streams into a
+  document: segments with per-joint and head-space figures, utterances with
+  their intervals and audio clips, and a timeline an LLM or the operator reads.
+  `--extract <segment-id>` writes a clip draft in the format the daemon's
+  loader reads, with every channel a delta over the neutral base. A third
+  launcher configuration (`robotcpu_record.textproto`) composes the bench, the
+  voice host in echo-brain / bypass-wake mode, and the pod --- no driver, no
+  control process, no arming path.
+
 - **Servo profiles and gains are per-class and tunable without a code change.**
   The nine servos fall into three classes — the six Stewart-platform legs, the
   body yaw, and the two antennas — each with its own load and its own Velocity

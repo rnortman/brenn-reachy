@@ -65,6 +65,18 @@ allowed_label() {
 	# on no unit.
 	//cogs:speech_run_report) return 0 ;;
 	//cogs:speech_run_report_test) return 0 ;;
+	# The audio half of the two analyzers' shared vocabulary: the store's
+	# resolver and wav writer, which are the pipeline crate's, read the one
+	# way by both. It is why this edge is a library of its own rather than a
+	# member of `:run_report`, which every analyzer in the package takes.
+	//cogs:run_audio) return 0 ;;
+	//cogs:run_audio_test) return 0 ;;
+	# The pose session report, on the same terms: an offline analyzer that
+	# names the pipeline crate for the recorded-audio store's own reader and
+	# wav writer, so a session's utterance cuts are made by the one
+	# implementation of that format. Workstation only, and in no payload.
+	//cogs:pose_session_report) return 0 ;;
+	//cogs:pose_session_report_test) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -188,6 +200,8 @@ if [ -z "${TOKIO_QUARANTINE_FIXTURE:-}" ]; then
 		cat <<-'LABELS'
 			//bazel/platform:device_deployables
 			//bazel/platform:motion_payload
+			//cogs:pose_session_report
+			//cogs:pose_session_report_test
 			//cogs:speech_run_report
 			//cogs:speech_run_report_test
 			//crates/reachy-host:example_params_test

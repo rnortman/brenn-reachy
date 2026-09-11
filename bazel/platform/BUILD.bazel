@@ -30,20 +30,27 @@ platform(
     visibility = ["//visibility:public"],
 )
 
-# What a unit is built out of: the driver binary, the voice host, the executable
-# both cog processes start from, the system target that emits their process
-# descriptions and the writer's channel set, the launcher that starts them, the
-# two launcher configs naming them, and the harness's intent source -- which the
-# launcher does not start, because it binds the narration port before the
+# What a unit is built out of: the driver binary, the voice host, the bench, the
+# executable both cog processes start from, the system target that emits their
+# process descriptions and the writer's channel set, the launcher that starts
+# them, the three launcher configs naming them, and the harness's intent source
+# -- which the launcher does not start, because it binds the narration port before the
 # composition comes up. tools/build-motion.sh builds this, so the payload it
 # stages and the set the gate covers are one set.
 #
-# Two launcher configs, not one: the production config names the host and the
+# Three launcher configs, not one: the production config names the host and the
 # audio device, and the harness twin names neither, because `deploy-motion.sh
 # --run` starts the intent source itself -- a second process binding the
 # narration port 7410 and addressing scripts to 7409 in one run is a bind race
 # deciding the verdict -- and because a motion run must need no audio hardware.
-# `//cogs:BUILD.bazel` states the rule at the rules.
+# The third names a recording session: the pod, a host reading the recording
+# speech configuration, and the bench holding the servo bus read-only, with
+# nothing in it that can arm a servo. `//cogs:BUILD.bazel` states the rule at the
+# rules.
+#
+# The bench binary is a payload member for the recording config's sake.
+# `tools/deploy-bench.sh` also stages a copy for bench nights; the two stagings
+# are independent.
 #
 # The launcher is C++ from the drop rather than anything of ours, so it is also
 # what makes `make check-device` gate a cross-build of boost, protobuf and
@@ -83,8 +90,10 @@ filegroup(
         "//cogs:robot_clk_exe",
         "//cogs:robotcpu.textproto",
         "//cogs:robotcpu_harness.textproto",
+        "//cogs:robotcpu_record.textproto",
         "//cogs:system_robot_clk",
         "//crates/reachy-ask:reachy_ask",
+        "//crates/reachy-bench:reachy_bench",
         "//crates/reachy-host:reachy_host",
         "//crates/reachy-motord:reachy_motord",
         "@clockwork//jewels/simplelaunch:simplelaunch",
@@ -103,11 +112,12 @@ filegroup(
 # and ONNX Runtime, and so the only proof that the voice pipeline's native
 # libraries resolve for the unit's architecture. It is testonly, which this
 # filegroup cannot carry, so the Makefile names it beside this one.
+#
+# Nothing is named here today that `motion_payload` does not already carry. The
+# rule stays, because it is the one place a target built for a unit and
+# not yet staged can be added.
 filegroup(
     name = "device_deployables",
-    srcs = [
-        ":motion_payload",
-        "//crates/reachy-bench:reachy_bench",
-    ],
+    srcs = [":motion_payload"],
     visibility = ["//visibility:public"],
 )

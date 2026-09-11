@@ -910,6 +910,74 @@ rust_test(
     ],
 )
 
+# What one recording session holds, read off the pose stream the recorder
+# wrote: the operator's tool for turning a session into clips, run as
+# `bazel run //cogs:pose_session_report -- <records> --out <dir>` over a fetched
+# recording.
+#
+# It reads two files -- the recorder's console and the voice host's, both in the
+# fetch -- and answers with a session document, a timeline and one `.wav` per
+# utterance. `--extract <segment-id>` writes one segment out as a clip draft
+# beside them. The analyzer holds no arithmetic of its own about what a hold is or
+# where the head was: segmentation is `reachy-motion`, head poses are
+# `reachy-kin`, counts-to-radians is `dxl-proto`, the pose stream's line schema
+# is `reachy-bench`'s, which is what writes it, and the recorded audio is read
+# and cut by brenn-pod's own store reader.
+rust_binary(
+    name = "pose_session_report",
+    srcs = ["pose_session_report.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        # The fetched audio store, cut the way the speech run report cuts it.
+        ":run_audio",
+        ":run_report",
+        "//crates/dxl-proto:dxl_proto",
+        # The recorder's own line schema and sampling grid: the writer of the
+        # stream declares the format, and this reader reads that declaration
+        # rather than a second copy of the field names.
+        "//crates/reachy-bench:reachy_bench_lib",
+        # The clip format and the recording-to-document conversion: `--extract`
+        # writes an asset the daemon's own loader reads, so the delta
+        # convention and the channel spellings are the format crate's rather
+        # than restated here.
+        "//crates/reachy-clips:reachy_clips",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:serde",
+        "@brenn_reachy_crates//:serde_json",
+        # The endpointer the pipeline actually ran under, for the derivation a
+        # speech interval is walked back by: the defaults and the chunk the
+        # windows quantize to are the listener's own, never numbers retyped
+        # from another repository.
+        "@brenn_reachy_crates//:speech-pipeline",
+        # The run's own speech configuration, for the three endpointer values a
+        # speech interval is walked back by.
+        "@brenn_reachy_crates//:toml",
+    ],
+)
+
+# The analyzer over crafted sessions: a hold, a move and a hold; the holds
+# solved back to the poses they were recorded at; cranks no linkage closes on;
+# the hole and the backwards stamp; the timeline's line order; a threshold that
+# absorbs a hold; three utterances joined to the segments around them, one of
+# them read back over; and each shape of fetch the verdict is red on. The cases
+# write a fetch into a scratch directory, which `//crates/reachy-scratch`
+# removes however a case ended.
+rust_test(
+    name = "pose_session_report_test",
+    size = "small",
+    crate = ":pose_session_report",
+    deps = [
+        "//crates/reachy-scratch:reachy_scratch",
+        # A fixture audio store written through brenn-pod's own frame-log
+        # writer: a store built any other way is a second writer of that format
+        # to keep in step with the first.
+        "@brenn_reachy_crates//:pod-ingest",
+    ],
+)
+
 # What the pose estimator keeps between samples, in a module of its own: the
 # motion box imports six fields, not the simulated plant.
 clk(
@@ -1156,6 +1224,70 @@ merge_simplelaunch_config(
     visibility = ["//visibility:public"],
 )
 
+# The third launcher config: a recording session. The servos de-torqued, an
+# operator's two hands on the head, the voice pipeline transcribing everything
+# said, and one read-only process reading the nine Present Positions at 50 Hz
+# into its own console.
+#
+# Three apps and no fourth: the audio device, a voice host naming the recording
+# speech configuration, and the bench under `pose-log`. No driver, no control
+# process, no logger -- a session with hands in the linkage runs nothing that can
+# arm a servo, and the property that argument rests on is the app table: the
+# recorder's code path writes to no register, and nothing here invokes any other
+# bench command. The pose stream is the recorder's console, so there is no log to
+# write and nothing for the logger to hold.
+#
+# Hand-written for the reason the harness twin is: the build updater renders the
+# production config from the system module and knows about no other. Three `srcs`
+# and no `data`: this composition wants no `proc`, `logger_proc` or prelaunch
+# entry, so the renderer's output is not a source here.
+merge_simplelaunch_config(
+    name = "robotcpu_record.textproto",
+    srcs = [
+        "//bench:record_launch.textproto",
+        "//host:host_record_launch.textproto",
+        "//pod:pod_launch.textproto",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# The fetched audio store, read the one way both analyzers of a fetch read it.
+#
+# Its own library rather than a member of `:run_report`: cutting a span is a
+# read of brenn-pod's frame-log format through the pipeline crate, and that
+# crate carries an async runtime. `:run_report` is depended on by every analyzer
+# in this package, including the ones on the motion path that must reach no
+# runtime at all, so the audio half is a separate edge that only the two
+# analyzers of a speech-bearing fetch take. `tools/tokio-quarantine.test.sh`
+# names it.
+rust_library(
+    name = "run_audio",
+    srcs = ["audio_store.rs"],
+    crate_name = "run_audio",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        # The bounding every piece of console-authored text passes through
+        # before it is said: a log name is the pod's, not this tree's.
+        ":run_report",
+        # The store's resolver and the wav writer. One reader of that format in
+        # the world, and this is not a second one.
+        "@brenn_reachy_crates//:speech-pipeline",
+    ],
+)
+
+# The store's three states and the one span cut, over scratch directories: an
+# absent store, an empty one and one that will not open are three answers; a
+# torn sample bound and a log the store does not hold are said without letting
+# the pod's own text reach a report as a line of it; and the output directory is
+# made once.
+rust_test(
+    name = "run_audio_test",
+    size = "small",
+    crate = ":run_audio",
+    deps = ["//crates/reachy-scratch:reachy_scratch"],
+)
+
 # The two lists an analyzer's verdict is, and the printer that turns them into
 # stdout, stderr and an exit status.
 #
@@ -1169,6 +1301,10 @@ rust_library(
     crate_name = "run_report",
     edition = "2024",
     visibility = ["//visibility:public"],
+    # The console tear-recovery is a JSON read: the launcher merges an app's two
+    # output streams into one file and both analyzers of a fetch read the events
+    # back out of it the same way.
+    deps = ["@brenn_reachy_crates//:serde_json"],
 )
 
 # The printer's own cases: the two halves stay separate and in order, and the
@@ -1952,6 +2088,7 @@ rust_binary(
         ":log_read",
         ":motion_channels",
         ":motion_evidence",
+        ":run_audio",
         ":run_report",
         ":script_clk_rs",
         ":session_clk_rs",

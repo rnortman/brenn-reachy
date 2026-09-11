@@ -113,7 +113,9 @@ use reachy_host::{
     UNSPOKEN, VOICELESS,
 };
 use reachy_motion::postures::neutral_targets;
-use run_report::{Report, verdict};
+use run_report::{
+    EVENT_HEAD, Report, audio_dir, console_dir, event, quote, recover, sibling, verdict,
+};
 use serde_json::Value;
 use stillness_report::{Standard, Stillness, say};
 
@@ -130,12 +132,6 @@ const HOST_LOG: &str = "voice_host_0.log";
 /// operator asks about a run the robot seemed deaf in, and the pipeline's own
 /// half of that story is in a file this tool has no schema for.
 const POD_LOG: &str = "pod_0.log";
-
-/// What the fetch names the console directory beside a record directory.
-const CONSOLE_SUFFIX: &str = ".console";
-
-/// What the fetch names the recorded-audio store beside a record directory.
-const AUDIO_SUFFIX: &str = ".audio";
 
 /// What this tool names the directory it writes one clip per turn into.
 const TURNS_SUFFIX: &str = ".turns";
@@ -219,7 +215,7 @@ const ANNOUNCE_SEAM_UNUSED: &str = "announce_seam_unused";
 /// this tool keeps say a pipeline was busy and never say whether anybody was
 /// answered.
 const WAKE_DETECTED: &str = "wake_detected";
-const UTTERANCE: &str = "utterance";
+const UTTERANCE: &str = event::UTTERANCE;
 const BRAIN_DISPATCHED: &str = "brain_dispatched";
 const WAKE_COMMAND_ABSENT: &str = "wake_command_absent";
 const BARGE_COMMAND_ABSENT: &str = "barge_command_absent";
@@ -245,8 +241,8 @@ const ARM_EXPIRED: &str = "arm_expired";
 /// pod, ahead of any decision about what was playing — so it is attributed to
 /// the reply it cut, which is the last turn this console dispatched.
 const BARGE_IN: &str = "barge_in";
-const PLAYBACK_FLUSHED: &str = "playback_flushed";
-const PLAYBACK_FINISHED: &str = "playback_finished";
+const PLAYBACK_FLUSHED: &str = event::PLAYBACK_FLUSHED;
+const PLAYBACK_FINISHED: &str = event::PLAYBACK_FINISHED;
 
 /// The two events the auto-select beam's bearing is read off.
 ///
@@ -284,17 +280,8 @@ const LOW_CONFIDENCE: &str = "low_confidence";
 /// sender's. Only the first is this run's failure.
 const SCRIPTER_SOURCE: &str = "scripter";
 
-/// Where a pipeline event begins when one is glued onto a console line.
-///
-/// Every event the pipeline emits leads with its timestamp, which is what makes
-/// the torn shape below recoverable rather than guessed at.
-const EVENT_HEAD: &str = "{\"ts_ms\"";
-
 /// How many non-JSON lines are quoted in the summary.
 const NOISE_SAMPLE: usize = 3;
-
-/// How much of a line is quoted where one is quoted.
-const QUOTE_LIMIT: usize = 160;
 
 /// The fields of an edge line the motion ledger reads by name.
 ///
@@ -2089,27 +2076,6 @@ fn spread(readings: &[f64]) -> Option<(f64, f64)> {
     Some((mean, variance.sqrt()))
 }
 
-/// A directory named beside `records` by suffixing the record directory's own
-/// name.
-///
-/// Built from the record path's own spelling rather than from a sibling scan:
-/// the set is named by construction, and a directory holding two runs would
-/// otherwise be ambiguous. Three siblings are spelled this way — the console
-/// and the audio store the fetch wrote, and the turn clips this tool writes.
-fn sibling(records: &Path, suffix: &str) -> PathBuf {
-    let mut name = records
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    name.push_str(suffix);
-    records.with_file_name(name)
-}
-
-/// The console directory the fetch wrote beside `records`.
-fn console_dir(records: &Path) -> PathBuf {
-    sibling(records, CONSOLE_SUFFIX)
-}
-
 /// What one raw line is: any console text around an event, and the line.
 struct Classified {
     /// The console text a recovered event was glued onto, as it was written.
@@ -2124,75 +2090,22 @@ struct Classified {
     lines: Vec<Line>,
 }
 
-/// What one raw line is, recovering an event glued onto console text.
+/// What one raw line is: the events in it, and the console text around them.
 ///
-/// The host's two output streams are one file: the launcher redirects both into
-/// `voice_host_0.log`, and they tear — a console sentence still without its
-/// newline, and a JSONL event written into the same descriptor behind it. A
-/// whole-line parse reads every torn line as noise. So a line that does not
-/// parse whole is read as the whole objects it holds and whatever text
-/// surrounds them: the objects are the events and the text on either side is
-/// kept as noise. A line with no whole object anywhere in it stays noise, which
-/// is what a sentence merely quoting that spelling is.
-///
-/// The tear runs both directions, and both are the ordinary shape rather than
-/// the exotic one — an event glued onto an unterminated sentence, and a
-/// sentence begun into the same descriptor behind a whole event. The second is
-/// how a transcript's own line arrives, so a reader that recovers only the
-/// first loses exactly the events a turn is assembled from.
-///
-/// Every occurrence of an [`EVENT_HEAD`] is tried rather than the first,
-/// because the console text a real event is glued onto can hold that spelling
-/// too — a sentence quoting an event, or a half-written event glued ahead of a
-/// whole one. Splitting at the first match alone loses the real event at the
-/// line's end, and a lost `brain_brenn` is a run that exempts itself from
-/// [`bridged`].
-///
-/// And every whole event from that point on is kept, not only the first: two
-/// writers interleaving cleanly put two finished events in one descriptor with
-/// no newline between them, and the second is as real as the first. Only the
-/// text after the last whole object is noise.
+/// The recovery is [`run_report::recover`], which is where the shapes a merged
+/// console tears into are described; what this adds is the reading of each
+/// recovered object as one of this tool's own lines. Torn lines are the ordinary
+/// case rather than the exotic one — a transcript's own line arrives glued to
+/// the event ahead of it — and a lost `brain_brenn` is a run that exempts itself
+/// from [`bridged`], so the objects are recovered rather than the line
+/// discarded.
 fn classify(raw: &str) -> Classified {
-    let starts = std::iter::once(0).chain(raw.match_indices(EVENT_HEAD).map(|(at, _)| at));
-    for at in starts {
-        let (lines, until) = leading(&raw[at..]);
-        if lines.is_empty() {
-            continue;
-        }
-        let behind = &raw[at + until..];
-        return Classified {
-            ahead: (at > 0).then(|| raw[..at].to_owned()),
-            behind: (!behind.is_empty()).then(|| behind.to_owned()),
-            lines,
-        };
-    }
+    let recovered = recover(raw, EVENT_HEAD);
     Classified {
-        ahead: None,
-        behind: None,
-        lines: Vec::new(),
+        ahead: recovered.ahead,
+        behind: recovered.behind,
+        lines: recovered.values.into_iter().filter_map(object).collect(),
     }
-}
-
-/// Every whole JSON object from the start of some text, and how much of the
-/// text they took.
-///
-/// A streaming read rather than a whole-text parse: trailing content is what a
-/// tear leaves behind an event, and a parse that rejects the line for it throws
-/// away the event with it. The read stops at the first thing that is not a
-/// whole object — a half-written event, or a scalar somebody printed — and
-/// whatever is left is the caller's noise.
-fn leading(raw: &str) -> (Vec<Line>, usize) {
-    let mut values = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
-    let mut lines = Vec::new();
-    let mut until = 0;
-    while let Some(Ok(value)) = values.next() {
-        let Some(line) = object(value) else {
-            break;
-        };
-        until = values.byte_offset();
-        lines.push(line);
-    }
-    (lines, until)
 }
 
 /// What the host refused with inside one line of console text, where it did.
@@ -2569,22 +2482,6 @@ fn died_of(reason: &str, detail: &str, keys: &str) -> String {
     } else {
         named.join(" — ")
     }
-}
-
-/// A line's text, bounded and stripped of control characters.
-///
-/// The console is a shared file and the text in it is not all this tree's: a
-/// pipeline event quoting what somebody said reaches the terminal through here.
-fn quote(text: &str) -> String {
-    let mut clean: String = text
-        .chars()
-        .take(QUOTE_LIMIT)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if text.chars().count() > QUOTE_LIMIT {
-        clean.push('…');
-    }
-    clean
 }
 
 /// The words the edge spells a dropped body with.
@@ -3325,11 +3222,7 @@ impl Clips {
             into: into.to_path_buf(),
             ..Self::default()
         };
-        let recorded = match std::fs::read_dir(store) {
-            Ok(mut entries) => Ok(entries.any(|entry| entry.is_ok())),
-            Err(why) if why.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(why) => Err(format!("{}: {why}", store.display())),
-        };
+        let recorded = run_audio::recorded(store);
         // The directory is made once, by the first turn that has audio to
         // write, and a directory that cannot be made is one fact about the
         // filesystem rather than one refusal per turn.
@@ -3417,9 +3310,6 @@ fn stopped_because(stop: &pod_ingest::SpliceStop) -> String {
 /// the report goes on. A partial clip is written all the same and says what is
 /// wrong with it, because partial audio beats none.
 ///
-/// The log name is console-authored text and must be quoted: a name carrying
-/// a newline would otherwise fabricate a line of this report.
-///
 /// `made` carries the one attempt at creating the output directory, made by the
 /// first turn that gets as far as audio to write.
 ///
@@ -3432,9 +3322,6 @@ fn stopped_because(stop: &pod_ingest::SpliceStop) -> String {
 /// call already paid for -- a second resolve would double the cost the TODO
 /// below is about.
 ///
-/// TODO(clip-one-pass-per-log): every turn of a run is carved from the same log
-/// and each call here decodes it from the head, so a session's clips cost work
-/// quadratic in its turns.
 #[allow(clippy::too_many_arguments)]
 fn cut(
     label: Label,
@@ -3448,37 +3335,12 @@ fn cut(
 ) -> Clip {
     let name = label.file_name();
     let name = name.as_str();
-    // A sample index off a line that tore is a number this tool does not carve
-    // with: the same fact the resolver names `InvalidSpan`, said in the same
-    // words, rather than a panic in the report the run is read by.
-    let (Ok(start_sample), Ok(end_sample)) = (u64::try_from(start), u64::try_from(end)) else {
-        return Clip::not_written("invalid span".to_owned());
-    };
-    let span = speech_pipeline::AudioSpan {
-        log: log.clone(),
-        start_sample,
-        end_sample,
-        segments: Vec::new(),
-    };
-    let audio = match span.resolve(store) {
+    let audio = match run_audio::resolve(store, &log, start, end) {
         Ok(audio) => audio,
-        Err(speech_pipeline::SpanResolveError::InvalidSpan { .. }) => {
-            return Clip::not_written("invalid span".to_owned());
-        }
-        Err(speech_pipeline::SpanResolveError::Resolve { log, source }) => {
-            return Clip::not_written(format!("{}: {source}", quote(&log)));
-        }
+        Err(why) => return Clip::not_written(why),
     };
-    if audio.pruned.iter().any(|part| part.log == log) {
-        return Clip::not_written(format!("{} is not in the store", quote(&log)));
-    }
-    if let Err(why) = made.get_or_insert_with(|| {
-        std::fs::create_dir_all(into).map_err(|why| format!("{}: {why}", into.display()))
-    }) {
-        return Clip::not_written(why.clone());
-    }
-    if let Err(why) = speech_pipeline::write_spine_wav(&into.join(name), &audio.pcm) {
-        return Clip::not_written(format!("{name}: {why}"));
+    if let Err(why) = run_audio::write_cut(into, name, &audio.pcm, made) {
+        return Clip::not_written(why);
     }
     let mut notes = String::new();
     // A boundary past the decoded audio states no suffix to write, and a write
@@ -3890,11 +3752,7 @@ fn main() -> ExitCode {
     }
     let at = Path::new(&records);
     let console = Console::read(at);
-    let clips = Clips::write(
-        &console,
-        &sibling(at, AUDIO_SUFFIX),
-        &sibling(at, TURNS_SUFFIX),
-    );
+    let clips = Clips::write(&console, &audio_dir(at), &sibling(at, TURNS_SUFFIX));
     let report = analyze(&console, &clips, &Records::of(at));
     verdict(
         "speech_run_report",
@@ -3916,24 +3774,20 @@ mod tests {
     use reachy_motion::record::write_pose;
     use reachy_motion::stillness::COUNT_RAD;
     use reachy_scratch::{Scratch, scratch_dir};
-    use run_report::Report;
+    use run_report::{Report, audio_dir, console_dir, sibling};
 
     use super::{
-        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, AUDIO_SUFFIX, Clips, Console, ESTIMATE_CHANNEL,
-        HOST_LOG, Line, POD_LOG, POSE_CHANNEL, PROVENANCE, PoseEstimateWire, PoseSampleWire,
-        REPORT_CHANNEL, Records, ReportKind, ReportKindWire, SCRIPT_CHANNEL, ScriptWire,
-        SessionPhaseWire, TURNS_SUFFIX, TimelineEntryWire, TimelineWire, analyze, classify,
-        console_dir, neutral_targets, refusal_kinds, sibling,
+        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Clips, Console, ESTIMATE_CHANNEL, HOST_LOG, Line,
+        POD_LOG, POSE_CHANNEL, PROVENANCE, PoseEstimateWire, PoseSampleWire, REPORT_CHANNEL,
+        Records, ReportKind, ReportKindWire, SCRIPT_CHANNEL, ScriptWire, SessionPhaseWire,
+        TURNS_SUFFIX, TimelineEntryWire, TimelineWire, analyze, classify, neutral_targets,
+        refusal_kinds,
     };
 
     /// The whole reading of one fetch, as a case has just written it.
     fn judge(at: &Path) -> Report {
         let console = Console::read(at);
-        let clips = Clips::write(
-            &console,
-            &sibling(at, AUDIO_SUFFIX),
-            &sibling(at, TURNS_SUFFIX),
-        );
+        let clips = Clips::write(&console, &audio_dir(at), &sibling(at, TURNS_SUFFIX));
         analyze(&console, &clips, &Records::of(at))
     }
 
@@ -7702,7 +7556,7 @@ mod tests {
     /// thing that writes this format: a fixture built any other way is a second
     /// writer of it to keep in step with the first.
     fn store(records: &Path, log: &str, frames: usize) -> PathBuf {
-        let dir = sibling(records, AUDIO_SUFFIX);
+        let dir = audio_dir(records);
         std::fs::create_dir_all(&dir).expect("an audio store");
         let mut written = vec![
             pod_ingest::test_fixtures::hello("reachy00"),
@@ -8195,7 +8049,7 @@ mod tests {
             dispatched(1),
         ];
         let (_dir, at) = records("speech-report-clip-empty-store", &lines);
-        std::fs::create_dir_all(sibling(&at, AUDIO_SUFFIX)).expect("an empty store");
+        std::fs::create_dir_all(audio_dir(&at)).expect("an empty store");
         let report = judge(&at);
         assert!(
             measured(
@@ -8265,7 +8119,7 @@ mod tests {
             dispatched(1),
         ];
         let (_dir, at) = records("speech-report-clip-fault", &lines);
-        let dir = sibling(&at, AUDIO_SUFFIX);
+        let dir = audio_dir(&at);
         std::fs::create_dir_all(&dir).expect("a store");
         std::fs::write(dir.join("a.framelog"), b"not a frame log at all").expect("a bad log");
         let report = judge(&at);
@@ -8406,7 +8260,7 @@ mod tests {
             dispatched(1),
         ];
         let (_dir, at) = records("speech-report-clip-unreadable-store", &lines);
-        let store = sibling(&at, AUDIO_SUFFIX);
+        let store = audio_dir(&at);
         std::fs::write(&store, b"not a store at all").expect("a store that is a file");
         let report = judge(&at);
         let line = clip_line(&report, "clip not written (");
@@ -8464,7 +8318,7 @@ mod tests {
             dispatched(1),
         ];
         let (_dir, at) = records("speech-report-clip-covered-twice", &lines);
-        let dir = sibling(&at, AUDIO_SUFFIX);
+        let dir = audio_dir(&at);
         std::fs::create_dir_all(&dir).expect("an audio store");
         pod_ingest::test_fixtures::write_log(
             &dir.join("a.framelog"),
@@ -8509,7 +8363,7 @@ mod tests {
             dispatched(1),
         ];
         let (_dir, at) = records("speech-report-clip-protocol-errors", &lines);
-        let dir = sibling(&at, AUDIO_SUFFIX);
+        let dir = audio_dir(&at);
         std::fs::create_dir_all(&dir).expect("an audio store");
         pod_ingest::test_fixtures::write_log(
             &dir.join("a.framelog"),

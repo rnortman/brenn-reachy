@@ -29,7 +29,7 @@ use anyhow::{Context as _, bail};
 
 use reachy_clips::envelope::ClipLimits;
 use reachy_clips::files::document_paths;
-use reachy_clips::format::{Channel, ChannelMask};
+use reachy_clips::format::ChannelMask;
 use reachy_clips::vendor::{Import, ImportError, ImportOptions, ROTATION_DRIFT_NOTED, convert};
 
 /// The sound files the vendor ships beside a recording, in the order their own
@@ -123,21 +123,9 @@ fn parse(words: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     })
 }
 
+/// The mask a `--channels` list names, in the format's own spellings.
 fn mask(list: &str) -> anyhow::Result<ChannelMask> {
-    let mut mask = ChannelMask::empty();
-    for word in list.split(',') {
-        let channel = Channel::ALL
-            .into_iter()
-            .find(|channel| channel.as_str() == word.trim())
-            .with_context(|| format!("{word} is not a channel; head, antennas or body_yaw"))?;
-        if !mask.insert(channel) {
-            bail!("{word} is named twice");
-        }
-    }
-    if mask == ChannelMask::empty() {
-        bail!("--channels names nothing");
-    }
-    Ok(mask)
+    ChannelMask::parse(list).with_context(|| format!("--channels {list}"))
 }
 
 /// The report header: what this run was, so the file beside the clips answers
@@ -367,6 +355,7 @@ fn sidecar(file: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use reachy_clips::format::Channel;
     use reachy_scratch::scratch_dir;
 
     use super::*;

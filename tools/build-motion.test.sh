@@ -122,6 +122,7 @@ done
 export MOTORD_MACHINE=183
 export HOST_MACHINE=183
 export ASK_MACHINE=183
+export BENCH_MACHINE=183
 export EXE_MACHINE=183
 export LAUNCHER_MACHINE=183
 export ONNX_MACHINE=183
@@ -158,6 +159,10 @@ done
 export APP_CONTROL=""
 export HARNESS_HOST=""
 export HARNESS_POD=""
+# And whether the recording config names a driver. A session with an operator's
+# hands in the linkage must carry no process that can arm a servo, so this is how
+# a case merges one into it.
+export RECORD_MOTORD=""
 export CALLS="${work}/calls"
 
 # The audio device's binary: the one payload member the subject does not ask
@@ -235,6 +240,7 @@ case "$sub" in
 		elf bazel-out/bin/reachy_motord "$MOTORD_MACHINE"
 		elf bazel-out/bin/reachy_host "$HOST_MACHINE"
 		elf bazel-out/bin/reachy_ask "$ASK_MACHINE"
+		elf bazel-out/bin/reachy_bench "$BENCH_MACHINE"
 		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
 		# A knob rather than a fixture the case moves aside: this arm runs on
 		# every build, so a file removed between builds would be written back.
@@ -319,6 +325,36 @@ pre_launch {
   executable: "clockwork/launch/clockwork_prelaunch.sh"
 }
 CONFIG
+		# The recording config: three apps and no prelaunch entry, because no
+		# Clockwork process runs in it and there is nothing to prepare.
+		cat >bazel-out/bin/robotcpu_record.textproto <<'CONFIG'
+app {
+  name: "recorder"
+  executable: "reachy_bench"
+  args: "pose-log"
+  args: "--config"
+  args: "bench/reachy-bench.toml"
+}
+app {
+  name: "voice_host"
+  executable: "reachy_host"
+  args: "--speech-config"
+  args: "host/speech-record.toml"
+}
+app {
+  name: "pod"
+  executable: "reachy_pod"
+  args: "run"
+}
+CONFIG
+		if [ -n "${RECORD_MOTORD:-}" ]; then
+			cat >>bazel-out/bin/robotcpu_record.textproto <<'CONFIG'
+app {
+  name: "motord"
+  executable: "reachy_motord"
+}
+CONFIG
+		fi
 		printf '#!/bin/bash\n' >bazel-out/bin/clockwork_prelaunch.sh
 		if [ -n "${DROP_EXE_FILE:-}" ]; then
 			rm -f -- bazel-out/bin/robot_clk_exe
@@ -339,10 +375,12 @@ CONFIG
 				echo bazel-out/bin/reachy_motord
 				echo bazel-out/bin/reachy_host
 				echo bazel-out/bin/reachy_ask
+				echo bazel-out/bin/reachy_bench
 				echo bazel-out/bin/robot_clk_exe
 				echo bazel-out/bin/simplelaunch
 				echo bazel-out/bin/robotcpu.textproto
 				echo bazel-out/bin/robotcpu_harness.textproto
+				echo bazel-out/bin/robotcpu_record.textproto
 				echo bazel-out/bin/clockwork_prelaunch.sh
 				echo cogs/robot.clk
 				echo cogs/system_robot.clk
@@ -479,6 +517,9 @@ assert_file "the voice host is beside it" "${payload}/reachy_host"
 # path a sibling brenn-pod checkout leaves it at, with no knob set.
 assert_file "the audio device is beside them" "${payload}/reachy_pod"
 assert_file "the intent source is beside it" "${payload}/reachy_ask"
+# A launcher app in the recording config alone, and staged in every payload
+# because which config a unit runs is decided at the prompt.
+assert_file "the bench is beside them" "${payload}/reachy_bench"
 assert_file "the launcher is in the payload" "${payload}/simplelaunch"
 # Beside the host and not under a lib directory: the binary's runpath ends in
 # `$ORIGIN`, and the payload root is where that resolves.
@@ -486,10 +527,13 @@ assert_file "the shared object the host needs is beside it" \
 	"${payload}/libonnxruntime.so.1"
 assert_file "its config is beside it, where it is started from" \
 	"${payload}/robotcpu.textproto"
-# Both configs travel: a unit is deployed once and used for production presence
-# and for a motion run, and `--run` names the twin.
+# All three configs travel: a unit is deployed once and used for production
+# presence, for a motion run and for a recording session, and each chain names
+# the one it starts.
 assert_file "the harness twin travels with it" \
 	"${payload}/robotcpu_harness.textproto"
+assert_file "and the recording config with them" \
+	"${payload}/robotcpu_record.textproto"
 
 # The three paths the launcher config spells, and the only reason they are these
 # paths: the executable under `cogs/`, the prelaunch script under the directory
@@ -584,7 +628,7 @@ assert_lacks "the configuration is not spelled out here" "$(calls)" \
 assert_contains "the build builds the deployables the gate names" "$(calls)" \
 	"build --config=device -- //bazel/platform:motion_payload"
 assert_contains "one cquery names every built output" "$(calls)" \
-	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:clockwork_prelaunch_sh"
+	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //crates/reachy-bench:reachy_bench + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:robotcpu_record.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
 	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto"
 assert_lacks "and does not name the host's own configuration, which Bazel does not supply" \
@@ -1004,6 +1048,106 @@ result=$(build)
 assert_status "and with the knob unset the default is back" 0 "$(status_of "$result")"
 assert_no_file "which is not there, so neither is the payload's" \
 	"${payload}/host/speech.toml"
+
+# ---------------------------------------------------------------------------
+# A recording session's two members
+# ---------------------------------------------------------------------------
+#
+# The recording launcher config names two files this build does not produce: the
+# voice pipeline's configuration for a session that transcribes with no wake word
+# (a site's own file, like the production one) and the bench's, which names the
+# serial node this unit's servos are on. Both are optional here, because a
+# payload that carries neither still runs presence and a motion run; the chain
+# that cannot start without them is `deploy-motion.sh --record`, and its refusals
+# are that script's. What this suite holds is that the build stages each where
+# the launcher entries name it, at the mode a per-unit file wants, says which of
+# the two states a payload is in, and refuses a *named* configuration that is not
+# there.
+record_default="${repo}/host/speech-record.toml"
+bench_default="${repo}/.local/reachy-bench.toml"
+
+result=$(build)
+assert_status "a build with neither recording member succeeds" 0 "$(status_of "$result")"
+assert_no_file "and the payload carries no recording speech configuration" \
+	"${payload}/host/speech-record.toml"
+assert_no_file "and no bench configuration" "${payload}/bench/reachy-bench.toml"
+assert_contains "and the report says what such a payload cannot do" \
+	"$(output_of "$result")" "cannot record a session"
+
+printf 'listen_addr = "0.0.0.0:7380"\n' >"$record_default"
+printf 'device = "/dev/ttyAMA3"\n' >"$bench_default"
+result=$(build)
+assert_status "a build with both at their default paths succeeds" 0 \
+	"$(status_of "$result")"
+assert_file "the recording speech configuration is where the launcher entry names it" \
+	"${payload}/host/speech-record.toml"
+assert_file "and the bench configuration is where the recorder's --config names it" \
+	"${payload}/bench/reachy-bench.toml"
+assert_eq "each readable by the account that runs the payload and nobody else" \
+	"600 600" \
+	"$(stat -c %a -- "${payload}/host/speech-record.toml" \
+		"${payload}/bench/reachy-bench.toml" | tr '\n' ' ' | sed 's/ $//')"
+assert_contains "and the report says where the voice half came from" \
+	"$(output_of "$result")" "staged from ${record_default}"
+assert_contains "and where the recorder's came from" "$(output_of "$result")" \
+	"staged from ${bench_default}"
+
+# The bench's knob is the one a bench night already uses, and the Makefile
+# exports it with a relative default -- so a relative value resolves against this
+# repository's root and not against wherever the caller stood.
+rm -- "$bench_default"
+BENCH_CONFIG=.local/elsewhere/bench.toml
+export BENCH_CONFIG
+mkdir -p -- "${repo}/.local/elsewhere"
+printf 'device = "/dev/ttyAMA1"\n' >"${repo}/.local/elsewhere/bench.toml"
+result=$(build)
+assert_status "a relative BENCH_CONFIG builds" 0 "$(status_of "$result")"
+assert_contains "resolved against the repository root" "$(output_of "$result")" \
+	"staged from ${repo}/.local/elsewhere/bench.toml"
+assert_file "and staged where the recorder reads it" \
+	"${payload}/bench/reachy-bench.toml"
+unset BENCH_CONFIG
+
+# An absent bench configuration is never a refusal, named or not: the Makefile
+# exports its own default, so a value arriving in the environment is not evidence
+# that anybody typed a path.
+BENCH_CONFIG="${work}/nowhere/reachy-bench.toml"
+export BENCH_CONFIG
+result=$(build)
+assert_status "a BENCH_CONFIG that is not there still builds" 0 \
+	"$(status_of "$result")"
+assert_no_file "and the payload carries no bench configuration" \
+	"${payload}/bench/reachy-bench.toml"
+unset BENCH_CONFIG
+
+# The recording speech configuration is the other way round, for the reason the
+# site's is: nothing exports that knob, so naming it is somebody's own act.
+mark_payload
+REACHY_RECORD_SPEECH_CONFIG="${work}/nowhere/speech-record.toml"
+export REACHY_RECORD_SPEECH_CONFIG
+result=$(build)
+assert_status "a named recording speech configuration that is not there refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
+	"${work}/nowhere/speech-record.toml"
+assert_contains "and says what unsetting the knob buys" "$(output_of "$result")" \
+	"records nothing"
+assert_unstaged "and a build refused for it stages nothing"
+
+REACHY_RECORD_SPEECH_CONFIG="${work}/elsewhere/speech-record.toml"
+mkdir -p -- "$(dirname -- "$REACHY_RECORD_SPEECH_CONFIG")"
+printf 'listen_addr = "0.0.0.0:7380"\n' >"$REACHY_RECORD_SPEECH_CONFIG"
+result=$(build)
+assert_status "a build against the knob's configuration succeeds" 0 \
+	"$(status_of "$result")"
+assert_file "and the payload carries it" "${payload}/host/speech-record.toml"
+unset REACHY_RECORD_SPEECH_CONFIG
+rm -- "$record_default"
+result=$(build)
+assert_status "and with the knob unset and no default the build is recordless" 0 \
+	"$(status_of "$result")"
+assert_no_file "so the payload carries none" \
+	"${payload}/host/speech-record.toml"
 
 # ---------------------------------------------------------------------------
 # The unit's own host configuration
@@ -1472,6 +1616,29 @@ assert_contains "and lists the pod among what it found" "$(output_of "$result")"
 assert_unstaged "a twin naming the pod stages nothing"
 HARNESS_POD=""
 
+# The recording config's own list, and the reason it is pinned: a session is the
+# machine de-torqued with an operator's hands in the linkage, so the composition
+# must carry no process that can arm a servo. The recorder writes to no register
+# and nothing in that app table invokes any other bench command; a driver merged
+# into it would put a torque-on path in the one run where hands are inside the
+# linkage.
+mark_payload
+RECORD_MOTORD=1
+result=$(build)
+assert_status "a recording config that names the driver refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the config" "$(output_of "$result")" \
+	"robotcpu_record.textproto names the apps"
+assert_contains "and lists the driver among what it found" "$(output_of "$result")" \
+	"'motord pod recorder voice_host'"
+assert_contains "and what a recording session needs instead" "$(output_of "$result")" \
+	"needs 'pod recorder voice_host'"
+assert_unstaged "a recording config naming the driver stages nothing"
+RECORD_MOTORD=""
+
+result=$(build)
+assert_status "and the three-app config builds" 0 "$(status_of "$result")"
+
 mark_payload
 rm -f -- "${repo}/cogs/mover_params.textproto"
 result=$(build)
@@ -1570,7 +1737,7 @@ labels_of() {
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|host_target|ask_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|prelaunch_target|onnx_target|models_target)=' \
+script_labels=$(grep -E '^(motord_target|host_target|ask_target|bench_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|record_config_target|prelaunch_target|onnx_target|models_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
 assert_eq "the payload's members are exactly the labels this script cqueries" \
@@ -1711,16 +1878,19 @@ assert_eq "and names no src the production config does not" \
 # name the runbook actually tails. Read out of this checkout, both sides.
 
 runbook=$(cat -- "${real_repo}/docs/bench-runbook.md")
-shipped_apps=$(sed -n 's/^launcher_apps=(\(.*\))$/\1/p' \
-	-- "${real_repo}/tools/build-motion.sh")
-if [ -n "$shipped_apps" ]; then
-	for app in $shipped_apps; do
-		assert_contains "the runbook names ${app}'s log file" "$runbook" "${app}_0.log"
-	done
-else
-	fail "the runbook names every app's log file" \
-		"read no launcher_apps=(...) from tools/build-motion.sh — the name has moved"
-fi
+for list in launcher_apps record_apps; do
+	tailed_apps=$(sed -n "s/^${list}=(\(.*\))\$/\1/p" \
+		-- "${real_repo}/tools/build-motion.sh")
+	if [ -n "$tailed_apps" ]; then
+		for app in $tailed_apps; do
+			assert_contains "the runbook names ${app}'s log file (${list})" \
+				"$runbook" "${app}_0.log"
+		done
+	else
+		fail "the runbook names every app's log file" \
+			"read no ${list}=(...) from tools/build-motion.sh — the name has moved"
+	fi
+done
 
 # ---------------------------------------------------------------------------
 # The runbook against the deploy script's own vocabulary
@@ -1735,7 +1905,8 @@ fi
 
 deploy_src=$(cat -- "${real_repo}/tools/deploy-motion.sh")
 for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
-	rc_no_audio_conf:12 rc_service_unreachable:13; do
+	rc_no_audio_conf:12 rc_service_unreachable:13 rc_no_record_config:14 \
+	rc_no_bench_config:15 rc_record_config_disagreement:16; do
 	name=${code%%:*}
 	number=${code#*:}
 	assert_contains "${name} is still ${number} in the deploy script" "$deploy_src" \
@@ -1745,6 +1916,8 @@ for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
 done
 assert_contains "the runbook names the speech run's section" "$runbook" \
 	"## The speech run"
+assert_contains "and the recording session's" "$runbook" \
+	"## Recording poses"
 assert_contains "and the target that starts one" "$runbook" "make speech-run"
 assert_contains "and the fetch that recovers its records" "$runbook" \
 	"make speech-fetch"
@@ -1794,6 +1967,33 @@ else
 		"$speech_recipe"
 fi
 
+# `pose-record`'s recipe is `speech-run`'s, for the same reasons: the same
+# provisioning writes the PSK table the build stages, the terminal question is
+# the cheapest refusal there is, and recipe lines are ordered where prerequisites
+# are not under `-j`. Asserted separately rather than folded into the loop above,
+# because the two recipes are allowed to diverge and this is the join that says
+# they have not.
+record_recipe=$(sed -n '/^pose-record:/,/^$/p' -- "${real_repo}/Makefile")
+assert_contains "pose-record provisions the pod's half of the link too" \
+	"$record_recipe" "$provision_step"
+assert_contains "and pushes the payload" "$record_recipe" "$deploy_step"
+assert_contains "and asks the terminal question of its own" "$record_recipe" \
+	"--record-preflight"
+for step in speech-provision motion-deploy; do
+	assert_lacks "with ${step} not left as a prerequisite here either" \
+		"${record_recipe%%$'\n'*}" "$step"
+done
+record_provision_at=${record_recipe%%"$provision_step"*}
+record_deploy_at=${record_recipe%%"$deploy_step"*}
+record_preflight_at=${record_recipe%%"--record-preflight"*}
+if [ "${#record_preflight_at}" -lt "${#record_provision_at}" ] &&
+	[ "${#record_provision_at}" -lt "${#record_deploy_at}" ]; then
+	pass "in that order: the refusal, the provisioning, then the build"
+else
+	fail "in that order: the refusal, the provisioning, then the build" \
+		"$record_recipe"
+fi
+
 # The step `speech-run` delegates to, which is also a target of its own. Its
 # recipe is one line, and every part of that line is load-bearing: the shim is
 # where both refusals live, the host is what the other repository provisions,
@@ -1811,7 +2011,7 @@ assert_contains "and asks for a named unit first" "${provision_recipe%%$'\n'*}" 
 # where they learn what it does: a target offered in one and absent from the
 # other is a command nobody can follow through.
 makefile_help=$(sed -n '/^help:/,/^$/p' -- "${real_repo}/Makefile")
-for target in speech-run speech-fetch speech-provision; do
+for target in speech-run speech-fetch speech-provision pose-record pose-fetch; do
 	assert_contains "the help text offers make ${target}" "$makefile_help" \
 		"make ${target}"
 	assert_contains "and the runbook names make ${target}" "$runbook" \
@@ -1976,10 +2176,11 @@ fi
 # ---------------------------------------------------------------------------
 #
 # The cases above screen a launcher config this file wrote, so what they prove is
-# that the screen works. The three app entries a unit actually starts are
-# hand-written textprotos merged into the rendered config
+# that the screen works. The five app entries a unit actually starts are
+# hand-written textprotos merged into one of the three configs
 # (`host/host_launch.textproto`, `driver/motord_launch.textproto`,
-# `pod/pod_launch.textproto`), and their
+# `pod/pod_launch.textproto`, and a recording session's
+# `host/host_record_launch.textproto` and `bench/record_launch.textproto`), and their
 # join to this script runs only inside `make motion-build`, which needs the
 # device cross-compile. Both halves are read out of this checkout instead: an app
 # renamed here has to be a name `launcher_apps` carries, and an executable
@@ -2013,8 +2214,22 @@ staged_binaries=$(printf '%s\n' "$script_src" |
 assert_eq "the paths stage() installs executables at are read out of build-motion.sh" \
 	yes "$(member_of reachy_motord "$staged_binaries")"
 
+# The recording session's two entries name apps of the third list, so the
+# membership question is asked against both lists at once: an app entry is
+# well-formed when some config this build stages expects its name.
+shipped_apps=$(sed -n 's/^launcher_apps=(\(.*\))$/\1/p' \
+	-- "${real_repo}/tools/build-motion.sh")
+record_shipped_apps=$(sed -n 's/^record_apps=(\(.*\))$/\1/p' \
+	-- "${real_repo}/tools/build-motion.sh")
+if [ -z "$record_shipped_apps" ]; then
+	fail "the recording session's app names are readable" \
+		"read no record_apps=(...) from tools/build-motion.sh -- the name has moved"
+fi
+every_app=$(printf '%s\n%s\n' "$shipped_apps" "$record_shipped_apps" | tr ' ' '\n' | sort -u)
+
 for entry in host/host_launch.textproto driver/motord_launch.textproto \
-	pod/pod_launch.textproto; do
+	pod/pod_launch.textproto host/host_record_launch.textproto \
+	bench/record_launch.textproto; do
 	app_name=$(sed -n 's/^ *name: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
 	app_exe=$(sed -n 's/^ *executable: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
 	if [ -z "$app_name" ] || [ -z "$app_exe" ]; then
@@ -2022,8 +2237,8 @@ for entry in host/host_launch.textproto driver/motord_launch.textproto \
 			"read name='${app_name}' executable='${app_exe}' -- the field spelling has moved"
 		continue
 	fi
-	assert_eq "${entry}'s app name is one this script expects the config to carry" \
-		yes "$(member_of "$app_name" "$(printf '%s\n' "$shipped_apps" | tr ' ' '\n')")"
+	assert_eq "${entry}'s app name is one this script expects a config to carry" \
+		yes "$(member_of "$app_name" "$every_app")"
 	assert_eq "and its executable is a file stage() installs at the payload root" \
 		yes "$(member_of "$app_exe" "$staged_binaries")"
 done
@@ -2095,6 +2310,53 @@ else
 	assert_eq "the launcher entry names the path the build stages one at" \
 		"$staged_speech" "$launch_speech"
 fi
+
+# The same join for a recording session, whose two per-unit files reach two
+# processes the same way and can disagree the same way: the voice host's
+# `--speech-config` and the recorder's `--config`, each spelled in a launch entry
+# this repo hand-writes and each staged at a path `lib.sh` names. A disagreement
+# is a session that starts and records nothing, discovered with an operator's
+# hands already on the head.
+launch_arg_after() {
+	awk -F'"' -v flag="args: \"$2\"" '
+		index($0, flag) { want = 1; next }
+		want && /args: "/ { print $2; exit }
+	' "$1"
+}
+
+launch_record_speech=$(launch_arg_after \
+	"${real_repo}/host/host_record_launch.textproto" --speech-config)
+staged_record_speech=$(sed -n 's/^record_speech_config_path=\(.*\)$/\1/p' \
+	-- "${real_repo}/tools/lib.sh")
+if [ -z "$launch_record_speech" ] || [ -z "$staged_record_speech" ]; then
+	fail "the recording speech configuration's payload path is readable on both sides" \
+		"read launcher argument='${launch_record_speech}' record_speech_config_path='${staged_record_speech}'"
+else
+	assert_eq "the recording entry names the path the build stages one at" \
+		"$staged_record_speech" "$launch_record_speech"
+	assert_eq "and it is not the production entry's file" \
+		"no" "$([ "$launch_record_speech" = "$launch_speech" ] && echo yes || echo no)"
+fi
+
+launch_bench=$(launch_arg_after "${real_repo}/bench/record_launch.textproto" --config)
+staged_bench=$(sed -n 's/^bench_config_path=\(.*\)$/\1/p' \
+	-- "${real_repo}/tools/lib.sh")
+if [ -z "$launch_bench" ] || [ -z "$staged_bench" ]; then
+	fail "the bench configuration's payload path is readable on both sides" \
+		"read launcher argument='${launch_bench}' bench_config_path='${staged_bench}'"
+else
+	assert_eq "the recorder's --config names the path the build stages one at" \
+		"$staged_bench" "$launch_bench"
+fi
+
+# And the command that entry starts, which is the whole of the safety argument
+# the composition rests on: the bench command whose code path writes to no
+# register. `--record` there would name where a self-test record is written,
+# which is a different thing entirely.
+record_entry=$(cat -- "${real_repo}/bench/record_launch.textproto")
+assert_contains "the recorder's entry starts pose-log" "$record_entry" \
+	'args: "pose-log"'
+assert_lacks "and asks for no self-test record" "$record_entry" 'args: "--record"'
 
 # ---------------------------------------------------------------------------
 

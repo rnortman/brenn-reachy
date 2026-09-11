@@ -2095,7 +2095,7 @@ assert_contains "the configuration is checked before any device is touched" "$ra
 assert_contains "the checker is built in the default configuration" "$ran" \
 	"bazel build -- //crates/reachy-host:reachy_host"
 assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # The voice host's console reaches the operator while the run is happening, not
@@ -2104,9 +2104,9 @@ assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 # pipeline dying in its first second is invisible to the person talking to it.
 assert_contains "the voice host's console is tailed onto the pty before the launcher starts" \
 	"$ran" \
-	"tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pid=\$!; ./simplelaunch"
+	"tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch"
 assert_contains "and the tail is killed once the launcher returns" "$ran" \
-	"rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
+	"rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 assert_lacks "nothing puts a budget around a conversation" "$ran" "timeout --signal=INT"
 assert_lacks "and the harness intent source is not started beside the host" "$ran" \
 	"./reachy_ask"
@@ -2501,6 +2501,297 @@ assert_eq "and the audio came with it" 1 \
 	"$(find "$speech_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
 
 # ---------------------------------------------------------------------------
+# The recording session
+# ---------------------------------------------------------------------------
+#
+# `--speech`'s chain over the third launcher config, and what is pinned here is
+# what differs: the two staged members a session cannot run without, the pair of
+# speech configurations that have to agree about the link, the recording
+# config's own endpoints being the ones the robot is asked about, both consoles
+# tailed rather than the host's alone, the session's own configuration carried
+# home beside the streams, and the pose analyzer's verdict over a fetch that
+# holds no records at all.
+
+# The two optional payload members a recording session needs, in the payload
+# where the build puts them.
+#
+# The endpoints deliberately differ from the site configuration's: what the
+# robot is asked to reach is the recording session's own pipeline, and a subject
+# reading the site's file instead would pass a test written against one set of
+# ports. The store is renamed for the same reason.
+stage_record_configs() {
+	mkdir -p -- "${payload}/host" "${payload}/bench"
+	cat >"${payload}/host/speech-record.toml" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+pod_psk_file = "secrets/pod-psk.toml"
+
+[wake]
+policy = "bypass"
+
+[stt]
+url = "http://speaches.example:8100"
+
+[tts]
+url = "http://speaches.example:8101"
+
+[brain]
+mode = "echo"
+
+[record]
+enabled = true
+dir = "poselogs"
+TOML
+	printf 'device = "/dev/ttyAMA3"\n' >"${payload}/bench/reachy-bench.toml"
+}
+
+stage_speech_config
+stage_record_configs
+
+# Neither member is one a motion payload has to carry, so each absence is its
+# own refusal naming its own knob: which of the two a payload is missing is
+# which file the operator goes and makes.
+rm -f -- "${payload}/host/speech-record.toml"
+result=$(deploy unit --record "${work}/record-novoice")
+assert_status "a payload with no recording speech configuration refuses with its own code" 14 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the member that is missing" "$(output_of "$result")" \
+	"carries no host/speech-record.toml"
+assert_contains "and the knob that names one" "$(output_of "$result")" \
+	"REACHY_RECORD_SPEECH_CONFIG"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+stage_record_configs
+
+rm -f -- "${payload}/bench/reachy-bench.toml"
+result=$(deploy unit --record "${work}/record-nobench")
+assert_status "a payload with no bench configuration refuses with its own code" 15 \
+	"$(status_of "$result")"
+assert_contains "the refusal says what the recorder would not know" "$(output_of "$result")" \
+	"which serial node to open"
+assert_contains "and names the one knob both payloads read" "$(output_of "$result")" \
+	"BENCH_CONFIG"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+stage_record_configs
+
+# The pod is provisioned from the site's configuration and the session's voice
+# host loads its own, so a pair that disagrees about the address or the key table
+# is a session with no microphone — refused here, by name, rather than found out
+# by a person with both hands on the head.
+for key in listen_addr pod_psk_file; do
+	case $key in
+	listen_addr) wrong='listen_addr = "127.0.0.1:7999"' ;;
+	pod_psk_file) wrong='pod_psk_file = "secrets/other-psk.toml"' ;;
+	esac
+	sed -i "s|^${key} = .*|${wrong}|" -- "${payload}/host/speech-record.toml"
+	result=$(deploy unit --record "${work}/record-disagree-${key}")
+	assert_status "the two speech configurations disagreeing on ${key} refuses with its own code" 16 \
+		"$(status_of "$result")"
+	assert_contains "the refusal names the key" "$(output_of "$result")" "${key} = "
+	assert_contains "and quotes both files' values" "$(output_of "$result")" \
+		"and the staged host/speech.toml states"
+	assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+	stage_record_configs
+done
+
+# A payload carrying no site configuration is asked nothing about agreement:
+# there is nothing to disagree with, and the pod on such a unit was provisioned
+# from a file this deploy cannot see.
+rm -f -- "${payload}/host/speech.toml"
+result=$(deploy_tty unit --record "${work}/record-nosite")
+assert_status "a recording session with no site configuration beside it still runs" 0 \
+	"$(status_of "$result")"
+stage_speech_config
+
+# This suite's stdin is a pipe, and a recording session is ended by the
+# operator's ^C too: one spelling of the refusal, asked by the run and asked
+# alone by `make pose-record` before it provisions and builds.
+result=$(deploy unit --record "${work}/record-notty")
+assert_status "a recording session with no terminal refuses with the speech run's code" 10 \
+	"$(status_of "$result")"
+assert_contains "in the same words" "$(output_of "$result")" "stdin is not a terminal"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+
+result=$(deploy unit --record-preflight)
+assert_status "the recording preflight alone refuses with the same code" 10 \
+	"$(status_of "$result")"
+assert_contains "in the same words again" "$(output_of "$result")" "stdin is not a terminal"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+
+# The three refusals a first recording session is likeliest to hit are asked of
+# the operator's own files here, before `make pose-record` provisions the unit
+# and cross-builds a payload: told after the build, an operator who has not
+# written `speech-record.toml` yet pays for the whole build twice.
+record_source="${repo}/host/speech-record.toml"
+bench_source="${repo}/.local/reachy-bench.toml"
+stage_record_sources() {
+	mkdir -p -- "$(dirname -- "$record_source")" "$(dirname -- "$bench_source")"
+	printf 'listen_addr = "127.0.0.1:7380"\npod_psk_file = "secrets/pod-psk.toml"\n' \
+		>"$record_source"
+	printf 'device = "/dev/ttyAMA3"\n' >"$bench_source"
+}
+stage_record_sources
+
+result=$(deploy_tty unit --record-preflight)
+assert_status "under a terminal and with both files written the recording preflight passes" 0 \
+	"$(status_of "$result")"
+assert_lacks "having touched nothing on the device" "$(calls)" "ssh"
+assert_lacks "and having built nothing" "$(calls)" "bazel"
+
+rm -f -- "$record_source"
+result=$(deploy_tty unit --record-preflight)
+assert_status "a tree with no recording speech configuration refuses with the run's own code" 14 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the file to write" "$(output_of "$result")" \
+	"there is no ${record_source}"
+assert_contains "and the knob that names one" "$(output_of "$result")" \
+	"REACHY_RECORD_SPEECH_CONFIG"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+stage_record_sources
+
+rm -f -- "$bench_source"
+result=$(deploy_tty unit --record-preflight)
+assert_status "a tree with no bench configuration refuses with the run's own code" 15 \
+	"$(status_of "$result")"
+assert_contains "the refusal says what the recorder would not know" "$(output_of "$result")" \
+	"which serial node to open"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+stage_record_sources
+
+# The agreement, over the same pair of files the operator edits. The site file
+# is what the pod is provisioned from, so a preflight run in a tree that has
+# none is asked nothing.
+result=$(deploy_tty unit --record-preflight)
+assert_status "with no site configuration in the tree the preflight asks nothing about agreement" 0 \
+	"$(status_of "$result")"
+
+printf 'listen_addr = "127.0.0.1:7999"\npod_psk_file = "secrets/pod-psk.toml"\n' \
+	>"$speech_source"
+result=$(deploy_tty unit --record-preflight)
+assert_status "two tree configurations disagreeing about the link refuse with the run's code" 16 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the pair it read" "$(output_of "$result")" \
+	"the ${record_source} states listen_addr"
+assert_contains "and the site file it read against" "$(output_of "$result")" \
+	"and the ${speech_source} states"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+rm -f -- "$speech_source"
+
+# The session itself.
+record_dest="${work}/pose-sessions"
+result=$(deploy_tty unit --record "$record_dest")
+ran=$(calls)
+assert_status "a recording session the analyzer passes succeeds" 0 "$(status_of "$result")"
+assert_contains "the session's own configuration is what is checked" "$ran" \
+	"reachy_host --speech-config host/speech-record.toml --check cwd=${payload}"
+assert_lacks "and not the site's, which no host in this composition loads" "$ran" \
+	"--speech-config host/speech.toml"
+assert_contains "the chain asks the robot for the recording pipeline's own endpoints, starts the recording config and tails both consoles" "$ran" \
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_record.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8100/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8101/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/host || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; cp -- /run/brenn-app/releases/motion/host/speech-record.toml /run/brenn-app/logs/testing/config/host/speech-record.toml || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; tail -F /run/brenn-app/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch robotcpu_record.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+# The recorder's console is the pose stream itself, so a session that cannot
+# tail it is one where a refused recorder — a torqued servo, a busy port — is
+# invisible until the fetch. Both tails, and one kill covering both.
+assert_contains "the recorder's console is tailed beside the host's" "$ran" \
+	"tail -F /run/brenn-app/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch"
+assert_lacks "no driver's launcher config is what starts" "$ran" \
+	"./simplelaunch robotcpu.textproto"
+assert_lacks "nor the harness one" "$ran" "./simplelaunch robotcpu_harness.textproto"
+assert_lacks "nothing puts a budget around a session" "$ran" "timeout --signal=INT"
+assert_lacks "and no intent source is started beside it" "$ran" "./reachy_ask"
+assert_contains "the streams come back under the recording name" "$ran" \
+	"//cogs:pose_session_report ${record_dest}/record-log-"
+assert_lacks "and not under the speech one" "$ran" "speech-log-"
+assert_lacks "the speech analyzer has nothing to say about a pose stream" "$ran" \
+	"speech_run_report"
+assert_lacks "nor does the motion one" "$ran" "first_motion_report"
+assert_contains "the operator is told what they are about to be doing" "$(output_of "$result")" \
+	"recording poses on unit"
+assert_contains "and how the session ends" "$(output_of "$result")" "^C ends it"
+
+# The document lands beside the fetch under the fetch's own name, because a
+# segment id means nothing without the session it was cut from.
+record_fetched=$(find "$record_dest" -mindepth 1 -maxdepth 1 -type d \
+	! -name '*.console' ! -name '*.audio')
+assert_contains "the analyzer is handed the fetch and writes its document beside it" "$ran" \
+	"//cogs:pose_session_report ${record_fetched} --out ${record_fetched}.session"
+assert_file "the host-side captures were filed with the consoles" \
+	"${record_fetched}.console/clock-before.txt"
+
+# The audio store is the one the *session's* host wrote to, named by the
+# configuration that host loaded. A fetch reading the site's file would look
+# where a host that did not run would have written.
+assert_contains "the store is resolved out of the recording configuration" "$ran" \
+	"rsync -a -e ssh -o BatchMode=yes root@unit:/run/brenn-app/releases/motion/poselogs/ ${record_fetched}.audio/"
+assert_lacks "and not out of the site's" "$ran" "/releases/motion/framelogs/"
+
+# The composition holds no logger, so a session's fetch never carries a `.olog`
+# and that is the ordinary case rather than a tolerated one: the streams are
+# both consoles.
+RSYNC_OLOG=none
+result=$(deploy_tty unit --record "${work}/record-nolog")
+assert_status "a session that wrote no channel log is still analyzed" 0 "$(status_of "$result")"
+assert_contains "and the analyzer reads the fetch" "$(calls)" "//cogs:pose_session_report"
+RSYNC_OLOG=full
+
+# The document's verdict is the script's, the way every other analyzer's is.
+BAZEL_STATUS=7
+result=$(deploy_tty unit --record "${work}/record-failed")
+assert_status "the pose analyzer's verdict is the session's" 7 "$(status_of "$result")"
+BAZEL_STATUS=0
+
+# A session that never reached its launcher is refused with the recording
+# config's name in it and the recording mode's own fetch flag, because that is
+# the flag that recovers the streams sitting on the unit's tmpfs.
+SSH_RUN_REACHED=no
+SSH_RUN_STATUS=8
+result=$(deploy_tty unit --record "${work}/record-nolaunchconfig")
+assert_status "a unit whose payload has no recording config refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the config that is not there" "$(output_of "$result")" \
+	"has no robotcpu_record.textproto"
+assert_contains "it says the config rides the payload" "$(output_of "$result")" \
+	"The recording config is pushed with the payload"
+assert_contains "and names the recording mode's own fetch flag" "$(output_of "$result")" \
+	"--record-fetch <records-dir>"
+SSH_RUN_STATUS=124
+SSH_RUN_REACHED=yes
+
+# A records directory named relatively, which is exactly what `make
+# pose-record` passes: POSE_RECORDS defaults to `.local/pose-sessions`. The
+# analyzer runs out of its own runfiles tree, so a relative path there names
+# nothing and the session reads as a fetch holding no recorder log.
+rel_record=$(basename -- "${work}")/record-relative
+result=$(cd -- "$(dirname -- "${work}")" && deploy_tty unit --record "$rel_record")
+assert_status "a relative records directory records" 0 "$(status_of "$result")"
+assert_contains "and the analyzer is handed an absolute path" "$(calls)" \
+	"//cogs:pose_session_report ${work}/record-relative/record-log-"
+
+# The recovery fetch: the session whose terminal died, or whose document is
+# wanted a second time under other segmenter flags.
+record_fetch_dest="${work}/record-fetched"
+result=$(deploy unit --record-fetch "$record_fetch_dest")
+assert_status "a recording fetch succeeds" 0 "$(status_of "$result")"
+assert_contains "and names the analyzer of a recording session" "$(output_of "$result")" \
+	"pose_session_report -- ${record_fetch_dest}/record-log-"
+
+# The printed command is pasted into a shell, and `bazel run` resolves a
+# relative path in the analyzer's own runfiles tree: the recovery fetch
+# absolutizes its destination for the reason the session does.
+rel_fetch=$(basename -- "${work}")/record-fetched-relative
+result=$(cd -- "$(dirname -- "${work}")" && deploy unit --record-fetch "$rel_fetch")
+assert_status "a relative recovery fetch succeeds" 0 "$(status_of "$result")"
+assert_contains "and the command it prints names an absolute records path" \
+	"$(output_of "$result")" "pose_session_report -- ${work}/record-fetched-relative/record-log-"
+assert_contains "and an absolute --out beside it" "$(output_of "$result")" \
+	"--out ${work}/record-fetched-relative/record-log-"
+
+result=$(deploy unit --record-fetch "${work}/record-fetch-extra" --wat)
+assert_status "an extra argument after --record-fetch refuses" 1 "$(status_of "$result")"
+assert_eq "and lands under the recording name" 1 \
+	"$(find "$record_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name 'record-log-*' \
+		! -name '*.console' ! -name '*.audio' | wc -l)"
+assert_eq "with the audio beside it" 1 \
+	"$(find "$record_fetch_dest" -mindepth 1 -maxdepth 1 -type d -name '*.audio' | wc -l)"
+
+# ---------------------------------------------------------------------------
 # The grammar
 # ---------------------------------------------------------------------------
 
@@ -2533,6 +2824,25 @@ assert_lacks "and starts nothing either" "$(calls)" "simplelaunch"
 
 result=$(deploy unit --speech-fetch)
 assert_status "a speech fetch with no destination refuses" 1 "$(status_of "$result")"
+
+result=$(deploy unit --record)
+assert_status "a recording session with no records directory refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal is the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and starts nothing" "$(calls)" "simplelaunch"
+
+result=$(deploy unit --record "${work}/record-extra" --wat)
+assert_status "an extra argument after --record refuses" 1 "$(status_of "$result")"
+assert_lacks "and starts nothing either" "$(calls)" "simplelaunch"
+
+# A mode absent from the usage line is one a mistyped invocation cannot recover
+# its way to, and these three are the whole of how a session is run.
+result=$(deploy unit --record-preflight "${work}/pose-sessions")
+assert_status "the recording preflight takes no arguments" 1 "$(status_of "$result")"
+assert_contains "and the usage names every recording mode" "$(output_of "$result")" \
+	"--record <dir>|--record-preflight|--record-fetch <dir>"
+
+result=$(deploy unit --record-fetch)
+assert_status "a recording fetch with no destination refuses" 1 "$(status_of "$result")"
 
 result=$(deploy unit --commands)
 assert_status "the mode that only printed commands is gone" 1 "$(status_of "$result")"

@@ -109,6 +109,21 @@ impl JointVector {
         ]
     }
 
+    /// Every angle in bus order, without the joint each one belongs to.
+    ///
+    /// For a caller writing the nine out as a row of numbers — a document's
+    /// nine-long array, a per-row loop — so neither the order nor the missing
+    /// case is spelled a second time at the call site. Total, because a
+    /// [`JointVector`] always holds nine angles.
+    #[must_use]
+    pub fn rows(&self) -> [f64; ROW_COUNT] {
+        let mut rows = [0.0; ROW_COUNT];
+        for (slot, (_, angle)) in rows.iter_mut().zip(self.joints()) {
+            *slot = angle;
+        }
+        rows
+    }
+
     /// The first joint in bus order whose angle is not a number, if any.
     ///
     /// Named rather than counted, so a fault raised from this can name the

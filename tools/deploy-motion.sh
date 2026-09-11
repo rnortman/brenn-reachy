@@ -10,6 +10,9 @@
 #   tools/deploy-motion.sh <host> --speech <dir>
 #   tools/deploy-motion.sh <host> --speech-preflight
 #   tools/deploy-motion.sh <host> --speech-fetch <dir>
+#   tools/deploy-motion.sh <host> --record <dir>
+#   tools/deploy-motion.sh <host> --record-preflight
+#   tools/deploy-motion.sh <host> --record-fetch <dir>
 #
 #   --push       rsync the payload into the unit's RAM and create the directory
 #                the logger writes into. Refuses a payload older than the newest
@@ -75,11 +78,32 @@
 #   --speech-fetch  what --fetch is to --run: bring a speech run's records back
 #                under the `speech-log-` name, for the run whose terminal died
 #                or whose report is wanted a second time.
+#   --record     start the recording launcher config — the pose recorder and the
+#                voice host beside the audio device, with no driver, no control
+#                process and no logger at all — and stop when the operator does.
+#                The session is the machine at the Minimum Risk Condition with a
+#                person's hands in the linkage: the recorder reads Present
+#                Position and writes to no register, and nothing this config
+#                starts can arm anything. `--speech`'s chain and `--speech`'s
+#                preflights, over the recording session's own speech
+#                configuration and with the bench's configuration required
+#                beside it, and both consoles tailed onto the operator's
+#                terminal rather than the host's alone.
+#   --record-preflight  the refusals answerable before anything is
+#                provisioned, built or pushed, for the reason
+#                `--speech-preflight` exists: the terminal, and the recording
+#                session's two configurations and their agreement, asked of the
+#                operator's own files. The staged copies are what `--record`
+#                refuses on.
+#   --record-fetch  bring a recording session's records back under the
+#                `record-log-` name, for the session whose terminal died or
+#                whose document is wanted a second time.
 #
 # A fetch brings back two things under one stamp, named for the kind of run it
 # came off — `motion-log-<stamp>` for a budgeted motion run, `tour-log-<stamp>`
 # for a library tour, `probe-log-<stamp>` for one motion played on its own, and
-# `speech-log-<stamp>` for a supervised speech one, so a session's kinds of
+# `speech-log-<stamp>` for a supervised speech one and `record-log-<stamp>` for
+# a pose recording session, so a session's kinds of
 # records sit side by side and say which is which. Under that name: the
 # records the analyzer judges — with `provenance.txt` at its root naming the
 # build that recorded them — and a `.console` directory of the same name beside
@@ -336,12 +360,25 @@ launch_logs="${store_mount}/logs/launch"
 # `reachy_ask` — the host owns the narration port here — and takes no budget.
 speech_launch_config=robotcpu.textproto
 
+# The launcher config a recording session starts: the third composition, which
+# holds the audio device, the voice host on the recording session's own speech
+# configuration, and the pose recorder — and no driver, no control process and
+# no logger. Nothing it starts writes a servo register, which is the whole of
+# why the session is safe to put a person's hands into.
+record_launch_config=robotcpu_record.textproto
+
 # The file the launcher gives the voice host's console, inside the log dir. The
 # launcher redirects every app's stdout and stderr into `<name>_<index>.log`
 # before exec, so nothing the host prints reaches the operator's terminal on its
 # own; a speech run tails this one onto the pty for exactly that reason. The
 # index is 0 because the log dir is emptied at the start of every run.
 voice_host_log=voice_host_0.log
+
+# The pose recorder's console, in the same log dir and under the same rule: the
+# JSON pose stream the analyzer reads is this file, and a recording session tails
+# it beside the host's so the operator hears the read-back and sees the
+# recorder's `started`, `refused`, `still` and `moving` lines.
+recorder_log=recorder_0.log
 
 # The pod's link credentials on the unit, written by brenn-pod's provisioning
 # and read by the audio device at start. Checked here and never written: that
@@ -383,7 +420,10 @@ check_target=//crates/reachy-host:reachy_host
 # 5 to 8 are the preparation chain's, emitted on the unit by both run modes; 9,
 # 10 and 11 are the speech run's local refusals and are what the script itself
 # exits with; 12 and 13 are the speech run's own remote steps and reach an
-# operator as `die`'s 1, the way 5 to 8 do.
+# operator as `die`'s 1, the way 5 to 8 do. 14 to 16 are the recording session's
+# local refusals, which is why they are three: which of the two configurations a
+# payload is missing, and a pair that would put the pod and the host on
+# different addresses, are three different things to go and fix.
 rc_no_stamp=5
 rc_stamp_unstaged=6
 rc_post_wipe=7
@@ -393,6 +433,9 @@ rc_no_tty=10
 rc_check_refused=11
 rc_no_audio_conf=12
 rc_service_unreachable=13
+rc_no_record_config=14
+rc_no_bench_config=15
+rc_record_config_disagreement=16
 
 # What the remote chain prints when it is about to exec the launcher.
 #
@@ -588,12 +631,20 @@ record_dir_fallback=framelogs
 # Where the speech pipeline writes the audio it heard, when it is recording,
 # and where that name came from — as `<device path>\t<source>`.
 #
+#   record_store <payload-relative speech configuration>
+#
 # The host resolves its store against its own working directory, which the
 # launcher makes the payload root, so the store is the release directory plus
 # the `[record] dir` the deployed speech configuration names. That name is the
 # operator's, so it is read out of the staged configuration rather than spelled
 # here: the build and the fetch cannot disagree about where the audio is, the
 # way they cannot about where the payload's credentials are.
+#
+# Which configuration is the caller's, because the payload carries one per voice
+# host entry and a session's audio was written by the host that ran: the site's
+# for a speech run, the recording session's own for a `--record` one. A fetch
+# reading the other file would look where a host that did not run would have
+# written.
 #
 # A fetch with no staged configuration in hand — `--speech-fetch` after a
 # rebuild, or before one — has nothing to read and falls back to the name every
@@ -602,7 +653,8 @@ record_dir_fallback=framelogs
 #
 # Read through a command substitution, as `toml_table_value` is.
 record_store() {
-	local config="${payload}/${speech_config_path}" dir=""
+	local config_path=$1
+	local config="${payload}/${config_path}" dir=""
 	if [ -f "$config" ]; then
 		dir=$(toml_table_value "$config" record dir) || exit 1
 	fi
@@ -611,8 +663,8 @@ record_store() {
 		# where the audio would land if one ran: read as written, so the
 		# fetch looks where the host would have written.
 		case $dir in
-		/*) printf '%s\t%s\n' "$dir" "the staged ${speech_config_path} names it" ;;
-		*) printf '%s\t%s\n' "${release}/${dir}" "the staged ${speech_config_path} names it" ;;
+		/*) printf '%s\t%s\n' "$dir" "the staged ${config_path} names it" ;;
+		*) printf '%s\t%s\n' "${release}/${dir}" "the staged ${config_path} names it" ;;
 		esac
 	else
 		printf '%s\t%s\n' "${release}/${record_dir_fallback}" \
@@ -652,7 +704,7 @@ workspace_paths=(
 )
 
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>"
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>"
 }
 
 # Refuse a value that is not a plain path or name, saying what it was.
@@ -721,24 +773,40 @@ config_string() {
 # directory, and a name that does not say which is which is one nobody can pick
 # a report for months later.
 #
-# The mode says which kind of run this is — `motion` or `speech` — and it
-# decides two things.
+# The mode says which kind of run this is — `motion`, `speech` or `record` — and
+# it decides two things.
 #
 # Whether a log root holding no records is a refusal. For a motion run it is:
 # the verdict is arithmetic over the channel log, so there is nothing to report
-# over. For a speech run it is not, because its verdict is read off the voice
-# host's console, which is fetched after this: a run that died in the launcher's
+# over. For the two supervised modes it is not, because their verdicts are read
+# off a console, which is fetched after this: a run that died in the launcher's
 # first seconds is exactly the run whose console explains it, and a refusal here
-# would leave that file on tmpfs until the next run's wipe.
+# would leave that file on tmpfs until the next run's wipe. A recording session
+# writes no `.olog` at all — its composition holds no logger — so for it the
+# absence is the ordinary case rather than a tolerated one, and nothing is said
+# about it: a line printed after every session is one nobody reads by the third.
 #
-# And whether the recorded audio comes home. Only a speech run records any, and
-# an empty third directory beside every motion log would be one nobody can tell
-# from a store that was lost.
+# And whether the recorded audio comes home, and out of which host's
+# configuration the store is named. Only the two supervised modes record any,
+# and an empty third directory beside every motion log would be one nobody can
+# tell from a store that was lost.
 #
 # Everything it says goes to stderr: the caller reads the path off stdout.
 fetch_records() {
 	local dest=$1 log_root=$2 prefix=$3 mode=$4
-	local stamp out part
+	local stamp out part records_audio=no store_config="" olog=refuse
+	case $mode in
+	speech)
+		records_audio=yes
+		store_config=$speech_config_path
+		olog=kept
+		;;
+	record)
+		records_audio=yes
+		store_config=$record_speech_config_path
+		olog=none
+		;;
+	esac
 	mkdir -p -- "$dest"
 	stamp=$(date -u +%Y%m%dT%H%M%SZ)
 	out="${dest}/${prefix}-${stamp}"
@@ -779,7 +847,14 @@ fetch_records() {
 	# process's channels somewhere else, which is silent at run time
 	# and looks exactly like this afterwards.
 	if [ -z "$(find "$part" -name '*.olog' -size +0 -print -quit)" ]; then
-		if [ "$mode" = speech ]; then
+		if [ "$olog" = none ]; then
+			# Nothing is said: a recording session's composition holds
+			# no logger, so this is what every successful one looks
+			# like. A warning here would be one an operator learns to
+			# scroll past, and the speech run's is the line that says
+			# its logger died.
+			:
+		elif [ "$olog" = kept ]; then
 			echo "${prog}: nothing in ${log_root} on ${host} is a .olog with bytes in it;" \
 				"keeping the fetch for its console" >&2
 		else
@@ -834,9 +909,9 @@ fetch_records() {
 	# rather than the log root, and it is the one thing a fetch brings home
 	# that the operator chose per site: a configuration recording nothing
 	# leaves this empty, which is a line and not a refusal.
-	if [ "$mode" = speech ]; then
+	if [ "$records_audio" = yes ]; then
 		local audio="${out}.audio" store store_source
-		store=$(record_store) || exit 1
+		store=$(record_store "$store_config") || exit 1
 		store_source=${store#*$'\t'}
 		store=${store%%$'\t'*}
 		mkdir -p -- "$audio"
@@ -1379,12 +1454,7 @@ play_from_library() {
 		article="a probe run"
 		prefix="probe-log"
 	fi
-	# Absolute for the reason --run's is: both the records and the name
-	# table are handed to an analyzer running out of its own runfiles tree.
-	case $dest in
-	/*) ;;
-	*) dest="${PWD}/${dest}" ;;
-	esac
+	dest=$(absolute_path "$dest")
 	require_bazel "the run's budget, table and report"
 	budget=$(tour_budget "$motion")
 	log_root=$(config_string log_root_dir)
@@ -1487,7 +1557,7 @@ play_from_library() {
 
 # The chain fragment that puts this run's configuration beside its records.
 #
-#   config_into_log_root <log root>
+#   config_into_log_root <log root> [extra payload-relative paths...]
 #
 # The three files a run can be varied by, copied out of the payload into the log
 # root the fetch brings home, so a fetched records directory carries the files
@@ -1503,16 +1573,24 @@ play_from_library() {
 # `config/cogs/servo_profile.textproto` says where on the unit the file was read
 # from.
 #
+# The extra paths are the caller's, for the files only one kind of run can be
+# read without: a recording session carries its own speech configuration home,
+# because the endpointer values an utterance's interval is derived from are in
+# it and a document derived from another file's numbers would be a timeline
+# nobody can trust.
+#
 # The copy lands in the log root and not in the run directory because the run
 # directory does not exist when the chain runs; the fetch moves it in
 # (`config_into_run_dir`), so a fetched run directory is self-contained and the
 # analyzers' one lookup stands.
 config_into_log_root() {
-	local log_root=$1 name dir fragment="" dirs=()
+	local log_root=$1
+	shift
+	local name dir fragment="" dirs=() members=("${run_config_files[@]}" "$@")
 	# One `mkdir` per directory the set lands in, not one per file: the
 	# payload-relative paths are known here, so the remote shell is not asked
 	# to run `dirname` three times to rediscover the one directory they share.
-	for name in "${run_config_files[@]}"; do
+	for name in "${members[@]}"; do
 		dir=${name%/*}
 		case " ${dirs[*]-} " in
 		*" ${dir} "*) ;;
@@ -1522,7 +1600,7 @@ config_into_log_root() {
 	for dir in "${dirs[@]}"; do
 		fragment="${fragment}; mkdir -p -- ${log_root}/config/${dir} || exit ${rc_post_wipe}"
 	done
-	for name in "${run_config_files[@]}"; do
+	for name in "${members[@]}"; do
 		fragment="${fragment}; cp -- ${release}/${name} ${log_root}/config/${name} || exit ${rc_post_wipe}"
 	done
 	printf '%s' "$fragment"
@@ -1703,7 +1781,11 @@ launch_chain() {
 
 # Refuse a staged speech configuration the host itself would refuse.
 #
-#   speech_preflight
+#   speech_preflight <payload-relative speech configuration>
+#
+# The configuration is the caller's, because the payload carries one per voice
+# host entry and each launcher config names its own literally: a session is
+# preflighted against the file the host it starts will load.
 #
 # The real loaders, over the payload that is about to run, before any device is
 # touched: `speech-surface`'s configuration structs refuse an unknown field
@@ -1717,15 +1799,15 @@ launch_chain() {
 # working directory, so the relative paths it resolves are the ones the launcher
 # will make the host resolve on the unit.
 speech_preflight() {
-	local listing binary
-	echo "${prog}: checking the staged speech configuration" >&2
+	local config_path=$1 listing binary
+	echo "${prog}: checking the staged ${config_path}" >&2
 	"$bazel" build "${build_flags[@]}" -- "$check_target" >&2 ||
 		refuse "$rc_check_refused" \
 			"the configuration checker did not build, so the staged speech configuration was not checked." \
 			"That is a build failure in this workspace and bazel's own output is above."
 	listing=$(bazel_files "$check_target")
 	binary=$(bazel_named_in "$listing" reachy_host)
-	(cd "$payload" && "$binary" --speech-config "$speech_config_path" --check) ||
+	(cd "$payload" && "$binary" --speech-config "$config_path" --check) ||
 		refuse "$rc_check_refused" \
 			"the staged speech configuration did not pass ${check_target} --check, so nothing was started." \
 			"Each line above is one conclusion; the last says which subjects did not hold." \
@@ -1749,6 +1831,329 @@ require_speech_tty() {
 			"A speech run has no budget — the operator ends it — so one that cannot be" \
 			"interrupted is not started. Run it from a terminal." \
 			"A run already going is stopped with 'ssh root@${host} pkill -x simplelaunch'."
+}
+
+# One value as an absolute path, whatever the caller typed.
+#
+#   absolute_path <path>
+#
+# A records directory, and the name table beside it, reach an analyzer through
+# `bazel run`, which runs it out of its own runfiles tree: a relative path would
+# be resolved there and name nothing, and what that looks like is a run that
+# produced records and an analyzer that says there is no log in them. Every mode
+# that hands a path onward goes through here, so the reason is stated once.
+absolute_path() {
+	case $1 in
+	/*) printf '%s\n' "$1" ;;
+	*) printf '%s\n' "${PWD}/$1" ;;
+	esac
+}
+
+# Refuse a pair of staged speech configurations that would put the pod and the
+# host on different addresses or different keys.
+#
+#   require_record_config_agreement
+#
+# The recording session has its own speech configuration — bypassed wake gate,
+# the parrot brain, no bridge — and the pod is provisioned from the site's,
+# because provisioning is what writes the PSK table both builds stage. So the
+# two files are independent operator files that have to agree on exactly the
+# scalars the link is made of: the address the pod dials, and the key table it
+# authenticates against.
+#
+# Refused here rather than discovered on the unit: what a mismatch looks like to
+# a person with both hands on the head is a robot that never answers, and the
+# half of the session they would spend looking at the recorder is the half that
+# was working.
+#
+# A payload with no site configuration is asked nothing — there is nothing to
+# disagree with, and the pod on such a unit was provisioned from a file this
+# deploy cannot see.
+require_record_config_agreement() {
+	record_config_agreement \
+		"${payload}/${record_speech_config_path}" "staged ${record_speech_config_path}" \
+		"${payload}/${speech_config_path}" "staged ${speech_config_path}"
+}
+
+# The agreement itself, over whichever pair of files the caller has.
+#
+#   record_config_agreement <recording file> <its name> <site file> <its name>
+#
+# Two callers and one comparison: the preflight asks it of the operator's own
+# files before anything is provisioned or built, and `--record` asks it of the
+# staged copies, which are what a session actually runs. The names are what the
+# refusal calls them, so an operator reading it knows which pair to go and fix.
+#
+# A file that is not there is asked nothing: the site's absence is a unit
+# provisioned from a file this deploy cannot see, and the recording one's is the
+# refusal its own caller makes.
+record_config_agreement() {
+	local mine_file=$1 mine_name=$2 site=$3 site_name=$4 key mine theirs
+	[ -f "$site" ] || return 0
+	[ -f "$mine_file" ] || return 0
+	for key in listen_addr pod_psk_file; do
+		mine=$(toml_table_value "$mine_file" "" "$key") || exit 1
+		theirs=$(toml_table_value "$site" "" "$key") || exit 1
+		[ "$mine" = "$theirs" ] ||
+			refuse "$rc_record_config_disagreement" \
+				"the ${mine_name} states ${key} = '${mine}' and the ${site_name} states '${theirs}'." \
+				"The pod is provisioned from the site's configuration and the recording session's" \
+				"voice host loads its own, so the two have to name one address and one key table:" \
+				"a pod dialling the address it was provisioned with would find nothing listening," \
+				"and a session with no pod is a session with no microphone and no speaker." \
+				"Both files are the operator's own — fix the recording one to match the site's and" \
+				"build again: make motion-build"
+	done
+}
+
+# A supervised run: the voice host on the unit, no budget, and a person in front
+# of the machine who ends it.
+#
+#   supervised_run <speech|record> <records directory>
+#
+# One chain and one set of refusals for the two modes that have them, because
+# every step but the ones named below is the same question asked of the same
+# unit: the bus, the launcher config, the provenance stamp, the pod's link
+# credentials, each speech service asked from the robot, the wipe, the
+# configuration copy, the sentinel, the launcher under a pty with its apps'
+# consoles tailed onto it, and a fetch and a verdict however the run ended.
+#
+# What the kind decides: which staged speech configuration is preflighted and
+# read for endpoints, which launcher config is started, which consoles are
+# tailed, what a fetch is named and which analyzer judges it, and the two lines
+# that tell the operator what they are about to be doing. The caller has already
+# refused a payload that cannot run this kind at all.
+supervised_run() {
+	local kind=$1 dest=$2
+	local config_path launcher prefix fetch_flag noun entry_target push_line
+	local opening closing tailed pids_named=no
+	local tails=() extra_config=()
+	case $kind in
+	speech)
+		config_path=$speech_config_path
+		launcher=$speech_launch_config
+		prefix=speech-log
+		fetch_flag=--speech-fetch
+		noun="speech run"
+		entry_target="make speech-run"
+		tails=("$voice_host_log")
+		push_line="The production config is pushed with the payload, so push again:"
+		opening="running the pipeline"
+		closing="talk to it, and stop the run with ^C when you are done"
+		;;
+	record)
+		config_path=$record_speech_config_path
+		launcher=$record_launch_config
+		prefix=record-log
+		fetch_flag=--record-fetch
+		noun="recording session"
+		entry_target="make pose-record"
+		tails=("$voice_host_log" "$recorder_log")
+		# The endpointer values every utterance's interval is derived
+		# from are in this file, so it travels home with the session.
+		extra_config=("$record_speech_config_path")
+		push_line="The recording config is pushed with the payload, so push again:"
+		opening="recording poses"
+		closing="the servos are yours to move; say what each pose is and wait for the read-back. ^C ends it"
+		;;
+	*) die "supervised_run was asked for ${kind}, which is no supervised mode." ;;
+	esac
+
+
+	require_speech_tty
+
+	require_bazel "the ${noun}'s preflight and report"
+	speech_preflight "$config_path"
+
+	# The endpoints are read out of the *staged* copy, not the
+	# assembly source: that is the file the host will load, and
+	# under --stale-ok the two can differ. Read here and pasted into
+	# the remote chain, because the reader is this script's and the
+	# question is the unit's.
+	speech_services=$(speech_service_urls "${payload}/${config_path}") || exit 1
+
+	log_root=$(config_string log_root_dir)
+	require_wipeable_log_root "$log_root"
+
+	# The same chain shape as `--run`'s, and the same codes for the
+	# steps they share, with the pipeline's own preflights ahead of
+	# the wipe and no budget around the launcher.
+	remote="$(bus_probe)"
+	remote="${remote}; [ -f ${release}/${launcher} ] || exit ${rc_no_launch_config}"
+	remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
+	# The pod's link credentials, before anything is emptied. A pod
+	# that cannot read them parks silently, and what that looks like
+	# to a person talking to the robot is a machine that is simply
+	# deaf: the whole session would be spent looking at the wrong
+	# half. Non-empty rather than merely present, because the file
+	# is written by another repo's provisioning and a zero-length
+	# one is that write interrupted.
+	remote="${remote}; [ -s ${audio_conf} ] || exit ${rc_no_audio_conf}"
+	# Each speech service the configuration names, asked from the
+	# unit — the vantage that decides whether this pipeline can hear
+	# and speak. A workstation-era endpoint that answers on the
+	# workstation and names nothing from the robot is the migration
+	# error this catches, and it catches it before the launcher
+	# starts rather than at the first thing a person says.
+	#
+	# No `-f`: with it curl exits 22 on any status from 400 up, and a
+	# speaches build that serves no listing route would answer 404
+	# and be refused as unreachable — a healthy service reading as a
+	# dead one, with the refusal sending an operator to re-address
+	# the endpoint that was right. What is asked here is whether the
+	# robot gets an answer at all.
+	while IFS=$'\t' read -r service_table service_url; do
+		[ -n "$service_table" ] || continue
+		remote="${remote}; curl -sS --max-time 5 -o /dev/null"
+		remote="${remote} ${service_url}${service_probe_path}"
+		remote="${remote} || exit ${rc_service_unreachable}"
+	done <<<"$speech_services"
+	remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
+	remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
+	remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
+	remote="${remote}$(config_into_log_root "$log_root" ${extra_config[@]+"${extra_config[@]}"})"
+	remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
+	remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
+	# Past the last step that can refuse: what a supervised session
+	# records is not repeatable, so the difference between a chain
+	# that refused and a launcher that happened to exit 5 has to be
+	# something other than the number.
+	remote="${remote}; echo ${launch_sentinel}"
+	# No `timeout` and no `reachy_ask`: both supervised configs start
+	# the voice host, which owns the narration port, and the run
+	# ends when the person watching it ends it. A ^C through the
+	# pty reaches this foreground group and a dropped ssh does the
+	# same by SIGHUP — the right shape for a supervised mode.
+	#
+	# The trailing `exit $?` keeps a shell in front of the launcher,
+	# for the reason `--run`'s does: without it a launcher killed by
+	# a signal comes back as ssh's own 255.
+	#
+	# The tails are what put the apps' own consoles on the operator's
+	# terminal. Without them the pipeline's narration — including the
+	# loud line a bridge or a stage dies on, and the recorder's own
+	# refusal — goes only into a file on the unit that nobody reads
+	# until the run is over, and the person at the machine spends the
+	# session addressing something that stopped listening in its first
+	# second. `-F` because the files do not exist yet when this starts,
+	# and their `2>/dev/null` suppresses only tail's own
+	# waiting-for-the-file chatter.
+	#
+	# The pids accumulate in one variable rather than one apiece: the
+	# set is this script's and the kill has to cover all of it, and a
+	# name per app would be a spelling that depends on how many there
+	# are.
+	for tailed in "${tails[@]}"; do
+		remote="${remote}; tail -F ${launch_logs}/${tailed} 2>/dev/null &"
+		if [ "$pids_named" = yes ]; then
+			remote="${remote} tail_pids=\"\$tail_pids \$!\""
+		else
+			remote="${remote} tail_pids=\$!"
+			pids_named=yes
+		fi
+	done
+	remote="${remote}; ./simplelaunch ${launcher} --logdir ${launch_logs}"
+	# The kill covers the orderly exit: a ^C through the pty reaches
+	# the tails with the rest of the foreground group, but a launcher
+	# that returned on its own would otherwise leave one holding the
+	# ssh session open.
+	remote="${remote}; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+
+	echo "${prog}: ${opening} on ${host}; eyes on the machine" >&2
+	echo "${prog}: ${closing}" >&2
+	# No ^C note: this run is ended by the operator's own ^C and
+	# `require_speech_tty` has already refused it without a terminal.
+	launch_and_capture "$remote"
+
+	# Only a run that never reached its launcher is refused here.
+	# Everything else — the launcher's own exit, a signal, a dropped
+	# connection — is a run that happened, and why it ended the way
+	# it did is the report's question over the console the fetch
+	# brings back. That is the whole difference from `--run`, which
+	# has one expected code and treats the rest as failures.
+	#
+	# The sentinel is what decides it, and here it earns its keep:
+	# what a supervised session records is not repeatable, so a
+	# launcher exiting 5 read as a payload with no provenance stamp
+	# would cost the records themselves, sitting on tmpfs until the
+	# next run wipes them, under a message saying nothing was
+	# started.
+	if ! launcher_reached "${aside}/run-console.log"; then
+		bus_refusal "$rc" "a ${noun}" "nothing was started"
+		chain_refusal "$rc" "$launcher" "$fetch_flag" "$push_line"
+		case "$rc" in
+		"$rc_no_audio_conf")
+			# The line below is pasted by someone already blocked, so
+			# it may only name a concrete file this run can show is the
+			# one the payload carries. REACHY_SPEECH_CONFIG is read
+			# here, at deploy time; the staged copy is what the host
+			# loads, and --stale-ok, a direct invocation with the
+			# variable unset, or a build in another shell each part the
+			# two. Provisioning from the other half derives the pod's
+			# address and its key from a configuration the host never
+			# reads — a next run that composes and sits deaf, which is
+			# the failure this refusal exists to head off. Unconfirmed,
+			# the placeholder goes back in and says so: a path the
+			# operator has to supply is one they have to think about.
+			#
+			# The host is always named: this refusal came from it.
+			# Omitted, the remediation command may target a different
+			# unit, and this one refuses again identically.
+			provision_note=()
+			if cmp -s -- "$speech_config" "${payload}/${speech_config_path}"; then
+				provision_config=$speech_config
+			else
+				provision_config="<assembly>/speech.toml"
+				provision_note=(
+					"The path there is yours to fill in: this deploy could not confirm which file the"
+					"staged ${speech_config_path} was built from, so name the assembly configuration"
+					"that matches it — not one that merely looks like it."
+				)
+			fi
+			die "${host} has no ${audio_conf}, so the audio device has no link credentials and would park silently." \
+				"That file is written for you by the target that runs this script:" \
+				"    ${entry_target}" \
+				"which provisions it before every run, from the same speech configuration it" \
+				"builds the payload with. Reaching this refusal means either this script was" \
+				"invoked directly, or the unit lost its tmpfs since the provisioning ran." \
+				"The raw command, for the first case — it is brenn-pod's, whose writer this repo" \
+				"invokes and never duplicates:" \
+				"    make -C firmware reachy-provision ON_UNIT=1 REACHY_HOST=${host} SPEECH_CONFIG=\"${provision_config}\"" \
+				${provision_note+"${provision_note[@]}"} \
+				"ON_UNIT=1 is what says the voice host runs on the unit, which is what makes the" \
+				"configuration's loopback address the right one to hand the audio device." \
+				"Nothing was started and nothing was emptied."
+			;;
+		"$rc_service_unreachable")
+			die "${host} cannot reach a speech service the configuration names, so nothing was started." \
+				"The failing URL is in the output above, asked for ${service_probe_path} from the unit." \
+				"Any answer at all counts as reached, so this is a name that does not resolve," \
+				"a connection refused or a five-second deadline. An endpoint that answers on" \
+				"this workstation and not from the robot is the usual cause — a speech service" \
+				"is named by an address the robot can dial, never by localhost. Nothing was emptied."
+			;;
+		esac
+	fi
+
+	echo "${prog}: the run ended (exit ${rc}); fetching what it recorded" >&2
+	out=$(fetch_records "$dest" "$log_root" "$prefix" "$kind")
+	console=$(file_captures "$aside" "$out")
+	echo "${prog}: console ${console}"
+	echo "${prog}: log  ${out}"
+	echo "${prog}: audio ${out}.audio"
+
+	# Both sides of the fetch are what a supervised run is read off:
+	# what a person said to the robot decides what is in either, so
+	# the analyzer's standard over the console is presence and
+	# absence rather than arithmetic. For a speech run the records are
+	# where it asks whether the head moved for the scripts the session
+	# took; for a recording session there are no records at all and the
+	# console is the pose stream itself. Either verdict is this
+	# script's.
+	case $kind in
+	speech) speech_verdict "$out" ;;
+	record) pose_verdict "$out" ;;
+	esac
 }
 
 host=${1:-}
@@ -1866,15 +2271,7 @@ case "$mode" in
 		dest=${1:-}
 		[ -n "$dest" ] || usage
 		[ $# -eq 1 ] || usage
-		# Absolute from here on. The report is invoked through `bazel run`,
-		# which runs it from its own runfiles tree rather than from here,
-		# so a relative records directory would be read against the wrong
-		# root -- and what that looks like is a run that produced records
-		# and an analyzer that says there is no log in them.
-		case $dest in
-		/*) ;;
-		*) dest="${PWD}/${dest}" ;;
-		esac
+		dest=$(absolute_path "$dest")
 		require_bazel "the run's report"
 		log_root=$(config_string log_root_dir)
 		require_wipeable_log_root "$log_root"
@@ -1994,12 +2391,6 @@ case "$mode" in
 		dest=${1:-}
 		[ -n "$dest" ] || usage
 		[ $# -eq 1 ] || usage
-		# Absolute from here on, for the reason `--run`'s is: the report
-		# runs through `bazel run`, out of its own runfiles tree.
-		case $dest in
-		/*) ;;
-		*) dest="${PWD}/${dest}" ;;
-		esac
 
 		# The speech configuration is an optional payload member: a
 		# payload built without one is a valid motion payload and no
@@ -2012,186 +2403,88 @@ case "$mode" in
 				"with the credential files it names:" \
 				"    REACHY_SPEECH_CONFIG=<assembly>/speech.toml make motion-build"
 
-		require_speech_tty
-
-		require_bazel "the speech run's preflight and report"
-		speech_preflight
-
-		# The endpoints are read out of the *staged* copy, not the
-		# assembly source: that is the file the host will load, and
-		# under --stale-ok the two can differ. Read here and pasted into
-		# the remote chain, because the reader is this script's and the
-		# question is the unit's.
-		speech_services=$(speech_service_urls "${payload}/${speech_config_path}") || exit 1
-
-		log_root=$(config_string log_root_dir)
-		require_wipeable_log_root "$log_root"
-
-		# The same chain shape as `--run`'s, and the same codes for the
-		# steps they share, with the pipeline's own preflights ahead of
-		# the wipe and no budget around the launcher.
-		remote="$(bus_probe)"
-		remote="${remote}; [ -f ${release}/${speech_launch_config} ] || exit ${rc_no_launch_config}"
-		remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
-		# The pod's link credentials, before anything is emptied. A pod
-		# that cannot read them parks silently, and what that looks like
-		# to a person talking to the robot is a machine that is simply
-		# deaf: the whole session would be spent looking at the wrong
-		# half. Non-empty rather than merely present, because the file
-		# is written by another repo's provisioning and a zero-length
-		# one is that write interrupted.
-		remote="${remote}; [ -s ${audio_conf} ] || exit ${rc_no_audio_conf}"
-		# Each speech service the configuration names, asked from the
-		# unit — the vantage that decides whether this pipeline can hear
-		# and speak. A workstation-era endpoint that answers on the
-		# workstation and names nothing from the robot is the migration
-		# error this catches, and it catches it before the launcher
-		# starts rather than at the first thing a person says.
-		#
-		# No `-f`: with it curl exits 22 on any status from 400 up, and a
-		# speaches build that serves no listing route would answer 404
-		# and be refused as unreachable — a healthy service reading as a
-		# dead one, with the refusal sending an operator to re-address
-		# the endpoint that was right. What is asked here is whether the
-		# robot gets an answer at all.
-		while IFS=$'\t' read -r service_table service_url; do
-			[ -n "$service_table" ] || continue
-			remote="${remote}; curl -sS --max-time 5 -o /dev/null"
-			remote="${remote} ${service_url}${service_probe_path}"
-			remote="${remote} || exit ${rc_service_unreachable}"
-		done <<<"$speech_services"
-		remote="${remote}; cp -- ${release}/${provenance_name} ${staged_provenance} || exit ${rc_stamp_unstaged}"
-		remote="${remote}; rm -rf -- ${log_root} && mkdir -p -- ${log_root} || exit ${rc_post_wipe}"
-		remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
-		remote="${remote}$(config_into_log_root "$log_root")"
-		remote="${remote}; rm -rf -- ${launch_logs} && mkdir -p -- ${launch_logs} || exit ${rc_post_wipe}"
-		remote="${remote}; cd ${release} || exit ${rc_post_wipe}"
-		# Past the last step that can refuse: what a supervised session
-		# records is not repeatable, so the difference between a chain
-		# that refused and a launcher that happened to exit 5 has to be
-		# something other than the number.
-		remote="${remote}; echo ${launch_sentinel}"
-		# No `timeout` and no `reachy_ask`: the production config starts
-		# the voice host, which owns the narration port, and the run
-		# ends when the person watching it ends it. A ^C through the
-		# pty reaches this foreground group and a dropped ssh does the
-		# same by SIGHUP — the right shape for a supervised mode.
-		#
-		# The trailing `exit $?` keeps a shell in front of the launcher,
-		# for the reason `--run`'s does: without it a launcher killed by
-		# a signal comes back as ssh's own 255.
-		#
-		# The tail is what puts the voice host's own console on the
-		# operator's terminal. Without it the pipeline's narration —
-		# including the loud line a bridge or a stage dies on — goes only
-		# into a file on the unit that nobody reads until the run is
-		# over, and the person talking to the robot spends the session
-		# addressing a machine that stopped listening in its first
-		# second. `-F` because the file does not exist yet when this
-		# starts, and its `2>/dev/null` suppresses only tail's own
-		# waiting-for-the-file chatter.
-		remote="${remote}; tail -F ${launch_logs}/${voice_host_log} 2>/dev/null &"
-		remote="${remote} tail_pid=\$!"
-		remote="${remote}; ./simplelaunch ${speech_launch_config} --logdir ${launch_logs}"
-		# The kill covers the orderly exit: a ^C through the pty reaches
-		# the tail with the rest of the foreground group, but a launcher
-		# that returned on its own would otherwise leave a tail holding
-		# the ssh session open.
-		remote="${remote}; rc=\$?; kill \$tail_pid 2>/dev/null; exit \$rc"
-
-		echo "${prog}: running the pipeline on ${host}; eyes on the machine" >&2
-		echo "${prog}: talk to it, and stop the run with ^C when you are done" >&2
-		# No ^C note: this run is ended by the operator's own ^C and
-		# `require_speech_tty` has already refused it without a terminal.
-		launch_and_capture "$remote"
-
-		# Only a run that never reached its launcher is refused here.
-		# Everything else — the launcher's own exit, a signal, a dropped
-		# connection — is a run that happened, and why it ended the way
-		# it did is the report's question over the console the fetch
-		# brings back. That is the whole difference from `--run`, which
-		# has one expected code and treats the rest as failures.
-		#
-		# The sentinel is what decides it, and here it earns its keep:
-		# what a supervised session records is not repeatable, so a
-		# launcher exiting 5 read as a payload with no provenance stamp
-		# would cost the records themselves, sitting on tmpfs until the
-		# next run wipes them, under a message saying nothing was
-		# started.
-		if ! launcher_reached "${aside}/run-console.log"; then
-			bus_refusal "$rc" "a speech run" "nothing was started"
-			chain_refusal "$rc" "$speech_launch_config" --speech-fetch \
-				"The production config is pushed with the payload, so push again:"
-			case "$rc" in
-			"$rc_no_audio_conf")
-				# The line below is pasted by someone already blocked, so
-				# it may only name a concrete file this run can show is the
-				# one the payload carries. REACHY_SPEECH_CONFIG is read
-				# here, at deploy time; the staged copy is what the host
-				# loads, and --stale-ok, a direct invocation with the
-				# variable unset, or a build in another shell each part the
-				# two. Provisioning from the other half derives the pod's
-				# address and its key from a configuration the host never
-				# reads — a next run that composes and sits deaf, which is
-				# the failure this refusal exists to head off. Unconfirmed,
-				# the placeholder goes back in and says so: a path the
-				# operator has to supply is one they have to think about.
-				#
-				# The host is always named: this refusal came from it.
-				# Omitted, the remediation command may target a different
-				# unit, and this one refuses again identically.
-				provision_note=()
-				if cmp -s -- "$speech_config" "${payload}/${speech_config_path}"; then
-					provision_config=$speech_config
-				else
-					provision_config="<assembly>/speech.toml"
-					provision_note=(
-						"The path there is yours to fill in: this deploy could not confirm which file the"
-						"staged ${speech_config_path} was built from, so name the assembly configuration"
-						"that matches it — not one that merely looks like it."
-					)
-				fi
-				die "${host} has no ${audio_conf}, so the audio device has no link credentials and would park silently." \
-					"That file is written for you by the target that runs this script:" \
-					"    make speech-run" \
-					"which provisions it before every run, from the same speech configuration it" \
-					"builds the payload with. Reaching this refusal means either this script was" \
-					"invoked directly, or the unit lost its tmpfs since the provisioning ran." \
-					"The raw command, for the first case — it is brenn-pod's, whose writer this repo" \
-					"invokes and never duplicates:" \
-					"    make -C firmware reachy-provision ON_UNIT=1 REACHY_HOST=${host} SPEECH_CONFIG=\"${provision_config}\"" \
-					${provision_note+"${provision_note[@]}"} \
-					"ON_UNIT=1 is what says the voice host runs on the unit, which is what makes the" \
-					"configuration's loopback address the right one to hand the audio device." \
-					"Nothing was started and nothing was emptied."
-				;;
-			"$rc_service_unreachable")
-				die "${host} cannot reach a speech service the configuration names, so nothing was started." \
-					"The failing URL is in the output above, asked for ${service_probe_path} from the unit." \
-					"Any answer at all counts as reached, so this is a name that does not resolve," \
-					"a connection refused or a five-second deadline. An endpoint that answers on" \
-					"this workstation and not from the robot is the usual cause — a speech service" \
-					"is named by an address the robot can dial, never by localhost. Nothing was emptied."
-				;;
-			esac
-		fi
-
-		echo "${prog}: the run ended (exit ${rc}); fetching what it recorded" >&2
-		out=$(fetch_records "$dest" "$log_root" speech-log speech)
-		console=$(file_captures "$aside" "$out")
-		echo "${prog}: console ${console}"
-		echo "${prog}: log  ${out}"
-		echo "${prog}: audio ${out}.audio"
-
-		# Both sides of the fetch are what a speech run is read off:
-		# what a person said to the robot decides what is in either, so
-		# the analyzer's standard over the console is presence and
-		# absence rather than arithmetic, and the records are where it
-		# asks whether the head moved for the scripts the session took.
-		# Its verdict is this script's.
-		speech_verdict "$out"
+		supervised_run speech "$(absolute_path "$dest")"
 		;;
 
+	--record)
+		dest=${1:-}
+		[ -n "$dest" ] || usage
+		[ $# -eq 1 ] || usage
+
+		# Two optional payload members, and a recording session needs
+		# both: the voice host's own arrangement of the pipeline, and
+		# the serial node the recorder opens. A payload carrying
+		# neither is a good motion payload and no recorder at all,
+		# which is why the build stages them and this refuses them.
+		[ -f "${payload}/${record_speech_config_path}" ] ||
+			refuse "$rc_no_record_config" \
+				"the staged payload carries no ${record_speech_config_path}, so there is no pipeline to record with." \
+				"The recording session's speech configuration is the operator's own file — the" \
+				"bypassed wake gate, the parrot brain, no bridge — named by" \
+				"REACHY_RECORD_SPEECH_CONFIG or taken from this tree's gitignored" \
+				"host/speech-record.toml, and the build stages it:" \
+				"    REACHY_RECORD_SPEECH_CONFIG=<assembly>/speech-record.toml make motion-build"
+		[ -f "${payload}/${bench_config_path}" ] ||
+			refuse "$rc_no_bench_config" \
+				"the staged payload carries no ${bench_config_path}, so the recorder does not know which serial node to open." \
+				"That is the bench's own configuration, the same file a bench night pushes, and" \
+				"the build stages a copy of it into the motion payload:" \
+				"    BENCH_CONFIG=<path> make motion-build" \
+				"One knob for both, because a unit whose bench and whose recorder looked at" \
+				"different serial nodes would be one nobody could explain."
+		require_record_config_agreement
+
+		supervised_run record "$(absolute_path "$dest")"
+		;;
+
+	--record-preflight)
+		[ $# -eq 0 ] || usage
+		# `--speech-preflight`'s question, asked by `make pose-record`
+		# before it provisions the unit and builds a payload: a
+		# recording session is ended by the operator's ^C too, and a
+		# session property knowable first is refused first.
+		require_speech_tty
+
+		# And the three a recording session is likeliest to hit on its
+		# first run, asked of the operator's own files rather than of
+		# the payload: a missing configuration is a file somebody has to
+		# write, and being told so after a device cross-build and a push
+		# costs the whole build again. The staged copies are still what
+		# `--record` refuses on — they are what a session runs — and
+		# these are the same three codes, so a chain that answers here
+		# and a chain that answers there read the same.
+		[ -f "$record_speech_config" ] ||
+			refuse "$rc_no_record_config" \
+				"there is no ${record_speech_config}, so there is no pipeline to record with." \
+				"The recording session's speech configuration is the operator's own file — the" \
+				"bypassed wake gate, the parrot brain, no bridge — named by" \
+				"REACHY_RECORD_SPEECH_CONFIG or taken from this tree's gitignored" \
+				"host/speech-record.toml. Write it, and the build stages it."
+		[ -f "$bench_config" ] ||
+			refuse "$rc_no_bench_config" \
+				"there is no ${bench_config}, so the recorder would not know which serial node to open." \
+				"That is the bench's own configuration, the same file a bench night pushes, named" \
+				"by BENCH_CONFIG. One knob for both, because a unit whose bench and whose" \
+				"recorder looked at different serial nodes would be one nobody could explain."
+		record_config_agreement \
+			"$record_speech_config" "$record_speech_config" \
+			"$speech_config" "$speech_config"
+		;;
+
+	--record-fetch)
+		dest=${1:-}
+		[ -n "$dest" ] || usage
+		[ $# -eq 1 ] || usage
+		# Absolute, like every other mode that hands a path onward: the
+		# command this prints is run through `bazel run`, which resolves
+		# a relative path in the analyzer's own runfiles tree, and
+		# `POSE_RECORDS` is spelled relatively.
+		dest=$(absolute_path "$dest")
+		log_root=$(config_string log_root_dir)
+		out=$(fetch_records "$dest" "$log_root" record-log record)
+		echo "${prog}: read it: bazel run //cogs:pose_session_report --" \
+			"${out} --out ${out}.session"
+		;;
 	--speech-preflight)
 		[ $# -eq 0 ] || usage
 		# The one refusal a speech run can reach before anything has been

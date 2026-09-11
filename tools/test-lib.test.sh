@@ -220,7 +220,7 @@ assert_contains "a suite starts with the operator's knobs cleared" \
 # workstation while CI, where nothing is set, stays green.
 lib_sh="${script_dir}/lib.sh"
 unset_line=$(grep -n -e '^unset ' -- "${script_dir}/test-lib.sh")
-readers=$(grep -o -E -e '\$\{(REACHY|BRENN)_[A-Z_]+' -- "$lib_sh" |
+readers=$(grep -o -E -e '\$\{(REACHY|BRENN|BENCH)_[A-Z_]+' -- "$lib_sh" |
 	sed 's/^\${//' | sort -u)
 if [ -z "$readers" ]; then
 	fail "tools/lib.sh names at least one operator knob" \

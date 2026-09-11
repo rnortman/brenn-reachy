@@ -32,8 +32,13 @@ reachy-bench.state.toml
 # The voice pipeline's own configuration, which the payload build stages into a
 # unit's RAM from here by default. It names a site's speech services, its bus
 # server and token, and a unit's link keys, so every copy of it belongs to
-# whoever runs the machine and none of them is content in this repo.
+# whoever runs the machine and none of them is content in this repo. Two
+# arrangements of the same pipeline, one per launcher entry: the site's, and a
+# recording session's. Both name the same services and the same key table, so
+# the second is no less a site's file than the first, and the tools that tell
+# an operator to write one call it gitignored.
 /host/speech.toml
+/host/speech-record.toml
 
 # Measured geometry and calibration output. Per-unit fitted numbers belong to a
 # unit, not to the repo.

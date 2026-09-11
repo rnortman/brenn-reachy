@@ -92,6 +92,7 @@ pub mod phase;
 pub mod plant;
 pub mod postures;
 pub mod record;
+pub mod segments;
 pub mod seq;
 pub mod snap;
 pub mod stillness;
@@ -125,6 +126,10 @@ pub use plant::{
 };
 pub use postures::{NEUTRAL_ANTENNAS, neutral_targets, stow_pose_targets};
 pub use resume::{GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError};
+pub use segments::{
+    DRIFT_SAMPLES, HISTORY_SAMPLES, JointSample, MIN_STILL, MOVING_RAD_PER_S, MotionSegmenter,
+    SPEED_WINDOW, STILL_RAD_PER_S, Segment, SegmentConfig, SegmentConfigError, SegmentKind,
+};
 pub use seq::{
     AbsentSet, AnswerShape, BusResult, RegId, SeqAction, SeqError, SeqFailureKind, SeqStepKind,
     Sequencer, StepContext, answer, failure, reg, step,

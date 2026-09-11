@@ -216,6 +216,14 @@ pub(crate) struct FakeMachine {
     /// and cycling: a joint that is not standing still, scripted as the series
     /// a reader would see rather than as a mechanism.
     pub(crate) wobble: HashMap<u8, VecDeque<i32>>,
+    /// Frames this machine takes before the port itself starts failing,
+    /// counted down as they arrive; `None` for a port that keeps working.
+    ///
+    /// The port going away rather than a servo doing so: a cut USB adapter, a
+    /// closed descriptor, an `EIO` from the kernel. Every servo going deaf is a
+    /// bus of silence, which the host times out on and carries on from — this
+    /// is the other failure, the one that ends a run.
+    pub(crate) port_fails_after: Option<u32>,
     out: VecDeque<u8>,
 }
 
@@ -244,6 +252,7 @@ impl FakeMachine {
             wire_time: None,
             written: Vec::new(),
             wobble: HashMap::new(),
+            port_fails_after: None,
             out: VecDeque::new(),
         }
     }
@@ -538,6 +547,12 @@ impl BusPort for FakeMachine {
         // that answer waits the same as for any other.
         if let Some((now, per_frame)) = &self.wire_time {
             now.set(now.get() + *per_frame);
+        }
+        if let Some(left) = self.port_fails_after.as_mut() {
+            if *left == 0 {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            *left -= 1;
         }
         if self.silent.contains(&id) {
             return Ok(());

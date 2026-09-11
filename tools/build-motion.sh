@@ -15,14 +15,18 @@
 #     simplelaunch                                      the launcher, started by hand
 #     robotcpu.textproto                                the five apps it starts
 #     robotcpu_harness.textproto                        the same without host or pod
+#     robotcpu_record.textproto                         a recording session's three apps
 #     clockwork/launch/clockwork_prelaunch.sh            what it runs before them
 #     reachy_motord                                     the driver process
 #     reachy_host                                       the voice host process
 #     reachy_pod                                        the audio device process
 #     reachy_ask                                        the harness's intent source
+#     reachy_bench                                      the recording session's pose stream
 #     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
 #     host/host_params.textproto                        the operator's host configuration
+#     host/speech-record.toml                           a recording session's voice half
+#     bench/reachy-bench.toml                           the recorder's own configuration
 #     cogs/clip_library.names.json                      the overlay name table it reads
 #     models/oww/*.onnx                                 the wake gate's three graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
@@ -39,12 +43,14 @@
 # Bazel's outputs, and the configuration itself from the operator's file
 # (`host_params`, staged at `host_params_path`).
 #
-# Two launcher configs are staged. The production one names the host and the pod;
-# the harness twin names neither, because `deploy-motion.sh --run` starts the
-# intent source itself and the host would bind the same narration port and
+# Three launcher configs are staged. The production one names the host and the
+# pod; the harness twin names neither, because `deploy-motion.sh --run` starts
+# the intent source itself and the host would bind the same narration port and
 # address scripts to the same port the control process binds, and because a
-# motion run must need no audio hardware. Both are staged because a unit is
-# deployed once and used for both.
+# motion run must need no audio hardware. The third is a recording session: the
+# pod, a host reading its own speech configuration, and the bench reading the
+# servos read-only, with no driver and no control process in it at all. All three
+# are staged because a unit is deployed once and used for each.
 #
 # One payload member is not built here. `reachy_pod` is brenn-pod's binary — it
 # links libusb and libasound and is compiled in that repo's arm64 container — so
@@ -77,6 +83,17 @@
 #                          not listen). The credential files it names are staged
 #                          with it, from beside it — see the assembly directory
 #                          below.
+#   REACHY_RECORD_SPEECH_CONFIG  the same for a recording session's voice half,
+#                          which transcribes with no wake word and reads each
+#                          transcript back (default: the gitignored
+#                          host/speech-record.toml of this tree; a payload
+#                          built without one is one `deploy-motion.sh --record`
+#                          refuses)
+#   BENCH_CONFIG           the bench's own configuration, naming the serial node
+#                          this unit's servos are on -- the same knob a bench
+#                          night pushes with (default: .local/reachy-bench.toml,
+#                          relative to this repository's root; a payload built
+#                          without one is refused by `--record` the same way)
 #
 # A speech configuration is not one file but a small directory: the TOML, and
 # the credential files it names — the pod's key table, the bus token — beside
@@ -94,10 +111,12 @@ set -euo pipefail
 
 bazel=${REACHY_BAZEL:-bazel}
 
-# The three payload members whose sources are outside this tree -- the audio
+# The five payload members whose sources are outside this tree -- the audio
 # device's binary (`pod_binary`), the site's speech configuration
-# (`speech_config`, staged at `speech_config_path`) and the unit's own host
-# configuration (`host_params`, staged at `host_params_path`) -- are named by
+# (`speech_config`, staged at `speech_config_path`), a recording session's
+# (`record_speech_config`, at `record_speech_config_path`), the bench's own
+# (`bench_config`, at `bench_config_path`) and the unit's host configuration
+# (`host_params`, staged at `host_params_path`) -- are named by
 # `lib.sh`:
 # this script stages them and `deploy-motion.sh` asks whether either has changed
 # since, and a knob spelled twice is a knob that answers two ways.
@@ -131,6 +150,11 @@ system_target=//cogs:system_robot_clk
 launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:robotcpu.textproto
 harness_config_target=//cogs:robotcpu_harness.textproto
+record_config_target=//cogs:robotcpu_record.textproto
+# The bench, a payload member for the recording session's sake: its `pose-log`
+# command is the recording config's third app. Named again here because its
+# output has to be told apart from the other Rust binaries' by basename.
+bench_target=//crates/reachy-bench:reachy_bench
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 # The payload's one shared object. The voice host links ONNX Runtime
 # dynamically, so this file has to be staged beside it at the payload root: the
@@ -213,15 +237,21 @@ logger_config=cogs/robot_logger.textproto
 # asserted by tools/build-motion.test.sh, so the refusal below cites a document
 # a self-check keeps true.
 #
-# Two lists because two configs are staged, and the difference between them is
-# the whole point of the twin: the harness config must not name the host, or a
-# motion run would start a second binder of the narration port `reachy_ask`
-# holds, and it must not name the pod, or a motion run would want a mic array.
-# Asserted per config below, so either app merged into the harness twin by
-# accident is a refused build rather than a bind race on a powered unit.
+# Three lists because three configs are staged, and the differences between them
+# are the whole point of the twins: the harness config must not name the host, or
+# a motion run would start a second binder of the narration port `reachy_ask`
+# holds, and it must not name the pod, or a motion run would want a mic array;
+# and the recording config must name neither the driver nor the control process,
+# or a session with an operator's hands in the linkage would carry a process that
+# can arm a servo. Asserted per config below, so an app merged into the wrong one
+# by accident is a refused build rather than a bind race, or a torque-on path, on
+# a powered unit.
 launcher_apps=(logger_proc motord pod proc voice_host)
 
 harness_apps=(logger_proc motord proc)
+
+# The safety-critical list: nothing in a recording session can arm a servo.
+record_apps=(pod recorder voice_host)
 
 compile() {
 	"$bazel" build "${build_flags[@]}" -- "$build_target"
@@ -356,10 +386,14 @@ payload_fixed_members=(
 	simplelaunch
 	robotcpu.textproto
 	robotcpu_harness.textproto
+	robotcpu_record.textproto
+	reachy_bench
 	cogs/robot_clk_exe
 	clockwork/launch/clockwork_prelaunch.sh
 	"$provenance_name"
 	"$speech_config_path"
+	"$record_speech_config_path"
+	"$bench_config_path"
 	"$host_params_path"
 	"$build_commit_name"
 )
@@ -478,12 +512,17 @@ stage() {
 	# Not a launcher app: it binds the narration port before the composition is
 	# started, so `--run` starts it itself, ahead of the launcher.
 	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
+	# A launcher app in one config only: the recording session's, under
+	# `pose-log`. Staged in every payload, because which config a unit runs is
+	# decided at the prompt and not at the build.
+	install -m 0755 -D -- "$bench_out" "${staging}/reachy_bench"
 	# Beside the host, because that is what its `$ORIGIN` runpath means.
 	install -m 0755 -D -- "$onnx_out" "${staging}/libonnxruntime.so.1"
 	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
 	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
 	install -m 0644 -D -- "$launch_config_out" "${staging}/robotcpu.textproto"
 	install -m 0644 -D -- "$harness_config_out" "${staging}/robotcpu_harness.textproto"
+	install -m 0644 -D -- "$record_config_out" "${staging}/robotcpu_record.textproto"
 	install -m 0755 -D -- "$prelaunch_out" \
 		"${staging}/clockwork/launch/clockwork_prelaunch.sh"
 
@@ -496,6 +535,19 @@ stage() {
 	# account that runs the payload and by nobody else on the machine.
 	if [ -f "$speech_config" ]; then
 		install -m 0600 -D -- "$speech_config" "${staging}/${speech_config_path}"
+	fi
+
+	# The recording session's two optional members, staged the same way and at
+	# the same mode: one holds a site's services and this unit's link keys, the
+	# other the serial node its servos are on. A payload carrying neither builds
+	# and runs everything but a recording session, which `--record` refuses for
+	# each by name.
+	if [ -f "$record_speech_config" ]; then
+		install -m 0600 -D -- "$record_speech_config" \
+			"${staging}/${record_speech_config_path}"
+	fi
+	if [ -f "$bench_config" ]; then
+		install -m 0600 -D -- "$bench_config" "${staging}/${bench_config_path}"
 	fi
 
 	# The other operator's file, staged the same way and refused above when it
@@ -529,8 +581,8 @@ report() {
 	size=$(du -sh -- "$payload" | cut -f1)
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
-	for file in reachy_motord reachy_host reachy_pod reachy_ask libonnxruntime.so.1 \
-		cogs/robot_clk_exe simplelaunch; do
+	for file in reachy_motord reachy_host reachy_pod reachy_ask reachy_bench \
+		libonnxruntime.so.1 cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
 	# The one member whose provenance a digest does not settle: reachy_pod was
@@ -545,6 +597,19 @@ report() {
 		echo "${prog}: ${speech_config_path}  staged from ${speech_config}"
 	else
 		echo "${prog}: ${speech_config_path}  absent; the voice host will run its edge half alone"
+	fi
+	# The recording session's two, reported present or absent the way the site's
+	# configuration is and for the same reason: what a person needs to know at
+	# the bench is whether this payload can record a session at all.
+	if [ -f "${payload}/${record_speech_config_path}" ]; then
+		echo "${prog}: ${record_speech_config_path}  staged from ${record_speech_config}"
+	else
+		echo "${prog}: ${record_speech_config_path}  absent; this payload cannot record a session"
+	fi
+	if [ -f "${payload}/${bench_config_path}" ]; then
+		echo "${prog}: ${bench_config_path}  staged from ${bench_config}"
+	else
+		echo "${prog}: ${bench_config_path}  absent; this payload cannot record a session"
 	fi
 	# Said without a digest for the same reason, and always present: the build
 	# refuses without it, so there is no absent case to report.
@@ -562,16 +627,19 @@ require_bazel "device payload"
 check_pinion_defaults "$logger_config"
 compile
 built=$(bazel_files "$(union "$motord_target" "$host_target" "$ask_target" \
-	"$exe_target" "$system_target" "$launcher_target" "$launch_config_target" \
-	"$harness_config_target" "$prelaunch_target")")
+	"$bench_target" "$exe_target" "$system_target" "$launcher_target" \
+	"$launch_config_target" "$harness_config_target" "$record_config_target" \
+	"$prelaunch_target")")
 configs=$(bazel_files "$(union "${config_targets[@]}")")
 motord_out=$(bazel_named_in "$built" reachy_motord)
 host_out=$(bazel_named_in "$built" reachy_host)
 ask_out=$(bazel_named_in "$built" reachy_ask)
+bench_out=$(bazel_named_in "$built" reachy_bench)
 exe_out=$(bazel_named_in "$built" robot_clk_exe)
 launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
 harness_config_out=$(bazel_named_in "$built" robotcpu_harness.textproto)
+record_config_out=$(bazel_named_in "$built" robotcpu_record.textproto)
 prelaunch_out=$(bazel_named_in "$built" clockwork_prelaunch.sh)
 # Resolved on its own and not out of the listing above: the shared object is a
 # fetched repository's file, so the path cquery answers with is relative to the
@@ -606,6 +674,22 @@ if [ -n "$speech_config_named" ] && [ ! -f "$speech_config" ]; then
 		"file and is never in this tree; unset it to build a payload whose host runs" \
 		"its edge half alone."
 fi
+# The recording session's speech configuration, decided the same way and for the
+# same reasons: unnamed and absent is a payload that runs everything but a
+# recording session, and named and absent is somebody who said where the file is
+# and typed the path wrong.
+if [ -n "$record_speech_config_named" ] && [ ! -f "$record_speech_config" ]; then
+	die "there is no recording speech configuration at ${record_speech_config}." \
+		"REACHY_RECORD_SPEECH_CONFIG names the voice pipeline's configuration for a" \
+		"recording session -- bypassed wake gate, the parrot brain, no bridge -- which is" \
+		"a site's own file and is never in this tree; unset it to build a payload that" \
+		"records nothing."
+fi
+# The bench's own configuration has no named case at all: the Makefile exports
+# its own default, so a value arriving here is not evidence anybody typed a path,
+# and an absent file is a payload `--record` refuses rather than a build that
+# does.
+
 # The third member from outside the build, and the one with no optional case:
 # the voice host reads its configuration at startup and exits without one, so a
 # payload built without it is a unit whose voice never starts. Named or
@@ -621,6 +705,7 @@ fi
 resolve_models
 check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"
 check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
+check_launcher_apps "$record_config_out" "${record_apps[@]}"
 verify_aarch64 "$motord_out"
 verify_aarch64 "$host_out"
 # Asked of the prebuilt member the same way, and it is the one where the answer
@@ -629,6 +714,7 @@ verify_aarch64 "$host_out"
 # brenn-pod's own pod binary sits at a path that looks just like the arm64 one.
 verify_aarch64 "$pod_binary"
 verify_aarch64 "$ask_out"
+verify_aarch64 "$bench_out"
 verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
 verify_aarch64 "$onnx_out"
