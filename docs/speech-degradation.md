@@ -23,7 +23,21 @@ degraded ones at `0.23–0.54`; the gate declines above `0.2`. The summary's
 range line — `no_speech: dispatched 0.075; declined 0.42–0.50` — is what a
 session is judged on. Declined turns are printed again under a line counting the transcripts with
 words in them that went unanswered; the verdict stays green, because a wake
-with nothing said after it is rightly declined.
+with nothing said after it is rightly declined. A carve the gate declined for
+having been heard over the robot's own reply — the read-back leaking back
+through the microphone — says `echo_declined` rather than
+`wake_command_absent`; it is the same gate, the same count, and nothing was
+interrupted to produce it.
+
+The host's own console carries two lines per reply. `playback_written` is the
+last frame handed to the pod, with `banked_ms` saying how much audio the device
+still holds; `playback_finished` is where the last of it is heard, which is up
+to the pacer's lead later and is the end of the span an utterance is judged
+against for talking over the read-back. `playback_audible` is a third line, and
+the only one that dates what the pod is *heard* saying: it moves when the reply
+being played changes, so a hand-over between two replies and a clip re-sent
+after a barge show up there and nowhere else. It is the barge-in floor's own
+record.
 
 ## Listening to a turn
 
@@ -54,6 +68,11 @@ away. It dials the recogniser the configuration names, so it is the one tool
 here that is not offline; a turn with no second clip is listed and not asked.
 
 ## The chip
+
+The startup line also carries `build=<commit12>[+dirty]`, which is the pod
+binary saying which brenn-pod it was compiled from — the one way to know a log
+came from the revision the payload's voice host links. `provenance.txt`'s
+`reachy_pod=` beside the run says what the build intended; this says what ran.
 
 The pod's `pod_0.log` carries a startup line and a repeating state line: both
 output routings, the ASR-output switch and gain, whether the echo canceller

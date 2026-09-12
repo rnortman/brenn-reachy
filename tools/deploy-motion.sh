@@ -158,10 +158,10 @@ payload="${repo_root}/target/motion-arm64/release"
 # that failed halfway or a stage somebody edited by hand. Five are the production
 # launcher config's; the sixth is the intent source `--run` starts ahead of it.
 #
-# `reachy_pod` is among them on the same terms as the rest, though the build
-# stages it from a prebuilt brenn-pod artifact rather than compiling it: what
-# this list is about is what the launcher will look for on the unit, and the
-# launcher does not care which build produced a file.
+# `reachy_pod` is among them on the same terms as the rest, though it is
+# compiled in brenn-pod's container rather than by this tree's build: what this
+# list is about is what the launcher will look for on the unit, and the launcher
+# does not care which build produced a file.
 binaries=(
 	reachy_motord
 	reachy_host
@@ -974,7 +974,7 @@ fetch_records() {
 # between the push and the run.
 stamp_provenance() {
 	local into=$1 age_unchecked=$2
-	local pushed_from dirty built commit commit_source brenn_pod name
+	local pushed_from dirty built commit commit_source brenn_pod reachy_pod name
 	pushed_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || pushed_from=
 	[ -n "$pushed_from" ] ||
 		die "this tree cannot state its own commit, so a push from it could not say which build ran." \
@@ -982,14 +982,18 @@ stamp_provenance() {
 			"readable by the build that recorded it. Push from a checkout with history."
 	built=
 	brenn_pod=
+	reachy_pod=
 	if [ -f "${payload}/${build_commit_name}" ]; then
 		built=$(sed -n 's/^commit=//p' -- "${payload}/${build_commit_name}")
 		brenn_pod=$(sed -n 's/^brenn_pod=//p' -- "${payload}/${build_commit_name}")
+		reachy_pod=$(sed -n 's/^reachy_pod=//p' -- "${payload}/${build_commit_name}")
 	fi
 	# A payload staged by a build that recorded no brenn-pod field: an older
-	# build script. Nothing here can work the value out — this tree's
-	# MODULE.bazel is where it stands now, not where it stood at the build.
+	# build script. Nothing here can work either value out — this tree's
+	# MODULE.bazel is where it stands now, not where it stood at the build, and
+	# the pod binary carries no revision a reader here could ask it for.
 	brenn_pod=${brenn_pod:-unknown}
+	reachy_pod=${reachy_pod:-unknown}
 	case $built in
 	'' | unknown)
 		# A payload staged by a build that recorded nothing — an older
@@ -1043,9 +1047,17 @@ stamp_provenance() {
 # overlay: means they came out of a working tree beside the building checkout
 # rather than a published revision, so no revision names those binaries. unknown
 # means the payload was staged by a build that recorded no such field.
+#
+# reachy_pod is the brenn-pod revision the audio-device binary was compiled from,
+# with +dirty when that checkout held uncommitted changes. named means an
+# operator handed the build a prebuilt artifact, whose revision nothing could
+# ask. unknown means the payload was staged by a build that did not record it,
+# which is also a build that did not hold this field and brenn_pod equal — so a
+# run whose two fields name two revisions is such a payload.
 commit=${commit}
 commit_source=${commit_source}
 brenn_pod=${brenn_pod}
+reachy_pod=${reachy_pod}
 pushed_from=${pushed_from}
 dirty=${dirty}
 age_unchecked=${age_unchecked}

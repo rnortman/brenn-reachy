@@ -166,13 +166,17 @@ export RECORD_MOTORD=""
 export CALLS="${work}/calls"
 
 # The audio device's binary: the one payload member the subject does not ask
-# Bazel about. It is brenn-pod's, built in that repo's arm64 container, so what
-# stands in for it here is a file this test writes at the path a sibling checkout
-# would leave it at -- which is what the subject's default resolves to, because
-# `repo_root` is the temporary tree.
+# Bazel about. It is brenn-pod's, compiled in that repository's arm64 container
+# by that repository's own script, which the subject runs; the stub for that
+# script is below and writes the binary where a sibling checkout leaves it --
+# which is what the subject's default resolves to, because `repo_root` is this
+# temporary tree.
 pod_checkout="${work}/brenn-pod/firmware/target/reachy-pod/payload"
 mkdir -p -- "$pod_checkout"
 pod_default="${pod_checkout}/reachy-pod"
+# The record that script writes beside the binary, and the subject's only witness
+# that the file it is about to stage is the one that build produced.
+pod_sidecar_default="${pod_default}.build"
 
 # An ELF header plausible enough for the subject's machine read and nothing more,
 # the same shape the bazel stub writes for the binaries it stands in for. Written
@@ -459,16 +463,42 @@ export POD_DIR="${repo}/../brenn-pod"
 # ordinary checkout; a case points it at an enclosing directory to stand for a
 # tree that is not a repository root but sits inside one.
 export POD_TOPLEVEL="${work}/brenn-pod"
-# The date of that checkout's HEAD commit, against which the staged binary's
-# mtime is read. Well in the past, so a fixture file written by this suite is
-# newer than it until a case says otherwise.
-export POD_COMMIT_TIME=1000000000
+# A second brenn-pod checkout, for the cases where the voice host's crates and
+# the pod's compiler would come from two working trees. A checkout in its own
+# right -- it answers a toplevel, a revision and a clean status -- so a case
+# pointed at it reaches the comparison between the two trees rather than dying
+# on a directory that is no checkout at all.
+export POD_DIR_ALT="${work}/brenn-pod-wip"
+export POD_ALT_HEAD=7777777777777777777777777777777777777777
+# Whether that checkout holds uncommitted changes, which decides two things: what
+# the subject refuses on a pinned revision, and what the pod build's own record
+# has to say for the subject to believe it built the tree the subject read.
+export POD_DIRTY=""
+# Whether that checkout answers the question at all: a locked index or a
+# permission fault, which is a checkout root that will not say what it holds.
+export POD_STATUS_FAILS=""
+# An untracked file in that checkout, which is not an uncommitted change: the
+# overlay form generates one per crate directory bazel reaches, so a definition
+# of dirty that counted them would refuse every pinned build after an overlay
+# round. The stub answers with it only for the question that asks for untracked
+# files, which is the question the subject must not be asking.
+export POD_UNTRACKED=""
 
 cat >"${stubs}/git" <<'STUB'
 #!/usr/bin/env bash
-# -C <dir> rev-parse HEAD, -C <dir> rev-parse --show-toplevel, and
-# -C <dir> log -1 --format=%ct. Nothing else is asked.
+# -C <dir> rev-parse HEAD, -C <dir> rev-parse --show-toplevel and
+# -C <dir> status --porcelain [--untracked-files=no]. Nothing else is asked, of
+# two directories: the brenn-pod checkout this build is pointed at, and a second
+# one beside it for the cases about a payload that would carry both.
 case "$*" in
+"-C ${POD_DIR} status --porcelain --untracked-files=no")
+	[ -z "${POD_STATUS_FAILS:-}" ] || exit 128
+	[ -z "${POD_DIRTY:-}" ] || printf ' M %s\n' "$POD_DIRTY"
+	;;
+"-C ${POD_DIR} status --porcelain")
+	[ -z "${POD_DIRTY:-}" ] || printf ' M %s\n' "$POD_DIRTY"
+	[ -z "${POD_UNTRACKED:-}" ] || printf '?? %s\n' "$POD_UNTRACKED"
+	;;
 "-C ${POD_DIR} rev-parse HEAD")
 	[ -n "${POD_GIT_HEAD:-}" ] || exit 128
 	echo "$POD_GIT_HEAD"
@@ -477,9 +507,12 @@ case "$*" in
 	[ -n "${POD_TOPLEVEL:-}" ] || exit 128
 	echo "$POD_TOPLEVEL"
 	;;
-"-C ${POD_DIR} log -1 --format=%ct")
-	[ -n "${POD_COMMIT_TIME:-}" ] || exit 128
-	echo "$POD_COMMIT_TIME"
+"-C ${POD_DIR_ALT} status --porcelain --untracked-files=no") ;;
+"-C ${POD_DIR_ALT} rev-parse HEAD")
+	echo "$POD_ALT_HEAD"
+	;;
+"-C ${POD_DIR_ALT} rev-parse --show-toplevel")
+	echo "$POD_DIR_ALT"
 	;;
 "-C ${REPO_DIR} rev-parse HEAD")
 	[ -n "${GIT_HEAD:-}" ] || exit 128
@@ -488,11 +521,84 @@ case "$*" in
 # Any other directory is not a repository this stub knows: git's own answer for
 # a tree with no history, which is what the cases that move a knob are asking
 # the subject to handle.
-*rev-parse*|*log*) exit 128 ;;
+*rev-parse*|*log*|*status*) exit 128 ;;
 *) echo "unstubbed git ${*}" >&2; exit 1 ;;
 esac
 STUB
 chmod 0755 -- "${stubs}/git"
+
+# A fourth stub, and the one that stands in for another repository's build: the
+# script the subject runs to compile the pod, at the path in the brenn-pod
+# checkout the subject spells. Not on PATH -- the subject names it by path,
+# because it is a file in that checkout and not a tool -- and it writes what the
+# real one writes: the binary in the payload output directory, and the record
+# beside it naming the revision, the dirtiness and the digest.
+#
+# The knobs are the ways that build can fail the subject: refusing outright (no
+# podman, no binfmt registration), succeeding and writing no binary, writing no
+# record, and writing a record that disagrees with the checkout the subject read
+# or with the file it is about to stage.
+pod_build_script="${work}/brenn-pod/firmware/tools/build-reachy-pod.sh"
+mkdir -p -- "$(dirname -- "$pod_build_script")"
+export POD_BUILD_STATUS=""
+export POD_BUILD_NO_BINARY=""
+export POD_BUILD_NO_SIDECAR=""
+export POD_BUILD_COMMIT=""
+export POD_BUILD_DIRTY=""
+export POD_BUILD_SHA=""
+export POD_BUILD_MACHINE=183
+
+cat >"$pod_build_script" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'build-reachy-pod\n' >>"$CALLS"
+[ -z "${POD_BUILD_STATUS:-}" ] || {
+	echo "build-reachy-pod: stub refusal" >&2
+	exit "$POD_BUILD_STATUS"
+}
+out=$POD_PAYLOAD_OUT
+rm -f -- "${out}/reachy-pod" "${out}/reachy-pod.build"
+[ -n "${POD_BUILD_NO_BINARY:-}" ] || {
+	printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000\002\000' >"${out}/reachy-pod"
+	# shellcheck disable=SC2059  # the format string is built from the machine number
+	printf "$(printf '\\%03o\\%03o' $((POD_BUILD_MACHINE % 256)) $((POD_BUILD_MACHINE / 256)))" >>"${out}/reachy-pod"
+	printf '\001\000\000\000' >>"${out}/reachy-pod"
+	chmod 0755 -- "${out}/reachy-pod"
+}
+[ -n "${POD_BUILD_NO_SIDECAR:-}" ] || {
+	if [ -n "${POD_BUILD_DIRTY:-}" ]; then
+		dirty=$POD_BUILD_DIRTY
+	elif [ -n "${POD_DIRTY:-}" ]; then
+		dirty=true
+	else
+		dirty=false
+	fi
+	if [ -n "${POD_BUILD_SHA:-}" ]; then
+		sha=$POD_BUILD_SHA
+	elif [ -f "${out}/reachy-pod" ]; then
+		sha=$(sha256sum -- "${out}/reachy-pod" | cut -d' ' -f1)
+	else
+		sha=
+	fi
+	{
+		printf 'commit=%s\n' "${POD_BUILD_COMMIT:-$POD_GIT_HEAD}"
+		printf 'dirty=%s\n' "$dirty"
+		printf 'sha256=%s\n' "$sha"
+	} >"${out}/reachy-pod.build"
+}
+STUB
+chmod 0755 -- "$pod_build_script"
+export POD_PAYLOAD_OUT="$pod_checkout"
+
+# The pin, and the checkout standing at it: every case below that is not about
+# provenance builds the ordinary way, and the ordinary way is the two halves of
+# brenn-pod agreeing. The cases that own this knob move it and put it back.
+module_pin="${repo}/MODULE.bazel"
+stage_module_pin() { printf 'BRENN_POD_REV = "%s"\n' "$1" >"$module_pin"; }
+stage_module_pin "$POD_GIT_HEAD"
+
+# A revision that is not the checkout's, for every case about two of them.
+other_rev=fedcba9876543210fedcba9876543210fedcba98
 
 build() {
 	: >"$CALLS"
@@ -591,10 +697,13 @@ assert_file "the payload names the commit it was built from" \
 assert_eq "and it is the commit the tree was at" "${GIT_HEAD}" \
 	"$(stamped_field commit)"
 
-# This fixture tree has no MODULE.bazel until a later case writes one, so the
-# absent-file answer is the one under test here.
-assert_eq "a tree with no MODULE.bazel names no brenn-pod either" "unknown" \
+# The two brenn-pod halves beside it, whose own cases are further down: here
+# only that a build stamps both, because a field a reader has to guess at is the
+# bug the provenance section exists to stop.
+assert_eq "the surface's half of brenn-pod is stamped" "${POD_GIT_HEAD}" \
 	"$(stamped_field brenn_pod)"
+assert_eq "and the pod's half beside it" "${POD_GIT_HEAD}" \
+	"$(stamped_field reachy_pod)"
 
 # A tree with no history is not a build refusal — provenance is the push's
 # refusal to make — but it is not a guess either.
@@ -735,90 +844,153 @@ assert_contains "the refusal names that binary" "$(output_of "$result")" \
 assert_unstaged "and that one stages nothing either"
 ASK_MACHINE=183
 
-# The prebuilt member's two refusals. It is the one binary in the payload that
-# was compiled somewhere else, so it is the one where "is this even an aarch64
-# executable" is a real question: brenn-pod builds the same crate for the
-# workstation as well, at a path that looks much like this one.
+# The pod binary's refusals. It is the one binary in the payload this tree does
+# not compile, and the one whose source used to be whatever the other repo's last
+# build happened to leave behind; the subject runs that build now, so these cases
+# are about what it does with the build's outcome. The wrong machine first,
+# because it is a real question for this member alone: brenn-pod builds the same
+# crate for the workstation, at a path that looks much like the arm64 one.
 mark_payload
-stage_pod_binary "$pod_default" 62
-result=$(build)
+result=$(POD_BUILD_MACHINE=62 build)
 assert_status "an audio device for the wrong machine refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal names that binary" "$(output_of "$result")" \
 	"reachy-pod is an ELF"
 assert_unstaged "and that one stages nothing either"
-stage_pod_binary "$pod_default" 183
 
-# Absent, which is the ordinary case in a checkout that has never built the other
-# repo. The production launcher config names the pod app unconditionally, so a
-# payload without the binary is a launcher starting an app that is not there.
-mark_payload
-mv -- "$pod_default" "${pod_default}.aside"
+# The build ran at all: the pod is a build product of the payload rather than an
+# artifact somebody refreshed by hand, so a build that stages a binary without
+# running brenn-pod's script is the bug this denies.
 result=$(build)
-assert_status "an audio-device binary that is not there refuses" 1 \
+assert_status "the ordinary build succeeds" 0 "$(status_of "$result")"
+assert_contains "and it ran brenn-pod's build" "$(calls)" "build-reachy-pod"
+assert_contains "saying so, with the revision it built" "$(output_of "$result")" \
+	"building the audio-device binary from"
+assert_file "that build left its record beside the binary" "$pod_sidecar_default"
+# The record is the checkout's, read at build time and not a payload member: a
+# staged copy would travel to the unit saying nothing the build stamp does not.
+assert_no_file "which the payload does not carry" "${payload}/reachy_pod.build"
+
+# No build script to run: a brenn-pod checkout predating it, which is the same
+# population the missing-record case below covers. Refused by name, because
+# invoking a path that is not there leaves an operator reading a shell error
+# from inside a build instead of the remedy.
+mark_payload
+chmod 0 -- "$pod_build_script"
+result=$(build)
+chmod 0755 -- "$pod_build_script"
+assert_status "a checkout with no runnable build script refuses" 1 \
 	"$(status_of "$result")"
-assert_contains "the refusal names the path it looked at" "$(output_of "$result")" \
-	"brenn-pod/firmware/target/reachy-pod/payload/reachy-pod"
-# The remedy names the checkout this run actually resolved, not the sibling
-# default: an operator whose checkouts are not siblings set BRENN_POD_DIR
-# precisely so that a message would stop naming a directory they do not have.
-assert_contains "and says whose build produces it, in the checkout it resolved" \
-	"$(output_of "$result")" \
-	"make -C ${repo}/../brenn-pod/firmware reachy-pod"
-assert_contains "and names the knob that moves the checkout" "$(output_of "$result")" \
-	"BRENN_POD_DIR"
-assert_contains "and the one that names a bare artifact" "$(output_of "$result")" \
-	"REACHY_POD_BINARY"
-# Asked of this build, before the marker is reset for the next one:
-# assert_unstaged measures against the last mark_payload, so an assertion left
-# below a second build interrogates that one twice and this one not at all.
-assert_unstaged "and a payload without it is never staged"
-
-# The same refusal from a checkout somewhere else: the remedy follows the knob.
-mark_payload
-BRENN_POD_DIR="${work}/elsewhere-pod"
-export BRENN_POD_DIR
-result=$(build)
-unset BRENN_POD_DIR
-assert_status "a named checkout with no binary refuses too" 1 "$(status_of "$result")"
-assert_contains "and the build command names that checkout" "$(output_of "$result")" \
-	"make -C ${work}/elsewhere-pod/firmware reachy-pod"
+assert_contains "naming the script it would have run" "$(output_of "$result")" \
+	"firmware/tools/build-reachy-pod.sh"
+assert_contains "and the knob for an artifact built elsewhere" \
+	"$(output_of "$result")" "REACHY_POD_BINARY"
+assert_lacks "and nothing was run" "$(calls)" "build-reachy-pod"
 assert_unstaged "and stages nothing"
-mv -- "${pod_default}.aside" "$pod_default"
 
-# The knob, for a checkout that is not a sibling: what it names is what is
-# staged, and the default is not consulted.
+# A checkout root that will not say whether it is dirty -- a locked index, a
+# permission fault. What a binary built there came from is then unknown, which is
+# the question the check exists to answer.
+mark_payload
+result=$(POD_STATUS_FAILS=1 build)
+assert_status "a checkout that will not answer its dirtiness refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" \
+	"will not say whether it is dirty"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# That build refusing. It compiles in a container, so the machine may have
+# neither podman nor the binfmt registration, and the remedy has to say which
+# tools are missing rather than leaving an operator with a container error.
+mark_payload
+result=$(POD_BUILD_STATUS=3 build)
+assert_status "a brenn-pod build that refuses refuses this build" 1 \
+	"$(status_of "$result")"
+assert_contains "and names what a container build needs" "$(output_of "$result")" \
+	"podman"
+assert_contains "and the escape hatch for an artifact built elsewhere" \
+	"$(output_of "$result")" "REACHY_POD_BINARY"
+assert_unstaged "and stages nothing"
+
+# That build succeeding and writing no binary. Not a case the subject can
+# diagnose, so it says what it looked at and where the two knobs are.
+mark_payload
+result=$(POD_BUILD_NO_BINARY=1 build)
+assert_status "a build that wrote no binary refuses" 1 "$(status_of "$result")"
+assert_contains "and names the path it looked at" "$(output_of "$result")" \
+	"brenn-pod/firmware/target/reachy-pod/payload/reachy-pod"
+assert_contains "and the knob that moves the checkout" "$(output_of "$result")" \
+	"BRENN_POD_DIR"
+assert_unstaged "and stages nothing"
+
+# No record beside the binary: a brenn-pod checkout whose build script predates
+# the record. Its own sentence, because it is a state of a real checkout rather
+# than a disagreement about what was built.
+mark_payload
+result=$(POD_BUILD_NO_SIDECAR=1 build)
+assert_status "a build that wrote no record refuses" 1 "$(status_of "$result")"
+assert_contains "and says the checkout is too old for this build" \
+	"$(output_of "$result")" "left no record at"
+assert_unstaged "and stages nothing"
+
+# The record naming another revision: the tree moved while the container was
+# building, so the binary is not the one the checkout check passed.
+mark_payload
+result=$(POD_BUILD_COMMIT="$other_rev" build)
+assert_status "a record naming another revision refuses" 1 "$(status_of "$result")"
+assert_contains "and names both revisions" "$(output_of "$result")" \
+	"${other_rev}"
+assert_contains "the checkout's among them" "$(output_of "$result")" \
+	"${POD_GIT_HEAD}"
+assert_unstaged "and stages nothing"
+
+# The record claiming a dirty tree over a clean checkout, which is the same
+# accident with nothing committed: a file saved between the check and the build.
+mark_payload
+result=$(POD_BUILD_DIRTY=true build)
+assert_status "a record disagreeing about dirtiness refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and says what each said" "$(output_of "$result")" "dirty=true"
+assert_unstaged "and stages nothing"
+
+# The record's digest against the file: the one witness to a binary replaced by
+# hand after the build wrote it.
+mark_payload
+result=$(POD_BUILD_SHA=$(printf '0%.0s' $(seq 64)) build)
+assert_status "a record whose digest is not the staged file's refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and names the digest it recorded" "$(output_of "$result")" \
+	"$(printf '0%.0s' $(seq 64))"
+assert_unstaged "and stages nothing"
+
+# The knob, for an artifact built somewhere else: what it names is what is
+# staged, no build runs, and none of the checks above run either.
 mark_payload
 elsewhere="${work}/elsewhere/reachy-pod"
 stage_pod_binary "$elsewhere" 183
-mv -- "$pod_default" "${pod_default}.aside"
 REACHY_POD_BINARY="$elsewhere"
 export REACHY_POD_BINARY
 result=$(build)
 assert_status "a build against the knob's artifact succeeds" 0 "$(status_of "$result")"
 assert_file "and the payload carries it" "${payload}/reachy_pod"
+assert_lacks "and no brenn-pod build ran" "$(calls)" "build-reachy-pod"
 unset REACHY_POD_BINARY
-mv -- "${pod_default}.aside" "$pod_default"
 result=$(build)
 assert_status "and the default is back" 0 "$(status_of "$result")"
 
 # ---------------------------------------------------------------------------
-# The two brenn-pod revisions in one payload
+# The two halves of brenn-pod in one payload
 # ---------------------------------------------------------------------------
 #
-# `reachy_pod` comes out of the brenn-pod checkout, and the `reachy_host` beside
-# it links that repository's crates from the revision MODULE.bazel pins. Nothing
-# makes the two agree, and a payload built out of two revisions fails on the
-# unit as a handshake or a protocol mismatch -- a device round-trip to diagnose.
-# So every build says which two revisions it used, and every shape of that line
-# is a case here, including the ones where a revision cannot be read: silence
-# there would read as agreement.
+# `reachy_pod` is compiled from the brenn-pod checkout, and the `reachy_host`
+# beside it links that repository's crates from what MODULE.bazel resolves. A
+# payload built out of two revisions fails on the unit as a handshake or a
+# protocol mismatch -- a device round-trip to diagnose -- so the build refuses,
+# and every shape of that refusal is a case here.
 #
-# The checkout's answer is the `git` stub's `POD_GIT_HEAD`, which is what the
-# subject's `git -C <brenn-pod checkout> rev-parse HEAD` resolves to here --
-# deliberately a different revision from `GIT_HEAD`, this tree's, so a line that
-# named the wrong tree's answer could not pass.
-module_pin="${repo}/MODULE.bazel"
-stage_module_pin() { printf 'BRENN_POD_REV = "%s"\n' "$1" >"$module_pin"; }
+# The checkout's answer is the `git` stub's `POD_GIT_HEAD`, deliberately a
+# different revision from `GIT_HEAD`, this tree's, so a check that asked the
+# wrong tree could not pass.
 
 # The overlay the pin's own comment block describes: a spec resolved from a
 # working tree beside the checkout. The pin line stays -- that is the whole
@@ -841,15 +1013,13 @@ crate.spec(
 OVERLAY
 }
 
-other_rev=fedcba9876543210fedcba9876543210fedcba98
-
 # Somebody else's crate resolved from a working tree, with the brenn-pod specs
 # still on the pin. Most of the twenty specs in the real file are of this kind,
 # and a reader that took the first `path =` it saw would stamp a tree the voice
 # host was not built from while hiding the revision that built it.
 stage_module_overlay_foreign() {
 	cat >"$module_pin" <<OVERLAY
-BRENN_POD_REV = "${other_rev}"
+BRENN_POD_REV = "${1}"
 
 crate.spec(
     package = "nalgebra",
@@ -864,135 +1034,252 @@ crate.spec(
 OVERLAY
 }
 
-# No MODULE.bazel at all: this fixture tree has none until the next case writes
-# one.
-result=$(build)
-assert_contains "a tree with no MODULE.bazel says the linked surface is unknown" \
-	"$(output_of "$result")" "there is no MODULE.bazel"
-
-# The file there and the pin unreadable -- a branch name, a short id, a reflowed
-# assignment. A different cause from the one above and a different sentence, so
-# a reader is not sent looking for a missing file.
-stage_module_pin main
-result=$(build)
-assert_contains "a pin this cannot read is named as unreadable" \
-	"$(output_of "$result")" "states no BRENN_POD_REV this can read"
-assert_lacks "and is not reported as a missing file" \
-	"$(output_of "$result")" "there is no MODULE.bazel"
-assert_eq "and the stamp cannot name a brenn-pod either" "unknown" \
-	"$(stamped_field brenn_pod)"
-
-# The overlay: the payload's speech crates came out of a working tree, so no
-# published revision names those binaries and the pin that is still in the file
-# would name one that does not.
-stage_module_overlay
-result=$(build)
-assert_status "a build over an overlaid spec succeeds" 0 "$(status_of "$result")"
-assert_eq "and the stamp names the tree the crates came from" \
-	"overlay:../brenn-pod/host/crates/speech-surface" "$(stamped_field brenn_pod)"
-
-# The same file shape with the working tree belonging to some other crate: the
-# voice host still came from the pinned revision, and that is what the stamp has
-# to say.
-stage_module_overlay_foreign
-result=$(build)
-assert_status "a build over another crate's overlay succeeds" 0 \
-	"$(status_of "$result")"
-assert_eq "and the stamp names the pin, not that crate's tree" "$other_rev" \
-	"$(stamped_field brenn_pod)"
-
-# A spec written compactly rather than one attribute per line. The overlay is
-# the state where the stamp is the only record, so a wrong answer here reads
-# as authoritative; the reader refuses rather than silently missing the spec.
-stage_module_overlay_compact() {
+# The overlay half done: one brenn-pod spec on a working tree and another still
+# on the pin. The four are hand-edited, so this is the shape a half-finished edit
+# has, and the voice host it links is two revisions of brenn-pod before the pod
+# is even built.
+stage_module_overlay_mixed() {
 	cat >"$module_pin" <<OVERLAY
-BRENN_POD_REV = "${other_rev}"
+BRENN_POD_REV = "${1}"
 
-crate.spec(package = "speech-surface", path = "../brenn-pod/host/crates/speech-surface")
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+
+crate.spec(
+    git = BRENN_POD_GIT,
+    package = "speech-pipeline",
+    rev = BRENN_POD_REV,
+)
 OVERLAY
 }
 
-stage_module_overlay_compact
-result=$(build)
-assert_status "a build over a compact spec succeeds" 0 "$(status_of "$result")"
-assert_eq "and the stamp refuses rather than naming the pin that did not build it" \
-	"unknown" "$(stamped_field brenn_pod)"
+# Both brenn-pod specs on a working tree, and not the same one. All four are
+# hand-edited, so this is the other half-finished edit: the voice host links two
+# working trees of brenn-pod, which is the mixed form's bug with an overlay on
+# each side of it instead of a pin.
+stage_module_overlay_two_trees() {
+	cat >"$module_pin" <<'OVERLAY'
+BRENN_POD_REV = "0000000000000000000000000000000000000000"
 
-# A pin, and a checkout that answers no revision -- an unpacked archive, or a
-# tree somebody copied out of one.
-stage_module_pin "$other_rev"
-result=$(POD_GIT_HEAD="" build)
-assert_contains "a checkout with no revision is named as unknown too" \
-	"$(output_of "$result")" "answers no revision"
-assert_contains "and the line still names the pin" "$(output_of "$result")" \
-	"${other_rev:0:12}"
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
 
-# The same, for the shape `rev-parse HEAD` answers anyway: a directory that is
-# not a checkout root but sits inside some other repository, whose HEAD would be
-# offered as brenn-pod's.
-result=$(POD_TOPLEVEL="$work" build)
-assert_contains "a directory inside another repository answers no revision" \
-	"$(output_of "$result")" "answers no revision"
-assert_lacks "rather than that repository's HEAD" \
-	"$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+crate.spec(
+    path = "../brenn-pod-wip/host/crates/speech-pipeline",
+    package = "speech-pipeline",
+)
+OVERLAY
+}
 
-# The pin and the checkout agreeing, with the staged binary newer than the
-# checkout's HEAD commit. Not silent even here: HEAD is where the checkout
-# stands now and the binary is what its last build left behind, so the line says
-# what was compared.
-stage_module_pin "$POD_GIT_HEAD"
+# The pin and the checkout agreeing, which is the ordinary state: the line says
+# which agreement it is, the stamp carries both halves, and the two questions
+# demonstrably went to two directories.
 result=$(build)
 assert_status "a build whose two halves agree succeeds" 0 "$(status_of "$result")"
 assert_contains "and says the checkout is at the pinned revision" \
 	"$(output_of "$result")" \
-	"pinned at ${POD_GIT_HEAD:0:12} and the checkout is at that revision"
-assert_contains "and where the staged binary sits against that commit" \
-	"$(output_of "$result")" "built after that commit"
+	"links brenn-pod at ${POD_GIT_HEAD:0:12} and the audio-device binary is built from"
 assert_lacks "the answer is brenn-pod's tree's, not this one's" \
 	"$(output_of "$result")" "${GIT_HEAD:0:12}"
-# The same build's stamp names this tree, so the two questions demonstrably went
-# to two directories.
 assert_eq "while the build stamp names this tree" "${GIT_HEAD}" \
 	"$(stamped_field commit)"
-assert_eq "and the pin beside it, which is the other half of the payload" \
+assert_eq "and the pin beside it, which is the surface's half" \
 	"$POD_GIT_HEAD" "$(stamped_field brenn_pod)"
+assert_eq "and the pod's own half, which is the binary's revision" \
+	"$POD_GIT_HEAD" "$(stamped_field reachy_pod)"
 
-# The pin and the checkout agreeing and the binary older than that commit: the
-# case the agreement hides, because a pull or a pin bump moves HEAD and leaves
-# the binary alone.
-result=$(POD_COMMIT_TIME=4000000000 build)
-assert_contains "a binary older than the checkout's HEAD commit is said to be" \
-	"$(output_of "$result")" "older than that commit, so it was built at an earlier one"
-assert_lacks "and the agreement is not left to speak for the binary" \
-	"$(output_of "$result")" "built after that commit"
-
-# A checkout whose HEAD commit has no date to read: nothing to compare, said
-# rather than assumed either way.
-result=$(POD_COMMIT_TIME="" build)
-assert_contains "an undatable commit leaves the binary's age uncompared" \
-	"$(output_of "$result")" "cannot be compared against it"
-
-# The two disagreeing: a note and never a refusal, because a development
-# checkout legitimately sits ahead of the pin.
+# The two disagreeing: the state this repo shipped for weeks, and now a refusal
+# before any container build runs. Both revisions and both remedies, because
+# which one is right is the operator's call: check the pin out, or overlay the
+# working tree so the host links it too.
+mark_payload
 stage_module_pin "$other_rev"
 result=$(build)
-assert_status "a build out of two revisions still succeeds" 0 "$(status_of "$result")"
-assert_contains "and says they are two" "$(output_of "$result")" \
-	"two revisions of brenn-pod in one payload"
-assert_contains "naming the pinned one" "$(output_of "$result")" "${other_rev:0:12}"
-assert_contains "and the checkout's" "$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+assert_status "a build out of two revisions refuses" 1 "$(status_of "$result")"
+assert_contains "naming the revision the host links" "$(output_of "$result")" \
+	"${other_rev:0:12}"
+assert_contains "and the one the checkout stands at" "$(output_of "$result")" \
+	"${POD_GIT_HEAD:0:12}"
+assert_contains "and the checkout command that reconciles them" \
+	"$(output_of "$result")" "git -C ${repo}/../brenn-pod checkout ${other_rev}"
+assert_contains "and the overlay that reconciles them the other way" \
+	"$(output_of "$result")" "overlay"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
 
-# A bare artifact copied out of a build somewhere else: the checkout's revision
-# says nothing about the file being staged, so the line does not offer it. The
-# pin here is `other_rev`, so the checkout's revision appearing at all is the
+# Dirty at the pin: the pod would be compiled from something no revision names
+# while the host links the pin, which is the same two-halves bug with nothing
+# committed.
+mark_payload
+stage_module_pin "$POD_GIT_HEAD"
+result=$(POD_DIRTY="firmware/src/run.rs" build)
+assert_status "a dirty checkout at the pin refuses" 1 "$(status_of "$result")"
+assert_contains "and says the tree has uncommitted changes" \
+	"$(output_of "$result")" "uncommitted changes"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# Overlay, dirty: allowed, because an overlaid tree is a working tree and the
+# host links that same tree, uncommitted edits included. The stamp says so.
+stage_module_overlay
+result=$(POD_DIRTY="firmware/src/run.rs" build)
+assert_status "a dirty overlaid checkout builds" 0 "$(status_of "$result")"
+assert_contains "and the line names the tree and its revision" \
+	"$(output_of "$result")" \
+	"links the working tree at ../brenn-pod/host/crates/speech-surface"
+assert_contains "saying it is dirty" "$(output_of "$result")" \
+	"${POD_GIT_HEAD:0:12}+dirty"
+assert_eq "and the stamp names the surface's tree" \
+	"overlay:../brenn-pod/host/crates/speech-surface" "$(stamped_field brenn_pod)"
+assert_eq "and the pod's revision with its dirtiness" \
+	"${POD_GIT_HEAD}+dirty" "$(stamped_field reachy_pod)"
+
+# Untracked files in the checkout at the pin: not an uncommitted change, and the
+# overlay form generates one per crate directory bazel reaches, so a build the
+# round after an overlay would otherwise refuse over litter with a remedy --
+# commit or stash -- that does not clear it.
+stage_module_pin "$POD_GIT_HEAD"
+result=$(POD_UNTRACKED="host/crates/speech-surface/BUILD.bazel" build)
+assert_status "untracked files in the checkout at the pin build" 0 \
+	"$(status_of "$result")"
+assert_eq "and the stamp calls that tree clean" "$POD_GIT_HEAD" \
+	"$(stamped_field reachy_pod)"
+
+# The overlay half done: the voice host itself would link two revisions, which is
+# the two-halves bug arriving through MODULE.bazel rather than through the
+# checkout. Refused ahead of both checks, naming the specs on each side.
+mark_payload
+stage_module_overlay_mixed "$POD_GIT_HEAD"
+result=$(build)
+assert_status "a half-overlaid MODULE.bazel refuses" 1 "$(status_of "$result")"
+assert_contains "naming the spec on the working tree" "$(output_of "$result")" \
+	"speech-surface"
+assert_contains "and the spec still on the pin" "$(output_of "$result")" \
+	"speech-pipeline"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# An overlay of some other crate's working tree, with brenn-pod's specs still on
+# the pin: the voice host came from the pinned revision, so the pinned check is
+# the one that applies.
+stage_module_overlay_foreign "$POD_GIT_HEAD"
+result=$(build)
+assert_status "a build over another crate's overlay succeeds" 0 \
+	"$(status_of "$result")"
+assert_eq "and the stamp names the pin, not that crate's tree" "$POD_GIT_HEAD" \
+	"$(stamped_field brenn_pod)"
+
+# An overlay resolving into a tree that is not the checkout this build compiles
+# from: two working trees of brenn-pod, which is the same bug again. Pointed at
+# the second checkout the stub knows, so the comparison between the two trees is
+# what refuses rather than a directory that is no checkout at all -- which is
+# the refusal the message has to be read to tell apart.
+mark_payload
+stage_module_overlay
+result=$(BRENN_POD_DIR="$POD_DIR_ALT" build)
+assert_status "an overlay of another tree refuses" 1 "$(status_of "$result")"
+assert_contains "saying two trees of brenn-pod is the state it stops" \
+	"$(output_of "$result")" "Two trees of brenn-pod in one payload"
+assert_contains "and naming the tree the host links" "$(output_of "$result")" \
+	"../brenn-pod/host/crates/speech-surface"
+assert_contains "and the checkout the pod would be built from" \
+	"$(output_of "$result")" "$POD_DIR_ALT"
+assert_lacks "and it is not the no-checkout refusal" "$(output_of "$result")" \
+	"is not a brenn-pod checkout"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# Every overlaid spec held to that one tree, and not the first alone: two
+# overlays into two trees pass any check that reads one path and is the same
+# two-revisions payload.
+mark_payload
+stage_module_overlay_two_trees
+result=$(build)
+assert_status "an overlay into two trees refuses" 1 "$(status_of "$result")"
+assert_contains "naming the spec that resolves elsewhere" "$(output_of "$result")" \
+	"../brenn-pod-wip/host/crates/speech-pipeline"
+assert_lacks "and no container build ran" "$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# A checkout that answers no revision -- an unpacked archive, or a tree somebody
+# copied out of one. An artifact, and the knob for an artifact is named.
+mark_payload
+stage_module_pin "$POD_GIT_HEAD"
+result=$(POD_GIT_HEAD="" build)
+assert_status "a checkout with no revision refuses" 1 "$(status_of "$result")"
+assert_contains "and says the checkout answers none" "$(output_of "$result")" \
+	"answers no revision"
+assert_contains "and names the knob for an artifact" "$(output_of "$result")" \
+	"REACHY_POD_BINARY"
+assert_unstaged "and stages nothing"
+
+# The same, for the shape `rev-parse HEAD` answers anyway: a directory that is
+# not a checkout root but sits inside some other repository, whose HEAD would
+# otherwise be offered as brenn-pod's.
+mark_payload
+result=$(POD_TOPLEVEL="$work" build)
+assert_status "a directory inside another repository refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "saying it is not a brenn-pod checkout" "$(output_of "$result")" \
+	"is not a brenn-pod checkout"
+assert_lacks "rather than being read as that repository's checkout" \
+	"$(calls)" "build-reachy-pod"
+assert_unstaged "and stages nothing"
+
+# A pin this cannot read -- a branch name, a short id, a reflowed assignment --
+# and a tree with no MODULE.bazel at all. There is nothing to check the pod
+# against, so neither is a build.
+mark_payload
+stage_module_pin main
+result=$(build)
+assert_status "a pin this cannot read refuses" 1 "$(status_of "$result")"
+assert_contains "and says which brenn-pod could not be named" \
+	"$(output_of "$result")" "cannot say which brenn-pod"
+assert_unstaged "and stages nothing"
+
+mark_payload
+mv -- "$module_pin" "${module_pin}.aside"
+result=$(build)
+assert_status "a tree with no MODULE.bazel refuses" 1 "$(status_of "$result")"
+assert_contains "and names the file it read" "$(output_of "$result")" "MODULE.bazel"
+assert_unstaged "and stages nothing"
+mv -- "${module_pin}.aside" "$module_pin"
+
+# A spec written compactly rather than one attribute per line: the reader refuses
+# it rather than missing the spec, so there is no revision to check against
+# either.
+mark_payload
+cat >"$module_pin" <<OVERLAY
+BRENN_POD_REV = "${POD_GIT_HEAD}"
+
+crate.spec(package = "speech-surface", path = "../brenn-pod/host/crates/speech-surface")
+OVERLAY
+result=$(build)
+assert_status "a compact spec refuses" 1 "$(status_of "$result")"
+assert_contains "rather than naming the pin that did not build it" \
+	"$(output_of "$result")" "cannot say which brenn-pod"
+assert_unstaged "and stages nothing"
+
+# A bare artifact copied out of a build somewhere else: no revision to compare,
+# so none of the above runs and the stamp says the artifact was named. The pin
+# here is another revision, so the checkout's revision appearing at all is the
 # bug this denies.
+stage_module_pin "$other_rev"
 REACHY_POD_BINARY="$elsewhere"
 export REACHY_POD_BINARY
 result=$(build)
-assert_contains "an artifact named by the knob has no revision to compare" \
+assert_status "a build against a named artifact succeeds whatever the pin says" 0 \
+	"$(status_of "$result")"
+assert_contains "and the line says its revision cannot be asked" \
 	"$(output_of "$result")" "REACHY_POD_BINARY names"
 assert_lacks "so the checkout's revision is not offered as one" \
 	"$(output_of "$result")" "${POD_GIT_HEAD:0:12}"
+assert_eq "and the stamp records that it was named" "named" \
+	"$(stamped_field reachy_pod)"
 unset REACHY_POD_BINARY
 
 stage_module_pin "$POD_GIT_HEAD"

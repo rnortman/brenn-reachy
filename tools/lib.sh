@@ -383,8 +383,8 @@ refuse_if_stale() {
 # cannot answer the two scripts differently.
 
 # The brenn-pod checkout this repo reads two things out of: the audio device's
-# prebuilt binary, staged into the payload, and the provisioning make target
-# that writes the pod's half of the voice link onto the unit.
+# binary, which the payload build compiles there and stages, and the provisioning
+# make target that writes the pod's half of the voice link onto the unit.
 #
 # One physical fact — where that repo is — gets one knob, so a workstation whose
 # checkouts are not siblings says so once. `REACHY_POD_BINARY` still wins for the
@@ -400,33 +400,44 @@ case $brenn_pod_dir in
 *) brenn_pod_dir=${repo_root}/${brenn_pod_dir} ;;
 esac
 
-# The audio device's binary, which this repo does not build.
+# The audio device's binary, which this repo does not compile.
 #
 # `reachy-pod` links libusb-1.0 and libasound2 and is compiled natively in
 # brenn-pod's pinned arm64 container, against the same dated Debian archive the
 # device image is bootstrapped from. Nothing in this tree's hermetic sysroot can
-# produce it, and vendoring the sources would be a second copy of a binary
-# brenn-pod already ships — so the payload takes the artifact that build leaves
-# behind.
+# produce it, so the payload takes what that container leaves behind — but the
+# build in this tree runs it. The payload output of a sibling checkout is that
+# container's path, which is why the default is spelled as one.
 #
-# The default is where a sibling checkout puts it, because that is how the two
-# repos are worked on and an inner loop that needs a knob set on every invocation
-# is a knob people set wrong. It is a default and not an assumption: a path that
-# is not there is a refused build naming both the knob and the command in the
-# other repo that produces the file, so a different layout says so once rather
-# than staging something unexpected.
+# `REACHY_POD_BINARY` names a file rather than a checkout, and that is the escape
+# hatch for an artifact copied out of a build elsewhere: named, the build stages
+# it and checks nothing about where it came from.
 pod_binary=${REACHY_POD_BINARY:-${brenn_pod_dir}/firmware/target/reachy-pod/payload/reachy-pod}
 # Whether an operator named the artifact rather than the checkout, which decides
 # whether the checkout's revision says anything about the file being staged.
 pod_binary_named=${REACHY_POD_BINARY:+named}
+# The build script in the other repo, and the record it writes beside the binary
+# it produced: `commit=`, `dirty=` and `sha256=` of that binary. Spelled here
+# because two things read the pair — the build that runs the script and the
+# provenance line that reports what the check concluded.
+pod_build_script=${brenn_pod_dir}/firmware/tools/build-reachy-pod.sh
+pod_sidecar=${brenn_pod_dir}/firmware/target/reachy-pod/payload/reachy-pod.build
+
+# What the pod half of the payload turned out to be, filled in by
+# `refuse_unless_pod_checkout_matches` below and read by the build's stamp and
+# its provenance line. Empty until the check has run, which is the state the
+# named-artifact case stays in.
+pod_commit=
+pod_dirty=
+pod_source_line=
 
 # The brenn-pod revision this tree links its surface crates from.
 #
 #   pinned_pod_rev <MODULE.bazel path>
 #
 # One reader, because two of them drift: the build's provenance line below and
-# `tools/module-pins.test.sh` both ask this question of the same line, and the
-# self-check holds this answer equal to its own independent parse of the file.
+# `tools/module-pins.sh` both ask this question of the same line, and the pin
+# check holds this answer equal to its own independent parse of the file.
 # An empty answer means the file states no `BRENN_POD_REV` in a form this reads
 # -- a branch name, a short id, a reflowed assignment -- which every caller has
 # to say out loud rather than treat as an absent pin.
@@ -438,13 +449,13 @@ pinned_pod_rev() {
 # The packages this tree takes from brenn-pod, space-padded for a substring
 # test. Named here rather than derived from the file, so a spec that quietly
 # loses its remote is a missing spec rather than a package this stops looking
-# for. `tools/module-pins.test.sh` keeps its own copy of the list and holds the
-# two equal, so a package added on one side alone is a failed case.
+# for. `tools/module-pins.sh` keeps its own copy of the list and holds the two
+# equal, so a package added on one side alone is a failed case.
 pod_crate_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
 
-# The working tree a `crate.spec` resolves from, when one does.
+# The working trees the `crate.spec`s resolve from, when they do.
 #
-#   pod_overlay_path <MODULE.bazel path>
+#   pod_overlay_paths <MODULE.bazel path>
 #
 # The overlay form the developing-a-seam block above `BRENN_POD_REV` describes:
 # a spec's `git`/`rev` pair replaced by `path = "../brenn-pod/<crate path>"`.
@@ -452,14 +463,27 @@ pod_crate_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
 # revision the binaries did not come from; this is the question that tells the
 # two apart, and it is asked first.
 #
-# The first uncommented `path =` inside a `crate.spec(` … `)` block whose
-# `package` is one of brenn-pod's, and empty when there is none. A line reader
-# over the literals a person typed, like the self-check's: commented text is not
-# a spec attribute, and a `path =` outside a spec belongs to some other
+# Every uncommented `path =` inside a `crate.spec(` … `)` block whose `package`
+# is one of brenn-pod's, comma-separated in the file's own order, and empty when
+# none of them names one. All of them and not the first alone, because one
+# containment check over one path would pass a file whose four specs name two
+# different working trees — the same two-revisions payload the mixed form
+# reaches, spelled entirely in overlays. A line
+# reader over the literals a person typed, like the self-check's: commented text
+# is not a spec attribute, and a `path =` outside a spec belongs to some other
 # dependency's override. The package decides, because most of the twenty specs
 # in the file are somebody else's crate: an overlaid `nalgebra` says nothing
 # about which brenn-pod the voice host was built from, and a field that named it
 # would hide the pin that did build it.
+#
+# Every brenn-pod spec is read, and not only up to the first overlaid one,
+# because the file has to say one thing: the overlay form is all four specs at
+# once, and a file where some are overlaid and the rest are on the pin links two
+# revisions of brenn-pod into one voice host -- the state the refusals below
+# exist to make unreachable, arriving through the file rather than through the
+# checkout. Status 3 is that refusal, and the printed answer is the two sides of
+# it, `<overlaid packages>|<pinned packages>`, comma-separated, for the message
+# that reports it.
 #
 # The whole block is read to its closing paren before it answers, so the
 # attribute order inside a spec cannot hide either key.
@@ -469,16 +493,20 @@ pod_crate_packages=" speech-surface speech-pipeline brenn-bridge pod-ingest "
 # read past: a compact `crate.spec(package = "…", path = "…")` would otherwise
 # be invisible here and the payload would be stamped with the pin that did not
 # build it, which reads as authoritative where `unknown` reads as "cannot tell".
-# A nonzero status is that refusal; the printed answer stays empty.
-pod_overlay_path() {
+# Status 2 is that refusal; the printed answer stays empty.
+pod_overlay_paths() {
 	awk -v packages="$pod_crate_packages" -- '
 		/^[ \t]*#/ { next }
-		/crate\.spec\(/ && !/^crate\.spec\($/ { exit 2 }
+		/crate\.spec\(/ && !/^crate\.spec\($/ { compact = 1; exit 2 }
 		/^crate\.spec\($/ { inspec = 1; pkg = ""; path = ""; next }
 		inspec && /^\)/ {
-			if (path != "" && index(packages, " " pkg " ")) {
-				print path
-				exit
+			if (index(packages, " " pkg " ")) {
+				if (path != "") {
+					overlaid = overlaid (overlaid == "" ? "" : ",") pkg
+					paths = paths (paths == "" ? "" : ",") path
+				} else {
+					pinned = pinned (pinned == "" ? "" : ",") pkg
+				}
 			}
 			inspec = 0
 			next
@@ -493,6 +521,14 @@ pod_overlay_path() {
 			sub(/^[^"]*"/, "", pkg)
 			sub(/".*/, "", pkg)
 		}
+		END {
+			if (compact) exit 2
+			if (overlaid != "" && pinned != "") {
+				print overlaid "|" pinned
+				exit 3
+			}
+			if (paths != "") print paths
+		}
 	' "$1" 2>/dev/null
 }
 
@@ -500,106 +536,291 @@ pod_overlay_path() {
 #
 #   pod_build_source <MODULE.bazel path>
 #
-# `overlay:<path>` when a spec resolves from a working tree, the pinned revision
-# when they resolve from the remote, and `unknown` when the file is absent, when
-# it states a pin in a form `pinned_pod_rev` cannot read, or when it writes a
-# `crate.spec` in a form `pod_overlay_path` refuses. The overlay is checked
+# `overlay:<path>` when every brenn-pod spec resolves from a working tree — the
+# first spec's path, which is the surface's and which names the tree for a
+# reader; `refuse_unless_pod_checkout_matches` is what holds the other three to
+# the same tree — the
+# pinned revision when they all resolve from the remote, and `unknown` when the
+# file is absent, when it states a pin in a form `pinned_pod_rev` cannot read,
+# when it writes a `crate.spec` in a form `pod_overlay_paths` refuses, or when its
+# brenn-pod specs disagree about which of the two they are. The overlay is checked
 # first because an overlaid tree still carries the pin line, and its refusal is
 # taken as the whole answer: a file whose specs cannot be read cannot be said to
 # resolve from the remote either.
 #
-# This is a record and not a warning: `pod_provenance` above already says at
-# build time whether the checkout beside this tree stands at the pin. What that
-# line cannot do is survive into a run's records, where an operator reading a
-# fetched run months later has nothing else to tell a pre-fix payload from a
-# post-fix one.
+# Two readers, for two questions. `refuse_unless_pod_checkout_matches` below
+# takes this as the revision the pod has to be built from, and the build stamp
+# records it as the `brenn_pod=` field, where it survives into a run's records:
+# an operator reading a fetched run months later has nothing else to tell a
+# pre-fix payload from a post-fix one.
 pod_build_source() {
 	local module=$1 overlay pinned
 	[ -f "$module" ] || {
 		echo unknown
 		return
 	}
-	overlay=$(pod_overlay_path "$module") || {
+	overlay=$(pod_overlay_paths "$module") || {
 		echo unknown
 		return
 	}
 	if [ -n "$overlay" ]; then
-		echo "overlay:${overlay}"
+		echo "overlay:${overlay%%,*}"
 		return
 	fi
 	pinned=$(pinned_pod_rev "$module")
 	echo "${pinned:-unknown}"
 }
 
-# What a payload's two halves of brenn-pod are, said in one line.
+# Refuse a payload whose two halves of brenn-pod would disagree.
 #
-#   pod_provenance
+#   refuse_unless_pod_checkout_matches <MODULE.bazel path>
 #
 # Two independent sources of brenn-pod feed one speech run. `reachy_host` links
-# speech-surface, speech-pipeline and brenn-bridge from the revision
-# `MODULE.bazel` pins, and `reachy_pod` is staged from whatever the working tree
-# at `brenn_pod_dir` last built. Nothing makes the two agree, and a payload that
-# pairs a pinned surface with a pod binary from another revision fails on the
-# unit as a handshake or a protocol mismatch — a long way from this build, and
-# costing a device round-trip to diagnose.
+# speech-surface, speech-pipeline and brenn-bridge from what `MODULE.bazel`
+# resolves — a pinned revision, or a working tree under the overlay form the
+# pin's comment block describes — and `reachy_pod` is compiled from the checkout
+# at `brenn_pod_dir`. A payload that pairs a pinned surface with a pod built from
+# another revision fails on the unit as a handshake or a protocol mismatch, a
+# long way from this build and a device round-trip to diagnose. That is a state a
+# payload should not be able to reach silently, so this is a refusal. A directory
+# that is not a git checkout at all is an artifact, and `REACHY_POD_BINARY` is
+# how an artifact is named.
 #
-# What can be measured here is narrow, and the line says only that. `HEAD` is
-# where the checkout stands *now*; the staged file is whatever the last build in
-# that tree left behind, and a pull or a pin bump moves the one without touching
-# the other. So the line never calls a revision the binary's: it names the
-# checkout's, and beside it the one comparison that bears on the file — the
-# binary's mtime against the HEAD commit's date, the same arithmetic
-# `refuse_if_stale` uses. A binary older than that commit was built at some
-# earlier revision, whatever the checkout says today.
+# Pinned: the checkout must stand at the pin with a clean tree, because anything
+# else names two revisions. Overlay: the checkout must be the tree the overlay
+# resolves into, and a dirty tree is allowed — an overlaid tree is a working tree
+# and the host links that same working tree, uncommitted edits included. Every
+# overlaid spec is held to that one tree and not the first alone: four specs
+# naming two working trees put two revisions inside the host itself, which is
+# the mixed form's bug with an overlay on both sides of it.
+#
+# Mixed: a `MODULE.bazel` whose brenn-pod specs are half overlaid and half on the
+# pin links two revisions into the host itself, before the pod is even built, so
+# it is refused ahead of both — and named, because the four specs are hand-edited
+# and a half-finished edit is what this shape is.
+#
+# Dirty is tracked edits only (`--untracked-files=no`). An untracked file is not
+# a revision the pod could have been built from, and the overlay form this repo
+# documents *generates* untracked files in that checkout — a `path =` spec makes
+# bazel write a `BUILD.bazel` into every crate directory it reaches — so counting
+# them would refuse every pinned build after an overlay round over litter the
+# message could not explain. brenn-pod's `build-reachy-pod.sh` has to write its
+# `dirty=` by the same definition, and `refuse_unless_pod_sidecar_agrees` below
+# is what holds the two equal: they part, and every build refuses.
 #
 # `rev-parse HEAD` also answers from an enclosing repository when the directory
 # is not a checkout root — an unpacked archive under a tracked `$HOME` would
 # otherwise be reported at the revision of whatever tracks it — so the toplevel
-# is checked first and anything else is "answers no revision".
+# is checked first and anything else is not a checkout.
 #
-# A note and never a refusal: a development checkout legitimately sits ahead of
-# the pin, and the checkout may not be a git checkout at all. Every shape it
-# cannot read says what it could not read rather than staying silent, because
-# silence here reads as agreement.
-pod_provenance() {
-	local module pinned tree top committed built age
-	module=${repo_root}/MODULE.bazel
-	if [ ! -f "$module" ]; then
-		echo "there is no MODULE.bazel at ${repo_root}, so the linked surface's revision is unknown"
-		return
+# Sets `pod_commit`, `pod_dirty` and `pod_source_line` for the stamp and the
+# provenance report; prints nothing.
+refuse_unless_pod_checkout_matches() {
+	local module=$1 source overlay top head status overlay_abs pod_abs forms mix
+	source=$(pod_build_source "$module")
+	if [ "$source" = unknown ]; then
+		mix=0
+		forms=$(pod_overlay_paths "$module") || mix=$?
+		if [ "$mix" = 3 ]; then
+			die "${module} overlays some of its brenn-pod crates and pins the rest, so the voice host itself would link two revisions of brenn-pod." \
+				"Overlaid from the working tree: ${forms%%|*}." \
+				"Resolved from the pinned revision: ${forms#*|}." \
+				"The overlay is all of them at once or none of them: put the rest on" \
+				"path = \"../brenn-pod/<crate path>\", or put these back on git = BRENN_POD_GIT," \
+				"rev = BRENN_POD_REV. The comment block above BRENN_POD_REV has both forms."
+		fi
+		die "this tree cannot say which brenn-pod its voice host links." \
+			"${module} is absent, states no BRENN_POD_REV in a readable form, or writes a" \
+			"crate.spec in a form tools/lib.sh refuses to read. The pod is built from" \
+			"${brenn_pod_dir} and has to be built from the revision the surface links, so" \
+			"there is nothing to check it against." \
+			"Fix the pin, or name a prebuilt artifact with REACHY_POD_BINARY."
 	fi
-	pinned=$(pinned_pod_rev "$module")
-	if [ -z "$pinned" ]; then
-		echo "MODULE.bazel is here but states no BRENN_POD_REV this can read, so the linked surface's revision is unknown"
-		return
-	fi
-	if [ -n "$pod_binary_named" ]; then
-		echo "the linked surface is pinned at ${pinned:0:12}; the audio-device binary is the artifact REACHY_POD_BINARY names, whose revision this cannot ask"
-		return
-	fi
-	tree=
 	top=$(git -C "$brenn_pod_dir" rev-parse --show-toplevel 2>/dev/null) || top=
-	if [ -n "$top" ] &&
-		[ "$(cd -P -- "$top" 2>/dev/null && pwd)" = "$(cd -P -- "$brenn_pod_dir" 2>/dev/null && pwd)" ]; then
-		tree=$(git -C "$brenn_pod_dir" rev-parse HEAD 2>/dev/null) || tree=
+	if [ -z "$top" ] ||
+		[ "$(cd -P -- "$top" 2>/dev/null && pwd)" != "$(cd -P -- "$brenn_pod_dir" 2>/dev/null && pwd)" ]; then
+		die "${brenn_pod_dir} is not a brenn-pod checkout, so the audio-device binary cannot be built or attributed." \
+			"The payload's pod is compiled from that checkout and has to match the revision" \
+			"the voice host links (${source})." \
+			"BRENN_POD_DIR names the checkout, and REACHY_POD_BINARY names a bare artifact" \
+			"copied out of a build elsewhere, which skips this check."
 	fi
-	if [ -z "$tree" ]; then
-		echo "the linked surface is pinned at ${pinned:0:12}; ${brenn_pod_dir} answers no revision, so where the audio-device binary came from is unknown"
+	head=$(git -C "$brenn_pod_dir" rev-parse HEAD 2>/dev/null) ||
+		die "${brenn_pod_dir} answers no revision, so an audio-device binary built there could not be attributed to one." \
+			"A checkout with no history is an artifact, and REACHY_POD_BINARY is how an" \
+			"artifact is named; BRENN_POD_DIR names a checkout with history."
+	status=$(git -C "$brenn_pod_dir" status --porcelain --untracked-files=no 2>/dev/null) ||
+		die "${brenn_pod_dir} will not say whether it is dirty, so what an audio-device binary built there came from is unknown." \
+			"REACHY_POD_BINARY names a prebuilt artifact and skips this check."
+	case $source in
+	overlay:*)
+		overlay=${source#overlay:}
+		pod_abs=$(realpath -m -- "$brenn_pod_dir" 2>/dev/null) || pod_abs=$brenn_pod_dir
+		local spec_path
+		# Each of them, so a file whose specs name two working trees is refused
+		# by the second one rather than passed by the first.
+		while IFS= read -r spec_path; do
+			[ -n "$spec_path" ] || continue
+			overlay_abs=$(realpath -m -- "${repo_root}/${spec_path}" 2>/dev/null) ||
+				overlay_abs="${repo_root}/${spec_path}"
+			case "${overlay_abs}/" in
+			"${pod_abs}/"*) continue ;;
+			esac
+			die "the voice host links its speech crates from the working tree at ${spec_path}, and the audio-device binary would be built from ${brenn_pod_dir}." \
+				"Two trees of brenn-pod in one payload is the state this check exists to stop." \
+				"Point BRENN_POD_DIR at the overlaid tree, or overlay the checkout this build" \
+				"is pointed at."
+		done < <(pod_overlay_paths "$module" | tr ',' '\n')
+		pod_source_line="the voice host links the working tree at ${overlay} and the audio-device binary is built from ${brenn_pod_dir} at ${head:0:12}$([ -n "$status" ] && echo "+dirty")"
+		;;
+	*)
+		if [ "$head" != "$source" ]; then
+			die "the voice host links brenn-pod at ${source:0:12} and ${brenn_pod_dir} stands at ${head:0:12}, so this payload would carry two revisions of brenn-pod." \
+				"Either check the pin out, so the pod is built from the revision the surface links:" \
+				"    git -C ${brenn_pod_dir} checkout ${source}" \
+				"or overlay that working tree in MODULE.bazel, so the host links it too — the" \
+				"overlay form is in the comment block above BRENN_POD_REV." \
+				"REACHY_POD_BINARY names a prebuilt artifact and skips this check."
+		fi
+		if [ -n "$status" ]; then
+			die "${brenn_pod_dir} stands at the pinned revision ${source:0:12} with uncommitted changes, so the pod would be built from something no revision names while the voice host links the pin." \
+				"Either commit or stash them:" \
+				"    git -C ${brenn_pod_dir} status" \
+				"or overlay that working tree in MODULE.bazel, so the host links it too — the" \
+				"overlay form is in the comment block above BRENN_POD_REV."
+		fi
+		pod_source_line="the voice host links brenn-pod at ${source:0:12} and the audio-device binary is built from ${brenn_pod_dir} at that revision"
+		;;
+	esac
+	pod_commit=$head
+	if [ -n "$status" ]; then
+		pod_dirty=true
+	else
+		pod_dirty=false
+	fi
+}
+
+# One `key=value` out of the record the other repo's build writes.
+#
+#   pod_sidecar_field <sidecar path> <key>
+#
+# The first assignment of that key, and empty for a key the file does not state
+# or a file that is not there — every caller below distinguishes those two by
+# asking about the file first. Plain `key=value`, the form `audio.conf` and
+# `provenance.txt` already use, read line-wise so a value containing `=` is the
+# value and not a parse.
+pod_sidecar_field() {
+	sed -n "s/^$2=//p" -- "$1" 2>/dev/null | head -n 1
+}
+
+# Refuse a pod binary the other repo's build did not just produce from the tree
+# this build checked.
+#
+#   refuse_unless_pod_sidecar_agrees <sidecar> <commit> <dirty> <staged file>
+#
+# The checkout check above reads the tree before the container build; this reads
+# what the container build says it did, which is the same question asked of the
+# artifact rather than of the directory. Two ways they part: the tree moved under
+# the build — a checkout switched, a file saved, between the check and the
+# container finishing — and the binary was replaced by hand afterwards, which the
+# digest is the only witness to.
+#
+# No sidecar at all is a brenn-pod checkout predating the build script that
+# writes one, which is a real state of a real checkout and so gets its own
+# sentence rather than being reported as a disagreement.
+refuse_unless_pod_sidecar_agrees() {
+	local sidecar=$1 commit=$2 dirty=$3 staged=$4 said_commit said_dirty
+	[ -f "$sidecar" ] ||
+		die "the brenn-pod build left no record at ${sidecar}, so what it built cannot be checked against the checkout." \
+			"A checkout whose firmware/tools/build-reachy-pod.sh predates that record is too" \
+			"old for this build: pull brenn-pod, or name a prebuilt artifact with" \
+			"REACHY_POD_BINARY, which skips this check."
+	said_commit=$(pod_sidecar_field "$sidecar" commit)
+	said_dirty=$(pod_sidecar_field "$sidecar" dirty)
+	if [ "$said_commit" != "$commit" ] || [ "$said_dirty" != "$dirty" ]; then
+		die "the brenn-pod build says it built ${said_commit:-no revision} (dirty=${said_dirty:-unknown}) and the checkout this build read stands at ${commit} (dirty=${dirty})." \
+			"The tree moved while the container was building, so the binary is not the one" \
+			"this payload was checked for. Build again with the checkout still."
+	fi
+	refuse_unless_pod_digest_matches "$sidecar" "$staged"
+}
+
+# The digest half of that record, asked of one file.
+#
+#   refuse_unless_pod_digest_matches <sidecar> <file>
+#
+# Asked twice, of two files. Of the build's own output, beside the revision
+# check above, so a binary that does not match its record is refused before an
+# arm64 build's worth of further work; and of the copy in the staging directory,
+# which is the file the payload actually carries. Between those two there is a
+# window — the machine sweep, the plan, the credentials — and a brenn-pod build
+# run by hand in another terminal lands in it, replacing the file after it was
+# checked and before it was copied. The staged copy is what the stamp and
+# `provenance.txt` claim a revision for, so it is the one that has to be asked.
+refuse_unless_pod_digest_matches() {
+	local sidecar=$1 file=$2 said_sha sha
+	said_sha=$(pod_sidecar_field "$sidecar" sha256)
+	sha=$(sha256sum -- "$file" | cut -d' ' -f1) ||
+		die "cannot digest ${file}, so what the brenn-pod build produced cannot be checked."
+	[ "$said_sha" = "$sha" ] ||
+		die "the brenn-pod build recorded ${said_sha:-no digest} for the audio-device binary and ${file} digests ${sha}." \
+			"The file was replaced after that build wrote it, so what would be staged is not" \
+			"what the record describes. Build brenn-pod again, or name the artifact with" \
+			"REACHY_POD_BINARY, which stages a file with no record and says so."
+}
+
+# What a payload's two halves of brenn-pod are, said in one line.
+#
+#   pod_provenance
+#
+# The refusals above are what makes the two halves agree; this is the line that
+# says which agreement it is, on every build, because a fetched run months later
+# is read by somebody who has only the records. Three shapes, one per outcome the
+# check can reach: the checkout at the pin, the checkout overlaid at some
+# revision and possibly dirty, and an artifact named by the knob whose revision
+# nothing here can ask.
+#
+# Every line this prints describes a payload whose halves were checked and agree.
+pod_provenance() {
+	if [ -n "$pod_binary_named" ]; then
+		echo "the audio-device binary is the artifact REACHY_POD_BINARY names at ${pod_binary}, whose revision this cannot ask; the voice host links $(pod_build_source "${repo_root}/MODULE.bazel")"
 		return
 	fi
-	committed=$(git -C "$brenn_pod_dir" log -1 --format=%ct 2>/dev/null) || committed=
-	built=$(stat -c %Y -- "$pod_binary" 2>/dev/null) || built=
-	if [ -z "$committed" ] || [ -z "$built" ]; then
-		age="when the audio-device binary was built cannot be compared against it"
-	elif [ "$built" -lt "$committed" ]; then
-		age="the audio-device binary is older than that commit, so it was built at an earlier one"
-	else
-		age="the audio-device binary was built after that commit"
+	# No line to print means the check never ran, and this function's promise
+	# above is the one thing it cannot report: an unnamed pod whose halves
+	# nobody compared is exactly the payload the refusals above exist to stop,
+	# so it is refused here rather than described. Unreachable from the one
+	# caller that keeps the order, which is what makes saying so worth the
+	# lines: the next caller of this is where it stops being unreachable.
+	[ -n "$pod_source_line" ] ||
+		die "this build staged an audio-device binary without checking where it came from, which is a bug in this script." \
+			"refuse_unless_pod_checkout_matches is what fills that answer in, and it has to" \
+			"run before the pod is built or staged."
+	echo "$pod_source_line"
+}
+
+# What the stamp records for the pod half of the payload.
+#
+#   pod_stamp_field
+#
+# `<commit>[+dirty]` for a pod this build compiled, and `named` for one an
+# operator handed it. The commit is the checkout's, which the refusals above have
+# already held equal to what the container built and to what the voice host
+# links, so unlike the `brenn_pod=` field beside it this one does describe the
+# binary in the payload.
+pod_stamp_field() {
+	if [ -n "$pod_binary_named" ]; then
+		echo named
+		return
 	fi
-	if [ "$tree" = "$pinned" ]; then
-		echo "the linked surface is pinned at ${pinned:0:12} and the checkout is at that revision; ${age}"
+	if [ -z "$pod_commit" ]; then
+		echo unknown
+		return
+	fi
+	if [ "$pod_dirty" = true ]; then
+		echo "${pod_commit}+dirty"
 	else
-		echo "the linked surface is pinned at ${pinned:0:12} and the checkout is at ${tree:0:12}: two revisions of brenn-pod in one payload; ${age}"
+		echo "$pod_commit"
 	fi
 }
 

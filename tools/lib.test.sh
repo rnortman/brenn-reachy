@@ -525,8 +525,9 @@ assert_contains "and says what is accepted" "$(output_of "$result")" \
 # ---------------------------------------------------------------------------
 #
 # One knob for one physical fact: BRENN_POD_DIR names the brenn-pod checkout,
-# and both things this repo takes out of it — the prebuilt audio binary the
-# payload stages and the provisioning a speech run invokes — resolve under it.
+# and both things this repo takes out of it — the audio binary the payload build
+# compiles there and stages, and the provisioning a speech run invokes — resolve
+# under it.
 # REACHY_POD_BINARY still wins for the binary alone, because it names a file
 # rather than a repository: an artifact copied out of a build somewhere else has
 # no checkout around it.
@@ -571,6 +572,202 @@ assert_eq "REACHY_POD_BINARY still names the artifact by itself" \
 assert_eq "and wins over a checkout named beside it" "/tmp/reachy-pod" \
 	"$(BRENN_POD_DIR=/elsewhere/brenn-pod REACHY_POD_BINARY=/tmp/reachy-pod \
 		pod_paths | sed -n 2p)"
+
+# ---------------------------------------------------------------------------
+# What the other repository's build says it produced
+# ---------------------------------------------------------------------------
+#
+# The pod is a build product of the payload, and the record brenn-pod's build
+# writes beside the binary is the only witness that the file about to be staged
+# is the one that build made. Its reader and the refusal over it are here; the
+# build that runs them is build-motion.test.sh, which has a git stub and a stub
+# for that other repository's script.
+
+sidecar="${work}/reachy-pod.build"
+staged="${work}/reachy-pod"
+printf 'the compiled pod\n' >"$staged"
+staged_sha=$(sha256sum -- "$staged" | cut -d' ' -f1)
+pod_rev=89abcdef0123456789abcdef0123456789abcdef
+
+stage_sidecar() {
+	printf 'commit=%s\ndirty=%s\nsha256=%s\n' "$1" "$2" "$3" >"$sidecar"
+}
+stage_sidecar "$pod_rev" false "$staged_sha"
+
+assert_eq "the record's revision is read out of it" "$pod_rev" \
+	"$(pod_sidecar_field "$sidecar" commit)"
+assert_eq "and its dirtiness" "false" "$(pod_sidecar_field "$sidecar" dirty)"
+assert_eq "and its digest" "$staged_sha" "$(pod_sidecar_field "$sidecar" sha256)"
+assert_eq "a key the record does not state reads empty" "" \
+	"$(pod_sidecar_field "$sidecar" branch)"
+assert_eq "and so does a record that is not there" "" \
+	"$(pod_sidecar_field "${work}/no-such.build" commit)"
+
+# A value carrying the separator is the value: these are plain key=value lines,
+# and an overlay path or a digest is not the place to discover a parser.
+printf 'commit=%s\ndirty=false\nsha256=a=b\n' "$pod_rev" >"$sidecar"
+assert_eq "a value containing the separator is read whole" "a=b" \
+	"$(pod_sidecar_field "$sidecar" sha256)"
+stage_sidecar "$pod_rev" false "$staged_sha"
+
+result=$(attempt refuse_unless_pod_sidecar_agrees "$sidecar" "$pod_rev" false \
+	"$staged")
+assert_status "a record agreeing with the checkout and the file passes" 0 \
+	"$(status_of "$result")"
+
+# The tree moved while the container was building, in its two shapes: another
+# revision, and the same revision with something saved.
+result=$(attempt refuse_unless_pod_sidecar_agrees "$sidecar" \
+	fedcba9876543210fedcba9876543210fedcba98 false "$staged")
+assert_status "a record naming another revision refuses" 1 "$(status_of "$result")"
+assert_contains "and names both" "$(output_of "$result")" "$pod_rev"
+assert_contains "and says the tree moved under the build" \
+	"$(output_of "$result")" "moved while the container was building"
+
+result=$(attempt refuse_unless_pod_sidecar_agrees "$sidecar" "$pod_rev" true \
+	"$staged")
+assert_status "a record disagreeing about dirtiness refuses" 1 \
+	"$(status_of "$result")"
+
+# The binary replaced after that build wrote it, which the digest is the only
+# witness to: this is the shape the stale hand-refreshed pod had.
+printf 'somebody else\n' >"$staged"
+result=$(attempt refuse_unless_pod_sidecar_agrees "$sidecar" "$pod_rev" false \
+	"$staged")
+assert_status "a record whose digest is not the staged file's refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "and names the digest it recorded" "$(output_of "$result")" \
+	"$staged_sha"
+printf 'the compiled pod\n' >"$staged"
+
+# The digest half on its own, which the build asks a second time of the copy in
+# the staging directory: the file it names in the refusal is the file it was
+# handed, because the two callers hand it two different ones and the message is
+# how an operator knows which of them the record disagrees with.
+copy="${work}/staged-reachy_pod"
+printf 'the copy that moved\n' >"$copy"
+result=$(attempt refuse_unless_pod_digest_matches "$sidecar" "$copy")
+assert_status "a staged copy the record does not describe refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "naming the file it digested" "$(output_of "$result")" "$copy"
+cp -- "$staged" "$copy"
+result=$(attempt refuse_unless_pod_digest_matches "$sidecar" "$copy")
+assert_status "and a copy of the file the record describes passes" 0 \
+	"$(status_of "$result")"
+
+# No record at all: a brenn-pod checkout whose build script predates it. Its own
+# sentence, and it names the knob that stages an artifact with no record.
+result=$(attempt refuse_unless_pod_sidecar_agrees "${work}/no-such.build" \
+	"$pod_rev" false "$staged")
+assert_status "a build that left no record refuses" 1 "$(status_of "$result")"
+assert_contains "saying the checkout is too old" "$(output_of "$result")" \
+	"left no record at"
+assert_contains "and naming the knob for an artifact" "$(output_of "$result")" \
+	"REACHY_POD_BINARY"
+
+# What the stamp carries for the pod half of the payload, which is the field a
+# fetched run is read by. The globals the checkout check fills in are what this
+# reads, so each shape is set here directly.
+pod_commit=$pod_rev
+pod_dirty=false
+assert_eq "the stamp names the revision the pod was built from" "$pod_rev" \
+	"$(pod_stamp_field)"
+pod_dirty=true
+assert_eq "and says when that tree was dirty" "${pod_rev}+dirty" \
+	"$(pod_stamp_field)"
+pod_dirty=false
+pod_commit=
+assert_eq "an unchecked pod is unknown rather than a guess" "unknown" \
+	"$(pod_stamp_field)"
+pod_binary_named=named
+assert_eq "and a named artifact says it was named" "named" "$(pod_stamp_field)"
+pod_binary_named=
+
+# ---------------------------------------------------------------------------
+# A MODULE.bazel whose brenn-pod specs disagree
+# ---------------------------------------------------------------------------
+#
+# The overlay form is all four specs at once. Half of them overlaid and the rest
+# on the pin is two revisions of brenn-pod inside the voice host itself, which is
+# the state the pod refusals exist to make unreachable arriving through the file
+# instead of through the checkout — so the file cannot be said to resolve from
+# either, and the reader names both sides for the message that reports it.
+mixed_module="${work}/MODULE.mixed"
+cat >"$mixed_module" <<'MIXED'
+BRENN_POD_REV = "89abcdef0123456789abcdef0123456789abcdef"
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+
+crate.spec(
+    git = BRENN_POD_GIT,
+    package = "speech-pipeline",
+    rev = BRENN_POD_REV,
+)
+MIXED
+sides=$(pod_overlay_paths "$mixed_module") && mixed_status=0 || mixed_status=$?
+assert_eq "a file overlaying some brenn-pod specs and pinning the rest is refused" \
+	3 "$mixed_status"
+assert_eq "and the refusal names the specs on each side" \
+	"speech-surface|speech-pipeline" "$sides"
+assert_eq "so the file resolves from neither" "unknown" \
+	"$(pod_build_source "$mixed_module")"
+
+# The build's refusal over that file, and not the reader's status alone: an
+# operator mid-edit reads this message, and the generic "cannot say which
+# brenn-pod" one sends them looking for a missing pin instead of the four specs
+# they half-edited.
+result=$(attempt refuse_unless_pod_checkout_matches "$mixed_module")
+assert_status "the build refuses a half-overlaid file" 1 "$(status_of "$result")"
+assert_contains "saying the host itself would link two revisions" \
+	"$(output_of "$result")" "would link two revisions of brenn-pod"
+assert_contains "and naming the spec on the working tree" "$(output_of "$result")" \
+	"working tree: speech-surface"
+assert_contains "and the spec still on the pin" "$(output_of "$result")" \
+	"pinned revision: speech-pipeline"
+assert_contains "and the remedy is all of them or none" "$(output_of "$result")" \
+	"all of them at once or none of them"
+
+# Every overlaid spec is read, not the first alone: four specs naming two
+# working trees is the same two-revisions payload as the mixed form, spelled
+# entirely in overlays, and one containment check over one path would pass it.
+two_trees="${work}/MODULE.two-trees"
+cat >"$two_trees" <<'TWO'
+BRENN_POD_REV = "89abcdef0123456789abcdef0123456789abcdef"
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+
+crate.spec(
+    path = "../brenn-pod-wip/host/crates/speech-pipeline",
+    package = "speech-pipeline",
+)
+TWO
+assert_eq "both overlaid trees are read, in the file's order" \
+	"../brenn-pod/host/crates/speech-surface,../brenn-pod-wip/host/crates/speech-pipeline" \
+	"$(pod_overlay_paths "$two_trees")"
+assert_eq "and the field names the surface's, which is the one a reader wants" \
+	"overlay:../brenn-pod/host/crates/speech-surface" \
+	"$(pod_build_source "$two_trees")"
+
+# ---------------------------------------------------------------------------
+# pod_provenance with nothing checked
+# ---------------------------------------------------------------------------
+#
+# Every line that function prints describes a payload whose halves were checked
+# and agree, so the one state it cannot describe is a build that staged an
+# unnamed pod without running the check. Unreachable from the build that keeps
+# the order; this is the case that says it stays that way.
+pod_source_line=
+result=$(attempt pod_provenance)
+assert_status "an unchecked pod is a refusal and not a provenance line" 1 \
+	"$(status_of "$result")"
+assert_contains "naming the check that did not run" "$(output_of "$result")" \
+	"refuse_unless_pod_checkout_matches"
 
 # ---------------------------------------------------------------------------
 # knob_remedy

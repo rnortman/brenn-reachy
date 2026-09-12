@@ -1,4 +1,39 @@
 #!/bin/bash
 set -e
 
-exec brenn-scrub range
+# Two questions about a push, in order: whether the trees it publishes resolve
+# their brenn-pod dependencies, and whether the range carries a secret.
+#
+# git writes one `<local ref> <local sha> <remote ref> <remote sha>` line per ref
+# being pushed on stdin, and `brenn-scrub range` reads them, so they are captured
+# here and handed on rather than consumed.
+#
+# The pin check is asked of the `MODULE.bazel` of each ref's tip -- the file a
+# fresh clone of that ref would get -- and not of the working tree. The two part
+# in exactly this repository's two-repo cycle: the overlay is committed for as
+# long as the cycle runs, so a tree with the pins restored and the restoration
+# not yet committed would answer for a tip that still overlays, and a tree
+# re-overlaid for the next increment would refuse a tip that is fine. Only the
+# tip of each ref is asked: the commits behind it are the cycle's own overlaid
+# increments, which is history and not what a clone resolves.
+refs=$(cat)
+
+module=$(mktemp)
+trap 'rm -f -- "$module"' EXIT
+
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	[ -n "$local_sha" ] || continue
+	# A ref being deleted pushes no tree.
+	case "$local_sha" in
+	*[!0]*) ;;
+	*) continue ;;
+	esac
+	git show "${local_sha}:MODULE.bazel" >"$module" 2>/dev/null ||
+		{
+			echo "pre-push: ${local_sha} carries no MODULE.bazel to check" >&2
+			exit 1
+		}
+	MODULE_PINS_FILE="$module" make check-pins
+done <<<"$refs"
+
+printf '%s\n' "$refs" | brenn-scrub range

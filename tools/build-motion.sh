@@ -52,11 +52,13 @@
 # servos read-only, with no driver and no control process in it at all. All three
 # are staged because a unit is deployed once and used for each.
 #
-# One payload member is not built here. `reachy_pod` is brenn-pod's binary — it
-# links libusb and libasound and is compiled in that repo's arm64 container — so
-# it arrives as a prebuilt artifact named by `REACHY_POD_BINARY` below. This
-# script stages it, checks its machine, and reports its digest, exactly as it
-# does for the binaries it did build.
+# One payload member is not compiled here. `reachy_pod` is brenn-pod's binary —
+# it links libusb and libasound and is compiled in that repo's arm64 container —
+# so this script runs that repo's build script for it, having first held its
+# checkout to the revision the payload's voice host links. Then it stages the
+# binary, checks its machine, and reports its digest, exactly as it does for the
+# binaries it did build. `REACHY_POD_BINARY` names an artifact built elsewhere
+# and skips all of that.
 #
 # Everything under it is copied out of Bazel's outputs rather than symlinked:
 # the freshness contract deploy-motion.sh enforces is about the age of files
@@ -70,12 +72,12 @@
 # Knobs, environment only:
 #
 #   REACHY_BAZEL           the bazel to run (default bazel)
-#   BRENN_POD_DIR          the brenn-pod checkout the prebuilt audio-device
-#                          binary is taken from (default: ../brenn-pod; a
-#                          relative value is relative to this repository's root)
-#   REACHY_POD_BINARY      the prebuilt audio-device binary to stage, overriding
-#                          that resolution for the file alone (default: the one
-#                          BRENN_POD_DIR's payload build leaves behind)
+#   BRENN_POD_DIR          the brenn-pod checkout the audio-device binary is
+#                          built in (default: ../brenn-pod; a relative value is
+#                          relative to this repository's root)
+#   REACHY_POD_BINARY      an audio-device binary built elsewhere to stage
+#                          instead, which skips that build and its checks
+#                          (default: the one BRENN_POD_DIR's build leaves)
 #   REACHY_SPEECH_CONFIG   the voice pipeline's own configuration to stage
 #                          (default: the gitignored host/speech.toml of this
 #                          tree; a payload built without one carries no speech
@@ -463,12 +465,20 @@ resolve_speech_credentials() {
 # tree's commit says nothing about either. So a second line names it:
 # `brenn_pod=<revision>`, `brenn_pod=overlay:<path>` when the binaries came out
 # of a working tree rather than a published revision, or `brenn_pod=unknown`.
+#
+# And a third for the pod binary beside them: `reachy_pod=<commit>[+dirty]` for
+# the checkout this build compiled it from, or `reachy_pod=named` for an artifact
+# an operator named. The field above describes the surface's half of brenn-pod
+# and this one the device's half, and the refusals in `lib.sh` are what make the
+# two agree — so a fetched run whose two fields disagree is a payload staged by a
+# build script that predates those refusals.
 stamp_build_commit() {
 	local into=$1 commit
 	commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || commit=
 	{
 		printf 'commit=%s\n' "${commit:-unknown}"
 		printf 'brenn_pod=%s\n' "$(pod_build_source "${repo_root}/MODULE.bazel")"
+		printf 'reachy_pod=%s\n' "$(pod_stamp_field)"
 	} >"$into"
 }
 
@@ -507,8 +517,13 @@ stage() {
 	install -m 0755 -D -- "$host_out" "${staging}/reachy_host"
 	# The one binary in the payload this build did not produce: brenn-pod's, at
 	# the payload root under this payload's own naming, which is what the pod's
-	# app entry spells.
+	# app entry spells. Digested again here, against the record the other
+	# repository's build left: the copy is what the payload carries and what the
+	# stamp names a revision for, and the checks above ran on the source file
+	# several steps ago.
 	install -m 0755 -D -- "$pod_binary" "${staging}/reachy_pod"
+	[ -n "$pod_binary_named" ] ||
+		refuse_unless_pod_digest_matches "$pod_sidecar" "${staging}/reachy_pod"
 	# Not a launcher app: it binds the narration port before the composition is
 	# started, so `--run` starts it itself, ahead of the launcher.
 	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
@@ -587,8 +602,9 @@ report() {
 	done
 	# The one member whose provenance a digest does not settle: reachy_pod was
 	# compiled in the other repository, and the host beside it links that
-	# repository's crates from a revision this tree pins. Said on every build,
-	# because the two agreeing is a habit rather than a mechanism.
+	# repository's crates from a revision this tree pins. The refusals above are
+	# what make the two agree; this line says which agreement it is, on every
+	# build, because a fetched run is read by somebody who has only the records.
 	echo "${prog}: brenn-pod  $(pod_provenance)"
 	# Said either way, and without a digest: the contents are a site's own, and
 	# what a person needs to know at the bench is whether this payload's host
@@ -653,17 +669,45 @@ onnx_out="${execroot}/$(bazel_files "$onnx_target")"
 [ -f "$onnx_out" ] ||
 	die "the build names ${onnx_out} and no file is there." \
 		"The ONNX Runtime archive pin moved, or its repository was not fetched."
-# The prebuilt member, decided here with the built ones and before anything is
-# staged: a payload missing the pod binary is a launcher that starts an app that
-# is not there, and the app entry is in the production config unconditionally
-# because a unit without a working audio device is still a unit whose pod should
-# be trying.
+# The pod binary, decided here with the built ones and before anything is
+# staged: a payload missing it is a launcher that starts an app that is not
+# there, and the app entry is in the production config unconditionally because a
+# unit without a working audio device is still a unit whose pod should be trying.
+#
+# Unless an operator named an artifact, this build makes it. brenn-pod's script
+# compiles in that repo's arm64 container, incrementally, and refuses cleanly
+# without podman or the qemu binfmt registration; the pod is a build product of
+# the payload for the same reason motion-build is a prerequisite of
+# motion-deploy rather than a step to remember.
+#
+# Three steps, in this order. The checkout is read first, so a tree at the wrong
+# revision is refused in milliseconds rather than after an arm64 build. Then the
+# build. Then its record, against both the checkout the first step read and the
+# file about to be staged.
+if [ -z "$pod_binary_named" ]; then
+	refuse_unless_pod_checkout_matches "${repo_root}/MODULE.bazel"
+	[ -x "$pod_build_script" ] ||
+		die "${brenn_pod_dir} has no ${pod_build_script#"${brenn_pod_dir}/"}, so the audio-device binary cannot be built." \
+			"That script is brenn-pod's; a checkout too old to carry it is too old for this" \
+			"build. Pull brenn-pod, or name a prebuilt artifact with REACHY_POD_BINARY."
+	echo "${prog}: building the audio-device binary from ${brenn_pod_dir} at ${pod_commit:0:12}" >&2
+	"$pod_build_script" ||
+		die "brenn-pod's build of the audio-device binary failed; its own output is above." \
+			"It compiles in that repository's arm64 container, so it needs podman and a" \
+			"qemu-aarch64 binfmt registration on this machine — 'sudo dnf install podman" \
+			"qemu-user-static' on Fedora — and it refuses saying which is missing." \
+			"REACHY_POD_BINARY names an artifact built elsewhere and skips the build."
+fi
 [ -f "$pod_binary" ] ||
 	die "there is no audio-device binary at ${pod_binary}." \
-		"It is brenn-pod's to build: run 'make -C ${brenn_pod_dir}/firmware reachy-pod'" \
-		"in that checkout. If brenn-pod is somewhere else, BRENN_POD_DIR names the" \
-		"checkout — for this invocation or once in the gitignored .local/reachy.conf —" \
-		"and REACHY_POD_BINARY names a bare artifact copied out of a build elsewhere."
+		"REACHY_POD_BINARY names a bare artifact copied out of a build elsewhere, and an" \
+		"unnamed one is built by this script from the brenn-pod checkout, so this path is" \
+		"a build that reported success and wrote nothing where its own record says it" \
+		"would. BRENN_POD_DIR names the checkout — for this invocation or once in the" \
+		"gitignored .local/reachy.conf."
+[ -n "$pod_binary_named" ] ||
+	refuse_unless_pod_sidecar_agrees "$pod_sidecar" "$pod_commit" "$pod_dirty" \
+		"$pod_binary"
 # The other member from outside the build, decided in the same place. Only the
 # named case can refuse: an unnamed one that is not there is a payload whose
 # host narrates and does not listen, which is what a unit runs until somebody
@@ -708,10 +752,11 @@ check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
 check_launcher_apps "$record_config_out" "${record_apps[@]}"
 verify_aarch64 "$motord_out"
 verify_aarch64 "$host_out"
-# Asked of the prebuilt member the same way, and it is the one where the answer
-# is in doubt: everything else here was cross-compiled by the build that just
-# ran, while this file was compiled elsewhere, and a workstation build of
-# brenn-pod's own pod binary sits at a path that looks just like the arm64 one.
+# Asked of the pod binary the same way, and it is the one where the answer is in
+# doubt: everything else here was cross-compiled by the build that just ran,
+# while this file came out of another repository's container, and a workstation
+# build of brenn-pod's own pod binary sits at a path that looks just like the
+# arm64 one.
 verify_aarch64 "$pod_binary"
 verify_aarch64 "$ask_out"
 verify_aarch64 "$bench_out"

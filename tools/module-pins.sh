@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 #
-# tools/module-pins.test.sh — how MODULE.bazel names brenn-pod, held to the form
-# a machine that is not this one can resolve.
+# tools/module-pins.sh — how MODULE.bazel names brenn-pod, held to the form a
+# machine that is not this one can resolve.
 #
-# The subject is this repository's own `MODULE.bazel`, not a script. It is here
-# because the failure it catches cannot be caught anywhere else in the gate: a
-# `crate.spec` switched from `git`/`rev` to `path = "../brenn-pod/..."` — the
-# overlay a seam landing on both sides of the dependency arrow is developed
-# through — resolves perfectly on the developer's workstation, so `make check`
-# is green on a tree that no fresh clone and no runner can load. `CLAUDE.md`
-# names the local gate as the gate and CI as the backstop; without this case the
-# order is inverted for exactly this class of change, and the discovery is a red
-# main or a contributor who cannot build the published tree.
+# The subject is this repository's own `MODULE.bazel`, not a script. What it
+# catches cannot be caught anywhere else: a `crate.spec` switched from
+# `git`/`rev` to `path = "../brenn-pod/..."` — the overlay a seam landing on
+# both sides of the dependency arrow is developed through — resolves perfectly
+# on the developer's workstation, so a tree that no fresh clone and no runner
+# can load builds green here.
+#
+# It runs at the push, as `make check-pins` from `.githooks/pre-push` beside the
+# range scrub — once per ref, over the `MODULE.bazel` of the commit that ref
+# publishes — and in CI's check job as the backstop. Not at the commit: the
+# overlay is committed for as long as the two-repo cycle it serves runs, so a
+# commit gate on it would stand in that cycle's way. What this asks about is
+# publishability — a tree a fresh clone can resolve — and that is a property of
+# a push.
 #
 # So: every `crate.spec` naming a brenn-pod package resolves from the published
 # remote at the pinned revision, both spelled once as constants, and none of
@@ -22,10 +27,11 @@
 # and builds nothing.
 #
 # The file it reads is this checkout's, unless `MODULE_PINS_FILE` names another
-# one. That knob is not an operator's: it is how the fixture cases at the foot of
-# this file run this same script over deliberately broken files, so the reader
-# above is held to detect what it claims to detect rather than only to pass on a
-# healthy tree.
+# one. Two callers name one: `.githooks/pre-push` points it at the `MODULE.bazel`
+# of each ref's tip, since the tree a fresh clone gets is that commit's and not
+# the one on this disk; and the fixture cases at the foot of this file run this
+# same script over deliberately broken files, so the reader above is held to
+# detect what it claims to detect rather than only to pass on a healthy tree.
 
 set -euo pipefail
 
@@ -102,7 +108,7 @@ while IFS=$'\t' read -r pkg git rev path; do
 		fail "the ${pkg} spec names no working tree" \
 			"it resolves from ${path}, which is a directory only this machine has" \
 			"put the four specs back on git = BRENN_POD_GIT, rev = BRENN_POD_REV" \
-			"before committing; MODULE.bazel says what else comes back with them"
+			"before pushing; MODULE.bazel says what else comes back with them"
 	else
 		pass "the ${pkg} spec names no working tree"
 	fi
@@ -135,26 +141,26 @@ assert_eq "the build's provenance line reads the same revision off this file" \
 	"$pinned" "$(pinned_pod_rev "$module")"
 
 # The build's other reader of these same blocks, held to this suite's parse of
-# them. `pod_overlay_path` answers a question this suite cannot answer for
-# itself -- an overlay is by construction uncommitted, the one state in which
-# the payload's stamp is the only record of which brenn-pod built it -- so the
-# two parsers can only be kept honest against each other: on a healthy file both
-# say there is no overlay, and on an overlaid one both name the same path.
-overlaid=-
+# them. `pod_overlay_paths` answers a question this suite cannot answer for
+# itself -- an overlay is the one state in which the payload's stamp is the only
+# record of which brenn-pod built it, the pin naming a revision that did not --
+# so the two parsers can only be kept honest against each other: on a healthy
+# file both say there is no overlay, and on an overlaid one both name the same
+# paths, all of them and in the file's order -- which is the parse the build
+# holds every overlaid spec to one working tree with.
+overlaid=
 while IFS=$'\t' read -r pkg git rev path; do
 	case $pod_packages in
 	*" ${pkg} "*) ;;
 	*) continue ;;
 	esac
 	if [ "$path" != "-" ]; then
-		overlaid=$path
-		break
+		overlaid="${overlaid}${overlaid:+,}${path}"
 	fi
 done <<<"$specs"
 
 assert_eq "the build's overlay reader agrees with this suite's parse" \
-	"$([ "$overlaid" = "-" ] || echo "$overlaid")" \
-	"$(pod_overlay_path "$module")"
+	"$overlaid" "$(pod_overlay_paths "$module")"
 
 assert_eq "the build's overlay reader looks at the same four packages" \
 	"$pod_packages" "$pod_crate_packages"

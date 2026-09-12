@@ -20,9 +20,11 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
 - **`.local/reachy-bench.toml`** (`BENCH_CONFIG=` overrides): copy
   `crates/reachy-bench/reachy-bench.example.toml`, fill in `[bus]`'s serial
   node.
-- **A sibling brenn-pod checkout** (`BRENN_POD_DIR=<path>` otherwise):
-  `make motion-build` stages its prebuilt audio binary and `make speech-run`
-  invokes its provisioning for the pod's half.
+- **A sibling brenn-pod checkout** (`BRENN_POD_DIR=<path>` otherwise) at this
+  tree's `BRENN_POD_REV`, clean or overlaid, and **podman with qemu-aarch64
+  binfmt**: `make motion-build` compiles its audio binary there, refusing
+  others; `make speech-run` invokes its provisioning. `REACHY_POD_BINARY=<file>`
+  skips both.
 - For a speech run, the mic array.
 
 ## Where things live
@@ -30,7 +32,7 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
 | | |
 |---|---|
 | `target/motion-arm64/release/` | the staged payload |
-| `.local/motion-logs/`, `.local/speech-logs/`, `.local/pose-sessions/` | fetched runs, one timestamped directory each: a `.console` beside it, a `provenance.txt` naming this tree's commit and the brenn-pod revision |
+| `.local/motion-logs/`, `.local/speech-logs/`, `.local/pose-sessions/` | fetched runs, one timestamped directory each: a `.console` beside it, a `provenance.txt` naming this tree's commit and both brenn-pod revisions |
 | `/run/brenn-app/releases/motion/` | the payload, and every process's working directory |
 | `/run/brenn-app/logs/motion/`, `logs/launch/` | `.olog` directories; consoles |
 | `/run/brenn-app/conf/audio.conf` | the pod's link credentials |

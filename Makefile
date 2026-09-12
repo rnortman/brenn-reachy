@@ -68,10 +68,10 @@ ifdef REACHY_EXPERIMENT_DIR
 export REACHY_EXPERIMENT_DIR
 endif
 
-# The brenn-pod checkout, read for two things a speech run needs: the prebuilt
-# audio-device binary the payload stages, and the provisioning target that
-# writes the pod's link credentials onto the unit. The default is the sibling
-# layout the two repos are worked on in.
+# The brenn-pod checkout, read for two things a speech run needs: the
+# audio-device binary, which the payload build compiles there and stages, and the
+# provisioning target that writes the pod's link credentials onto the unit. The
+# default is the sibling layout the two repos are worked on in.
 #
 # Exported for the same reason the speech configuration is: `tools/lib.sh` reads
 # it, and the scripts are children of a recipe.
@@ -83,6 +83,7 @@ help:
 	@echo "Repo-root targets:"
 	@echo "  make check         what a commit must pass: shellcheck, script tests, bazel test"
 	@echo "  make check-device  the other half of the gate: the device binaries cross-compile"
+	@echo "  make check-pins    what a push must pass: MODULE.bazel resolves off this machine"
 	@echo "  make fix           auto-fix what the gate can fix (rustfmt)"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
@@ -247,6 +248,23 @@ check:
 	@$(MAKE) check-scripts
 	@$(MAKE) test-scripts
 	bazel test --config=lint $(BAZEL_FLAGS) //...
+
+# The publishability check: `MODULE.bazel` names brenn-pod in the form a machine
+# that is not this one can resolve — no `crate.spec` on a working-tree path, no
+# module override reaching one.
+#
+# A push target and not a commit one. The overlay it catches is how a seam
+# landing on both sides of the dependency arrow is developed, and that cycle
+# commits the overlay for as long as it runs; only the push has to be
+# resolvable by a fresh clone.
+#
+# This checkout's file, or the one `MODULE_PINS_FILE` names: the pre-push hook
+# points it at the `MODULE.bazel` of each ref's tip, because the tree a clone
+# gets is that commit's and not the one on this disk. CI runs it bare, over a
+# checkout that is the tip.
+.PHONY: check-pins
+check-pins:
+	tools/module-pins.sh
 
 # The other half of the gate: everything a unit runs, built for the device. A
 # build and not a run — nothing here needs a device, and nothing here executes
@@ -508,9 +526,12 @@ MOTION_RECORDS ?= .local/motion-logs
 # configs and those processes' relative paths expect. Needs bazel; needs no
 # device.
 #
-# It also needs one file this repo does not build: the audio device is
-# brenn-pod's binary, staged from a prebuilt artifact found beside a sibling
-# checkout or named by `REACHY_POD_BINARY`. The script's refusal says so.
+# It also needs one binary this repo cannot compile: the audio device is
+# brenn-pod's, built by that repo's own script in its arm64 container, which this
+# build runs — so the checkout has to stand at the revision this tree links, and
+# the machine needs podman and a qemu-aarch64 binfmt registration.
+# `REACHY_POD_BINARY` names an artifact built elsewhere instead. The script's
+# refusals say all of it.
 #
 # One more file is optional and is never in this tree: the voice pipeline's own
 # configuration, taken from `host/speech.toml` or from `REACHY_SPEECH_CONFIG`. A

@@ -114,7 +114,8 @@ use reachy_host::{
 };
 use reachy_motion::postures::neutral_targets;
 use run_report::{
-    EVENT_HEAD, Report, audio_dir, console_dir, event, quote, recover, sibling, verdict,
+    EVENT_HEAD, Report, audio_dir, console_dir, event, quote, recover, sibling, utterance_id,
+    verdict,
 };
 use serde_json::Value;
 use stillness_report::{Standard, Stillness, say};
@@ -219,6 +220,9 @@ const UTTERANCE: &str = event::UTTERANCE;
 const BRAIN_DISPATCHED: &str = "brain_dispatched";
 const WAKE_COMMAND_ABSENT: &str = "wake_command_absent";
 const BARGE_COMMAND_ABSENT: &str = "barge_command_absent";
+/// The pod's own reply leaking back through the microphone. A separate
+/// name because nothing was interrupted, unlike the other two declines.
+const ECHO_DECLINED: &str = "echo_declined";
 const BRAIN_NO_TRANSCRIPT: &str = "brain_no_transcript";
 const STT_FAILED: &str = "stt_failed";
 const UTTERANCE_SUPERSEDED: &str = "utterance_superseded";
@@ -2247,25 +2251,6 @@ fn whole(object: &serde_json::Map<String, Value>, key: &str) -> Option<i64> {
     object.get(key).and_then(Value::as_i64)
 }
 
-/// An utterance's sequence number off whichever field this event names it in.
-///
-/// Three spellings, because the pipeline names an utterance three ways: the
-/// utterance's own line calls it `id`, the events that answer it call it
-/// `utterance`, and the recogniser's failure calls it `utterance_seq`. A
-/// supersession names the whole identity and the sequence is inside it.
-fn utterance_id(object: &serde_json::Map<String, Value>) -> Option<u64> {
-    for key in ["utterance", "id", "utterance_seq"] {
-        if let Some(seq) = object.get(key).and_then(Value::as_u64) {
-            return Some(seq);
-        }
-    }
-    object
-        .get("utterance_id")
-        .and_then(Value::as_object)
-        .and_then(|id| id.get("seq"))
-        .and_then(Value::as_u64)
-}
-
 /// The span an event names, out of the fields it names it in.
 ///
 /// Two shapes: the utterance's line nests it under `audio_ref`, and the gate's
@@ -2404,7 +2389,7 @@ fn turned(event: &str, object: &serde_json::Map<String, Value>) -> Option<Turned
             stt_sent_from: whole(object, "stt_sent_from_sample"),
         },
         BRAIN_DISPATCHED => Turned::Dispatched { id },
-        WAKE_COMMAND_ABSENT | BARGE_COMMAND_ABSENT => Turned::Declined {
+        WAKE_COMMAND_ABSENT | BARGE_COMMAND_ABSENT | ECHO_DECLINED => Turned::Declined {
             id,
             reason,
             no_speech: number(object, "no_speech"),
@@ -7301,6 +7286,57 @@ mod tests {
                 &report,
                 "1 transcript(s) with words were declined as likely hallucination — no reply \
                  followed those wakes"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The shape the event exists for and the only one that produces it: the wake
+    /// policy is bypass, so the echo carves with no wake ahead of it. The turn goes
+    /// through the no-wake path, and the summary an acceptance session is judged on
+    /// has to file it under the gate's declines there too — not under "unanswered
+    /// for other reasons", and not dropped for having woken nothing.
+    #[test]
+    fn an_echo_the_gate_declined_is_counted_with_the_others() {
+        const ECHO: &str = r#"{"ts_ms":5,"event":"echo_declined","utterance":1,"pod":"reachy00","reason":"low_confidence","no_speech":0.29,"logprob":-0.88}"#;
+        let lines = [
+            STARTED.to_owned(),
+            COMPOSED.to_owned(),
+            said(1, "The weather today is sunny.", 0.29),
+            ECHO.to_owned(),
+        ];
+        let (_dir, at) = records("speech-report-turn-echo-declined", &lines);
+        let report = judge(&at);
+        assert!(
+            measured(
+                &report,
+                "0 wake(s): 0 dispatched, 1 declined by the confidence gate, 0 with no \
+                 transcript, 0 STT failure(s), 0 barge-in(s); 1 turn(s) began with no wake \
+                 ahead of them"
+            ),
+            "{:?}",
+            report.measured
+        );
+        // The declined side of the no_speech spread reads the echo's own score, so
+        // the two acceptance sessions are compared on the audio the gate judged.
+        assert!(
+            measured(&report, "no_speech: dispatched none; declined 0.29"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "turn #1 — wake none → \"The weather today is sunny.\""
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "1 transcript(s) with words were declined as likely hallucination"
             ),
             "{:?}",
             report.measured

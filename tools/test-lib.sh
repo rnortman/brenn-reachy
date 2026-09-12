@@ -10,6 +10,11 @@
 # and every improvement to a harness that exists six times costs six edits or
 # produces six dialects.
 #
+# One sourcing file is not a self-check and not in that gate's set:
+# `tools/module-pins.sh` asks these same questions of this repository's own
+# `MODULE.bazel`, and `make check-pins` runs it from the push hook. The harness
+# is the same either way -- what differs is which gate the answers stop.
+#
 # Everything here is read by the file that sources this one, so "appears unused"
 # is the expected shape of every definition.
 # shellcheck disable=SC2034

@@ -181,7 +181,38 @@ Nothing has been released, and nothing here has driven a motor.
   ceiling, a composed setpoint is not step-guarded, and the per-tick step bound
   guards only the moves this repo plans for itself.
 
+### Fixed
+
+- **The robot can hear a barge-in over its own voice.** The pose-session
+  analyzer was measuring a playback's audible window from the instant its last
+  audio frame was written to the device, which is up to a second before the
+  speaker finishes --- the pacer runs ahead. Utterances in that tail were not
+  flagged as echo overlap, so the recorder accepted its own read-backs as
+  operator speech. The analyzer now spans a playback from first write to
+  audible end, pairs starts and finishes by reply id, and correctly marks
+  echo-overlapping carves. The underlying timing fix is in brenn-pod; this
+  side carries the consumer changes and the pin bump.
+
 ### Changed
+
+- **The pod binary is built from source with a checked pedigree.** `make
+  motion-build` compiles `reachy_pod` by running brenn-pod's own build script
+  in its arm64 container, instead of staging whatever prebuilt artifact the
+  other checkout last left behind. The build refuses unless the brenn-pod
+  checkout stands at the revision this tree links (or is overlaid to a path
+  inside it), reads the build record the script writes beside the binary, and
+  stamps the payload with both the pin and what actually compiled. The deploy
+  path carries the stamp into `provenance.txt`, and the pod's own startup line
+  prints the commit it was built from.
+
+- **A push gate catches `MODULE.bazel` overlays.** `make check-pins` (new)
+  checks that every `crate.spec` naming a brenn-pod package resolves from the
+  published remote at the pinned revision --- no working-tree paths, no literal
+  URLs, no module overrides. The pre-push hook runs it over each ref's tip
+  commit, so the overlay a two-repo development cycle commits for its own
+  duration cannot reach the remote. CI runs the same check as a backstop. The
+  script (`tools/module-pins.sh`, formerly `module-pins.test.sh`) carries its
+  own fixture suite that holds the reader to detecting each broken shape.
 
 - **A head obstruction during a stow defeats the stow.** Previously a
   `head_obstructed` raise inside a running stow re-commanded the stow into the

@@ -43,14 +43,44 @@ pub mod event {
     pub const LISTENING: &str = "listening";
     /// One carve, with its transcript, confidence and host-receipt stamps.
     pub const UTTERANCE: &str = "utterance";
-    /// The pod beginning to play a reply.
+    /// The pod beginning to play a reply: the reply's first frame written to
+    /// the device, which the device begins playing a playout hop later.
     pub const PLAYBACK_STARTED: &str = "playback_started";
-    /// The pod finishing one.
+    /// The last of a reply being heard. The pacer's estimate of where the
+    /// device runs out of audio, so a start and its finish bound what came out
+    /// of the speaker; the write finishing up to the pacer's lead earlier is
+    /// `playback_written`, which neither analyzer pairs a playback by.
     pub const PLAYBACK_FINISHED: &str = "playback_finished";
     /// A reply cut short by somebody speaking over it. Terminal: the job
     /// settles on it and no finish follows, so a reader pairing playbacks by
     /// their starts and finishes alone never closes a barged one.
     pub const PLAYBACK_FLUSHED: &str = "playback_flushed";
+}
+
+/// The utterance an event names, off whichever field it names it in.
+///
+/// Four spellings, because the pipeline names an utterance four ways: the
+/// utterance's own line calls it `id`, the events that answer it call it
+/// `utterance`, the recogniser's failure calls it `utterance_seq`, and a
+/// supersession names the whole identity with the sequence inside it.
+///
+/// Shared for the reason the names above are: both analyzers of a fetch pair a
+/// reply's events by this number — one keying a turn ledger, the other pairing a
+/// playback's start with its end — and a second copy of the spellings is a
+/// rename upstream that reaches one analyzer and not the other, which is two
+/// reports of one run disagreeing.
+#[must_use]
+pub fn utterance_id(object: &serde_json::Map<String, Value>) -> Option<u64> {
+    for key in ["utterance", "id", "utterance_seq"] {
+        if let Some(seq) = object.get(key).and_then(Value::as_u64) {
+            return Some(seq);
+        }
+    }
+    object
+        .get("utterance_id")
+        .and_then(Value::as_object)
+        .and_then(|id| id.get("seq"))
+        .and_then(Value::as_u64)
 }
 
 /// A line's text, bounded and stripped of control characters.

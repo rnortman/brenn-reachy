@@ -84,7 +84,9 @@ use reachy_motion::segments::{JointSample, MotionSegmenter, Segment, SegmentConf
 use run_report::event::{
     LISTENING, PLAYBACK_FINISHED, PLAYBACK_FLUSHED, PLAYBACK_STARTED, UTTERANCE,
 };
-use run_report::{EVENT_HEAD, Report, audio_dir, console_dir, quote, recover, write_verdict};
+use run_report::{
+    EVENT_HEAD, Report, audio_dir, console_dir, quote, recover, utterance_id, write_verdict,
+};
 use serde::Serialize;
 use serde_json::Value;
 use speech_pipeline::listener::silero::{SILERO_CHUNK, SILERO_SAMPLE_RATE};
@@ -98,6 +100,11 @@ const HOST_LOG: &str = "voice_host_0.log";
 /// A playback the writer gave up on. Terminal, like a flush: the job settles on
 /// it and no finish follows it.
 const PLAYBACK_ABORTED: &str = "playback_aborted";
+
+/// A playback whose audio has all been handed to the device, which is up to the
+/// pacer's lead before the last of it is heard. Neither an opener nor a closer
+/// here; the finish is the audible end.
+const PLAYBACK_WRITTEN: &str = "playback_written";
 
 /// The directory, inside a fetched run, holding the configuration it ran under.
 const CONFIG_DIR: &str = "config";
@@ -487,8 +494,18 @@ impl Spoken {
     }
 }
 
-/// One stretch of the pod playing something back.
+/// One stretch of the pod playing something back: audible from the first frame
+/// written to the instant the last of it is heard.
+///
+/// The start dates the first write and the end the pacer's estimate of the
+/// audible end, so the span is what came out of the speaker rather than what
+/// went into the device — which is the whole reason an utterance inside it is
+/// the parrot hearing itself.
 struct Played {
+    /// The reply this playback carried, where its lines named one. The join key
+    /// between a start and its closer: a job written while another's tail is
+    /// still audible interleaves the two, so recency pairs them wrongly.
+    utterance: Option<u64>,
     start_ns: i64,
     end_ns: i64,
     /// Whether the record holds the line that closed it.
@@ -554,10 +571,18 @@ impl Voice {
                         voice.said.push(spoken(seq, &value));
                     }
                     PLAYBACK_STARTED => voice.playbacks.push(Played {
+                        utterance: value.as_object().and_then(utterance_id),
                         start_ns: at_ns,
                         end_ns: at_ns,
                         closed: false,
                     }),
+                    // The last write, which is not the audible end: the pacer
+                    // runs up to its lead ahead of the device, so a second of
+                    // the reply is still coming out of the speaker here. The
+                    // finish below is the end of the audio. Read as neither a
+                    // start nor a closer, and named so that the reading is a
+                    // decision rather than a line that fell through.
+                    PLAYBACK_WRITTEN => {}
                     // Three closers and not one: a reply cut short by somebody
                     // speaking over it ends on a flush and a reply the writer
                     // gave up on ends on an abort, and neither is followed by a
@@ -568,13 +593,32 @@ impl Voice {
                     // A closer with no start ahead of it is a record whose head
                     // the fetch or the launcher's own wipe took: the playback
                     // happened, and all that is known of it is where it ended.
+                    //
+                    // A closer for audio nobody heard closes the clip it names
+                    // and nothing else. A flush reports the clips queued behind
+                    // the one it cut as well, and a clip already on the stream
+                    // has been written and so has a start of its own: left open
+                    // it would run to the end of the record and read as speech
+                    // over a read-back that stopped at the barge. It takes
+                    // neither fallback and mints no headless record, because
+                    // there is no window to bound where the device played
+                    // nothing.
                     PLAYBACK_FINISHED | PLAYBACK_FLUSHED | PLAYBACK_ABORTED => {
-                        match voice.playbacks.last_mut() {
-                            Some(open) if !open.closed => {
+                        let utterance = value.as_object().and_then(utterance_id);
+                        let closes = if heard_nothing(&value) {
+                            voice.opened_for(utterance)
+                        } else {
+                            voice.closing(utterance)
+                        };
+                        match closes {
+                            Some(index) => {
+                                let open = &mut voice.playbacks[index];
                                 open.end_ns = at_ns.max(open.start_ns);
                                 open.closed = true;
                             }
-                            _ => voice.playbacks.push(Played {
+                            None if heard_nothing(&value) => {}
+                            None => voice.playbacks.push(Played {
+                                utterance,
                                 start_ns: at_ns,
                                 end_ns: at_ns,
                                 closed: true,
@@ -587,18 +631,70 @@ impl Voice {
         }
         // A playback the record never closed ran until the record stopped: the
         // session ended over the parrot, which is the ordinary end of a run the
-        // operator interrupted with Ctrl-C.
-        if let Some(open) = voice.playbacks.last_mut()
-            && !open.closed
-        {
-            open.end_ns = last_ns.max(open.start_ns);
-            voice.notes.push(
-                "the speech record ends with a playback still running: the session was stopped \
-                 over the read-back"
-                    .to_owned(),
-            );
+        // operator interrupted with Ctrl-C. Every open one and not just the
+        // last: a job written while an earlier one's tail is still audible
+        // leaves two open, and the earlier of them left at its start is an
+        // overlap the report would miss.
+        let mut open = 0_usize;
+        for played in &mut voice.playbacks {
+            if !played.closed {
+                played.end_ns = last_ns.max(played.start_ns);
+                open += 1;
+            }
+        }
+        if open > 0 {
+            let plural = if open == 1 { "" } else { "s" };
+            voice.notes.push(format!(
+                "the speech record ends with {open} playback{plural} still running: the session \
+                 was stopped over the read-back"
+            ));
         }
         voice
+    }
+
+    /// Which open playback a closer closes, by index.
+    ///
+    /// The utterance the closer names, where it names one this record holds
+    /// open; otherwise the most recent open playback, which is what a line
+    /// carrying no id can mean. Nothing, where no playback is open — the
+    /// headless record whose start the fetch took.
+    ///
+    /// A closer carrying no id prefers the most recent open playback that
+    /// carries none either: an announcement names no reply, and one finishing
+    /// while a reply is playing would otherwise hand the reply's end to the
+    /// announcement and leave the reply for the fallback to mispair again.
+    ///
+    /// A closer naming a reply this record holds no playback open for takes the
+    /// same fallback, which is the one reading that can be wrong: a record whose
+    /// head the fetch truncated ends its reply on a line naming an id nothing
+    /// here started, and the most recent open playback — some other reply, still
+    /// playing — is what absorbs it. The alternative loses the closer entirely,
+    /// and a truncated record is likelier than a session that overlaps two
+    /// replies whose starts are unequally present.
+    fn closing(&self, utterance: Option<u64>) -> Option<usize> {
+        self.opened_for(utterance)
+            .or_else(|| {
+                if utterance.is_some() {
+                    return None;
+                }
+                self.playbacks
+                    .iter()
+                    .rposition(|played| !played.closed && played.utterance.is_none())
+            })
+            .or_else(|| self.playbacks.iter().rposition(|played| !played.closed))
+    }
+
+    /// The earliest open playback the closer's own reply id names, by index.
+    ///
+    /// Earliest, because a reply of several clips holds one open per clip it
+    /// wrote and the stream plays them in order, so the first still open is the
+    /// one a closer for that reply is about. Nothing for a closer carrying no
+    /// id: an id is what this pairs on.
+    fn opened_for(&self, utterance: Option<u64>) -> Option<usize> {
+        let id = utterance?;
+        self.playbacks
+            .iter()
+            .position(|played| !played.closed && played.utterance == Some(id))
     }
 
     /// Whether `interval` overlaps any playback.
@@ -607,6 +703,16 @@ impl Voice {
             played.start_ns <= interval.t_end_ns && played.end_ns >= interval.t_start_ns
         })
     }
+}
+
+/// Whether a closer says the device never played the clip it closes.
+///
+/// A flush reports every clip of the reply it cut, and the clips still queued
+/// behind the audible one carry `was_playing: false`: their frames were
+/// discarded with the device's bank rather than heard. Only the flush states the
+/// field, so a line without it is a line about audio that played.
+fn heard_nothing(value: &Value) -> bool {
+    value.get("was_playing").and_then(Value::as_bool) == Some(false)
 }
 
 /// What one `utterance` line said, out of the fields it says it in.
@@ -4565,7 +4671,425 @@ mod tests {
 
     /// One playback event of the pod's, as the router emits one.
     fn playback(event: &str, at_ms: i64) -> String {
-        format!(r#"{{"ts_ms":{at_ms},"event":"{event}","pod":"reachy00","utterance":2}}"#)
+        playback_of(event, at_ms, Some(2))
+    }
+
+    /// The same, for the reply a case names — or for a line carrying no reply
+    /// at all, which is what the fallback pairing exists for.
+    fn playback_of(event: &str, at_ms: i64, utterance: Option<u64>) -> String {
+        let named = utterance.map_or_else(String::new, |id| format!(r#","utterance":{id}"#));
+        format!(r#"{{"ts_ms":{at_ms},"event":"{event}","pod":"reachy00"{named}}}"#)
+    }
+
+    /// The write finishing is not the audible end: a carve that onsets after
+    /// the last frame was handed to the device, while a second of the reply is
+    /// still coming out of the speaker, is the parrot hearing itself.
+    ///
+    /// `playback_written` is the line that says where the write was. The reader
+    /// reads it as neither an opener nor a closer: read as a closer the window
+    /// would end early and this carve would go unflagged; read as an opener it
+    /// would leave a playback nothing closes.
+    #[test]
+    fn an_utterance_after_the_last_write_and_before_the_audible_end_is_over_the_playback() {
+        let at = scratch_dir("pose-session-banked");
+        let echo = stamps_for(2_400_000_000, 2_600_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback("playback_started", 1_000),
+                playback("playback_written", 2_000),
+                utterance(
+                    1,
+                    "this is the resting pose",
+                    echo.0 - 300_000,
+                    Some(echo.0),
+                    echo.1,
+                ),
+                playback("playback_finished", 3_100),
+            ],
+        );
+        let said = &document.utterances;
+        assert!(said[0].overlaps_playback, "{:?}", said[0]);
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "{:?}",
+            document.session.notes
+        );
+    }
+
+    /// A reply written while the previous one's tail is still audible
+    /// interleaves the lines — `started(A) started(B) finished(A) finished(B)`
+    /// — and the reply id is what pairs them.
+    ///
+    /// Paired by recency instead, A's finish closes B at A's end, B's finish
+    /// mints a phantom playback at an instant, and A is left open to the end of
+    /// the record: the span between A's end and B's is then the one stretch of
+    /// read-back an utterance is not flagged against.
+    #[test]
+    fn playbacks_the_record_interleaves_are_paired_by_their_reply() {
+        let at = scratch_dir("pose-session-interleaved");
+        let inside = stamps_for(3_000_000_000, 3_400_000_000);
+        let after = stamps_for(4_100_000_000, 4_300_000_000);
+        let lines = |said: String| {
+            vec![
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(1)),
+                playback_of("playback_started", 2_000, Some(2)),
+                playback_of("playback_finished", 2_600, Some(1)),
+                said,
+                playback_of("playback_finished", 3_600, Some(2)),
+                // A line past every playback, so a playback the pairing left
+                // open would be extended over the speech below rather than
+                // ending where the record does.
+                r#"{"ts_ms":5000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ]
+        };
+        let document = session_saying(
+            &at,
+            "inside",
+            &lines(utterance(
+                1,
+                "no, the other one",
+                inside.0 - 300_000,
+                Some(inside.0),
+                inside.1,
+            )),
+        );
+        assert!(
+            document.utterances[0].overlaps_playback,
+            "spoken inside the second reply: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "both replies were closed: {:?}",
+            document.session.notes
+        );
+
+        // Past the second reply's own end: the pairing bounds the session's
+        // read-back rather than running it to the end of the record.
+        let beyond = session_saying(
+            &at,
+            "after",
+            &lines(utterance(
+                1,
+                "this is the resting pose",
+                after.0 - 300_000,
+                Some(after.0),
+                after.1,
+            )),
+        );
+        assert!(
+            !beyond.utterances[0].overlaps_playback,
+            "{:?}",
+            beyond.utterances[0]
+        );
+    }
+
+    /// A closer naming no reply closes the open playback: an older pipeline's
+    /// line, or one whose tear recovery kept the head and lost the field.
+    #[test]
+    fn a_closer_that_names_no_reply_closes_the_open_playback() {
+        let at = scratch_dir("pose-session-unnamed-closer");
+        let after = stamps_for(2_400_000_000, 2_600_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(7)),
+                playback_of("playback_finished", 1_900, None),
+                utterance(
+                    1,
+                    "this is the resting pose",
+                    after.0 - 300_000,
+                    Some(after.0),
+                    after.1,
+                ),
+            ],
+        );
+        assert!(
+            !document.utterances[0].overlaps_playback,
+            "{:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "{:?}",
+            document.session.notes
+        );
+    }
+
+    /// One `playback_flushed` of the router's, which says whether the clip it
+    /// names was coming out of the speaker or was still queued behind it.
+    fn flushed(at_ms: i64, utterance: u64, was_playing: bool) -> String {
+        format!(
+            r#"{{"ts_ms":{at_ms},"event":"playback_flushed","pod":"reachy00","utterance":{utterance},"was_playing":{was_playing}}}"#
+        )
+    }
+
+    /// A barge cuts one reply and the router reports every clip of it: the
+    /// audible one, and one line per clip the device's bank discarded unheard.
+    /// An unheard line naming a reply whose clips are all closed closes nothing
+    /// — and reaches for no fallback.
+    ///
+    /// Read through the fallback it would close the reply written behind the
+    /// barged one — whose tail the stream carried on playing — at the flush
+    /// instant, and its own finish would then mint a phantom: the mispairing the
+    /// reply id exists to prevent.
+    #[test]
+    fn a_flush_of_a_clip_nobody_heard_closes_no_playback() {
+        let at = scratch_dir("pose-session-unheard-flush");
+        let inside = stamps_for(3_000_000_000, 3_200_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(1)),
+                playback_of("playback_started", 2_000, Some(2)),
+                flushed(2_500, 1, true),
+                flushed(2_500, 1, false),
+                utterance(
+                    1,
+                    "no, the other one",
+                    inside.0 - 300_000,
+                    Some(inside.0),
+                    inside.1,
+                ),
+                playback_of("playback_finished", 3_600, Some(2)),
+                r#"{"ts_ms":5000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ],
+        );
+        assert!(
+            document.utterances[0].overlaps_playback,
+            "spoken inside the reply the flush did not cut: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "both replies were closed: {:?}",
+            document.session.notes
+        );
+    }
+
+    /// A reply of two clips, barged: the flush reports the audible clip and the
+    /// one banked behind it, both under the reply's own id, and the second line
+    /// closes the second clip.
+    ///
+    /// Dropped instead, that clip's start stays open and the end-of-record sweep
+    /// runs it to the last line of the log, so every carve after the barge reads
+    /// as speech over a read-back that stopped at the barge — and the session
+    /// reads as ended over the parrot.
+    #[test]
+    fn a_flush_closes_every_clip_of_the_reply_it_names() {
+        let at = scratch_dir("pose-session-flushed-clips");
+        let after = stamps_for(4_000_000_000, 4_200_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(5)),
+                playback_of("playback_started", 2_000, Some(5)),
+                flushed(2_500, 5, true),
+                flushed(2_500, 5, false),
+                utterance(
+                    1,
+                    "this is the resting pose",
+                    after.0 - 300_000,
+                    Some(after.0),
+                    after.1,
+                ),
+                r#"{"ts_ms":6000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ],
+        );
+        assert!(
+            !document.utterances[0].overlaps_playback,
+            "spoken well after the barge cut the reply: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "the flush closed both clips: {:?}",
+            document.session.notes
+        );
+    }
+
+    /// A session stopped between two clips of one reply: both starts are open
+    /// when the record ends, and both run to it.
+    ///
+    /// The earlier one and not the later alone — left at its start it bounds no
+    /// window, and the read-back an utterance sits inside is the one the reader
+    /// would then miss. The note counts them.
+    #[test]
+    fn two_playbacks_open_when_the_record_ends_both_run_to_it() {
+        let at = scratch_dir("pose-session-two-open");
+        let inside = stamps_for(2_000_000_000, 2_400_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(1)),
+                utterance(
+                    1,
+                    "no, the other one",
+                    inside.0 - 300_000,
+                    Some(inside.0),
+                    inside.1,
+                ),
+                playback_of("playback_started", 4_000, Some(2)),
+                r#"{"ts_ms":5000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ],
+        );
+        assert!(
+            document.utterances[0].overlaps_playback,
+            "spoken inside the first reply, which never closed: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("2 playbacks still running")),
+            "two replies were left open: {:?}",
+            document.session.notes
+        );
+    }
+
+    /// A closer naming a reply this record holds no playback open for: the
+    /// record's head was truncated, and the most recent open playback is what
+    /// absorbs it rather than the line being lost.
+    ///
+    /// The reading that can be wrong, and the one the fallback's own reach is
+    /// measured by: the reply it absorbed into ends early, so a carve after that
+    /// instant is not flagged against it.
+    #[test]
+    fn a_closer_naming_no_open_reply_closes_the_open_playback() {
+        let at = scratch_dir("pose-session-mispaired-closer");
+        let inside = stamps_for(1_500_000_000, 1_800_000_000);
+        let after = stamps_for(3_000_000_000, 3_200_000_000);
+        let lines = |said: String| {
+            vec![
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(2)),
+                said,
+                playback_of("playback_finished", 2_000, Some(9)),
+                r#"{"ts_ms":5000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ]
+        };
+        let document = session_saying(
+            &at,
+            "inside",
+            &lines(utterance(
+                1,
+                "no, the other one",
+                inside.0 - 300_000,
+                Some(inside.0),
+                inside.1,
+            )),
+        );
+        assert!(
+            document.utterances[0].overlaps_playback,
+            "spoken before the closer arrived: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "the closer closed the open reply: {:?}",
+            document.session.notes
+        );
+
+        // Past that closer: the playback it closed bounds nothing further, so
+        // the fallback's reach is exactly one closer wide.
+        let beyond = session_saying(
+            &at,
+            "after",
+            &lines(utterance(
+                1,
+                "this is the resting pose",
+                after.0 - 300_000,
+                Some(after.0),
+                after.1,
+            )),
+        );
+        assert!(
+            !beyond.utterances[0].overlaps_playback,
+            "{:?}",
+            beyond.utterances[0]
+        );
+    }
+
+    /// An announcement names no reply, and one finishing while a reply plays
+    /// closes the announcement rather than the reply.
+    ///
+    /// Paired by recency alone the reply ends at the announcement's end, and
+    /// speech inside the rest of the reply reads as speech over nothing.
+    #[test]
+    fn an_unnamed_closer_prefers_the_unnamed_playback() {
+        let at = scratch_dir("pose-session-announcement");
+        let inside = stamps_for(3_000_000_000, 3_200_000_000);
+        let document = session_saying(
+            &at,
+            "session",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(4)),
+                playback_of("playback_started", 1_500, None),
+                playback_of("playback_finished", 2_000, None),
+                utterance(
+                    1,
+                    "no, the other one",
+                    inside.0 - 300_000,
+                    Some(inside.0),
+                    inside.1,
+                ),
+                playback_of("playback_finished", 3_600, Some(4)),
+                r#"{"ts_ms":5000,"event":"listening","addr":"127.0.0.1:9"}"#.to_owned(),
+            ],
+        );
+        assert!(
+            document.utterances[0].overlaps_playback,
+            "spoken inside the reply the announcement interrupted: {:?}",
+            document.utterances[0]
+        );
+        assert!(
+            !document
+                .session
+                .notes
+                .iter()
+                .any(|note| note.contains("still running")),
+            "both were closed: {:?}",
+            document.session.notes
+        );
     }
 
     /// Replace a fixture session's voice console with lines of a case's own.

@@ -49,9 +49,10 @@ binding on every change in this repo.
 ## Gates
 
 A commit scans the staged change for secrets and then runs `make check`; a push
-scans the range being pushed. Both hooks are wired by `make setup-hooks`, once
-per clone. CI independently scans the tree and runs `make check` on every push
-and pull request.
+runs `make check-pins` over the `MODULE.bazel` of each ref's tip — it resolves
+brenn-pod off this machine — and scans the range being pushed. Both hooks are wired by `make setup-hooks`,
+once per clone. CI independently scans the tree and runs `make check` and
+`make check-pins` on every push and pull request.
 
 Treat the local hooks as the gate and CI as a backstop, not the other way round.
 A CI run says nothing about the commit sitting in your working tree.

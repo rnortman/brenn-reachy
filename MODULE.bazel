@@ -238,9 +238,13 @@ crate.spec(
 #
 # The remote and the revision are named once each and the four specs read them,
 # so a fork, a mirror or a bump cannot reach some of them and not the rest.
+#
+# The payload build reads the build record this revision's
+# `build-reachy-pod.sh` writes beside the pod binary, so the pin cannot move
+# below the revision that first writes it.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "13a513d6b38a14194ecb2e1853a7a55d9e7f7dab"
+BRENN_POD_REV = "d80081f53d6b8725eb7cfbf217a54551a7def475"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
@@ -254,7 +258,9 @@ BRENN_POD_REV = "13a513d6b38a14194ecb2e1853a7a55d9e7f7dab"
 # with the pin; and a `path =` spec writes generated `BUILD.bazel` files into
 # the other repository's crate directories, which are the overlay's litter to
 # delete. The pin is what CI, a fresh clone and every other machine resolve --
-# `tools/module-pins.test.sh` is the gate that catches an overlay left active.
+# `tools/module-pins.sh`, which `make check-pins` runs at the push over the file
+# each pushed ref's tip carries, is the gate that catches an overlay reaching
+# one of them.
 #
 # The host library the robot's voice process is a composition of. reachy-host.
 crate.spec(

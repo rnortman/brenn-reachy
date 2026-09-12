@@ -118,6 +118,11 @@ jobs:
       # --config=ci points Bazel at the cached stores above.
       - run: make check BAZEL_FLAGS="$GATE_BAZEL_FLAGS"
 
+      # The push-side check, run here as the backstop it is meant to be: a
+      # `crate.spec` on a working-tree path resolves on the machine it was
+      # written on and nowhere else, so the runner is the second place to ask.
+      - run: make check-pins
+
       # Whether the caches are doing anything is otherwise invisible: a job that
       # restores nothing and writes nowhere is green and looks like any other,
       # just slower. The script compares .bazelrc's store paths against the ones
