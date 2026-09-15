@@ -755,6 +755,102 @@ assert_eq "and the field names the surface's, which is the one a reader wants" \
 	"$(pod_build_source "$two_trees")"
 
 # ---------------------------------------------------------------------------
+# The overlay form over a real checkout
+# ---------------------------------------------------------------------------
+#
+# The accepting half of the overlay path, against a checkout on disk: the two
+# cases above are both refusals, so the line this function writes for a build
+# that *passes* has no coverage, and the clean-tree branch of it is a build that
+# ends with no message at all if the dirty mark is assembled where a failed test
+# becomes the assignment's status.
+overlay_root="${work}/overlay"
+mkdir -p "${overlay_root}/reachy" "${overlay_root}/brenn-pod"
+git -C "${overlay_root}/brenn-pod" init -q
+printf 'the other repository\n' >"${overlay_root}/brenn-pod/README.md"
+git -C "${overlay_root}/brenn-pod" add README.md
+git -C "${overlay_root}/brenn-pod" \
+	-c user.name=tester -c user.email=tester@example.invalid \
+	commit -q -m "a revision to be named"
+overlay_head=$(git -C "${overlay_root}/brenn-pod" rev-parse HEAD)
+
+overlay_module="${work}/MODULE.overlay"
+cat >"$overlay_module" <<'OVERLAY'
+BRENN_POD_REV = "89abcdef0123456789abcdef0123456789abcdef"
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-pipeline",
+    package = "speech-pipeline",
+)
+OVERLAY
+
+# The two globals the function reads, set for these cases alone: the overlaid
+# specs are resolved against `repo_root` and the checkout against
+# `brenn_pod_dir`, and the case is the layout the comment above BRENN_POD_REV
+# describes — the two repositories side by side.
+overlay_line() {
+	(
+		repo_root=${overlay_root}/reachy
+		brenn_pod_dir=${overlay_root}/brenn-pod
+		refuse_unless_pod_checkout_matches "$overlay_module"
+		# shellcheck disable=SC2031 # set and read inside this same subshell,
+		# which is the point: the globals it writes do not escape a case.
+		printf '%s\n' "$pod_source_line"
+	)
+}
+
+result=$(attempt overlay_line)
+assert_status "an overlay onto a clean checkout is accepted" 0 "$(status_of "$result")"
+assert_eq "and the provenance line names the tree and the revision beside it" \
+	"the voice host links the working tree at ../brenn-pod/host/crates/speech-surface and the audio-device binary is built from ${overlay_root}/brenn-pod at ${overlay_head:0:12}" \
+	"$(output_of "$result")"
+
+# The same checkout with a tracked edit in it: the mark is the one difference,
+# and it is what the stamp reports as dirty.
+printf 'edited\n' >>"${overlay_root}/brenn-pod/README.md"
+result=$(attempt overlay_line)
+assert_status "an overlay onto a dirty checkout is accepted too" 0 "$(status_of "$result")"
+assert_contains "and the line says the tree was dirty" "$(output_of "$result")" \
+	"${overlay_head:0:12}+dirty"
+git -C "${overlay_root}/brenn-pod" checkout -q -- README.md
+
+# The loop's own reason for existing: a module whose second spec names another
+# tree is refused by that second spec rather than passed by the first. Without
+# the loop the check reads the surface's spec, finds it under the checkout being
+# built, and lets a payload through carrying two revisions of brenn-pod.
+split_module="${work}/MODULE.overlay-split"
+cat >"$split_module" <<'SPLIT'
+BRENN_POD_REV = "89abcdef0123456789abcdef0123456789abcdef"
+
+crate.spec(
+    path = "../brenn-pod/host/crates/speech-surface",
+    package = "speech-surface",
+)
+
+crate.spec(
+    path = "../elsewhere/host/crates/speech-pipeline",
+    package = "speech-pipeline",
+)
+SPLIT
+
+split_line() {
+	(
+		repo_root=${overlay_root}/reachy
+		brenn_pod_dir=${overlay_root}/brenn-pod
+		refuse_unless_pod_checkout_matches "$split_module"
+	)
+}
+
+result=$(attempt split_line)
+assert_status "specs naming two trees are refused" 1 "$(status_of "$result")"
+assert_contains "by the spec that names the other one" "$(output_of "$result")" 	"../elsewhere/host/crates/speech-pipeline"
+assert_contains "saying what the check is for" "$(output_of "$result")" 	"Two trees of brenn-pod in one payload"
+
+# ---------------------------------------------------------------------------
 # pod_provenance with nothing checked
 # ---------------------------------------------------------------------------
 #

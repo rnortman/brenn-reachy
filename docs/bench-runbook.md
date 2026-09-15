@@ -15,7 +15,7 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
       REACHY_SPEECH_CONFIG ?= /elsewhere/reachy-speech/speech.toml
       REACHY_HOST_PARAMS ?= /elsewhere/reachy00/host_params.textproto
 
-  Only make reads it, and not as shell syntax; for the `ssh` lines below,
+  Only make reads it, not as shell syntax; for the `ssh` lines below,
   `export REACHY_HOST=reachy00` too.
 - **`.local/reachy-bench.toml`** (`BENCH_CONFIG=` overrides): copy
   `crates/reachy-bench/reachy-bench.example.toml`, fill in `[bus]`'s serial
@@ -69,7 +69,7 @@ An unexpected reading goes to a person before anything is made green.
 **Run `make bench-run ARGS="watchdog"` and power-cycle before a unit's first
 motion run.** It fails here: a watchdog trip stops the servos with torque held.
 
-Watch the machine; the verdict is `first_motion_report`'s over the records. Tail from a second shell, under `/run/brenn-app/logs/launch`:
+Watch the machine; `first_motion_report` is the verdict. Tail from a second shell, under `/run/brenn-app/logs/launch`:
 `motord_0.log`, `proc_0.log`, `logger_proc_0.log`, plus `voice_host_0.log` and
 `pod_0.log` under the production config. Ctrl-C, or
 `curl -X POST 127.0.0.1:8080/quit`, stops it; the driver de-torques.
@@ -101,17 +101,18 @@ tmpfs); `make speech-provision` runs it alone. The far end is the production
 launcher config: voice host and audio device beside the motion stack. No
 budget — Ctrl-C ends it.
 
-The **assembly directory** is `speech.toml` plus the credentials it names,
-outside this tree, named by `REACHY_SPEECH_CONFIG`. It names them by the
+The **assembly directory** (`REACHY_SPEECH_CONFIG`) is `speech.toml` plus the
+credentials it names, outside this tree. `speech.toml` names them by the
 **payload-relative paths they will occupy** —
 `pod_psk_file = "secrets/pod-psk.toml"` is `<assembly>/secrets/pod-psk.toml`.
 Site values: loopback `listen_addr`; `[stt]`/`[tts]` URLs reachable *from the
 robot*, never `localhost`; `[brenn.bridge]`'s `wss://` URL and `token_file`,
 absent for a bus-less pipeline; four model paths spelling the staged
-`models/...` names; `[jsonl] sink = "stdout"`.
+`models/...` names, and the `[wake] phrase` they fix: `"hey jarvis"`;
+`[jsonl] sink = "stdout"`.
 
-Talk to it, then Ctrl-C. However it ends, the run is fetched and
-`speech_run_report` judges it.
+Talk to it; however it ends, the run is fetched and `speech_run_report` judges
+it.
 
 ## Recording poses
 
@@ -129,7 +130,7 @@ before speaking again**: a shorter pause merges two utterances. The tail is
 enabled = true`; `listen_addr`, `pod_psk_file` and `[pods]` must match.
 
 The fetch prints the `pose_session_report` command; it writes `session.json`
-and `timeline.txt` (a line per hold, move, utterance). Other segmenter flags
+and `timeline.txt` (a line per hold, move, utterance). Segmenter flags
 tune it; `--extract <segment>` drafts a clip.
 
 ## Exit codes

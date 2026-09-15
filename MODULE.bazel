@@ -242,9 +242,16 @@ crate.spec(
 # The payload build reads the build record this revision's
 # `build-reachy-pod.sh` writes beside the pod binary, so the pin cannot move
 # below the revision that first writes it.
+#
+# Moving this revision re-resolves the whole crate universe, and every other
+# `crate.spec` here names a version range, so the regenerated
+# `MODULE.bazel.lock` also carries whatever crates.io has published since the
+# last resolve. The `CHANGELOG.md` entry for a bump names the third-party
+# crates that moved with it, so a bisect that lands here knows which half to
+# read.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "d80081f53d6b8725eb7cfbf217a54551a7def475"
+BRENN_POD_REV = "ea6e0e4a08f5f0f8b40d49cd3de329dd3b50a481"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to

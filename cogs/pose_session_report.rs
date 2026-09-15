@@ -43,6 +43,11 @@
 //! before settling, while holding, or after letting go, and which they did is
 //! what the LLM turn reads off their own words.
 //!
+//! The pod's own read-backs travel in the same chronology: every playback the
+//! record holds, the reply it answered, how long it ran and whether somebody
+//! spoke over it. A session's words alone say what was heard and never say what
+//! the machine was saying while it was heard, which is what a leak reads as.
+//!
 //! One segment at a time then leaves as a clip draft. `--extract` writes the
 //! stretch an operator names as a clip document in the format the daemon's own
 //! loader reads: every channel a delta over the neutral base, one frame per
@@ -510,6 +515,10 @@ struct Played {
     end_ns: i64,
     /// Whether the record holds the line that closed it.
     closed: bool,
+    /// Whether what closed it was a flush: somebody spoke over the reply and
+    /// the rest of it was never heard. The one distinction an operator reads a
+    /// leak off — a read-back that ran to its end played clean.
+    cut: bool,
 }
 
 /// The session's speech, as the voice host recorded it.
@@ -575,6 +584,7 @@ impl Voice {
                         start_ns: at_ns,
                         end_ns: at_ns,
                         closed: false,
+                        cut: false,
                     }),
                     // The last write, which is not the audible end: the pacer
                     // runs up to its lead ahead of the device, so a second of
@@ -615,6 +625,7 @@ impl Voice {
                                 let open = &mut voice.playbacks[index];
                                 open.end_ns = at_ns.max(open.start_ns);
                                 open.closed = true;
+                                open.cut = event == PLAYBACK_FLUSHED;
                             }
                             None if heard_nothing(&value) => {}
                             None => voice.playbacks.push(Played {
@@ -622,6 +633,7 @@ impl Voice {
                                 start_ns: at_ns,
                                 end_ns: at_ns,
                                 closed: true,
+                                cut: event == PLAYBACK_FLUSHED,
                             }),
                         }
                     }
@@ -1121,12 +1133,40 @@ struct UtteranceDoc {
     overlaps_playback: bool,
 }
 
+/// One playback, as the document prints one.
+///
+/// The other half of the chronology an operator reads a leak off: a session's
+/// `SAY` lines alone say what was heard and never say what the machine was
+/// saying while it was heard.
+#[derive(Debug, Serialize)]
+struct PlaybackDoc {
+    /// Which playback of the record it is, counted from one.
+    seq: usize,
+    /// The utterance this reply answered, as the document numbers utterances —
+    /// the pipeline's id resolved to the carve's `seq` where this record holds
+    /// that carve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<usize>,
+    /// The pipeline's own id for that utterance, as the line carried it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utterance_id: Option<u64>,
+    t0_ns: i64,
+    t1_ns: i64,
+    duration_s: f64,
+    /// Whether somebody spoke over it and the rest was never heard.
+    cut: bool,
+    /// Whether the record holds the line that ended it: a playback still
+    /// running when the record stopped ends where the record does.
+    closed: bool,
+}
+
 /// The whole document.
 #[derive(Debug, Serialize)]
 struct Document {
     session: SessionDoc,
     segments: Vec<SegmentDoc>,
     utterances: Vec<UtteranceDoc>,
+    playbacks: Vec<PlaybackDoc>,
 }
 
 /// The per-sample kinematic solve of a whole stream.
@@ -1508,6 +1548,7 @@ fn analyze(
         ));
     }
     let (said, cuts) = document_utterances(voice, &documented, records, &mut notes);
+    let playbacks = document_playbacks(voice);
     let t0_ns = stream.samples.first().map_or(0, |sample| sample.t_ns);
     let duration_s = stream
         .samples
@@ -1564,6 +1605,7 @@ fn analyze(
             },
             segments: documented,
             utterances: said,
+            playbacks,
         },
         report,
         extraction,
@@ -2000,6 +2042,40 @@ fn document_utterances(
     (out_docs, cuts)
 }
 
+/// Every playback the record holds, in the order it started them.
+///
+/// The reply id each line carried is resolved to the carve's own `seq` here and
+/// not at read time: an id names a carve the record may hold no `utterance`
+/// line for — a truncated head, or a host that restarted and counted from zero
+/// again — and both numbers travel so a reader can tell which happened.
+///
+/// A restarted host also puts one id on two carves, and which of them a reply
+/// answers is not in the record. That reply claims no sequence either: the id
+/// stands alone, as it does for a carve the record lost, rather than naming the
+/// first of the two with a confidence nothing supports.
+fn document_playbacks(voice: &Voice) -> Vec<PlaybackDoc> {
+    voice
+        .playbacks
+        .iter()
+        .enumerate()
+        .map(|(index, played)| PlaybackDoc {
+            seq: index + 1,
+            reply_to: played.utterance.and_then(|id| {
+                let mut named = voice.said.iter().filter(|said| said.id == Some(id));
+                let first = named.next()?;
+                named.next().is_none().then_some(first.seq)
+            }),
+            utterance_id: played.utterance,
+            t0_ns: played.start_ns,
+            t1_ns: played.end_ns,
+            #[allow(clippy::cast_precision_loss)]
+            duration_s: (played.end_ns - played.start_ns) as f64 * 1e-9,
+            cut: played.cut,
+            closed: played.closed,
+        })
+        .collect()
+}
+
 /// One utterance's audio out of the fetched store, ready for the caller to
 /// write.
 ///
@@ -2128,6 +2204,30 @@ fn timeline(document: &Document) -> String {
                 "{at}  SAY    #{}    {:?}  before={before} after={after}{over}",
                 said.seq, said.text
             ),
+        );
+    }
+    // The read-backs, in the same chronology and keyed past the words: a reply
+    // and the carve that cut it stamp the same region, and the word is what the
+    // reply is about.
+    let after_said = after_segments + document.utterances.len();
+    for (index, played) in document.playbacks.iter().enumerate() {
+        let at = stamp(played.t0_ns - t0);
+        let ran = if played.cut {
+            format!("cut at {:.2}s", played.duration_s)
+        } else {
+            format!("{:.2}s", played.duration_s)
+        };
+        let reply = match (played.reply_to, played.utterance_id) {
+            (Some(seq), _) => format!("  reply to #{seq}"),
+            (None, Some(id)) => format!("  reply to id {id}"),
+            (None, None) => String::new(),
+        };
+        // A playback the record never closed ran to the end of the record, and
+        // its length is a lower bound rather than how long it played.
+        let open = if played.closed { "" } else { "  still running" };
+        lines.insert(
+            (played.t0_ns, after_said + index),
+            format!("{at}  PLAY   #{}    {ran}{reply}{open}", played.seq),
         );
     }
     let mut text = String::new();
@@ -2692,8 +2792,11 @@ mod tests {
     /// start is the missed-onset estimate off the first of those.
     const SAID_ESTIMATED: (i64, i64) = (4_500_000, 5_400_000);
     /// When the pod is playing the read-back of the second utterance back,
-    /// milliseconds: over the third, and over nothing else.
+    /// milliseconds: over the third, and over nothing else. Cut short, which is
+    /// what somebody speaking over a read-back does to it.
     const READ_BACK_MS: (i64, i64) = (4_900, 5_600);
+    /// An earlier reply, milliseconds: played to its end, over nothing said.
+    const FIRST_REPLY_MS: (i64, i64) = (2_800, 3_000);
 
     /// The frame log the fixture's utterances name their audio in.
     const FIXTURE_LOG: &str = "a.framelog";
@@ -2728,8 +2831,13 @@ mod tests {
     }
 
     /// The voice host's console for a fixture session: the pipeline announcing
-    /// itself, three utterances over the pose stream the fixture wrote, and the
-    /// parrot reading the second one back over the third.
+    /// itself, three utterances over the pose stream the fixture wrote, an
+    /// earlier reply played to its end, and the parrot reading the second
+    /// utterance back over the third — a read-back somebody cut short.
+    ///
+    /// Two replies and not one, because the timeline's `PLAY` lines are what an
+    /// operator reads a leak off and a fixture carrying only a cut read-back
+    /// proves nothing about the one that played clean.
     ///
     /// The pipeline's own human console is interleaved with the JSONL in this
     /// file, and the first utterance is glued onto the console sentence about it
@@ -2754,6 +2862,14 @@ mod tests {
                 SAID_OVER_MOVE.1,
             ),
             format!(
+                r#"{{"ts_ms":{},"event":"playback_started","pod":"reachy00","utterance":1,"interruptible":true}}"#,
+                FIRST_REPLY_MS.0
+            ),
+            format!(
+                r#"{{"ts_ms":{},"event":"playback_finished","pod":"reachy00","utterance":1}}"#,
+                FIRST_REPLY_MS.1
+            ),
+            format!(
                 r#"{{"ts_ms":{},"event":"playback_started","pod":"reachy00","utterance":2,"interruptible":true}}"#,
                 READ_BACK_MS.0
             ),
@@ -2767,7 +2883,7 @@ mod tests {
                 SAID_ESTIMATED.1,
             ),
             format!(
-                r#"{{"ts_ms":{},"event":"playback_finished","pod":"reachy00","utterance":2}}"#,
+                r#"{{"ts_ms":{},"event":"playback_flushed","pod":"reachy00","utterance":2}}"#,
                 READ_BACK_MS.1
             ),
         ];
@@ -3755,7 +3871,7 @@ mod tests {
         let text = timeline(&document);
         let segments: Vec<&str> = text
             .lines()
-            .filter(|line| !line.contains("  SAY "))
+            .filter(|line| !line.contains("  SAY ") && !line.contains("  PLAY "))
             .collect();
         assert_eq!(segments.len(), document.segments.len(), "{text}");
         assert!(segments[0].starts_with("00:00.00  STILL  S001"), "{text}");
@@ -4221,7 +4337,9 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec!["STILL", "SAY", "MOVE", "SAY", "STILL", "SAY"],
+            vec![
+                "STILL", "SAY", "PLAY", "MOVE", "SAY", "STILL", "PLAY", "SAY"
+            ],
             "{text}"
         );
         assert!(
@@ -4230,7 +4348,137 @@ mod tests {
                 && lines[1].contains("after=S003"),
             "{text}"
         );
-        assert!(lines[5].contains("over-readback"), "{text}");
+        assert!(lines[7].contains("over-readback"), "{text}");
+
+        // The read-backs in the same chronology: the one that played out, and
+        // the one that was cut short.
+        assert_eq!(
+            lines[2], "00:02.80  PLAY   #1    0.20s  reply to #1",
+            "{text}"
+        );
+        assert_eq!(
+            lines[6], "00:04.90  PLAY   #2    cut at 0.70s  reply to #2",
+            "{text}"
+        );
+    }
+
+    /// The document's own account of the read-backs, which is what the `PLAY`
+    /// lines are rendered off.
+    #[test]
+    fn the_playbacks_the_record_holds_travel_in_the_document() {
+        let at = scratch_dir("pose-session-playbacks-doc");
+        let document = read(&at, SegmentConfig::default());
+        let played = &document.playbacks;
+        assert_eq!(played.len(), 2, "{played:?}");
+        assert_eq!(played[0].seq, 1);
+        assert_eq!(played[0].reply_to, Some(1));
+        assert_eq!(played[0].utterance_id, Some(1));
+        assert!(!played[0].cut && played[0].closed, "{played:?}");
+        assert!((played[0].duration_s - 0.2).abs() < 1e-9, "{played:?}");
+        assert_eq!(played[1].seq, 2);
+        assert_eq!(played[1].reply_to, Some(2));
+        assert!(played[1].cut && played[1].closed, "{played:?}");
+    }
+
+    /// A playback naming a reply this record holds no `utterance` line for
+    /// keeps the pipeline's own id and claims no sequence: the two numbers are
+    /// not the same number, and inventing one would misattribute the reply.
+    #[test]
+    fn a_playback_for_a_reply_the_record_lost_carries_the_id_alone() {
+        let at = scratch_dir("pose-session-playback-unknown-reply");
+        let inside = stamps_for(3_000_000_000, 3_400_000_000);
+        let document = session_saying(
+            &at,
+            "orphan",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(77)),
+                playback_of("playback_finished", 1_600, Some(77)),
+                utterance(
+                    1,
+                    "this is the resting pose",
+                    inside.0 - 300_000,
+                    Some(inside.0),
+                    inside.1,
+                ),
+            ],
+        );
+        let played = &document.playbacks;
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert_eq!(played[0].utterance_id, Some(77));
+        assert_eq!(played[0].reply_to, None);
+        let text = timeline(&document);
+        assert!(
+            text.contains("PLAY   #1    0.60s  reply to id 77"),
+            "{text}"
+        );
+    }
+
+    /// A host that restarted counted its ids from zero again, so one id can name
+    /// two carves in one record. Which of them a reply answers is not knowable
+    /// from the record, so the reply claims no sequence and the id travels alone
+    /// — the same reading a reply whose carve the record lost gets, and the one
+    /// the reader is told to expect.
+    #[test]
+    fn a_reply_naming_an_id_two_carves_share_claims_neither() {
+        let at = scratch_dir("pose-session-playback-ambiguous-reply");
+        let first = stamps_for(1_000_000_000, 1_400_000_000);
+        let second = stamps_for(3_000_000_000, 3_400_000_000);
+        let document = session_saying(
+            &at,
+            "restarted",
+            &[
+                LISTENING_LINE.to_owned(),
+                utterance(
+                    7,
+                    "this is the resting pose",
+                    first.0 - 300_000,
+                    Some(first.0),
+                    first.1,
+                ),
+                utterance(
+                    7,
+                    "this is the reaching pose",
+                    second.0 - 300_000,
+                    Some(second.0),
+                    second.1,
+                ),
+                playback_of("playback_started", 4_000, Some(7)),
+                playback_of("playback_finished", 4_600, Some(7)),
+            ],
+        );
+        let played = &document.playbacks;
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert_eq!(played[0].utterance_id, Some(7));
+        assert_eq!(
+            played[0].reply_to, None,
+            "two carves answer to that id: {played:?}"
+        );
+        let text = timeline(&document);
+        assert!(text.contains("PLAY   #1    0.60s  reply to id 7"), "{text}");
+    }
+
+    /// A playback the record never closed: it ran to the end of the record, and
+    /// the line says so rather than claiming a length the record cannot know.
+    #[test]
+    fn a_playback_the_record_never_closed_is_said_to_be_still_running() {
+        let at = scratch_dir("pose-session-playback-open");
+        let document = session_saying(
+            &at,
+            "open",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback_of("playback_started", 1_000, Some(4)),
+            ],
+        );
+        let played = &document.playbacks;
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert!(!played[0].closed && !played[0].cut, "{played:?}");
+        assert_eq!(played[0].reply_to, None);
+        assert_eq!(played[0].utterance_id, Some(4));
+        let text = timeline(&document);
+        assert!(text.contains("PLAY   #1"), "{text}");
+        assert!(text.contains("still running"), "{text}");
     }
 
     /// The audio: one cut per utterance out of the store the fetch brought
@@ -4794,6 +5042,24 @@ mod tests {
             "{:?}",
             beyond.utterances[0]
         );
+
+        // Two replies, two `PLAY` lines, each bounded by its own pair: an
+        // operator reading the interleave off the timeline sees the span each
+        // reply actually occupied and not one span covering both.
+        let text = timeline(&document);
+        let played: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("  PLAY "))
+            .collect();
+        assert_eq!(played.len(), 2, "{text}");
+        assert!(
+            played[0].contains("PLAY   #1    1.60s  reply to #1"),
+            "{text}"
+        );
+        assert!(
+            played[1].contains("PLAY   #2    1.60s  reply to id 2"),
+            "{text}"
+        );
     }
 
     /// A closer naming no reply closes the open playback: an older pipeline's
@@ -5186,6 +5452,33 @@ mod tests {
             "{:?}",
             aborted.utterances[0]
         );
+        // An abort is the device dropping a clip, not a person taking the turn:
+        // the timeline reads a cut as a barge, so only the flush may set it.
+        assert!(
+            !aborted.playbacks[0].cut && aborted.playbacks[0].closed,
+            "{:?}",
+            aborted.playbacks
+        );
+    }
+
+    /// A flush whose start the fetch or the launcher's wipe took: all that is
+    /// known of the clip is where it ended, and that it was cut there. The
+    /// headless record carries the mark too — it is the one reading of such a
+    /// clip an operator gets.
+    #[test]
+    fn a_headless_flush_is_still_read_as_a_cut() {
+        let at = scratch_dir("pose-session-headless-flush");
+        let document = session_saying(
+            &at,
+            "beheaded",
+            &[
+                LISTENING_LINE.to_owned(),
+                playback("playback_flushed", 1_600),
+            ],
+        );
+        let played = &document.playbacks;
+        assert_eq!(played.len(), 1, "{played:?}");
+        assert!(played[0].cut && played[0].closed, "{played:?}");
     }
 
     /// The ordinary end of a recording session: ^C while the parrot is still

@@ -172,6 +172,10 @@ pub fn runnable_with_pods(
 /// Nothing here is a real model — they are bytes at a path, which is all a
 /// presence check reads. No `[brenn]`, so this composes without a bus.
 ///
+/// The `[wake]` table must carry a `phrase` — the words the wake model
+/// listens for — so a reply that says them is not cut short by the machine
+/// hearing itself.
+///
 /// # Panics
 ///
 /// If the directory cannot be written.
@@ -196,6 +200,7 @@ pub fn modelled_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf
              melspectrogram = {melspectrogram}\n\
              embedding = {embedding}\n\
              model = {wake_model}\n\
+             phrase = \"hey jarvis\"\n\
              [endpointer]\nmodel = {endpointer}\n\
              [brain]\nmode = \"wav\"\nclip = {clip}\n",
         ),

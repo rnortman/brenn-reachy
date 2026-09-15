@@ -37,7 +37,9 @@ against for talking over the read-back. `playback_audible` is a third line, and
 the only one that dates what the pod is *heard* saying: it moves when the reply
 being played changes, so a hand-over between two replies and a clip re-sent
 after a barge show up there and nowhere else. It is the barge-in floor's own
-record.
+record. A `barge_in` line's `cause` says which rule cut the reply — `wake`
+for a wake-word detection over it, `speech` for sustained confident speech —
+and under the default `[barge] mode = "wake"` only `wake` occurs.
 
 ## Listening to a turn
 

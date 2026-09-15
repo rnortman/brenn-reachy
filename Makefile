@@ -85,6 +85,7 @@ help:
 	@echo "  make check-device  the other half of the gate: the device binaries cross-compile"
 	@echo "  make check-pins    what a push must pass: MODULE.bazel resolves off this machine"
 	@echo "  make fix           auto-fix what the gate can fix (rustfmt)"
+	@echo "  make pod-overlay-on|-off|-status   link brenn-pod from the checkout next door"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
 	@echo "  make clip-config   regenerate the clip library asset from cogs/clips/"
@@ -265,6 +266,27 @@ check:
 .PHONY: check-pins
 check-pins:
 	tools/module-pins.sh
+
+# The overlay that check is the gate on, as two commands instead of four hand
+# edits.
+#
+# A seam landing on both sides of the brenn-pod arrow is developed with this
+# tree's four `crate.spec`s resolving from the checkout next door, so the voice
+# host links the same working tree the payload's pod is compiled from. All four
+# specs move together or the host links two revisions of brenn-pod; doing it by
+# hand is how half of them move.
+#
+# `on` before the cycle, `off` before the push — and `check-pins` above is what
+# catches an `off` nobody ran.
+.PHONY: pod-overlay-on pod-overlay-off pod-overlay-status
+pod-overlay-on:
+	tools/pod-overlay.sh on
+
+pod-overlay-off:
+	tools/pod-overlay.sh off
+
+pod-overlay-status:
+	tools/pod-overlay.sh status
 
 # The other half of the gate: everything a unit runs, built for the device. A
 # build and not a run — nothing here needs a device, and nothing here executes

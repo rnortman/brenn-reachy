@@ -95,13 +95,16 @@ use std::process::ExitCode;
 
 use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+use brenn_reachy__driver__health_clk_rs::DriverStatusWire;
 use brenn_reachy__driver__pose_clk_rs::{PoseEstimateWire, PoseSampleWire};
 use brenn_reachy__motion__reports_clk_rs::{ReportKind, ReportKindWire};
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 use log_read::{
     Bound, Census, Complaints, Logged, Streams, binding, cumulative, each, read_with, typed,
 };
-use motion_channels::{ESTIMATE_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL, SCRIPT_CHANNEL};
+use motion_channels::{
+    ESTIMATE_CHANNEL, POSE_CHANNEL, REPORT_CHANNEL, SCRIPT_CHANNEL, STATUS_CHANNEL,
+};
 use motion_evidence::{ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Motion};
 use motion_proto::DecodeError;
 use reachy_edge::{
@@ -1592,12 +1595,113 @@ impl Console {
     }
 }
 
-/// What the run's channel log held, over the three channels this tool reads.
+/// What the driver said about its own bus, folded off its status records.
 ///
-/// Three and not the twelve `first_motion_report` binds: a speech run is not a
+/// Three counters and one instant. The counters are the driver's own, cumulative
+/// since it started — so the newest record holds the whole of one driver's run
+/// and the fold keeps the last of each rather than a sum, but a counter that
+/// *falls* is a driver that started over, and the fold carries what the one
+/// before it had counted. Without that, a run an operator restarted the driver
+/// in — which is what a park-class fault asks of them — reads as a bus that
+/// answered everything, because the newest record is a fresh process's zero.
+/// The instant is the first record that carried any of them non-zero, which is
+/// the question a blinded bus is read with: a run whose misses are all in its
+/// first second is a start-up condition, and one that accumulates them
+/// throughout is a bus going away under a conversation.
+///
+/// The audio chip's reboot takes the servo bus with it while the board
+/// re-enumerates, and the commissioning survey asks each register once — so a
+/// single read that lands in the outage parks the machine, and the only trace on
+/// the verdict is a refusal with no cause beside it.
+#[derive(Default)]
+struct BusMisses {
+    /// Status records read, so a figure is never printed off no evidence.
+    records: usize,
+    /// The publisher's instant of the first record this log holds, whatever its
+    /// counters said: the base every offset below is measured from.
+    first_at_ns: Option<i64>,
+    /// The publisher's instant of the first record carrying a non-zero counter.
+    rose_at_ns: Option<i64>,
+    /// Rows that did not answer a grouped read, summed over cycles.
+    read_misses: u64,
+    /// Cycles in which the bus answered nothing at all.
+    blind_cycles: u64,
+    /// Health reads the machine did not answer, so no report went out.
+    health_misses: u64,
+    /// What every driver run before the newest one had counted, added in when a
+    /// counter fell.
+    carried: (u64, u64, u64),
+    /// How many times a counter fell — one per driver restart the log spans.
+    restarts: usize,
+}
+
+impl BusMisses {
+    /// Fold one status record in.
+    fn status(&mut self, at_ns: i64, status: &DriverStatusWire) {
+        self.records += 1;
+        if self.first_at_ns.is_none() {
+            self.first_at_ns = Some(at_ns);
+        }
+        let cycle = status.cycle();
+        let (read, blind, health) = (
+            cycle.read_misses(),
+            cycle.blind_cycles(),
+            cycle.health_misses(),
+        );
+        // A counter cannot fall within one driver run, so one that did is a
+        // process that started over. What it had reached is banked before the
+        // new run's figures take its place.
+        if read < self.read_misses || blind < self.blind_cycles || health < self.health_misses {
+            self.carried.0 += self.read_misses;
+            self.carried.1 += self.blind_cycles;
+            self.carried.2 += self.health_misses;
+            self.restarts += 1;
+        }
+        self.read_misses = read;
+        self.blind_cycles = blind;
+        self.health_misses = health;
+        if self.rose_at_ns.is_none() && self.any() {
+            self.rose_at_ns = Some(at_ns);
+        }
+    }
+
+    /// The three counters over every driver run this log spans.
+    const fn counted(&self) -> (u64, u64, u64) {
+        (
+            self.carried.0 + self.read_misses,
+            self.carried.1 + self.blind_cycles,
+            self.carried.2 + self.health_misses,
+        )
+    }
+
+    /// Whether the driver counted anything the bus did not answer.
+    const fn any(&self) -> bool {
+        let (read, blind, health) = self.counted();
+        read > 0 || blind > 0 || health > 0
+    }
+
+    /// How far into the log's own status stream the counters first rose, or
+    /// nothing where they never did — which is also the reading of a log that
+    /// held no status record at all.
+    ///
+    /// Against the log's first status record rather than against the run's
+    /// start, because the logger attaches when it attaches and the driver
+    /// publishes on a cadence: this is "how far into what was recorded", which
+    /// is what the number can honestly be.
+    fn rose_after_s(&self) -> Option<f64> {
+        let (first, rose) = (self.first_at_ns?, self.rose_at_ns?);
+        #[allow(clippy::cast_precision_loss)]
+        Some((rose - first) as f64 / 1e9)
+    }
+}
+
+/// What the run's channel log held, over the five channels this tool reads.
+///
+/// Five and not the twelve `first_motion_report` binds: a speech run is not a
 /// wake gesture, and the questions here are what the session said about the
-/// scripts that reached it, where the head was while it said so, and whether
-/// anything reached its port at all. Binding a channel this run has no question
+/// scripts that reached it, where the head was while it said so, whether
+/// anything reached its port at all, and whether the bus under all of it was
+/// answering. Binding a channel this run has no question
 /// about would buy a byte-equal refusal of a log for a schema nobody read.
 struct Log {
     /// The rows of the newest story the session published, which is the whole
@@ -1622,6 +1726,9 @@ struct Log {
     motion: Motion,
     /// The scripts that reached the session's port.
     scripts: Vec<Logged<ScriptWire>>,
+    /// What the driver counted about its own bus, folded off its status
+    /// records as they were read.
+    misses: BusMisses,
     /// Whether the machine stood still while it was asked to, folded off the
     /// driver's sample stream as it was read.
     ///
@@ -1649,6 +1756,7 @@ impl Default for Log {
             dropped: 0,
             motion: Motion::towards(&neutral_targets()),
             scripts: Vec::new(),
+            misses: BusMisses::default(),
             stillness: Stillness::default(),
             census: Census::default(),
             complaints: Complaints::default(),
@@ -1666,14 +1774,14 @@ impl Streams for Log {
     }
 }
 
-/// The four channels this tool binds, checked before anything is decoded.
+/// The five channels this tool binds, checked before anything is decoded.
 ///
 /// Bindings are strict, as everywhere: a log recorded under other schemas than
 /// this build's is refused rather than read approximately, because a payload of
 /// the right size is not the right message and a report about a machine read
 /// that way is nonsense. Reading such a log means building this tool at the
 /// revision `provenance.txt` names.
-const CHANNELS: [Bound<Log>; 4] = [
+const CHANNELS: [Bound<Log>; 5] = [
     Bound {
         name: REPORT_CHANNEL,
         check: binding::<TimelineWire>,
@@ -1726,6 +1834,21 @@ const CHANNELS: [Bound<Log>; 4] = [
             } = log;
             each::<PoseSampleWire>(message, complaints, |logged| {
                 stillness.sample(&logged.message);
+            });
+        },
+    },
+    // The driver's own account of its run, for what the bus under it answered.
+    // Cumulative and republished, so a logger that attached late still reads the
+    // whole of the counters and only loses how early they rose.
+    Bound {
+        name: STATUS_CHANNEL,
+        check: binding::<DriverStatusWire>,
+        route: |log, message| {
+            let Log {
+                misses, complaints, ..
+            } = log;
+            each::<DriverStatusWire>(message, complaints, |logged| {
+                misses.status(logged.at_ns, &logged.message);
             });
         },
     },
@@ -2938,6 +3061,54 @@ fn the_machine_held_still(records: &Records, report: &mut Report) {
     say(&log.stillness, Standard::Printed, report);
 }
 
+/// Whether the servo bus answered the driver, and what it cost if it did not.
+///
+/// Printed only when the driver counted something: on a healthy run every one of
+/// these is zero and a line saying so on every verdict is a line an operator
+/// learns to skim. What it says when it is there is the three counters at the
+/// end of the run and how far into the recorded status stream they first rose,
+/// which separates a start-up outage from a bus going away mid-conversation.
+///
+/// A finding rather than a figure when the session also refused to commission
+/// the machine. Either alone is ambiguous — counters can rise on a run that
+/// survived them, and a survey can refuse for reasons that are nothing to do
+/// with the bus — but the two together are the signature of the audio chip's
+/// reset taking the bus down under the survey.
+///
+/// Silent where there is no log, for the reason [`the_machine_held_still`] is.
+fn the_bus_answered(records: &Records, report: &mut Report) {
+    let Some(log) = records.readable() else {
+        return;
+    };
+    // Nothing rose, or nothing was read: either way the bus answered everything
+    // this log can speak for, which is not a finding.
+    let Some(after) = log.misses.rose_after_s() else {
+        return;
+    };
+    let (read_misses, blind_cycles, health_misses) = log.misses.counted();
+    let restarts = match log.misses.restarts {
+        0 => String::new(),
+        n => format!(", over {} driver run(s) in this log", n + 1),
+    };
+    let counted = format!(
+        "the driver counted read_misses={read_misses} blind_cycles={blind_cycles} \
+         health_misses={health_misses}, first {after:.1}s into the {} status record(s) \
+         read{restarts}",
+        log.misses.records
+    );
+    if log.rows(ReportKind::CommissionFailed).is_empty() {
+        report.note(counted);
+    } else {
+        report.fail(format!(
+            "{counted}; the session also refused to commission the machine in this run. A bus \
+             that stops answering while the startup survey asks each register once is what parks \
+             it, and the survey does not retry by design. The audio chip's reset takes the servo \
+             bus with it while the board re-enumerates: read the pod's startup line for what its \
+             `chip=` field says about when that reset ran."
+        ));
+    }
+}
+
 /// What the fetch's records held, whatever was made of it.
 ///
 /// The census is the difference between a channel that was silent and one this
@@ -3710,6 +3881,7 @@ fn analyze(console: &Console, clips: &Clips, records: &Records) -> Report {
     the_motion_path(console, &session, records, &mut report);
     the_head_moved(records, &session, &mut report);
     the_machine_held_still(records, &mut report);
+    the_bus_answered(records, &mut report);
     alerts_travelled(console, &mut report);
     turns(console, clips, &mut report);
     kinds(console, &mut report);
@@ -3762,11 +3934,11 @@ mod tests {
     use run_report::{Report, audio_dir, console_dir, sibling};
 
     use super::{
-        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Clips, Console, ESTIMATE_CHANNEL, HOST_LOG, Line,
-        POD_LOG, POSE_CHANNEL, PROVENANCE, PoseEstimateWire, PoseSampleWire, REPORT_CHANNEL,
-        Records, ReportKind, ReportKindWire, SCRIPT_CHANNEL, ScriptWire, SessionPhaseWire,
-        TURNS_SUFFIX, TimelineEntryWire, TimelineWire, analyze, classify, neutral_targets,
-        refusal_kinds,
+        ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Clips, Console, DriverStatusWire, ESTIMATE_CHANNEL,
+        HOST_LOG, Line, POD_LOG, POSE_CHANNEL, PROVENANCE, PoseEstimateWire, PoseSampleWire,
+        REPORT_CHANNEL, Records, ReportKind, ReportKindWire, SCRIPT_CHANNEL, STATUS_CHANNEL,
+        ScriptWire, SessionPhaseWire, TURNS_SUFFIX, TimelineEntryWire, TimelineWire, analyze,
+        classify, neutral_targets, refusal_kinds,
     };
 
     /// The whole reading of one fetch, as a case has just written it.
@@ -3842,6 +4014,9 @@ mod tests {
         story_schema: Option<ChannelMetadata>,
         /// The driver's heartbeat, cycle by cycle.
         samples: Vec<PoseSampleWire>,
+        /// The driver's own account of its run, record by record. Cumulative on
+        /// the wire, so a case states the counters as they stood at each copy.
+        statuses: Vec<DriverStatusWire>,
     }
 
     /// Write a run directory under a fetch, through the framework's own writer.
@@ -3926,6 +4101,30 @@ mod tests {
                         blob_as_bytes(sample),
                     )
                     .expect("a sample");
+            }
+        }
+        if !recorded.statuses.is_empty() {
+            let channel = writer
+                .add_channel(&ChannelMetadata::for_schema::<DriverStatusWire>(
+                    STATUS_CHANNEL,
+                ))
+                .expect("a status channel");
+            // A second apart, which is the driver's own republication cadence:
+            // the report reads how far into the stream the counters rose, and a
+            // fixture packed into a microsecond could not tell a start-up
+            // outage from a bus that went away later.
+            for (n, status) in recorded.statuses.iter().enumerate() {
+                let at = when(n as i64 * 1_000_000_000);
+                writer
+                    .log_message(
+                        channel,
+                        u32::try_from(n).expect("a small run"),
+                        at,
+                        at,
+                        &[],
+                        blob_as_bytes(status),
+                    )
+                    .expect("a status record");
             }
         }
         if recorded.scripts > 0 {
@@ -5655,6 +5854,175 @@ mod tests {
             found(&report, "never took the machine"),
             "{:?}",
             report.findings
+        );
+    }
+
+    /// A status record with these three counters standing at these values.
+    fn counted(read_misses: u64, blind_cycles: u64, health_misses: u64) -> DriverStatusWire {
+        let mut status = DriverStatusWire::new();
+        let cycle = status.cycle_mut();
+        cycle.set_read_misses(read_misses);
+        cycle.set_blind_cycles(blind_cycles);
+        cycle.set_health_misses(health_misses);
+        status
+    }
+
+    /// A bus that answered every cycle says nothing: the line exists for the
+    /// runs where it did not, and a zero on every verdict is a line an operator
+    /// stops reading.
+    #[test]
+    fn a_bus_that_answered_everything_is_not_reported_on() {
+        let (_dir, at) = records("speech-report-bus-clean", &[STARTED, COMPOSED]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                statuses: vec![counted(0, 0, 0), counted(0, 0, 0)],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(!measured(&report, "read_misses="), "{:?}", report.measured);
+    }
+
+    /// Counters that rose on a run the session commissioned anyway: a figure,
+    /// with how far into the recorded stream they first rose, and no finding.
+    #[test]
+    fn a_bus_that_went_quiet_is_measured_with_when_it_started() {
+        let (_dir, at) = records("speech-report-bus-misses", &[STARTED, COMPOSED]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                statuses: vec![counted(0, 0, 0), counted(56, 5, 2), counted(56, 5, 2)],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(
+                &report,
+                "the driver counted read_misses=56 blind_cycles=5 health_misses=2, first 1.0s \
+                 into the 3 status record(s) read"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The counters rose and the session refused to commission the machine in
+    /// the same run. Either alone is a figure; together they are the reset that
+    /// took the bus down under the survey, and a finding.
+    #[test]
+    fn a_blinded_bus_under_a_refused_commission_is_a_finding() {
+        let (_dir, at) = records("speech-report-bus-parked", &[STARTED, COMPOSED]);
+        let mut story = engagement();
+        story.push(row(ReportKindWire::COMMISSION_FAILED, 1, 16));
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                statuses: vec![counted(45, 3, 1)],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            found(&report, "read_misses=45 blind_cycles=3 health_misses=1")
+                && found(&report, "refused to commission the machine")
+                && found(&report, "`chip=` field"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A refused commission on a bus that answered every cycle. The finding
+    /// turns on the conjunction — either half alone is ambiguous — so a refusal
+    /// that had nothing to do with the bus must not be handed a bus outage as
+    /// its explanation.
+    #[test]
+    fn a_refused_commission_over_a_clean_bus_is_not_a_bus_finding() {
+        let (_dir, at) = records("speech-report-bus-clean-refusal", &[STARTED, COMPOSED]);
+        let mut story = engagement();
+        story.push(row(ReportKindWire::COMMISSION_FAILED, 1, 16));
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                statuses: vec![counted(0, 0, 0), counted(0, 0, 0)],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            !found(&report, "read_misses="),
+            "the bus answered everything it was asked: {:?}",
+            report.findings
+        );
+        assert!(!measured(&report, "read_misses="), "{:?}", report.measured);
+    }
+
+    /// The counters are one driver process's, so a restart inside the recorded
+    /// stream takes them back to zero — which is exactly what a park-class fault
+    /// asks an operator for. The fold banks what the run before had reached, so
+    /// the outage that parked the machine is still on the verdict rather than
+    /// wiped by the fresh process's first record.
+    #[test]
+    fn a_driver_restart_inside_the_log_does_not_wipe_what_it_counted() {
+        let (_dir, at) = records("speech-report-bus-restart", &[STARTED, COMPOSED]);
+        let mut story = engagement();
+        story.push(row(ReportKindWire::COMMISSION_FAILED, 1, 16));
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                statuses: vec![counted(0, 0, 0), counted(45, 3, 1), counted(0, 0, 0)],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            found(&report, "read_misses=45 blind_cycles=3 health_misses=1")
+                && found(&report, "over 2 driver run(s) in this log"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A log that carries no status channel at all: read as before, silent on
+    /// the bus, and every other reading of it intact.
+    ///
+    /// The channel is bound as strictly as the four before it, and in an
+    /// onboard log a channel nothing was ever published on is a channel the
+    /// writer never declared — so absence there is silence rather than a
+    /// complaint, and this case is what says so.
+    #[test]
+    fn a_log_with_no_status_channel_says_nothing_about_the_bus() {
+        let (_dir, at) = records("speech-report-bus-absent", &[STARTED, COMPOSED]);
+        let held = neutral_targets().head_pose_body;
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: engagement(),
+                poses: vec![held, held, held],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(!measured(&report, "read_misses="), "{:?}", report.measured);
+        assert!(
+            measured(&report, "largest excursion over the run was 0.0000 m"),
+            "{:?}",
+            report.measured
         );
     }
 

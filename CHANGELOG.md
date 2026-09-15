@@ -11,6 +11,30 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Added
 
+- **The speech run report says whether the servo bus answered.** On any run the
+  driver counted a `read_misses`, a `blind_cycle` or a `health_miss`, the report
+  prints all three and how far into the recorded status stream they first rose
+  --- and fails the run when that run also refused to commission the machine,
+  which is the signature of the bus going away while the startup survey asks
+  each register once. The report binds the driver's own `DriverStatus` channel
+  for it, as the first-motion report already does.
+
+- **The pose session report says what the machine was saying.** Every playback
+  the speech record holds travels in the document and on the timeline as a
+  `PLAY` line: the reply it answered, how long it ran, whether somebody spoke
+  over it, and whether the record ends with it still running. A session's `SAY`
+  lines alone never said what the pod's own voice was doing while a carve was
+  heard, which is what a read-back leaking into the microphone reads as.
+
+- **The brenn-pod overlay is a command.** `make pod-overlay-on` rewrites this
+  tree's four brenn-pod `crate.spec`s to resolve from the checkout next door,
+  `make pod-overlay-off` puts them back on `BRENN_POD_GIT`/`BRENN_POD_REV`, and
+  `make pod-overlay-status` says which form the file is in. All four specs move
+  together or none do --- a half-finished hand edit is a voice host linking two
+  revisions of brenn-pod, which the build then refuses after a cross-build. The
+  `off` side also clears the generated `BUILD.bazel` files an overlay leaves
+  untracked in the other checkout.
+
 - **A pose recorder for authoring clips by hand.** `make pose-record` runs a
   recording session: the servos de-torqued, the operator's hands on the head,
   and three streams on one clock --- servo positions at 50 Hz from a new
@@ -183,6 +207,14 @@ Nothing has been released, and nothing here has driven a motor.
 
 ### Fixed
 
+- **A payload built against a brenn-pod working tree gets built.** The
+  provenance line for an overlaid checkout ended in a command substitution whose
+  last command was a test for a dirty tree, so on a *clean* one the assignment
+  itself exited non-zero and `set -e` ended the build there --- no message, no
+  artifact, exit 1, on the case an overlay is normally in. The mark is computed
+  first and interpolated as a value, and the accepting half of that path gets
+  its first coverage, clean and dirty, over a real checkout on disk.
+
 - **The robot can hear a barge-in over its own voice.** The pose-session
   analyzer was measuring a playback's audible window from the instant its last
   audio frame was written to the device, which is up to a second before the
@@ -194,6 +226,23 @@ Nothing has been released, and nothing here has driven a motor.
   side carries the consumer changes and the pin bump.
 
 ### Changed
+
+- **The voice host barges in on the wake word, and wants the phrase written
+  out.** `BRENN_POD_REV` moves to a host whose default barge-in rule cuts an
+  audible reply only on a wake-word detection: speech over a reply no longer
+  interrupts it, because the echo canceller cannot tell the machine's own voice
+  from a person's while the head moves. The host refuses at startup any
+  configuration that builds a listener --- `[wake]` and `[endpointer]` both
+  present --- without `[wake] phrase`, the words the wake model listens for,
+  which is how a reply that says the phrase escapes being cut short by the
+  machine hearing itself. Every `speech.toml` assembled for a site needs that
+  key added before this pin is deployed.
+
+- **The crate lock moved with that pin.** Re-resolving `MODULE.bazel.lock` for
+  the new `BRENN_POD_REV` also took every third-party update the version ranges
+  in `MODULE.bazel` allow: `clap` and its three companion crates, `cc`, `ureq`
+  and `ureq-proto`, `wide`, `synstructure`, `yoke-derive`, `zerofrom-derive`.
+  Nothing in this tree asked for any of them.
 
 - **The pod binary is built from source with a checked pedigree.** `make
   motion-build` compiles `reachy_pod` by running brenn-pod's own build script

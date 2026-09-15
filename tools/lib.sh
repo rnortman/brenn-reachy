@@ -616,7 +616,7 @@ pod_build_source() {
 # Sets `pod_commit`, `pod_dirty` and `pod_source_line` for the stamp and the
 # provenance report; prints nothing.
 refuse_unless_pod_checkout_matches() {
-	local module=$1 source overlay top head status overlay_abs pod_abs forms mix
+	local module=$1 source overlay top head status overlay_abs pod_abs forms mix dirty_mark
 	source=$(pod_build_source "$module")
 	if [ "$source" = unknown ]; then
 		mix=0
@@ -671,7 +671,14 @@ refuse_unless_pod_checkout_matches() {
 				"Point BRENN_POD_DIR at the overlaid tree, or overlay the checkout this build" \
 				"is pointed at."
 		done < <(pod_overlay_paths "$module" | tr ',' '\n')
-		pod_source_line="the voice host links the working tree at ${overlay} and the audio-device binary is built from ${brenn_pod_dir} at ${head:0:12}$([ -n "$status" ] && echo "+dirty")"
+		# The mark is a variable and not a command substitution inside the
+		# string: a substitution whose last command is a failed test makes the
+		# whole assignment exit non-zero, and under `set -e` that ends the build
+		# with no message at all — on the clean-tree case, which is the common
+		# one.
+		dirty_mark=
+		[ -z "$status" ] || dirty_mark="+dirty"
+		pod_source_line="the voice host links the working tree at ${overlay} and the audio-device binary is built from ${brenn_pod_dir} at ${head:0:12}${dirty_mark}"
 		;;
 	*)
 		if [ "$head" != "$source" ]; then

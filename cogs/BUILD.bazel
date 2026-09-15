@@ -2072,7 +2072,7 @@ rust_clk_module(
 # what the machine did, and the recorded-audio store beside them, which it cuts
 # one `.wav` per turn out of into `<records>.turns` so a turn is listened to by
 # reading the line that names its file. The log half is read through the same `:log_read`
-# binding machinery the motion report uses, over four of the channels
+# binding machinery the motion report uses, over five of the channels
 # `:motion_channels` names, and judges the head's movement by `:motion_evidence`
 # -- the one copy of the tolerances and the solver both analyzers share. It
 # depends on the edge and the host for the words the console is spelled with, so
@@ -2097,6 +2097,7 @@ rust_binary(
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-host:reachy_host_lib",
         "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
         "//motion:reports_clk_rs",
         "//motion:timeline_clk_rs",
