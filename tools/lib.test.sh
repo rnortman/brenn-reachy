@@ -328,8 +328,14 @@ result=$(attempt toml_table_value "$speech_toml" stt url)
 assert_status "the same key under two tables is not a duplicate" 0 "$(status_of "$result")"
 
 # ---------------------------------------------------------------------------
-# The credential paths, and what a payload cannot carry
+# The payload-relative paths a configuration names, and what a payload cannot
+# carry
 # ---------------------------------------------------------------------------
+#
+# One checker under two readers: the credential files, and the wake head the
+# site supplies itself. The rules are about payload-relative paths and not about
+# what kind of file is at the end of one, so what the cases below pin per reader
+# is which noun the refusal speaks in.
 
 assert_eq "both credential fields come back, keyed, with the source beside the configuration" \
 	"pod_psk_file	secrets/pod-psk.toml	${work}/secrets/pod-psk.toml
@@ -352,7 +358,7 @@ printf 'pod_psk_file = "/etc/brenn/pod-psk.toml"\n' >"${work}/absolute.toml"
 result=$(attempt speech_credential_paths "${work}/absolute.toml")
 assert_status "an absolute credential path refuses" 1 "$(status_of "$result")"
 assert_contains "and the refusal says the payload carries its own" \
-	"$(output_of "$result")" "the payload carries its own credentials"
+	"$(output_of "$result")" "the payload carries its own copy of every credential"
 assert_contains "and says what it would do on the unit" "$(output_of "$result")" \
 	"names nothing on the unit"
 
@@ -398,6 +404,67 @@ printf 'pod_psk_file = "secrets/pod..psk.toml"\n' >"${work}/dots.toml"
 assert_eq "a doubled dot inside a name is not a climb" \
 	"pod_psk_file	secrets/pod..psk.toml	${work}/secrets/pod..psk.toml" \
 	"$(speech_credential_paths "${work}/dots.toml")"
+
+# ---------------------------------------------------------------------------
+# The wake head the site supplies
+# ---------------------------------------------------------------------------
+#
+# The one model that is site policy rather than build input: which phrase this
+# machine answers to. It travels by the credentials' convention -- the
+# configuration names the payload-relative path the file will occupy, and the
+# file sits beside the configuration under that same name -- so what is pinned
+# here is that the reader emits the same three columns, and that a key the
+# configuration does not state names nothing.
+
+printf '[wake]\nmode = "oww"\nmodel = "models/wake/head.onnx"\nphrase = "hey cogsworth"\n' \
+	>"${work}/wake.toml"
+assert_eq "the wake head comes back keyed, with the source beside the configuration" \
+	"model	models/wake/head.onnx	${work}/models/wake/head.onnx" \
+	"$(speech_model_paths "${work}/wake.toml")"
+
+# The source column is the configuration's own directory and not this process's:
+# a head is staged from beside the TOML the build was pointed at, wherever that
+# assembly directory sits.
+mkdir -p -- "${work}/elsewhere"
+cp -- "${work}/wake.toml" "${work}/elsewhere/wake.toml"
+assert_eq "the source is beside the configuration, not beside anything else" \
+	"model	models/wake/head.onnx	${work}/elsewhere/models/wake/head.onnx" \
+	"$(speech_model_paths "${work}/elsewhere/wake.toml")"
+
+# A configuration with no `[wake]` table at all is the voiced-but-deaf case the
+# host sorts out; nothing is staged for it and nothing is refused here.
+assert_eq "a configuration with no wake table names no model" "" \
+	"$(speech_model_paths "$speech_toml")"
+
+printf '[wake]\nmode = "oww"\nphrase = "hey cogsworth"\n' >"${work}/wake-modelless.toml"
+assert_eq "a wake table stating no model names none either" "" \
+	"$(speech_model_paths "${work}/wake-modelless.toml")"
+
+# A configuration that is not there names nothing, as for credentials: a payload
+# built without one is the ordinary case.
+assert_eq "a configuration that is not there names no model" "" \
+	"$(speech_model_paths "${work}/no-such-config.toml")"
+
+# The same checker, and the refusal speaks in this reader's noun: an operator
+# reading it is looking at a `[wake] model` line, not at a credential.
+printf '[wake]\nmodel = "/srv/models/head.onnx"\n' >"${work}/wake-absolute.toml"
+result=$(attempt speech_model_paths "${work}/wake-absolute.toml")
+assert_status "an absolute wake model path refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal is about wake models, not credentials" \
+	"$(output_of "$result")" "the payload carries its own copy of every wake model"
+
+printf '[wake]\nmodel = "../head.onnx"\n' >"${work}/wake-climbing.toml"
+result=$(attempt speech_model_paths "${work}/wake-climbing.toml")
+assert_status "a wake model path that climbs out of the payload refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "with the same rule as a credential" "$(output_of "$result")" \
+	"climbs out of the payload"
+
+printf '[wake]\nmodel = "./robotcpu.textproto"\n' >"${work}/wake-dot.toml"
+result=$(attempt speech_model_paths "${work}/wake-dot.toml")
+assert_status "a wake model path with a . component refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal names what it would install" "$(output_of "$result")" \
+	"install a wake model"
 
 # ---------------------------------------------------------------------------
 # The run directory under a log root

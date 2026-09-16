@@ -35,11 +35,19 @@ scripts do is search the machine and, for ONNX Runtime, download; what the
 answers should be is stated in `MODULE.bazel` and checked against the linked
 libraries by `//crates/reachy-host:host_closure_test`.
 
-The weights that runtime evaluates — the wake gate's three openWakeWord graphs
-and the endpointer's Silero graph — are fetched by digest too, and deliberately
-not committed: the openWakeWord models are CC BY-NC-SA 4.0, whose NonCommercial
-term this Apache-2.0 tree cannot redistribute under.
+The weights that runtime evaluates — the wake gate's two phrase-independent
+openWakeWord graphs and the endpointer's Silero graph — are fetched by digest
+too, and deliberately not committed: the openWakeWord models are CC BY-NC-SA
+4.0, whose NonCommercial term this Apache-2.0 tree cannot redistribute under.
 `//bazel/third_party/models` names them and the deployed payload carries a copy.
+
+The wake gate's third stage, the head that scores one phrase, is not fetched at
+all. It is a site's own file: the speech configuration's `[wake] model` names
+the payload-relative path it will occupy, the file sits beside that
+configuration under the same path, and `tools/build-motion.sh` stages it with
+the configuration's credentials. Changing which phrase a unit answers to is
+`[wake] model` and `[wake] phrase` in the site's configurations and the file
+beside them — nothing in this tree.
 
 An editor wanting a project model gets one from
 `bazel run @rules_rust//tools/rust_analyzer:gen_rust_project`, which writes the

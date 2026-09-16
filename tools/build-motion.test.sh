@@ -144,7 +144,7 @@ mkdir -p -- "${EXECROOT}/external/onnxruntime_linux_aarch64/lib"
 # it goes.
 export MODELS_PRESENT=1
 export MODELS_EXTRA=""
-export MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx silero_vad.onnx"
+export MODEL_FILES="melspectrogram.onnx embedding_model.onnx silero_vad.onnx"
 for name in $MODEL_FILES hey_pavlov_v0.1.onnx; do
 	mkdir -p -- "${EXECROOT}/external/model_${name%.onnx}/file"
 done
@@ -660,14 +660,15 @@ for file in "${config_files[@]}"; do
 	assert_file "the payload carries ${file} at that path" "${payload}/${file}"
 done
 # The weights, at the paths a speech configuration names them by — the wake
-# gate's three under one directory and the endpointer's under another, because
-# that is how the configuration that loads them spells the paths.
+# gate's front two under one directory and the endpointer's under another,
+# because that is how the configuration that loads them spells the paths. The
+# wake gate's third stage is not among them: it is a site's file, staged from
+# the assembly directory, and a payload built without a speech configuration
+# carries none.
 assert_file "the wake gate's spectrogram model is staged" \
 	"${payload}/models/oww/melspectrogram.onnx"
 assert_file "its embedding model is beside it" \
 	"${payload}/models/oww/embedding_model.onnx"
-assert_file "the wake phrase's own model is beside them" \
-	"${payload}/models/oww/hey_jarvis_v0.1.onnx"
 assert_file "the endpointer's model is staged" \
 	"${payload}/models/silero/silero_vad.onnx"
 assert_no_file "and none of them is left at the payload root" \
@@ -1522,10 +1523,11 @@ mkdir -p -- "${assembly}/secrets"
 assembly_config="${assembly}/speech.toml"
 
 # The whole assembly, rewritten by each case so a refusal leaves nothing behind
-# for the next one. `psk` and `token` are the payload-relative paths the TOML
-# names; an empty one leaves that key out of the file entirely.
+# for the next one. `psk`, `token` and `model` are the payload-relative paths
+# the TOML names; an empty one leaves that key out of the file entirely, and an
+# absent third argument leaves out the `[wake]` table altogether.
 stage_assembly() {
-	local psk=$1 token=$2
+	local psk=$1 token=$2 model=${3:-}
 	rm -rf -- "$assembly"
 	mkdir -p -- "${assembly}/secrets"
 	{
@@ -1534,6 +1536,10 @@ stage_assembly() {
 		printf '\n[stt]\nurl = "http://speaches.example:8000"\n'
 		if [ -n "$token" ]; then
 			printf '\n[brenn.bridge]\ntoken_file = "%s"\n' "$token"
+		fi
+		if [ -n "$model" ]; then
+			printf '\n[wake]\nmode = "oww"\nphrase = "hey cogsworth"\nmodel = "%s"\n' \
+				"$model"
 		fi
 	} >"$assembly_config"
 }
@@ -1547,12 +1553,28 @@ stage_credential() {
 	printf 'a credential\n' >"$at"
 }
 
+# The wake head beside the configuration, at the path the TOML names it by.
+# Separate from stage_assembly for the reason stage_credential is: a head the
+# configuration names and the directory does not hold is one of the refusals.
+stage_wake_model() {
+	local at="${assembly}/$1"
+	mkdir -p -- "$(dirname -- "$at")"
+	printf 'an onnx graph\n' >"$at"
+}
+
 REACHY_SPEECH_CONFIG="$assembly_config"
 export REACHY_SPEECH_CONFIG
 
-stage_assembly secrets/pod-psk.toml secrets/remote.token
+stage_assembly secrets/pod-psk.toml secrets/remote.token models/wake/head.onnx
 stage_credential secrets/pod-psk.toml
 stage_credential secrets/remote.token
+stage_wake_model models/wake/head.onnx
+# An assembly directory holds every head the site keeps -- the one in use, the
+# ones an A/B would reach for -- and whatever prose sits beside them. The
+# configuration names one. What follows the named head into the payload is the
+# difference between staging a path and staging a directory, so both live here.
+stage_wake_model models/wake/other.onnx
+printf 'which phrase each head wants\n' >"${assembly}/models/wake/README.md"
 result=$(build)
 assert_status "a build against an assembly directory succeeds" 0 "$(status_of "$result")"
 assert_file "the key table lands where the configuration names it" \
@@ -1569,19 +1591,58 @@ assert_contains "and the token" "$(output_of "$result")" \
 assert_lacks "and neither line carries a digest" "$(output_of "$result")" \
 	"$(sha256sum -- "${payload}/secrets/pod-psk.toml" | cut -d' ' -f1)"
 
-# The collision check decides whether a credential would be installed over a
-# payload member, and it asks that of a hand-written list. Nothing in the
-# subject keeps that list in step with what `stage` actually installs, and a
-# member added to one and not the other is a credential landing on top of a
-# config with the winner decided by install order -- bad bytes at run time,
-# found on hardware. This is the join: every path the build just staged has to
-# be one the collision check knows about.
+# The wake head travels the same way and lands at the path the TOML spells,
+# which is also the path the host resolves at run time. It is the member whose
+# identity decides which phrase the unit answers to, and nothing in this tree
+# fetches it: a build that did not stage it is a payload whose wake gate has no
+# third stage.
+assert_file "the wake head lands where the configuration names it" \
+	"${payload}/models/wake/head.onnx"
+assert_eq "and it carries the source's bytes" "an onnx graph" \
+	"$(cat -- "${payload}/models/wake/head.onnx")"
+# 0644 and not 0600: the credentials' mode guards keys from other accounts on
+# the unit, and a head is private in the publication sense, not that one. The
+# build's own models are 0644 and this sits among them.
+assert_eq "the head is staged at the mode the build's own models carry" 644 \
+	"$(stat -c %a -- "${payload}/models/wake/head.onnx")"
+assert_eq "and the build's fetched models are still that mode" 644 \
+	"$(stat -c %a -- "${payload}/models/oww/melspectrogram.onnx")"
+assert_contains "the report names the head and where it came from" \
+	"$(output_of "$result")" "models/wake/head.onnx  staged from ${assembly}/models/wake/head.onnx"
+# And it is the one staged member reported with a digest: a retrained head
+# arrives under the name of the one before it, so the source path says where the
+# file came from and not which file it is.
+assert_contains "and the head's line carries its digest" "$(output_of "$result")" \
+	"models/wake/head.onnx  staged from ${assembly}/models/wake/head.onnx  $(sha256sum -- "${payload}/models/wake/head.onnx" | cut -d' ' -f1)"
+
+# The configuration is what says which of the directory's heads the payload
+# carries, and the build stages that path and nothing else. A build that staged
+# the directory instead would ship weights the operator deliberately did not
+# select, at paths a mistyped `[wake] model` resolves to on the unit rather than
+# failing the preflight -- and both of these are members the accounting join
+# below would then refuse to account for.
+assert_no_file "a head the directory holds and no configuration names is not staged" \
+	"${payload}/models/wake/other.onnx"
+assert_no_file "and neither is the directory's own prose" \
+	"${payload}/models/wake/README.md"
+assert_lacks "and the report names neither" "$(output_of "$result")" "models/wake/other.onnx"
+assert_lacks "nor the prose" "$(output_of "$result")" "models/wake/README.md"
+
+# The collision check decides whether a site file -- a credential, the wake head
+# -- would be installed over a payload member, and it asks that of a hand-written
+# list. Nothing in the subject keeps that list in step with what `stage` actually
+# installs, and a member added to one and not the other is a site file landing on
+# top of a config with the winner decided by install order -- bad bytes at run
+# time, found on hardware. This is the join: every path the build just staged has
+# to be one the collision check knows about.
 #
-# The generated plan and the model weights are resolved sets rather than named
-# ones, so they are recognised by the shapes and the places they occupy; the
-# two credentials are this case's own. Everything else is a name the subject
-# spells in that list, and a member added to `stage` and not to it makes this
-# red.
+# The generated plan and the fetched weights are resolved sets rather than named
+# ones, so they are recognised by the two directories they occupy; the site files
+# -- two credentials and a head -- are this case's own and are named here one by
+# one, because nothing makes a head land under `models/` and a skip arm wide
+# enough to swallow it would make the next site member invisible to this join.
+# Everything else is a name the subject spells in that list, and a member added
+# to `stage` and not to it makes this red.
 listing=$(cd -- "$payload" && find . -type f | sed 's|^\./||' | sort)
 fixed=$(sed -n '/^payload_fixed_members=(/,/^)/p' -- "${script_dir}/build-motion.sh" |
 	sed -e '1d' -e '$d' -e 's/^[[:space:]]*//' -e 's/"//g' \
@@ -1591,14 +1652,15 @@ unaccounted=""
 while read -r member; do
 	[ -n "$member" ] || continue
 	case "$member" in
-	models/*) continue ;;
+	models/oww/* | models/silero/*) continue ;;
 	cogs/*.textproto | cogs/*.json | cogs/*.tachyon) continue ;;
 	driver/*.textproto | host/*.textproto | *.tachyon) continue ;;
 	secrets/pod-psk.toml | secrets/remote.token) continue ;;
+	models/wake/head.onnx) continue ;;
 	esac
 	grep -qxF -- "$member" <<<"$fixed" || unaccounted="${unaccounted}${member} "
 done <<<"$listing"
-assert_eq "every payload member is one the credential collision check knows about" \
+assert_eq "every payload member is one the site-file collision check knows about" \
 	"" "$unaccounted"
 
 # A configuration with no [brenn.bridge] is a voiced, bus-less pipeline. Legal,
@@ -1609,6 +1671,11 @@ result=$(build)
 assert_status "a configuration naming no bridge builds" 0 "$(status_of "$result")"
 assert_file "and the key table is still staged" "${payload}/secrets/pod-psk.toml"
 assert_no_file "and no token is" "${payload}/secrets/remote.token"
+# The same file states no `[wake]` at all. Nothing is staged for it and nothing
+# is refused: whether a pipeline with no head is coherent is the host's question
+# and surfaces at `--check`, not this build's.
+assert_no_file "a configuration with no wake table stages no head" \
+	"${payload}/models/wake/head.onnx"
 
 # A credential the configuration names and the assembly does not hold. The
 # refusal names both, because which of the two is wrong — the path or the
@@ -1633,7 +1700,7 @@ stage_credential secrets/pod-psk.toml
 result=$(build)
 assert_status "an absolute credential path refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal says the payload carries its own credentials" \
-	"$(output_of "$result")" "the payload carries its own credentials"
+	"$(output_of "$result")" "the payload carries its own copy of every credential"
 assert_unstaged "and that one stages nothing either"
 
 mark_payload
@@ -1709,6 +1776,161 @@ assert_contains "the refusal says what it could not read" "$(output_of "$result"
 	"the value's quoting does not close"
 assert_unstaged "and stages nothing"
 
+# ---------------------------------------------------------------------------
+# The wake head that configuration names
+# ---------------------------------------------------------------------------
+#
+# The head is the one model the build does not fetch: it is site policy, not a
+# third-party input, so it travels in the assembly directory with the
+# credentials. The refusals are the credentials' refusals under a noun of their
+# own, and what is pinned here is that a head the payload cannot carry is a
+# refused build rather than a unit that wakes to the wrong word or not at all.
+
+# A head the configuration names and the assembly does not hold. The likeliest
+# spelling mistake of the whole change -- a swap that edits `[wake] model` and
+# does not copy the file -- so the refusal names the key, the value and the path
+# it looked at.
+mark_payload
+stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "a named wake head that is not beside the configuration refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the key and its value" "$(output_of "$result")" \
+	"model = models/wake/head.onnx"
+assert_contains "and the path it looked at" "$(output_of "$result")" \
+	"${assembly}/models/wake/head.onnx"
+assert_contains "and says the head is the site's file and not a fetch" \
+	"$(output_of "$result")" "the assembly directory is the only place it can come from"
+assert_unstaged "and it stages nothing"
+
+# A head named at a path the payload already carries. Install order would decide
+# which file wins, and the loser is the wake gate reading a graph that is not
+# its own -- or the endpointer's model replaced by a head, which is a pipeline
+# that never fires. Refused for each class of member the payload holds.
+mark_payload
+stage_assembly secrets/pod-psk.toml "" models/silero/silero_vad.onnx
+stage_credential secrets/pod-psk.toml
+stage_wake_model models/silero/silero_vad.onnx
+result=$(build)
+assert_status "a wake head over a fetched model refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal says whose path it is" "$(output_of "$result")" \
+	"a payload member's own path"
+assert_contains "and says it is the wake model that would land there" \
+	"$(output_of "$result")" "The wake model would be installed over"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly secrets/pod-psk.toml "" reachy_host
+stage_credential secrets/pod-psk.toml
+stage_wake_model reachy_host
+result=$(build)
+assert_status "a wake head over a payload binary refuses" 1 "$(status_of "$result")"
+assert_contains "and names that path" "$(output_of "$result")" "reachy_host"
+assert_unstaged "and stages nothing"
+
+# A head over a credential: the collision between the two classes of site file,
+# which one shared check asks against everything resolved so far rather than each
+# resolver asking about the other. A key table replaced by an onnx graph is a pod
+# link that never opens, under a build that reported success.
+mark_payload
+stage_assembly secrets/pod-psk.toml "" secrets/pod-psk.toml
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "a wake head over a credential refuses" 1 "$(status_of "$result")"
+assert_contains "and names the credential's path" "$(output_of "$result")" \
+	"secrets/pod-psk.toml"
+assert_unstaged "and stages nothing"
+
+# The same check from inside one class. Two credentials at one path are refused
+# only because the accumulating list is itself in the scan: the first is
+# resolved and the second would be installed over it, with the winner decided by
+# install order and the payload carrying whichever `stage` wrote last.
+mark_payload
+stage_assembly secrets/pod-psk.toml secrets/pod-psk.toml
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "two credentials named at one path refuse" 1 "$(status_of "$result")"
+assert_contains "the refusal says whose path it is" "$(output_of "$result")" \
+	"a payload member's own path"
+assert_contains "and names the path they share" "$(output_of "$result")" \
+	"secrets/pod-psk.toml"
+assert_contains "and says it is a credential that would land there" \
+	"$(output_of "$result")" "The credential would be installed over"
+assert_unstaged "and stages nothing"
+
+# And the cross-class collision from the other key's side: a key table named at
+# the path `[wake] model` names is one file under two owners, and which of the
+# two classes was resolved first decides nothing about whether it is refused.
+mark_payload
+stage_assembly models/wake/head.onnx "" models/wake/head.onnx
+stage_credential models/wake/head.onnx
+result=$(build)
+assert_status "a credential and the head named at one path refuse" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path they share" "$(output_of "$result")" \
+	"models/wake/head.onnx"
+assert_contains "and says whose path it is" "$(output_of "$result")" \
+	"a payload member's own path"
+assert_contains "and names the head as what would land there" \
+	"$(output_of "$result")" "The wake model would be installed over"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly secrets/pod-psk.toml "" cogs/mover_params.textproto
+stage_credential secrets/pod-psk.toml
+stage_wake_model cogs/mover_params.textproto
+result=$(build)
+assert_status "a wake head over a cog's configuration refuses" 1 "$(status_of "$result")"
+assert_contains "and names it" "$(output_of "$result")" "cogs/mover_params.textproto"
+assert_unstaged "and stages nothing"
+
+# The path-shape rules are the credentials', spoken in this key's noun: an
+# operator reading the refusal is looking at a `[wake] model` line.
+mark_payload
+stage_assembly secrets/pod-psk.toml "" "${assembly}/models/wake/head.onnx"
+stage_credential secrets/pod-psk.toml
+stage_wake_model models/wake/head.onnx
+result=$(build)
+assert_status "an absolute wake head path refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal is about wake models" "$(output_of "$result")" \
+	"the payload carries its own copy of every wake model"
+assert_unstaged "and stages nothing"
+
+# The head the build stages is the site configuration's, and the recording
+# configuration is not read for it. That configuration names its own
+# `[wake] model` and is held equal to the site's by the push; reading both here
+# would be a second staging path and a collision case nobody needs.
+stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx
+stage_credential secrets/pod-psk.toml
+stage_wake_model models/wake/head.onnx
+record_assembly="${work}/record-assembly"
+rm -rf -- "$record_assembly"
+mkdir -p -- "$record_assembly"
+printf 'listen_addr = "127.0.0.1:7380"\n\n[wake]\nmode = "oww"\nphrase = "hey cogsworth"\nmodel = "models/wake/other.onnx"\n' \
+	>"${record_assembly}/speech-record.toml"
+REACHY_RECORD_SPEECH_CONFIG="${record_assembly}/speech-record.toml"
+export REACHY_RECORD_SPEECH_CONFIG
+result=$(build)
+assert_status "a recording configuration naming its own head does not refuse the build" 0 \
+	"$(status_of "$result")"
+assert_file "the site configuration's head is staged" "${payload}/models/wake/head.onnx"
+assert_no_file "and the recording configuration's is not" \
+	"${payload}/models/wake/other.onnx"
+unset REACHY_RECORD_SPEECH_CONFIG
+
+# `models/wake/` is a convention and nothing enforces it: the checks are about
+# path shapes and collisions, not about directories. Pinned because the member
+# accounting above names the head rather than skipping everything under
+# `models/`, and a head landing elsewhere is what that distinction is for.
+stage_assembly secrets/pod-psk.toml "" wake/head.onnx
+stage_credential secrets/pod-psk.toml
+stage_wake_model wake/head.onnx
+result=$(build)
+assert_status "a head outside models/ stages as readily" 0 "$(status_of "$result")"
+assert_file "at the path the configuration spells" "${payload}/wake/head.onnx"
+assert_no_file "and nowhere else" "${payload}/models/wake/head.onnx"
+
 # Back to the ordinary case, so what follows builds against a payload with no
 # speech configuration at all.
 unset REACHY_SPEECH_CONFIG
@@ -1768,16 +1990,16 @@ MODELS_EXTRA=""
 # MODULE.bazel. Nothing else catches it: every file the build did name was
 # resolved and placed, so the only evidence is the count.
 mark_payload
-MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx"
+MODEL_FILES="melspectrogram.onnx embedding_model.onnx"
 result=$(build)
 assert_status "a build naming fewer models than the payload wants refuses" 1 \
 	"$(status_of "$result")"
 assert_contains "the refusal names both counts" "$(output_of "$result")" \
-	"the payload wants 4 model files and the build named 3"
+	"the payload wants 3 model files and the build named 2"
 assert_contains "and says which two lists have to describe one set" \
 	"$(output_of "$result")" "model_paths"
 assert_unstaged "and a payload short a graph is never staged"
-MODEL_FILES="melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx silero_vad.onnx"
+MODEL_FILES="melspectrogram.onnx embedding_model.onnx silero_vad.onnx"
 
 mark_payload
 ONNX_MACHINE=62
@@ -2039,7 +2261,7 @@ assert_contains "and this script builds the payload filegroup itself" \
 
 # A fourth hand-written list, joined here for the same reason: the payload paths
 # this script installs the weights at, and the ones deploy-motion.sh refuses a
-# push without. Two scripts spelling four paths, and a path renamed in one of
+# push without. Two scripts spelling three paths, and a path renamed in one of
 # them is a push that turns away every payload this build stages.
 # Each row is `<downloaded name>\t<payload path>` inside one quoted string, on an
 # indented line, so the tab-separated fields are the empty indent, the name
@@ -2056,9 +2278,9 @@ deploy_models=$(awk '
 	inside && NF { print $1 }
 ' "${real_repo}/tools/deploy-motion.sh" | sort)
 
-assert_eq "the weights are staged at the four paths the push checks for" \
+assert_eq "the weights are staged at the three paths the push checks for" \
 	"$model_targets" "$deploy_models"
-assert_eq "and there are four of them, so neither list was read as empty" 4 \
+assert_eq "and there are three of them, so neither list was read as empty" 3 \
 	"$(printf '%s\n' "$model_targets" | grep -c .)"
 
 # The other half of that join, and the half the cases above cannot reach: the
@@ -2067,8 +2289,12 @@ assert_eq "and there are four of them, so neither list was read as empty" 4 \
 # no `http_file` downloads -- or a filegroup src with no row -- is invisible to
 # every case here and to `make check`, which never runs this script's subject.
 # The discovery would be a refused `make motion-build` at the bench, with the
-# operator already standing there. Changing the wake phrase is exactly that
-# edit: one digest, one downloaded name, one row.
+# operator already standing there.
+#
+# What the join holds is the fetched set against the staging rows against the
+# push's list. The wake gate's phrase head is in none of the three: it is a
+# site's file named by `[wake] model`, so changing the wake phrase touches
+# nothing this join reads and is not an edit in this tree at all.
 downloaded_names=$(awk '
 	match($0, /downloaded_file_path = "[^"]*"/) {
 		field = substr($0, RSTART, RLENGTH)
@@ -2093,10 +2319,12 @@ models_srcs=$(awk '
 
 assert_eq "every fetched model has a row, and every row a fetch" \
 	"$downloaded_names" "$fetched_names"
-assert_eq "and there are four of each, so neither list was read as empty" 4 \
+assert_eq "and there are three of each, so neither list was read as empty" 3 \
 	"$(printf '%s\n' "$downloaded_names" | grep -c .)"
-assert_eq "and the filegroup the build asks for names four repositories" 4 \
+assert_eq "and the filegroup the build asks for names three repositories" 3 \
 	"$(printf '%s\n' "$models_srcs" | grep -c .)"
+assert_lacks "and no fetch in this tree is a wake phrase's head" \
+	"$downloaded_names" "hey_jarvis"
 
 # ---------------------------------------------------------------------------
 # The two launcher config rules, held to each other

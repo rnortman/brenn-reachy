@@ -486,13 +486,19 @@ http_archive(
     urls = ["https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-aarch64-1.24.2.tgz"],
 )
 
-# The weights that runtime evaluates: the three-model openWakeWord graph the wake
-# gate runs and the Silero graph the endpointer runs. Fetched by hash rather than
-# committed, for two separate reasons -- the openWakeWord weights are
-# CC BY-NC-SA 4.0, whose NonCommercial term this Apache-2.0 tree cannot
-# redistribute under, and a model file is an opaque blob whose only meaningful
-# review is its digest. `//bazel/third_party/models` says what each one is and
-# what the payload does with it.
+# The weights that runtime evaluates: the two phrase-independent openWakeWord
+# graphs the wake gate runs ahead of its head, and the Silero graph the
+# endpointer runs. Fetched by hash rather than committed, for two separate
+# reasons -- the openWakeWord weights are CC BY-NC-SA 4.0, whose NonCommercial
+# term this Apache-2.0 tree cannot redistribute under, and a model file is an
+# opaque blob whose only meaningful review is its digest.
+# `//bazel/third_party/models` says what each one is and what the payload does
+# with it.
+#
+# The wake gate's phrase head is deliberately not here. It is a site's own file,
+# named by `[wake] model` in that site's speech configuration and staged from
+# beside it by `tools/build-motion.sh`, so which phrase a unit answers to is not
+# a fetch in this tree.
 #
 # Each URL names an immutable upstream object -- a release asset, or a file at a
 # commit -- so the pinned digest and the URL cannot disagree about which bytes a
@@ -514,13 +520,6 @@ http_file(
     downloaded_file_path = "embedding_model.onnx",
     sha256 = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f",
     urls = [OPENWAKEWORD_RELEASE + "/embedding_model.onnx"],
-)
-
-http_file(
-    name = "oww_hey_jarvis",
-    downloaded_file_path = "hey_jarvis_v0.1.onnx",
-    sha256 = "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb",
-    urls = [OPENWAKEWORD_RELEASE + "/hey_jarvis_v0.1.onnx"],
 )
 
 # Silero at a commit rather than a tag or a branch: upstream ships successive

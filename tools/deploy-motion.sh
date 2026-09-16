@@ -198,10 +198,14 @@ launch_configs=(robotcpu.textproto robotcpu_harness.textproto)
 # inference, on a unit, with the operator watching a head that never moves.
 # Files, not executables, and their contents are the build's business -- every
 # one of them is fetched against a digest.
+#
+# The wake gate's phrase head is not among them, because it is not fetched: it
+# is a site's own file, named by `[wake] model` in the speech configuration and
+# staged from beside it, so the path it occupies is the staged configuration's
+# to state rather than this list's.
 models=(
 	models/oww/melspectrogram.onnx
 	models/oww/embedding_model.onnx
-	models/oww/hey_jarvis_v0.1.onnx
 	models/silero/silero_vad.onnx
 )
 
@@ -250,6 +254,13 @@ run_config_files=(
 	cogs/servo_gains.textproto
 	cogs/mover_params.textproto
 )
+
+# The site-supplied models the staged speech configuration names, as
+# `speech_model_paths` emits them. Read once in the `--push` arm, where the
+# payload is asked to actually carry them, and read again by the provenance
+# stamp, which digests them: one listing, so the file the push checks for is the
+# file the stamp names. Empty for every other mode.
+staged_wake_models=
 
 # The directory of experiment configuration to lay over the staged payload, or
 # empty for none. The operator's, out of `.local/reachy.conf` by way of the
@@ -972,6 +983,14 @@ fetch_records() {
 # analyzers read; these lines are the push's own record of what it staged, so a
 # fetched log says both what its configuration is and that nothing rewrote it
 # between the push and the run.
+#
+# And a `wake_model_sha256=` line per site-supplied model the payload carries,
+# out of `staged_wake_models` — the listing the push already read from the staged
+# speech configuration. The commit does not name that file: it is the site's own,
+# not a fetch this tree pins, and a retrained head arrives in the assembly
+# directory under the name of the one before it. So the digest is the only thing
+# a fetched run can be attributed to a head by, which is what reading scores
+# across sessions and across heads needs.
 stamp_provenance() {
 	local into=$1 age_unchecked=$2
 	local pushed_from dirty built commit commit_source brenn_pod reachy_pod name
@@ -1042,6 +1061,12 @@ stamp_provenance() {
 # the copy that was pushed: the same files are in config/ beside these records,
 # so a digest that disagrees with one of them is a payload edited on the unit.
 #
+# A wake_model_sha256 line per model the speech configuration supplies itself,
+# naming its payload path and the digest of the copy that was pushed. The wake
+# head is a site file rather than a fetch this tree pins, and heads are retrained
+# under one name, so the commit above says nothing about which one this run
+# listened with. No such line means the payload carried no site-supplied model.
+#
 # brenn_pod is the other half of what built the voice host: the brenn-pod
 # revision the payload's build resolved its speech crates from. A value starting
 # overlay: means they came out of a working tree beside the building checkout
@@ -1067,6 +1092,11 @@ STAMP
 	for name in "${run_config_files[@]}"; do
 		echo "config_sha256=${name} $(sha256_of "${payload}/${name}")" >>"$into"
 	done
+	local model_path
+	while IFS=$'\t' read -r _ model_path _; do
+		[ -n "$model_path" ] || continue
+		echo "wake_model_sha256=${model_path} $(sha256_of "${payload}/${model_path}")" >>"$into"
+	done <<<"$staged_wake_models"
 	echo "${prog}: provenance: commit ${commit} (${commit_source}), pushed from ${pushed_from}," \
 		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
 }
@@ -1899,22 +1929,76 @@ require_record_config_agreement() {
 # A file that is not there is asked nothing: the site's absence is a unit
 # provisioned from a file this deploy cannot see, and the recording one's is the
 # refusal its own caller makes.
+#
+# Each row is `<table>\t<key>\t<reason>`, and the reason is the row's own: it
+# selects the paragraph that says why *that key* has to agree, rather than the
+# refusal being chosen by the table the key happens to sit in. A `[wake]`
+# threshold or policy added to this list would inherit the head-and-phrase
+# paragraph under a table-name dispatch, which is wrong guidance at the bench;
+# here it cannot be added without its author stating what it is.
+#
+# Two reasons so far. `link` is what the pod is reached by. `wake` is what the
+# gate is: the payload stages exactly one head, at the path the *site's*
+# configuration names, so a recording configuration naming another one names a
+# file no payload carries, and one stating another phrase opens on words the
+# staged head was not trained on. Neither is derivable from the other -- nothing
+# can check a phrase against a head -- which is why both are stated in both files
+# and both are held here.
+record_config_agreement_keys=(
+	$'\tlisten_addr\tlink'
+	$'\tpod_psk_file\tlink'
+	$'wake\tmodel\twake'
+	$'wake\tphrase\twake'
+)
+
 record_config_agreement() {
-	local mine_file=$1 mine_name=$2 site=$3 site_name=$4 key mine theirs
+	local mine_file=$1 mine_name=$2 site=$3 site_name=$4
+	local entry table rest key reason label mine theirs
+	local why=()
 	[ -f "$site" ] || return 0
 	[ -f "$mine_file" ] || return 0
-	for key in listen_addr pod_psk_file; do
-		mine=$(toml_table_value "$mine_file" "" "$key") || exit 1
-		theirs=$(toml_table_value "$site" "" "$key") || exit 1
-		[ "$mine" = "$theirs" ] ||
-			refuse "$rc_record_config_disagreement" \
-				"the ${mine_name} states ${key} = '${mine}' and the ${site_name} states '${theirs}'." \
-				"The pod is provisioned from the site's configuration and the recording session's" \
-				"voice host loads its own, so the two have to name one address and one key table:" \
-				"a pod dialling the address it was provisioned with would find nothing listening," \
-				"and a session with no pod is a session with no microphone and no speaker." \
-				"Both files are the operator's own — fix the recording one to match the site's and" \
-				"build again: make motion-build"
+	# Cut by hand rather than with `read`: a tab is IFS whitespace, so `read`
+	# would fold the leading empty table of a top-level key into the next
+	# column.
+	for entry in "${record_config_agreement_keys[@]}"; do
+		table=${entry%%$'\t'*}
+		rest=${entry#*$'\t'}
+		key=${rest%%$'\t'*}
+		reason=${rest#*$'\t'}
+		label=$key
+		[ -z "$table" ] || label="[${table}] ${key}"
+		mine=$(toml_table_value "$mine_file" "$table" "$key") || exit 1
+		theirs=$(toml_table_value "$site" "$table" "$key") || exit 1
+		[ "$mine" = "$theirs" ] && continue
+		case "$reason" in
+		wake)
+			why=(
+				"The payload stages one wake head, at the path the site's configuration names it by,"
+				"and a recording session under the gated policy opens on the phrase that head was"
+				"trained on: a recording configuration naming a different head loads a file the"
+				"payload does not carry, and one stating a different phrase never opens at all."
+			)
+			;;
+		link)
+			why=(
+				"The pod is provisioned from the site's configuration and the recording session's"
+				"voice host loads its own, so the two have to name one address and one key table:"
+				"a pod dialling the address it was provisioned with would find nothing listening,"
+				"and a session with no pod is a session with no microphone and no speaker."
+			)
+			;;
+		*)
+			die "record_config_agreement_keys states ${label} with reason '${reason}', which has no refusal body." \
+				"A key held to agree says why it is held; add its paragraph beside the others."
+			;;
+		esac
+		# The first line and the last two are the same whatever the reason:
+		# which pair disagrees, and that both files are the operator's to fix.
+		refuse "$rc_record_config_disagreement" \
+			"the ${mine_name} states ${label} = '${mine}' and the ${site_name} states '${theirs}'." \
+			"${why[@]}" \
+			"Both files are the operator's own — fix the recording one to match the site's and" \
+			"build again: make motion-build"
 	done
 }
 
@@ -2182,6 +2266,20 @@ case "$mode" in
 		require_members "shared object" "${shared_objects[@]}"
 		require_members "launcher config" "${launch_configs[@]}"
 		require_members model "${models[@]}"
+		# The wake head, at whatever path the payload's own configuration
+		# names it by. It is staged from beside that configuration rather
+		# than fetched, so the list above cannot hold it and the staged
+		# copy is the only thing on this machine that knows where it
+		# landed -- which is also why the payload is asked about it
+		# regardless of --stale-ok: a member that is not there is not a
+		# member that is old, and the symptom on the unit is a wake gate
+		# that fails at its first inference. The listing is kept for the
+		# provenance stamp below, which digests the same files.
+		staged_wake_models=$(speech_model_paths "${payload}/${speech_config_path}") || exit 1
+		while IFS=$'\t' read -r wake_key wake_path _; do
+			[ -n "$wake_key" ] || continue
+			require_members model "$wake_path"
+		done <<<"$staged_wake_models"
 		require_members "run configuration" "${run_config_files[@]}"
 
 		age_unchecked=no
@@ -2227,6 +2325,21 @@ case "$mode" in
 					"speech credential ${credential_path}" \
 					"${prog} ${host} --push --stale-ok"
 			done <<<"$speech_credentials"
+			# The wake head travels the same way the credentials do,
+			# and a retrained one dropped into the assembly directory
+			# since the last build is the same shape of mistake: a
+			# push that ships the previous gate under a green verdict.
+			# The site's configuration is what is read, as above --
+			# the recording one is held equal to it.
+			speech_models=$(speech_model_paths "$speech_config") || exit 1
+			while IFS=$'\t' read -r model_key model_path model_src; do
+				[ -n "$model_key" ] || continue
+				refuse_if_source_newer \
+					"${payload}/${model_path}" \
+					"$model_src" \
+					"wake model ${model_path}" \
+					"${prog} ${host} --push --stale-ok"
+			done <<<"$speech_models"
 		fi
 
 		log_root=$(config_string log_root_dir)

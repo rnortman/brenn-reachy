@@ -114,10 +114,25 @@ stage_payload() {
 		echo "${name}: from the build" >"${payload}/cogs/${name}.textproto"
 	done
 	for name in models/oww/melspectrogram.onnx models/oww/embedding_model.onnx \
-		models/oww/hey_jarvis_v0.1.onnx models/silero/silero_vad.onnx; do
+		models/silero/silero_vad.onnx; do
 		mkdir -p -- "$(dirname -- "${payload}/${name}")"
 		: >"${payload}/${name}"
 	done
+	# The wake head and the configuration that names it, which are one
+	# fixture rather than two: the head is not in the list above and cannot
+	# be -- it is the site's own file, staged from beside its configuration
+	# at whatever payload-relative path that configuration spells -- so the
+	# only thing that says a payload should carry this file is the copy of
+	# the configuration the payload itself carries.
+	mkdir -p -- "${payload}/host" "${payload}/models/wake"
+	: >"${payload}/models/wake/head.onnx"
+	cat >"${payload}/host/speech.toml" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+
+[wake]
+model = "models/wake/head.onnx"
+phrase = "hey cogsworth"
+TOML
 	stage_logger_config
 	rm -f -- "${payload}/build-commit.txt"
 	if [ -n "$BUILD_COMMIT" ]; then
@@ -469,6 +484,8 @@ speech_source="${repo}/host/speech.toml"
 mkdir -p -- "$(dirname -- "$speech_source")"
 printf 'listen_addr = "127.0.0.1:7380"\n' >"$speech_source"
 touch -d "@${after}" -- "$speech_source"
+# The fixture stages one; this case is about a payload that staged none.
+rm -f -- "${payload}/host/speech.toml"
 result=$(deploy unit --push)
 assert_status "a speech configuration the payload never staged refuses" 1 \
 	"$(status_of "$result")"
@@ -572,6 +589,55 @@ assert_contains "and says the payload carries none" "$(output_of "$result")" \
 : >"${payload}/secrets/remote.token"
 touch -d "@$((after + 60))" -- "${payload}/secrets/remote.token"
 
+# The wake head, which travels the way the credentials travel and goes stale the
+# way they do: retrained and dropped into the assembly directory after the last
+# build, it is a file no commit to this workspace dates, and pushed as it stands
+# it is the previous gate shipped under a green verdict. The path comes out of
+# the configuration, so the build's staging and this check cannot disagree about
+# where the head landed.
+mkdir -p -- "${repo}/host/models/wake" "${payload}/models/wake"
+cat >"$speech_source" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+
+[wake]
+model = "models/wake/head.onnx"
+TOML
+cp -- "$speech_source" "${payload}/host/speech.toml"
+: >"${repo}/host/models/wake/head.onnx"
+: >"${payload}/models/wake/head.onnx"
+touch -d "@${after}" -- "$speech_source" "${repo}/host/models/wake/head.onnx"
+touch -d "@$((after + 60))" -- "${payload}/host/speech.toml" \
+	"${payload}/models/wake/head.onnx"
+result=$(deploy unit --push)
+assert_status "a head no newer than its staged copy pushes" 0 "$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "${repo}/host/models/wake/head.onnx"
+result=$(deploy unit --push)
+assert_status "a head retrained since the build refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names it by the payload path its configuration spells" \
+	"$(output_of "$result")" "wake model models/wake/head.onnx"
+assert_contains "and says which copy would be shipped" "$(output_of "$result")" \
+	"newer than the copy in the payload"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok covers the head too" 0 "$(status_of "$result")"
+
+# A head the payload does not carry is the other half, and it is not an age
+# question: the member check reads the staged configuration and asks the payload
+# for what it found there, so the override that forgives an old head does not
+# forgive a missing one.
+rm -f -- "${payload}/models/wake/head.onnx"
+result=$(deploy unit --push --stale-ok)
+assert_status "a head the payload never staged refuses under --stale-ok too" 1 \
+	"$(status_of "$result")"
+assert_contains "and the refusal names the path the staged configuration spells" \
+	"$(output_of "$result")" "no model models/wake/head.onnx"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+: >"${payload}/models/wake/head.onnx"
+touch -d "@$((after + 60))" -- "${payload}/models/wake/head.onnx"
+rm -rf -- "${repo}/host/models"
+
 # A configuration this reader cannot read is a refused push, not a push that
 # skipped a credential it could not name.
 printf 'pod_psk_file = "secrets/pod-psk.toml\n' >"$speech_source"
@@ -652,12 +718,12 @@ stage_payload "$after"
 # so they are the one part a proxy or an outage can leave out of an otherwise
 # complete staging. Refused here, because the symptom on a unit is a wake gate
 # that fails at its first inference rather than a process that never starts.
-rm -f -- "${payload}/models/oww/hey_jarvis_v0.1.onnx"
+rm -f -- "${payload}/models/oww/embedding_model.onnx"
 result=$(deploy unit --push)
-assert_status "a payload missing the wake phrase's model refuses" 1 \
+assert_status "a payload missing the wake gate's embedding model refuses" 1 \
 	"$(status_of "$result")"
 assert_contains "the refusal names the missing model" "$(output_of "$result")" \
-	"no model models/oww/hey_jarvis_v0.1.onnx"
+	"no model models/oww/embedding_model.onnx"
 stage_payload "$after"
 
 rm -f -- "${payload}/models/silero/silero_vad.onnx"
@@ -666,6 +732,45 @@ assert_status "a payload missing the endpointer's model refuses" 1 \
 	"$(status_of "$result")"
 assert_contains "the refusal names that one too" "$(output_of "$result")" \
 	"no model models/silero/silero_vad.onnx"
+stage_payload "$after"
+
+# The wake head is checked the same way and named by something else: it is the
+# site's own file rather than a fetched one, so no list in this script knows its
+# path and the payload's own copy of the speech configuration is what is read for
+# it. Same symptom if it is missing -- a gate that fails at its first inference
+# -- and the same refusal.
+rm -f -- "${payload}/models/wake/head.onnx"
+result=$(deploy unit --push)
+assert_status "a payload missing the head its configuration names refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the path the configuration spells" \
+	"$(output_of "$result")" "no model models/wake/head.onnx"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
+stage_payload "$after"
+
+# A staged configuration naming no head is a payload that carries none and is
+# asked for none: whether what is left is a pipeline that can wake is the host's
+# business, and `--check` is where it surfaces.
+rm -f -- "${payload}/models/wake/head.onnx"
+printf 'listen_addr = "127.0.0.1:7380"\n' >"${payload}/host/speech.toml"
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a payload whose configuration names no head pushes" 0 \
+	"$(status_of "$result")"
+assert_lacks "and its stamp digests no head" "$(cat -- "$PUSHED_PROVENANCE")" \
+	"wake_model_sha256="
+stage_payload "$after"
+
+# A staged configuration whose head is spelled absolutely: the value would
+# resolve on the machine the payload was built on and name nothing on the unit,
+# so it is refused where it is read rather than checked for as a member.
+printf '[wake]\nmodel = "/opt/heads/head.onnx"\n' >"${payload}/host/speech.toml"
+result=$(deploy unit --push)
+assert_status "a staged configuration naming an absolute head refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal says what the payload carries its own of" \
+	"$(output_of "$result")" "the payload carries its own copy of every wake model"
+assert_lacks "and nothing is pushed" "$(calls)" "rsync"
 stage_payload "$after"
 
 # The two launcher configs are payload members like the binaries: `--run` names
@@ -884,6 +989,28 @@ for name in servo_profile servo_gains mover_params; do
 		"config_sha256=cogs/${name}.textproto $(sha256sum -- "${payload}/cogs/${name}.textproto" | cut -d' ' -f1)"
 done
 assert_lacks "and nothing was named as overlaid" "$(output_of "$result")" "overlay:"
+
+# The wake head, digested for a reason the three above do not need: it is a site
+# file and not a fetch this tree pins, so the stamp's commit says nothing about
+# which head a run listened with, and heads are retrained under one name. Without
+# this line a pile of fetched sessions cannot be sorted by the head that produced
+# their scores, which is the whole of reading a threshold.
+assert_contains "the stamp digests the staged wake head" "$stamp" \
+	"wake_model_sha256=models/wake/head.onnx $(sha256sum -- "${payload}/models/wake/head.onnx" | cut -d' ' -f1)"
+
+# A retrained head under the same name is a different stamp, which is what makes
+# the line worth writing.
+head_digest_before=$(sed -n 's/^wake_model_sha256=//p' -- "$PUSHED_PROVENANCE")
+printf 'a retrained onnx graph\n' >"${payload}/models/wake/head.onnx"
+rm -f -- "$PUSHED_PROVENANCE"
+result=$(deploy unit --push)
+assert_status "a push of a retrained head under the same name still pushes" 0 \
+	"$(status_of "$result")"
+stamp=$(cat -- "$PUSHED_PROVENANCE")
+assert_lacks "and the stamp no longer carries the head it replaced" "$stamp" \
+	"$head_digest_before"
+assert_contains "but names the one that landed" "$stamp" \
+	"wake_model_sha256=models/wake/head.onnx $(sha256sum -- "${payload}/models/wake/head.onnx" | cut -d' ' -f1)"
 
 # A payload missing one of the three is a build that staged nothing to overlay,
 # and a push of it would put a unit's analyzer in front of a log with no
@@ -2010,6 +2137,10 @@ stage_speech_config() {
 listen_addr = "127.0.0.1:7380"
 pod_psk_file = "secrets/pod-psk.toml"
 
+[wake]
+model = "models/wake/head.onnx"
+phrase = "hey cogsworth"
+
 [stt]
 url = "http://speaches.example:8000"
 
@@ -2527,6 +2658,8 @@ pod_psk_file = "secrets/pod-psk.toml"
 
 [wake]
 policy = "bypass"
+model = "models/wake/head.onnx"
+phrase = "hey cogsworth"
 
 [stt]
 url = "http://speaches.example:8100"
@@ -2585,12 +2718,106 @@ for key in listen_addr pod_psk_file; do
 	result=$(deploy unit --record "${work}/record-disagree-${key}")
 	assert_status "the two speech configurations disagreeing on ${key} refuses with its own code" 16 \
 		"$(status_of "$result")"
-	assert_contains "the refusal names the key" "$(output_of "$result")" "${key} = "
+	assert_contains "the refusal names the key with no table before it" \
+		"$(output_of "$result")" "states ${key} = "
+	assert_lacks "and renders no empty table name" "$(output_of "$result")" "[] ${key}"
 	assert_contains "and quotes both files' values" "$(output_of "$result")" \
 		"and the staged host/speech.toml states"
+	# The body is selected per row, so the link pair's paragraph is asserted
+	# here and the wake pair's absence with it: a dispatch that fell through
+	# would send an operator at the bench to go and fix a wake head.
+	assert_contains "and says why the link has to agree" "$(output_of "$result")" \
+		"a session with no pod is a session with no microphone"
+	assert_lacks "and not the wake pair's reason" "$(output_of "$result")" \
+		"The payload stages one wake head"
 	assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
 	stage_record_configs
 done
+
+# The wake pair, held for its own reason. The payload stages exactly one head,
+# at the path the site's configuration names it by, so a recording configuration
+# naming another one names a file no payload carries; and nothing anywhere can
+# check a phrase against a head, which is why the phrase is a second stated value
+# and is held here rather than derived.
+for key in model phrase; do
+	case $key in
+	model) wrong='model = "models/wake/other.onnx"' ;;
+	phrase) wrong='phrase = "hey somebody else"' ;;
+	esac
+	sed -i "s|^${key} = .*|${wrong}|" -- "${payload}/host/speech-record.toml"
+	result=$(deploy unit --record "${work}/record-wake-${key}")
+	assert_status "the two speech configurations disagreeing on the wake ${key} refuses with the same code" 16 \
+		"$(status_of "$result")"
+	assert_contains "the refusal names the table and the key" "$(output_of "$result")" \
+		"[wake] ${key} = "
+	assert_contains "and quotes both files' values" "$(output_of "$result")" \
+		"and the staged host/speech.toml states"
+	assert_contains "and says why one head is the only head" "$(output_of "$result")" \
+		"The payload stages one wake head"
+	assert_lacks "and not the link pair's reason" "$(output_of "$result")" \
+		"a session with no pod is a session with no microphone"
+	assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+	stage_record_configs
+done
+
+# A recording configuration stating neither key against a site one stating both
+# is the same disagreement: the session would open on a gate the payload's head
+# was not staged for.
+sed -i '/^model = /d;/^phrase = /d' -- "${payload}/host/speech-record.toml"
+result=$(deploy unit --record "${work}/record-wake-silent")
+assert_status "a recording configuration naming no head at all refuses too" 16 \
+	"$(status_of "$result")"
+assert_contains "and the refusal shows the empty half" "$(output_of "$result")" \
+	"[wake] model = ''"
+stage_record_configs
+
+# Every row states why its key is held, and that reason is what selects the
+# paragraph. The two lists are joined here because nothing else joins them: a
+# row whose reason no arm handles is latent until that key actually disagrees,
+# which is a `die` in the middle of a preflight with the operator already at the
+# bench.
+agreement_rows=$(sed -n '/^record_config_agreement_keys=(/,/^)/p' \
+	-- "${script_dir}/deploy-motion.sh")
+agreement_reasons=""
+while IFS= read -r line; do
+	case $line in *"\\t"*) ;; *) continue ;; esac
+	line=${line#*\$\'}
+	line=${line%\'*}
+	agreement_reasons="${agreement_reasons}${line##*\\t}"$'\n'
+done <<<"$agreement_rows"
+agreement_reasons=$(printf '%s' "$agreement_reasons" | sort -u)
+if [ -z "$agreement_reasons" ]; then
+	fail "the reasons record_config_agreement_keys states are readable" \
+		"read no rows out of deploy-motion.sh -- the array's spelling has moved"
+fi
+agreement_body=$(sed -n '/^record_config_agreement() {/,/^}/p' \
+	-- "${script_dir}/deploy-motion.sh")
+while IFS= read -r reason; do
+	[ -n "$reason" ] || continue
+	assert_eq "the '${reason}' reason has a refusal paragraph of its own" yes \
+		"$(printf '%s\n' "$agreement_body" |
+			grep -q "^[[:space:]]*${reason})\$" && echo yes || echo no)"
+done <<<"$agreement_reasons"
+
+# And the guard driven, because a join over the source cannot say what happens
+# when it is out of step. `[wake] policy` is a key the recording configuration
+# states and the site's does not, so an injected row naming it is the only one of
+# the five that disagrees.
+while IFS= read -r line; do
+	printf '%s\n' "$line"
+	case $line in
+	*"wake\\tphrase\\twake'") printf '\t$%s\n' "'wake\\tpolicy\\tmumble'" ;;
+	esac
+done <"${script_dir}/deploy-motion.sh" >"$subject"
+result=$(deploy unit --record "${work}/record-wake-noreason")
+assert_status "a key held to agree under a reason no arm handles stops the preflight" 1 \
+	"$(status_of "$result")"
+assert_contains "and names the row that has no refusal body" "$(output_of "$result")" \
+	"[wake] policy with reason 'mumble', which has no refusal body"
+assert_contains "and says what a row owes" "$(output_of "$result")" \
+	"A key held to agree says why it is held"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+cp -- "${script_dir}/deploy-motion.sh" "$subject"
 
 # A payload carrying no site configuration is asked nothing about agreement:
 # there is nothing to disagree with, and the pod on such a unit was provisioned
@@ -2673,6 +2900,18 @@ assert_contains "the refusal names the pair it read" "$(output_of "$result")" \
 	"the ${record_source} states listen_addr"
 assert_contains "and the site file it read against" "$(output_of "$result")" \
 	"and the ${speech_source} states"
+assert_lacks "and nothing is built" "$(calls)" "bazel"
+
+# The wake pair is asked of the operator's files at the same moment and for the
+# same reason: the swap it catches is one file edited and the other not, which is
+# the likeliest way a head change goes wrong, and catching it here costs no build.
+printf 'listen_addr = "127.0.0.1:7380"\npod_psk_file = "secrets/pod-psk.toml"\n\n[wake]\nmodel = "models/wake/head.onnx"\nphrase = "hey cogsworth"\n' \
+	>"$speech_source"
+result=$(deploy_tty unit --record-preflight)
+assert_status "a site file naming a head the recording one does not refuses before the build" 16 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the wake key" "$(output_of "$result")" \
+	"[wake] model = "
 assert_lacks "and nothing is built" "$(calls)" "bazel"
 rm -f -- "$speech_source"
 

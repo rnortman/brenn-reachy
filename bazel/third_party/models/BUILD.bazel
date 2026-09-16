@@ -2,16 +2,21 @@
 # fetched by digest in `MODULE.bazel` and named here as one set the payload
 # stages.
 #
-# Four files, two graphs:
+# Three files, two graphs:
 #
 #   melspectrogram.onnx    openWakeWord: raw audio -> mel spectrogram
 #   embedding_model.onnx   openWakeWord: spectrogram -> embedding
-#   hey_jarvis_v0.1.onnx   openWakeWord: embedding -> wake score for one phrase
 #   silero_vad.onnx        Silero VAD: P(speech) per 512-sample chunk
 #
-# The first three are the wake gate's; only the third is phrase-specific, so
-# changing the wake phrase is one digest here. The fourth is the endpointer's,
-# without which no wake ever fires.
+# The first two are the wake gate's front half and are the same whatever phrase
+# a unit answers to. The third is the endpointer's, without which no wake ever
+# fires.
+#
+# The wake gate's third stage -- the head that turns an embedding into a score
+# for one phrase -- is deliberately absent. It is a site's own file, named by
+# `[wake] model` in that site's speech configuration and staged from beside it,
+# so changing the wake phrase is `[wake] model` and `[wake] phrase` in the
+# speech configurations and the file beside them, and nothing in this tree.
 #
 # **The openWakeWord weights are not redistributed by this repository.** Their
 # code is Apache-2.0 but the pre-trained models are CC BY-NC-SA 4.0, whose
@@ -28,7 +33,6 @@ filegroup(
     name = "models",
     srcs = [
         "@oww_embedding//file",
-        "@oww_hey_jarvis//file",
         "@oww_melspectrogram//file",
         "@silero_vad//file",
     ],

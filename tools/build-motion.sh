@@ -28,8 +28,9 @@
 #     host/speech-record.toml                           a recording session's voice half
 #     bench/reachy-bench.toml                           the recorder's own configuration
 #     cogs/clip_library.names.json                      the overlay name table it reads
-#     models/oww/*.onnx                                 the wake gate's three graphs
+#     models/oww/*.onnx                                 the wake gate's two front graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
+#     wherever `[wake] model` puts it                   the wake gate's phrase head
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
 #     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
@@ -82,8 +83,9 @@
 #                          (default: the gitignored host/speech.toml of this
 #                          tree; a payload built without one carries no speech
 #                          configuration, which is a host that narrates and does
-#                          not listen). The credential files it names are staged
-#                          with it, from beside it — see the assembly directory
+#                          not listen). The credential files it names, and the
+#                          wake head its `[wake] model` names, are staged with
+#                          it, from beside it — see the assembly directory
 #                          below.
 #   REACHY_RECORD_SPEECH_CONFIG  the same for a recording session's voice half,
 #                          which transcribes with no wake word and reads each
@@ -97,14 +99,19 @@
 #                          relative to this repository's root; a payload built
 #                          without one is refused by `--record` the same way)
 #
-# A speech configuration is not one file but a small directory: the TOML, and
-# the credential files it names — the pod's key table, the bus token — beside
-# it. The TOML names them by the payload-relative paths they will occupy, which
-# are also the paths the host resolves at run time, because the launcher starts
-# it with the payload root as its working directory. This script stages them
-# into the payload for the reason it stages `reachy_pod` there: a payload member
-# that arrived by a different route would be the one file whose freshness,
-# machine and digest nothing checked.
+# A speech configuration is not one file but a small directory: the TOML, the
+# credential files it names — the pod's key table, the bus token — and the wake
+# gate's phrase head, beside it. The TOML names them by the payload-relative
+# paths they will occupy, which are also the paths the host resolves at run
+# time, because the launcher starts it with the payload root as its working
+# directory. This script stages them into the payload for the reason it stages
+# `reachy_pod` there: a payload member that arrived by a different route would
+# be the one file whose freshness, machine and digest nothing checked.
+#
+# The head is in that directory and not in the fetch table because it is the one
+# model that is site policy: which phrase this machine answers to. The other
+# three are third-party, phrase-independent and identical for every unit, so the
+# build owns them.
 
 set -euo pipefail
 
@@ -164,7 +171,7 @@ prelaunch_target=//cogs:clockwork_prelaunch_sh
 # is a process that never starts.
 onnx_target=//bazel/third_party/onnxruntime:shared_object
 # The wake and VAD weights, fetched by digest rather than committed. One target
-# for all four, because they are staged as a set and none of them is told apart
+# for all three, because they are staged as a set and none of them is told apart
 # from another by anything this script does.
 models_target=//bazel/third_party/models:models
 
@@ -172,12 +179,15 @@ models_target=//bazel/third_party/models:models
 # not this script's choice either: the host's speech configuration names a model
 # by a path relative to the working directory the launcher starts it in, which is
 # the payload root, so this table and that configuration have to spell the same
-# four paths. A model the build fetches and this table has no row for is a
+# three paths. A model the build fetches and this table has no row for is a
 # refused build rather than a file quietly left out of the payload.
+#
+# The wake gate's phrase head is not a row here and is not fetched at all: it is
+# a site's own file, named by `[wake] model` and staged from beside the speech
+# configuration by `resolve_speech_models` below.
 model_paths=(
 	"melspectrogram.onnx	models/oww/melspectrogram.onnx"
 	"embedding_model.onnx	models/oww/embedding_model.onnx"
-	"hey_jarvis_v0.1.onnx	models/oww/hey_jarvis_v0.1.onnx"
 	"silero_vad.onnx	models/silero/silero_vad.onnx"
 )
 
@@ -374,9 +384,10 @@ resolve_models() {
 # launcher's prelaunch script, the speech configuration and the build stamp. The
 # push writes one more, `provenance.txt`, into the same directory.
 #
-# They are listed for one purpose — deciding whether a credential file the
-# speech configuration names would land on top of one of them. Nothing else
-# reads this, and the members themselves are installed by `stage` by name,
+# They are listed for one purpose — deciding whether a site file the speech
+# configuration names would land on top of one of them. Their one reader is
+# `refuse_payload_collision`, asked by both site-file resolvers (the credentials
+# and the wake head); the members themselves are installed by `stage` by name,
 # because an unlabelled argument list is where two cross-built binaries get
 # transposed.
 payload_fixed_members=(
@@ -404,13 +415,45 @@ payload_fixed_members=(
 # source>\t<path under the payload root>`, in the shape `plan_files` uses.
 speech_credentials=()
 
-# Resolve them, and refuse everything about them that cannot be staged.
+# The model files the staged speech configuration supplies itself -- the wake
+# gate's phrase head -- in the same shape.
+speech_models=()
+
+# Refuse a site file that would land on a payload member.
+#
+#   refuse_payload_collision <key> <value> <noun>
+#
+# A site path that lands on a model, a cog's configuration or another site file
+# is a file the payload carries under a name something else reads, with the
+# loser decided by install order. Asked against everything resolved so far: the
+# named members, the resolved plan and models, and both classes of site file —
+# including the class being resolved right now, whose own list is still empty
+# while its first entry is checked. So the answer does not depend on which
+# resolver runs first, and a new class of site file is covered by adding its
+# array here rather than by a cross-check per pair.
+#
+# `payload_fixed_members` entries are bare paths and the rest are
+# `<source>\t<path>`, so the suffix cut is a no-op on the first and the column
+# cut on the second: one loop reads both.
+refuse_payload_collision() {
+	local key=$1 value=$2 noun=$3 entry
+	for entry in "${payload_fixed_members[@]}" \
+		"${plan_files[@]}" "${model_files[@]}" \
+		${speech_credentials[@]+"${speech_credentials[@]}"} \
+		${speech_models[@]+"${speech_models[@]}"}; do
+		[ "${entry#*$'\t'}" = "$value" ] || continue
+		die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
+			"The ${noun} would be installed over ${value}, or under it; name it something" \
+			"the payload does not already carry."
+	done
+}
+
+# Resolve the credentials, and refuse everything about them that cannot be
+# staged.
 #
 # Run after `plan` and `resolve_models`, because the collision question is asked
-# against the payload members those two resolved: a credential path that lands
-# on a model or a cog's configuration would be a file the payload carries under
-# a name something else reads, and the loser depends on install order. Still
-# before `stage`, so every refusal here leaves the previous payload alone.
+# against the payload members those two resolved. Still before `stage`, so every
+# refusal here leaves the previous payload alone.
 #
 # The source is beside the configuration, because the configuration names the
 # path the file will occupy in the payload rather than the path it occupies now.
@@ -418,29 +461,43 @@ speech_credentials=()
 # its credentials, and it is also what brenn-pod's provisioning is pointed at,
 # so the two sides of the pod's key link keep deriving from one source.
 resolve_speech_credentials() {
-	local listing key value src entry
+	local listing key value src
 	speech_credentials=()
 	listing=$(speech_credential_paths "$speech_config") || exit 1
 	while IFS=$'\t' read -r key value src; do
 		[ -n "$key" ] || continue
-		for entry in "${payload_fixed_members[@]}"; do
-			[ "$entry" = "$value" ] || continue
-			die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
-				"The credential would be installed over ${value}, or under it; name it something" \
-				"the payload does not already carry."
-		done
-		for entry in "${plan_files[@]}" "${model_files[@]}"; do
-			[ "${entry#*$'\t'}" = "$value" ] || continue
-			die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
-				"The credential would be installed over ${value}, or under it; name it something" \
-				"the payload does not already carry."
-		done
+		refuse_payload_collision "$key" "$value" credential
 		[ -f "$src" ] ||
 			die "${speech_config} names ${key} = ${value} and there is no file at ${src}." \
 				"The credential files a speech configuration names live beside it, under the" \
 				"payload-relative paths it spells: that is the directory the payload is staged" \
 				"from and the one brenn-pod's provisioning writes the key table into."
 		speech_credentials+=("${src}"$'\t'"${value}")
+	done <<<"$listing"
+}
+
+# Resolve the wake head, and refuse everything about it that cannot be staged.
+#
+# Run after `plan` and `resolve_models` for the reason the credentials are, and
+# before `stage` for the same one. Which of the two site-file resolvers runs
+# first does not matter: `refuse_payload_collision` reads both lists.
+#
+# Only the site's configuration is read. The recording configuration names its
+# own `[wake] model` and is held equal to this one by the push's agreement
+# check, so the head this stages is the head a recording session loads.
+resolve_speech_models() {
+	local listing key value src
+	speech_models=()
+	listing=$(speech_model_paths "$speech_config") || exit 1
+	while IFS=$'\t' read -r key value src; do
+		[ -n "$key" ] || continue
+		refuse_payload_collision "$key" "$value" "wake model"
+		[ -f "$src" ] ||
+			die "${speech_config} names ${key} = ${value} and there is no file at ${src}." \
+				"The wake head a speech configuration names lives beside it, under the" \
+				"payload-relative path it spells: the head is a site's own file, not one this" \
+				"build fetches, so the assembly directory is the only place it can come from."
+		speech_models+=("${src}"$'\t'"${value}")
 	done <<<"$listing"
 }
 
@@ -578,6 +635,13 @@ stage() {
 		install -m 0600 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
 
+	# The wake gate's phrase head, at 0644 like the build's own models. The
+	# 0600 above guards keys from other accounts on the unit; a head is
+	# private in the publication sense and not the access-control one.
+	for entry in "${speech_models[@]}"; do
+		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
+	done
+
 	stamp_build_commit "${staging}/${build_commit_name}"
 
 	if [ -e "$payload" ]; then
@@ -636,6 +700,15 @@ report() {
 	local entry
 	for entry in "${speech_credentials[@]}"; do
 		echo "${prog}: ${entry#*$'\t'}  staged from ${entry%%$'\t'*}"
+	done
+	# And the wake head, with a digest the credentials do not get: it is the
+	# member whose identity decides which phrase the unit answers to, it is not
+	# a secret, and a retrained head arrives under the name of the one before
+	# it, so where it came from does not say which one it is.
+	local member
+	for entry in "${speech_models[@]}"; do
+		member=${entry#*$'\t'}
+		echo "${prog}: ${member}  staged from ${entry%%$'\t'*}  $(sha256sum -- "${payload}/${member}" | cut -d' ' -f1)"
 	done
 }
 
@@ -765,5 +838,6 @@ verify_aarch64 "$launcher_out"
 verify_aarch64 "$onnx_out"
 plan "$built" "$configs"
 resolve_speech_credentials
+resolve_speech_models
 stage
 report

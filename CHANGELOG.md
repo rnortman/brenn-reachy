@@ -9,6 +9,19 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 Nothing has been released, and nothing here has driven a motor.
 
+### Changed
+
+- **The wake head is a site file, not a build fetch.** The wake gate's
+  phrase-specific model --- the one that decides which words a unit answers to
+  --- is no longer an `http_file` in `MODULE.bazel`. It is now the site
+  operator's own file, named by `[wake] model` in the speech configuration and
+  staged from the assembly directory beside it, the way credentials already are.
+  Changing the wake phrase is `[wake] model` and `[wake] phrase` in the speech
+  configurations and the file beside them; nothing in this tree. The two
+  phrase-independent openWakeWord graphs (melspectrogram, embedding) and Silero
+  stay build-fetched. A recording configuration is held to agree with the site's
+  on both `[wake]` keys, so a half-done swap is refused before it builds.
+
 ### Added
 
 - **The speech run report says whether the servo bus answered.** On any run the

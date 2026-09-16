@@ -1112,20 +1112,26 @@ speech_credential_keys=(
 	$'brenn.bridge\ttoken_file'
 )
 
-# Refuse a credential path the payload cannot carry.
+# Refuse a payload-relative path the payload cannot carry.
 #
-#   check_credential_path <config> <key> <value>
+#   check_payload_path <config> <key> <value> <noun>
 #
 # Every file the configuration names travels inside the payload and is named by
 # the payload-relative path it will occupy — which is also the path the host
 # resolves at run time, because the launcher starts it with the payload root as
 # its working directory. An absolute path is the workstation-era spelling: it would resolve on
 # the machine the payload was built on and name nothing on the unit.
-check_credential_path() {
-	local config=$1 key=$2 value=$3
+#
+# The noun is what the file is to an operator ("credential", "wake model"): the
+# two refusals that name the kind of file take it, because these rules are about
+# payload-relative paths and not about any one class of member. It is used in the
+# singular in both, so a caller's noun is never bent into a plural this cannot
+# spell.
+check_payload_path() {
+	local config=$1 key=$2 value=$3 noun=$4
 	case "$value" in
 	/*)
-		die "${key} in ${config} is the absolute path ${value}, and the payload carries its own credentials." \
+		die "${key} in ${config} is the absolute path ${value}, and the payload carries its own copy of every ${noun}." \
 			"Name it relative to the payload root, with the file beside the configuration:" \
 			"a re-push then replaces it and the freshness check covers it. An absolute path" \
 			"resolves on this machine and names nothing on the unit."
@@ -1152,42 +1158,87 @@ check_credential_path() {
 	*/./* | *//*)
 		die "${key} in ${config} is ${value}, which carries a . or an empty component." \
 			"The payload's members are compared against this path by name, so a spelling" \
-			"that resolves to one of them without matching it would install a credential" \
+			"that resolves to one of them without matching it would install a ${noun}" \
 			"over a launcher config or a model. Name the file plainly."
 		;;
 	esac
 }
 
-# The credential files a speech configuration names, as
+# The site files a speech configuration names, as
 # `<key>\t<payload-relative path>\t<source path>` lines, one per key it states.
 #
-#   speech_credential_paths <config>
+#   payload_path_entries <config> <noun> <table\tkey>...
+#
+# One reader for every class of file that travels by the assembly-directory
+# convention, because the three columns and the rules behind them are one
+# contract: a second copy of this loop is a second place a new column or a new
+# refusal has to be made, with separate suites that both go green when only one
+# of them is.
 #
 # A configuration that is not there names nothing: a payload built without one
 # is the ordinary case, and the build refuses a *named* one that is missing
 # before this is ever asked. Every value that is there is checked here, so the
-# build and the push cannot disagree about which paths the payload's credentials
+# build and the push cannot disagree about which paths the payload's site files
 # occupy.
 #
-# The source column is the other half of the assembly-directory convention: the
-# configuration names the path a file will occupy in the payload, and the file
-# itself sits beside the configuration under that same name. Emitted here rather
-# than re-joined at each call site, so the build's staging and the push's
-# freshness check cannot come to disagree about where a credential came from —
-# which would be a stale secret shipped under a green verdict.
+# The source column is the other half of the convention: the configuration names
+# the path a file will occupy in the payload, and the file itself sits beside the
+# configuration under that same name. Emitted here rather than re-joined at each
+# call site, so the build's staging and the push's freshness check cannot come to
+# disagree about where a file came from — which would be a stale secret, or a
+# superseded wake head, shipped under a green verdict.
 #
 # Read through a command substitution, as `toml_table_value` is.
-speech_credential_paths() {
-	local config=$1 entry table key value
+payload_path_entries() {
+	local config=$1 noun=$2
+	shift 2
+	local entry table key value
 	[ -f "$config" ] || return 0
-	for entry in "${speech_credential_keys[@]}"; do
+	for entry in "$@"; do
 		table=${entry%%$'\t'*}
 		key=${entry#*$'\t'}
 		value=$(toml_table_value "$config" "$table" "$key") || exit 1
 		[ -n "$value" ] || continue
-		check_credential_path "$config" "$key" "$value"
+		check_payload_path "$config" "$key" "$value" "$noun"
 		printf '%s\t%s\t%s\n' "$key" "$value" "$(dirname -- "$config")/${value}"
 	done
+}
+
+# The credential files a speech configuration names.
+#
+#   speech_credential_paths <config>
+speech_credential_paths() {
+	payload_path_entries "$1" credential "${speech_credential_keys[@]}"
+}
+
+# The speech configuration's model path fields, as `<table>\t<key>`.
+#
+# One key, and a list rather than a bare name because the reader takes a list and
+# because a second site-supplied model would be a row here. `[wake]
+# melspectrogram`, `[wake] embedding` and `[endpointer] model`
+# are deliberately not in it: those name files the build fetches and stages from
+# its own table, so the scripts never read them and the host's `--check`
+# preflight is what holds them to the payload.
+speech_model_keys=(
+	$'wake\tmodel'
+)
+
+# The model files a speech configuration supplies itself.
+#
+#   speech_model_paths <config>
+#
+# The wake head is the one model that is site policy rather than build input:
+# which phrase this machine answers to. So it travels by the assembly-directory
+# convention the credentials travel by — the configuration names the
+# payload-relative path the file will occupy, and the file sits beside the
+# configuration under that same name — rather than being fetched by digest with
+# the phrase-independent graphs.
+#
+# Absent keys name nothing, as for credentials: a configuration with no `[wake]`
+# table, or one whose wake mode reads no head, stages none. Whether what is left
+# is a coherent pipeline is the host's business and surfaces at `--check`.
+speech_model_paths() {
+	payload_path_entries "$1" "wake model" "${speech_model_keys[@]}"
 }
 
 # The speech configuration's service endpoints, as `<table>\t<key>`.
